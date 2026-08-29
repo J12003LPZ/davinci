@@ -413,58 +413,268 @@ fn item_matches_query(item: &SessionItem, query: &str) -> bool {
 fn regex_is_match(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
-    (0..=text.len()).any(|start| match_here(&pattern, &text[start..]))
+    split_alternation(&pattern)
+        .into_iter()
+        .any(|branch| match_anchored(&branch, &text))
 }
 
-fn match_here(pattern: &[char], text: &[char]) -> bool {
-    if pattern.is_empty() {
-        return true;
-    }
-    let (atom, rest) = match pattern {
-        ['\\', escaped, rest @ ..] => (*escaped, rest),
-        [atom, rest @ ..] => (*atom, rest),
-        [] => return true,
-    };
-    let quant = rest.first().copied();
-    let (min, rest) = match quant {
-        Some('*') => (0, &rest[1..]),
-        Some('+') => (1, &rest[1..]),
-        Some('?') => {
-            if match_atom(atom, text.first().copied())
-                && match_here(rest.get(1..).unwrap_or(&[]), text.get(1..).unwrap_or(&[]))
-            {
-                return true;
+fn split_alternation(pattern: &[char]) -> Vec<Vec<char>> {
+    let mut branches = Vec::new();
+    let mut current = Vec::new();
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < pattern.len() {
+        match pattern[i] {
+            '\\' if i + 1 < pattern.len() => {
+                current.push(pattern[i]);
+                current.push(pattern[i + 1]);
+                i += 2;
             }
-            return match_here(rest.get(1..).unwrap_or(&[]), text);
+            '[' => {
+                current.push(pattern[i]);
+                i += 1;
+                while i < pattern.len() {
+                    current.push(pattern[i]);
+                    if pattern[i] == ']' && current.len() > 2 {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '(' => {
+                depth += 1;
+                current.push(pattern[i]);
+                i += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(pattern[i]);
+                i += 1;
+            }
+            '|' if depth == 0 => {
+                branches.push(std::mem::take(&mut current));
+                i += 1;
+            }
+            _ => {
+                current.push(pattern[i]);
+                i += 1;
+            }
         }
-        _ => {
-            return match_atom(atom, text.first().copied())
-                && match_here(rest, text.get(1..).unwrap_or(&[]));
-        }
-    };
-    let mut consumed = 0usize;
-    while consumed < min {
-        if !match_atom(atom, text.get(consumed).copied()) {
-            return false;
-        }
-        consumed += 1;
     }
-    loop {
-        if match_here(rest, text.get(consumed..).unwrap_or(&[])) {
-            return true;
+    branches.push(current);
+    branches
+}
+
+fn match_anchored(pattern: &[char], text: &[char]) -> bool {
+    let (anchored_start, pattern) = pattern
+        .strip_prefix(&['^'])
+        .map(|rest| (true, rest))
+        .unwrap_or((false, pattern));
+    let (anchored_end, pattern) = pattern
+        .strip_suffix(&['$'])
+        .map(|rest| (true, rest))
+        .unwrap_or((false, pattern));
+    let mut starts = if anchored_start {
+        0..=0
+    } else {
+        0..=text.len()
+    };
+    starts.any(|start| {
+        match_here(pattern, &text[start..])
+            .is_some_and(|consumed| !anchored_end || start + consumed == text.len())
+    })
+}
+
+fn match_here(pattern: &[char], text: &[char]) -> Option<usize> {
+    if pattern.is_empty() {
+        return Some(0);
+    }
+    if pattern[0] == '(' {
+        let end = group_end(pattern)?;
+        let inner = &pattern[1..end];
+        let rest = &pattern[end + 1..];
+        let (min, max, rest) = take_quantifier(rest);
+        return match_quantified(|slice| match_here(inner, slice), min, max, rest, text);
+    }
+    let (atom_len, rest_after_atom) = parse_atom(pattern)?;
+    let atom = &pattern[..atom_len];
+    let (min, max, rest) = take_quantifier(rest_after_atom);
+    match_quantified(|slice| match_atom(atom, slice), min, max, rest, text)
+}
+
+fn group_end(pattern: &[char]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            '\\' if i + 1 < pattern.len() => i += 2,
+            '[' => {
+                i += 1;
+                while i < pattern.len() {
+                    if pattern[i] == ']' && i > 0 {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '(' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
         }
-        if !match_atom(atom, text.get(consumed).copied()) {
-            return false;
+    }
+    None
+}
+
+fn parse_atom(pattern: &[char]) -> Option<(usize, &[char])> {
+    match pattern {
+        ['\\', _, rest @ ..] => Some((2, rest)),
+        ['[', rest @ ..] => {
+            let mut i = 0;
+            while i < rest.len() {
+                if rest[i] == ']' && i > 0 {
+                    return Some((i + 2, &rest[i + 1..]));
+                }
+                if rest[i] == ']' && i == 0 {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+            }
+            None
         }
-        consumed += 1;
+        [_, rest @ ..] => Some((1, rest)),
+        [] => None,
     }
 }
 
-fn match_atom(atom: char, next: Option<char>) -> bool {
-    match next {
-        Some(_) if atom == '.' => true,
-        Some(ch) => atom == ch,
-        None => false,
+fn take_quantifier(rest: &[char]) -> (usize, Option<usize>, &[char]) {
+    match rest {
+        ['*', rest @ ..] => (0, None, rest),
+        ['+', rest @ ..] => (1, None, rest),
+        ['?', rest @ ..] => (0, Some(1), rest),
+        rest if rest.first() == Some(&'{') => {
+            parse_brace_quantifier(&rest[1..]).unwrap_or((1, Some(1), rest))
+        }
+        _ => (1, Some(1), rest),
+    }
+}
+
+fn parse_brace_quantifier(rest: &[char]) -> Option<(usize, Option<usize>, &[char])> {
+    let close = rest.iter().position(|ch| *ch == '}')?;
+    let spec: String = rest[..close].iter().collect();
+    let after = &rest[close + 1..];
+    if let Some((min, max)) = spec.split_once(',') {
+        let min = min.parse().ok()?;
+        if max.is_empty() {
+            return Some((min, None, after));
+        }
+        return Some((min, Some(max.parse().ok()?), after));
+    }
+    let n = spec.parse().ok()?;
+    Some((n, Some(n), after))
+}
+
+fn match_quantified(
+    matcher: impl Fn(&[char]) -> Option<usize>,
+    min: usize,
+    max: Option<usize>,
+    rest: &[char],
+    text: &[char],
+) -> Option<usize> {
+    let mut spans = vec![0];
+    let mut offset = 0;
+    let limit = max.unwrap_or(text.len() + 1);
+    while spans.len() <= limit {
+        if spans.len() > min {
+            if let Some(tail) = match_here(rest, &text[offset..]) {
+                return Some(offset + tail);
+            }
+        }
+        if spans.len() > limit {
+            break;
+        }
+        let Some(consumed) = matcher(&text[offset..]) else {
+            break;
+        };
+        if consumed == 0 && spans.len() > min {
+            break;
+        }
+        offset += consumed;
+        spans.push(offset);
+        if consumed == 0 {
+            break;
+        }
+    }
+    if spans.len() > min {
+        match_here(rest, &text[offset..]).map(|tail| offset + tail)
+    } else {
+        None
+    }
+}
+
+fn match_atom(atom: &[char], text: &[char]) -> Option<usize> {
+    let next = *text.first()?;
+    let ok = match atom {
+        ['.'] => true,
+        ['\\', escaped] => match_escaped(*escaped, next),
+        ['[', class @ .., ']'] => match_class(class, next),
+        [ch] => *ch == next,
+        _ => false,
+    };
+    ok.then_some(1)
+}
+
+fn match_escaped(escaped: char, next: char) -> bool {
+    match escaped {
+        'd' => next.is_ascii_digit(),
+        'D' => !next.is_ascii_digit(),
+        'w' => next.is_ascii_alphanumeric() || next == '_',
+        'W' => !(next.is_ascii_alphanumeric() || next == '_'),
+        's' => next.is_ascii_whitespace(),
+        'S' => !next.is_ascii_whitespace(),
+        'n' => next == '\n',
+        't' => next == '\t',
+        other => other == next,
+    }
+}
+
+fn match_class(class: &[char], next: char) -> bool {
+    let (negate, class) = class
+        .strip_prefix(&['^'])
+        .map(|rest| (true, rest))
+        .unwrap_or((false, class));
+    let mut matched = false;
+    let mut i = 0;
+    while i < class.len() {
+        if i + 2 < class.len() && class[i + 1] == '-' {
+            let start = class[i] as u32;
+            let end = class[i + 2] as u32;
+            if (start..=end).contains(&(next as u32)) {
+                matched = true;
+            }
+            i += 3;
+            continue;
+        }
+        if class[i] == next {
+            matched = true;
+        }
+        i += 1;
+    }
+    if negate {
+        !matched
+    } else {
+        matched
     }
 }
 
@@ -491,6 +701,18 @@ mod tests {
                 parent_id: Some("aaa".into()),
             },
         ]
+    }
+
+    #[test]
+    fn js_like_regex_supports_anchors_classes_and_alternation() {
+        assert!(regex_is_match("^aaa$", "aaa"));
+        assert!(!regex_is_match("^aaa$", "baaa"));
+        assert!(regex_is_match("foo|bar", "xxbarxx"));
+        assert!(regex_is_match("[ab]{3}", "xaaab"));
+        assert!(regex_is_match(r"\d+", "id-12"));
+        assert!(!regex_is_match(r"\d+", "abc"));
+        assert!(regex_is_match("[^x]+", "abc"));
+        assert!(regex_is_match("(ab)+c", "ababc"));
     }
 
     #[test]
@@ -570,6 +792,22 @@ mod tests {
         selector.handle_key("re:aa+");
         assert_eq!(selector.filtered.len(), 1);
         assert_eq!(selector.filtered[0].id, "aaa");
+        selector.query.clear();
+        selector.apply_filter();
+        selector.handle_key("re:^aaa ");
+        assert_eq!(selector.filtered.len(), 1);
+        selector.query.clear();
+        selector.apply_filter();
+        selector.handle_key("re:bbb|other");
+        assert_eq!(selector.filtered.len(), 2);
+        selector.query.clear();
+        selector.apply_filter();
+        selector.handle_key("re:[ab]{3}");
+        assert_eq!(selector.filtered.len(), 2);
+        selector.query.clear();
+        selector.apply_filter();
+        selector.handle_key(r"re:\d+");
+        assert_eq!(selector.filtered.len(), 0);
         selector.query.clear();
         selector.apply_filter();
         selector.handle_key("\"other\"");

@@ -165,6 +165,37 @@ pub struct ThemeDetection {
     pub confidence: String,
 }
 
+/// Dedicated OSC drain independent of the crossterm key loop.
+/// Reads `PI_OSC_DRAIN_REPLY`, then polls `PI_OSC_TTY` (or `/dev/tty` when set via env)
+/// until data arrives or `timeout_ms` elapses — matching TS `queryTerminalBackgroundColor`.
+pub fn drain_osc_tty(timeout_ms: u64) -> Option<String> {
+    if let Ok(reply) = std::env::var("PI_OSC_DRAIN_REPLY") {
+        if !reply.is_empty() {
+            return Some(reply);
+        }
+    }
+    let path = std::env::var("PI_OSC_TTY").ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if !data.is_empty() {
+                return Some(data);
+            }
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+pub fn query_terminal_background_color(timeout_ms: u64) -> Option<RgbColor> {
+    if let Some(data) = drain_osc_tty(timeout_ms) {
+        return parse_osc11_background_color(&data);
+    }
+    None
+}
+
 pub fn detect_terminal_background_from_env(colorfgbg: Option<&str>) -> ThemeDetection {
     if let Some(colorfgbg) = colorfgbg.filter(|value| !value.is_empty()) {
         let bg = colorfgbg
@@ -291,5 +322,25 @@ mod tests {
             detect_terminal_theme_for_auto(None, None, Some("15;0")).source,
             "COLORFGBG"
         );
+    }
+
+    #[test]
+    fn drain_osc_tty_reads_path_with_timeout() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("osc");
+        std::fs::write(&path, "\x1b]11;#ffffff\x07").expect("write");
+        std::env::set_var("PI_OSC_TTY", path.display().to_string());
+        std::env::remove_var("PI_OSC_DRAIN_REPLY");
+        let drained = drain_osc_tty(50).expect("drain");
+        assert_eq!(
+            query_terminal_background_color(0),
+            Some(RgbColor {
+                r: 255,
+                g: 255,
+                b: 255
+            })
+        );
+        assert!(drained.contains("11;"));
+        std::env::remove_var("PI_OSC_TTY");
     }
 }

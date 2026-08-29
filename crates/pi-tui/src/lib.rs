@@ -56,9 +56,9 @@ pub use mermaid::{transform_mermaid, MermaidArt, MermaidContext, MermaidMode, Me
 pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
 pub use open_browser::{copy_text, open_browser, open_browser_argv, open_browser_dry_run};
 pub use osc::{
-    detect_terminal_background_from_env, detect_terminal_theme_for_auto,
-    parse_osc11_background_color, parse_terminal_color_scheme_report, ThemeDetection,
-    COLOR_SCHEME_QUERY, OSC_11_QUERY,
+    detect_terminal_background_from_env, detect_terminal_theme_for_auto, drain_osc_tty,
+    parse_osc11_background_color, parse_terminal_color_scheme_report,
+    query_terminal_background_color, ThemeDetection, COLOR_SCHEME_QUERY, OSC_11_QUERY,
 };
 pub use overlay::Overlay;
 pub use render::{visible_width, Component, Text};
@@ -83,7 +83,7 @@ pub use settings_submenu::{
     parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
     SettingsSubmenuKind, AUTOMATIC_THEME_VALUE,
 };
-pub use themes::{builtin_themes, Theme};
+pub use themes::{builtin_themes, load_themes_from_dir, Theme};
 pub use tool_card::{ToolCard, ToolCardState, FALLBACK_PREVIEW_LINES};
 pub use transcript::{Transcript, TranscriptLine};
 pub use tree::{
@@ -128,13 +128,40 @@ pub const TUI_KEYBINDINGS: &[(&str, &str)] = &[
 ];
 
 pub fn get_keybindings() -> Vec<Keybinding> {
-    TUI_KEYBINDINGS
+    let bindings = Keybindings::defaults();
+    let mut out: Vec<Keybinding> = TUI_KEYBINDINGS
         .iter()
         .map(|(action, key)| Keybinding {
             action: (*action).to_string(),
             keys: vec![(*key).to_string()],
         })
-        .collect()
+        .collect();
+    for action in [
+        "app.interrupt",
+        "app.clear",
+        "app.exit",
+        "app.model.select",
+        "app.model.cycleForward",
+        "app.model.cycleBackward",
+        "app.tools.expand",
+        "app.thinking.cycle",
+        "app.thinking.toggle",
+        "app.editor.external",
+        "app.clipboard.pasteImage",
+        "app.message.followUp",
+        "app.message.dequeue",
+        "app.session.new",
+        "app.session.tree",
+        "app.session.fork",
+        "app.session.resume",
+        "app.session.delete",
+    ] {
+        out.push(Keybinding {
+            action: action.into(),
+            keys: bindings.keys_for(action).to_vec(),
+        });
+    }
+    out
 }
 
 #[derive(Debug, Clone)]

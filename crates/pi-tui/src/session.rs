@@ -48,7 +48,12 @@ pub enum SessionAction {
     Abort,
     Quit,
     CycleModel,
+    CycleModelBackward,
     CycleThinking,
+    ToggleHideThinking,
+    ExpandTools,
+    NewSession,
+    OpenResume,
     Clear,
     OpenModel,
     SelectModel(String),
@@ -621,6 +626,54 @@ impl InteractiveSession {
                 }
                 return SessionAction::Dequeue;
             }
+            if self.keybindings.matches(data, "app.model.select") {
+                self.open_model_overlay();
+                return SessionAction::OpenModel;
+            }
+            if self.keybindings.matches(data, "app.tools.expand") {
+                if let Some(card) = self.chrome.tool_cards.last_mut() {
+                    card.expanded = !card.expanded;
+                }
+                return SessionAction::ExpandTools;
+            }
+            if self.keybindings.matches(data, "app.thinking.toggle") {
+                self.chrome.transcript.hide_thinking_block =
+                    !self.chrome.transcript.hide_thinking_block;
+                return SessionAction::ToggleHideThinking;
+            }
+            if self.keybindings.matches(data, "app.thinking.cycle") {
+                self.cycle_thinking();
+                return SessionAction::CycleThinking;
+            }
+            if self.keybindings.matches(data, "app.model.cycleBackward") {
+                self.cycle_model_backward();
+                return SessionAction::CycleModelBackward;
+            }
+            if self.keybindings.matches(data, "app.model.cycleForward") {
+                self.cycle_model();
+                return SessionAction::CycleModel;
+            }
+            if self.keybindings.matches(data, "app.session.new") {
+                return SessionAction::NewSession;
+            }
+            if self.keybindings.matches(data, "app.session.tree") {
+                return SessionAction::OpenTree;
+            }
+            if self.keybindings.matches(data, "app.session.fork") {
+                return SessionAction::OpenFork;
+            }
+            if self.keybindings.matches(data, "app.session.resume") {
+                return SessionAction::OpenResume;
+            }
+            if self.keybindings.matches(data, "app.clear") && !self.chrome.editor.buffer.is_empty()
+            {
+                self.chrome.editor.buffer.clear();
+                self.chrome.editor.cursor = 0;
+                return SessionAction::None;
+            }
+            if self.keybindings.matches(data, "app.exit") && self.chrome.editor.buffer.is_empty() {
+                return SessionAction::Quit;
+            }
         }
         match data {
             "\x03" => SessionAction::Quit,
@@ -1039,6 +1092,26 @@ impl InteractiveSession {
         self.thinking_index = (self.thinking_index + 1) % self.thinking_levels.len();
         self.chrome.status = format!("thinking={}", self.current_thinking());
     }
+
+    fn cycle_model_backward(&mut self) {
+        let ids = self.cycle_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self.current_model().unwrap_or_default().to_string();
+        let position = ids.iter().position(|id| id == &current).unwrap_or(0);
+        let prev = ids[(position + ids.len() - 1) % ids.len()].clone();
+        if let Some(index) = self.models.iter().position(|model| model == &prev) {
+            self.model_index = index;
+        }
+        if let Some(model) = self.current_model() {
+            self.chrome.status = format!("model={model}");
+        }
+    }
+
+    pub fn osc_query_pending(&self) -> bool {
+        self.osc_query.as_ref().is_some_and(|query| !query.finished)
+    }
 }
 
 #[cfg(test)]
@@ -1073,8 +1146,16 @@ mod tests {
         );
         assert_eq!(session.handle_bytes("\x10"), SessionAction::CycleModel);
         assert_eq!(session.current_model(), Some("anthropic/sonnet"));
-        assert_eq!(session.handle_bytes("\x14"), SessionAction::CycleThinking);
+        assert_eq!(session.handle_bytes("\x1b[Z"), SessionAction::CycleThinking);
         assert_eq!(session.current_thinking(), "minimal");
+        assert_eq!(
+            session.handle_bytes("\x14"),
+            SessionAction::ToggleHideThinking
+        );
+        assert!(session.chrome.transcript.hide_thinking_block);
+        assert_eq!(session.handle_bytes("\x0c"), SessionAction::OpenModel);
+        session.close_overlays();
+        assert_eq!(session.handle_bytes("\x0f"), SessionAction::ExpandTools);
         session.chrome.editor.handle_input("busy");
         assert_eq!(session.handle_bytes("\x1b"), SessionAction::Abort);
         assert!(session.aborted);

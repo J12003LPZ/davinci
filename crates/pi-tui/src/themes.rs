@@ -58,3 +58,54 @@ pub fn builtin_themes() -> Vec<Theme> {
         },
     ]
 }
+
+pub fn load_themes_from_dir(dir: &std::path::Path) -> Vec<Theme> {
+    let mut themes = builtin_themes();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return themes;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(theme) = serde_json::from_str::<Theme>(&raw) {
+            if let Some(existing) = themes.iter_mut().find(|item| item.name == theme.name) {
+                *existing = theme;
+            } else {
+                themes.push(theme);
+            }
+        }
+    }
+    themes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_themes_from_dir_overlays_json() {
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::write(
+            dir.path().join("custom.json"),
+            r##"{"name":"custom","background":"#000","foreground":"#fff","accent":"#f80"}"##,
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join("dark.json"),
+            r##"{"name":"dark","background":"#111111","foreground":"#eeeeee","accent":"#abcdef"}"##,
+        )
+        .expect("write");
+        let themes = load_themes_from_dir(dir.path());
+        assert!(themes.iter().any(|theme| theme.name == "custom"));
+        let dark = themes
+            .iter()
+            .find(|theme| theme.name == "dark")
+            .expect("dark");
+        assert_eq!(dark.background, "#111111");
+    }
+}

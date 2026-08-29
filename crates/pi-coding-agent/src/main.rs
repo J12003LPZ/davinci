@@ -29,11 +29,12 @@ use pi_session::{
     resolve_session_ref, JsonlSession, SessionEntry,
 };
 use pi_tui::{
-    builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto, encode_kitty,
-    interactive_settings_list, parse_auto_theme, parse_http_idle_timeout, ChatChrome, Component,
-    CustomMessage, DoubleEscapeAction, FilterMode, InteractiveSession, Keybindings, MermaidMode,
-    ScopedModel, SessionAction, SessionItem, SessionTreeEntry, SlashCommandSpec, ThemeDetection,
-    ToolCard, TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
+    builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto,
+    drain_osc_tty, encode_kitty, interactive_settings_list, load_themes_from_dir, parse_auto_theme,
+    parse_http_idle_timeout, ChatChrome, Component, CustomMessage, DoubleEscapeAction, FilterMode,
+    InteractiveSession, Keybindings, MermaidMode, ScopedModel, SessionAction, SessionItem,
+    SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TuiMode,
+    FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -723,6 +724,14 @@ fn run_raw_session(
 ) -> Result<i32, String> {
     let _raw = RawModeGuard::enter()?;
     loop {
+        if session.osc_query_pending() {
+            if let Some(reply) = drain_osc_tty(OSC_QUERY_TIMEOUT_MS) {
+                let action = session.handle_bytes(&reply);
+                if !apply_session_action(parsed, agent, session, action)? {
+                    break;
+                }
+            }
+        }
         if let Some(detection) = session.finish_osc_query(std::time::Instant::now()) {
             apply_osc_theme(session, &detection);
         }
@@ -944,7 +953,7 @@ fn apply_session_action(
             session.chrome.status = "aborted".into();
             Ok(true)
         }
-        SessionAction::CycleModel => {
+        SessionAction::CycleModel | SessionAction::CycleModelBackward => {
             if let Some(model) = session.current_model() {
                 let (provider, model_id) = parse_model_ref("google", Some(model));
                 agent.provider = provider;
@@ -956,6 +965,22 @@ fn apply_session_action(
             if let Some(level) = pi_protocol::ThinkingLevel::parse(session.current_thinking()) {
                 agent.thinking_level = level;
             }
+            Ok(true)
+        }
+        SessionAction::ToggleHideThinking => {
+            apply_interactive_setting(
+                session,
+                &format!(
+                    "hide-thinking={}",
+                    session.chrome.transcript.hide_thinking_block
+                ),
+            )?;
+            Ok(true)
+        }
+        SessionAction::ExpandTools => Ok(true),
+        SessionAction::NewSession => handle_user_line(parsed, agent, &mut session.chrome, "/new"),
+        SessionAction::OpenResume => {
+            open_session_selector(parsed, agent, session)?;
             Ok(true)
         }
         SessionAction::Clear => Ok(true),
@@ -988,7 +1013,7 @@ fn apply_session_action(
                 Ok(true)
             }
             SlashAction::Reload => {
-                session.keybindings = Keybindings::load(&default_agent_dir());
+                reload_interactive_resources(parsed, agent, session);
                 handle_user_line(parsed, agent, &mut session.chrome, &text)
             }
             SlashAction::Import(_) | SlashAction::Share | SlashAction::Changelog => {
@@ -1194,8 +1219,11 @@ fn handle_user_line(
             agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
             agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
             agent.context_files = load_context_files(&agent.cwd, true);
-            chrome.status = "reloaded".into();
-            println!("reloaded");
+            let _host = loaded_extension_host(parsed);
+            chrome.status =
+                "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
+                    .into();
+            println!("{}", chrome.status);
             Ok(true)
         }
         SlashAction::Import(path) => {
@@ -1234,6 +1262,27 @@ fn handle_user_line(
     }
 }
 
+const DEFAULT_RADIUS_GATEWAY: &str = "https://radius.pi.dev";
+
+fn reload_interactive_resources(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+) {
+    session.keybindings = Keybindings::load(&default_agent_dir());
+    agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
+    agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
+    agent.context_files = load_context_files(&agent.cwd, true);
+    let host = loaded_extension_host(parsed);
+    replay_custom_messages(agent, session, &host);
+    let current = session.chrome.theme.name.clone();
+    apply_theme_value(session, &current);
+}
+
+fn available_themes() -> Vec<Theme> {
+    load_themes_from_dir(&default_agent_dir().join("themes"))
+}
+
 fn share_current_session(agent: &Agent) -> Result<String, String> {
     if std::env::var("PI_SHARE_DRY_RUN").is_ok() {
         let viewer = std::env::var("PI_SHARE_VIEWER_URL")
@@ -1243,6 +1292,9 @@ fn share_current_session(agent: &Agent) -> Result<String, String> {
     }
     if let Ok(url) = std::env::var("PI_SHARE_URL") {
         return Ok(format!("Share URL: {url}"));
+    }
+    if let Some(result) = try_share_via_radius(agent) {
+        return result;
     }
     let Some(session) = &agent.session else {
         return Ok("No session to share".into());
@@ -1274,6 +1326,68 @@ fn share_current_session(agent: &Agent) -> Result<String, String> {
             Ok("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/".into())
         }
     }
+}
+
+fn radius_share_token() -> Option<String> {
+    if let Ok(token) = std::env::var("PI_RADIUS_TOKEN") {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    let storage = AuthStorage::create().ok()?;
+    let cred = storage.get("radius")?;
+    cred.access
+        .clone()
+        .or_else(|| cred.key.clone())
+        .filter(|token| !token.is_empty())
+}
+
+fn try_share_via_radius(agent: &Agent) -> Option<Result<String, String>> {
+    let token = radius_share_token()?;
+    if let Ok(url) = std::env::var("PI_RADIUS_ARTIFACT_URL") {
+        if !url.is_empty() {
+            return Some(Ok(format!("Share URL: {url}")));
+        }
+    }
+    if let Ok(reply) = std::env::var("PI_RADIUS_ARTIFACT_REPLY") {
+        return Some(parse_radius_artifact_reply(&reply));
+    }
+    Some(upload_radius_artifact(agent, &token))
+}
+
+fn parse_radius_artifact_reply(reply: &str) -> Result<String, String> {
+    let json: serde_json::Value = serde_json::from_str(reply)
+        .map_err(|err| format!("Failed to upload Radius artifact: {err}"))?;
+    if let Some(url) = json
+        .pointer("/artifact/canonical_url")
+        .and_then(|value| value.as_str())
+    {
+        return Ok(format!("Share URL: {url}"));
+    }
+    let error = json
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown error");
+    Err(format!("Failed to upload Radius artifact: {error}"))
+}
+
+fn upload_radius_artifact(agent: &Agent, token: &str) -> Result<String, String> {
+    let session = agent
+        .session
+        .as_ref()
+        .ok_or_else(|| "No session to share".to_string())?;
+    let body = std::fs::read(&session.path).map_err(|err| err.to_string())?;
+    let url =
+        format!("{DEFAULT_RADIUS_GATEWAY}/v1/artifacts?visibility=organization&title=Pi%20session");
+    let response = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/x-ndjson")
+        .send_bytes(&body)
+        .map_err(|err| format!("Failed to upload Radius artifact: {err}"))?;
+    let text = response
+        .into_string()
+        .map_err(|err| format!("Failed to upload Radius artifact: {err}"))?;
+    parse_radius_artifact_reply(&text)
 }
 
 fn apply_tool_events(chrome: &mut ChatChrome, events: &[AgentEvent]) {
@@ -1662,7 +1776,7 @@ fn tree_entry_from_session(entry: &pi_session::SessionEntry) -> SessionTreeEntry
 
 fn apply_theme_value(session: &mut InteractiveSession, value: &str) {
     let resolved = resolve_theme_name(value);
-    if let Some(theme) = builtin_themes()
+    if let Some(theme) = available_themes()
         .into_iter()
         .find(|theme| theme.name == resolved)
     {
@@ -1908,7 +2022,10 @@ fn apply_first_time_result(
     theme: &str,
     share_analytics: bool,
 ) -> Result<(), String> {
-    if let Some(found) = builtin_themes().into_iter().find(|item| item.name == theme) {
+    if let Some(found) = available_themes()
+        .into_iter()
+        .find(|item| item.name == theme)
+    {
         session.chrome.theme = found;
     }
     let dir = default_agent_dir();
@@ -2011,5 +2128,25 @@ mod tests {
             slash::parse_line("/changelog"),
             slash::SlashAction::Changelog
         ));
+    }
+
+    #[test]
+    fn radius_share_uses_fixture_url() {
+        std::env::set_var("PI_RADIUS_TOKEN", "fixture-token");
+        std::env::set_var("PI_RADIUS_ARTIFACT_URL", "https://example.test/session/abc");
+        std::env::remove_var("PI_SHARE_DRY_RUN");
+        std::env::remove_var("PI_SHARE_URL");
+        let agent = Agent::new("sys");
+        let shared = share_current_session(&agent).expect("share");
+        assert_eq!(shared, "Share URL: https://example.test/session/abc");
+        std::env::set_var(
+            "PI_RADIUS_ARTIFACT_REPLY",
+            r#"{"artifact":{"canonical_url":"https://radius.example/a"}}"#,
+        );
+        std::env::remove_var("PI_RADIUS_ARTIFACT_URL");
+        let shared = share_current_session(&agent).expect("share reply");
+        assert_eq!(shared, "Share URL: https://radius.example/a");
+        std::env::remove_var("PI_RADIUS_TOKEN");
+        std::env::remove_var("PI_RADIUS_ARTIFACT_REPLY");
     }
 }
