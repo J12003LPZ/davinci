@@ -36,11 +36,12 @@ use pi_agent::{
 };
 use pi_ai::{
     apply_config_auth_with_shell, apply_models_config, check_auth, complete_simple, content_text,
-    find_model, format_no_models_available_message, fuzzy_models, get_supported_thinking_levels,
-    live_complete_streaming_with, load_builtin_models, models_json_path, resolve_provider_auth,
-    snapshot_availability, AssistantMessage, AuthStorage, ContentBlock, Credential, CredentialKind,
-    ModelConfig, ModelRuntimeSnapshot, ResolvedAuth, StopReason, StreamOptions, ToolSpec,
-    NO_MODELS_AVAILABLE, PROVIDER_SPECS,
+    find_model, format_no_api_key_found_message, format_no_model_selected_message,
+    format_no_models_available_message, format_oauth_auth_failed_message, fuzzy_models,
+    get_supported_thinking_levels, live_complete_streaming_with, load_builtin_models,
+    models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
+    ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
+    StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE, PROVIDER_SPECS,
 };
 use pi_coding_agent::interactive_tui::{
     create_interactive_tui, handle_copy_command, remount_chrome_panes, stop_interactive_tui,
@@ -1481,6 +1482,33 @@ fn print_text_exit(events: &[AgentEvent]) -> (i32, Option<String>) {
     (0, None)
 }
 
+fn rpc_prompt_auth_error(runtime: &RpcRuntime) -> Option<String> {
+    if runtime.agent.model_id.is_empty() {
+        return Some(format_no_model_selected_message(&coding_agent_docs_dir()));
+    }
+    let env: std::collections::HashMap<_, _> = std::env::vars().collect();
+    let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
+    let Ok(storage) = AuthStorage::create() else {
+        return Some(format_no_api_key_found_message(
+            &runtime.agent.provider,
+            &coding_agent_docs_dir(),
+        ));
+    };
+    if check_auth(&runtime.agent.provider, &config, &storage, &env).is_some() {
+        return None;
+    }
+    if storage
+        .get(&runtime.agent.provider)
+        .is_some_and(|credential| credential.kind == CredentialKind::Oauth)
+    {
+        return Some(format_oauth_auth_failed_message(&runtime.agent.provider));
+    }
+    Some(format_no_api_key_found_message(
+        &runtime.agent.provider,
+        &coding_agent_docs_dir(),
+    ))
+}
+
 fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     if let Some(code) = immediate_shutdown_if_fixture(parsed) {
         return Ok(code);
@@ -1558,8 +1586,67 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
+        let mut command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
         let is_prompt = command.kind == "prompt";
+        if is_prompt {
+            if let Some(err) = rpc_prompt_auth_error(&runtime) {
+                let response = rpc::fail_response(command.id.clone(), "prompt", err);
+                output::write_raw_stdout_line(
+                    &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
+                continue;
+            }
+            let images = command
+                .images
+                .as_deref()
+                .map(pi_agent::parse_rpc_images)
+                .unwrap_or_default();
+            let prepared = prepare_user_input(
+                parsed,
+                &mut runtime.agent,
+                command.message.as_deref().unwrap_or(""),
+                &images,
+                "rpc",
+                None,
+            )?;
+            match prepared {
+                PreparedInput::Handled => {
+                    let response = rpc::ok_response(command.id.clone(), "prompt", None);
+                    output::write_raw_stdout_line(
+                        &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    continue;
+                }
+                PreparedInput::Ready { text, images } => {
+                    command.message = Some(text);
+                    command.images = Some(
+                        images
+                            .into_iter()
+                            .filter_map(|block| serde_json::to_value(block).ok())
+                            .collect(),
+                    );
+                }
+            }
+        }
+        if command.kind == "bash" {
+            let mut locked = host.lock().unwrap_or_else(|err| err.into_inner());
+            locked.emit(ExtensionEvent::UserBash {
+                command: command.command.clone().unwrap_or_default(),
+                exclude_from_context: command.exclude_from_context.unwrap_or(false),
+                cwd: runtime.cwd.display().to_string(),
+            });
+            emit_extension_ui_requests(&std::mem::take(&mut locked.ui_calls))?;
+            if let Some(result) = locked.last_user_bash_result() {
+                let response = rpc::ok_response(command.id.clone(), "bash", Some(result));
+                output::write_raw_stdout_line(
+                    &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
+                continue;
+            }
+        }
         let response = handle_rpc(&mut runtime, command.clone());
         if matches!(
             command.kind.as_str(),
@@ -1587,7 +1674,7 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
             emit_extension_ui_requests(&std::mem::take(&mut host.ui_calls))?;
         }
-        if is_prompt {
+        if is_prompt && response.success && runtime.prompt_needs_turn {
             let prompt_args = Args {
                 offline: matches!(
                     std::env::var("PI_OFFLINE").as_deref(),
@@ -6751,6 +6838,19 @@ fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_prompt_auth_error_matches_ts_no_model_copy() {
+        let runtime = RpcRuntime::new(
+            Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        let error = rpc_prompt_auth_error(&runtime).expect("no model");
+        assert!(error.starts_with("No model selected."));
+        assert!(error.contains("Then use /model to select a model."));
+        assert!(error.contains("Use /login to log into a provider via OAuth or API key. See:"));
+    }
 
     #[test]
     fn offline_flag_sets_ts_env_vars() {

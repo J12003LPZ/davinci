@@ -151,6 +151,8 @@ Closed this slice: expandable built-in startup header (logo, compact/expanded ke
 
 Closed this slice: `autocompleteMaxVisible` default **5** (TS `settings-manager` / editor). Interactive OSC window title `π - [sessionName - ]cwdBasename` on startup, `/name`, new/fork/clone/switch, plus extension `setTitle`. RPC `get_available_models` / `set_model` use the ModelRuntime **available** snapshot (`Model not found: provider/id`). Managed `fd`/`rg` (`ensureTool`): `{agentDir}/bin` then PATH (`fd`/`fdfind`/`rg`), offline/Termux warnings, GitHub download with `PI_ENSURE_TOOL_*` / `PI_GITHUB_RELEASE_REPLY` / `PI_TOOL_DOWNLOAD_REPLY` fixtures, PATH prepend like `getShellEnv`, `@` autocomplete checks the tools bin, tools→bin migration writes `{agentDir}/bin`. `--offline` (or truthy `PI_OFFLINE`) sets `PI_OFFLINE=1` and `PI_SKIP_VERSION_CHECK=1` at process start like TS `main()`.
 
+Closed this slice: RPC `prompt` preflight matches TS — compaction-in-progress and streaming-without-`streamingBehavior` fail before a turn; missing model/API key use TS `auth-guidance` strings; extension command / `input` handled count as success without starting a turn; `streamingBehavior` queues steer/follow-up. RPC `bash` emits `user_bash` and honors an extension `result` override.
+
 ## Remaining product gaps
 
 None. A `pi eval` runner binary is not a shipped TS CLI (`run-evals.mjs` is a package script; the harness is library-only in both trees).

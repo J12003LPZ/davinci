@@ -14,6 +14,11 @@ use crate::model_resolver::{
     resolve_model_scope_from_models, thinking_level_for_model_switch, ScopedModelRef,
 };
 
+pub const COMPACTION_PROMPT_ERROR: &str =
+    "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
+pub const STREAMING_PROMPT_ERROR: &str =
+    "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RpcCommand {
     #[serde(default)]
@@ -129,6 +134,7 @@ pub struct RpcRuntime {
     pub invocable_commands: Vec<Value>,
     pub pending_ui: std::collections::HashMap<String, RpcCommand>,
     pub pending_events: Vec<RpcSessionEvent>,
+    pub prompt_needs_turn: bool,
 }
 
 impl RpcRuntime {
@@ -156,6 +162,7 @@ impl RpcRuntime {
             invocable_commands: Vec::new(),
             pending_ui: std::collections::HashMap::new(),
             pending_events: Vec::new(),
+            prompt_needs_turn: false,
         }
     }
 
@@ -238,11 +245,40 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
     let kind = command.kind.clone();
     match kind.as_str() {
         "prompt" => {
+            runtime.prompt_needs_turn = false;
             let images = command
                 .images
                 .as_deref()
                 .map(pi_agent::parse_rpc_images)
                 .unwrap_or_default();
+            if runtime.agent.is_compacting {
+                return fail(id, &kind, COMPACTION_PROMPT_ERROR.to_string());
+            }
+            if runtime.agent.is_streaming {
+                let Some(message) = command.message.as_deref() else {
+                    return fail(id, &kind, STREAMING_PROMPT_ERROR.to_string());
+                };
+                let text = pi_agent::expand_user_text(
+                    message,
+                    &runtime.agent.skills,
+                    &runtime.agent.templates,
+                );
+                match command.streaming_behavior.as_deref() {
+                    Some("followUp") => {
+                        runtime.agent.queues.follow_up_mode = QueueMode::All;
+                        runtime.agent.queues.enqueue_follow_up_with(&text, images);
+                        runtime.emit_queue_update();
+                        return ok(id, &kind, None);
+                    }
+                    Some("steer") => {
+                        runtime.agent.queues.steer_mode = QueueMode::All;
+                        runtime.agent.queues.enqueue_steer_with(&text, images);
+                        runtime.emit_queue_update();
+                        return ok(id, &kind, None);
+                    }
+                    _ => return fail(id, &kind, STREAMING_PROMPT_ERROR.to_string()),
+                }
+            }
             if let Some(message) = &command.message {
                 let text = pi_agent::expand_user_text(
                     message,
@@ -250,12 +286,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                     &runtime.agent.templates,
                 );
                 runtime.agent.prompt_with(&text, &images);
-            }
-            if command.streaming_behavior.as_deref() == Some("followUp") {
-                runtime.agent.queues.follow_up_mode = QueueMode::All;
-            }
-            if command.streaming_behavior.as_deref() == Some("steer") {
-                runtime.agent.queues.steer_mode = QueueMode::All;
+                runtime.prompt_needs_turn = true;
             }
             ok(id, &kind, None)
         }
@@ -856,6 +887,14 @@ fn parse_queue_mode(value: Option<&str>) -> QueueMode {
     }
 }
 
+pub fn ok_response(id: Option<String>, command: &str, data: Option<Value>) -> RpcResponse {
+    ok(id, command, data)
+}
+
+pub fn fail_response(id: Option<String>, command: &str, error: String) -> RpcResponse {
+    fail(id, command, error)
+}
+
 fn ok(id: Option<String>, command: &str, data: Option<Value>) -> RpcResponse {
     RpcResponse {
         id,
@@ -1274,5 +1313,49 @@ mod tests {
             missing.error.as_deref(),
             Some("Model not found: nope/missing")
         );
+    }
+
+    #[test]
+    fn prompt_preflight_rejects_compaction_and_streaming_without_behavior() {
+        let mut runtime = RpcRuntime::new(
+            pi_agent::Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        runtime.agent.is_compacting = true;
+        let compacting = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "prompt".into(),
+                message: Some("hi".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(!compacting.success);
+        assert_eq!(compacting.error.as_deref(), Some(COMPACTION_PROMPT_ERROR));
+        runtime.agent.is_compacting = false;
+        runtime.agent.is_streaming = true;
+        let streaming = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "prompt".into(),
+                message: Some("hi".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(!streaming.success);
+        assert_eq!(streaming.error.as_deref(), Some(STREAMING_PROMPT_ERROR));
+        let queued = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "prompt".into(),
+                message: Some("later".into()),
+                streaming_behavior: Some("followUp".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(queued.success);
+        assert!(!runtime.prompt_needs_turn);
+        assert_eq!(runtime.agent.queues.follow_up.len(), 1);
     }
 }

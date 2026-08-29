@@ -58,11 +58,40 @@ impl ModelRuntimeSnapshot {
     }
 }
 
-pub fn format_no_models_available_message(docs_dir: &Path) -> String {
+fn provider_login_help(docs_dir: &Path) -> String {
     format!(
-        "No models available. Use /login to log into a provider via OAuth or API key. See:\n  {}\n  {}",
+        "Use /login to log into a provider via OAuth or API key. See:\n  {}\n  {}",
         docs_dir.join("providers.md").display(),
         docs_dir.join("models.md").display()
+    )
+}
+
+pub fn format_no_models_available_message(docs_dir: &Path) -> String {
+    format!("No models available. {}", provider_login_help(docs_dir))
+}
+
+pub fn format_no_model_selected_message(docs_dir: &Path) -> String {
+    format!(
+        "No model selected.\n\n{}\n\nThen use /model to select a model.",
+        provider_login_help(docs_dir)
+    )
+}
+
+pub fn format_no_api_key_found_message(provider: &str, docs_dir: &Path) -> String {
+    let provider_display = if provider == "unknown" {
+        "the selected model"
+    } else {
+        provider
+    };
+    format!(
+        "No API key found for {provider_display}.\n\n{}",
+        provider_login_help(docs_dir)
+    )
+}
+
+pub fn format_oauth_auth_failed_message(provider: &str) -> String {
+    format!(
+        "Authentication failed for \"{provider}\". Credentials may have expired or network is unavailable. Run '/login {provider}' to re-authenticate."
     )
 }
 
@@ -448,6 +477,12 @@ mod tests {
         assert!(message.starts_with("No models available. Use /login to log into a provider"));
         assert!(message.contains("/docs/providers.md"));
         assert!(message.contains("/docs/models.md"));
+        let no_model = format_no_model_selected_message(Path::new("/docs"));
+        assert!(no_model.starts_with("No model selected."));
+        assert!(no_model.contains("Then use /model to select a model."));
+        let no_key = format_no_api_key_found_message("fake-provider", Path::new("/docs"));
+        assert!(no_key.starts_with("No API key found for fake-provider."));
+        assert!(no_key.contains("Use /login to log into a provider via OAuth or API key. See:"));
     }
 
     #[test]

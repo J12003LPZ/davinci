@@ -525,6 +525,13 @@ impl ExtensionHost {
             .unwrap_or(false)
     }
 
+    pub fn last_user_bash_result(&self) -> Option<Value> {
+        self.last_js_result
+            .as_ref()
+            .and_then(|value| value.get("result"))
+            .cloned()
+    }
+
     pub fn last_result_system_prompt(&self) -> Option<String> {
         self.last_js_result
             .as_ref()
@@ -1075,6 +1082,14 @@ mod tests {
             exclude_from_context: false,
             cwd: "/tmp".into(),
         });
+        host.last_js_result = Some(serde_json::json!({
+            "result": { "content": "overridden", "exitCode": 0 }
+        }));
+        assert_eq!(
+            host.last_user_bash_result()
+                .and_then(|value| value.get("content").cloned()),
+            Some(serde_json::json!("overridden"))
+        );
         host.emit(ExtensionEvent::TurnStart);
         host.emit(ExtensionEvent::TurnEnd);
         host.emit(ExtensionEvent::ProjectTrust {

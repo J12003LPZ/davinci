@@ -68,8 +68,10 @@ pub use model_config::{
     ModelsJsonProvider, NO_MODELS_AVAILABLE,
 };
 pub use model_runtime::{
-    check_auth, empty_catalog_error, format_no_models_available_message, get_available,
-    snapshot_availability, AuthCheck, ModelRuntimeSnapshot,
+    check_auth, empty_catalog_error, format_no_api_key_found_message,
+    format_no_model_selected_message, format_no_models_available_message,
+    format_oauth_auth_failed_message, get_available, snapshot_availability, AuthCheck,
+    ModelRuntimeSnapshot,
 };
 pub use models_store::{
     catalog_url, load_models_store, merge_models, models_store_path, now_ms, parse_remote_catalog,
