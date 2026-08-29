@@ -309,25 +309,28 @@ pub fn live_complete(
     Ok(parse_provider_response(model, &text))
 }
 
-fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
+pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
     let base = model
         .base_url
         .clone()
         .unwrap_or_else(|| "https://api.openai.com/v1".into());
+    let base = base.trim_end_matches('/');
     match model.api.as_str() {
-        "anthropic-messages" => format!("{}/v1/messages", base.trim_end_matches('/')),
+        "anthropic-messages" | "pi-messages" => format!("{base}/v1/messages"),
         "google-generative-ai" => {
             let key = auth.api_key.clone().unwrap_or_default();
-            format!(
-                "{}/models/{}:generateContent?key={key}",
-                base.trim_end_matches('/'),
-                model.id
-            )
+            format!("{base}/models/{}:generateContent?key={key}", model.id)
         }
-        "openai-responses" | "azure-openai-responses" => {
-            format!("{}/responses", base.trim_end_matches('/'))
+        "google-vertex" => format!(
+            "{base}/v1/projects/default/locations/us-central1/publishers/google/models/{}:generateContent",
+            model.id
+        ),
+        "openai-responses" | "azure-openai-responses" | "openai-codex-responses" => {
+            format!("{base}/responses")
         }
-        _ => format!("{}/chat/completions", base.trim_end_matches('/')),
+        "mistral-conversations" => format!("{base}/v1/conversations"),
+        "bedrock-converse-stream" => format!("{base}/model/{}/converse", model.id),
+        _ => format!("{base}/chat/completions"),
     }
 }
 
@@ -589,6 +592,44 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
                     arguments: block.get("input").cloned().unwrap_or(Value::Null),
                 });
             }
+        }
+    }
+    if let Some(blocks) = value
+        .pointer("/output/message/content")
+        .and_then(Value::as_array)
+    {
+        for block in blocks {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                content.push(ContentBlock::Text {
+                    text: text.to_string(),
+                });
+            }
+            if let Some(tool) = block.get("toolUse") {
+                content.push(ContentBlock::ToolCall {
+                    id: tool
+                        .get("toolUseId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    name: tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    arguments: tool.get("input").cloned().unwrap_or(Value::Null),
+                });
+            }
+        }
+    }
+    if let Some(text) = value
+        .pointer("/outputs/0/content")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/output_text").and_then(Value::as_str))
+    {
+        if !text.is_empty() && content.is_empty() {
+            content.push(ContentBlock::Text {
+                text: text.to_string(),
+            });
         }
     }
     if let Some(parts) = value

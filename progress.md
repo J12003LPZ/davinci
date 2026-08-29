@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: 72%**
+**Complete: 74%**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 

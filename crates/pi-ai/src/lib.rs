@@ -13,11 +13,13 @@ pub use catalog::{
     builtin_provider_ids, flatten_catalog, load_builtin_models, Model, ModelCost, KNOWN_PROVIDERS,
 };
 pub use oauth::{poll_oauth_device_code_flow, DeviceCodePoller, DevicePollStatus};
-pub use providers::{builtin_providers, load_models_json, Provider, ProviderSpec, PROVIDER_SPECS};
+pub use providers::{
+    builtin_providers, load_models_json, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS,
+};
 pub use stream::{
     assistant_to_chat, complete_from_events, fixture_complete, live_complete, parse_sse_block,
-    replay_sse_events, AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason,
-    StreamEvent,
+    replay_sse_events, request_url, AssistantMessage, AssistantMessageEvent, ContentBlock,
+    StopReason, StreamEvent,
 };
 
 use pi_protocol::Usage;
@@ -184,6 +186,33 @@ mod tests {
                 "missing catalog for {}",
                 spec.id
             );
+        }
+        let auth = ResolvedAuth {
+            api_key: Some("k".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        for api in KNOWN_APIS {
+            let model = Model {
+                id: "m".into(),
+                name: "m".into(),
+                api: (*api).into(),
+                provider: "openai".into(),
+                base_url: Some("https://example.test".into()),
+                reasoning: false,
+                input: vec!["text".into()],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 1,
+                max_tokens: 1,
+                compat: serde_json::Value::Null,
+            };
+            let url = request_url(&model, &auth);
+            assert!(url.starts_with("https://example.test"), "{api} -> {url}");
         }
     }
 }

@@ -398,6 +398,19 @@ impl Provider {
     }
 }
 
+pub const KNOWN_APIS: &[&str] = &[
+    "openai-completions",
+    "mistral-conversations",
+    "openai-responses",
+    "azure-openai-responses",
+    "openai-codex-responses",
+    "anthropic-messages",
+    "bedrock-converse-stream",
+    "google-generative-ai",
+    "google-vertex",
+    "pi-messages",
+];
+
 pub fn builtin_providers() -> Vec<Provider> {
     let models = load_builtin_models();
     PROVIDER_SPECS
