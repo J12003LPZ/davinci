@@ -73,6 +73,42 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         print!("{}", print_help());
         return Ok(0);
     }
+    if let Some((left, right)) = &parsed.diff_jsonl {
+        let left_txt = std::fs::read_to_string(left).map_err(|e| e.to_string())?;
+        let right_txt = std::fs::read_to_string(right).map_err(|e| e.to_string())?;
+        let diffs = pi_parity::diff_jsonl(&left_txt, &right_txt);
+        if diffs.is_empty() {
+            println!("jsonl match");
+            return Ok(0);
+        }
+        for line in diffs {
+            println!("{line}");
+        }
+        return Ok(1);
+    }
+    if let Some(ts_pi) = &parsed.parallel_run {
+        let rust = std::env::current_exe().map_err(|e| e.to_string())?;
+        let rest: Vec<&str> = raw
+            .iter()
+            .filter(|a| *a != "--parallel-run" && *a != ts_pi)
+            .map(String::as_str)
+            .collect();
+        match pi_parity::parallel_run(&rust, std::path::Path::new(ts_pi), &rest) {
+            Ok((ours, theirs)) => {
+                let diffs = pi_parity::diff_jsonl(&ours, &theirs);
+                print!("{ours}");
+                if !diffs.is_empty() {
+                    eprintln!("parallel-run diffs:\n{}", diffs.join("\n"));
+                    return Ok(1);
+                }
+                return Ok(0);
+            }
+            Err(err) => {
+                eprintln!("parallel-run skipped: {err}");
+                return Ok(0);
+            }
+        }
+    }
     if let Some(export) = &parsed.export {
         let output = parsed.messages.first().map(String::as_str);
         match export::export_from_file(export, output) {

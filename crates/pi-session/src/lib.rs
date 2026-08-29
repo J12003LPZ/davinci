@@ -1,5 +1,8 @@
 //! JSONL session store compatible with TypeScript pi (`~/.pi` and `--session-dir`).
 
+pub mod backend;
+pub mod conformance;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -204,9 +207,30 @@ pub fn migrate_v3_to_v4(
     Ok(out)
 }
 
-/// Encode a cwd as TypeScript does for session directory names.
+/// Encode a cwd as TypeScript `jsonlSessionDirectoryName`.
+/// `/tmp/work` → `--tmp-work--`; `C:\Users\me` → `--C--Users-me--`.
+pub fn jsonl_session_directory_name(cwd: &str) -> String {
+    let stripped = cwd.trim_start_matches(['/', '\\']);
+    let encoded = stripped.replace(['/', '\\', ':'], "-");
+    format!("--{encoded}--")
+}
+
+/// Older name kept for callers; same encoding as TypeScript.
 pub fn encode_cwd_dir(cwd: &str) -> String {
-    cwd.replace(['/', '\\', ':'], "--")
+    jsonl_session_directory_name(cwd)
+}
+
+/// `{ISO with : and . replaced by -}_{id}.jsonl`
+pub fn session_file_name(created_at_ms: i64, id: &str) -> String {
+    use chrono::{TimeZone, Utc};
+    let secs = created_at_ms.div_euclid(1000);
+    let nanos = (created_at_ms.rem_euclid(1000) * 1_000_000) as u32;
+    let dt = Utc
+        .timestamp_opt(secs, nanos)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+    let iso = dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    format!("{}_{id}.jsonl", iso.replace([':', '.'], "-"))
 }
 
 pub fn default_sessions_root() -> PathBuf {
@@ -346,10 +370,11 @@ pub fn create_session(
     let id = id
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let dir = root.join(encode_cwd_dir(cwd));
+    backend::validate_session_id(&id).map_err(|e| SessionError::Storage(e.message))?;
+    let dir = root.join(jsonl_session_directory_name(cwd));
     fs::create_dir_all(&dir).map_err(|e| SessionError::Storage(e.to_string()))?;
-    let path = dir.join(format!("{id}.jsonl"));
     let created_at = now_ms();
+    let path = dir.join(session_file_name(created_at, &id));
     let header = JsonlV4Header {
         kind: "header".into(),
         version: 4,
@@ -475,6 +500,19 @@ mod tests {
         let forked = fork_session(dir.path(), &resumed, "/proj").unwrap();
         assert_eq!(forked.parent_session_id.as_deref(), Some("aaaa-1111"));
         assert_ne!(forked.id, resumed.id);
+    }
+
+    #[test]
+    fn cwd_and_file_name_match_ts() {
+        assert_eq!(jsonl_session_directory_name("/tmp/work"), "--tmp-work--");
+        assert_eq!(
+            jsonl_session_directory_name(r"C:\Users\me"),
+            "--C--Users-me--"
+        );
+        let name = session_file_name(0, "abc");
+        assert!(name.ends_with("_abc.jsonl"));
+        assert!(!name.contains(':'));
+        assert!(name.starts_with("1970-01-01T00-00-00-000Z_"));
     }
 
     #[test]

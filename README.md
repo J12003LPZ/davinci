@@ -63,8 +63,8 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`pi-parity` can optionally compare against a TypeScript `pi` on `PATH`
-(`--parallel-run`, `--diff-jsonl`) when Node is present.
+The `pi` binary also accepts `--parallel-run <ts-pi>` and `--diff-jsonl <a> <b>`
+when a TypeScript `pi` (or two JSONL transcripts) should be compared.
 
 ## Progress
 

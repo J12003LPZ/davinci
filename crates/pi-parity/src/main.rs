@@ -28,7 +28,8 @@ fn main() -> ExitCode {
     }
     if let Some(pos) = args.iter().position(|a| a == "--parallel-run") {
         let ts = PathBuf::from(args.get(pos + 1).cloned().unwrap_or_else(|| "pi".into()));
-        match parallel_run(&ts, &["--version"]) {
+        let rust = env::current_exe().unwrap_or_else(|_| PathBuf::from("pi"));
+        match parallel_run(&rust, &ts, &["--version"]) {
             Ok((out, err)) => {
                 print!("{out}{err}");
             }

@@ -1,5 +1,9 @@
 //! SQLite session backend matching `packages/session-backends/sqlite-node`.
 
+pub mod repo;
+
+pub use repo::SqliteSessionRepo;
+
 use pi_session::{discover_sessions, migrate_v3_to_v4, parse_header, SessionInfo};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -276,7 +280,7 @@ impl SessionSqlite {
     }
 }
 
-fn apply_migrations(conn: &Connection) -> Result<(), SqliteError> {
+pub(crate) fn apply_migrations(conn: &Connection) -> Result<(), SqliteError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS migrations (
             id TEXT PRIMARY KEY,
@@ -366,5 +370,17 @@ mod tests {
             err.to_string(),
             "writerLease.heartbeatIntervalMs must be positive and less than ttlMs"
         );
+    }
+
+    #[test]
+    fn sqlite_matches_ts_conformance() {
+        let dir = tempdir().unwrap();
+        pi_session::conformance::run_all(|| {
+            crate::SqliteSessionRepo::open(
+                dir.path().join(format!("{}.sqlite", uuid::Uuid::new_v4())),
+            )
+            .expect("sqlite repo")
+        })
+        .expect("sqlite conformance");
     }
 }

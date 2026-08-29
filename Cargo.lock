@@ -500,6 +500,7 @@ dependencies = [
  "pi-ai",
  "pi-client",
  "pi-evals",
+ "pi-parity",
  "pi-protocol",
  "pi-server",
  "pi-session",
@@ -571,6 +572,7 @@ dependencies = [
 name = "pi-session"
 version = "0.84.4"
 dependencies = [
+ "chrono",
  "dirs",
  "indexmap",
  "serde",

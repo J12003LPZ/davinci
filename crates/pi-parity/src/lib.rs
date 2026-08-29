@@ -149,18 +149,25 @@ fn check_print_rpc_events() -> CorpusCheck {
     }
 }
 
-pub fn parallel_run(ts_pi: &Path, args: &[&str]) -> Result<(String, String), String> {
-    let rust = Command::new(env!("CARGO_MANIFEST_DIR"))
-        .arg("--help")
-        .output();
-    let _ = rust;
+pub fn parallel_run(
+    rust_pi: &Path,
+    ts_pi: &Path,
+    args: &[&str],
+) -> Result<(String, String), String> {
+    if !ts_pi.exists() {
+        return Err("TypeScript pi binary not present".into());
+    }
+    let rust = Command::new(rust_pi)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
     let ts = Command::new(ts_pi)
         .args(args)
         .output()
         .map_err(|e| e.to_string())?;
     Ok((
-        String::from_utf8_lossy(&ts.stdout).to_string(),
-        String::from_utf8_lossy(&ts.stderr).to_string(),
+        String::from_utf8_lossy(&rust.stdout).into_owned(),
+        String::from_utf8_lossy(&ts.stdout).into_owned(),
     ))
 }
 

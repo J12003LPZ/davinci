@@ -66,6 +66,8 @@ pub struct Args {
     pub tui_mode: Option<TuiMode>,
     pub verbose: bool,
     pub project_trust_override: Option<bool>,
+    pub parallel_run: Option<String>,
+    pub diff_jsonl: Option<(String, String)>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
     pub unknown_flags: BTreeMap<String, FlagValue>,
@@ -282,6 +284,16 @@ pub fn parse_args(args: &[String]) -> Args {
             result.project_trust_override = Some(false);
         } else if arg == "--offline" {
             result.offline = true;
+        } else if arg == "--parallel-run" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                i += 1;
+                result.parallel_run = Some(args[i].clone());
+            } else {
+                result.parallel_run = Some(String::new());
+            }
+        } else if arg == "--diff-jsonl" && i + 2 < args.len() {
+            result.diff_jsonl = Some((args[i + 1].clone(), args[i + 2].clone()));
+            i += 2;
         } else if let Some(path) = arg.strip_prefix('@') {
             result.file_args.push(path.to_string());
         } else if let Some(flag) = arg.strip_prefix("--") {
@@ -377,6 +389,8 @@ Options:
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
+  --parallel-run <ts-pi>         Compare this binary with a TypeScript `pi` (when Node is present)
+  --diff-jsonl <a> <b>           Diff two JSONL transcripts and exit
   --                             End option parsing; treat remaining arguments as messages/files
   --help, -h                     Show this help
   --version, -v                  Show version number

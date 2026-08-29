@@ -114,6 +114,62 @@ pub fn handle_rpc(
         }
         "set_session_name" => json!({"ok": true, "name": command.get("name")}),
         "get_session_stats" => json!({"ok": true, "messages": messages.len()}),
+        "get_tree" => {
+            let tree: Vec<Value> = messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    json!({
+                        "id": format!("m{i}"),
+                        "role": m.role,
+                        "content": m.content,
+                        "parentId": if i == 0 { Value::Null } else { json!(format!("m{}", i - 1)) }
+                    })
+                })
+                .collect();
+            json!({"ok": true, "entries": tree})
+        }
+        "get_entries" => {
+            let since = command.get("since").and_then(|v| v.as_str());
+            let entries: Vec<Value> = messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| json!({"id": format!("m{i}"), "role": m.role, "content": m.content}))
+                .filter(|e| {
+                    since.is_none_or(|s| e.get("id").and_then(|v| v.as_str()).unwrap_or("") > s)
+                })
+                .collect();
+            json!({"ok": true, "entries": entries})
+        }
+        "get_last_assistant_text" => {
+            let text = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            json!({"ok": true, "text": text})
+        }
+        "fork" | "clone" | "new_session" | "switch_session" => {
+            json!({"ok": true, "command": ty, "sessionId": command.get("entryId").or_else(|| command.get("sessionPath"))})
+        }
+        "export_html" => {
+            let path = command
+                .get("outputPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or("session.html");
+            json!({"ok": true, "outputPath": path})
+        }
+        "get_fork_messages" => json!({"ok": true, "messages": messages}),
+        "cycle_model"
+        | "set_model"
+        | "cycle_thinking_level"
+        | "set_steering_mode"
+        | "set_follow_up_mode"
+        | "set_auto_compaction"
+        | "set_auto_retry"
+        | "abort_retry"
+        | "abort_bash" => json!({"ok": true, "command": ty}),
         "extension_tool" => {
             let path = command.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let name = command.get("name").and_then(|v| v.as_str()).unwrap_or("");

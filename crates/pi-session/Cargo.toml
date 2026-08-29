@@ -14,6 +14,7 @@ uuid.workspace = true
 walkdir.workspace = true
 indexmap.workspace = true
 dirs.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
