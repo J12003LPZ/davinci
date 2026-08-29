@@ -1,6 +1,9 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use pi_core::SessionError;
+use pi_core::{now_ms, SessionError};
+use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterLease {
@@ -136,6 +139,91 @@ pub fn delete_writer_lease(db: &Connection, session_id: &str) -> Result<(), Sess
     )
     .map_err(|error| SessionError::storage(error.to_string()))?;
     Ok(())
+}
+
+/// Background renewer that extends an owned writer lease every `heartbeat_interval_ms`.
+pub struct LeaseHeartbeat {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl LeaseHeartbeat {
+    pub fn spawn(
+        db: Arc<Mutex<Connection>>,
+        session_id: String,
+        lease: Arc<Mutex<WriterLease>>,
+        options: WriterLeaseOptions,
+    ) -> Self {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_for_thread = Arc::clone(&stop);
+        let interval = Duration::from_millis(options.heartbeat_interval_ms.max(1) as u64);
+        let handle = thread::spawn(move || {
+            heartbeat_loop(stop_for_thread, db, session_id, lease, options, interval);
+        });
+        Self {
+            stop,
+            join: Mutex::new(Some(handle)),
+        }
+    }
+
+    pub fn stop(&self) {
+        if let Ok(mut stopped) = self.stop.0.lock() {
+            *stopped = true;
+        }
+        self.stop.1.notify_all();
+        if let Ok(mut join) = self.join.lock() {
+            if let Some(handle) = join.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn heartbeat_loop(
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    db: Arc<Mutex<Connection>>,
+    session_id: String,
+    lease: Arc<Mutex<WriterLease>>,
+    options: WriterLeaseOptions,
+    interval: Duration,
+) {
+    loop {
+        let (lock, cv) = &*stop;
+        let Ok(stopped) = lock.lock() else {
+            break;
+        };
+        if *stopped {
+            break;
+        }
+        let Ok((guard, wait)) = cv.wait_timeout(stopped, interval) else {
+            break;
+        };
+        if *guard {
+            break;
+        }
+        drop(guard);
+        if !wait.timed_out() {
+            continue;
+        }
+        let now = now_ms();
+        let Ok(db) = db.lock() else {
+            break;
+        };
+        let Ok(mut lease) = lease.lock() else {
+            break;
+        };
+        if !renew_writer_lease(&db, &session_id, &mut lease, now, now + options.ttl_ms)
+            .unwrap_or(false)
+        {
+            break;
+        }
+    }
 }
 
 pub fn read_writer_leases(

@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use pi_core::{next_id, now_ms, SessionError};
 use pi_session::{
@@ -13,7 +14,7 @@ use uuid::Uuid;
 
 use crate::leases::{
     acquire_writer_lease, active_writer_error, delete_writer_lease, lost_writer_error,
-    release_writer_lease, renew_writer_lease, WriterLease, WriterLeaseOptions,
+    release_writer_lease, renew_writer_lease, LeaseHeartbeat, WriterLease, WriterLeaseOptions,
 };
 
 const SCHEMA: &str = include_str!("../migrations/001_initial.sql");
@@ -207,13 +208,78 @@ fn append_entry_to_branch_cache(
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct SqliteSessionStorage {
+struct SharedWriter {
     db: Arc<Mutex<Connection>>,
     metadata: SessionMetadata,
-    lease: WriterLease,
+    lease: Arc<Mutex<WriterLease>>,
     options: WriterLeaseOptions,
-    closed: bool,
+    closed: Mutex<bool>,
+    heartbeat: LeaseHeartbeat,
+    active: Weak<Mutex<HashMap<String, Arc<SharedWriter>>>>,
+}
+
+impl SharedWriter {
+    fn is_closed(&self) -> Result<bool, SessionError> {
+        self.closed
+            .lock()
+            .map(|guard| *guard)
+            .map_err(|error| SessionError::storage(error.to_string()))
+    }
+
+    fn close_and_release_lease(&self) -> Result<(), SessionError> {
+        {
+            let mut closed = self
+                .closed
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            if *closed {
+                return Ok(());
+            }
+            *closed = true;
+        }
+        self.heartbeat.stop();
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
+        let lease = self
+            .lease
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
+        release_writer_lease(&db, &self.metadata.id, &lease)
+    }
+
+    fn release_claim(&self) -> Result<(), SessionError> {
+        self.close_and_release_lease()?;
+        if let Some(active) = self.active.upgrade() {
+            let mut active = active
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            active.remove(&self.metadata.id);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SharedWriter {
+    fn drop(&mut self) {
+        self.heartbeat.stop();
+        let closed = self
+            .closed
+            .get_mut()
+            .map(|value| *value)
+            .unwrap_or_else(|error| *error.into_inner());
+        if !closed {
+            if let (Ok(db), Ok(lease)) = (self.db.lock(), self.lease.lock()) {
+                let _ = release_writer_lease(&db, &self.metadata.id, &lease);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SqliteSessionStorage {
+    shared: Arc<SharedWriter>,
 }
 
 impl SqliteSessionStorage {
@@ -221,13 +287,14 @@ impl SqliteSessionStorage {
         &mut self,
         op: impl FnOnce(&Connection, &mut WriterLease) -> Result<T, SessionError>,
     ) -> Result<T, SessionError> {
-        if self.closed {
+        if self.shared.is_closed()? {
             return Err(SessionError::storage(format!(
                 "SQLite session {} is closed",
-                self.metadata.id
+                self.shared.metadata.id
             )));
         }
         let db = self
+            .shared
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
@@ -235,16 +302,21 @@ impl SqliteSessionStorage {
             .unchecked_transaction()
             .map_err(|error| SessionError::storage(error.to_string()))?;
         let now = now_ms();
+        let mut lease = self
+            .shared
+            .lease
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         if !renew_writer_lease(
             &tx,
-            &self.metadata.id,
-            &mut self.lease,
+            &self.shared.metadata.id,
+            &mut lease,
             now,
-            now + self.options.ttl_ms,
+            now + self.shared.options.ttl_ms,
         )? {
-            return Err(lost_writer_error(&self.metadata.id));
+            return Err(lost_writer_error(&self.shared.metadata.id));
         }
-        let result = op(&tx, &mut self.lease);
+        let result = op(&tx, &mut lease);
         match result {
             Ok(value) => {
                 tx.commit()
@@ -261,12 +333,13 @@ impl SqliteSessionStorage {
     #[allow(dead_code)]
     pub fn expire_lease_for_test(&self) -> Result<(), SessionError> {
         let db = self
+            .shared
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
         db.execute(
             "UPDATE writer_leases SET expires_at_ms = 0 WHERE session_id = ?1",
-            params![self.metadata.id],
+            params![self.shared.metadata.id],
         )
         .map_err(|error| SessionError::storage(error.to_string()))?;
         Ok(())
@@ -275,12 +348,13 @@ impl SqliteSessionStorage {
     #[allow(dead_code)]
     pub fn current_fence(&self) -> Result<i64, SessionError> {
         let db = self
+            .shared
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
         db.query_row(
             "SELECT fence FROM writer_leases WHERE session_id = ?1",
-            params![self.metadata.id],
+            params![self.shared.metadata.id],
             |row| row.get(0),
         )
         .map_err(|error| SessionError::storage(error.to_string()))
@@ -290,14 +364,15 @@ impl SqliteSessionStorage {
 impl SessionStore for SqliteSessionStorage {
     fn metadata(&self) -> Result<SessionMetadata, SessionError> {
         let db = self
+            .shared
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
-        read_metadata(&db, &self.metadata.id, &self.metadata.path)
+        read_metadata(&db, &self.shared.metadata.id, &self.shared.metadata.path)
     }
 
     fn append_entry(&mut self, entry: Entry, lane: &str) -> Result<Entry, SessionError> {
-        let session_id = self.metadata.id.clone();
+        let session_id = self.shared.metadata.id.clone();
         self.with_lease(|db, _| {
             let parent_id: Option<String> = db
                 .query_row(
@@ -364,6 +439,7 @@ impl SessionStore for SqliteSessionStorage {
 
     fn find_entries(&self, query: EntryQuery) -> Result<Vec<Entry>, SessionError> {
         let db = self
+            .shared
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
@@ -385,9 +461,9 @@ impl SessionStore for SqliteSessionStorage {
             .prepare(&sql)
             .map_err(|error| SessionError::storage(error.to_string()))?;
         let mapped = if let Some(entry_type) = query.entry_type.as_deref() {
-            stmt.query_map(params![self.metadata.id, entry_type], row_to_entry)
+            stmt.query_map(params![self.shared.metadata.id, entry_type], row_to_entry)
         } else {
-            stmt.query_map(params![self.metadata.id], row_to_entry)
+            stmt.query_map(params![self.shared.metadata.id], row_to_entry)
         }
         .map_err(|error| SessionError::storage(error.to_string()))?;
         let mut entries = mapped
@@ -401,13 +477,14 @@ impl SessionStore for SqliteSessionStorage {
 
     fn find_entries_on_branch(&self, start: &str) -> Result<Vec<Entry>, SessionError> {
         let db = self
+            .shared
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
         let branch_id: String = db
             .query_row(
                 "SELECT branch_id FROM branch_entries WHERE session_id = ?1 AND entry_id = ?2 LIMIT 1",
-                params![self.metadata.id, start],
+                params![self.shared.metadata.id, start],
                 |row| row.get(0),
             )
             .map_err(|_| SessionError::not_found(format!("entry {start} not found")))?;
@@ -424,14 +501,17 @@ impl SessionStore for SqliteSessionStorage {
             )
             .map_err(|error| SessionError::storage(error.to_string()))?;
         let rows = stmt
-            .query_map(params![self.metadata.id, branch_id, start], row_to_entry)
+            .query_map(
+                params![self.shared.metadata.id, branch_id, start],
+                row_to_entry,
+            )
             .map_err(|error| SessionError::storage(error.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| SessionError::storage(error.to_string()))
     }
 
     fn append_record(&mut self, record: LaneRecord) -> Result<LaneRecord, SessionError> {
-        let session_id = self.metadata.id.clone();
+        let session_id = self.shared.metadata.id.clone();
         self.with_lease(|db, _| {
             let seq = next_sequence(db, &session_id)?;
             let payload = serde_json::to_string(&record)
@@ -456,6 +536,7 @@ impl SessionStore for SqliteSessionStorage {
 
     fn find_records(&self, lane: Option<&str>) -> Result<Vec<LaneRecord>, SessionError> {
         let db = self
+            .shared
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
@@ -470,7 +551,7 @@ impl SessionStore for SqliteSessionStorage {
         let mut payloads = Vec::new();
         if let Some(lane) = lane {
             let mut rows = stmt
-                .query(params![self.metadata.id, lane])
+                .query(params![self.shared.metadata.id, lane])
                 .map_err(|error| SessionError::storage(error.to_string()))?;
             while let Some(row) = rows
                 .next()
@@ -483,7 +564,7 @@ impl SessionStore for SqliteSessionStorage {
             }
         } else {
             let mut rows = stmt
-                .query(params![self.metadata.id])
+                .query(params![self.shared.metadata.id])
                 .map_err(|error| SessionError::storage(error.to_string()))?;
             while let Some(row) = rows
                 .next()
@@ -533,7 +614,7 @@ impl SessionStore for SqliteSessionStorage {
     }
 
     fn set_name(&mut self, name: Option<&str>) -> Result<(), SessionError> {
-        let session_id = self.metadata.id.clone();
+        let session_id = self.shared.metadata.id.clone();
         let stored = name.map(str::to_string);
         self.with_lease(|db, _| {
             let seq = next_sequence(db, &session_id)?;
@@ -552,13 +633,14 @@ impl SessionStore for SqliteSessionStorage {
 
     fn get_stats(&self) -> Result<SessionStats, SessionError> {
         let db = self
+            .shared
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
         db.query_row(
             "SELECT message_count, cached_tokens, uncached_tokens, total_tokens, cost_total
              FROM session_stats WHERE session_id = ?1",
-            params![self.metadata.id],
+            params![self.shared.metadata.id],
             |row| {
                 Ok(SessionStats {
                     message_count: row.get(0)?,
@@ -573,16 +655,7 @@ impl SessionStore for SqliteSessionStorage {
     }
 
     fn release(&mut self) -> Result<(), SessionError> {
-        if self.closed {
-            return Ok(());
-        }
-        let db = self
-            .db
-            .lock()
-            .map_err(|error| SessionError::storage(error.to_string()))?;
-        release_writer_lease(&db, &self.metadata.id, &self.lease)?;
-        self.closed = true;
-        Ok(())
+        self.shared.release_claim()
     }
 }
 
@@ -638,6 +711,7 @@ pub struct SqliteSessionRepository {
     db: Arc<Mutex<Connection>>,
     path: PathBuf,
     options: WriterLeaseOptions,
+    active: Arc<Mutex<HashMap<String, Arc<SharedWriter>>>>,
 }
 
 impl SqliteSessionRepository {
@@ -648,6 +722,7 @@ impl SqliteSessionRepository {
             db: Arc::new(Mutex::new(db)),
             path,
             options,
+            active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -708,18 +783,50 @@ impl SqliteSessionRepository {
         &self,
         metadata: SessionMetadata,
     ) -> Result<SqliteSessionStorage, SessionError> {
-        let db = self
-            .db
-            .lock()
-            .map_err(|error| SessionError::storage(error.to_string()))?;
-        let lease = claim_writer_lease(&db, &metadata.id, self.options, now_ms())?;
-        Ok(SqliteSessionStorage {
+        {
+            let active = self
+                .active
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            if let Some(existing) = active.get(&metadata.id) {
+                if !existing.is_closed()? {
+                    return Ok(SqliteSessionStorage {
+                        shared: Arc::clone(existing),
+                    });
+                }
+            }
+        }
+        let lease = {
+            let db = self
+                .db
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            claim_writer_lease(&db, &metadata.id, self.options, now_ms())?
+        };
+        let lease = Arc::new(Mutex::new(lease));
+        let heartbeat = LeaseHeartbeat::spawn(
+            Arc::clone(&self.db),
+            metadata.id.clone(),
+            Arc::clone(&lease),
+            self.options,
+        );
+        let shared = Arc::new(SharedWriter {
             db: Arc::clone(&self.db),
             metadata,
             lease,
             options: self.options,
-            closed: false,
-        })
+            closed: Mutex::new(false),
+            heartbeat,
+            active: Arc::downgrade(&self.active),
+        });
+        {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            active.insert(shared.metadata.id.clone(), Arc::clone(&shared));
+        }
+        Ok(SqliteSessionStorage { shared })
     }
 }
 
@@ -813,6 +920,16 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     fn delete(&mut self, metadata: &SessionMetadata) -> Result<(), SessionError> {
+        let existing = {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            active.remove(&metadata.id)
+        };
+        if let Some(existing) = existing {
+            existing.close_and_release_lease()?;
+        }
         let db = self
             .db
             .lock()

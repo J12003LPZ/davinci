@@ -3,6 +3,7 @@
 //! Mirrors `vendor/pi/packages/agent/src/harness/session/types.ts`.
 
 mod conformance;
+mod jsonl;
 mod memory;
 
 use std::collections::BTreeMap;
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use conformance::{run_conformance, ConformanceReport};
+pub use jsonl::{JsonlSession, JsonlSessionRepository};
 pub use memory::MemorySessionRepository;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
