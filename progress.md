@@ -1,38 +1,33 @@
 # Progress: TypeScript → Rust Migration of `pi`
 
-**Overall Completion: 10%**
+**Overall Completion: 25%**
 
 ## Current Status
 - Initialized Rust workspace targeting Rust 1.83.0 toolchain.
 - Vendor reference TypeScript repository locked at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
-- Pinned toolchain dependencies configured in root `Cargo.toml`.
-- Crates skeleton created:
-  - `crates/pi-ai`
-  - `crates/pi-agent`
-  - `crates/pi-tui`
-  - `crates/pi-session`
-  - `crates/pi-session-sqlite`
-  - `crates/pi-protocol`
-  - `crates/pi-client`
-  - `crates/pi-server`
-  - `crates/pi-telemetry`
-  - `crates/pi-evals`
-  - `crates/pi-coding-agent`
-  - `crates/pi-parity`
+- `pi-ai` slice completed with full model catalog, multi-provider interfaces (Anthropic, OpenAI, Google, OpenRouter, Faux), credential store, usage and cost calculation, context token estimation, and retry classification.
+- All gates passing (`cargo test --workspace`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`).
 
 ## What Landed
-- Setup root workspace configuration with exact dependency versions (clap 4.5.23, uuid 1.11.0, tempfile 3.14.0, thiserror 1, ureq 2.10.1, url 2.5.0, rustls 0.23.19, rustls-pki-types 1.10.1, webpki-roots 0.26.7, zeroize 1.8.1).
-- Pinned rust-toolchain.toml to 1.83.0.
+- `pi-ai`:
+  - Complete types: `Model`, `Context`, `Message`, `AssistantMessage`, `ToolCall`, `Usage`, `ModelCost`, `StopReason`, `AssistantMessageEvent`.
+  - Providers: Anthropic, OpenAI, Google, OpenRouter, Faux with `stream_simple` dispatch.
+  - Cost calculations: tiered pricing, cache read/write cost rates.
+  - Context estimation: `estimate_context_tokens` with trailing tokens and assistant usage lookback.
+  - Retry logic: regex patterns classifying retryable vs non-retryable provider errors.
+  - Auth: `CredentialStore`, `InMemoryCredentialStore`, environment variable lookup.
+  - Models store: `ModelsStore`, `InMemoryModelsStore`.
+  - Builtin models catalog: Anthropic, OpenAI, Google, OpenRouter, Mistral, Groq, Cerebras, DeepSeek, xAI, Together, Fireworks.
 
 ## What Remains
-1. `pi-ai`: Port all providers (Anthropic, OpenAI, Google, Ollama, etc.), models catalog, auth storage, streaming event lifecycle, usage and cost estimation. SSE/HTTP fixture tests matching vendor TS.
-2. `pi-agent`: Agent loop, context window compaction, skills, prompt templates, context files, extension tools, retry logic, steer/follow-up queues.
-3. `pi-tui`: Component render engine, fullscreen alternate buffer, editor, keybindings, markdown renderer, mouse support, themes, selectors.
-4. `pi-session` & `pi-session-sqlite`: SQLite backend with FTS, schema v3->v4 migration, discovery, continue/resume/fork/clone logic.
-5. `pi-protocol`, `pi-client`, `pi-server`: Transports (Unix sockets, TCP, in-memory), handshake timeouts, leases, request correlation, CBOR encoding.
-6. `pi-telemetry` & `pi-evals`: Telemetry schemas/contracts and evals harness.
-7. `pi-coding-agent`: Full `pi` CLI binary with all flags and subcommands, built-in tools (read, write, edit, bash), settings, trust, RPC server mode, HTML export.
-8. `pi-parity`: Parity test suite with golden fixtures against vendor TypeScript reference.
+1. `pi-agent`: Port core agent loop (`run_agent`), context compaction, skills, prompt templates, context files, extension tools, steer/follow-up queues.
+2. `pi-tui`: Component render engine, fullscreen alternate buffer, editor, keybindings, markdown renderer, mouse support, themes, selectors.
+3. `pi-session` & `pi-session-sqlite`: SQLite backend with FTS, schema v3->v4 migration, discovery, continue/resume/fork/clone logic.
+4. `pi-protocol`, `pi-client`, `pi-server`: Transports (Unix sockets, TCP, in-memory), handshake timeouts, leases, request correlation, CBOR encoding.
+5. `pi-telemetry` & `pi-evals`: Telemetry schemas/contracts and evals harness.
+6. `pi-coding-agent`: Full `pi` CLI binary with all flags and subcommands, built-in tools (read, write, edit, bash), settings, trust, RPC server mode, HTML export.
+7. `pi-parity`: Parity test suite with golden fixtures against vendor TypeScript reference.
 
 ## Next Step
-Implement Slice 1: `pi-ai` crate with full provider support, model catalog, auth storage, SSE streaming, and fixture tests.
+Implement Slice 2: `pi-agent` crate with core agent loop, tool execution traits, permission policies, context compaction, skills, prompt templates, and steer/follow-up queues.
+
