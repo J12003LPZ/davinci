@@ -470,6 +470,7 @@ async function main() {
 		commands: [],
 		commandHandlers: {},
 		flags: [],
+		flagDefaults: {},
 		shortcuts: [],
 		shortcutHandlers: {},
 		messageRenderers: {},
@@ -723,8 +724,11 @@ async function main() {
 			}
 		},
 		ui,
-		registerFlag(name) {
+		registerFlag(name, options) {
 			recorded.flags.push(name);
+			if (options && options.default !== undefined) {
+				recorded.flagDefaults[name] = options.default;
+			}
 		},
 		registerShortcut(key, options) {
 			recorded.shortcuts.push(key);
@@ -744,8 +748,12 @@ async function main() {
 		sendMessage(message, options) {
 			recorded.sessionCalls.push({ op: "sendMessage", message, options: options || {} });
 		},
-		sendUserMessage(text) {
-			recorded.sessionCalls.push({ op: "sendUserMessage", text });
+		sendUserMessage(text, options) {
+			recorded.sessionCalls.push({
+				op: "sendUserMessage",
+				text,
+				options: options || {},
+			});
 		},
 		appendEntry(customType, data) {
 			recorded.sessionCalls.push({ op: "appendEntry", customType, data: data ?? null });
@@ -767,14 +775,60 @@ async function main() {
 			recorded.sessionCalls.push({ op: "fork", entryId, options: options || {} });
 			return { cancelled: false };
 		},
-		exec(command) {
-			recorded.sessionCalls.push({ op: "exec", command });
-			const reply = process.env.PI_EXTENSION_EXEC_REPLY;
-			return Promise.resolve({
-				code: 0,
-				stdout: reply === undefined ? "" : reply,
-				stderr: "",
+		switchSession(sessionPath, options) {
+			recorded.sessionCalls.push({
+				op: "switchSession",
+				sessionPath,
+				options: options || {},
 			});
+			return Promise.resolve({ cancelled: false });
+		},
+		navigateTree(targetId, options) {
+			recorded.sessionCalls.push({
+				op: "navigateTree",
+				targetId,
+				options: options || {},
+			});
+			return Promise.resolve({ cancelled: false });
+		},
+		reload() {
+			recorded.sessionCalls.push({ op: "reload" });
+			return Promise.resolve();
+		},
+		waitForIdle() {
+			return Promise.resolve();
+		},
+		exec(command, args, options) {
+			const cwd = (options && options.cwd) || payload.cwd || process.cwd();
+			const reply = process.env.PI_EXTENSION_EXEC_REPLY;
+			if (reply !== undefined) {
+				recorded.sessionCalls.push({
+					op: "exec",
+					command,
+					args: args || [],
+					cwd,
+					stdout: reply,
+					code: 0,
+				});
+				return Promise.resolve({ code: 0, stdout: reply, stderr: "" });
+			}
+			const { spawnSync } = require("child_process");
+			const argv = Array.isArray(args) && args.length ? [command, ...args] : null;
+			const ran = argv
+				? spawnSync(argv[0], argv.slice(1), { encoding: "utf8", cwd, shell: false })
+				: spawnSync(String(command), { encoding: "utf8", cwd, shell: true });
+			const stdout = ran.stdout || "";
+			const stderr = ran.stderr || "";
+			const code = ran.status == null ? 1 : ran.status;
+			recorded.sessionCalls.push({
+				op: "exec",
+				command,
+				args: args || [],
+				cwd,
+				stdout,
+				code,
+			});
+			return Promise.resolve({ code, stdout, stderr });
 		},
 		getActiveTools() {
 			return Array.isArray(payload.activeTools) ? payload.activeTools : [];
@@ -792,8 +846,14 @@ async function main() {
 		getCommands() {
 			return Array.isArray(payload.commands) ? payload.commands : [];
 		},
-		setModel() {
-			return Promise.resolve(false);
+		setModel(model) {
+			const id =
+				typeof model === "string"
+					? model
+					: model && (model.id || model.name || model.model);
+			const provider = typeof model === "object" && model ? model.provider : undefined;
+			recorded.sessionCalls.push({ op: "setModel", model: id, provider });
+			return Promise.resolve(true);
 		},
 		getThinkingLevel() {
 			return payload.thinkingLevel || "off";
@@ -804,8 +864,11 @@ async function main() {
 		unregisterProvider(name) {
 			recorded.providers = recorded.providers.filter((provider) => provider.name !== name);
 		},
-		getFlag() {
-			return undefined;
+		getFlag(name) {
+			if (!recorded.flags.includes(name)) return undefined;
+			const flags = payload.flagValues || {};
+			if (Object.prototype.hasOwnProperty.call(flags, name)) return flags[name];
+			return recorded.flagDefaults[name];
 		},
 		events: {
 			emit() {},
@@ -1002,6 +1065,10 @@ async function main() {
 			ctx.newSession = pi.newSession;
 			ctx.fork = pi.fork;
 			ctx.exec = pi.exec;
+			ctx.switchSession = pi.switchSession;
+			ctx.navigateTree = pi.navigateTree;
+			ctx.reload = pi.reload;
+			ctx.waitForIdle = pi.waitForIdle;
 			try {
 				result = await handler(payload.args || "", ctx);
 			} catch (error) {

@@ -321,3 +321,19 @@ pub fn parse_args(args: &[String]) -> Args {
 pub fn print_help() -> String {
     include_str!("help.txt").to_string()
 }
+
+/// Append dynamically registered extension flags, matching TS `printHelp(extensionFlags)`.
+pub fn print_help_with_extension_flags(flags: &[(String, String)]) -> String {
+    let mut help = print_help();
+    if flags.is_empty() {
+        return help;
+    }
+    if !help.ends_with('\n') {
+        help.push('\n');
+    }
+    help.push_str("\nExtension CLI Flags:\n");
+    for (name, path) in flags {
+        help.push_str(&format!("  --{name:<24} Registered by {path}\n"));
+    }
+    help
+}

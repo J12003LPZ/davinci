@@ -43,6 +43,17 @@ pub enum ExtensionEvent {
     },
     #[serde(rename = "input")]
     Input { text: String },
+    #[serde(rename = "user_bash")]
+    UserBash {
+        command: String,
+        #[serde(rename = "excludeFromContext")]
+        exclude_from_context: bool,
+        cwd: String,
+    },
+    #[serde(rename = "turn_start")]
+    TurnStart,
+    #[serde(rename = "turn_end")]
+    TurnEnd,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +70,7 @@ pub struct LoadedJsExtension {
     pub shortcuts: Vec<String>,
     pub has_editor: bool,
     pub providers: Vec<JsRegisteredProvider>,
+    pub flags: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -77,6 +89,7 @@ pub struct ExtensionHost {
     pub runtime_all_tools: Vec<String>,
     pub runtime_thinking_level: String,
     pub runtime_commands: Vec<Value>,
+    pub runtime_flag_values: Value,
 }
 
 impl ExtensionHost {
@@ -97,6 +110,7 @@ impl ExtensionHost {
             runtime_all_tools: Vec::new(),
             runtime_thinking_level: "off".into(),
             runtime_commands: Vec::new(),
+            runtime_flag_values: Value::Object(serde_json::Map::new()),
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -144,6 +158,7 @@ impl ExtensionHost {
                             shortcuts: loaded.shortcuts,
                             has_editor,
                             providers: loaded.providers,
+                            flags: loaded.flags,
                         });
                     }
                 }
@@ -158,9 +173,25 @@ impl ExtensionHost {
     }
 
     fn dispatch_js(&mut self, event: &ExtensionEvent) {
-        let Ok(payload) = serde_json::to_value(event) else {
+        let Ok(mut payload) = serde_json::to_value(event) else {
             return;
         };
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("flagValues".into(), self.runtime_flag_values.clone());
+            object.insert(
+                "activeTools".into(),
+                Value::Array(
+                    self.runtime_active_tools
+                        .iter()
+                        .map(|name| Value::String(name.clone()))
+                        .collect(),
+                ),
+            );
+            object.insert(
+                "thinkingLevel".into(),
+                Value::String(self.runtime_thinking_level.clone()),
+            );
+        }
         for ext in &self.js {
             if let Ok(result) = run_js_extension(Path::new(&ext.path), "emit", &payload) {
                 if result.ok {
@@ -344,6 +375,17 @@ impl ExtensionHost {
         Err(pi_agent::ToolError::Unknown(name.to_string()))
     }
 
+    pub fn registered_flags(&self) -> Vec<(String, String)> {
+        self.js
+            .iter()
+            .flat_map(|ext| {
+                ext.flags
+                    .iter()
+                    .map(|name| (name.clone(), ext.path.clone()))
+            })
+            .collect()
+    }
+
     pub fn registered_providers(&self) -> Vec<JsRegisteredProvider> {
         self.js
             .iter()
@@ -365,6 +407,9 @@ impl ExtensionHost {
                 ExtensionEvent::ToolCall { .. } => "tool_call",
                 ExtensionEvent::ToolResult { .. } => "tool_result",
                 ExtensionEvent::Input { .. } => "input",
+                ExtensionEvent::UserBash { .. } => "user_bash",
+                ExtensionEvent::TurnStart => "turn_start",
+                ExtensionEvent::TurnEnd => "turn_end",
             })
             .collect()
     }
@@ -442,6 +487,7 @@ impl ExtensionHost {
                 "allTools": self.runtime_all_tools,
                 "thinkingLevel": self.runtime_thinking_level,
                 "commands": self.runtime_commands,
+                "flagValues": self.runtime_flag_values,
             }),
         )?;
         if !result.ok {
@@ -535,10 +581,11 @@ impl ExtensionHost {
             .iter()
             .map(|ext| {
                 format!(
-                    "{} handlers={} commands={} renderers={} entries={} md={} editor={}",
+                    "{} handlers={} commands={} flags={} renderers={} entries={} md={} editor={}",
                     ext.path,
                     ext.handlers.join(","),
                     ext.commands.join(","),
+                    ext.flags.join(","),
                     ext.message_renderers.join(","),
                     ext.entry_renderers.join(","),
                     ext.markdown_transformers,
@@ -630,9 +677,23 @@ mod tests {
             args: serde_json::json!({}),
         });
         host.emit(ExtensionEvent::SessionStart);
+        host.emit(ExtensionEvent::UserBash {
+            command: "echo hi".into(),
+            exclude_from_context: false,
+            cwd: "/tmp".into(),
+        });
+        host.emit(ExtensionEvent::TurnStart);
+        host.emit(ExtensionEvent::TurnEnd);
         assert_eq!(
             host.kinds(),
-            ["before_agent_start", "tool_call", "session_start"]
+            [
+                "before_agent_start",
+                "tool_call",
+                "session_start",
+                "user_bash",
+                "turn_start",
+                "turn_end"
+            ]
         );
     }
 

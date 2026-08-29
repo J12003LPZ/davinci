@@ -21,6 +21,7 @@ mod startup;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use pi_agent::{
     default_system_prompt, discover_prompt_templates, discover_skills, env_summarizer,
@@ -133,7 +134,11 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         }
     }
     if parsed.help {
-        println!("{}", print_help());
+        let host = loaded_extension_host(&parsed);
+        println!(
+            "{}",
+            args::print_help_with_extension_flags(&host.registered_flags())
+        );
         return Ok(0);
     }
     if parsed.version {
@@ -152,7 +157,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     let mut agent = build_agent(&parsed, &session_dir, &cwd)?;
 
     if parsed.mode == Some(Mode::Rpc) {
-        return run_rpc(&mut agent);
+        return run_rpc(&parsed, &mut agent);
     }
 
     let stdin_tty = io::stdin().is_terminal();
@@ -273,8 +278,13 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         std::env::set_var("PI_SHELL_COMMAND_PREFIX", prefix);
     }
     let _trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
-    let mut extensions = settings.extensions.clone();
-    extensions.extend(parsed.extensions.clone());
+    let mut extensions = if parsed.no_extensions {
+        parsed.extensions.clone()
+    } else {
+        let mut extensions = settings.extensions.clone();
+        extensions.extend(parsed.extensions.clone());
+        extensions
+    };
     for pkg in &settings.packages {
         if !parsed.no_extensions {
             for path in settings::collect_package_resources(pkg, "extensions") {
@@ -294,7 +304,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             ));
         }
     }
-    if !parsed.no_extensions && !extensions.is_empty() {
+    if !extensions.is_empty() {
         let host = ExtensionHost::load(&default_agent_dir(), &extensions);
         let mut names = extensions.clone();
         names.extend(extensions::extension_tool_names(&host.manifests));
@@ -889,8 +899,37 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             parameters: tool.parameters,
         })
         .collect();
-    let mut host = ExtensionHost::default();
-    host.emit(ExtensionEvent::BeforeAgentStart);
+    let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
+    {
+        let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+        host.runtime_active_tools = agent.tools.clone();
+        host.runtime_all_tools = agent.tool_registry.clone();
+        host.runtime_thinking_level = agent.thinking_level.as_str().to_string();
+        host.runtime_flag_values = flag_values_json(parsed);
+        host.emit(ExtensionEvent::BeforeAgentStart);
+        host.emit(ExtensionEvent::AgentStart);
+        host.emit(ExtensionEvent::TurnStart);
+    }
+    let hook_host = host.clone();
+    agent.pre_tool = Some(pi_agent::PreToolHook(Arc::new(move |name, args| {
+        let mut host = hook_host.lock().ok()?;
+        host.emit(ExtensionEvent::ToolCall {
+            tool_name: name.to_string(),
+            args: args.clone(),
+        });
+        if host.tool_call_blocked() {
+            Some(
+                host.last_js_result
+                    .as_ref()
+                    .and_then(|value| value.get("reason"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("blocked by extension")
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    })));
     let events = agent
         .run_loop(|current| {
             let last_user = current
@@ -959,27 +998,65 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             })
         })
         .unwrap_or_default();
-    host.emit(ExtensionEvent::AgentEnd);
-    for event in &events {
-        if let AgentEvent::ToolExecutionStart {
-            tool_name, args, ..
-        } = event
-        {
-            host.emit(ExtensionEvent::ToolCall {
-                tool_name: tool_name.clone(),
-                args: args.clone(),
-            });
-            if host.tool_call_blocked() {
-                continue;
-            }
-            if let Some(result) = host.execute_named_tool(tool_name, &agent.cwd) {
-                let _ = result;
+    agent.pre_tool = None;
+    {
+        let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+        host.emit(ExtensionEvent::TurnEnd);
+        host.emit(ExtensionEvent::AgentEnd);
+        host.emit(ExtensionEvent::AgentSettled);
+        for event in &events {
+            match event {
+                AgentEvent::ToolExecutionEnd {
+                    tool_name,
+                    is_error,
+                    ..
+                } => {
+                    host.emit(ExtensionEvent::ToolResult {
+                        tool_name: tool_name.clone(),
+                        is_error: *is_error,
+                    });
+                }
+                AgentEvent::ToolExecutionStart { tool_name, .. } => {
+                    if let Some(result) = host.execute_named_tool(tool_name, &agent.cwd) {
+                        let _ = result;
+                    }
+                }
+                _ => {}
             }
         }
+        apply_session_calls(
+            Some(parsed),
+            agent,
+            None,
+            &host.session_calls.clone(),
+            false,
+        );
+        if host.session_calls.iter().any(|call| {
+            matches!(
+                call.get("op").and_then(|value| value.as_str()),
+                Some("newSession" | "fork" | "switchSession" | "reload")
+            )
+        }) {
+            host.emit(ExtensionEvent::SessionStart);
+        }
+        let _ = host.kinds();
     }
-    let _ = host.kinds();
     let _ = ExtensionHost::js_summary(&crate::js_host::JsExtensionResult::default());
     (reply, events)
+}
+
+fn flag_values_json(parsed: &Args) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (name, value) in &parsed.unknown_flags {
+        map.insert(
+            name.clone(),
+            match value {
+                args::FlagValue::Bool(flag) => serde_json::Value::Bool(*flag),
+                args::FlagValue::String(text) => serde_json::Value::String(text.clone()),
+            },
+        );
+    }
+    serde_json::Value::Object(map)
 }
 
 fn parse_model_ref(provider: &str, model: Option<&str>) -> (String, String) {
@@ -1026,7 +1103,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     Ok(0)
 }
 
-fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
+fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     let session_dir = agent
         .session
         .as_ref()
@@ -1039,7 +1116,7 @@ fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
         session_dir,
         cwd,
     );
-    let host = loaded_extension_host(&Args::default());
+    let host = loaded_extension_host(parsed);
     for provider in host.registered_providers() {
         runtime.models.extend(pi_ai::models_from_provider_config(
             &provider.name,
@@ -1183,8 +1260,10 @@ fn run_interactive(
         session.model_thinking_levels = levels;
     }
     let _ = session.begin_osc_query(OSC_QUERY_TIMEOUT_MS);
-    let host = loaded_extension_host(parsed);
-    apply_extension_shortcuts(&mut session, agent, &host);
+    let mut host = loaded_extension_host(parsed);
+    host.runtime_flag_values = flag_values_json(parsed);
+    host.emit(ExtensionEvent::SessionStart);
+    apply_extension_shortcuts(parsed, &mut session, agent, &host);
     session.slash_commands = interactive_slash_commands(agent, parsed);
     session.extra_autocomplete = interactive_extra_autocomplete(parsed);
     replay_custom_messages(agent, &mut session, &host);
@@ -1560,6 +1639,21 @@ fn apply_session_action(
         }
         SessionAction::OpenFork => handle_user_line(parsed, agent, session, "/fork"),
         SessionAction::RunBash(command) => {
+            let mut host = loaded_extension_host(parsed);
+            host.runtime_flag_values = flag_values_json(parsed);
+            host.emit(ExtensionEvent::UserBash {
+                command: command.clone(),
+                exclude_from_context: command.starts_with('!'),
+                cwd: agent.cwd.display().to_string(),
+            });
+            session.apply_extension_ui_calls(&host.ui_calls);
+            apply_session_calls(
+                Some(parsed),
+                agent,
+                Some(&mut session.chrome),
+                &host.session_calls,
+                true,
+            );
             match crate::js_host::execute_command_tool(&command, &agent.cwd) {
                 Ok(out) => {
                     session.chrome.transcript.push("bash", &out);
@@ -1692,6 +1786,12 @@ fn handle_user_line(
     match slash::parse_line(text) {
         SlashAction::Quit => Ok(false),
         SlashAction::Prompt(prompt) => {
+            let mut host = loaded_extension_host(parsed);
+            host.runtime_flag_values = flag_values_json(parsed);
+            host.emit(ExtensionEvent::Input {
+                text: prompt.clone(),
+            });
+            session.apply_extension_ui_calls(&host.ui_calls);
             session.chrome.transcript.push("user", &prompt);
             agent.prompt(&prompt);
             let (reply, events) = complete_prompt(parsed, agent);
@@ -1957,8 +2057,10 @@ fn reload_interactive_resources(
     agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
     agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
     agent.context_files = load_context_files(&agent.cwd, true);
-    let host = loaded_extension_host(parsed);
-    apply_extension_shortcuts(session, agent, &host);
+    let mut host = loaded_extension_host(parsed);
+    host.runtime_flag_values = flag_values_json(parsed);
+    host.emit(ExtensionEvent::SessionStart);
+    apply_extension_shortcuts(parsed, session, agent, &host);
     session.slash_commands = interactive_slash_commands(agent, parsed);
     session.extra_autocomplete = interactive_extra_autocomplete(parsed);
     replay_custom_messages(agent, session, &host);
@@ -2547,6 +2649,7 @@ fn format_session_info(
 }
 
 fn apply_extension_shortcuts(
+    parsed: &Args,
     session: &mut InteractiveSession,
     agent: &mut Agent,
     host: &ExtensionHost,
@@ -2554,7 +2657,13 @@ fn apply_extension_shortcuts(
     let (shortcuts, diagnostics) = host.resolve_shortcuts(&session.keybindings);
     session.extension_shortcuts = shortcuts;
     session.apply_extension_ui_calls(&host.ui_calls);
-    apply_session_calls(agent, &mut session.chrome, &host.session_calls);
+    apply_session_calls(
+        Some(parsed),
+        agent,
+        Some(&mut session.chrome),
+        &host.session_calls,
+        true,
+    );
     activate_custom_editor(session, host);
     if let Some(warning) = diagnostics.first() {
         session.chrome.status = warning.clone();
@@ -2675,7 +2784,13 @@ fn host_invoke_shortcut(
         ExtensionHost::default().invoke_shortcut(path, key)?
     };
     session.apply_extension_ui_calls(&host.ui_calls);
-    apply_session_calls(agent, &mut session.chrome, &host.session_calls);
+    apply_session_calls(
+        Some(parsed),
+        agent,
+        Some(&mut session.chrome),
+        &host.session_calls,
+        true,
+    );
     Ok(result)
 }
 
@@ -2697,9 +2812,16 @@ fn try_extension_slash(
     host.runtime_active_tools = agent.tools.clone();
     host.runtime_all_tools = agent.tool_registry.clone();
     host.runtime_thinking_level = agent.thinking_level.as_str().to_string();
+    host.runtime_flag_values = flag_values_json(parsed);
     let result = host.invoke_command(&path, name)?;
     session.apply_extension_ui_calls(&host.ui_calls);
-    apply_session_calls(agent, &mut session.chrome, &host.session_calls);
+    apply_session_calls(
+        Some(parsed),
+        agent,
+        Some(&mut session.chrome),
+        &host.session_calls,
+        true,
+    );
     apply_custom_overlay_result(&mut session.chrome, &path, name, result.as_ref());
     session.chrome.status = format!("/{name}");
     println!("{}", session.chrome.status);
@@ -2765,10 +2887,17 @@ fn handle_custom_overlay_input(
     host.runtime_active_tools = agent.tools.clone();
     host.runtime_all_tools = agent.tool_registry.clone();
     host.runtime_thinking_level = agent.thinking_level.as_str().to_string();
+    host.runtime_flag_values = flag_values_json(parsed);
     match host.invoke_command_with(&path, &name, data, snapshot.as_ref(), session.width) {
         Ok(result) => {
             session.apply_extension_ui_calls(&host.ui_calls);
-            apply_session_calls(agent, &mut session.chrome, &host.session_calls);
+            apply_session_calls(
+                Some(parsed),
+                agent,
+                Some(&mut session.chrome),
+                &host.session_calls,
+                true,
+            );
             apply_custom_overlay_result(&mut session.chrome, &path, &name, result.as_ref());
             if session.chrome.custom_overlay_lines.is_none() {
                 if let Some(value) = result {
@@ -2792,9 +2921,14 @@ fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
 
 fn loaded_extension_host(parsed: &Args) -> ExtensionHost {
     let stored = load_settings(&default_agent_dir());
-    let mut extensions = stored.extensions.clone();
-    extensions.extend(parsed.extensions.clone());
-    if parsed.no_extensions {
+    let extensions = if parsed.no_extensions {
+        parsed.extensions.clone()
+    } else {
+        let mut extensions = stored.extensions.clone();
+        extensions.extend(parsed.extensions.clone());
+        extensions
+    };
+    if extensions.is_empty() {
         ExtensionHost::default()
     } else {
         ExtensionHost::load(&default_agent_dir(), &extensions)
@@ -3221,7 +3355,13 @@ fn apply_progress_events(session: &mut InteractiveSession, events: &[AgentEvent]
     }
 }
 
-fn apply_session_calls(agent: &mut Agent, chrome: &mut ChatChrome, calls: &[serde_json::Value]) {
+fn apply_session_calls(
+    parsed: Option<&Args>,
+    agent: &mut Agent,
+    mut chrome: Option<&mut ChatChrome>,
+    calls: &[serde_json::Value],
+    trigger_turns: bool,
+) {
     for call in calls {
         match call.get("op").and_then(|value| value.as_str()) {
             Some("sendMessage") | Some("sendUserMessage") => {
@@ -3230,8 +3370,33 @@ fn apply_session_calls(agent: &mut Agent, chrome: &mut ChatChrome, calls: &[serd
                     .and_then(|value| value.as_str())
                     .or_else(|| call.get("text").and_then(|value| value.as_str()))
                     .unwrap_or("");
-                if !text.is_empty() {
+                if text.is_empty() {
+                    continue;
+                }
+                if let Some(chrome) = chrome.as_mut() {
                     chrome.transcript.push("user", text);
+                }
+                let deliver = call
+                    .get("options")
+                    .and_then(|value| value.get("deliverAs"))
+                    .and_then(|value| value.as_str());
+                match deliver {
+                    Some("steer") => agent.queues.enqueue_steer(text),
+                    Some("followUp") => agent.queues.enqueue_follow_up(text),
+                    _ => {
+                        agent.prompt(text);
+                    }
+                }
+                let should_turn = trigger_turns
+                    && call
+                        .get("options")
+                        .and_then(|value| value.get("triggerTurn"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                if should_turn {
+                    if let Some(parsed) = parsed {
+                        let _ = complete_prompt(parsed, agent);
+                    }
                 }
             }
             Some("appendEntry") => {
@@ -3275,15 +3440,113 @@ fn apply_session_calls(agent: &mut Agent, chrome: &mut ChatChrome, calls: &[serd
                 }
             }
             Some("exec") => {
-                if let Some(command) = call.get("command").and_then(|value| value.as_str()) {
-                    chrome.status = format!("exec {command}");
+                if let Some(stdout) = call.get("stdout").and_then(|value| value.as_str()) {
+                    if let Some(chrome) = chrome.as_mut() {
+                        chrome.transcript.push("exec", stdout);
+                        chrome.status = format!(
+                            "exec {}",
+                            call.get("command")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("")
+                        );
+                    }
+                } else if let Some(command) = call.get("command").and_then(|value| value.as_str()) {
+                    match crate::js_host::execute_command_tool(command, &agent.cwd) {
+                        Ok(out) => {
+                            if let Some(chrome) = chrome.as_mut() {
+                                chrome.transcript.push("exec", &out);
+                                chrome.status = format!("exec {command}");
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(chrome) = chrome.as_mut() {
+                                chrome.status = format!("exec error: {err}");
+                            }
+                        }
+                    }
                 }
             }
             Some("newSession") => {
-                chrome.status = "newSession".into();
+                let parsed = parsed.cloned().unwrap_or_default();
+                let session_dir = resolved_session_dir(&parsed, &agent.cwd);
+                if let Ok(store) =
+                    JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
+                {
+                    agent.messages.clear();
+                    agent.session = Some(store);
+                    if let Some(chrome) = chrome.as_mut() {
+                        chrome.status = "newSession".into();
+                    }
+                }
             }
             Some("fork") => {
-                chrome.status = "fork".into();
+                let parsed = parsed.cloned().unwrap_or_default();
+                let session_dir = resolved_session_dir(&parsed, &agent.cwd);
+                if let Some(store) = agent.session.as_ref() {
+                    let entry_id = call
+                        .get("entryId")
+                        .and_then(|value| value.as_str())
+                        .or(store.leaf_id.as_deref())
+                        .unwrap_or(&store.header.id)
+                        .to_string();
+                    if let Ok(next) = store.fork(&entry_id, &session_dir) {
+                        agent.load_from_session(next);
+                        if let Some(chrome) = chrome.as_mut() {
+                            chrome.status = format!(
+                                "fork={}",
+                                agent
+                                    .session
+                                    .as_ref()
+                                    .map(|session| session.header.id.clone())
+                                    .unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+            Some("setModel") => {
+                let model = call.get("model").and_then(|value| value.as_str());
+                let provider = call.get("provider").and_then(|value| value.as_str());
+                if let Some(model) = model {
+                    let (next_provider, model_id) = if let Some(provider) = provider {
+                        (provider.to_string(), model.to_string())
+                    } else {
+                        parse_model_ref("google", Some(model))
+                    };
+                    agent.provider = next_provider;
+                    agent.model_id = model_id;
+                    if let Some(chrome) = chrome.as_mut() {
+                        chrome.status = format!("model={}/{}", agent.provider, agent.model_id);
+                    }
+                }
+            }
+            Some("switchSession") => {
+                if let Some(path) = call.get("sessionPath").and_then(|value| value.as_str()) {
+                    if let Ok(next) = JsonlSession::open(Path::new(path)) {
+                        agent.load_from_session(next);
+                        if let Some(chrome) = chrome.as_mut() {
+                            chrome.status = format!("session={}", path);
+                        }
+                    }
+                }
+            }
+            Some("navigateTree") => {
+                if let Some(target) = call.get("targetId").and_then(|value| value.as_str()) {
+                    let summarize = call
+                        .get("options")
+                        .and_then(|value| value.get("summarize"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    let _ = agent.navigate_tree_entry(target, summarize, None, false, 16_384);
+                    if let Some(chrome) = chrome.as_mut() {
+                        chrome.status = format!("tree={target}");
+                    }
+                }
+            }
+            Some("reload") => {
+                if let Some(chrome) = chrome.as_mut() {
+                    chrome.status = "reload".into();
+                }
             }
             Some("setActiveTools") => {
                 let names: Vec<String> = call
@@ -3297,7 +3560,9 @@ fn apply_session_calls(agent: &mut Agent, chrome: &mut ChatChrome, calls: &[serd
                     })
                     .unwrap_or_default();
                 agent.set_active_tools_by_name(&names);
-                chrome.status = format!("tools {}", agent.tools.join(","));
+                if let Some(chrome) = chrome.as_mut() {
+                    chrome.status = format!("tools {}", agent.tools.join(","));
+                }
             }
             Some("setThinkingLevel") => {
                 if let Some(level) = call
@@ -3306,7 +3571,9 @@ fn apply_session_calls(agent: &mut Agent, chrome: &mut ChatChrome, calls: &[serd
                     .and_then(pi_protocol::ThinkingLevel::parse)
                 {
                     agent.thinking_level = level;
-                    chrome.status = format!("thinking {}", level.as_str());
+                    if let Some(chrome) = chrome.as_mut() {
+                        chrome.status = format!("thinking {}", level.as_str());
+                    }
                 }
             }
             _ => {}
@@ -4382,6 +4649,11 @@ mod tests {
         ] {
             assert!(help.contains(needle), "missing {needle}");
         }
+        assert!(help.contains("Extensions can register additional flags"));
+        let with_flags =
+            args::print_help_with_extension_flags(&[("plan".into(), "/tmp/plan.js".into())]);
+        assert!(with_flags.contains("Extension CLI Flags:"));
+        assert!(with_flags.contains("--plan"));
         assert_eq!(
             args::normalize_session_name("  demo  ").as_deref(),
             Some("demo")
@@ -4501,5 +4773,40 @@ mod tests {
         assert!(row.contains("200K"));
         assert!(row.contains("16.4K") || row.contains("16384") || row.contains("16K"));
         assert!(row.contains("yes"));
+    }
+
+    #[test]
+    fn apply_session_calls_creates_session_switches_model_and_steers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("x");
+        agent.cwd = dir.path().to_path_buf();
+        let parsed = Args {
+            session_dir: Some(dir.path().join("sessions").display().to_string()),
+            ..Args::default()
+        };
+        let mut chrome = ChatChrome::new(builtin_themes()[0].clone(), "pi");
+        apply_session_calls(
+            Some(&parsed),
+            &mut agent,
+            Some(&mut chrome),
+            &[
+                serde_json::json!({"op":"setModel","model":"sonnet","provider":"anthropic"}),
+                serde_json::json!({"op":"sendUserMessage","text":"hi","options":{"deliverAs":"steer"}}),
+                serde_json::json!({"op":"exec","command":"echo","stdout":"ok"}),
+                serde_json::json!({"op":"newSession"}),
+            ],
+            false,
+        );
+        assert_eq!(agent.provider, "anthropic");
+        assert_eq!(agent.model_id, "sonnet");
+        assert_eq!(agent.queues.steer.len(), 1);
+        assert!(agent.session.is_some());
+        assert!(agent.messages.is_empty());
+        assert!(chrome
+            .transcript
+            .lines
+            .iter()
+            .any(|line| line.role == "exec" && line.text == "ok"));
+        assert!(chrome.status.contains("newSession") || chrome.status.contains("model="));
     }
 }

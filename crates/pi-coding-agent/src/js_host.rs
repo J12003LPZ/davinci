@@ -391,6 +391,55 @@ module.exports = (pi) => {
     }
 
     #[test]
+    fn records_set_model_get_flag_and_session_ops() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerFlag("demo", { type: "boolean", default: true });
+  pi.registerCommand("go", {
+    description: "go",
+    handler: async (_args, ctx) => {
+      const flag = pi.getFlag("demo");
+      await pi.setModel({ provider: "anthropic", id: "sonnet" });
+      ctx.newSession();
+      ctx.switchSession("/tmp/x.jsonl");
+      ctx.navigateTree("leaf-1");
+      return { flag };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let command = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({
+                "name": "go",
+                "flagValues": { "demo": true },
+                "ctx": { "mode": "tui" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(command.result.as_ref().unwrap()["flag"], true);
+        let ops: Vec<&str> = command
+            .session_calls
+            .iter()
+            .filter_map(|call| call.get("op").and_then(|value| value.as_str()))
+            .collect();
+        assert!(ops.contains(&"setModel"));
+        assert!(ops.contains(&"newSession"));
+        assert!(ops.contains(&"switchSession"));
+        assert!(ops.contains(&"navigateTree"));
+    }
+
+    #[test]
     fn records_argument_completions_and_autocomplete_providers() {
         let Some(_) = find_node() else {
             return;
@@ -597,6 +646,15 @@ module.exports = (pi) => {
         assert!(ops.contains(&"setThinkingLevel"));
         assert_eq!(command.result.as_ref().unwrap()["current"][0], "read");
         assert_eq!(command.result.as_ref().unwrap()["thinking"], "high");
+        assert_eq!(
+            command
+                .session_calls
+                .iter()
+                .find(|call| call["op"] == "setThinkingLevel")
+                .and_then(|call| call.get("level"))
+                .and_then(|value| value.as_str()),
+            Some("max")
+        );
         assert!(command
             .ui_calls
             .iter()

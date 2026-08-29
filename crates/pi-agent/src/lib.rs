@@ -52,6 +52,17 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 type CustomToolFn = dyn Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync;
+type PreToolFn = dyn Fn(&str, &Value) -> Option<String> + Send + Sync;
+
+/// Blocks a tool call when the hook returns a reason (TS `tool_call` `{ block: true }`).
+#[derive(Clone)]
+pub struct PreToolHook(pub Arc<PreToolFn>);
+
+impl std::fmt::Debug for PreToolHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreToolHook")
+    }
+}
 
 /// Injected tool runner for JS/manifest tools so `pi-agent` stays independent of the coding-agent host.
 #[derive(Clone)]
@@ -115,6 +126,7 @@ pub struct Agent {
     pub model_id: String,
     pub tool_execution_mode: ToolExecutionMode,
     pub custom_tool_executor: Option<CustomToolExecutor>,
+    pub pre_tool: Option<PreToolHook>,
     pub summarizer: Option<Summarizer>,
     pub block_images: bool,
     pub auto_resize_images: bool,
@@ -154,6 +166,7 @@ impl Agent {
             model_id: String::new(),
             tool_execution_mode: ToolExecutionMode::Sequential,
             custom_tool_executor: None,
+            pre_tool: None,
             summarizer: None,
             block_images: false,
             auto_resize_images: true,
@@ -828,6 +841,65 @@ mod tests {
             .messages
             .iter()
             .any(|message| content_text(&message.content) == "other"));
+    }
+
+    #[test]
+    fn pre_tool_hook_blocks_before_execution() {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+        let mut agent = Agent::new("x");
+        agent.pre_tool = Some(PreToolHook(Arc::new(|name, _| {
+            if name == "bash" {
+                Some("blocked by extension".into())
+            } else {
+                None
+            }
+        })));
+        agent.prompt("run");
+        let events = agent
+            .run_loop(|current| {
+                if current
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "toolResult")
+                {
+                    return Ok(AssistantMessage {
+                        id: "a2".into(),
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text {
+                            text: "stopped".into(),
+                        }],
+                        model: "fixture".into(),
+                        usage: None,
+                        stop_reason: Some(StopReason::Stop),
+                        error_message: None,
+                    });
+                }
+                Ok(AssistantMessage {
+                    id: "a1".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "echo hi"}),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::ToolUse),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { is_error: true, .. })));
+        let result = agent
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "toolResult")
+            .map(|message| content_text(&message.content))
+            .unwrap_or_default();
+        assert!(result.contains("blocked by extension"));
     }
 
     #[test]

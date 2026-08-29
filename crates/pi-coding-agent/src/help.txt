@@ -58,6 +58,8 @@ Options:
   --help, -h                     Show this help
   --version, -v                  Show version number
 
+Extensions can register additional flags (e.g., --plan from plan-mode extension).
+
 Built-in Tool Names:
   read       - Read file contents
   bash       - Execute bash commands

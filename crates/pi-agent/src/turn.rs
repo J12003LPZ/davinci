@@ -375,40 +375,47 @@ impl Agent {
             tool_name: name.to_string(),
             args: args.clone(),
         });
-        let result = if !self.tools.iter().any(|tool| tool == name) {
-            crate::ToolResult {
-                content: format!("Unknown tool: {name}"),
-                is_error: true,
-                details: None,
-            }
-        } else {
-            match execute_tool(cwd, name, args) {
-                Ok(result) => result,
-                Err(crate::tools::ToolError::Unknown(_)) => {
-                    if let Some(executor) = &self.custom_tool_executor {
-                        match executor.execute(cwd, name, args) {
-                            Ok(result) => result,
-                            Err(err) => crate::ToolResult {
-                                content: err.to_string(),
-                                is_error: true,
-                                details: None,
-                            },
-                        }
-                    } else {
-                        crate::ToolResult {
-                            content: format!("Unknown tool: {name}"),
-                            is_error: true,
-                            details: None,
-                        }
-                    }
-                }
-                Err(err) => crate::ToolResult {
-                    content: err.to_string(),
+        let result =
+            if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
+                crate::ToolResult {
+                    content: reason,
                     is_error: true,
                     details: None,
-                },
-            }
-        };
+                }
+            } else if !self.tools.iter().any(|tool| tool == name) {
+                crate::ToolResult {
+                    content: format!("Unknown tool: {name}"),
+                    is_error: true,
+                    details: None,
+                }
+            } else {
+                match execute_tool(cwd, name, args) {
+                    Ok(result) => result,
+                    Err(crate::tools::ToolError::Unknown(_)) => {
+                        if let Some(executor) = &self.custom_tool_executor {
+                            match executor.execute(cwd, name, args) {
+                                Ok(result) => result,
+                                Err(err) => crate::ToolResult {
+                                    content: err.to_string(),
+                                    is_error: true,
+                                    details: None,
+                                },
+                            }
+                        } else {
+                            crate::ToolResult {
+                                content: format!("Unknown tool: {name}"),
+                                is_error: true,
+                                details: None,
+                            }
+                        }
+                    }
+                    Err(err) => crate::ToolResult {
+                        content: err.to_string(),
+                        is_error: true,
+                        details: None,
+                    },
+                }
+            };
         events.push(AgentEvent::ToolExecutionUpdate {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
