@@ -232,9 +232,9 @@ mod tests {
     #[test]
     fn search_filters_and_escape_cancels() {
         let mut selector = ThinkingSelector::new("off", levels(), "off");
-        let _ = selector.handle_key("m");
-        let _ = selector.handle_key("a");
-        assert_eq!(selector.selected_level().as_deref(), Some("max"));
+        let _ = selector.handle_key("x");
+        let _ = selector.handle_key("h");
+        assert_eq!(selector.selected_level().as_deref(), Some("xhigh"));
         assert_eq!(selector.handle_key("\x1b"), ThinkingSelectorAction::Cancel);
         let rendered = selector.render(80).join("\n");
         assert!(rendered.contains("Thinking Level"));
