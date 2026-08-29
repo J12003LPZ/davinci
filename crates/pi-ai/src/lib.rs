@@ -3,6 +3,7 @@
 mod auth;
 mod catalog;
 mod oauth;
+mod oauth_providers;
 mod providers;
 mod stream;
 
@@ -10,16 +11,21 @@ pub use auth::{
     resolve_provider_auth, AuthStorage, AuthStorageError, Credential, CredentialKind, ResolvedAuth,
 };
 pub use catalog::{
-    builtin_provider_ids, flatten_catalog, load_builtin_models, Model, ModelCost, KNOWN_PROVIDERS,
+    builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models, Model,
+    ModelCost, KNOWN_PROVIDERS,
 };
 pub use oauth::{poll_oauth_device_code_flow, DeviceCodePoller, DevicePollStatus};
+pub use oauth_providers::{
+    authorize_request, device_status_from_error, exchange_authorization_code, generate_pkce,
+    oauth_providers, parse_authorization_input, AuthorizeRequest, Pkce,
+};
 pub use providers::{
     builtin_providers, load_models_json, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS,
 };
 pub use stream::{
-    assistant_to_chat, complete_from_events, fixture_complete, live_complete, parse_sse_block,
-    replay_sse_events, request_url, AssistantMessage, AssistantMessageEvent, ContentBlock,
-    StopReason, StreamEvent,
+    assistant_to_chat, complete_from_events, events_from_complete, fixture_complete, live_complete,
+    live_stream, parse_sse_block, replay_sse_events, request_body, request_url, AssistantMessage,
+    AssistantMessageEvent, ContentBlock, StopReason, StreamEvent,
 };
 
 use pi_protocol::Usage;

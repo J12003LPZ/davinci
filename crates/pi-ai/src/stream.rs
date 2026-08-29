@@ -278,11 +278,7 @@ pub fn live_complete(
     system: Option<&str>,
     tools: &[ToolSpec],
 ) -> Result<AssistantMessage, String> {
-    let body = match model.api.as_str() {
-        "anthropic-messages" => anthropic_body(model, messages, system, tools),
-        "google-generative-ai" | "google-vertex" => google_body(model, messages, system, tools),
-        _ => openai_body(model, messages, system, tools),
-    };
+    let body = request_body(model, messages, system, tools);
     let url = request_url(model, auth);
     let mut request = ureq::post(&url);
     for (key, value) in &auth.headers {
@@ -307,6 +303,168 @@ pub fn live_complete(
         .into_string()
         .map_err(|err| format!("Unable to read provider response: {err}"))?;
     Ok(parse_provider_response(model, &text))
+}
+
+pub fn request_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+) -> Value {
+    match model.api.as_str() {
+        "anthropic-messages" | "pi-messages" => anthropic_body(model, messages, system, tools),
+        "google-generative-ai" | "google-vertex" => google_body(model, messages, system, tools),
+        "bedrock-converse-stream" => bedrock_body(model, messages, system, tools),
+        "mistral-conversations" => mistral_body(model, messages, system, tools),
+        _ => openai_body(model, messages, system, tools),
+    }
+}
+
+/// Stream complete via SSE when the provider returns `data:` frames; otherwise wrap `complete`.
+pub fn live_stream(
+    model: &Model,
+    messages: &[ChatMessage],
+    auth: &ResolvedAuth,
+    system: Option<&str>,
+    tools: &[ToolSpec],
+) -> Result<Vec<AssistantMessageEvent>, String> {
+    let mut body = request_body(model, messages, system, tools);
+    if let Value::Object(map) = &mut body {
+        map.insert("stream".into(), Value::Bool(true));
+    }
+    let url = request_url(model, auth);
+    let mut request = ureq::post(&url);
+    for (key, value) in &auth.headers {
+        request = request.set(key, value);
+    }
+    if let Some(key) = &auth.api_key {
+        if model.api.starts_with("google") {
+        } else if model.api == "anthropic-messages" || model.api == "pi-messages" {
+            request = request
+                .set("x-api-key", key)
+                .set("anthropic-version", "2023-06-01");
+        } else {
+            request = request.set("Authorization", &format!("Bearer {key}"));
+        }
+    }
+    request = request.set("content-type", "application/json");
+    let response = request
+        .send_string(&body.to_string())
+        .map_err(|err| format!("Provider request failed: {err}"))?;
+    let text = response
+        .into_string()
+        .map_err(|err| format!("Unable to read provider response: {err}"))?;
+    if text.contains("data:") {
+        Ok(replay_sse_events(model, &text))
+    } else {
+        let message = parse_provider_response(model, &text);
+        Ok(events_from_complete(&message))
+    }
+}
+
+pub fn events_from_complete(message: &AssistantMessage) -> Vec<AssistantMessageEvent> {
+    let mut events = vec![AssistantMessageEvent::Start {
+        partial: message.clone(),
+    }];
+    for (index, block) in message.content.iter().enumerate() {
+        match block {
+            ContentBlock::Text { text } => {
+                events.push(AssistantMessageEvent::TextStart {
+                    content_index: index,
+                    partial: message.clone(),
+                });
+                events.push(AssistantMessageEvent::TextDelta {
+                    content_index: index,
+                    delta: text.clone(),
+                    partial: message.clone(),
+                });
+                events.push(AssistantMessageEvent::TextEnd {
+                    content_index: index,
+                    content: text.clone(),
+                    partial: message.clone(),
+                });
+            }
+            ContentBlock::Thinking { thinking } => {
+                events.push(AssistantMessageEvent::ThinkingStart {
+                    content_index: index,
+                    partial: message.clone(),
+                });
+                events.push(AssistantMessageEvent::ThinkingDelta {
+                    content_index: index,
+                    delta: thinking.clone(),
+                    partial: message.clone(),
+                });
+                events.push(AssistantMessageEvent::ThinkingEnd {
+                    content_index: index,
+                    content: thinking.clone(),
+                    partial: message.clone(),
+                });
+            }
+            ContentBlock::ToolCall { .. } => {
+                events.push(AssistantMessageEvent::ToolcallStart {
+                    content_index: index,
+                    partial: message.clone(),
+                });
+                events.push(AssistantMessageEvent::ToolcallEnd {
+                    content_index: index,
+                    tool_call: block.clone(),
+                    partial: message.clone(),
+                });
+            }
+        }
+    }
+    events.push(AssistantMessageEvent::Done {
+        reason: message.stop_reason.unwrap_or(StopReason::Stop),
+        message: message.clone(),
+    });
+    events
+}
+
+fn bedrock_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+) -> Value {
+    let converted: Vec<Value> = messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": if message.role == "assistant" { "assistant" } else { "user" },
+                "content": [{"text": content_text(&message.content)}],
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "modelId": model.id,
+        "messages": converted,
+    });
+    if let Some(system) = system {
+        body["system"] = serde_json::json!([{"text": system}]);
+    }
+    if !tools.is_empty() {
+        body["toolConfig"] = serde_json::json!({
+            "tools": tools.iter().map(|tool| serde_json::json!({
+                "toolSpec": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": { "json": tool.parameters },
+                }
+            })).collect::<Vec<_>>()
+        });
+    }
+    body
+}
+
+fn mistral_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+) -> Value {
+    let mut body = openai_body(model, messages, system, tools);
+    body["stream"] = Value::Bool(false);
+    body
 }
 
 pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
@@ -749,5 +907,19 @@ mod tests {
                 .find(|b| matches!(b, ContentBlock::ToolCall { .. })),
             Some(ContentBlock::ToolCall { .. })
         ));
+        let events = events_from_complete(&openai);
+        assert!(matches!(events[0], AssistantMessageEvent::Start { .. }));
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Done { .. })
+        ));
+        let bedrock = parse_provider_response(
+            &model,
+            r#"{"output":{"message":{"content":[{"text":"ok"},{"toolUse":{"toolUseId":"t1","name":"read","input":{"path":"a"}}}]}}}"#,
+        );
+        assert!(bedrock
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolCall { .. })));
     }
 }

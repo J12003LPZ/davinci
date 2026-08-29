@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 include!("catalog_include.rs");
 
+pub fn builtin_catalog_json(provider: &str) -> Option<&'static str> {
+    catalog_json(provider)
+}
+
 pub const KNOWN_PROVIDERS: &[&str] = &[
     "amazon-bedrock",
     "ant-ling",

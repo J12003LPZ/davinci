@@ -4,11 +4,15 @@ mod box_comp;
 mod chrome;
 mod editor;
 mod fuzzy;
+mod image;
 mod keys;
+mod latex;
 mod markdown;
 mod mouse;
+mod overlay;
 mod render;
 mod scroll;
+mod settings;
 mod themes;
 mod transcript;
 
@@ -16,11 +20,15 @@ pub use box_comp::TuiBox;
 pub use chrome::ChatChrome;
 pub use editor::Editor;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
+pub use image::{iterm_image, kitty_image_chunk, KITTY_IMAGE_PREFIX};
 pub use keys::{parse_key, Key};
+pub use latex::render_latex;
 pub use markdown::render_markdown;
 pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
+pub use overlay::Overlay;
 pub use render::{visible_width, Component, Text};
 pub use scroll::ScrollView;
+pub use settings::{SettingItem, SettingsList};
 pub use themes::{builtin_themes, Theme};
 pub use transcript::{Transcript, TranscriptLine};
 
@@ -145,5 +153,18 @@ mod tests {
         let rendered = chrome.render(40);
         assert!(rendered.iter().any(|line| line.contains("pi 0.84.4")));
         assert!(parse_mouse_sgr("\x1b[<0;2;2M").is_some());
+        assert_eq!(render_latex("\\pi", false).as_deref(), Some("π"));
+        let mut settings = SettingsList::new(
+            vec![SettingItem {
+                id: "theme".into(),
+                label: "Theme".into(),
+                description: None,
+                current_value: "dark".into(),
+                values: vec!["dark".into(), "light".into()],
+            }],
+            8,
+        );
+        settings.cycle();
+        assert_eq!(settings.items[0].current_value, "light");
     }
 }

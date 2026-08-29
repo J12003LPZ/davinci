@@ -1,6 +1,7 @@
 mod args;
 mod auth_cmd;
 mod export;
+mod extension_host;
 mod extensions;
 mod packages;
 mod rpc;
@@ -33,6 +34,7 @@ use auth_cmd::{
     is_auth_command_help, parse_auth_command, print_auth_command_help, validate_auth_command_args,
     AuthCommandKind,
 };
+use extension_host::{ExtensionEvent, ExtensionHost};
 use packages::handle_package_command;
 use rpc::{handle_rpc, RpcCommand, RpcRuntime};
 use settings::{is_trusted, load_settings, save_settings};
@@ -381,6 +383,8 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             parameters: tool.parameters,
         })
         .collect();
+    let mut host = ExtensionHost::default();
+    host.emit(ExtensionEvent::BeforeAgentStart);
     let events = agent
         .run_loop(|current| {
             let last_user = current
@@ -432,6 +436,8 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             })
         })
         .unwrap_or_default();
+    host.emit(ExtensionEvent::AgentEnd);
+    let _ = host.kinds();
     (reply, events)
 }
 
@@ -660,6 +666,15 @@ fn handle_user_line(
         }
         SlashAction::Login { provider, key } => {
             let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+            if key.is_none() && !provider.is_empty() {
+                let id = uuid::Uuid::new_v4();
+                let pkce = pi_ai::generate_pkce(id.as_bytes());
+                if let Some(request) = pi_ai::authorize_request(&provider, &pkce, "pi") {
+                    println!("{}", request.url);
+                    println!("{}", request.instructions);
+                    return Ok(true);
+                }
+            }
             if let Some(key) = key {
                 storage
                     .login_api_key(&provider, key)

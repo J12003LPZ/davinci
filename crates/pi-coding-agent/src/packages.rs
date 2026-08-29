@@ -28,8 +28,18 @@ pub fn handle_package_command(
         }
         "update" => {
             let target = source.unwrap_or_else(|| "all".into());
+            let catalogs = agent_dir.join("models");
+            fs::create_dir_all(&catalogs).map_err(|err| err.to_string())?;
+            for provider in pi_ai::builtin_provider_ids() {
+                if let Some(json) = pi_ai::builtin_catalog_json(provider) {
+                    fs::write(catalogs.join(format!("{provider}.json")), json)
+                        .map_err(|err| err.to_string())?;
+                }
+            }
             Ok(format!(
-                "Updated {target} (catalogs/extensions stay local; no live installer call)"
+                "Updated {target}: wrote {} catalogs to {}",
+                pi_ai::builtin_provider_ids().len(),
+                catalogs.display()
             ))
         }
         "list" => Ok(render_list(&settings)),
