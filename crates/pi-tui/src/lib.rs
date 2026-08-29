@@ -5,6 +5,7 @@ mod autocomplete;
 mod box_comp;
 mod chrome;
 mod config_selector;
+mod container;
 mod custom_message;
 mod editor;
 mod extension_ui;
@@ -17,6 +18,7 @@ mod keybindings;
 mod keys;
 mod kill_ring;
 mod latex;
+mod loader;
 mod login_dialog;
 mod markdown;
 mod mermaid;
@@ -33,6 +35,8 @@ mod session;
 mod session_selector;
 mod settings;
 mod settings_submenu;
+mod spacer;
+mod stack;
 mod stdin_buffer;
 mod terminal;
 mod themes;
@@ -42,6 +46,7 @@ mod transcript;
 mod tree;
 mod truncated_text;
 mod trust_selector;
+mod tui_text;
 mod undo_stack;
 mod word_nav;
 mod word_wrap;
@@ -62,6 +67,7 @@ pub use chrome::ChatChrome;
 pub use config_selector::{
     ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector, ConfigSelectorAction,
 };
+pub use container::Container;
 pub use custom_message::{
     CustomMessage, MessageRenderOptions, MessageRenderer, MessageRendererRegistry,
 };
@@ -86,6 +92,10 @@ pub use input::{Input, InputAction};
 pub use keybindings::{key_to_bytes, Keybindings};
 pub use keys::{decode_kitty_printable, parse_key, Key};
 pub use latex::render_latex;
+pub use loader::{
+    CancellableLoader, Loader, LoaderIndicatorOptions, DEFAULT_LOADER_FRAMES,
+    DEFAULT_LOADER_INTERVAL_MS,
+};
 pub use login_dialog::{AuthInfoLink, DeviceCodeInfo, LoginDialog, LoginDialogAction};
 pub use markdown::{
     format_markdown_link, hyperlinks_enabled, osc8_hyperlink, render_markdown,
@@ -136,6 +146,11 @@ pub use settings_submenu::{
     parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
     SettingsSubmenuKind, AUTOMATIC_THEME_VALUE,
 };
+pub use spacer::Spacer;
+pub use stack::{
+    allocate_stack_sizes, HStack, LayoutViewport, StackAlign, StackBasis, StackEntryOptions,
+    StackLayoutEntry, VStack,
+};
 pub use stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvents};
 pub use terminal::{
     is_apple_terminal_session, is_keyboard_protocol_negotiation_sequence_prefix,
@@ -161,6 +176,7 @@ pub use truncated_text::TruncatedText;
 pub use trust_selector::{
     TrustOption, TrustSavedDecision, TrustSelector, TrustSelectorAction, TrustUpdate,
 };
+pub use tui_text::{apply_background_to_line, TuiText};
 
 pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 pub const ALT_BUFFER_ENTER: &str = "\x1b[?1049h";

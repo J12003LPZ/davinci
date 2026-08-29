@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (file-mutation queue on write/edit, TruncatedText, native module-path/modifiers, ANSI `sliceWithWidth`/`extractSegments`, Unix client/server write queues + pending-byte limit, eval harness reporter). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (file-mutation queue, TruncatedText, native helpers, Unix write queues, eval reporter, TUI Spacer/Text/Container/VStack/HStack/Loader). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -129,8 +129,10 @@ Closed this slice: `pi-server` Unix `removeStaleSocket` identity-preserving rena
 
 Closed this slice: write/edit tools serialize per realpath via `withFileMutationQueue` (symlink aliases share a key; parallel `alpha`/`beta` edits both apply). TUI `TruncatedText` (first line, ANSI truncate, pad X/Y). Native helper resolution (`getNativeModuleCandidates`, darwin/win32 `.node` paths, `isNativeModifierPressed` via `PI_TUI_NATIVE_MODIFIER_*`, VT input). ANSI `sliceWithWidth` / `extractSegments` lock tab-width fixtures (`out 192M\t…`). `pi-client` `createUnixTransportFactory` + `UnixByteTransport` write queue (`Unix transport exceeded its pending byte limit`, ENOENT, path/maxPendingBytes TypeErrors) and `pi-server` `UnixByteConnection` keeps `pendingBytes` until the write finishes, then half-closes with `gracefulCloseTimeoutMs`. `pi-evals` reporter `collectHarnessObservations` / `appendHarnessRunReport` / interrupted string `Eval comparisons unavailable: test run interrupted.` (runs.jsonl 0o700/0o600).
 
+Closed this slice: TUI `Spacer`, TS `Text` (`TuiText` wrap + pad + tab=3 + background), `Container`, `allocateStackSizes` grow/shrink, `VStack` (invisible entries omit gaps), `HStack` (allocated widths + zero-width skip), `Loader`/`CancellableLoader` with tickable frames and Escape abort (`tui.select.cancel`).
+
 Still not product-equivalent:
 
 - Native TUI C addons (`tui/native/darwin`, `tui/native/win32`) — optional; Shift detection uses crossterm modifiers, `PI_TUI_SHIFT` / `PI_TUI_NATIVE_MODIFIER_SHIFT`, plus the TS rewrite helpers. Darwin/Win32 `.node` binaries are not shipped.
-- TUI layout runtime still incomplete vs `@earendil-works/pi-tui` exports used by interactive: `Container`/`HStack`/`VStack`/`Spacer`, `Loader`/`CancellableLoader`, `TuiMainScreen`/`TuiAltScreen`/`ProcessTerminal`, full `SelectList` layout options.
+- TUI viewport layout runtime still incomplete: `renderLayoutFrame` / `TuiMainScreen` / `TuiAltScreen` / `ProcessTerminal`, ScrollView follow-end + proportional scrollbar, Kitty crop at scroll bounds, full `SelectList` layout options.
 - TypeScript under `vendor/pi` remains the behavioral spec.
