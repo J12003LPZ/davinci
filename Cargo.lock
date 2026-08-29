@@ -671,6 +671,7 @@ dependencies = [
 name = "pi-tui"
 version = "0.84.4"
 dependencies = [
+ "base64",
  "indexmap",
  "libc",
  "pulldown-cmark",
