@@ -248,11 +248,7 @@ fn validate_provider_schema(path: &str, value: &Value, errors: &mut Vec<String>)
         Some(_) => errors.push(format!("  - {path}.authHeader: Expected boolean")),
     }
     validate_string_record(&format!("{path}.headers"), object.get("headers"), errors);
-    if let Some(compat) = object.get("compat") {
-        if !compat.is_null() && !compat.is_object() {
-            errors.push(format!("  - {path}.compat: Expected union value"));
-        }
-    }
+    validate_compat(&format!("{path}.compat"), object.get("compat"), errors);
     match object.get("models") {
         None | Some(Value::Null) => {}
         Some(Value::Array(items)) => {
@@ -309,11 +305,7 @@ fn validate_model_definition(path: &str, value: &Value, errors: &mut Vec<String>
     validate_input_array(&format!("{path}.input"), object.get("input"), errors);
     validate_model_cost(&format!("{path}.cost"), object.get("cost"), true, errors);
     validate_string_record(&format!("{path}.headers"), object.get("headers"), errors);
-    if let Some(compat) = object.get("compat") {
-        if !compat.is_null() && !compat.is_object() {
-            errors.push(format!("  - {path}.compat: Expected union value"));
-        }
-    }
+    validate_compat(&format!("{path}.compat"), object.get("compat"), errors);
 }
 
 fn validate_model_override(path: &str, value: &Value, errors: &mut Vec<String>) {
@@ -386,6 +378,127 @@ fn validate_input_array(path: &str, value: Option<&Value>, errors: &mut Vec<Stri
             Some("text") | Some("image") => {}
             _ => errors.push(format!("  - {path}.{index}: Expected union value")),
         }
+    }
+}
+
+fn validate_compat(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected union value"));
+        return;
+    };
+    expect_optional_union(
+        &format!("{path}.thinkingFormat"),
+        object.get("thinkingFormat"),
+        &[
+            "openai",
+            "openrouter",
+            "together",
+            "baseten",
+            "deepseek",
+            "zai",
+            "qwen",
+            "chat-template",
+            "qwen-chat-template",
+            "string-thinking",
+            "ant-ling",
+        ],
+        errors,
+    );
+    expect_optional_const(
+        &format!("{path}.cacheControlFormat"),
+        object.get("cacheControlFormat"),
+        "anthropic",
+        errors,
+    );
+    expect_optional_union(
+        &format!("{path}.maxTokensField"),
+        object.get("maxTokensField"),
+        &["max_completion_tokens", "max_tokens"],
+        errors,
+    );
+    expect_optional_union(
+        &format!("{path}.sessionAffinityFormat"),
+        object.get("sessionAffinityFormat"),
+        &["openai", "openai-nosession", "openrouter"],
+        errors,
+    );
+    expect_optional_const(
+        &format!("{path}.deferredToolsMode"),
+        object.get("deferredToolsMode"),
+        "kimi",
+        errors,
+    );
+    expect_optional_bool(
+        &format!("{path}.supportsStore"),
+        object.get("supportsStore"),
+        errors,
+    );
+    expect_optional_bool(
+        &format!("{path}.supportsDeveloperRole"),
+        object.get("supportsDeveloperRole"),
+        errors,
+    );
+    expect_optional_bool(
+        &format!("{path}.supportsReasoningEffort"),
+        object.get("supportsReasoningEffort"),
+        errors,
+    );
+    expect_optional_bool(
+        &format!("{path}.supportsUsageInStreaming"),
+        object.get("supportsUsageInStreaming"),
+        errors,
+    );
+    expect_optional_bool(
+        &format!("{path}.supportsFinishReason"),
+        object.get("supportsFinishReason"),
+        errors,
+    );
+    expect_optional_bool(
+        &format!("{path}.supportsStrictMode"),
+        object.get("supportsStrictMode"),
+        errors,
+    );
+    expect_optional_bool(
+        &format!("{path}.supportsLongCacheRetention"),
+        object.get("supportsLongCacheRetention"),
+        errors,
+    );
+    expect_optional_bool(
+        &format!("{path}.supportsEagerToolInputStreaming"),
+        object.get("supportsEagerToolInputStreaming"),
+        errors,
+    );
+}
+
+fn expect_optional_union(
+    path: &str,
+    value: Option<&Value>,
+    allowed: &[&str],
+    errors: &mut Vec<String>,
+) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) if allowed.contains(&text.as_str()) => {}
+        Some(_) => errors.push(format!("  - {path}: Expected union value")),
+    }
+}
+
+fn expect_optional_const(
+    path: &str,
+    value: Option<&Value>,
+    expected: &str,
+    errors: &mut Vec<String>,
+) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) if text == expected => {}
+        Some(_) => errors.push(format!("  - {path}: Expected const value")),
     }
 }
 
@@ -978,5 +1091,15 @@ mod tests {
         assert!(collected_error.contains(
             "  - providers.local.models.0.id: Expected string length greater or equal to 1"
         ));
+
+        let compat = write(
+            "compat.json",
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","compat":{"thinkingFormat":"nope","cacheControlFormat":"openai"}}}}"#,
+        );
+        let compat_error = compat.error().unwrap();
+        assert!(compat_error
+            .contains("  - providers.local.compat.thinkingFormat: Expected union value"));
+        assert!(compat_error
+            .contains("  - providers.local.compat.cacheControlFormat: Expected const value"));
     }
 }

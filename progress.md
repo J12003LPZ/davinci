@@ -55,8 +55,9 @@ Closed this slice: `models.json` ModelConfig + apply/overrides/auth headers + `/
 
 Closed this slice: live npm/git `checkForAvailableUpdates`, TypeBox models.json keyword error paths, ModelSelector `theme.fg` roles, overlay `visible(termWidth, termHeight)`, ModelRuntime availability snapshot filtering `/model` and `--list-models`.
 
+Closed this slice: `--list-models` TS column table (`provider`/`model`/`context`/`max-out`/`thinking`/`images` + `200K`/`1M` token counts); TypeBox `compat` nested `thinkingFormat` / `cacheControlFormat` / `maxTokensField` / `sessionAffinityFormat` / `deferredToolsMode` keyword paths.
+
 Still not product-equivalent:
 
-- `--list-models` still prints `provider/id  name` rather than the TS column table (`provider`, `model`, `context`, `max-out`, `thinking`, `images`)
-- TypeBox `compat` nested union/const paths (`thinkingFormat`, routing, `cacheControlFormat`) are typed as object-or-union, not every nested instancePath
 - Live `getAvailable()` per-provider network auth probes (snapshot uses storage + env + models.json keys only)
+- TypeBox OpenRouter/Vercel routing nested records inside `compat` are not walked field-by-field

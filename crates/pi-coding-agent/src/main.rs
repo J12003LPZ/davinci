@@ -379,6 +379,121 @@ fn coding_agent_docs_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pi/packages/coding-agent/docs")
 }
 
+fn format_token_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        let millions = count as f64 / 1_000_000.0;
+        if millions.fract() == 0.0 {
+            format!("{}M", millions as u64)
+        } else {
+            format!("{millions:.1}M")
+        }
+    } else if count >= 1_000 {
+        let thousands = count as f64 / 1_000.0;
+        if thousands.fract() == 0.0 {
+            format!("{}K", thousands as u64)
+        } else {
+            format!("{thousands:.1}K")
+        }
+    } else {
+        count.to_string()
+    }
+}
+
+fn render_models_table(models: &[&pi_ai::Model]) -> String {
+    let mut rows: Vec<(String, String, String, String, String, String)> = models
+        .iter()
+        .map(|model| {
+            (
+                model.provider.clone(),
+                model.id.clone(),
+                format_token_count(model.context_window),
+                format_token_count(model.max_tokens),
+                if model.reasoning { "yes" } else { "no" }.into(),
+                if model.input.iter().any(|item| item == "image") {
+                    "yes"
+                } else {
+                    "no"
+                }
+                .into(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let headers = (
+        "provider".to_string(),
+        "model".to_string(),
+        "context".to_string(),
+        "max-out".to_string(),
+        "thinking".to_string(),
+        "images".to_string(),
+    );
+    let widths = [
+        rows.iter()
+            .map(|row| row.0.len())
+            .max()
+            .unwrap_or(0)
+            .max(headers.0.len()),
+        rows.iter()
+            .map(|row| row.1.len())
+            .max()
+            .unwrap_or(0)
+            .max(headers.1.len()),
+        rows.iter()
+            .map(|row| row.2.len())
+            .max()
+            .unwrap_or(0)
+            .max(headers.2.len()),
+        rows.iter()
+            .map(|row| row.3.len())
+            .max()
+            .unwrap_or(0)
+            .max(headers.3.len()),
+        rows.iter()
+            .map(|row| row.4.len())
+            .max()
+            .unwrap_or(0)
+            .max(headers.4.len()),
+        rows.iter()
+            .map(|row| row.5.len())
+            .max()
+            .unwrap_or(0)
+            .max(headers.5.len()),
+    ];
+    let mut lines = vec![format!(
+        "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {:<w5$}",
+        headers.0,
+        headers.1,
+        headers.2,
+        headers.3,
+        headers.4,
+        headers.5,
+        w0 = widths[0],
+        w1 = widths[1],
+        w2 = widths[2],
+        w3 = widths[3],
+        w4 = widths[4],
+        w5 = widths[5],
+    )];
+    for row in rows {
+        lines.push(format!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {:<w5$}",
+            row.0,
+            row.1,
+            row.2,
+            row.3,
+            row.4,
+            row.5,
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4],
+            w5 = widths[5],
+        ));
+    }
+    lines.join("\n")
+}
+
 fn list_models(list: &ListModels) -> Result<i32, String> {
     let snapshot = load_model_runtime(&Args::default());
     if let Some(error) = snapshot.get_error() {
@@ -409,9 +524,7 @@ fn list_models(list: &ListModels) -> Result<i32, String> {
             return Ok(0);
         }
     }
-    for model in selected {
-        println!("{}/{}  {}", model.provider, model.id, model.name);
-    }
+    println!("{}", render_models_table(&selected));
     Ok(0)
 }
 
@@ -3512,5 +3625,46 @@ mod tests {
         assert_eq!(shared, "Share URL: https://radius.example/a");
         std::env::remove_var("PI_RADIUS_TOKEN");
         std::env::remove_var("PI_RADIUS_ARTIFACT_REPLY");
+    }
+
+    #[test]
+    fn list_models_table_matches_ts_columns() {
+        assert_eq!(format_token_count(200_000), "200K");
+        assert_eq!(format_token_count(1_000_000), "1M");
+        assert_eq!(format_token_count(1_500_000), "1.5M");
+        assert_eq!(format_token_count(500), "500");
+        let model = pi_ai::Model {
+            id: "sonnet".into(),
+            name: "Sonnet".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: None,
+            reasoning: true,
+            input: vec!["text".into(), "image".into()],
+            cost: pi_ai::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 16_384,
+            compat: serde_json::json!(null),
+            headers: Default::default(),
+        };
+        let table = render_models_table(&[&model]);
+        let header = table.lines().next().unwrap();
+        assert!(header.contains("provider"));
+        assert!(header.contains("model"));
+        assert!(header.contains("context"));
+        assert!(header.contains("max-out"));
+        assert!(header.contains("thinking"));
+        assert!(header.contains("images"));
+        let row = table.lines().nth(1).unwrap();
+        assert!(row.contains("anthropic"));
+        assert!(row.contains("sonnet"));
+        assert!(row.contains("200K"));
+        assert!(row.contains("16.4K") || row.contains("16384") || row.contains("16K"));
+        assert!(row.contains("yes"));
     }
 }
