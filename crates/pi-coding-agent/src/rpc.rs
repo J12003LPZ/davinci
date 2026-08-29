@@ -354,17 +354,37 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
             vec![],
         ),
         "get_commands" => {
-            let commands: Vec<_> = BUILTIN_SLASH_COMMANDS
+            let mut commands: Vec<_> = runtime
+                .registry
+                .commands
                 .iter()
-                .map(|(name, description)| {
+                .map(|command| {
                     json!({
-                        "name": name,
-                        "description": description,
-                        "source": "prompt",
-                        "sourceInfo": {"kind": "builtin", "name": name}
+                        "name": command.name,
+                        "description": command.description,
+                        "source": "extension",
+                        "sourceInfo": {
+                            "path": command.path.display().to_string(),
+                            "source": command.path.display().to_string(),
+                            "scope": "project",
+                            "origin": "top-level"
+                        }
                     })
                 })
                 .collect();
+            commands.extend(BUILTIN_SLASH_COMMANDS.iter().map(|(name, description)| {
+                json!({
+                    "name": name,
+                    "description": description,
+                    "source": "prompt",
+                    "sourceInfo": {
+                        "path": *name,
+                        "source": *name,
+                        "scope": "temporary",
+                        "origin": "top-level"
+                    }
+                })
+            }));
             (
                 success(id, "get_commands", Some(json!({"commands": commands}))),
                 vec![],
@@ -422,6 +442,7 @@ mod tests {
             context_window: 128_000,
             ui: crate::extension_ui::ExtensionUiHost::default(),
             extensions: vec![],
+            registry: crate::extensions::ExtensionRegistry::default(),
         }
     }
 

@@ -282,7 +282,9 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         context_window: 128_000,
         ui: crate::extension_ui::ExtensionUiHost::default(),
         extensions: discovered.clone(),
+        registry: crate::extensions::ExtensionRegistry::default(),
     };
+    runtime.bind_extensions();
 
     match app_mode {
         AppMode::Rpc => run_rpc(&mut runtime),

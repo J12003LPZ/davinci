@@ -39,6 +39,9 @@ pub fn run_eval(case: &EvalCase) -> EvalResult {
         permission: Box::new(pi_agent::AllowAllPermissionPolicy),
         transport: None,
         session_id: None,
+        base_url: None,
+        extra_headers: vec![],
+        api: None,
     };
     let events = run_agent(
         &config,

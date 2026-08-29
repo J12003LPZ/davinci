@@ -1,11 +1,11 @@
 # Rust rewrite progress
 
-**Complete: 100%**
+**Complete: 98%**
 
 TypeScript spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185` (`@earendil-works/pi-*` 0.84.4).
 Toolchain: Rust **1.83.0**, no `edition2024`, no `unsafe`. TypeScript remains in `vendor/pi` as the behavioral reference only. Rust under `crates/*` is the product.
 
-A TypeScript `pi` user can install Rust `pi` and use the same flags, `~/.pi` sessions, provider credentials, TUI, print, and RPC. There is no remaining documented not-ported product-feature list.
+A TypeScript `pi` user can install Rust `pi` and use the same flags, `~/.pi` sessions, provider credentials, TUI, print, RPC, and JS extension registration (`pi.registerProvider` / `registerTool` / `registerCommand`). HTML export still uses a lite markdown renderer instead of TypeScript `template.js` (marked / highlight / full tool view).
 
 ## What landed
 
@@ -18,15 +18,16 @@ A TypeScript `pi` user can install Rust `pi` and use the same flags, `~/.pi` ses
 - **pi-protocol/client/server**: Unix+TCP+memory, handshake timeout, leases, request correlation, CBOR vectors. Server implements the full TypeScript `Command` union (list/create/attach/detach/prompt/steer/abort/set_model/set_thinking).
 - **pi-evals / pi-parity**: fixture evals + required golden corpora. Optional `--parallel-run` / `--diff-jsonl`.
 - **pi binary**: flags/subcommands from `args.ts` / `main.ts`, print/json/rpc/interactive sharing `SessionRuntime`. RPC `{type:"response",command,success}` plus streamed agent events. Prompt `streamingBehavior` queues steer/follow-up while a turn is running. Unknown command error `Unknown command: {type}`. Extension UI host implements every `RpcExtensionUIRequest` method (`select`, `confirm`, `input`, `editor`, `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) with pending-response correlation matching TypeScript. Interactive applies those requests to the TUI (title, footer statuses, widgets, selectors, editor text). JS extensions receive `pi.on` plus `ctx.ui` / `hasUI` in the Node host; `session_start` / `turn_start` / `turn_end` apply collected UI calls. Interactive raw-stdin key loop and builtin slash handlers. `/copy` uses platform clipboard tools then OSC 52 with TypeScript error strings. `/changelog` parses `CHANGELOG.md` version headers and normalizes GitHub links. `/share` tries Radius (`https://radius.pi.dev/v1/artifacts`) when a bearer token is present, then a secret gist (`gh gist create --public=false`) with `PI_SHARE_VIEWER_URL` (`https://pi.dev/session/#<id>`).
+- **JS extension API**: `pi.registerProvider` / `unregisterProvider` (name+config or native `{id}` object), `pi.registerTool` (schema + `execute(toolCallId, params, signal, onUpdate, ctx)`), `pi.registerCommand` (slash handler), `registerShortcut`, `registerFlag` / `getFlag` with TypeScript default-type error. Load-time capture; tools join `ToolRegistry`; commands appear in `/help`, RPC `get_commands` (`source: "extension"`), print/RPC prompt, and interactive slash; providers merge into model list and `AgentConfig` (`baseUrl`, `api`, interpolated `apiKey`, headers, `authHeader`). `resolveConfigValue` matches `$ENV` / `${ENV}` / `$$` / `$!` / leading `!command`. Exact errors: `Provider config is required when registering by name`, `Provider id must not be empty.`
 - **HTML export**: themed session dump with TypeScript `escapeHtml` / `sanitizeMarkdownUrl` (`https?|mailto|tel|ftp`, C0 strip), sidebar tree (`buildTree` / `#tree-container` / `#session-data` base64), search, default/all filters, hamburger, theme toggle. XSS fixtures reject `javascript:` hrefs and unescaped markup.
 
 ## What remains
 
-None. TypeScript under `vendor/pi` stays as the reference implementation only.
+- HTML export `template.js` marked / highlight.js / full tool-call renderer (lite markdown + tree/search/theme/XSS are ported).
 
 ## Next crate/module
 
-None. Maintenance and fixture updates track TypeScript `vendor/pi`.
+Port TypeScript HTML `template.js` markdown/highlight/tool rendering into `pi-coding-agent` export.
 
 ## Gates
 
@@ -34,4 +35,4 @@ None. Maintenance and fixture updates track TypeScript `vendor/pi`.
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: green on 1.83 after Radius share, JS extension `ctx.ui` host, `/copy`, `/changelog`, and RPC `streamingBehavior`.
+Last run: pending this slice (JS `registerProvider` / `registerTool` / `registerCommand`).

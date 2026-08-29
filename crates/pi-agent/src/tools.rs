@@ -18,8 +18,8 @@ pub struct ToolResult {
 }
 
 pub trait BuiltinTool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
     fn parameters(&self) -> Value;
     fn execute(&self, input: &Value, cwd: &Path) -> Result<ToolResult, ToolError>;
 }
@@ -73,7 +73,7 @@ impl ToolRegistry {
             .map(|t| t.as_ref())
     }
 
-    pub fn names(&self) -> Vec<&'static str> {
+    pub fn names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
     }
 

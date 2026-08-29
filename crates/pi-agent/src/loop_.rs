@@ -31,6 +31,9 @@ pub struct AgentConfig {
     pub permission: Box<dyn PermissionPolicy>,
     pub transport: Option<pi_ai::Transport>,
     pub session_id: Option<String>,
+    pub base_url: Option<String>,
+    pub extra_headers: Vec<(String, String)>,
+    pub api: Option<String>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -63,6 +66,9 @@ impl Clone for AgentConfig {
             permission: Box::new(AllowAllPermissionPolicy),
             transport: self.transport,
             session_id: self.session_id.clone(),
+            base_url: self.base_url.clone(),
+            extra_headers: self.extra_headers.clone(),
+            api: self.api.clone(),
         }
     }
 }
@@ -139,6 +145,9 @@ pub fn run_agent(
             fixture: config.fixture.clone(),
             transport: config.transport,
             session_id: config.session_id.clone(),
+            base_url: config.base_url.clone(),
+            extra_headers: config.extra_headers.clone(),
+            api: config.api.clone(),
             ..StreamOptions::default()
         }) {
             Ok(assistant) => {
@@ -299,6 +308,9 @@ mod tests {
             permission: Box::new(AllowAllPermissionPolicy),
             transport: None,
             session_id: None,
+            base_url: None,
+            extra_headers: vec![],
+            api: None,
         };
         let mut steer = SteerQueue::default();
         let mut follow = FollowUpQueue::default();
@@ -358,6 +370,9 @@ mod tests {
             permission: Box::new(AllowAllPermissionPolicy),
             transport: None,
             session_id: None,
+            base_url: None,
+            extra_headers: vec![],
+            api: None,
         };
         let events = run_agent(
             &config,

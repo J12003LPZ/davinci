@@ -192,10 +192,17 @@ impl InteractiveMode {
         match cmd {
             "quit" | "exit" => return Ok(true),
             "help" => {
-                let body = BUILTIN_SLASH_COMMANDS
+                let mut body: Vec<String> = BUILTIN_SLASH_COMMANDS
                     .iter()
                     .map(|(name, desc)| format!("/{name}  {desc}"))
                     .collect();
+                for command in &self.runtime.registry.commands {
+                    body.push(format!(
+                        "/{}  {}",
+                        command.name,
+                        command.description.as_deref().unwrap_or("extension command")
+                    ));
+                }
                 self.tui.show_overlay(
                     Overlay::new("help", body).render(80),
                     OverlayOptions {
@@ -206,10 +213,20 @@ impl InteractiveMode {
                 self.chat.push("help", "slash commands overlay");
             }
             "hotkeys" => {
-                let keys = default_keybindings()
+                let mut keys: Vec<String> = default_keybindings()
                     .into_iter()
                     .map(|k| format!("{}  {}", k.key, k.action))
                     .collect();
+                for shortcut in &self.runtime.registry.shortcuts {
+                    keys.push(format!(
+                        "{}  {}",
+                        shortcut.shortcut,
+                        shortcut
+                            .description
+                            .as_deref()
+                            .unwrap_or("extension shortcut")
+                    ));
+                }
                 self.tui.show_overlay(
                     Overlay::new("hotkeys", keys).render(40),
                     OverlayOptions::default(),
@@ -456,12 +473,27 @@ impl InteractiveMode {
             "reload" => {
                 self.runtime.bus.clear();
                 extensions::attach_extensions(&self.runtime.bus, &self.discovered);
+                self.runtime.bind_extensions();
                 self.chat.push(
                     "system",
                     format!("reloaded ({} channels)", self.runtime.bus.channel_count()),
                 );
             }
-            other => self.chat.push("system", format!("/{other} {args}")),
+            other => {
+                if self.runtime.registry.command(other).is_some() {
+                    match self.runtime.invoke_registered_command(other, args) {
+                        Ok(events) => {
+                            for event in events {
+                                self.apply_ui_request(&event);
+                            }
+                            self.chat.push("system", format!("/{other}"));
+                        }
+                        Err(err) => self.chat.push("error", err),
+                    }
+                } else {
+                    self.chat.push("system", format!("/{other} {args}"));
+                }
+            }
         }
         Ok(false)
     }
