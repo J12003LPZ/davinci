@@ -1153,6 +1153,10 @@ fn run_interactive(
         DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
     session.autocomplete_max_visible =
         stored.autocomplete_max_visible.unwrap_or(8).clamp(3, 20) as usize;
+    session
+        .chrome
+        .editor
+        .set_padding_x(stored.editor_padding_x.unwrap_or(0) as usize);
     session.tree_filter_mode =
         FilterMode::parse(stored.tree_filter_mode.as_deref().unwrap_or("default"));
     session.mermaid_mode =
@@ -2183,6 +2187,11 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
                 session.autocomplete_max_visible = n.clamp(3, 20) as usize;
             }
         }
+        "editor-padding" => {
+            if let Ok(n) = value.parse::<usize>() {
+                session.chrome.editor.set_padding_x(n.min(3));
+            }
+        }
         "theme" => apply_theme_value(session, value),
         "warnings.anthropic-extra-usage" => {
             session.warnings_anthropic_extra_usage = value == "true";
@@ -2904,13 +2913,12 @@ fn launch_external_editor(session: &mut InteractiveSession) -> Result<(), String
     let stored = load_settings(&default_agent_dir());
     let editor = ExternalEditor::new(
         stored.external_editor.as_deref(),
-        &session.chrome.editor.buffer,
+        &session.chrome.editor.get_expanded_text(),
     )?;
     session.chrome.status = editor.launch_message();
     println!("{}", session.chrome.status);
     let text = editor.edit()?;
-    session.chrome.editor.buffer = text;
-    session.chrome.editor.cursor = session.chrome.editor.buffer.len();
+    session.chrome.editor.set_text(text);
     Ok(())
 }
 
@@ -2940,7 +2948,7 @@ fn paste_clipboard(session: &mut InteractiveSession) {
         session.place_kitty_image(&b64, Some(1));
         session.chrome.status = status;
     } else if let Some(text) = clipboard_text() {
-        session.chrome.editor.handle_input(&text);
+        session.chrome.editor.insert_text_at_cursor(&text);
         session.chrome.status = "pasted clipboard".into();
     } else {
         session.chrome.status = "clipboard empty".into();

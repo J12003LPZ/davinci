@@ -142,6 +142,8 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("tui.editor.cursorDown", &["down"]),
         ("tui.editor.historyPrevious", &[]),
         ("tui.editor.historyNext", &[]),
+        ("tui.editor.pageUp", &["pageUp", "ctrl+pageUp"]),
+        ("tui.editor.pageDown", &["pageDown", "ctrl+pageDown"]),
         ("tui.editor.cursorLeft", &["left", "ctrl+b"]),
         ("tui.editor.cursorRight", &["right", "ctrl+f"]),
         (
@@ -236,6 +238,10 @@ pub fn key_to_bytes(key: &str) -> String {
         "tab" => "\t".into(),
         "up" => "\x1b[A".into(),
         "down" => "\x1b[B".into(),
+        "pageUp" => "\x1b[5~".into(),
+        "pageDown" => "\x1b[6~".into(),
+        "ctrl+pageUp" => "\x1b[5;5~".into(),
+        "ctrl+pageDown" => "\x1b[6;5~".into(),
         "shift+enter" => "\n".into(),
         other => other.to_string(),
     }
@@ -275,6 +281,8 @@ mod tests {
         assert!(Keybindings::defaults()
             .keys_for("tui.editor.historyPrevious")
             .is_empty());
+        assert!(Keybindings::defaults().matches("\x1b[5~", "tui.editor.pageUp"));
+        assert!(Keybindings::defaults().matches("\x1b[6~", "tui.editor.pageDown"));
         let migrated = Keybindings::from_json(r#"{"clear":"ctrl+u"}"#);
         assert!(migrated.matches("\x15", "app.clear"));
     }

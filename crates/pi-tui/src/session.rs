@@ -1399,6 +1399,14 @@ impl InteractiveSession {
             editor.cursor_down();
             return true;
         }
+        if self.keybindings.matches(data, "tui.editor.pageUp") {
+            editor.page_up();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.pageDown") {
+            editor.page_down();
+            return true;
+        }
         if self.keybindings.matches(data, "tui.editor.cursorWordLeft") {
             editor.move_word_backwards();
             return true;
@@ -2024,5 +2032,15 @@ mod tests {
             .buffer
             .contains("[paste #1 +12 lines]"));
         assert_eq!(session.handle_bytes("\r"), SessionAction::Submit(big));
+        session.chrome.editor.set_text(
+            (0..40)
+                .map(|i| format!("row{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        session.chrome.editor.render(20);
+        let start_line = session.chrome.editor.get_cursor().0;
+        assert_eq!(session.handle_bytes("\x1b[5~"), SessionAction::None);
+        assert!(session.chrome.editor.get_cursor().0 < start_line);
     }
 }

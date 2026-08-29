@@ -23,6 +23,53 @@ pub fn visible_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// TS `visibleWidth`: strip ANSI/OSC/APC then measure columns.
+pub fn visible_width_stripped(text: &str) -> usize {
+    visible_width(&strip_terminal_sequences(text))
+}
+
+pub fn strip_terminal_sequences(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&b) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if i + 1 < bytes.len()
+                && (bytes[i + 1] == b']' || bytes[i + 1] == b'_' || bytes[i + 1] == b'^')
+            {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];

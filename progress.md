@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (editor prompt history, large-paste markers, multiline Up/Down). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (editor wrap/page/paste-delete + expanded external editor). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -93,6 +93,11 @@ Closed this slice: TUI `Input` matches TS `components/input.ts` — grapheme cur
 
 Closed this slice: TUI Editor prompt history matches TS `editor.test.ts` / `editor-history-keybindings.test.ts` — newest-first `addToHistory` (trim, skip empty, no consecutive dups, cap 100), Up on first line/col 0 or empty browses history, first Up from a mid-line draft jumps to start then restores the draft on Down, Down at last line while browsing continues, dedicated `historyPrevious`/`historyNext` skip the cursor-first step, typing exits browse. Large pastes (`>10` lines or `>1000` chars) insert `[paste #N +L lines]` / `[paste #N C chars]` markers that are atomic for left/right and expand on submit (TS `.trim()`). InteractiveSession Up/Down and bracketed paste use this path; `\\`+Enter inserts a newline.
 
+Closed this slice: TUI Editor wrap/page/paste-delete matches TS `editor.ts` / `editor.test.ts` — `wordWrapLine` (word + CJK + oversized marker split), bordered render with reverse-video cursor and `─── ↑/↓ N more` scroll, visual-line Up/Down with sticky column and paste-marker snap, `pageUp`/`pageDown`, backspace deletes a valid marker and renumbers the registry (undo restores pastes), typed fake markers stay non-atomic, `getExpandedText` feeds the external editor, `insertTextAtCursor` normalizes CRLF, `editorPaddingX` applies from settings. Tests: `vendor/pi/packages/tui/test/editor.test.ts`.
+
 Still not product-equivalent:
 
-- None from the prior documented backlog. TypeScript under `vendor/pi` remains the behavioral spec.
+- Codex websocket live socket reuse (TS `websocketSessionCache` keeps the TCP/TLS socket; Rust caches continuation state and reconnects per request).
+- In-editor AutocompleteProvider host (slash/`@` completion already runs on InteractiveSession).
+- Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
+- TypeScript under `vendor/pi` remains the behavioral spec.

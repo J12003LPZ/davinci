@@ -37,6 +37,7 @@ mod transcript;
 mod tree;
 mod undo_stack;
 mod word_nav;
+mod word_wrap;
 
 pub use autocomplete::{
     apply_completion, suggestions, AutocompleteItem, AutocompleteSuggestions, SlashCommandSpec,
@@ -88,7 +89,9 @@ pub use overlay::{
     resolve_anchor_row, resolve_overlay_layout, Overlay, OverlayAnchor, OverlayLayout,
     OverlayOptions, SizeValue,
 };
-pub use render::{visible_width, Component, Text};
+pub use render::{
+    strip_terminal_sequences, visible_width, visible_width_stripped, Component, Text,
+};
 pub use scoped_models::{
     clear_all, enable_all, get_sorted_ids, is_enabled, move_id, toggle, EnabledIds, ScopedModel,
     ScopedModelsAction, ScopedModelsSelector,
