@@ -1,5 +1,7 @@
 //! SQLite session backend matching `@earendil-works/pi-session-backend-sqlite-node`.
 
+mod branch_cache;
+
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,6 +9,11 @@ use pi_session::{now_ms, JsonlSession, SessionEntry, SessionError, SessionSummar
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use uuid::Uuid;
+
+pub use branch_cache::{
+    append_entry_to_branch_cache, branch_id_for_entry, delete_branch_cache, read_cached_branch_ids,
+    rebuild_branch_cache,
+};
 
 pub const INITIAL_MIGRATION_SQL: &str = include_str!("migrations/001_initial.sql");
 
@@ -127,12 +134,26 @@ impl SqliteSessionStore {
             )
             .map_err(|err| SessionError::storage(format!("Unable to upsert session: {err}")))?;
         for entry in &session.entries {
-            self.insert_entry(&session.header.id, entry)?;
+            self.insert_entry_row(&session.header.id, entry)?;
         }
+        self.rebuild_branch_cache(&session.header.id)?;
         Ok(())
     }
 
     pub fn insert_entry(&self, session_id: &str, entry: &SessionEntry) -> Result<(), SessionError> {
+        self.insert_entry_row(session_id, entry)?;
+        append_entry_to_branch_cache(
+            &self.conn,
+            session_id,
+            &entry.id,
+            entry.seq as i64,
+            &entry.entry_type,
+            entry.custom_type.as_deref(),
+            entry.parent_id.as_deref(),
+        )
+    }
+
+    fn insert_entry_row(&self, session_id: &str, entry: &SessionEntry) -> Result<(), SessionError> {
         let payload = serde_json::to_string(entry)
             .map_err(|err| SessionError::storage(format!("Unable to encode entry: {err}")))?;
         self.conn
@@ -151,6 +172,27 @@ impl SqliteSessionStore {
             )
             .map_err(|err| SessionError::storage(format!("Unable to insert entry: {err}")))?;
         Ok(())
+    }
+
+    pub fn delete_branch_cache(&self, session_id: &str) -> Result<(), SessionError> {
+        delete_branch_cache(&self.conn, session_id)
+    }
+
+    pub fn rebuild_branch_cache(&self, session_id: &str) -> Result<(), SessionError> {
+        rebuild_branch_cache(&self.conn, session_id)
+    }
+
+    pub fn cached_branch_ids(
+        &self,
+        session_id: &str,
+        leaf_id: &str,
+    ) -> Result<Vec<String>, SessionError> {
+        let Some(branch_id) = branch_id_for_entry(&self.conn, session_id, leaf_id)? else {
+            return Err(SessionError::invalid_entry(format!(
+                "Branch cache has no branch containing parent entry {leaf_id}"
+            )));
+        };
+        read_cached_branch_ids(&self.conn, session_id, &branch_id)
     }
 
     pub fn list_sessions(&self, cwd: Option<&str>) -> Result<Vec<SessionSummary>, SessionError> {
@@ -791,5 +833,81 @@ mod tests {
             .find_records(&RecordQuery::default())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn branch_cache_rebuild_and_append_lock_ts_strings() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/branch", None).unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"root"}]),
+            ))
+            .unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "assistant",
+                serde_json::json!([{"type":"text","text":"child"}]),
+            ))
+            .unwrap();
+        store.import_jsonl(&session).unwrap();
+        let root_id = &session.entries[0].id;
+        let child_id = &session.entries[1].id;
+        assert_eq!(
+            store
+                .cached_branch_ids(&session.header.id, child_id)
+                .unwrap(),
+            vec![root_id.clone(), child_id.clone()]
+        );
+
+        store.delete_branch_cache(&session.header.id).unwrap();
+        let missing = store.cached_branch_ids(&session.header.id, child_id);
+        assert_eq!(missing.as_ref().unwrap_err().code, "invalid_entry");
+        assert!(missing
+            .unwrap_err()
+            .message
+            .contains("has no branch containing parent entry"));
+
+        let later = SessionEntry {
+            id: "later".into(),
+            entry_type: "message".into(),
+            parent_id: Some(child_id.clone()),
+            seq: 3,
+            timestamp: 3,
+            message: Some(serde_json::json!({"role":"assistant","content":[]})),
+            custom_type: None,
+            extra: serde_json::Map::new(),
+        };
+        let append = store.insert_entry(&session.header.id, &later);
+        assert_eq!(append.as_ref().unwrap_err().code, "invalid_entry");
+        assert_eq!(
+            append.unwrap_err().message,
+            format!("Branch cache has no branch containing parent entry {child_id}")
+        );
+
+        store.rebuild_branch_cache(&session.header.id).unwrap();
+        assert_eq!(
+            store
+                .cached_branch_ids(&session.header.id, child_id)
+                .unwrap(),
+            vec![root_id.clone(), child_id.clone()]
+        );
+
+        store.insert_entry(&session.header.id, &later).unwrap();
+        assert_eq!(
+            store
+                .cached_branch_ids(&session.header.id, "later")
+                .unwrap(),
+            vec![root_id.clone(), child_id.clone(), "later".into()]
+        );
+        let tip_changed =
+            SessionError::invalid_entry(format!("Branch tip {child_id} changed during append"));
+        assert_eq!(tip_changed.code, "invalid_entry");
+        assert_eq!(
+            tip_changed.message,
+            format!("Branch tip {child_id} changed during append")
+        );
     }
 }

@@ -9,7 +9,11 @@ pub enum AgentEvent {
     #[serde(rename = "agent_start")]
     AgentStart,
     #[serde(rename = "agent_end")]
-    AgentEnd { messages: Vec<ChatMessage> },
+    AgentEnd {
+        messages: Vec<ChatMessage>,
+        #[serde(rename = "willRetry", default)]
+        will_retry: bool,
+    },
     #[serde(rename = "turn_start")]
     TurnStart,
     #[serde(rename = "turn_end")]

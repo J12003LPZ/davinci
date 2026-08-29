@@ -1,9 +1,10 @@
 //! Protocol server matching `@earendil-works/pi-server`.
 
-use std::collections::HashMap;
+mod unix;
+
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -20,6 +21,12 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use unix::{
+    bind_unix, bind_unix_with, max_unix_socket_path_bytes, owned_bind_path,
+    resolve_unix_listener_options, validate_unix_socket_path, BoundUnixListener,
+    UnixListenerOptions, UnixListenerOptionsBuilder, DEFAULT_SOCKET_MODE,
+};
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("{0}")]
@@ -35,7 +42,14 @@ struct LiveSession {
     model: ModelRef,
     thinking_level: ThinkingLevel,
     queued_steer: Vec<TranscriptItem>,
-    attached: bool,
+    connections: HashSet<String>,
+    operation_count: u32,
+    terminal: bool,
+    disposing: bool,
+}
+
+struct ConnectionState {
+    session_ids: HashSet<String>,
 }
 
 fn new_runtime_agent(cwd: &str) -> Agent {
@@ -49,7 +63,8 @@ pub struct PiServer {
     pub sessions_dir: PathBuf,
     pub handshake_timeout: Duration,
     pub revision: u64,
-    attachments: HashMap<String, String>,
+    connections: HashMap<String, ConnectionState>,
+    current_connection: String,
     live: HashMap<String, LiveSession>,
     pending_events: Vec<ServerEvent>,
 }
@@ -61,10 +76,20 @@ impl PiServer {
             sessions_dir,
             handshake_timeout: Duration::from_secs(5),
             revision: 0,
-            attachments: HashMap::new(),
+            connections: HashMap::new(),
+            current_connection: "memory".into(),
             live: HashMap::new(),
             pending_events: Vec::new(),
         }
+    }
+
+    fn ensure_connection(&mut self, connection_id: &str) {
+        self.connections
+            .entry(connection_id.to_string())
+            .or_insert_with(|| ConnectionState {
+                session_ids: HashSet::new(),
+            });
+        self.current_connection = connection_id.to_string();
     }
 
     pub fn take_events(&mut self) -> Vec<ServerEvent> {
@@ -218,9 +243,11 @@ impl PiServer {
                         },
                     };
                 }
+                let connection_id = Uuid::new_v4().to_string();
+                self.ensure_connection(&connection_id);
                 ServerMessage::Hello {
                     version: PROTOCOL_VERSION,
-                    connection_id: Uuid::new_v4().to_string(),
+                    connection_id,
                     snapshot: self.snapshot(),
                 }
             }
@@ -266,96 +293,47 @@ impl PiServer {
                     model: model.unwrap_or_else(pi_protocol::default_model_ref),
                     thinking_level: thinking_level.unwrap_or(ThinkingLevel::Off),
                     queued_steer: Vec::new(),
-                    attached: true,
+                    connections: HashSet::new(),
+                    operation_count: 0,
+                    terminal: false,
+                    disposing: false,
                 };
                 self.live.insert(id.clone(), live);
+                self.attach_connection(&id)?;
                 self.revision += 1;
                 Ok(CommandResult::Create {
                     session: self.live_snapshot(&id)?,
                 })
             }
             Command::Attach { session_id } => {
-                self.attachments
-                    .insert(session_id.clone(), "attached".into());
-                self.ensure_live(&session_id)?;
-                if let Some(live) = self.live.get_mut(&session_id) {
-                    live.attached = true;
-                }
+                self.acquire(&session_id)?;
+                self.attach_connection(&session_id)?;
                 Ok(CommandResult::Attach {
                     session: self.live_snapshot(&session_id)?,
                 })
             }
             Command::Detach { session_id } => {
-                self.attachments.remove(&session_id);
-                if let Some(live) = self.live.get_mut(&session_id) {
-                    live.attached = false;
-                }
+                self.detach_connection(&session_id);
                 Ok(CommandResult::Detach { session_id })
             }
             Command::Prompt { session_id, text } => {
-                self.ensure_live(&session_id)?;
-                let mut loop_events = Vec::new();
+                self.require_attached(&session_id)?;
                 {
                     let live = self
                         .live
-                        .get_mut(&session_id)
+                        .get(&session_id)
                         .ok_or_else(|| not_found(&session_id))?;
                     if live.phase != SessionPhase::Idle {
                         return Err(busy("A prompt is already running"));
                     }
-                    live.session
-                        .append_entry(pi_session::SessionEntry::message(
-                            "user",
-                            serde_json::json!([{"type":"text","text": text}]),
-                        ))
-                        .map_err(internal)?;
-                    live.agent.prompt(&text);
-                    live.phase = SessionPhase::Turn;
-                    live.queued_steer.clear();
-                    if std::env::var("PI_SERVER_KEEP_TURN").is_err() {
-                        let user_text = text.clone();
-                        loop_events = live
-                            .agent
-                            .run_loop(|_| {
-                                let reply = std::env::var("PI_SERVER_PROMPT_REPLY")
-                                    .ok()
-                                    .map(|value| {
-                                        if value.is_empty() {
-                                            format!("reply:{user_text}")
-                                        } else {
-                                            value
-                                        }
-                                    })
-                                    .unwrap_or_else(|| format!("reply:{user_text}"));
-                                Ok(AssistantMessage {
-                                    id: pi_agent::new_message_id(),
-                                    role: "assistant".into(),
-                                    content: vec![ContentBlock::Text { text: reply }],
-                                    model: "server".into(),
-                                    usage: None,
-                                    stop_reason: Some(StopReason::Stop),
-                                    error_message: None,
-                                })
-                            })
-                            .map_err(internal)?;
-                        if let Some(reply) = live.agent.last_assistant_text() {
-                            live.session
-                                .append_entry(pi_session::SessionEntry::message(
-                                    "assistant",
-                                    serde_json::json!([{"type":"text","text": reply}]),
-                                ))
-                                .map_err(internal)?;
-                        }
-                        live.phase = SessionPhase::Idle;
-                    }
                 }
-                let session = self.live_snapshot(&session_id)?;
-                self.emit_runtime_progress(&session_id, &loop_events);
-                self.emit_prompt_progress(&session_id, &session);
-                Ok(CommandResult::Prompt { session })
+                self.begin_operation(&session_id);
+                let result = self.run_prompt(&session_id, &text);
+                self.end_operation(&session_id);
+                result
             }
             Command::Steer { session_id, text } => {
-                self.ensure_live(&session_id)?;
+                self.require_attached(&session_id)?;
                 {
                     let live = self
                         .live
@@ -376,7 +354,7 @@ impl PiServer {
                 })
             }
             Command::Abort { session_id } => {
-                self.ensure_live(&session_id)?;
+                self.require_attached(&session_id)?;
                 {
                     let live = self
                         .live
@@ -399,7 +377,7 @@ impl PiServer {
                 })
             }
             Command::SetModel { session_id, model } => {
-                self.ensure_live(&session_id)?;
+                self.require_attached(&session_id)?;
                 {
                     let live = self
                         .live
@@ -418,7 +396,7 @@ impl PiServer {
                 session_id,
                 thinking_level,
             } => {
-                self.ensure_live(&session_id)?;
+                self.require_attached(&session_id)?;
                 {
                     let live = self
                         .live
@@ -436,7 +414,19 @@ impl PiServer {
         }
     }
 
-    fn ensure_live(&mut self, session_id: &str) -> Result<(), ProtocolError> {
+    fn acquire(&mut self, session_id: &str) -> Result<(), ProtocolError> {
+        if let Some(live) = self.live.get(session_id) {
+            if live.terminal || live.disposing {
+                return Err(session_locked(&format!(
+                    "Session runtime is terminating: {session_id}"
+                )));
+            }
+            return Ok(());
+        }
+        self.open_live(session_id)
+    }
+
+    fn open_live(&mut self, session_id: &str) -> Result<(), ProtocolError> {
         if self.live.contains_key(session_id) {
             return Ok(());
         }
@@ -452,10 +442,81 @@ impl PiServer {
                 model: pi_protocol::default_model_ref(),
                 thinking_level: ThinkingLevel::Off,
                 queued_steer: Vec::new(),
-                attached: self.attachments.contains_key(session_id),
+                connections: HashSet::new(),
+                operation_count: 0,
+                terminal: false,
+                disposing: false,
             },
         );
         Ok(())
+    }
+
+    fn attach_connection(&mut self, session_id: &str) -> Result<(), ProtocolError> {
+        self.ensure_connection(&self.current_connection.clone());
+        let connection_id = self.current_connection.clone();
+        let live = self
+            .live
+            .get_mut(session_id)
+            .ok_or_else(|| not_found(session_id))?;
+        if live.terminal || live.disposing {
+            return Err(session_locked(&format!(
+                "Session runtime is terminating: {session_id}"
+            )));
+        }
+        live.connections.insert(connection_id.clone());
+        if let Some(connection) = self.connections.get_mut(&connection_id) {
+            connection.session_ids.insert(session_id.to_string());
+        }
+        Ok(())
+    }
+
+    fn detach_connection(&mut self, session_id: &str) {
+        let connection_id = self.current_connection.clone();
+        if let Some(connection) = self.connections.get_mut(&connection_id) {
+            connection.session_ids.remove(session_id);
+        }
+        if let Some(live) = self.live.get_mut(session_id) {
+            live.connections.remove(&connection_id);
+        }
+        self.maybe_dispose(session_id);
+    }
+
+    fn require_attached(&mut self, session_id: &str) -> Result<(), ProtocolError> {
+        self.ensure_connection(&self.current_connection.clone());
+        let connection_id = self.current_connection.clone();
+        let attached = self
+            .connections
+            .get(&connection_id)
+            .is_some_and(|connection| connection.session_ids.contains(session_id));
+        if !attached {
+            return Err(invalid_request(&format!(
+                "Connection is not attached to session {session_id}"
+            )));
+        }
+        let live = self
+            .live
+            .get(session_id)
+            .ok_or_else(|| not_live(session_id))?;
+        if live.terminal || live.disposing {
+            return Err(not_live(session_id));
+        }
+        Ok(())
+    }
+
+    fn maybe_dispose(&mut self, session_id: &str) {
+        let should_dispose = self.live.get(session_id).is_some_and(|live| {
+            !live.disposing
+                && live.connections.is_empty()
+                && live.operation_count == 0
+                && (live.terminal || live.phase == SessionPhase::Idle)
+        });
+        if !should_dispose {
+            return;
+        }
+        if let Some(live) = self.live.get_mut(session_id) {
+            live.disposing = true;
+        }
+        self.live.remove(session_id);
     }
 
     fn live_snapshot(&self, session_id: &str) -> Result<SessionSnapshot, ProtocolError> {
@@ -463,7 +524,107 @@ impl PiServer {
             .live
             .get(session_id)
             .ok_or_else(|| not_found(session_id))?;
-        Ok(snapshot_from_live(live))
+        let mut snapshot = snapshot_from_live(live);
+        snapshot.attached = self
+            .connections
+            .get(&self.current_connection)
+            .is_some_and(|connection| connection.session_ids.contains(session_id));
+        Ok(snapshot)
+    }
+
+    pub fn disconnect(&mut self, connection_id: &str) {
+        let sessions = self
+            .connections
+            .remove(connection_id)
+            .map(|connection| connection.session_ids)
+            .unwrap_or_default();
+        for session_id in sessions {
+            if let Some(live) = self.live.get_mut(&session_id) {
+                live.connections.remove(connection_id);
+            }
+            self.maybe_dispose(&session_id);
+        }
+        if self.current_connection == connection_id {
+            self.current_connection = "memory".into();
+        }
+    }
+
+    pub fn mark_terminal(&mut self, session_id: &str) {
+        if let Some(live) = self.live.get_mut(session_id) {
+            live.terminal = true;
+        }
+    }
+
+    fn run_prompt(&mut self, session_id: &str, text: &str) -> Result<CommandResult, ProtocolError> {
+        let mut loop_events = Vec::new();
+        {
+            let live = self
+                .live
+                .get_mut(session_id)
+                .ok_or_else(|| not_found(session_id))?;
+            live.session
+                .append_entry(pi_session::SessionEntry::message(
+                    "user",
+                    serde_json::json!([{"type":"text","text": text}]),
+                ))
+                .map_err(internal)?;
+            live.agent.prompt(text);
+            live.phase = SessionPhase::Turn;
+            live.queued_steer.clear();
+            if std::env::var("PI_SERVER_KEEP_TURN").is_err() {
+                let user_text = text.to_string();
+                loop_events = live
+                    .agent
+                    .run_loop(|_| {
+                        let reply = std::env::var("PI_SERVER_PROMPT_REPLY")
+                            .ok()
+                            .map(|value| {
+                                if value.is_empty() {
+                                    format!("reply:{user_text}")
+                                } else {
+                                    value
+                                }
+                            })
+                            .unwrap_or_else(|| format!("reply:{user_text}"));
+                        Ok(AssistantMessage {
+                            id: pi_agent::new_message_id(),
+                            role: "assistant".into(),
+                            content: vec![ContentBlock::Text { text: reply }],
+                            model: "server".into(),
+                            usage: None,
+                            stop_reason: Some(StopReason::Stop),
+                            error_message: None,
+                        })
+                    })
+                    .map_err(internal)?;
+                if let Some(reply) = live.agent.last_assistant_text() {
+                    live.session
+                        .append_entry(pi_session::SessionEntry::message(
+                            "assistant",
+                            serde_json::json!([{"type":"text","text": reply}]),
+                        ))
+                        .map_err(internal)?;
+                }
+                live.phase = SessionPhase::Idle;
+            }
+        }
+        let session = self.live_snapshot(session_id)?;
+        self.emit_runtime_progress(session_id, &loop_events);
+        self.emit_prompt_progress(session_id, &session);
+        Ok(CommandResult::Prompt { session })
+    }
+
+    fn begin_operation(&mut self, session_id: &str) {
+        if let Some(live) = self.live.get_mut(session_id) {
+            live.operation_count = live.operation_count.saturating_add(1);
+        }
+    }
+
+    fn end_operation(&mut self, session_id: &str) {
+        if let Some(live) = self.live.get_mut(session_id) {
+            live.operation_count = live.operation_count.saturating_sub(1);
+        }
+        self.maybe_dispose(session_id);
     }
 }
 
@@ -487,8 +648,8 @@ fn snapshot_from_live(live: &LiveSession) -> SessionSnapshot {
         phase: live.phase,
         model: live.model.clone(),
         thinking_level: live.thinking_level,
-        attached: live.attached,
-        locked: live.phase != SessionPhase::Idle,
+        attached: !live.connections.is_empty(),
+        locked: live.phase != SessionPhase::Idle || live.terminal,
         revision: live.session.entries.len() as u64,
         transcript: transcript_from_jsonl(&live.session, &live.model),
         queued_steer: live.queued_steer.clone(),
@@ -619,6 +780,30 @@ fn busy(message: &str) -> ProtocolError {
     }
 }
 
+fn session_locked(message: &str) -> ProtocolError {
+    ProtocolError {
+        code: ProtocolErrorCode::SessionLocked,
+        message: message.into(),
+        details: None,
+    }
+}
+
+fn invalid_request(message: &str) -> ProtocolError {
+    ProtocolError {
+        code: ProtocolErrorCode::InvalidRequest,
+        message: message.into(),
+        details: None,
+    }
+}
+
+fn not_live(session_id: &str) -> ProtocolError {
+    ProtocolError {
+        code: ProtocolErrorCode::NotFound,
+        message: format!("Session is not live: {session_id}"),
+        details: None,
+    }
+}
+
 fn not_found(session_id: &str) -> ProtocolError {
     ProtocolError {
         code: ProtocolErrorCode::NotFound,
@@ -697,10 +882,6 @@ fn read_auth_line<R: Read>(stream: &mut R) -> Result<Vec<u8>, ServerError> {
         }
     }
     Ok(buf)
-}
-
-pub fn bind_unix(path: &str) -> Result<UnixListener, ServerError> {
-    UnixListener::bind(path).map_err(|err| ServerError::Io(err.to_string()))
 }
 
 pub fn bind_tcp(addr: &str) -> Result<TcpListener, ServerError> {
@@ -1037,5 +1218,126 @@ mod tests {
                 .to_string(),
             "Unauthorized"
         );
+    }
+
+    #[test]
+    fn unix_listener_validates_path_and_binds_private_link() {
+        assert_eq!(
+            validate_unix_socket_path("", "PiServer Unix socket path")
+                .unwrap_err()
+                .to_string(),
+            "PiServer Unix socket path must not be empty"
+        );
+        let too_long = "x".repeat(max_unix_socket_path_bytes() + 1);
+        assert!(
+            validate_unix_socket_path(&too_long, "PiServer Unix socket path")
+                .unwrap_err()
+                .to_string()
+                .contains("is too long; maximum is")
+        );
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pi.sock");
+        let path_str = path.to_string_lossy().into_owned();
+        let bound = bind_unix(&path_str).unwrap();
+        assert!(path.exists());
+        assert!(bound.owned_bind_path.exists());
+        assert_eq!(bound.owned_bind_path, owned_bind_path(&path_str));
+        let again = bind_unix(&path_str);
+        assert!(again
+            .unwrap_err()
+            .to_string()
+            .contains("Unix listener is already running"));
+        drop(bound);
+    }
+
+    #[test]
+    fn attach_sets_and_exclusive_acquire_match_ts() {
+        let dir = tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let created = create_session(&mut server);
+        assert!(created.attached);
+        let first = memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "a1".into(),
+                request: Command::Attach {
+                    session_id: created.id.clone(),
+                },
+            },
+        );
+        match first {
+            ServerMessage::Response {
+                result: Some(CommandResult::Attach { session }),
+                ..
+            } => assert!(session.attached),
+            other => panic!("expected attach: {other:?}"),
+        }
+        let _ = memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "d1".into(),
+                request: Command::Detach {
+                    session_id: created.id.clone(),
+                },
+            },
+        );
+        assert!(!server.live.contains_key(&created.id));
+        let prompt = memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "p1".into(),
+                request: Command::Prompt {
+                    session_id: created.id.clone(),
+                    text: "hi".into(),
+                },
+            },
+        );
+        match prompt {
+            ServerMessage::Response {
+                ok: false,
+                error: Some(error),
+                ..
+            } => {
+                assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+                assert_eq!(
+                    error.message,
+                    format!("Connection is not attached to session {}", created.id)
+                );
+            }
+            other => panic!("expected not attached: {other:?}"),
+        }
+        let _ = memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "a2".into(),
+                request: Command::Attach {
+                    session_id: created.id.clone(),
+                },
+            },
+        );
+        server.mark_terminal(&created.id);
+        let locked = memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "a3".into(),
+                request: Command::Attach {
+                    session_id: created.id.clone(),
+                },
+            },
+        );
+        match locked {
+            ServerMessage::Response {
+                ok: false,
+                error: Some(error),
+                ..
+            } => {
+                assert_eq!(error.code, ProtocolErrorCode::SessionLocked);
+                assert_eq!(
+                    error.message,
+                    format!("Session runtime is terminating: {}", created.id)
+                );
+            }
+            other => panic!("expected session_locked: {other:?}"),
+        }
     }
 }

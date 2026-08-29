@@ -1054,13 +1054,14 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                     "assistant",
                     format!("Provider error: {err}"),
                 )],
+                will_retry: false,
             }]
         });
     let reply = agent
         .last_assistant_text()
         .or_else(|| {
             events.iter().rev().find_map(|event| match event {
-                AgentEvent::AgentEnd { messages } => messages
+                AgentEvent::AgentEnd { messages, .. } => messages
                     .iter()
                     .rev()
                     .find(|m| m.role == "assistant")
@@ -1286,6 +1287,7 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         let command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
         let is_prompt = command.kind == "prompt";
         let response = handle_rpc(&mut runtime, command.clone());
+        let mut extras = runtime.take_events();
         for request in rpc::extension_ui_requests_from_calls(&host.ui_calls) {
             println!(
                 "{}",
@@ -1315,6 +1317,13 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                     serde_json::to_string(&event).map_err(|err| err.to_string())?
                 );
             }
+            extras.push(rpc::RpcSessionEvent::AgentSettled);
+        }
+        for event in extras {
+            println!(
+                "{}",
+                serde_json::to_string(&event).map_err(|err| err.to_string())?
+            );
         }
         println!(
             "{}",

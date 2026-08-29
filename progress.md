@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (server agent-loop runtime, transport AUTH preamble, missing extension events, evals harness). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (RPC `AgentSessionEvent` extras, SQLite branch-cache, Unix listener mode/link + attach sets + exclusive acquire/dispose). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -121,10 +121,9 @@ Closed this slice: `pi-client` `Connection` + `ByteTransport` matching TS framed
 
 Closed this slice: `pi-server` prompt drives `Agent::run_loop` (fixture `PI_SERVER_PROMPT_REPLY` or TS `reply:{text}`; `PI_SERVER_KEEP_TURN` still holds the turn). Transport AUTH preamble (`AUTH {token}\\n`) is required before protocol bytes when `--auth-token` is set. Extension bus adds `project_trust`, `resources_discover`, `session_compact`/`_failed`, `session_tree`, `before_provider_headers`, `after_provider_response`, `ui_prompt_start`/`end`, `model_select`, `thinking_level_select`. `pi-evals` `run_harness` locks TS error strings and transcript tool_call/tool_result events. Telemetry schema records typed span/attribute definitions.
 
+Closed this slice: RPC streams TS `AgentSessionEvent` extras (`queue_update`, `compaction_start`/`compaction_end`, `session_info_changed`, `thinking_level_changed`, `agent_settled`) and `agent_end.willRetry`. `pi-session-sqlite` ports `branch_tips`/`branch_entries` rebuild/append with TS error strings (`Failed to build SQLite branch cache at entry`, `Branch tip changed during append`, `has no branch containing parent entry`). `pi-server` Unix bind uses private `.p-{sha256}` path, `link` to the public socket, mode `0o600`, parent `0o700`, and TS path/mode/`maxFrameLength` validation; live sessions use per-connection attach sets, exclusive acquire (`session_locked` while terminating), and dispose when idle and unattached.
+
 Still not product-equivalent:
 
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
 - TypeScript under `vendor/pi` remains the behavioral spec.
-- `pi-server` is still not the full TS listener service (unix socket mode/link, multi-connection attach sets, exclusive runtime acquire/dispose).
-- RPC `AgentSessionEvent` extras (`queue_update`, `compaction_*`, `session_info_changed` streaming) remain incomplete.
-- `pi-session-sqlite` branch-cache / full TS repository API remains thinner than TypeScript.

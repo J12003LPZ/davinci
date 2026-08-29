@@ -155,13 +155,12 @@ pub fn run_server(command: ServerCommand) -> Result<String, String> {
         ));
     }
     let address = &command.listen[0];
-    let _ = std::fs::remove_file(&address.path);
     let listener = bind_unix(&address.path).map_err(|err| err.to_string())?;
     let sessions_dir = std::env::var("PI_SESSION_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| pi_session::default_session_dir());
     let mut server = PiServer::new(sessions_dir);
-    let (stream, _) = listener.accept().map_err(|err| err.to_string())?;
+    let stream = listener.accept().map_err(|err| err.to_string())?;
     serve_stream_with_auth(&mut server, stream, command.auth_token.as_deref())
         .map_err(|err| err.to_string())?;
     Ok(format!("Served {}", address.path))

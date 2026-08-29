@@ -66,6 +66,7 @@ impl Agent {
             if self.aborted {
                 events.push(AgentEvent::AgentEnd {
                     messages: new_messages,
+                    will_retry: false,
                 });
                 self.is_streaming = false;
                 return Ok(events);
@@ -118,6 +119,7 @@ impl Agent {
                 });
                 events.push(AgentEvent::AgentEnd {
                     messages: new_messages,
+                    will_retry: false,
                 });
                 self.is_streaming = false;
                 return Ok(events);
@@ -248,6 +250,7 @@ impl Agent {
 
         events.push(AgentEvent::AgentEnd {
             messages: new_messages,
+            will_retry: false,
         });
         self.is_streaming = false;
         Ok(events)

@@ -797,6 +797,7 @@ dependencies = [
 name = "pi-server"
 version = "0.84.4"
 dependencies = [
+ "pi-agent",
  "pi-ai",
  "pi-client",
  "pi-protocol",

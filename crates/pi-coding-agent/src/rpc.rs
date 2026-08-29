@@ -79,6 +79,38 @@ pub struct RpcResponse {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RpcSessionEvent {
+    QueueUpdate {
+        steering: Vec<String>,
+        #[serde(rename = "followUp")]
+        follow_up: Vec<String>,
+    },
+    CompactionStart {
+        reason: String,
+    },
+    CompactionEnd {
+        reason: String,
+        result: Option<Value>,
+        aborted: bool,
+        #[serde(rename = "willRetry")]
+        will_retry: bool,
+        #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    },
+    SessionInfoChanged {
+        name: Option<String>,
+    },
+    ThinkingLevelChanged {
+        level: ThinkingLevel,
+    },
+    AgentSettled,
+    EntryAppended {
+        entry: Value,
+    },
+}
+
 pub struct RpcRuntime {
     pub agent: Agent,
     pub session_dir: PathBuf,
@@ -88,6 +120,7 @@ pub struct RpcRuntime {
     pub bash_aborted: bool,
     pub invocable_commands: Vec<Value>,
     pub pending_ui: std::collections::HashMap<String, RpcCommand>,
+    pub pending_events: Vec<RpcSessionEvent>,
 }
 
 impl RpcRuntime {
@@ -102,7 +135,37 @@ impl RpcRuntime {
             bash_aborted: false,
             invocable_commands: Vec::new(),
             pending_ui: std::collections::HashMap::new(),
+            pending_events: Vec::new(),
         }
+    }
+
+    pub fn take_events(&mut self) -> Vec<RpcSessionEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    fn emit(&mut self, event: RpcSessionEvent) {
+        self.pending_events.push(event);
+    }
+
+    fn emit_queue_update(&mut self) {
+        let steering = self
+            .agent
+            .queues
+            .steer
+            .iter()
+            .map(|message| message.text.clone())
+            .collect();
+        let follow_up = self
+            .agent
+            .queues
+            .follow_up
+            .iter()
+            .map(|message| message.text.clone())
+            .collect();
+        self.emit(RpcSessionEvent::QueueUpdate {
+            steering,
+            follow_up,
+        });
     }
 
     fn current_model(&self) -> Option<&Model> {
@@ -228,6 +291,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 );
                 runtime.agent.queues.enqueue_steer_with(&text, images);
             }
+            runtime.emit_queue_update();
             ok(id, &kind, None)
         }
         "follow_up" => {
@@ -244,6 +308,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 );
                 runtime.agent.queues.enqueue_follow_up_with(&text, images);
             }
+            runtime.emit_queue_update();
             ok(id, &kind, None)
         }
         "abort" => {
@@ -252,6 +317,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
         }
         "clear_queue" => {
             let (steering, follow_up) = runtime.agent.queues.clear();
+            runtime.emit_queue_update();
             ok(
                 id,
                 &kind,
@@ -279,6 +345,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
         "set_thinking_level" => {
             if let Some(level) = command.level.as_deref().and_then(ThinkingLevel::parse) {
                 runtime.agent.thinking_level = level;
+                runtime.emit(RpcSessionEvent::ThinkingLevelChanged { level });
             }
             ok(id, &kind, None)
         }
@@ -291,9 +358,19 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             ok(id, &kind, None)
         }
         "compact" => {
+            runtime.emit(RpcSessionEvent::CompactionStart {
+                reason: "manual".into(),
+            });
             let result = runtime
                 .agent
                 .compact(command.custom_instructions.as_deref());
+            runtime.emit(RpcSessionEvent::CompactionEnd {
+                reason: "manual".into(),
+                result: Some(serde_json::to_value(&result).unwrap_or(Value::Null)),
+                aborted: false,
+                will_retry: false,
+                error_message: None,
+            });
             ok(
                 id,
                 &kind,
@@ -333,6 +410,9 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 (runtime.agent.session.as_mut(), command.name.as_deref())
             {
                 let _ = session.set_name(name);
+                runtime.emit(RpcSessionEvent::SessionInfoChanged {
+                    name: session.display_name(),
+                });
             }
             ok(id, &kind, None)
         }
@@ -784,6 +864,7 @@ fn fail(id: Option<String>, command: &str, error: String) -> RpcResponse {
 mod tests {
     use super::*;
     use pi_agent::default_system_prompt;
+    use pi_session::JsonlSession;
 
     #[test]
     fn extension_ui_protocol_matches_ts_shapes() {
@@ -935,5 +1016,99 @@ mod tests {
             },
         );
         assert_eq!(single.data, Some(Value::Null));
+    }
+
+    #[test]
+    fn session_events_match_ts_agent_session_extras() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/rpc", Some("named")).unwrap();
+        session
+            .append_entry(pi_session::SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"hi"}]),
+            ))
+            .unwrap();
+        let mut runtime = RpcRuntime::new(
+            pi_agent::Agent::new(default_system_prompt()),
+            dir.path().to_path_buf(),
+            PathBuf::from("/tmp"),
+        );
+        runtime.agent.session = Some(session);
+        let steer = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "steer".into(),
+                message: Some("nudge".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(steer.success);
+        let follow = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "follow_up".into(),
+                message: Some("later".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(follow.success);
+        let thinking = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "set_thinking_level".into(),
+                level: Some("high".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(thinking.success);
+        let compact = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "compact".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(compact.success);
+        let named = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "set_session_name".into(),
+                name: Some("renamed".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(named.success);
+        let events = runtime.take_events();
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| match event {
+                RpcSessionEvent::QueueUpdate { .. } => "queue_update",
+                RpcSessionEvent::CompactionStart { .. } => "compaction_start",
+                RpcSessionEvent::CompactionEnd { .. } => "compaction_end",
+                RpcSessionEvent::SessionInfoChanged { .. } => "session_info_changed",
+                RpcSessionEvent::ThinkingLevelChanged { .. } => "thinking_level_changed",
+                RpcSessionEvent::AgentSettled => "agent_settled",
+                RpcSessionEvent::EntryAppended { .. } => "entry_appended",
+            })
+            .collect();
+        assert!(kinds.contains(&"queue_update"));
+        assert!(kinds.contains(&"compaction_start"));
+        assert!(kinds.contains(&"compaction_end"));
+        assert!(kinds.contains(&"thinking_level_changed"));
+        assert!(kinds.contains(&"session_info_changed"));
+        let queue = events
+            .iter()
+            .find_map(|event| match event {
+                RpcSessionEvent::QueueUpdate {
+                    steering,
+                    follow_up,
+                } => Some((steering.clone(), follow_up.clone())),
+                _ => None,
+            })
+            .expect("queue_update");
+        assert_eq!(queue.0, vec!["nudge".to_string()]);
+        assert_eq!(queue.1, vec!["later".to_string()]);
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert!(json.get("type").is_some());
     }
 }
