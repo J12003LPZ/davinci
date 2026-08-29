@@ -41,4 +41,4 @@ Re-audit the Done bar against `vendor/pi/packages/*` and the numbered backlog. D
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: 2026-08-29 — `pi-tui` lib tests green after TuiAltScreen word/line selection, overlay deferral, auto-scroll, right-click paste, and `compositeTuiLine` base-text fixtures. Workspace gates pending this slice.
+Last run: 2026-08-29 — `cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings` green on 1.83.0 after TuiAltScreen word/line selection, overlay deferral, auto-scroll, right-click paste, and `compositeTuiLine` base-text fixtures.
