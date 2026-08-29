@@ -113,6 +113,23 @@ impl SettingsDocument {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     }
+
+    pub fn npm_command(&self) -> Option<Vec<String>> {
+        let args = self
+            .value
+            .get("npmCommand")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })?;
+        if args.is_empty() || args.iter().all(|s| s.is_empty()) {
+            None
+        } else {
+            Some(args)
+        }
+    }
 }
 
 pub fn trust_store_path(agent_dir: &Path) -> PathBuf {

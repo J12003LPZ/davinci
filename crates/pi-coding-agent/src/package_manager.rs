@@ -563,6 +563,90 @@ fn spawn_allowed() -> bool {
     !network_disabled()
 }
 
+pub fn configured_npm_command() -> Option<Vec<String>> {
+    SettingsDocument::load(&settings_path(false)).npm_command()
+}
+
+pub fn package_manager_name(argv: &[String]) -> String {
+    if argv.is_empty() {
+        return String::new();
+    }
+    let command = argv
+        .iter()
+        .rposition(|part| part == "--")
+        .and_then(|idx| argv.get(idx + 1))
+        .unwrap_or(&argv[0]);
+    let base = Path::new(command)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command);
+    let lower = base.to_ascii_lowercase();
+    lower
+        .strip_suffix(".cmd")
+        .or_else(|| lower.strip_suffix(".exe"))
+        .unwrap_or(&lower)
+        .to_string()
+}
+
+pub fn npm_install_args(specs: &[String], install_root: &Path, argv: &[String]) -> Vec<String> {
+    let name = package_manager_name(argv);
+    let root = install_root.to_string_lossy().into_owned();
+    if name == "bun" {
+        let mut args = vec!["install".into()];
+        args.extend(specs.iter().cloned());
+        args.extend(["--cwd".into(), root, "--omit=peer".into()]);
+        return args;
+    }
+    if name == "pnpm" {
+        let mut args = vec!["install".into()];
+        args.extend(specs.iter().cloned());
+        args.extend([
+            "--prefix".into(),
+            root,
+            "--config.auto-install-peers=false".into(),
+            "--config.strict-peer-dependencies=false".into(),
+            "--config.strict-dep-builds=false".into(),
+        ]);
+        return args;
+    }
+    let mut args = vec!["install".into()];
+    args.extend(specs.iter().cloned());
+    args.extend(["--prefix".into(), root, "--legacy-peer-deps".into()]);
+    args
+}
+
+pub fn git_dependency_install_args() -> Vec<String> {
+    if configured_npm_command().is_some() {
+        vec!["install".into()]
+    } else {
+        vec!["install".into(), "--omit=dev".into()]
+    }
+}
+
+fn spawn_npm(args: &[String]) -> Result<(), String> {
+    let argv = configured_npm_command().unwrap_or_else(|| vec!["npm".into()]);
+    let (command, prefix) = argv
+        .split_first()
+        .ok_or("Invalid npmCommand: first array entry must be a non-empty command")?;
+    if command.is_empty() {
+        return Err("Invalid npmCommand: first array entry must be a non-empty command".into());
+    }
+    let status = Command::new(command)
+        .args(prefix)
+        .args(args)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!(
+            "{} {} exited with code {}",
+            command,
+            args.join(" "),
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
 fn install_npm_tree(source: &ParsedSource, local: bool) -> Result<PathBuf, String> {
     let ParsedSource::Npm { spec, name, .. } = source else {
         return Err("not an npm source".into());
@@ -584,19 +668,9 @@ fn install_npm_tree(source: &ParsedSource, local: bool) -> Result<PathBuf, Strin
             "Network is disabled; cannot install npm:{spec}. Set PI_PACKAGE_FIXTURE to a local package tree."
         ));
     }
-    let status = Command::new("npm")
-        .args(["install", spec, "--prefix"])
-        .arg(&install_root)
-        .arg("--legacy-peer-deps")
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(format!(
-            "npm install {spec} --prefix {} --legacy-peer-deps exited with code {}",
-            install_root.display(),
-            status.code().unwrap_or(-1)
-        ));
-    }
+    let argv = configured_npm_command().unwrap_or_else(|| vec!["npm".into()]);
+    let install_args = npm_install_args(&[spec.clone()], &install_root, &argv);
+    spawn_npm(&install_args)?;
     Ok(dest)
 }
 
@@ -653,6 +727,28 @@ fn install_git_tree(source: &ParsedSource, raw: &str, local: bool) -> Result<Pat
         if !checkout.success() {
             let _ = fs::remove_dir_all(&dest);
             return Err(format!("git checkout {git_ref} failed"));
+        }
+    }
+    if dest.join("package.json").exists() {
+        let argv = configured_npm_command().unwrap_or_else(|| vec!["npm".into()]);
+        let (command, prefix) = argv
+            .split_first()
+            .ok_or("Invalid npmCommand: first array entry must be a non-empty command")?;
+        let deps = git_dependency_install_args();
+        let status = Command::new(command)
+            .args(prefix)
+            .args(&deps)
+            .current_dir(&dest)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            let _ = fs::remove_dir_all(&dest);
+            return Err(format!(
+                "{} {} exited with code {}",
+                command,
+                deps.join(" "),
+                status.code().unwrap_or(-1)
+            ));
         }
     }
     Ok(dest)
@@ -1493,6 +1589,66 @@ mod tests {
         }
         if let Some(cwd) = previous_cwd {
             let _ = std::env::set_current_dir(cwd);
+        }
+    }
+
+    #[test]
+    fn npm_and_git_install_args_match_typescript_package_managers() {
+        let root = PathBuf::from("/tmp/pi-npm");
+        let spec = vec!["@foo/bar".into()];
+        assert_eq!(
+            npm_install_args(&spec, &root, &["npm".into()]),
+            vec![
+                "install",
+                "@foo/bar",
+                "--prefix",
+                "/tmp/pi-npm",
+                "--legacy-peer-deps"
+            ]
+        );
+        assert_eq!(
+            npm_install_args(&spec, &root, &["bun".into()]),
+            vec!["install", "@foo/bar", "--cwd", "/tmp/pi-npm", "--omit=peer"]
+        );
+        assert_eq!(
+            npm_install_args(&spec, &root, &["pnpm".into()]),
+            vec![
+                "install",
+                "@foo/bar",
+                "--prefix",
+                "/tmp/pi-npm",
+                "--config.auto-install-peers=false",
+                "--config.strict-peer-dependencies=false",
+                "--config.strict-dep-builds=false"
+            ]
+        );
+        assert_eq!(
+            package_manager_name(&[
+                "mise".into(),
+                "exec".into(),
+                "bun@1".into(),
+                "--".into(),
+                "bun".into()
+            ]),
+            "bun"
+        );
+        let _lock = crate::settings::test_env_lock();
+        let dir = tempdir().unwrap();
+        let previous_agent = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        assert_eq!(
+            git_dependency_install_args(),
+            vec!["install".to_string(), "--omit=dev".into()]
+        );
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"npmCommand":["pnpm"]}"#,
+        )
+        .unwrap();
+        assert_eq!(git_dependency_install_args(), vec!["install".to_string()]);
+        match previous_agent {
+            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
     }
 }
