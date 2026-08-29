@@ -1,3 +1,4 @@
+use pi_ai::MessageContent;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +12,8 @@ pub enum QueueMode {
 pub struct QueuedMessage {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub images: Vec<MessageContent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,16 +37,26 @@ impl Default for SteerFollowUpQueues {
 
 impl SteerFollowUpQueues {
     pub fn enqueue_steer(&mut self, text: impl Into<String>) {
+        self.enqueue_steer_with(text, Vec::new());
+    }
+
+    pub fn enqueue_steer_with(&mut self, text: impl Into<String>, images: Vec<MessageContent>) {
         self.steer.push(QueuedMessage {
             id: uuid::Uuid::new_v4().to_string(),
             text: text.into(),
+            images,
         });
     }
 
     pub fn enqueue_follow_up(&mut self, text: impl Into<String>) {
+        self.enqueue_follow_up_with(text, Vec::new());
+    }
+
+    pub fn enqueue_follow_up_with(&mut self, text: impl Into<String>, images: Vec<MessageContent>) {
         self.follow_up.push(QueuedMessage {
             id: uuid::Uuid::new_v4().to_string(),
             text: text.into(),
+            images,
         });
     }
 

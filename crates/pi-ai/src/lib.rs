@@ -1,5 +1,6 @@
 //! Unified multi-provider LLM API matching `@earendil-works/pi-ai`.
 
+mod attribution;
 mod auth;
 mod catalog;
 mod codex;
@@ -16,6 +17,7 @@ mod shell;
 mod stream;
 mod thinking;
 
+pub use attribution::{is_install_telemetry_enabled, merge_provider_attribution_headers};
 pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
     copilot_base_url_from_token, fetch_github_copilot_available_model_ids,

@@ -42,6 +42,7 @@ impl Agent {
         F: FnMut(&Agent) -> Result<AssistantMessage, String>,
     {
         self.is_streaming = true;
+        self.retry_aborted = false;
         let mut events = Vec::new();
         let mut new_messages: Vec<ChatMessage> = Vec::new();
         events.push(AgentEvent::AgentStart);
@@ -255,7 +256,7 @@ impl Agent {
             self.queues.drain_follow_up(mode)
         };
         for queued in drained {
-            let message = self.prompt(&queued.text);
+            let message = self.prompt_with(&queued.text, &queued.images);
             new_messages.push(message.clone());
             events.push(AgentEvent::MessageStart {
                 message: message.clone(),
@@ -281,7 +282,7 @@ impl Agent {
         let mut last_error = None;
         let mut scheduled_attempt = 0_u32;
         for attempt in 0..attempts {
-            if self.aborted {
+            if self.aborted || self.retry_aborted {
                 if scheduled_attempt > 0 {
                     events.push(AgentEvent::AutoRetryEnd {
                         success: false,
@@ -374,37 +375,53 @@ impl Agent {
             tool_name: name.to_string(),
             args: args.clone(),
         });
-        let (content, is_error) = if !self.tools.iter().any(|tool| tool == name) {
-            (format!("Unknown tool: {name}"), true)
+        let result = if !self.tools.iter().any(|tool| tool == name) {
+            crate::ToolResult {
+                content: format!("Unknown tool: {name}"),
+                is_error: true,
+                details: None,
+            }
         } else {
             match execute_tool(cwd, name, args) {
-                Ok(result) => (result.content, result.is_error),
+                Ok(result) => result,
                 Err(crate::tools::ToolError::Unknown(_)) => {
                     if let Some(executor) = &self.custom_tool_executor {
                         match executor.execute(cwd, name, args) {
-                            Ok(result) => (result.content, result.is_error),
-                            Err(err) => (err.to_string(), true),
+                            Ok(result) => result,
+                            Err(err) => crate::ToolResult {
+                                content: err.to_string(),
+                                is_error: true,
+                                details: None,
+                            },
                         }
                     } else {
-                        (format!("Unknown tool: {name}"), true)
+                        crate::ToolResult {
+                            content: format!("Unknown tool: {name}"),
+                            is_error: true,
+                            details: None,
+                        }
                     }
                 }
-                Err(err) => (err.to_string(), true),
+                Err(err) => crate::ToolResult {
+                    content: err.to_string(),
+                    is_error: true,
+                    details: None,
+                },
             }
         };
         events.push(AgentEvent::ToolExecutionUpdate {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
             args: args.clone(),
-            partial_result: Value::String(content.clone()),
+            partial_result: Value::String(result.content.clone()),
         });
         events.push(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
-            result: Value::String(content.clone()),
-            is_error,
+            result: Value::String(result.content.clone()),
+            is_error: result.is_error,
         });
-        ChatMessage::tool_result(id, name, content, is_error)
+        tool_result_message(id, name, result, self.auto_resize_images)
     }
 
     fn persist_chat(&mut self, message: &ChatMessage) {
@@ -412,6 +429,44 @@ impl Agent {
             let content = serde_json::to_value(&message.content).unwrap_or(Value::Null);
             let _ = session.append_entry(pi_session::SessionEntry::message(&message.role, content));
         }
+    }
+}
+
+fn tool_result_message(
+    id: &str,
+    name: &str,
+    result: crate::ToolResult,
+    auto_resize_images: bool,
+) -> ChatMessage {
+    let mut content = vec![MessageContent::Text {
+        text: result.content,
+    }];
+    if let Some(details) = &result.details {
+        if let Some(image) = details.get("image") {
+            if let (Some(data), Some(mime_type)) = (
+                image.get("data").and_then(Value::as_str),
+                image
+                    .get("mimeType")
+                    .or_else(|| image.get("mime_type"))
+                    .and_then(Value::as_str),
+            ) {
+                content.push(MessageContent::Image {
+                    data: data.to_string(),
+                    mime_type: mime_type.to_string(),
+                });
+            }
+        }
+        if let Some(images) = details.get("images").and_then(Value::as_array) {
+            content.extend(crate::parse_rpc_images(images));
+        }
+    }
+    content = crate::normalize_tool_result_images(&content, auto_resize_images);
+    ChatMessage {
+        role: "toolResult".into(),
+        content,
+        tool_call_id: Some(id.to_string()),
+        tool_name: Some(name.to_string()),
+        is_error: Some(result.is_error),
     }
 }
 

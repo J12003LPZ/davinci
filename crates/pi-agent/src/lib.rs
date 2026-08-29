@@ -5,6 +5,7 @@ mod compaction;
 mod context;
 mod edit_diff;
 mod events;
+mod images;
 mod queues;
 mod skills;
 mod templates;
@@ -31,6 +32,10 @@ pub use compaction::{
 };
 pub use context::{load_context_files, ContextFile};
 pub use events::AgentEvent;
+pub use images::{
+    apply_block_images, convert_to_llm_for_provider, normalize_tool_result_images,
+    parse_rpc_images, process_image_bytes, IMAGE_READING_DISABLED,
+};
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
 pub use skills::{discover_skills, Skill};
 pub use templates::{discover_prompt_templates, PromptTemplate};
@@ -110,6 +115,11 @@ pub struct Agent {
     pub tool_execution_mode: ToolExecutionMode,
     pub custom_tool_executor: Option<CustomToolExecutor>,
     pub summarizer: Option<Summarizer>,
+    pub block_images: bool,
+    pub auto_resize_images: bool,
+    pub retry_aborted: bool,
+    pub transport: Option<String>,
+    pub install_telemetry: bool,
 }
 
 impl Agent {
@@ -143,19 +153,49 @@ impl Agent {
             tool_execution_mode: ToolExecutionMode::Sequential,
             custom_tool_executor: None,
             summarizer: None,
+            block_images: false,
+            auto_resize_images: true,
+            retry_aborted: false,
+            transport: None,
+            install_telemetry: true,
         }
     }
 
     pub fn prompt(&mut self, text: &str) -> ChatMessage {
-        let message = ChatMessage::text("user", text);
+        self.prompt_with(text, &[])
+    }
+
+    pub fn prompt_with(&mut self, text: &str, images: &[pi_ai::MessageContent]) -> ChatMessage {
+        let mut content = vec![pi_ai::MessageContent::Text {
+            text: text.to_string(),
+        }];
+        content.extend(images.iter().cloned());
+        if self.auto_resize_images {
+            content = crate::normalize_tool_result_images(&content, true);
+        }
+        let message = ChatMessage {
+            role: "user".into(),
+            content,
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+        };
         self.messages.push(message.clone());
         if let Some(session) = &mut self.session {
             let _ = session.append_entry(SessionEntry::message(
                 "user",
-                serde_json::json!([{"type":"text","text": text}]),
+                serde_json::to_value(&message.content).unwrap_or(Value::Null),
             ));
         }
         message
+    }
+
+    pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
+        convert_to_llm_for_provider(&self.messages, self.block_images)
+    }
+
+    pub fn abort_retry(&mut self) {
+        self.retry_aborted = true;
     }
 
     pub fn record_assistant(&mut self, text: &str) {
@@ -651,6 +691,27 @@ mod tests {
             .iter()
             .any(|event| event.kind() == "tool_execution_end"));
         assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn block_images_and_abort_retry_match_ts() {
+        use pi_ai::MessageContent;
+        let mut agent = Agent::new("x");
+        agent.block_images = true;
+        agent.prompt_with(
+            "hi",
+            &[MessageContent::Image {
+                data: "e30=".into(),
+                mime_type: "image/png".into(),
+            }],
+        );
+        let for_llm = agent.messages_for_provider();
+        assert!(for_llm[0].content.iter().any(|block| matches!(
+            block,
+            MessageContent::Text { text } if text == IMAGE_READING_DISABLED
+        )));
+        agent.abort_retry();
+        assert!(agent.retry_aborted);
     }
 
     #[test]

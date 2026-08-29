@@ -21,6 +21,9 @@ pub struct StreamOptions {
     pub max_retry_delay_ms: Option<u64>,
     pub max_tokens: Option<u64>,
     pub websocket_connect_timeout_ms: Option<u64>,
+    pub transport: Option<String>,
+    pub session_id: Option<String>,
+    pub install_telemetry: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,7 +319,7 @@ pub fn live_complete_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
-    if model.api == "openai-codex-responses" {
+    if model.api == "openai-codex-responses" && options.transport.as_deref() != Some("sse") {
         let timeout = crate::codex::resolve_websocket_connect_timeout_ms(
             options.websocket_connect_timeout_ms,
         );
@@ -335,7 +338,12 @@ pub fn live_complete_with(
     }
     let body = request_body_with(model, messages, system, tools, options);
     let url = request_url(model, auth);
-    let headers = collect_request_headers(model, auth);
+    let headers = crate::merge_provider_attribution_headers(
+        model,
+        options.session_id.as_deref(),
+        options.install_telemetry,
+        &collect_request_headers(model, auth),
+    );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let text = crate::provider_retry::retry_provider_request(
         || send_provider_body(&url, &headers, &body, timeout_ms),

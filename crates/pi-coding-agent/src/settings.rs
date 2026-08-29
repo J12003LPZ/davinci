@@ -570,6 +570,10 @@ impl Settings {
             .unwrap_or(true)
     }
 
+    pub fn install_telemetry_enabled(&self) -> bool {
+        pi_ai::is_install_telemetry_enabled(self.enable_install_telemetry)
+    }
+
     pub fn block_images(&self) -> bool {
         self.images
             .as_ref()
@@ -692,7 +696,7 @@ pub fn to_interactive_config(
         hide_thinking: settings.hide_thinking_block.unwrap_or(false),
         cache_miss_notices: settings.show_cache_miss_notices.unwrap_or(false),
         collapse_changelog: settings.collapse_changelog.unwrap_or(false),
-        install_telemetry: settings.enable_install_telemetry.unwrap_or(false),
+        install_telemetry: settings.install_telemetry_enabled(),
         default_project_trust: default_project_trust_label(
             settings.default_project_trust.as_deref(),
         ),

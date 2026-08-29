@@ -247,6 +247,10 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent.provider_max_retries = settings.provider_max_retries();
     agent.provider_max_retry_delay_ms = settings.provider_max_retry_delay_ms();
     agent.thinking_budgets = settings.thinking_budgets.clone();
+    agent.block_images = settings.block_images();
+    agent.auto_resize_images = settings.image_auto_resize();
+    agent.transport = settings.transport.clone();
+    agent.install_telemetry = settings.install_telemetry_enabled();
     if let Some(ms) = settings.websocket_connect_timeout_ms {
         std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", ms.to_string());
     }
@@ -414,6 +418,9 @@ fn complete_simple_summarization(
         max_tokens: Some(request.max_tokens),
         websocket_connect_timeout_ms: load_settings(&default_agent_dir())
             .websocket_connect_timeout_ms,
+        transport: load_settings(&default_agent_dir()).transport.clone(),
+        session_id: None,
+        install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
     };
     let response = complete_simple(
         &model,
@@ -893,7 +900,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             match (offline, model.as_ref(), auth.as_ref()) {
                 (false, Some(model), Some(auth)) => live_complete_with(
                     model,
-                    &current.messages,
+                    &current.messages_for_provider(),
                     auth,
                     Some(&current.system_prompt),
                     &tools,
@@ -905,6 +912,12 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                         max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
                         max_tokens: None,
                         websocket_connect_timeout_ms: None,
+                        transport: current.transport.clone(),
+                        session_id: current
+                            .session
+                            .as_ref()
+                            .map(|session| session.header.id.clone()),
+                        install_telemetry: Some(current.install_telemetry),
                     },
                 ),
                 _ => Ok(AssistantMessage {
@@ -1374,11 +1387,13 @@ fn apply_session_action(
         }
         SessionAction::SelectSetting(value) => {
             apply_interactive_setting(session, &value)?;
+            sync_agent_from_settings(agent);
             Ok(true)
         }
         SessionAction::OpenSettingsSubmenu => Ok(true),
         SessionAction::ApplySetting { id, value } => {
             apply_interactive_setting(session, &format!("{id}={value}"))?;
+            sync_agent_from_settings(agent);
             Ok(true)
         }
         SessionAction::FollowUp(_) => {
@@ -2220,6 +2235,15 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
     }
     save_settings(&dir, &stored)?;
     Ok(())
+}
+
+fn sync_agent_from_settings(agent: &mut Agent) {
+    let stored = load_settings(&default_agent_dir());
+    agent.block_images = stored.block_images();
+    agent.auto_resize_images = stored.image_auto_resize();
+    agent.transport = stored.transport.clone();
+    agent.install_telemetry = stored.install_telemetry_enabled();
+    agent.auto_retry = stored.retry_enabled();
 }
 
 fn looks_like_oauth_input(value: &str) -> bool {

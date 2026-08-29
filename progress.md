@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (edit `edits[]` + bash timeout). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (images on the LLM path, Codex transport, attribution headers, RPC images/`abort_retry`). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -75,12 +75,10 @@ Closed this slice: `/tree` “Summarize branch?” runs TS `completeSummarizatio
 
 Closed this slice: edit tool accepts TS `edits[]` (JSON-string / single-object / legacy `oldText`+`newText`), unique non-overlapping matches, fuzzy whitespace/quote/dash normalize, BOM + line-ending restore, and locked not-found / duplicate / overlap / empty / no-change strings. Bash tool honors `timeout` seconds (`Invalid timeout: must be a finite number of seconds`, `Command timed out after N seconds`).
 
+Closed this slice: `images.blockImages` replaces image blocks with “Image reading is disabled.” (consecutive placeholders deduped) before provider calls; `images.autoResize` normalizes tool-result and RPC/user images (convert + 2000×2000 / 4.5MB). Codex `transport=sse` skips websocket connect; `auto`/`websocket` still attempt fixture/localhost connect. Provider attribution headers match TS (`HTTP-Referer` / `X-OpenRouter-*`, `X-BILLING-INVOKE-ORIGIN`, Cloudflare `User-Agent`, OpenCode session) gated by `PI_TELEMETRY` / `enableInstallTelemetry` (default on). RPC `prompt`/`steer`/`follow_up` attach `images`; `abort_retry` cancels in-flight retry.
+
 Still not product-equivalent:
 
-- `images.blockImages` / `images.autoResize` and tool-result image normalization are parsed but not applied on the LLM path
-- Codex `transport` (`auto`/`sse`/`websocket`) is stored in settings but not passed into stream options
-- Provider attribution headers (OpenRouter referer, NIM, Cloudflare, OpenCode session) are not sent
-- RPC `abort_retry` is a no-op; RPC `images` on prompt/steer/follow_up are dropped
 - Interactive polish: cache-miss notices, OSC 9;4 terminal progress, git-branch footer, `quietStartup` banners, post-update changelog overlay
 - Packages: interactive `pi config` persist, `pi update --extensions` reinstall, `package.json` `"pi"` manifest, extension `ctx` session APIs
 - `pi-session-sqlite` is not the product session backend (JSONL-only in coding-agent)

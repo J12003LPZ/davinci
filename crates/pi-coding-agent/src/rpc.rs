@@ -122,8 +122,13 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
     let kind = command.kind.clone();
     match kind.as_str() {
         "prompt" => {
+            let images = command
+                .images
+                .as_deref()
+                .map(pi_agent::parse_rpc_images)
+                .unwrap_or_default();
             if let Some(message) = &command.message {
-                runtime.agent.prompt(message);
+                runtime.agent.prompt_with(message, &images);
             }
             if command.streaming_behavior.as_deref() == Some("followUp") {
                 runtime.agent.queues.follow_up_mode = QueueMode::All;
@@ -131,18 +136,27 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             if command.streaming_behavior.as_deref() == Some("steer") {
                 runtime.agent.queues.steer_mode = QueueMode::All;
             }
-            let _ = command.images;
             ok(id, &kind, None)
         }
         "steer" => {
+            let images = command
+                .images
+                .as_deref()
+                .map(pi_agent::parse_rpc_images)
+                .unwrap_or_default();
             if let Some(message) = &command.message {
-                runtime.agent.queues.enqueue_steer(message);
+                runtime.agent.queues.enqueue_steer_with(message, images);
             }
             ok(id, &kind, None)
         }
         "follow_up" => {
+            let images = command
+                .images
+                .as_deref()
+                .map(pi_agent::parse_rpc_images)
+                .unwrap_or_default();
             if let Some(message) = &command.message {
-                runtime.agent.queues.enqueue_follow_up(message);
+                runtime.agent.queues.enqueue_follow_up_with(message, images);
             }
             ok(id, &kind, None)
         }
@@ -213,7 +227,10 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             }
             ok(id, &kind, None)
         }
-        "abort_retry" => ok(id, &kind, None),
+        "abort_retry" => {
+            runtime.agent.abort_retry();
+            ok(id, &kind, None)
+        }
         "get_messages" => ok(
             id,
             &kind,
@@ -714,5 +731,43 @@ mod tests {
                 .and_then(|item| item.value.clone()),
             Some("a".into())
         );
+    }
+
+    #[test]
+    fn prompt_images_and_abort_retry_match_ts() {
+        let mut runtime = RpcRuntime::new(
+            pi_agent::Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        let response = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "prompt".into(),
+                message: Some("see this".into()),
+                images: Some(vec![serde_json::json!({
+                    "type": "image",
+                    "data": "abc",
+                    "mimeType": "image/png"
+                })]),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(response.success);
+        let user = runtime.agent.messages.last().expect("prompt");
+        assert_eq!(user.role, "user");
+        assert!(user
+            .content
+            .iter()
+            .any(|block| matches!(block, pi_ai::MessageContent::Image { mime_type, .. } if mime_type == "image/png")));
+        let abort = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "abort_retry".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(abort.success);
+        assert!(runtime.agent.retry_aborted);
     }
 }
