@@ -268,6 +268,41 @@ impl ExtensionHost {
         None
     }
 
+    pub fn js_refresh_providers(&self) -> Vec<(String, String)> {
+        self.js
+            .iter()
+            .flat_map(|ext| {
+                ext.providers
+                    .iter()
+                    .filter(|registered| registered.has_refresh_models)
+                    .map(|registered| (ext.path.clone(), registered.name.clone()))
+            })
+            .collect()
+    }
+
+    pub fn js_oauth_provider(&self, provider: &str) -> Option<(String, String)> {
+        for ext in &self.js {
+            for registered in &ext.providers {
+                if registered.name == provider && registered.has_oauth {
+                    return Some((ext.path.clone(), registered.name.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn js_oauth_provider_names(&self) -> Vec<String> {
+        self.js
+            .iter()
+            .flat_map(|ext| {
+                ext.providers
+                    .iter()
+                    .filter(|registered| registered.has_oauth)
+                    .map(|registered| registered.name.clone())
+            })
+            .collect()
+    }
+
     pub fn tool_call_blocked(&self) -> bool {
         self.last_js_result
             .as_ref()

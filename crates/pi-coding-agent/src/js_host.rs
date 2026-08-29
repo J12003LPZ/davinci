@@ -376,6 +376,114 @@ pub fn run_js_stream_simple(
     })
 }
 
+pub fn run_js_refresh_models(
+    module: &Path,
+    provider: &str,
+    allow_network: bool,
+    force: bool,
+) -> Result<Vec<pi_ai::Model>, String> {
+    let result = run_persistent_js_extension(
+        module,
+        "refreshModels",
+        &serde_json::json!({
+            "provider": provider,
+            "context": {
+                "allowNetwork": allow_network,
+                "force": force,
+                "signal": { "aborted": false },
+            },
+        }),
+    )?;
+    let models = result
+        .result
+        .and_then(|value| value.get("models").cloned())
+        .unwrap_or(Value::Null);
+    Ok(pi_ai::models_from_provider_config(
+        provider,
+        &serde_json::json!({ "models": models }),
+    ))
+}
+
+fn oauth_credentials_json(access: &str, refresh: Option<&str>, expires: Option<u64>) -> Value {
+    serde_json::json!({
+        "access": access,
+        "refresh": refresh.unwrap_or(""),
+        "expires": expires.unwrap_or(0),
+    })
+}
+
+pub fn parse_oauth_credentials(
+    value: &Value,
+) -> Result<(String, Option<String>, Option<u64>), String> {
+    let access = value
+        .get("access")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "OAuth login missing access token".to_string())?
+        .to_string();
+    let refresh = value
+        .get("refresh")
+        .and_then(Value::as_str)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string);
+    let expires = value.get("expires").and_then(Value::as_u64);
+    Ok((access, refresh, expires))
+}
+
+pub fn run_js_oauth_login(
+    module: &Path,
+    provider: &str,
+) -> Result<(String, Option<String>, Option<u64>), String> {
+    let result = run_persistent_js_extension(
+        module,
+        "oauthLogin",
+        &serde_json::json!({ "provider": provider }),
+    )?;
+    let value = result.result.unwrap_or(Value::Null);
+    parse_oauth_credentials(&value)
+}
+
+pub fn run_js_oauth_refresh(
+    module: &Path,
+    provider: &str,
+    access: &str,
+    refresh: Option<&str>,
+    expires: Option<u64>,
+) -> Result<(String, Option<String>, Option<u64>), String> {
+    let result = run_persistent_js_extension(
+        module,
+        "oauthRefresh",
+        &serde_json::json!({
+            "provider": provider,
+            "credentials": oauth_credentials_json(access, refresh, expires),
+        }),
+    )?;
+    parse_oauth_credentials(&result.result.unwrap_or(Value::Null))
+}
+
+pub fn run_js_oauth_get_api_key(
+    module: &Path,
+    provider: &str,
+    access: &str,
+    refresh: Option<&str>,
+    expires: Option<u64>,
+) -> Option<String> {
+    let result = run_persistent_js_extension(
+        module,
+        "oauthGetApiKey",
+        &serde_json::json!({
+            "provider": provider,
+            "credentials": oauth_credentials_json(access, refresh, expires),
+        }),
+    )
+    .ok()?;
+    result.result.and_then(|value| {
+        value
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
 pub fn execute_js_tool(
     module: &Path,
     name: &str,
@@ -696,6 +804,50 @@ module.exports = (pi) => {
             })
             .unwrap_or_default();
         assert!(text.contains("streamed:"));
+    }
+
+    #[test]
+    fn refresh_models_and_oauth_handlers_run_from_js() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerProvider("corp-ai", {
+    models: [{ id: "static", name: "static" }],
+    refreshModels: async ({ allowNetwork }) => {
+      return [{ id: allowNetwork ? "live" : "cached", name: "dyn", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 64 }];
+    },
+    oauth: {
+      name: "Corp",
+      login: async () => ({ access: "acc-1", refresh: "ref-1", expires: 99 }),
+      refreshToken: async (creds) => ({ access: creds.access + "-new", refresh: creds.refresh, expires: 100 }),
+      getApiKey: (creds) => "key:" + creds.access,
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.providers[0].has_refresh_models);
+        assert!(loaded.providers[0].has_oauth);
+        stop_persistent_js_extension();
+        let models = run_js_refresh_models(&module, "corp-ai", true, true).unwrap();
+        assert!(models.iter().any(|model| model.id == "live"));
+        let login = run_js_oauth_login(&module, "corp-ai").unwrap();
+        assert_eq!(login.0, "acc-1");
+        let refreshed =
+            run_js_oauth_refresh(&module, "corp-ai", "acc-1", Some("ref-1"), Some(99)).unwrap();
+        assert_eq!(refreshed.0, "acc-1-new");
+        let key =
+            run_js_oauth_get_api_key(&module, "corp-ai", "acc-1", Some("ref-1"), Some(99)).unwrap();
+        assert_eq!(key, "key:acc-1");
+        stop_persistent_js_extension();
     }
 
     #[test]

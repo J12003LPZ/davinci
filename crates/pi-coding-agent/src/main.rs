@@ -393,7 +393,7 @@ fn complete_simple_summarization(
         storage.set_runtime_override(&request.provider, key);
     }
     if let Some(storage) = storage.as_mut() {
-        let _ = storage.maybe_refresh(&request.provider, now_ms(), 0, false);
+        maybe_refresh_auth(storage, &request.provider, now_ms(), 0, false);
     }
     let env = std::env::vars().collect();
     let mut auth = storage
@@ -784,7 +784,8 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
         return Err("Auth commands require --provider <provider> or --model <model>".into());
     };
     let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
-    let _ = storage.maybe_refresh(
+    maybe_refresh_auth(
+        &mut storage,
         &provider,
         now_ms(),
         command.min_expiry_ms.unwrap_or(0),
@@ -859,7 +860,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
         storage.set_runtime_override(&agent.provider, key);
     }
     if let Some(storage) = storage.as_mut() {
-        let _ = storage.maybe_refresh(&agent.provider, now_ms(), 0, false);
+        maybe_refresh_auth(storage, &agent.provider, now_ms(), 0, false);
     }
     let env = std::env::vars().collect();
     let mut auth = storage
@@ -885,6 +886,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             shell_path.as_deref(),
         );
     }
+    apply_js_oauth_api_key(&agent.provider, storage.as_ref(), &mut auth);
     if auth.as_ref().is_some_and(|item| {
         item.api_key.is_none() && item.headers.is_empty() && item.source == "none"
     }) {
@@ -1273,6 +1275,7 @@ fn run_interactive(
         .iter()
         .map(|name| (*name).to_string())
         .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
+        .chain(loaded_extension_host(parsed).js_oauth_provider_names())
         .collect();
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     session.double_escape_action =
@@ -2437,8 +2440,96 @@ fn looks_like_oauth_input(value: &str) -> bool {
         || value.contains('#')
 }
 
+fn login_js_oauth_provider(provider: &str) -> Option<(String, String)> {
+    let stored = load_settings(&default_agent_dir());
+    ExtensionHost::load(&default_agent_dir(), &stored.extensions).js_oauth_provider(provider)
+}
+
+fn maybe_refresh_auth(
+    storage: &mut AuthStorage,
+    provider: &str,
+    now: u64,
+    min_expiry_ms: u64,
+    no_refresh: bool,
+) {
+    if storage
+        .maybe_refresh(provider, now, min_expiry_ms, no_refresh)
+        .unwrap_or(false)
+        || no_refresh
+    {
+        return;
+    }
+    let Some((path, name)) = login_js_oauth_provider(provider) else {
+        return;
+    };
+    let Some(cred) = storage.get(provider) else {
+        return;
+    };
+    if cred.kind != CredentialKind::Oauth {
+        return;
+    }
+    let expired = cred
+        .expires
+        .map(|exp| exp <= now.saturating_add(min_expiry_ms))
+        .unwrap_or(false);
+    if !expired {
+        return;
+    }
+    if let Ok((access, refresh, expires)) = crate::js_host::run_js_oauth_refresh(
+        Path::new(&path),
+        &name,
+        cred.access.as_deref().unwrap_or(""),
+        cred.refresh.as_deref(),
+        cred.expires,
+    ) {
+        let _ = storage.login_oauth(provider, access, refresh, expires);
+    }
+}
+
+fn apply_js_oauth_api_key(
+    provider: &str,
+    storage: Option<&AuthStorage>,
+    auth: &mut Option<ResolvedAuth>,
+) {
+    let Some(storage) = storage else {
+        return;
+    };
+    let Some((path, name)) = login_js_oauth_provider(provider) else {
+        return;
+    };
+    let Some(cred) = storage.get(provider) else {
+        return;
+    };
+    if cred.kind != CredentialKind::Oauth {
+        return;
+    }
+    let Some(key) = crate::js_host::run_js_oauth_get_api_key(
+        Path::new(&path),
+        &name,
+        cred.access.as_deref().unwrap_or(""),
+        cred.refresh.as_deref(),
+        cred.expires,
+    ) else {
+        return;
+    };
+    if let Some(auth) = auth.as_mut() {
+        auth.api_key = Some(key);
+    }
+}
+
 fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+    if key.is_none() {
+        if let Some((path, name)) = login_js_oauth_provider(provider) {
+            let (access, refresh, expires) =
+                crate::js_host::run_js_oauth_login(Path::new(&path), &name)?;
+            storage
+                .login_oauth(provider, access, refresh, expires)
+                .map_err(|err| err.to_string())?;
+            println!("stored oauth token for {provider}");
+            return Ok(());
+        }
+    }
     if provider == llama::LLAMA_PROVIDER_ID {
         let mut env = std::collections::HashMap::new();
         let (api_key, url) = match key {
@@ -3661,7 +3752,13 @@ fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
     session.chrome.status = catalog_refresh::refresh_status_refreshing().into();
     let agent_dir = default_agent_dir();
     let allow_network = std::env::var("PI_OFFLINE").is_err();
-    let refreshed = catalog_refresh::refresh_model_catalogs(&agent_dir, allow_network, false);
+    let mut refreshed = catalog_refresh::refresh_model_catalogs(&agent_dir, allow_network, false);
+    catalog_refresh::refresh_js_providers(
+        &mut refreshed,
+        &loaded_extension_host(parsed).js_refresh_providers(),
+        allow_network,
+        false,
+    );
     let snapshot = load_model_runtime(parsed);
     let mut models: Vec<String> = snapshot
         .available
@@ -4609,9 +4706,14 @@ fn open_session_tree(agent: &Agent, session: &mut InteractiveSession) {
 
 fn open_scoped_models(session: &mut InteractiveSession) {
     session.chrome.status = catalog_refresh::refresh_status_refreshing().into();
-    let refreshed = catalog_refresh::refresh_model_catalogs(
-        &default_agent_dir(),
-        std::env::var("PI_OFFLINE").is_err(),
+    let allow_network = std::env::var("PI_OFFLINE").is_err();
+    let mut refreshed =
+        catalog_refresh::refresh_model_catalogs(&default_agent_dir(), allow_network, false);
+    let stored = load_settings(&default_agent_dir());
+    catalog_refresh::refresh_js_providers(
+        &mut refreshed,
+        &ExtensionHost::load(&default_agent_dir(), &stored.extensions).js_refresh_providers(),
+        allow_network,
         false,
     );
     let models = refreshed

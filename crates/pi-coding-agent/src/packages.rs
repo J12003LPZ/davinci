@@ -259,7 +259,15 @@ pub fn apply_resource_enabled(settings: &mut Settings, source: &str, enabled: bo
 }
 
 fn refresh_model_catalogs(agent_dir: &Path, _target: Option<&str>) -> Result<String, String> {
-    let result = crate::catalog_refresh::refresh_model_catalogs(agent_dir, true, true);
+    let mut result = crate::catalog_refresh::refresh_model_catalogs(agent_dir, true, true);
+    let stored = load_settings(agent_dir);
+    let host = crate::extension_host::ExtensionHost::load(agent_dir, &stored.extensions);
+    crate::catalog_refresh::refresh_js_providers(
+        &mut result,
+        &host.js_refresh_providers(),
+        true,
+        true,
+    );
     crate::catalog_refresh::cli_refresh_message(&result)
 }
 

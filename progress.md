@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (live extension autocomplete, events.emit, ctx.reload, JS streamSimple, lifecycle events). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (JS refreshModels + OAuth login/refresh/getApiKey). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -105,9 +105,9 @@ Closed this slice: extension runtime P0s — `complete_prompt` uses the loaded J
 
 Closed this slice: live `#` `getSuggestions` on each keystroke via persistent JS `autocomplete` (static snapshot is fallback); `pi.events.emit` / `on` is an in-process bus and Rust rebroadcasts to other loaded extensions; `ctx.reload` reloads skills/prompts/themes/extensions and emits `session_shutdown`; `waitForIdle` is recorded in session-call order (sync turns are already idle); print/RPC emit `message_*`, `tool_execution_*`, `before_provider_request`, and `session_before_{fork,switch,tree}`; JS `registerProvider({ streamSimple, refreshModels, oauth })` keeps live `streamSimple` / `refreshModels` handlers and `complete_prompt` calls `streamSimple` for that provider.
 
+Closed this slice: `refreshModels` runs during interactive catalog refresh, `/scoped-models`, and `pi update --models`. JS `oauth.login` / `refreshToken` / `getApiKey` run on `/login`, token refresh, and request auth; those providers appear in `/login` completions.
+
 Still not product-equivalent:
 
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
-- JS `registerProvider` OAuth login/refresh still has no live JS authorize/token callbacks (catalog `oauth` metadata only).
-- `refreshModels` handlers are stored but not invoked from `pi update --models` / catalog refresh.
 - TypeScript under `vendor/pi` remains the behavioral spec.

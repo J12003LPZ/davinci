@@ -483,6 +483,9 @@ async function main() {
 		eventEmits: [],
 		streamHandlers: {},
 		refreshHandlers: {},
+		oauthLogin: {},
+		oauthRefresh: {},
+		oauthGetApiKey: {},
 	};
 	const eventBus = {};
 	let editorFactory;
@@ -742,6 +745,13 @@ async function main() {
 					name: source.oauth.name,
 					id: source.oauth.id,
 				};
+				if (typeof source.oauth.login === "function") recorded.oauthLogin[name] = source.oauth.login;
+				if (typeof source.oauth.refreshToken === "function") {
+					recorded.oauthRefresh[name] = source.oauth.refreshToken;
+				}
+				if (typeof source.oauth.getApiKey === "function") {
+					recorded.oauthGetApiKey[name] = source.oauth.getApiKey;
+				}
 			}
 			recorded.providers.push({
 				name,
@@ -1246,7 +1256,70 @@ async function main() {
 	} else if (op === "refreshModels") {
 		const handler = recorded.refreshHandlers[payload.provider];
 		if (typeof handler === "function") {
-			result = { models: await handler(payload.context || {}) };
+			const context = Object.assign(
+				{
+					allowNetwork: true,
+					force: false,
+					signal: { aborted: false },
+					publish: async () => true,
+				},
+				payload.context || {},
+			);
+			result = { models: await handler(context) };
+		}
+	} else if (op === "oauthLogin") {
+		const fixture = process.env.PI_EXTENSION_OAUTH_REPLY;
+		if (fixture) {
+			try {
+				result = JSON.parse(fixture);
+			} catch {
+				result = { access: fixture, refresh: "", expires: 0 };
+			}
+		} else {
+			const handler = recorded.oauthLogin[payload.provider];
+			const callbacks = {
+				onAuth(info) {
+					recorded.uiCalls.push({ op: "oauthOnAuth", info: info || {} });
+				},
+				onDeviceCode(info) {
+					recorded.uiCalls.push({ op: "oauthOnDeviceCode", info: info || {} });
+				},
+				onPrompt() {
+					return Promise.resolve(process.env.PI_OAUTH_CODE || "");
+				},
+				onProgress() {},
+				onManualCodeInput() {
+					return Promise.resolve(process.env.PI_OAUTH_CODE || "");
+				},
+				onSelect() {
+					return Promise.resolve(process.env.PI_EXTENSION_UI_REPLY || undefined);
+				},
+				signal: { aborted: false },
+			};
+			if (typeof handler === "function") {
+				result = await handler(callbacks);
+			}
+		}
+	} else if (op === "oauthRefresh") {
+		const fixture = process.env.PI_EXTENSION_OAUTH_REFRESH_REPLY;
+		if (fixture) {
+			try {
+				result = JSON.parse(fixture);
+			} catch {
+				result = { access: fixture, refresh: payload.credentials && payload.credentials.refresh, expires: 0 };
+			}
+		} else {
+			const handler = recorded.oauthRefresh[payload.provider];
+			if (typeof handler === "function") {
+				result = await handler(payload.credentials || {}, { aborted: false });
+			}
+		}
+	} else if (op === "oauthGetApiKey") {
+		const handler = recorded.oauthGetApiKey[payload.provider];
+		if (typeof handler === "function") {
+			result = { apiKey: handler(payload.credentials || {}) };
+		} else if (payload.credentials && payload.credentials.access) {
+			result = { apiKey: payload.credentials.access };
 		}
 	}
 	}

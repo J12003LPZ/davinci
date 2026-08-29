@@ -123,6 +123,27 @@ pub fn refresh_model_catalogs(
     }
 }
 
+pub fn merge_extension_models(result: &mut CatalogRefreshResult, extra: Vec<Model>) {
+    result.models = merge_models(&result.models, &extra);
+}
+
+pub fn refresh_js_providers(
+    result: &mut CatalogRefreshResult,
+    providers: &[(String, String)],
+    allow_network: bool,
+    force: bool,
+) {
+    for (path, name) in providers {
+        match crate::js_host::run_js_refresh_models(Path::new(path), name, allow_network, force) {
+            Ok(extra) => merge_extension_models(result, extra),
+            Err(err) => result.errors.push((name.clone(), err)),
+        }
+    }
+    if !result.errors.is_empty() && result.status.starts_with(refresh_status_ok()) {
+        result.status = refresh_error_message(&result.errors);
+    }
+}
+
 fn load_cached_or_builtin(agent_dir: &Path) -> Vec<Model> {
     let store = load_models_store(agent_dir);
     let mut models = load_builtin_models();
@@ -289,5 +310,34 @@ mod tests {
         let failed = refresh_model_catalogs(dir.path(), true, true);
         std::env::remove_var("PI_CATALOG_REFRESH_ERROR");
         assert!(failed.status.contains("openai, anthropic"));
+        let mut merged = CatalogRefreshResult {
+            models: Vec::new(),
+            status: refresh_status_ok().into(),
+            timed_out: false,
+            errors: Vec::new(),
+        };
+        merge_extension_models(
+            &mut merged,
+            vec![Model {
+                id: "live".into(),
+                name: "live".into(),
+                api: "openai-completions".into(),
+                provider: "corp-ai".into(),
+                base_url: None,
+                reasoning: false,
+                input: vec!["text".into()],
+                cost: pi_ai::ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 1000,
+                max_tokens: 64,
+                compat: serde_json::json!(null),
+                headers: Default::default(),
+            }],
+        );
+        assert!(merged.models.iter().any(|model| model.id == "live"));
     }
 }
