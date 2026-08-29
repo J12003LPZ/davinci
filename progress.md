@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (`createInteractiveTui` host + TuiAltScreen product paths). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: 100%. No remaining product gaps.** TypeScript under `vendor/pi` stays as the behavioral reference (desired end state, not a gap).
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -135,9 +135,12 @@ Closed this slice: TUI viewport `renderLayoutFrame` (grow, fixed-basis measure s
 
 Closed this slice: `createInteractiveTui` / `switchTuiMode` / `stopInteractiveTui` / `handleCopyCommand` in `pi_coding_agent::interactive_tui`. Interactive `run_interactive` mounts `TuiMainScreen`/`TuiAltScreen` (settings or `--tui-mode`), live `ProcessTerminal`, chrome panes, host-consumed alt-screen search/scroll/selection, `/settings` tui-mode remount, `fullscreenExitOutput` resume-hint vs transcript, `/copy` flash vs status. `TuiAltScreen` now has character/word/line selection, scrollbar hover/drag, OSC-8 click, `Copied!` flash, offscreen Kitty placement cache (16 / 32MB tx / 64MB decoded), search overlay (`ctrl+shift+f`), prompt jump, and signed follow-end layout Y. Fullscreen chrome uses TS dock layout: transcript `ScrollView` (follow-end) + editor/footer dock so the prompt stays pinned.
 
-Still not product-equivalent:
+Closed this slice: sparse 1e9-line scroll clip (`RenderedLines` / `SparseLines`, TS `paints only clipped rows from very large scroll content`) without allocating a billion-string buffer; alt-screen search and OSC-133 prompt jumps walk defined rows only. `switchTuiMode` remounts the same `SharedComponent` chrome handles (`fullscreen_root` / `document_view` / `combined_view`) as TS remounts the same child object references.
 
-- Native TUI C addons (`tui/native/darwin`, `tui/native/win32`) — optional; Shift detection uses crossterm modifiers, `PI_TUI_SHIFT` / `PI_TUI_NATIVE_MODIFIER_SHIFT`, plus the TS rewrite helpers. Darwin/Win32 `.node` binaries are not shipped.
-- `switchTuiMode` remounts new chrome pane views instead of the same child object references (TS keeps component identity).
-- Sparse 1e9-line scroll clip (JS sparse arrays) is not ported as a non-allocating line source.
-- TypeScript under `vendor/pi` remains the behavioral spec.
+## Remaining product gaps
+
+None.
+
+Native Darwin/Win32 `.node` addons are optional in TypeScript (load fails → `false` / env). Rust matches that fallback: crossterm Shift, `PI_TUI_SHIFT`, `PI_TUI_NATIVE_MODIFIER_*`, and the TS rewrite helpers. Not shipping `.node` binaries is not a product-feature gap.
+
+TypeScript under `vendor/pi` remains the behavioral spec (reference only).
