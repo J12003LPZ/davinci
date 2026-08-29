@@ -149,6 +149,9 @@ pub fn clipboard_image_png() -> Option<Vec<u8>> {
 }
 
 fn normalize_clipboard_image(bytes: Vec<u8>) -> Vec<u8> {
+    if let Some(png) = crate::image_convert::convert_image_bytes_to_png(&bytes) {
+        return png;
+    }
     if bytes.starts_with(b"BM") {
         if let Some(png) = bmp_to_png(&bytes) {
             return png;

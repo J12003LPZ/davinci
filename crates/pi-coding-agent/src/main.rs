@@ -5,6 +5,7 @@ mod export;
 mod extension_host;
 mod extensions;
 mod external_editor;
+mod image_convert;
 mod js_host;
 mod packages;
 mod rpc;
@@ -1884,9 +1885,29 @@ fn launch_external_editor(session: &mut InteractiveSession) -> Result<(), String
 
 fn paste_clipboard(session: &mut InteractiveSession) {
     if let Some(png) = clipboard_image_png() {
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png);
+        let (display, status) =
+            match crate::image_convert::resize_image_in_process(&png, "image/png") {
+                Some(resized) => {
+                    let status = format!(
+                        "pasted image {}x{} (from {}x{}, {})",
+                        resized.width,
+                        resized.height,
+                        resized.original_width,
+                        resized.original_height,
+                        resized.mime_type
+                    );
+                    let display = if resized.was_resized && resized.mime_type == "image/png" {
+                        resized.bytes
+                    } else {
+                        png
+                    };
+                    (display, status)
+                }
+                None => (png, "pasted image".into()),
+            };
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, display);
         session.place_kitty_image(&b64, Some(1));
-        session.chrome.status = "pasted image".into();
+        session.chrome.status = status;
     } else if let Some(text) = clipboard_text() {
         session.chrome.editor.handle_input(&text);
         session.chrome.status = "pasted clipboard".into();
