@@ -1,6 +1,5 @@
 //! Differential fixtures for the TypeScript-authoritative rewrite.
 
-
 pub fn fixture(name: &str) -> serde_json::Value {
     let raw = match name {
         "assistant-message" => include_str!("../fixtures/assistant-message.json"),
@@ -16,7 +15,7 @@ mod tests {
     use super::*;
     use pi_ai::{AssistantContent, Message, StopReason, Usage, UsageCost};
     use pi_protocol::{
-        encode_cbor, encode_client_message, ClientMessage, CborValue, PROTOCOL_VERSION,
+        encode_cbor, encode_client_message, CborValue, ClientMessage, PROTOCOL_VERSION,
     };
 
     #[test]

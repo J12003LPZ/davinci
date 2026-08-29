@@ -25,7 +25,10 @@ impl Default for WriterLeaseOptions {
 }
 
 impl WriterLeaseOptions {
-    pub fn resolve(ttl_ms: Option<i64>, heartbeat_interval_ms: Option<i64>) -> Result<Self, SessionError> {
+    pub fn resolve(
+        ttl_ms: Option<i64>,
+        heartbeat_interval_ms: Option<i64>,
+    ) -> Result<Self, SessionError> {
         let ttl_ms = ttl_ms.unwrap_or(30_000);
         let heartbeat_interval_ms = heartbeat_interval_ms.unwrap_or(10_000);
         if ttl_ms <= 0 {
@@ -52,9 +55,7 @@ pub fn active_writer_error(session_id: &str) -> SessionError {
 }
 
 pub fn lost_writer_error(session_id: &str) -> SessionError {
-    SessionError::storage(format!(
-        "SQLite session {session_id} writer lease was lost"
-    ))
+    SessionError::storage(format!("SQLite session {session_id} writer lease was lost"))
 }
 
 pub fn acquire_writer_lease(
@@ -103,13 +104,7 @@ pub fn renew_writer_lease(
 			AND owner_id = ?3
 			AND fence = ?4
 			AND expires_at_ms > ?5",
-            params![
-                expires_at_ms,
-                session_id,
-                lease.owner_id,
-                lease.fence,
-                now
-            ],
+            params![expires_at_ms, session_id, lease.owner_id, lease.fence, now],
         )
         .map_err(|error| SessionError::storage(error.to_string()))?;
     if changes == 1 {
@@ -143,7 +138,9 @@ pub fn delete_writer_lease(db: &Connection, session_id: &str) -> Result<(), Sess
     Ok(())
 }
 
-pub fn read_writer_leases(db: &Connection) -> Result<Vec<(String, String, i64, i64)>, SessionError> {
+pub fn read_writer_leases(
+    db: &Connection,
+) -> Result<Vec<(String, String, i64, i64)>, SessionError> {
     let mut stmt = db
         .prepare(
             "SELECT session_id, owner_id, fence, expires_at_ms FROM writer_leases ORDER BY session_id",

@@ -3,7 +3,8 @@
 use std::collections::VecDeque;
 
 use pi_ai::{
-    AssistantContent, AssistantMessageEvent, Context, Message, MockProvider, Model, StopReason, Tool, Usage,
+    AssistantContent, AssistantMessageEvent, Context, Message, MockProvider, Model, StopReason,
+    Tool, Usage,
 };
 use serde_json::Value;
 
@@ -23,13 +24,29 @@ pub enum QueueMode {
 pub enum AgentEvent {
     AgentStart,
     TurnStart,
-    MessageStart { message: Message },
-    MessageUpdate { event: AssistantMessageEvent },
-    MessageEnd { message: Message },
-    ToolExecutionStart { name: String },
-    ToolExecutionEnd { name: String, is_error: bool },
-    TurnEnd { message: Message, tool_results: Vec<Message> },
-    AgentEnd { messages: Vec<Message> },
+    MessageStart {
+        message: Message,
+    },
+    MessageUpdate {
+        event: AssistantMessageEvent,
+    },
+    MessageEnd {
+        message: Message,
+    },
+    ToolExecutionStart {
+        name: String,
+    },
+    ToolExecutionEnd {
+        name: String,
+        is_error: bool,
+    },
+    TurnEnd {
+        message: Message,
+        tool_results: Vec<Message>,
+    },
+    AgentEnd {
+        messages: Vec<Message>,
+    },
 }
 
 pub type AgentMessage = Message;
@@ -92,12 +109,10 @@ pub fn run_agent_loop(
         };
         let stream_events = provider.stream(&config.model, &stream_context, None);
         let terminal = stream_events.last().cloned();
-        if let Some(first) = stream_events.first() {
-            if let AssistantMessageEvent::Start { partial } = first {
-                events.push(AgentEvent::MessageStart {
-                    message: partial.clone(),
-                });
-            }
+        if let Some(AssistantMessageEvent::Start { partial }) = stream_events.first() {
+            events.push(AgentEvent::MessageStart {
+                message: partial.clone(),
+            });
         }
         for event in &stream_events {
             events.push(AgentEvent::MessageUpdate {
@@ -105,9 +120,10 @@ pub fn run_agent_loop(
             });
         }
         let assistant = match terminal {
-            Some(AssistantMessageEvent::Done { message, .. } | AssistantMessageEvent::Error { error: message, .. }) => {
-                message
-            }
+            Some(
+                AssistantMessageEvent::Done { message, .. }
+                | AssistantMessageEvent::Error { error: message, .. },
+            ) => message,
             _ => break,
         };
         events.push(AgentEvent::MessageEnd {
@@ -124,9 +140,11 @@ pub fn run_agent_loop(
             Message::Assistant { content, .. } => content
                 .iter()
                 .filter_map(|block| match block {
-                    AssistantContent::ToolCall { id, name, arguments } => {
-                        Some((id.clone(), name.clone(), arguments.clone()))
-                    }
+                    AssistantContent::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => Some((id.clone(), name.clone(), arguments.clone())),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -134,7 +152,7 @@ pub fn run_agent_loop(
         };
 
         let mut tool_results = Vec::new();
-        if stop == StopReason::Length {
+        if stop == StopReason::Length && !executed_tools {
             for (id, name, _) in tool_calls {
                 events.push(AgentEvent::ToolExecutionStart { name: name.clone() });
                 let result = Message::ToolResult {
@@ -150,16 +168,23 @@ pub fn run_agent_loop(
                 });
                 tool_results.push(result);
             }
-        } else {
+        } else if !executed_tools {
             let execute_one = |id: String, name: String, arguments: Value| {
                 let tool = context.tools.iter().find(|tool| tool.spec.name == name);
                 let (content, is_error) = match tool {
                     Some(tool) => match (tool.execute)(&arguments) {
-                        Ok(value) => (vec![serde_json::json!({"type":"text","text": value.to_string()})], false),
-                        Err(error) => (vec![serde_json::json!({"type":"text","text": error})], true),
+                        Ok(value) => (
+                            vec![serde_json::json!({"type":"text","text": value.to_string()})],
+                            false,
+                        ),
+                        Err(error) => {
+                            (vec![serde_json::json!({"type":"text","text": error})], true)
+                        }
                     },
                     None => (
-                        vec![serde_json::json!({"type":"text","text": format!("unknown tool {name}")})],
+                        vec![
+                            serde_json::json!({"type":"text","text": format!("unknown tool {name}")}),
+                        ],
                         true,
                     ),
                 };
@@ -297,7 +322,9 @@ mod tests {
         );
         assert!(matches!(events.first(), Some(AgentEvent::AgentStart)));
         assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
-        assert!(messages.iter().any(|message| matches!(message, Message::Assistant { .. })));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, Message::Assistant { .. })));
     }
 
     #[test]
@@ -313,8 +340,17 @@ mod tests {
             forced_text: Some("done".into()),
             ..MockProvider::default()
         };
-        let (_, messages) = run_agent_loop(vec![user("hi")], context, config(), &provider, steering, VecDeque::new());
-        assert!(messages.iter().any(|message| matches!(message, Message::User { content, .. } if content == "steer")));
+        let (_, messages) = run_agent_loop(
+            vec![user("hi")],
+            context,
+            config(),
+            &provider,
+            steering,
+            VecDeque::new(),
+        );
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, Message::User { content, .. } if content == "steer")));
     }
 
     #[test]
@@ -334,7 +370,9 @@ mod tests {
             VecDeque::new(),
             follow,
         );
-        assert!(messages.iter().any(|message| matches!(message, Message::User { content, .. } if content == "again")));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, Message::User { content, .. } if content == "again")));
     }
 
     #[test]
@@ -349,8 +387,17 @@ mod tests {
             stop_reason: Some(StopReason::Length),
             ..MockProvider::default()
         };
-        let (events, _) = run_agent_loop(vec![user("hi")], context, config(), &provider, VecDeque::new(), VecDeque::new());
-        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolExecutionEnd { is_error: true, .. })));
+        let (events, _) = run_agent_loop(
+            vec![user("hi")],
+            context,
+            config(),
+            &provider,
+            VecDeque::new(),
+            VecDeque::new(),
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { is_error: true, .. })));
     }
 
     #[test]
@@ -369,7 +416,14 @@ mod tests {
         };
         let mut config = config();
         config.tool_execution = ToolExecutionMode::Parallel;
-        let (_, messages) = run_agent_loop(vec![user("hi")], context, config, &provider, VecDeque::new(), VecDeque::new());
+        let (_, messages) = run_agent_loop(
+            vec![user("hi")],
+            context,
+            config,
+            &provider,
+            VecDeque::new(),
+            VecDeque::new(),
+        );
         let tools = messages
             .iter()
             .filter(|message| matches!(message, Message::ToolResult { .. }))

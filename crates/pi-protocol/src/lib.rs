@@ -5,10 +5,13 @@ mod framing;
 mod messages;
 
 pub use cbor::{
-    decode_cbor, decode_cbor_with, encode_cbor, encode_cbor_with, CborError, CborOptions, CborValue,
-    DEFAULT_MAX_CBOR_BYTE_LENGTH, DEFAULT_MAX_CBOR_CONTAINER_LENGTH, DEFAULT_MAX_CBOR_DEPTH,
+    decode_cbor, decode_cbor_with, encode_cbor, encode_cbor_with, CborError, CborOptions,
+    CborValue, DEFAULT_MAX_CBOR_BYTE_LENGTH, DEFAULT_MAX_CBOR_CONTAINER_LENGTH,
+    DEFAULT_MAX_CBOR_DEPTH,
 };
-pub use framing::{assert_complete_frame, encode_frame, FrameDecoder, FrameError, DEFAULT_MAX_FRAME_LENGTH};
+pub use framing::{
+    assert_complete_frame, encode_frame, FrameDecoder, FrameError, DEFAULT_MAX_FRAME_LENGTH,
+};
 pub use messages::*;
 
 #[cfg(test)]
@@ -23,7 +26,12 @@ mod tests {
     }
 
     fn to_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
     }
 
     #[test]
@@ -42,7 +50,10 @@ mod tests {
             (CborValue::Integer(1000), "1903e8"),
             (CborValue::Integer(1_000_000), "1a000f4240"),
             (CborValue::Integer(1_000_000_000_000), "1b000000e8d4a51000"),
-            (CborValue::Integer(9_007_199_254_740_991), "1b001fffffffffffff"),
+            (
+                CborValue::Integer(9_007_199_254_740_991),
+                "1b001fffffffffffff",
+            ),
             (CborValue::Integer(-1), "20"),
             (CborValue::Integer(-10), "29"),
             (CborValue::Integer(-24), "37"),
@@ -50,7 +61,10 @@ mod tests {
             (CborValue::Integer(-100), "3863"),
             (CborValue::Integer(-1000), "3903e7"),
             (CborValue::Integer(-1_000_000), "3a000f423f"),
-            (CborValue::Integer(-9_007_199_254_740_991), "3b001ffffffffffffe"),
+            (
+                CborValue::Integer(-9_007_199_254_740_991),
+                "3b001ffffffffffffe",
+            ),
             (CborValue::Float(1.1), "fb3ff199999999999a"),
             (CborValue::Float(-0.0), "fb8000000000000000"),
             (CborValue::Bytes(vec![1, 2, 3, 4]), "4401020304"),
@@ -88,9 +102,12 @@ mod tests {
             ),
         ];
         for (value, wire) in vectors {
-            assert_eq!(to_hex(&encode_cbor(&value).unwrap()), wire, "encode {wire}");
+            let encoded =
+                encode_cbor(&value).unwrap_or_else(|e| panic!("encode {wire}: {e} {value:?}"));
+            assert_eq!(to_hex(&encoded), wire, "encode {wire}");
             let decoded = decode_cbor(&from_hex(wire)).unwrap();
-            if matches!(value, CborValue::Float(float) if float == 0.0 && float.is_sign_negative()) {
+            if matches!(value, CborValue::Float(float) if float == 0.0 && float.is_sign_negative())
+            {
                 match decoded {
                     CborValue::Float(float) => assert!(float == 0.0 && float.is_sign_negative()),
                     other => panic!("expected -0.0, got {other:?}"),

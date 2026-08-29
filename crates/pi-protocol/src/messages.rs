@@ -49,9 +49,17 @@ pub struct SessionMetadata {
     pub created_at: i64,
     #[serde(rename = "updatedAt", default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
-    #[serde(rename = "parentSessionId", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "parentSessionId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub parent_session_id: Option<String>,
-    #[serde(rename = "sessionName", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "sessionName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -103,7 +111,11 @@ pub enum Command {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelRef>,
-        #[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "thinkingLevel",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         thinking_level: Option<String>,
     },
     Attach {
@@ -144,15 +156,34 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum CommandResult {
-    List { sessions: Vec<SessionMetadata> },
-    Create { session: SessionSnapshot },
-    Attach { session: SessionSnapshot },
-    Detach { #[serde(rename = "sessionId")] session_id: String },
-    Prompt { session: SessionSnapshot },
-    Steer { session: SessionSnapshot },
-    Abort { session: SessionSnapshot },
-    SetModel { session: SessionSnapshot },
-    SetThinking { session: SessionSnapshot },
+    List {
+        sessions: Vec<SessionMetadata>,
+    },
+    Create {
+        session: SessionSnapshot,
+    },
+    Attach {
+        session: SessionSnapshot,
+    },
+    Detach {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    Prompt {
+        session: SessionSnapshot,
+    },
+    Steer {
+        session: SessionSnapshot,
+    },
+    Abort {
+        session: SessionSnapshot,
+    },
+    SetModel {
+        session: SessionSnapshot,
+    },
+    SetThinking {
+        session: SessionSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -190,10 +221,21 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
-    ServerSnapshot { snapshot: ServerSnapshot },
-    SessionSnapshot { snapshot: SessionSnapshot },
-    SessionProgress { #[serde(rename = "sessionId")] session_id: String, progress: Value },
-    SessionRemoved { #[serde(rename = "sessionId")] session_id: String },
+    ServerSnapshot {
+        snapshot: ServerSnapshot,
+    },
+    SessionSnapshot {
+        snapshot: SessionSnapshot,
+    },
+    SessionProgress {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        progress: Value,
+    },
+    SessionRemoved {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -228,18 +270,21 @@ pub fn encode_server_message(message: &ServerMessage) -> Result<Vec<u8>, Protoco
 }
 
 fn encode_message<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtocolValidationError> {
-    let json = serde_json::to_value(message).map_err(|error| ProtocolValidationError::Schema(error.to_string()))?;
+    let json = serde_json::to_value(message)
+        .map_err(|error| ProtocolValidationError::Schema(error.to_string()))?;
     let cbor = CborValue::from_json(&json).map_err(ProtocolValidationError::Cbor)?;
     let payload = encode_cbor(&cbor).map_err(ProtocolValidationError::Cbor)?;
     encode_frame(&payload).map_err(ProtocolValidationError::Frame)
 }
 
 pub fn parse_client_message(value: &CborValue) -> Result<ClientMessage, ProtocolValidationError> {
-    serde_json::from_value(value.to_json()).map_err(|error| ProtocolValidationError::Schema(error.to_string()))
+    serde_json::from_value(value.to_json())
+        .map_err(|error| ProtocolValidationError::Schema(error.to_string()))
 }
 
 pub fn parse_server_message(value: &CborValue) -> Result<ServerMessage, ProtocolValidationError> {
-    serde_json::from_value(value.to_json()).map_err(|error| ProtocolValidationError::Schema(error.to_string()))
+    serde_json::from_value(value.to_json())
+        .map_err(|error| ProtocolValidationError::Schema(error.to_string()))
 }
 
 pub struct ClientMessageDecoder {
@@ -254,7 +299,10 @@ impl ClientMessageDecoder {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ClientMessage>, ProtocolValidationError> {
-        let frames = self.frames.push(chunk).map_err(ProtocolValidationError::Frame)?;
+        let frames = self
+            .frames
+            .push(chunk)
+            .map_err(ProtocolValidationError::Frame)?;
         frames
             .into_iter()
             .map(|payload| {
@@ -287,7 +335,10 @@ impl ServerMessageDecoder {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ServerMessage>, ProtocolValidationError> {
-        let frames = self.frames.push(chunk).map_err(ProtocolValidationError::Frame)?;
+        let frames = self
+            .frames
+            .push(chunk)
+            .map_err(ProtocolValidationError::Frame)?;
         frames
             .into_iter()
             .map(|payload| {

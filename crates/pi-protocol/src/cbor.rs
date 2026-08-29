@@ -87,7 +87,9 @@ impl CborValue {
                 .unwrap_or(serde_json::Value::Null),
             Self::Bytes(bytes) => serde_json::json!(bytes),
             Self::Text(text) => serde_json::Value::String(text.clone()),
-            Self::Array(items) => serde_json::Value::Array(items.iter().map(Self::to_json).collect()),
+            Self::Array(items) => {
+                serde_json::Value::Array(items.iter().map(Self::to_json).collect())
+            }
             Self::Map(entries) => {
                 let mut map = serde_json::Map::new();
                 for (key, value) in entries {
@@ -154,7 +156,11 @@ fn encode_value(
             out.extend_from_slice(bytes);
         }
         CborValue::Text(text) => {
-            if text.contains('\u{FFFD}') && text.chars().any(|ch| (0xD800..=0xDFFF).contains(&(ch as u32))) {
+            if text.contains('\u{FFFD}')
+                && text
+                    .chars()
+                    .any(|ch| (0xD800..=0xDFFF).contains(&(ch as u32)))
+            {
                 return Err(CborError("lone Unicode surrogate".into()));
             }
             if !text.is_char_boundary(text.len()) {
@@ -186,7 +192,13 @@ fn encode_value(
                 if !seen.insert(key) {
                     return Err(CborError("duplicate map key".into()));
                 }
-                encode_into(&CborValue::Text(key.clone()), out, depth + 1, options, stack)?;
+                encode_into(
+                    &CborValue::Text(key.clone()),
+                    out,
+                    depth + 1,
+                    options,
+                    stack,
+                )?;
                 encode_into(value, out, depth + 1, options, stack)?;
             }
         }
@@ -265,6 +277,9 @@ fn decode_item<'a>(
     let initial = bytes[0];
     let major = initial >> 5;
     let additional = initial & 0x1f;
+    if major == 7 {
+        return decode_simple(additional, 0, &bytes[1..]);
+    }
     let (argument, rest) = read_argument(additional, &bytes[1..])?;
     match major {
         0 => {
@@ -302,7 +317,9 @@ fn decode_item<'a>(
             }
             let (head, tail) = rest.split_at(argument as usize);
             let text = std::str::from_utf8(head).map_err(|_| CborError("invalid UTF-8".into()))?;
-            if !text.chars().all(|ch| !(0xD800..=0xDFFF).contains(&(ch as u32)))
+            if !text
+                .chars()
+                .all(|ch| !(0xD800..=0xDFFF).contains(&(ch as u32)))
                 && text.as_bytes().iter().any(|b| *b >= 0x80)
             {
                 validate_utf8_strict(head)?;
@@ -345,7 +362,6 @@ fn decode_item<'a>(
             Ok((CborValue::Map(entries), cursor))
         }
         6 => Err(CborError("CBOR tags are not supported".into())),
-        7 => decode_simple(additional, argument, rest),
         _ => Err(CborError("unsupported major type".into())),
     }
 }
@@ -363,7 +379,9 @@ fn read_argument(additional: u8, rest: &[u8]) -> Result<(u64, &[u8]), CborError>
         26 => take_int(rest, 4),
         27 => take_int(rest, 8),
         28..=30 => Err(CborError("reserved additional information".into())),
-        31 => Err(CborError("indefinite-length items are not supported".into())),
+        31 => Err(CborError(
+            "indefinite-length items are not supported".into(),
+        )),
         _ => Err(CborError("reserved additional information".into())),
     }
 }
@@ -377,11 +395,11 @@ fn take_int(rest: &[u8], width: usize) -> Result<(u64, &[u8]), CborError> {
     Ok((u64::from_be_bytes(buf), &rest[width..]))
 }
 
-fn decode_simple<'a>(
+fn decode_simple(
     additional: u8,
     argument: u64,
-    rest: &'a [u8],
-) -> Result<(CborValue, &'a [u8]), CborError> {
+    rest: &[u8],
+) -> Result<(CborValue, &[u8]), CborError> {
     match additional {
         20 => Ok((CborValue::Bool(false), rest)),
         21 => Ok((CborValue::Bool(true), rest)),
@@ -438,7 +456,10 @@ fn validate_utf8_strict(bytes: &[u8]) -> Result<(), CborError> {
         let slice = &bytes[index..index + width];
         match std::str::from_utf8(slice) {
             Ok(text) => {
-                if text.chars().any(|ch| (0xD800..=0xDFFF).contains(&(ch as u32))) {
+                if text
+                    .chars()
+                    .any(|ch| (0xD800..=0xDFFF).contains(&(ch as u32)))
+                {
                     return Err(CborError("UTF-8 surrogate".into()));
                 }
             }

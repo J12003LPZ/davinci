@@ -3,16 +3,17 @@ use std::sync::{Arc, Mutex};
 
 use pi_core::{next_id, now_ms, SessionError};
 use pi_session::{
-    assign_storage_fields, Entry, EntryQuery, ForkOptions, ForkScope, LaneRecord, LogItem, QueryOrder,
-    SessionCreateOptions, SessionMetadata, SessionRepository, SessionStats, SessionStore,
+    assign_storage_fields, Entry, EntryQuery, ForkOptions, ForkScope, LaneRecord, LogItem,
+    QueryOrder, SessionCreateOptions, SessionMetadata, SessionRepository, SessionStats,
+    SessionStore,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::leases::{
-    acquire_writer_lease, active_writer_error, delete_writer_lease, lost_writer_error, release_writer_lease,
-    renew_writer_lease, WriterLease, WriterLeaseOptions,
+    acquire_writer_lease, active_writer_error, delete_writer_lease, lost_writer_error,
+    release_writer_lease, renew_writer_lease, WriterLease, WriterLeaseOptions,
 };
 
 const SCHEMA: &str = include_str!("../migrations/001_initial.sql");
@@ -50,7 +51,8 @@ pub fn apply_migrations(db: &Connection) -> Result<(), SessionError> {
 
 pub fn open_database(path: &Path) -> Result<Connection, SessionError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| SessionError::storage(error.to_string()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| SessionError::storage(error.to_string()))?;
     }
     let db = Connection::open(path).map_err(|error| SessionError::storage(error.to_string()))?;
     apply_migrations(&db)?;
@@ -85,7 +87,8 @@ fn next_sequence(db: &Connection, session_id: &str) -> Result<i64, SessionError>
 }
 
 fn entry_payload(entry: &Entry) -> Result<String, SessionError> {
-    let mut value = serde_json::to_value(entry).map_err(|error| SessionError::invalid_payload(error.to_string()))?;
+    let mut value = serde_json::to_value(entry)
+        .map_err(|error| SessionError::invalid_payload(error.to_string()))?;
     if let Value::Object(map) = &mut value {
         map.remove("type");
         map.remove("id");
@@ -110,10 +113,13 @@ fn decode_entry(
         map.insert("type".into(), json!(entry_type));
         map.insert("id".into(), json!(id));
         map.insert("seq".into(), json!(seq));
-        map.insert("parentId".into(), match parent_id {
-            Some(parent) => json!(parent),
-            None => Value::Null,
-        });
+        map.insert(
+            "parentId".into(),
+            match parent_id {
+                Some(parent) => json!(parent),
+                None => Value::Null,
+            },
+        );
         map.insert("timestamp".into(), json!(timestamp));
     }
     serde_json::from_value(body).map_err(|error| SessionError::storage(error.to_string()))
@@ -221,12 +227,21 @@ impl SqliteSessionStorage {
                 self.metadata.id
             )));
         }
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         let tx = db
             .unchecked_transaction()
             .map_err(|error| SessionError::storage(error.to_string()))?;
         let now = now_ms();
-        if !renew_writer_lease(&tx, &self.metadata.id, &mut self.lease, now, now + self.options.ttl_ms)? {
+        if !renew_writer_lease(
+            &tx,
+            &self.metadata.id,
+            &mut self.lease,
+            now,
+            now + self.options.ttl_ms,
+        )? {
             return Err(lost_writer_error(&self.metadata.id));
         }
         let result = op(&tx, &mut self.lease);
@@ -245,7 +260,10 @@ impl SqliteSessionStorage {
 
     #[allow(dead_code)]
     pub fn expire_lease_for_test(&self) -> Result<(), SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         db.execute(
             "UPDATE writer_leases SET expires_at_ms = 0 WHERE session_id = ?1",
             params![self.metadata.id],
@@ -256,7 +274,10 @@ impl SqliteSessionStorage {
 
     #[allow(dead_code)]
     pub fn current_fence(&self) -> Result<i64, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         db.query_row(
             "SELECT fence FROM writer_leases WHERE session_id = ?1",
             params![self.metadata.id],
@@ -268,7 +289,10 @@ impl SqliteSessionStorage {
 
 impl SessionStore for SqliteSessionStorage {
     fn metadata(&self) -> Result<SessionMetadata, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         read_metadata(&db, &self.metadata.id, &self.metadata.path)
     }
 
@@ -339,7 +363,10 @@ impl SessionStore for SqliteSessionStorage {
     }
 
     fn find_entries(&self, query: EntryQuery) -> Result<Vec<Entry>, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         let order = if matches!(query.order, Some(QueryOrder::NewestFirst)) {
             "DESC"
         } else {
@@ -373,7 +400,10 @@ impl SessionStore for SqliteSessionStorage {
     }
 
     fn find_entries_on_branch(&self, start: &str) -> Result<Vec<Entry>, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         let branch_id: String = db
             .query_row(
                 "SELECT branch_id FROM branch_entries WHERE session_id = ?1 AND entry_id = ?2 LIMIT 1",
@@ -425,7 +455,10 @@ impl SessionStore for SqliteSessionStorage {
     }
 
     fn find_records(&self, lane: Option<&str>) -> Result<Vec<LaneRecord>, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         let mut stmt = if lane.is_some() {
             db.prepare(
                 "SELECT payload FROM records WHERE session_id = ?1 AND lane = ?2 ORDER BY seq",
@@ -443,7 +476,10 @@ impl SessionStore for SqliteSessionStorage {
                 .next()
                 .map_err(|error| SessionError::storage(error.to_string()))?
             {
-                payloads.push(row.get::<_, String>(0).map_err(|error| SessionError::storage(error.to_string()))?);
+                payloads.push(
+                    row.get::<_, String>(0)
+                        .map_err(|error| SessionError::storage(error.to_string()))?,
+                );
             }
         } else {
             let mut rows = stmt
@@ -453,12 +489,18 @@ impl SessionStore for SqliteSessionStorage {
                 .next()
                 .map_err(|error| SessionError::storage(error.to_string()))?
             {
-                payloads.push(row.get::<_, String>(0).map_err(|error| SessionError::storage(error.to_string()))?);
+                payloads.push(
+                    row.get::<_, String>(0)
+                        .map_err(|error| SessionError::storage(error.to_string()))?,
+                );
             }
         }
         payloads
             .into_iter()
-            .map(|payload| serde_json::from_str(&payload).map_err(|error| SessionError::storage(error.to_string())))
+            .map(|payload| {
+                serde_json::from_str(&payload)
+                    .map_err(|error| SessionError::storage(error.to_string()))
+            })
             .collect()
     }
 
@@ -509,7 +551,10 @@ impl SessionStore for SqliteSessionStorage {
     }
 
     fn get_stats(&self) -> Result<SessionStats, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         db.query_row(
             "SELECT message_count, cached_tokens, uncached_tokens, total_tokens, cost_total
              FROM session_stats WHERE session_id = ?1",
@@ -531,7 +576,10 @@ impl SessionStore for SqliteSessionStorage {
         if self.closed {
             return Ok(());
         }
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         release_writer_lease(&db, &self.metadata.id, &self.lease)?;
         self.closed = true;
         Ok(())
@@ -545,11 +593,16 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     let entry_type: String = row.get(3)?;
     let timestamp: i64 = row.get(4)?;
     let payload: String = row.get(5)?;
-    decode_entry(id, seq, parent_id, &entry_type, timestamp, &payload)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error.to_string()))))
+    decode_entry(id, seq, parent_id, &entry_type, timestamp, &payload).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error.to_string())))
+    })
 }
 
-fn read_metadata(db: &Connection, session_id: &str, path: &str) -> Result<SessionMetadata, SessionError> {
+fn read_metadata(
+    db: &Connection,
+    session_id: &str,
+    path: &str,
+) -> Result<SessionMetadata, SessionError> {
     db.query_row(
         "SELECT s.id, s.created_at, s.cwd, s.parent_session_id, s.metadata,
                 name_fact.value AS session_name
@@ -603,7 +656,10 @@ impl SqliteSessionRepository {
     }
 
     pub fn inspect_leases(&self) -> Result<Vec<(String, String, i64, i64)>, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         crate::leases::read_writer_leases(&db)
     }
 
@@ -648,8 +704,14 @@ impl SqliteSessionRepository {
         Ok(())
     }
 
-    fn claim_storage(&self, metadata: SessionMetadata) -> Result<SqliteSessionStorage, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+    fn claim_storage(
+        &self,
+        metadata: SessionMetadata,
+    ) -> Result<SqliteSessionStorage, SessionError> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         let lease = claim_writer_lease(&db, &metadata.id, self.options, now_ms())?;
         Ok(SqliteSessionStorage {
             db: Arc::clone(&self.db),
@@ -662,7 +724,10 @@ impl SqliteSessionRepository {
 }
 
 impl SessionRepository for SqliteSessionRepository {
-    fn create(&mut self, options: SessionCreateOptions) -> Result<Box<dyn SessionStore>, SessionError> {
+    fn create(
+        &mut self,
+        options: SessionCreateOptions,
+    ) -> Result<Box<dyn SessionStore>, SessionError> {
         let id = options.id.unwrap_or_else(next_id);
         let metadata = SessionMetadata {
             id: id.clone(),
@@ -674,7 +739,10 @@ impl SessionRepository for SqliteSessionRepository {
             metadata: options.metadata,
         };
         {
-            let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+            let db = self
+                .db
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
             let tx = db
                 .unchecked_transaction()
                 .map_err(|error| SessionError::storage(error.to_string()))?;
@@ -690,19 +758,23 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     fn open(&mut self, metadata: &SessionMetadata) -> Result<Box<dyn SessionStore>, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         let resolved = read_metadata(&db, &metadata.id, &self.path.to_string_lossy())?;
         drop(db);
         Ok(Box::new(self.claim_storage(resolved)?))
     }
 
     fn list(&self, cwd: Option<&str>) -> Result<Vec<SessionMetadata>, SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         let path = self.path.to_string_lossy().into_owned();
         let mut stmt = if cwd.is_some() {
-            db.prepare(
-                "SELECT s.id FROM sessions s WHERE s.cwd = ?1 ORDER BY s.created_at ASC",
-            )
+            db.prepare("SELECT s.id FROM sessions s WHERE s.cwd = ?1 ORDER BY s.created_at ASC")
         } else {
             db.prepare("SELECT s.id FROM sessions s ORDER BY s.created_at ASC")
         }
@@ -716,7 +788,10 @@ impl SessionRepository for SqliteSessionRepository {
                 .next()
                 .map_err(|error| SessionError::storage(error.to_string()))?
             {
-                ids.push(row.get::<_, String>(0).map_err(|error| SessionError::storage(error.to_string()))?);
+                ids.push(
+                    row.get::<_, String>(0)
+                        .map_err(|error| SessionError::storage(error.to_string()))?,
+                );
             }
         } else {
             let mut rows = stmt
@@ -726,7 +801,10 @@ impl SessionRepository for SqliteSessionRepository {
                 .next()
                 .map_err(|error| SessionError::storage(error.to_string()))?
             {
-                ids.push(row.get::<_, String>(0).map_err(|error| SessionError::storage(error.to_string()))?);
+                ids.push(
+                    row.get::<_, String>(0)
+                        .map_err(|error| SessionError::storage(error.to_string()))?,
+                );
             }
         }
         ids.into_iter()
@@ -735,7 +813,10 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     fn delete(&mut self, metadata: &SessionMetadata) -> Result<(), SessionError> {
-        let db = self.db.lock().map_err(|error| SessionError::storage(error.to_string()))?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         let tx = db
             .unchecked_transaction()
             .map_err(|error| SessionError::storage(error.to_string()))?;
@@ -784,12 +865,18 @@ impl SessionRepository for SqliteSessionRepository {
                     ..EntryQuery::default()
                 })
                 .ok()
-                .and_then(|entries| entries.into_iter().next().map(|entry| entry.id().to_string()))
+                .and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .next()
+                        .map(|entry| entry.id().to_string())
+                })
         });
         let copied = match options.scope {
             ForkScope::Tree => source.find_entries(EntryQuery::default())?,
             ForkScope::Branch => {
-                let start = start.ok_or_else(|| SessionError::invalid_payload("fork target missing"))?;
+                let start =
+                    start.ok_or_else(|| SessionError::invalid_payload("fork target missing"))?;
                 let mut path = source.find_entries_on_branch(&start)?;
                 if matches!(options.position, pi_session::ForkPosition::Before) {
                     path.pop();

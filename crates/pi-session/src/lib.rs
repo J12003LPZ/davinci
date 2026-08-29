@@ -109,7 +109,7 @@ impl Entry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Usage {
     pub input: i64,
     pub output: i64,
@@ -131,19 +131,6 @@ pub struct UsageCost {
     #[serde(rename = "cacheWrite")]
     pub cache_write: f64,
     pub total: f64,
-}
-
-impl Default for Usage {
-    fn default() -> Self {
-        Self {
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            total_tokens: 0,
-            cost: UsageCost::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,8 +217,14 @@ impl LaneRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LogItem {
-    Entry { seq: i64, entry: Entry },
-    Record { seq: i64, record: LaneRecord },
+    Entry {
+        seq: i64,
+        entry: Entry,
+    },
+    Record {
+        seq: i64,
+        record: LaneRecord,
+    },
     Lane {
         seq: i64,
         lane: String,
@@ -271,7 +264,11 @@ pub struct SessionMetadata {
     pub created_at: i64,
     pub cwd: String,
     pub path: String,
-    #[serde(rename = "parentSessionId", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "parentSessionId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub parent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -320,10 +317,18 @@ pub fn message_entry(id: impl Into<String>, message: Value) -> Entry {
     }
 }
 
-pub fn assign_storage_fields(entry: Entry, seq: i64, parent_id: Option<String>, timestamp: i64) -> Entry {
+pub fn assign_storage_fields(
+    entry: Entry,
+    seq: i64,
+    parent_id: Option<String>,
+    timestamp: i64,
+) -> Entry {
     match entry {
         Entry::Message {
-            id, message, terminate, ..
+            id,
+            message,
+            terminate,
+            ..
         } => Entry::Message {
             id,
             seq,
@@ -333,7 +338,10 @@ pub fn assign_storage_fields(entry: Entry, seq: i64, parent_id: Option<String>, 
             terminate,
         },
         Entry::ModelChange {
-            id, provider, model_id, ..
+            id,
+            provider,
+            model_id,
+            ..
         } => Entry::ModelChange {
             id,
             seq,
@@ -352,7 +360,10 @@ pub fn assign_storage_fields(entry: Entry, seq: i64, parent_id: Option<String>, 
             thinking_level,
         },
         Entry::Custom {
-            id, custom_type, data, ..
+            id,
+            custom_type,
+            data,
+            ..
         } => Entry::Custom {
             id,
             seq,
@@ -406,7 +417,10 @@ pub trait SessionStore: Send {
 }
 
 pub trait SessionRepository: Send {
-    fn create(&mut self, options: SessionCreateOptions) -> Result<Box<dyn SessionStore>, SessionError>;
+    fn create(
+        &mut self,
+        options: SessionCreateOptions,
+    ) -> Result<Box<dyn SessionStore>, SessionError>;
     fn open(&mut self, metadata: &SessionMetadata) -> Result<Box<dyn SessionStore>, SessionError>;
     fn list(&self, cwd: Option<&str>) -> Result<Vec<SessionMetadata>, SessionError>;
     fn delete(&mut self, metadata: &SessionMetadata) -> Result<(), SessionError>;

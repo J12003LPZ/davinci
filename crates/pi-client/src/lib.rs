@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use pi_protocol::{
-    encode_client_message, ClientMessage, Command, CommandResult, PROTOCOL_VERSION, ServerMessage,
-    ServerMessageDecoder, ServerSnapshot, SessionSnapshot,
+    encode_client_message, ClientMessage, Command, CommandResult, ServerMessage,
+    ServerMessageDecoder, ServerSnapshot, SessionSnapshot, PROTOCOL_VERSION,
 };
 use pi_server::PiServer;
 use uuid::Uuid;
@@ -96,7 +96,11 @@ impl PiClient {
         }
     }
 
-    pub fn create_session(&mut self, cwd: Option<String>, name: Option<String>) -> Result<SessionLease, String> {
+    pub fn create_session(
+        &mut self,
+        cwd: Option<String>,
+        name: Option<String>,
+    ) -> Result<SessionLease, String> {
         match self.request(Command::Create {
             cwd,
             name,
@@ -133,7 +137,11 @@ impl PiClient {
         }
     }
 
-    pub fn prompt(&mut self, lease: &mut SessionLease, text: &str) -> Result<SessionSnapshot, String> {
+    pub fn prompt(
+        &mut self,
+        lease: &mut SessionLease,
+        text: &str,
+    ) -> Result<SessionSnapshot, String> {
         self.ensure_active(lease)?;
         match self.request(Command::Prompt {
             session_id: lease.id.clone(),
@@ -151,7 +159,12 @@ impl PiClient {
 
     pub fn detach(&mut self, lease: &mut SessionLease) -> Result<(), String> {
         self.ensure_active(lease)?;
-        let remaining = self.leases.get(&lease.id).copied().unwrap_or(0).saturating_sub(1);
+        let remaining = self
+            .leases
+            .get(&lease.id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(1);
         if remaining == 0 {
             self.request(Command::Detach {
                 session_id: lease.id.clone(),
@@ -180,12 +193,18 @@ mod tests {
     #[test]
     fn loopback_create_prompt_detach() {
         let mut client = PiClient::connect(PiServer::default()).unwrap();
-        let mut lease = client.create_session(Some("/tmp".into()), Some("demo".into())).unwrap();
+        let mut lease = client
+            .create_session(Some("/tmp".into()), Some("demo".into()))
+            .unwrap();
         let snapshot = client.prompt(&mut lease, "hello").unwrap();
         assert!(snapshot.transcript.len() >= 2);
         client.detach(&mut lease).unwrap();
         assert!(!lease.active);
-        assert!(client.list_sessions().unwrap().iter().any(|session| session.id == snapshot.id));
+        assert!(client
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.id == snapshot.id));
     }
 
     #[test]

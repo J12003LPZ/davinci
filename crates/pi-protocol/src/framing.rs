@@ -100,7 +100,8 @@ impl FrameDecoder {
             let expected = self.expected.unwrap() as usize;
             let remaining = expected - self.payload.len();
             let take = remaining.min(chunk.len() - offset);
-            self.payload.extend_from_slice(&chunk[offset..offset + take]);
+            self.payload
+                .extend_from_slice(&chunk[offset..offset + take]);
             offset += take;
             if self.payload.len() == expected {
                 frames.push(std::mem::take(&mut self.payload));

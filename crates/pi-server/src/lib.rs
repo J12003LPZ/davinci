@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use pi_core::now_ms;
 use pi_protocol::{
-    encode_server_message, ClientMessage, ClientMessageDecoder, Command, CommandResult, ProtocolError,
-    ProtocolErrorCode, PROTOCOL_VERSION, ServerEvent, ServerMessage, ServerSnapshot, SessionMetadata,
-    SessionPhase, SessionSnapshot, ModelRef,
+    encode_server_message, ClientMessage, ClientMessageDecoder, Command, CommandResult, ModelRef,
+    ProtocolError, ProtocolErrorCode, ServerEvent, ServerMessage, ServerSnapshot, SessionMetadata,
+    SessionPhase, SessionSnapshot, PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
@@ -81,7 +81,12 @@ impl MemoryService {
         }
     }
 
-    fn create_session(&self, cwd: Option<String>, name: Option<String>, model: Option<ModelRef>) -> SessionSnapshot {
+    fn create_session(
+        &self,
+        cwd: Option<String>,
+        name: Option<String>,
+        model: Option<ModelRef>,
+    ) -> SessionSnapshot {
         let mut inner = self.inner.lock().expect("service");
         inner.revision += 1;
         let id = Uuid::now_v7().to_string();
@@ -145,7 +150,11 @@ impl MemoryService {
         Ok(session.snapshot.clone())
     }
 
-    fn attach(&self, session_id: &str, connection_id: &str) -> Result<SessionSnapshot, ProtocolError> {
+    fn attach(
+        &self,
+        session_id: &str,
+        connection_id: &str,
+    ) -> Result<SessionSnapshot, ProtocolError> {
         let mut inner = self.inner.lock().expect("service");
         let session = inner
             .sessions
@@ -251,7 +260,9 @@ impl PiServer {
             Command::Steer { session_id, text } => self
                 .service
                 .mutate(&session_id, connection_id, true, |snapshot| {
-                    snapshot.queued_steer.push(serde_json::json!({"text": text}));
+                    snapshot
+                        .queued_steer
+                        .push(serde_json::json!({"text": text}));
                     snapshot.queued_steer_count = snapshot.queued_steer.len() as u32;
                 })
                 .map(|session| CommandResult::Steer { session }),

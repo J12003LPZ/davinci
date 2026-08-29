@@ -49,7 +49,11 @@ pub enum Message {
         #[serde(rename = "stopReason")]
         stop_reason: StopReason,
         timestamp: i64,
-        #[serde(rename = "errorMessage", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "errorMessage",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         error_message: Option<String>,
     },
     #[serde(rename = "toolResult")]
@@ -68,8 +72,14 @@ pub enum Message {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AssistantContent {
-    Text { text: String },
-    Thinking { thinking: String, #[serde(default, skip_serializing_if = "Option::is_none")] redacted: Option<bool> },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<bool>,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -134,7 +144,11 @@ impl Usage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Context {
-    #[serde(rename = "systemPrompt", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "systemPrompt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub system_prompt: Option<String>,
     pub messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,11 +165,24 @@ pub struct Tool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantMessageEvent {
-    Start { partial: Message },
-    TextDelta { delta: String, partial: Message },
-    ToolcallStart { partial: Message },
-    Done { reason: StopReason, message: Message },
-    Error { reason: StopReason, error: Message },
+    Start {
+        partial: Message,
+    },
+    TextDelta {
+        delta: String,
+        partial: Message,
+    },
+    ToolcallStart {
+        partial: Message,
+    },
+    Done {
+        reason: StopReason,
+        message: Message,
+    },
+    Error {
+        reason: StopReason,
+        error: Message,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,15 +191,20 @@ pub struct StreamOptions {
 }
 
 /// Stream contract: never throw for request/model failures; encode them as events.
-pub fn stream(model: &Model, context: &Context, options: Option<StreamOptions>) -> Vec<AssistantMessageEvent> {
+pub fn stream(
+    model: &Model,
+    context: &Context,
+    options: Option<StreamOptions>,
+) -> Vec<AssistantMessageEvent> {
     MockProvider::default().stream(model, context, options)
 }
 
 pub fn complete(model: &Model, context: &Context, options: Option<StreamOptions>) -> Message {
     match stream(model, context, options).last() {
-        Some(AssistantMessageEvent::Done { message, .. } | AssistantMessageEvent::Error { error: message, .. }) => {
-            message.clone()
-        }
+        Some(
+            AssistantMessageEvent::Done { message, .. }
+            | AssistantMessageEvent::Error { error: message, .. },
+        ) => message.clone(),
         _ => panic!("stream produced no terminal event"),
     }
 }
@@ -230,7 +262,13 @@ impl MockProvider {
         } else {
             StopReason::ToolUse
         });
-        let message = assistant_message(model, content, Usage::with_tokens(8, text.len() as i64), stop, None);
+        let message = assistant_message(
+            model,
+            content,
+            Usage::with_tokens(8, text.len() as i64),
+            stop,
+            None,
+        );
         vec![
             AssistantMessageEvent::Start {
                 partial: message.clone(),
@@ -267,17 +305,21 @@ pub fn assistant_message(
 }
 
 pub fn last_user_text(context: &Context) -> Option<String> {
-    context.messages.iter().rev().find_map(|message| match message {
-        Message::User { content, .. } => content.as_str().map(str::to_string).or_else(|| {
-            content
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("text"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        }),
-        _ => None,
-    })
+    context
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::User { content, .. } => content.as_str().map(str::to_string).or_else(|| {
+                content
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+            _ => None,
+        })
 }
 
 pub fn test_model() -> Model {
@@ -327,8 +369,14 @@ mod tests {
             tools: None,
         };
         let events = stream(&model, &context, None);
-        assert!(matches!(events.first(), Some(AssistantMessageEvent::Start { .. })));
-        assert!(matches!(events.last(), Some(AssistantMessageEvent::Done { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(AssistantMessageEvent::Start { .. })
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Done { .. })
+        ));
         let Message::Assistant { usage, .. } = complete(&model, &context, None) else {
             panic!("expected assistant");
         };
@@ -341,8 +389,19 @@ mod tests {
             fail: true,
             ..MockProvider::default()
         };
-        let events = provider.stream(&test_model(), &Context { system_prompt: None, messages: vec![], tools: None }, None);
-        assert!(matches!(events.last(), Some(AssistantMessageEvent::Error { .. })));
+        let events = provider.stream(
+            &test_model(),
+            &Context {
+                system_prompt: None,
+                messages: vec![],
+                tools: None,
+            },
+            None,
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Error { .. })
+        ));
     }
 
     #[test]

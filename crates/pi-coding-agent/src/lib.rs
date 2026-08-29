@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{Parser, Subcommand};
-use pi_agent::{run_agent_loop, AgentContext, AgentLoopConfig, AgentTool, QueueMode, ToolExecutionMode};
+use pi_agent::{
+    run_agent_loop, AgentContext, AgentLoopConfig, AgentTool, QueueMode, ToolExecutionMode,
+};
 use pi_ai::{test_model, Message, MockProvider, Tool};
 use pi_session::{provision_message, SessionCreateOptions, SessionRepository};
 use pi_session_sqlite::{SqliteSessionRepository, WriterLeaseOptions};
@@ -50,7 +52,11 @@ pub fn create_coding_tools(cwd: PathBuf) -> Vec<AgentTool> {
     ]
 }
 
-fn make_tool(name: &'static str, description: &'static str, execute: fn(&Value) -> Result<Value, String>) -> AgentTool {
+fn make_tool(
+    name: &'static str,
+    description: &'static str,
+    execute: fn(&Value) -> Result<Value, String>,
+) -> AgentTool {
     AgentTool {
         spec: Tool {
             name: name.into(),
@@ -97,7 +103,10 @@ fn current_cwd() -> PathBuf {
 
 fn read_tool(_ctx: ToolContext) -> fn(&Value) -> Result<Value, String> {
     fn exec(args: &Value) -> Result<Value, String> {
-        let path = args.get("path").and_then(Value::as_str).ok_or("missing path")?;
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("missing path")?;
         let resolved = resolve_path(&current_cwd(), path)?;
         let contents = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
         Ok(Value::String(contents))
@@ -107,7 +116,10 @@ fn read_tool(_ctx: ToolContext) -> fn(&Value) -> Result<Value, String> {
 
 fn write_tool(_ctx: ToolContext) -> fn(&Value) -> Result<Value, String> {
     fn exec(args: &Value) -> Result<Value, String> {
-        let path = args.get("path").and_then(Value::as_str).ok_or("missing path")?;
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("missing path")?;
         let content = args.get("content").and_then(Value::as_str).unwrap_or("");
         let resolved = resolve_path(&current_cwd(), path)?;
         if let Some(parent) = resolved.parent() {
@@ -121,9 +133,18 @@ fn write_tool(_ctx: ToolContext) -> fn(&Value) -> Result<Value, String> {
 
 fn edit_tool(_ctx: ToolContext) -> fn(&Value) -> Result<Value, String> {
     fn exec(args: &Value) -> Result<Value, String> {
-        let path = args.get("path").and_then(Value::as_str).ok_or("missing path")?;
-        let old = args.get("oldText").and_then(Value::as_str).ok_or("missing oldText")?;
-        let new = args.get("newText").and_then(Value::as_str).ok_or("missing newText")?;
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("missing path")?;
+        let old = args
+            .get("oldText")
+            .and_then(Value::as_str)
+            .ok_or("missing oldText")?;
+        let new = args
+            .get("newText")
+            .and_then(Value::as_str)
+            .ok_or("missing newText")?;
         let resolved = resolve_path(&current_cwd(), path)?;
         let contents = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
         if !contents.contains(old) {
@@ -189,10 +210,12 @@ pub fn run_print(prompt: &str, json: bool) -> Result<String, String> {
             Ok(serde_json::to_string(&payload).unwrap())
         } else {
             let text = messages.iter().rev().find_map(|message| match message {
-                Message::Assistant { content, .. } => content.iter().find_map(|block| match block {
-                    pi_ai::AssistantContent::Text { text } => Some(text.clone()),
-                    _ => None,
-                }),
+                Message::Assistant { content, .. } => {
+                    content.iter().find_map(|block| match block {
+                        pi_ai::AssistantContent::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                }
                 _ => None,
             });
             Ok(text.unwrap_or_default())
@@ -208,13 +231,7 @@ pub fn list_sessions(database: &Path) -> Result<Vec<String>, String> {
         .map(|sessions| {
             sessions
                 .into_iter()
-                .map(|session| {
-                    format!(
-                        "{}\t{}",
-                        session.id,
-                        session.name.unwrap_or_else(|| session.cwd)
-                    )
-                })
+                .map(|session| format!("{}\t{}", session.id, session.name.unwrap_or(session.cwd)))
                 .collect()
         })
 }

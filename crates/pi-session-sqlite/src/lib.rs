@@ -4,8 +4,8 @@ mod leases;
 mod repo;
 
 pub use leases::{
-    acquire_writer_lease, delete_writer_lease, release_writer_lease, renew_writer_lease, WriterLease,
-    WriterLeaseOptions,
+    acquire_writer_lease, delete_writer_lease, release_writer_lease, renew_writer_lease,
+    WriterLease, WriterLeaseOptions,
 };
 pub use repo::{apply_migrations, open_database, SqliteSessionRepository, SqliteSessionStorage};
 
@@ -13,7 +13,8 @@ pub use repo::{apply_migrations, open_database, SqliteSessionRepository, SqliteS
 mod tests {
     use pi_core::SessionErrorCode;
     use pi_session::{
-        provision_message, run_conformance, EntryQuery, QueryOrder, SessionCreateOptions, SessionRepository,
+        provision_message, run_conformance, EntryQuery, QueryOrder, SessionCreateOptions,
+        SessionRepository,
     };
     use tempfile::tempdir;
 
@@ -69,8 +70,10 @@ mod tests {
             ttl_ms: 120_000,
             heartbeat_interval_ms: 60_000,
         };
-        let mut first = SqliteSessionRepository::open(dir.path().join("sessions.sqlite"), options).unwrap();
-        let mut second = SqliteSessionRepository::open(dir.path().join("sessions.sqlite"), options).unwrap();
+        let mut first =
+            SqliteSessionRepository::open(dir.path().join("sessions.sqlite"), options).unwrap();
+        let mut second =
+            SqliteSessionRepository::open(dir.path().join("sessions.sqlite"), options).unwrap();
         let mut stale = first
             .create(SessionCreateOptions {
                 cwd: dir.path().to_string_lossy().into_owned(),
@@ -89,9 +92,14 @@ mod tests {
         }
 
         let mut current = second.open(&metadata).unwrap();
-        let err = stale.append_entry(provision_message("stale owner"), "main").unwrap_err();
+        let err = stale
+            .append_entry(provision_message("stale owner"), "main")
+            .unwrap_err();
         assert!(err.message.contains("writer lease was lost"));
-        assert!(current.find_entries(EntryQuery::default()).unwrap().is_empty());
+        assert!(current
+            .find_entries(EntryQuery::default())
+            .unwrap()
+            .is_empty());
         let fence = second
             .inspect_leases()
             .unwrap()
@@ -120,9 +128,7 @@ mod tests {
             .unwrap();
         first.set_name(Some("Review session")).unwrap();
         let before = writer.inspect_leases().unwrap();
-        let listed = reader
-            .list(Some(&dir.path().to_string_lossy()))
-            .unwrap();
+        let listed = reader.list(Some(&dir.path().to_string_lossy())).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name.as_deref(), Some("Review session"));
         assert_eq!(writer.inspect_leases().unwrap(), before);
@@ -139,8 +145,12 @@ mod tests {
                 ..SessionCreateOptions::default()
             })
             .unwrap();
-        let first = session.append_entry(provision_message("first"), "main").unwrap();
-        let second = session.append_entry(provision_message("second"), "main").unwrap();
+        let first = session
+            .append_entry(provision_message("first"), "main")
+            .unwrap();
+        let second = session
+            .append_entry(provision_message("second"), "main")
+            .unwrap();
         let ids: Vec<_> = session
             .find_entries(EntryQuery {
                 order: Some(QueryOrder::OldestFirst),
@@ -161,4 +171,3 @@ mod tests {
         assert!(report.ok(), "conformance failures: {:?}", report.failed);
     }
 }
-

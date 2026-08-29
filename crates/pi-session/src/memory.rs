@@ -4,8 +4,9 @@ use pi_core::{next_id, now_ms, SessionError};
 use serde_json::Value;
 
 use crate::{
-    assign_storage_fields, Entry, EntryQuery, ForkOptions, ForkScope, LaneRecord, LogItem, QueryOrder,
-    SessionCreateOptions, SessionMetadata, SessionRepository, SessionStats, SessionStore,
+    assign_storage_fields, Entry, EntryQuery, ForkOptions, ForkScope, LaneRecord, LogItem,
+    QueryOrder, SessionCreateOptions, SessionMetadata, SessionRepository, SessionStats,
+    SessionStore,
 };
 
 #[derive(Debug, Clone)]
@@ -51,10 +52,18 @@ impl SessionInner {
 
     fn append_entry(&mut self, entry: Entry, lane: &str) -> Result<Entry, SessionError> {
         if !self.lanes.contains_key(lane) {
-            return Err(SessionError::invalid_payload(format!("unknown lane {lane}")));
+            return Err(SessionError::invalid_payload(format!(
+                "unknown lane {lane}"
+            )));
         }
-        if self.entries.iter().any(|existing| existing.id() == entry.id())
-            || self.records.iter().any(|existing| existing.id() == entry.id())
+        if self
+            .entries
+            .iter()
+            .any(|existing| existing.id() == entry.id())
+            || self
+                .records
+                .iter()
+                .any(|existing| existing.id() == entry.id())
         {
             return Err(SessionError::invalid_payload(format!(
                 "duplicate id {}",
@@ -295,10 +304,15 @@ impl MemorySessionRepository {
 }
 
 impl SessionRepository for MemorySessionRepository {
-    fn create(&mut self, options: SessionCreateOptions) -> Result<Box<dyn SessionStore>, SessionError> {
+    fn create(
+        &mut self,
+        options: SessionCreateOptions,
+    ) -> Result<Box<dyn SessionStore>, SessionError> {
         let id = options.id.unwrap_or_else(next_id);
         if self.sessions.contains_key(&id) {
-            return Err(SessionError::invalid_payload(format!("session {id} exists")));
+            return Err(SessionError::invalid_payload(format!(
+                "session {id} exists"
+            )));
         }
         let metadata = SessionMetadata {
             id: id.clone(),
@@ -318,11 +332,10 @@ impl SessionRepository for MemorySessionRepository {
     }
 
     fn open(&mut self, metadata: &SessionMetadata) -> Result<Box<dyn SessionStore>, SessionError> {
-        let inner = self
-            .sessions
-            .get(&metadata.id)
-            .cloned()
-            .ok_or_else(|| SessionError::not_found(format!("session {} not found", metadata.id)))?;
+        let inner =
+            self.sessions.get(&metadata.id).cloned().ok_or_else(|| {
+                SessionError::not_found(format!("session {} not found", metadata.id))
+            })?;
         Ok(Box::new(MemorySession::from_inner(inner)))
     }
 
@@ -350,11 +363,9 @@ impl SessionRepository for MemorySessionRepository {
         options: ForkOptions,
     ) -> Result<Box<dyn SessionStore>, SessionError> {
         let source_meta = source.metadata()?;
-        let source_inner = self
-            .sessions
-            .get(&source_meta.id)
-            .cloned()
-            .ok_or_else(|| SessionError::not_found(format!("session {} not found", source_meta.id)))?;
+        let source_inner = self.sessions.get(&source_meta.id).cloned().ok_or_else(|| {
+            SessionError::not_found(format!("session {} not found", source_meta.id))
+        })?;
         let created = self.create(SessionCreateOptions {
             id: None,
             cwd: options.cwd,
@@ -370,7 +381,12 @@ impl SessionRepository for MemorySessionRepository {
                 let start = options
                     .entry_id
                     .clone()
-                    .or_else(|| source_inner.lanes.get("main").and_then(|lane| lane.leaf_id.clone()))
+                    .or_else(|| {
+                        source_inner
+                            .lanes
+                            .get("main")
+                            .and_then(|lane| lane.leaf_id.clone())
+                    })
                     .ok_or_else(|| SessionError::invalid_payload("fork target missing"))?;
                 let mut path = source_inner.branch_path(&start)?;
                 if matches!(options.position, crate::ForkPosition::Before) {
@@ -382,7 +398,8 @@ impl SessionRepository for MemorySessionRepository {
         dest.entries.clear();
         dest.next_seq = 1;
         dest.stats = SessionStats::default();
-        dest.lanes.insert("main".to_string(), LaneState { leaf_id: None });
+        dest.lanes
+            .insert("main".to_string(), LaneState { leaf_id: None });
         for entry in copied {
             dest.append_entry(strip_storage(entry), "main")?;
         }
@@ -410,8 +427,12 @@ mod tests {
                 ..SessionCreateOptions::default()
             })
             .unwrap();
-        let first = session.append_entry(provision_message("one"), "main").unwrap();
-        let second = session.append_entry(provision_message("two"), "main").unwrap();
+        let first = session
+            .append_entry(provision_message("one"), "main")
+            .unwrap();
+        let second = session
+            .append_entry(provision_message("two"), "main")
+            .unwrap();
         assert_eq!(first.seq(), 1);
         assert_eq!(second.seq(), 2);
         assert_eq!(second.parent_id(), Some(first.id()));
