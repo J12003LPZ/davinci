@@ -292,6 +292,95 @@ pub fn catalog_option_label(model: &LlamaModelInfo) -> String {
     format!("{} [{}]", model.id, model.status.value)
 }
 
+fn llama_error_message(payload: Option<&Value>, fallback: &str) -> String {
+    payload
+        .and_then(|value| value.get("error"))
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn llama_request(
+    server_url: &str,
+    path: &str,
+    method: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    if let Ok(raw) = std::env::var("PI_LLAMA_ACTION_REPLY") {
+        if raw.is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&raw).or(Ok(Value::String(raw)));
+    }
+    if std::env::var("PI_LLAMA_DRY_RUN").is_ok() {
+        return Ok(serde_json::json!({ "ok": true, "path": path, "method": method }));
+    }
+    let url = format!("{}{path}", normalize_llama_server_url(server_url)?);
+    let mut request = match method {
+        "POST" => ureq::post(&url),
+        _ => ureq::get(&url),
+    };
+    if let Ok(key) = std::env::var("LLAMA_API_KEY") {
+        if !key.is_empty() {
+            request = request.set("Authorization", &format!("Bearer {key}"));
+        }
+    }
+    let response = if let Some(body) = body {
+        request
+            .send_json(body)
+            .map_err(|err| format!("Could not connect to the server. {err}"))?
+    } else {
+        request
+            .call()
+            .map_err(|err| format!("Could not connect to the server. {err}"))?
+    };
+    let status = response.status();
+    let payload = response.into_json::<Value>().ok();
+    if !(200..300).contains(&status) {
+        return Err(llama_error_message(
+            payload.as_ref(),
+            &format!("llama.cpp returned HTTP {status}"),
+        ));
+    }
+    Ok(payload.unwrap_or(Value::Null))
+}
+
+pub fn load_model(server_url: &str, model: &str) -> Result<(), String> {
+    llama_request(
+        server_url,
+        "/models/load",
+        "POST",
+        Some(serde_json::json!({ "model": model })),
+    )
+    .map(|_| ())
+}
+
+pub fn unload_model(server_url: &str, model: &str) -> Result<(), String> {
+    llama_request(
+        server_url,
+        "/models/unload",
+        "POST",
+        Some(serde_json::json!({ "model": model })),
+    )
+    .map(|_| ())
+}
+
+pub fn download_model(server_url: &str, model: &str) -> Result<(), String> {
+    llama_request(
+        server_url,
+        "/models",
+        "POST",
+        Some(serde_json::json!({ "model": model })),
+    )
+    .map(|_| ())
+}
+
 pub fn list_models(server_url: &str) -> Result<Vec<LlamaModelInfo>, String> {
     if let Ok(raw) = std::env::var("PI_LLAMA_MODELS_REPLY") {
         let payload: Value =
@@ -472,5 +561,17 @@ mod tests {
         std::env::remove_var("PI_LLAMA_MODELS_REPLY");
         assert_eq!(models[0].id, "local");
         assert_eq!(catalog_option_label(&models[0]), "local [loaded]");
+    }
+
+    #[test]
+    fn load_unload_download_use_action_fixture() {
+        std::env::set_var("PI_LLAMA_ACTION_REPLY", r#"{"ok":true}"#);
+        load_model("http://127.0.0.1:8080", "local").unwrap();
+        unload_model("http://127.0.0.1:8080", "local").unwrap();
+        download_model("http://127.0.0.1:8080", "org/model:Q4_K_M").unwrap();
+        std::env::remove_var("PI_LLAMA_ACTION_REPLY");
+        std::env::set_var("PI_LLAMA_DRY_RUN", "1");
+        load_model("http://127.0.0.1:8080", "local").unwrap();
+        std::env::remove_var("PI_LLAMA_DRY_RUN");
     }
 }

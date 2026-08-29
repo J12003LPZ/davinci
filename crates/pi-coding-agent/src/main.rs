@@ -2070,11 +2070,12 @@ fn handle_extension_select(
             .find(|model| llama::catalog_option_label(model) == choice)
         {
             if llama::model_is_loaded(model) {
-                session.extension_dialog_context = Some(format!("llama-unload:{url}:{}", model.id));
+                session.extension_dialog_context = Some(format!("llama-unload:{}@{url}", model.id));
                 session.open_extension_confirm("Unload model?", &model.id);
                 return Ok(true);
             }
             if llama::model_is_selectable(model, autoload) || model.status.value == "unloaded" {
+                llama::load_model(url, &model.id)?;
                 let progress = llama::parse_load_progress(&serde_json::json!({
                     "progress": { "stage": "starting" }
                 }));
@@ -2105,6 +2106,11 @@ fn handle_extension_input(session: &mut InteractiveSession, value: Option<String
     {
         let (repository, quantization) = llama::parse_hugging_face_model(&value);
         let token = llama::find_hugging_face_token();
+        let model = match quantization {
+            Some(name) => format!("{repository}:{name}"),
+            None => repository.clone(),
+        };
+        llama::download_model(url, &model).ok();
         let progress = llama::parse_download_progress(&serde_json::json!({
             "model.gguf": { "done": 512, "total": 1024 }
         }));
@@ -2113,10 +2119,7 @@ fn handle_extension_input(session: &mut InteractiveSession, value: Option<String
             .and_then(|item| item.detail.clone())
             .unwrap_or_else(|| llama::format_bytes(0.0));
         session.chrome.status = format!(
-            "download {repository}{} via {url} hf={} {detail}",
-            quantization
-                .map(|name| format!(":{name}"))
-                .unwrap_or_default(),
+            "download {model} via {url} hf={} {detail}",
             token.as_deref().unwrap_or("missing")
         );
         return;
@@ -2130,11 +2133,16 @@ fn handle_extension_confirm(session: &mut InteractiveSession, confirmed: bool) {
         .as_deref()
         .and_then(|item| item.strip_prefix("llama-unload:"))
     {
-        session.chrome.status = if confirmed {
-            format!("Unloaded {rest}")
+        if confirmed {
+            if let Some((model, url)) = rest.split_once('@') {
+                let _ = llama::unload_model(url, model);
+                session.chrome.status = format!("Unloaded {model}");
+            } else {
+                session.chrome.status = format!("Unloaded {rest}");
+            }
         } else {
-            "llama unload cancelled".into()
-        };
+            session.chrome.status = "llama unload cancelled".into();
+        }
         return;
     }
     session.chrome.status = format!("extension-confirm={confirmed}");

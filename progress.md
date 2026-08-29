@@ -28,4 +28,4 @@ Gates on this slice: `cargo test --workspace`, `cargo fmt --check`, `clippy --wo
 ## Remaining product gaps
 
 - **JS custom editor hosts**: `setEditorComponent` / `ui.custom()` still record calls and use fixture replies; they do not instantiate a Node-authored Editor subclass inside the Rust TUI.
-- **llama.cpp mutations**: `/llama` lists the router catalog and opens download/input dialogs. Live load/unload/download/SSE watch is not driven the same way as TS `LlamaClient` (fixtures cover catalog/URL/progress).
+- **llama.cpp SSE watch**: `/llama` lists the catalog and drives load/unload/download via TS paths (`/models/load`, `/models/unload`, POST `/models`) with `PI_LLAMA_ACTION_REPLY` / `PI_LLAMA_DRY_RUN` fixtures. Streaming `/models/sse` wait loops are not ported.
