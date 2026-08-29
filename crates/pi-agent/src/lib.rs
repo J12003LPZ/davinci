@@ -5,6 +5,7 @@ mod compaction;
 mod context;
 mod edit_diff;
 mod events;
+mod file_mutation_queue;
 mod images;
 mod queues;
 mod skills;
@@ -32,6 +33,7 @@ pub use compaction::{
 };
 pub use context::{load_context_files, ContextFile};
 pub use events::AgentEvent;
+pub use file_mutation_queue::{mutation_queue_key, with_file_mutation_queue};
 pub use images::{
     apply_block_images, convert_to_llm_for_provider, normalize_tool_result_images,
     parse_rpc_images, process_image_bytes, IMAGE_READING_DISABLED,

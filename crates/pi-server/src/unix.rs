@@ -1,5 +1,6 @@
 //! Unix listener matching `vendor/pi/packages/server/src/transports/unix/listener.ts`.
 
+use std::collections::VecDeque;
 use std::fs::{self, Permissions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -323,6 +324,11 @@ fn is_socket_live(path: &Path) -> bool {
     }
 }
 
+struct QueuedWrite {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
 pub struct UnixByteConnection {
     stream: Option<UnixStream>,
     graceful_close_timeout_ms: u64,
@@ -330,10 +336,12 @@ pub struct UnixByteConnection {
     pending_bytes: u64,
     closed: bool,
     closing: bool,
+    queue: VecDeque<QueuedWrite>,
 }
 
 impl UnixByteConnection {
     pub fn new(stream: UnixStream, graceful_close_timeout_ms: u64, max_pending_bytes: u64) -> Self {
+        let _ = stream.set_nonblocking(true);
         Self {
             stream: Some(stream),
             graceful_close_timeout_ms,
@@ -341,11 +349,16 @@ impl UnixByteConnection {
             pending_bytes: 0,
             closed: false,
             closing: false,
+            queue: VecDeque::new(),
         }
     }
 
     pub fn closed(&self) -> bool {
         self.closed
+    }
+
+    pub fn pending_bytes(&self) -> u64 {
+        self.pending_bytes
     }
 
     pub fn send(&mut self, chunk: &[u8]) -> Result<(), ServerError> {
@@ -358,9 +371,11 @@ impl UnixByteConnection {
             ));
         }
         self.pending_bytes += chunk.len() as u64;
-        let result = self.write_all(chunk);
-        self.pending_bytes = self.pending_bytes.saturating_sub(chunk.len() as u64);
-        result
+        self.queue.push_back(QueuedWrite {
+            bytes: chunk.to_vec(),
+            offset: 0,
+        });
+        self.flush_writes(false)
     }
 
     pub fn close(&mut self, final_chunk: Option<&[u8]>) -> Result<(), ServerError> {
@@ -373,6 +388,14 @@ impl UnixByteConnection {
         }
         self.closing = true;
         let started = Instant::now();
+        if let Err(error) = self.flush_writes(true) {
+            self.mark_closed();
+            return Err(error);
+        }
+        if started.elapsed() > Duration::from_millis(self.graceful_close_timeout_ms) {
+            self.mark_closed();
+            return Ok(());
+        }
         if let Some(chunk) = final_chunk {
             if let Err(error) = self.write_all(chunk) {
                 self.mark_closed();
@@ -383,6 +406,9 @@ impl UnixByteConnection {
             self.mark_closed();
             return Ok(());
         }
+        if let Some(stream) = self.stream.as_mut() {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
         self.mark_closed();
         Ok(())
     }
@@ -391,12 +417,64 @@ impl UnixByteConnection {
         self.closed = true;
         self.closing = true;
         self.stream.take();
+        self.queue.clear();
+        self.pending_bytes = 0;
+    }
+
+    fn flush_writes(&mut self, blocking: bool) -> Result<(), ServerError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(ServerError::Io("Unix connection is closed".into()));
+        };
+        let _ = stream.set_nonblocking(!blocking);
+        let started = Instant::now();
+        while let Some(front) = self.queue.front_mut() {
+            match stream.write(&front.bytes[front.offset..]) {
+                Ok(0) => {
+                    return Err(ServerError::Io(
+                        "Unix connection closed during write".into(),
+                    ))
+                }
+                Ok(n) => {
+                    front.offset += n;
+                    if front.offset >= front.bytes.len() {
+                        let total = front.bytes.len() as u64;
+                        self.queue.pop_front();
+                        self.pending_bytes = self.pending_bytes.saturating_sub(total);
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    if !blocking {
+                        return Ok(());
+                    }
+                    if started.elapsed() > Duration::from_millis(self.graceful_close_timeout_ms) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::BrokenPipe
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::NotConnected
+                    ) =>
+                {
+                    return Err(ServerError::Io(
+                        "Unix connection closed during write".into(),
+                    ));
+                }
+                Err(err) => return Err(ServerError::Io(err.to_string())),
+            }
+        }
+        Ok(())
     }
 
     fn write_all(&mut self, chunk: &[u8]) -> Result<(), ServerError> {
         let Some(stream) = self.stream.as_mut() else {
             return Err(ServerError::Io("Unix connection is closed".into()));
         };
+        let _ = stream.set_nonblocking(false);
         stream.write_all(chunk).map_err(|err| {
             if err.kind() == ErrorKind::BrokenPipe
                 || err.kind() == ErrorKind::ConnectionReset
@@ -436,6 +514,24 @@ mod tests {
             Err(err) => assert_eq!(err.to_string(), "Unix connection is closed"),
             Ok(()) => panic!("expected closed"),
         }
+    }
+
+    #[test]
+    fn unix_byte_connection_keeps_pending_bytes_until_peer_reads() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let expected = 2 * 1024 * 1024;
+        let mut conn = UnixByteConnection::new(left, 5_000, (expected * 2) as u64);
+        conn.send(&vec![1u8; expected]).unwrap();
+        conn.send(&vec![2u8; expected]).unwrap();
+        match conn.send(&[3]) {
+            Err(err) => assert_eq!(
+                err.to_string(),
+                "Unix connection exceeded its pending byte limit"
+            ),
+            Ok(()) => panic!("expected pending byte limit while the peer is paused"),
+        }
+        assert!(conn.pending_bytes() > 0);
+        drop(right);
     }
 
     fn socket_identity(path: &Path) -> (u64, u64) {

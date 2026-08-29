@@ -22,6 +22,7 @@ mod markdown;
 mod mermaid;
 mod model_selector;
 mod mouse;
+mod native;
 mod open_browser;
 mod osc;
 mod overlay;
@@ -39,15 +40,17 @@ mod thinking_selector;
 mod tool_card;
 mod transcript;
 mod tree;
+mod truncated_text;
 mod trust_selector;
 mod undo_stack;
 mod word_nav;
 mod word_wrap;
 
 pub use ansi::{
-    extract_ansi_code, grapheme_width, normalize_terminal_output,
-    strip_terminal_sequences as strip_ansi_sequences, truncate_to_width as truncate_to_width_ansi,
-    visible_width as visible_width_ansi, wrap_text_with_ansi,
+    extract_ansi_code, extract_segments, grapheme_width, normalize_terminal_output,
+    slice_with_width, strip_terminal_sequences as strip_ansi_sequences,
+    truncate_to_width as truncate_to_width_ansi, visible_width as visible_width_ansi,
+    wrap_text_with_ansi, ExtractedSegments, SlicedText,
 };
 pub use autocomplete::{
     apply_completion, autocomplete_debounce_ms, suggestions, AutocompleteItem,
@@ -91,6 +94,10 @@ pub use markdown::{
 pub use mermaid::{transform_mermaid, MermaidArt, MermaidContext, MermaidMode, MermaidTheme};
 pub use model_selector::{ModelScope, ModelSelector, ModelSelectorAction, ModelSelectorItem};
 pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
+pub use native::{
+    enable_virtual_terminal_input, get_native_module_candidates, is_native_modifier_pressed,
+    native_helper_path, ModifierKey, NativeModuleCandidateOptions, TUI_PACKAGE_NAME,
+};
 pub use open_browser::{copy_text, open_browser, open_browser_argv, open_browser_dry_run};
 pub use osc::{
     detect_terminal_background_from_env, detect_terminal_theme_for_auto, drain_osc_tty,
@@ -150,6 +157,7 @@ pub use tree::{
     build_session_tree, FilterMode, SessionTreeEntry, SessionTreeNode, TreeAction, TreeSelector,
     FILTER_MODES,
 };
+pub use truncated_text::TruncatedText;
 pub use trust_selector::{
     TrustOption, TrustSavedDecision, TrustSelector, TrustSelectorAction, TrustUpdate,
 };

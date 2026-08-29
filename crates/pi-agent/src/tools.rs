@@ -134,19 +134,7 @@ pub fn execute_tool(
 ) -> Result<ToolResult, ToolError> {
     match name {
         "read" => read_tool(cwd, input),
-        "write" => {
-            let path = resolve(cwd, required_str(input, "path")?)?;
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|err| ToolError::Failed(err.to_string()))?;
-            }
-            let content = required_str(input, "content")?;
-            fs::write(&path, content).map_err(|err| ToolError::Failed(err.to_string()))?;
-            Ok(ToolResult {
-                content: format!("Wrote {}", path.display()),
-                is_error: false,
-                details: None,
-            })
-        }
+        "write" => write_tool(cwd, input),
         "edit" => edit_tool(cwd, input),
         "bash" => shell_tool(cwd, input),
         "powershell" => powershell_tool(cwd, required_str(input, "command")?),
@@ -271,11 +259,37 @@ fn detect_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn write_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let path = resolve(cwd, required_str(input, "path")?)?;
+    crate::file_mutation_queue::with_file_mutation_queue(&path, || {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| ToolError::Failed(err.to_string()))?;
+        }
+        let content = required_str(input, "content")?;
+        fs::write(&path, content).map_err(|err| ToolError::Failed(err.to_string()))?;
+        Ok(ToolResult {
+            content: format!("Wrote {}", path.display()),
+            is_error: false,
+            details: None,
+        })
+    })
+}
+
 fn edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     let (display_path, edits) =
         crate::edit_diff::prepare_edit_arguments(input).map_err(ToolError::Failed)?;
     let path = resolve(cwd, &display_path)?;
-    let raw = match fs::read_to_string(&path) {
+    crate::file_mutation_queue::with_file_mutation_queue(&path, || {
+        edit_tool_locked(&path, &display_path, &edits)
+    })
+}
+
+fn edit_tool_locked(
+    path: &Path,
+    display_path: &str,
+    edits: &[crate::edit_diff::Edit],
+) -> Result<ToolResult, ToolError> {
+    let raw = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => {
             return Err(ToolError::Failed(format!(
@@ -290,13 +304,13 @@ fn edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
     let ending = crate::edit_diff::detect_line_ending(content);
     let normalized = crate::edit_diff::normalize_to_lf(content);
     let applied =
-        crate::edit_diff::apply_edits_to_normalized_content(&normalized, &edits, &display_path)
+        crate::edit_diff::apply_edits_to_normalized_content(&normalized, edits, display_path)
             .map_err(ToolError::Failed)?;
     let final_content = format!(
         "{bom}{}",
         crate::edit_diff::restore_line_endings(&applied.new_content, ending)
     );
-    fs::write(&path, final_content).map_err(|err| ToolError::Failed(err.to_string()))?;
+    fs::write(path, final_content).map_err(|err| ToolError::Failed(err.to_string()))?;
     Ok(ToolResult {
         content: format!("Edited {display_path}"),
         is_error: false,
@@ -1005,6 +1019,46 @@ fn match_glob_chars(pattern: &str, name: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn parallel_edits_on_the_same_file_are_serialized() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("parallel-edit.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        let cwd = dir.path().to_path_buf();
+        let left = std::thread::spawn({
+            let cwd = cwd.clone();
+            move || {
+                execute_tool(
+                    &cwd,
+                    "edit",
+                    &serde_json::json!({
+                        "path":"parallel-edit.txt",
+                        "edits":[{"oldText":"alpha","newText":"ALPHA"}]
+                    }),
+                )
+            }
+        });
+        let right = std::thread::spawn({
+            let cwd = cwd.clone();
+            move || {
+                execute_tool(
+                    &cwd,
+                    "edit",
+                    &serde_json::json!({
+                        "path":"parallel-edit.txt",
+                        "edits":[{"oldText":"beta","newText":"BETA"}]
+                    }),
+                )
+            }
+        });
+        left.join().unwrap().unwrap();
+        right.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "ALPHA\nBETA\ngamma\n"
+        );
+    }
 
     #[test]
     fn read_write_edit_semantics() {

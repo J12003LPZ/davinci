@@ -3,6 +3,7 @@
 mod connection;
 mod session;
 mod state;
+mod unix;
 
 pub use connection::{
     loopback_factory, ByteTransport, ByteTransportHandlers, Connection, ConnectionState,
@@ -10,6 +11,10 @@ pub use connection::{
 };
 pub use session::{SessionClient, SessionHandle, SessionLeaseMode};
 pub use state::{ClientState, Unsubscribe};
+pub use unix::{
+    connect_unix_transport, create_unix_transport_factory, max_unix_socket_path_bytes,
+    resolve_unix_transport_options, UnixByteTransport, UnixTransportOptions,
+};
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

@@ -1214,6 +1214,157 @@ pub fn truncate_to_width(text: &str, max_width: usize, ellipsis: &str, pad: bool
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlicedText {
+    pub text: String,
+    pub width: usize,
+}
+
+/// TS `sliceWithWidth`.
+pub fn slice_with_width(line: &str, start_col: usize, length: usize, strict: bool) -> SlicedText {
+    if length == 0 {
+        return SlicedText {
+            text: String::new(),
+            width: 0,
+        };
+    }
+    let end_col = start_col + length;
+    let mut result = String::new();
+    let mut result_width = 0usize;
+    let mut current_col = 0usize;
+    let mut i = 0usize;
+    let mut pending_ansi = String::new();
+    while i < line.len() {
+        if let Some((code, len)) = extract_ansi_code(line, i) {
+            if current_col >= start_col && current_col < end_col {
+                result.push_str(&code);
+            } else if current_col < start_col {
+                pending_ansi.push_str(&code);
+            }
+            i += len;
+            continue;
+        }
+        let mut text_end = i;
+        while text_end < line.len() && extract_ansi_code(line, text_end).is_none() {
+            text_end += line[text_end..]
+                .chars()
+                .next()
+                .map_or(1, |ch| ch.len_utf8());
+        }
+        for segment in line[i..text_end].graphemes(true) {
+            let w = grapheme_width(segment);
+            let in_range = current_col >= start_col && current_col < end_col;
+            let fits = !strict || current_col + w <= end_col;
+            if in_range && fits {
+                result.push_str(&pending_ansi);
+                pending_ansi.clear();
+                result.push_str(segment);
+                result_width += w;
+            }
+            current_col += w;
+            if current_col >= end_col {
+                break;
+            }
+        }
+        i = text_end;
+        if current_col >= end_col {
+            break;
+        }
+    }
+    SlicedText {
+        text: result,
+        width: result_width,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedSegments {
+    pub before: String,
+    pub before_width: usize,
+    pub after: String,
+    pub after_width: usize,
+}
+
+/// TS `extractSegments`.
+pub fn extract_segments(
+    line: &str,
+    before_end: usize,
+    after_start: usize,
+    after_len: usize,
+    strict_after: bool,
+) -> ExtractedSegments {
+    let mut before = String::new();
+    let mut before_width = 0usize;
+    let mut after = String::new();
+    let mut after_width = 0usize;
+    let mut current_col = 0usize;
+    let mut i = 0usize;
+    let mut pending_ansi_before = String::new();
+    let mut after_started = false;
+    let after_end = after_start + after_len;
+    let mut tracker = AnsiCodeTracker::default();
+    while i < line.len() {
+        if let Some((code, len)) = extract_ansi_code(line, i) {
+            tracker.process(&code);
+            if current_col < before_end {
+                pending_ansi_before.push_str(&code);
+            } else if current_col >= after_start && current_col < after_end && after_started {
+                after.push_str(&code);
+            }
+            i += len;
+            continue;
+        }
+        let mut text_end = i;
+        while text_end < line.len() && extract_ansi_code(line, text_end).is_none() {
+            text_end += line[text_end..]
+                .chars()
+                .next()
+                .map_or(1, |ch| ch.len_utf8());
+        }
+        for segment in line[i..text_end].graphemes(true) {
+            let w = grapheme_width(segment);
+            if current_col < before_end && current_col + w <= before_end {
+                before.push_str(&pending_ansi_before);
+                pending_ansi_before.clear();
+                before.push_str(segment);
+                before_width += w;
+            } else if current_col >= after_start && current_col < after_end {
+                let fits = !strict_after || current_col + w <= after_end;
+                if fits {
+                    if !after_started {
+                        after.push_str(&tracker.get_active_codes());
+                        after_started = true;
+                    }
+                    after.push_str(segment);
+                    after_width += w;
+                }
+            }
+            current_col += w;
+            if if after_len == 0 {
+                current_col >= before_end
+            } else {
+                current_col >= after_end
+            } {
+                break;
+            }
+        }
+        i = text_end;
+        if if after_len == 0 {
+            current_col >= before_end
+        } else {
+            current_col >= after_end
+        } {
+            break;
+        }
+    }
+    ExtractedSegments {
+        before,
+        before_width,
+        after,
+        after_width,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,5 +1598,24 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].matches("\x1b]8;;https:").count(), 1);
         assert_eq!(lines[0].matches("\x1b]8;;\x1b\\").count(), 1);
+    }
+
+    #[test]
+    fn tab_width_slice_and_segments_match_ts() {
+        let text = "out 192M\t.pi/skill-tests/results-ha";
+        let slice = slice_with_width(text, 0, 10, true);
+        assert_eq!(slice.text, "out 192M");
+        assert_eq!(slice.width, 8);
+        assert_eq!(visible_width(&slice.text), slice.width);
+
+        let segments = extract_segments(text, 10, 13, 10, true);
+        assert_eq!(segments.before, "out 192M");
+        assert_eq!(segments.before_width, 8);
+        assert_eq!(visible_width(&segments.before), segments.before_width);
+
+        let tab_fits = extract_segments(text, 11, 13, 10, true);
+        assert_eq!(tab_fits.before, "out 192M\t");
+        assert_eq!(tab_fits.before_width, 11);
+        assert_eq!(visible_width(&tab_fits.before), tab_fits.before_width);
     }
 }

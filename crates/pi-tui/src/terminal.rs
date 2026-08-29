@@ -115,7 +115,7 @@ pub fn native_shift_is_pressed() -> bool {
     matches!(
         std::env::var("PI_TUI_SHIFT").as_deref(),
         Ok("1") | Ok("true")
-    )
+    ) || crate::native::is_native_modifier_pressed(crate::native::ModifierKey::Shift)
 }
 
 pub fn rewrite_shift_enter_input(data: &str) -> String {

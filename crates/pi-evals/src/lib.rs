@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod harness_table;
+pub mod reporter;
 pub mod summary;
 
 pub use artifacts::{
@@ -11,6 +12,11 @@ pub use artifacts::{
 pub use harness_table::{
     derive_eval_group_key, eval_harness_table, parse_eval_harness_iteration_artifact,
     EvalHarnessIterationArtifact, EvalHarnessTableRow, EVAL_HARNESS_ITERATION_ARTIFACT,
+};
+pub use reporter::{
+    append_harness_run_report, collect_harness_observations, format_test_run_end, is_harness_run,
+    HarnessRun, HarnessTestCase, HarnessTestModule, HarnessTimings, HarnessUsage,
+    EVAL_COMPARISONS_INTERRUPTED,
 };
 pub use summary::{
     format_harness_comparison_report, strip_vt_control_characters, summarize_harness_comparisons,

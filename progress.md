@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (Unix stale-socket identity probe + owned-socket cleanup, TUI StdinBuffer with tickable clock, ANSI `truncateToWidth` / `wrapTextWithAnsi` / `visibleWidth`, experimental `pi` / `server` / `client` CLI composition including `--listen` while interactive). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (file-mutation queue on write/edit, TruncatedText, native module-path/modifiers, ANSI `sliceWithWidth`/`extractSegments`, Unix client/server write queues + pending-byte limit, eval harness reporter). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -127,7 +127,10 @@ Closed this slice: `pi-evals` ports TS `summarizeHarnessComparisons` / `formatHa
 
 Closed this slice: `pi-server` Unix `removeStaleSocket` identity-preserving rename (`.s-{uuid}`), `ECONNRESET` live probe, and `cleanupOwnedSocket` (`.c-{uuid}`) so a live listener keeps its inode, a regular file is never unlinked, nested parents stay `0o700` / socket `0o600`, replacement inodes survive shutdown, and a genuinely stale socket is removed before rebind. `BoundUnixListener::close` / `Drop` unlinks only the owned identity. `pi-tui` `StdinBuffer` ports CSI/OSC/DCS/APC/SS3/mouse/paste buffering, lone-ESC vs sequence timeouts, WezTerm `\x1b\x1b[27;…u` split, Kitty printable duplicate drop, high-byte ESC conversion; timeouts are tickable (`tick(ms)` / `flush`) so tests stay deterministic. `process_stdin` feeds the buffer without changing `handle_bytes` ESC-as-Abort. ANSI `visibleWidth` / `truncateToWidth` / `wrapTextWithAnsi` lock TS fixtures (underline/bg no-bleed, OSC-8 BEL vs ST, CJK wrap, Indic/Myanmar/Thai/RI widths). Experimental CLI `parse_experimental_cli` matches `experimentalCli.parse` (`pi`/`server`/`client`, `--listen` once, auth exclusivity, leftover-option errors, `--listen=` as unknown flag, `--system-prompt --listen` left to the existing parser). `PI_EXPERIMENTAL=1` routes the coding-agent command through that parser; `--listen` on `pi` binds while running.
 
+Closed this slice: write/edit tools serialize per realpath via `withFileMutationQueue` (symlink aliases share a key; parallel `alpha`/`beta` edits both apply). TUI `TruncatedText` (first line, ANSI truncate, pad X/Y). Native helper resolution (`getNativeModuleCandidates`, darwin/win32 `.node` paths, `isNativeModifierPressed` via `PI_TUI_NATIVE_MODIFIER_*`, VT input). ANSI `sliceWithWidth` / `extractSegments` lock tab-width fixtures (`out 192M\t…`). `pi-client` `createUnixTransportFactory` + `UnixByteTransport` write queue (`Unix transport exceeded its pending byte limit`, ENOENT, path/maxPendingBytes TypeErrors) and `pi-server` `UnixByteConnection` keeps `pendingBytes` until the write finishes, then half-closes with `gracefulCloseTimeoutMs`. `pi-evals` reporter `collectHarnessObservations` / `appendHarnessRunReport` / interrupted string `Eval comparisons unavailable: test run interrupted.` (runs.jsonl 0o700/0o600).
+
 Still not product-equivalent:
 
-- Native TUI C addons (`tui/native/darwin`, `tui/native/win32`) — optional; Shift detection uses crossterm modifiers plus the TS rewrite helpers. Darwin/Win32 `.node` binaries are not shipped.
+- Native TUI C addons (`tui/native/darwin`, `tui/native/win32`) — optional; Shift detection uses crossterm modifiers, `PI_TUI_SHIFT` / `PI_TUI_NATIVE_MODIFIER_SHIFT`, plus the TS rewrite helpers. Darwin/Win32 `.node` binaries are not shipped.
+- TUI layout runtime still incomplete vs `@earendil-works/pi-tui` exports used by interactive: `Container`/`HStack`/`VStack`/`Spacer`, `Loader`/`CancellableLoader`, `TuiMainScreen`/`TuiAltScreen`/`ProcessTerminal`, full `SelectList` layout options.
 - TypeScript under `vendor/pi` remains the behavioral spec.
