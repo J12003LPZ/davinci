@@ -63,6 +63,24 @@ impl SessionEntry {
             extra: serde_json::Map::new(),
         }
     }
+
+    pub fn label_change(target_id: &str, label: Option<&str>) -> Self {
+        let mut extra = serde_json::Map::new();
+        extra.insert("targetId".into(), Value::String(target_id.to_string()));
+        if let Some(label) = label {
+            extra.insert("label".into(), Value::String(label.to_string()));
+        }
+        Self {
+            id: String::new(),
+            entry_type: "label".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: None,
+            extra,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,6 +121,9 @@ pub const ENTRY_TYPES: &[&str] = &[
     "compaction",
     "branch_summary",
     "custom",
+    "custom_message",
+    "label",
+    "session_info",
 ];
 
 pub const RECORD_TYPES: &[&str] = &[

@@ -14,6 +14,8 @@ mod login_dialog;
 mod markdown;
 mod mermaid;
 mod mouse;
+mod open_browser;
+mod osc;
 mod overlay;
 mod render;
 mod scoped_models;
@@ -30,7 +32,9 @@ pub use autocomplete::{
 };
 pub use box_comp::TuiBox;
 pub use chrome::ChatChrome;
-pub use custom_message::CustomMessage;
+pub use custom_message::{
+    CustomMessage, MessageRenderOptions, MessageRenderer, MessageRendererRegistry,
+};
 pub use editor::Editor;
 pub use first_time::{
     detect_terminal_theme, FirstTimeAction, FirstTimeSetup, FirstTimeSetupResult, SETUP_LOGO_LINES,
@@ -46,6 +50,12 @@ pub use login_dialog::{AuthInfoLink, DeviceCodeInfo, LoginDialog, LoginDialogAct
 pub use markdown::render_markdown;
 pub use mermaid::{transform_mermaid, MermaidArt, MermaidContext, MermaidMode, MermaidTheme};
 pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
+pub use open_browser::{copy_text, open_browser, open_browser_argv, open_browser_dry_run};
+pub use osc::{
+    detect_terminal_background_from_env, detect_terminal_theme_for_auto,
+    parse_osc11_background_color, parse_terminal_color_scheme_report, ThemeDetection,
+    COLOR_SCHEME_QUERY, OSC_11_QUERY,
+};
 pub use overlay::Overlay;
 pub use render::{visible_width, Component, Text};
 pub use scoped_models::{
@@ -58,7 +68,10 @@ pub use session::{
     BRACKETED_PASTE_ENABLE, DISABLE_AUTOWRAP, DOUBLE_ESCAPE_MS, ENABLE_AUTOWRAP,
     KITTY_KEYBOARD_DISABLE, KITTY_KEYBOARD_QUERY,
 };
-pub use settings::{default_interactive_settings, SettingItem, SettingsList};
+pub use settings::{
+    default_interactive_settings, format_http_idle_timeout, interactive_settings_list,
+    parse_http_idle_timeout, InteractiveSettingsConfig, SettingItem, SettingsList,
+};
 pub use themes::{builtin_themes, Theme};
 pub use tool_card::{ToolCard, ToolCardState, FALLBACK_PREVIEW_LINES};
 pub use transcript::{Transcript, TranscriptLine};

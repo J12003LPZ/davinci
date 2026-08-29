@@ -28,6 +28,62 @@ pub struct Settings {
     pub tracking_id: Option<String>,
     #[serde(default, rename = "enabledModels")]
     pub enabled_models: Option<Vec<String>>,
+    #[serde(default, rename = "autoCompact")]
+    pub auto_compact: Option<bool>,
+    #[serde(default, rename = "steeringMode")]
+    pub steering_mode: Option<String>,
+    #[serde(default, rename = "followUpMode")]
+    pub follow_up_mode: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default, rename = "httpIdleTimeoutMs")]
+    pub http_idle_timeout_ms: Option<u64>,
+    #[serde(default, rename = "hideThinkingBlock")]
+    pub hide_thinking_block: Option<bool>,
+    #[serde(default, rename = "showCacheMissNotices")]
+    pub show_cache_miss_notices: Option<bool>,
+    #[serde(default, rename = "collapseChangelog")]
+    pub collapse_changelog: Option<bool>,
+    #[serde(default, rename = "enableInstallTelemetry")]
+    pub enable_install_telemetry: Option<bool>,
+    #[serde(default, rename = "defaultProjectTrust")]
+    pub default_project_trust: Option<String>,
+    #[serde(default, rename = "tuiMode")]
+    pub tui_mode: Option<String>,
+    #[serde(default, rename = "fullscreenExitOutput")]
+    pub fullscreen_exit_output: Option<String>,
+    #[serde(default, rename = "fullscreenScrollbar")]
+    pub fullscreen_scrollbar: Option<String>,
+    #[serde(default, rename = "fullscreenCopyOnSelect")]
+    pub fullscreen_copy_on_select: Option<bool>,
+    #[serde(default, rename = "showImages")]
+    pub show_images: Option<bool>,
+    #[serde(default, rename = "imageWidthCells")]
+    pub image_width_cells: Option<u32>,
+    #[serde(default, rename = "autoResizeImages")]
+    pub auto_resize_images: Option<bool>,
+    #[serde(default, rename = "blockImages")]
+    pub block_images: Option<bool>,
+    #[serde(default, rename = "enableSkillCommands")]
+    pub enable_skill_commands: Option<bool>,
+    #[serde(default, rename = "showHardwareCursor")]
+    pub show_hardware_cursor: Option<bool>,
+    #[serde(default, rename = "editorPaddingX")]
+    pub editor_padding_x: Option<u32>,
+    #[serde(default, rename = "outputPad")]
+    pub output_pad: Option<u32>,
+    #[serde(default, rename = "clearOnShrink")]
+    pub clear_on_shrink: Option<bool>,
+    #[serde(default, rename = "showTerminalProgress")]
+    pub show_terminal_progress: Option<bool>,
+    #[serde(default)]
+    pub warnings: WarningSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WarningSettings {
+    #[serde(default, rename = "anthropicExtraUsage")]
+    pub anthropic_extra_usage: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -70,6 +126,90 @@ pub fn set_enable_analytics(settings: &mut Settings, enabled: bool) {
     settings.enable_analytics = Some(enabled);
     if enabled && settings.tracking_id.is_none() {
         settings.tracking_id = Some(Uuid::new_v4().to_string());
+    }
+}
+
+pub fn default_project_trust_label(value: Option<&str>) -> String {
+    match value {
+        Some("always") => "Always trust".into(),
+        Some("never") => "Never trust".into(),
+        _ => "Ask".into(),
+    }
+}
+
+pub fn default_project_trust_value(label: &str) -> &'static str {
+    match label {
+        "Always trust" => "always",
+        "Never trust" => "never",
+        _ => "ask",
+    }
+}
+
+pub fn to_interactive_config(
+    settings: &Settings,
+    theme: &str,
+) -> pi_tui::InteractiveSettingsConfig {
+    pi_tui::InteractiveSettingsConfig {
+        theme: settings.theme.clone().unwrap_or_else(|| theme.to_string()),
+        double_escape: settings
+            .double_escape_action
+            .clone()
+            .unwrap_or_else(|| "tree".into()),
+        quiet_startup: settings.quiet_startup,
+        autocomplete_max_visible: settings.autocomplete_max_visible.unwrap_or(8),
+        tree_filter_mode: settings
+            .tree_filter_mode
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+        mermaid_mode: settings
+            .markdown
+            .mermaid
+            .clone()
+            .unwrap_or_else(|| "streaming".into()),
+        enable_analytics: settings.enable_analytics.unwrap_or(false),
+        auto_compact: settings.auto_compact.unwrap_or(true),
+        steering_mode: settings
+            .steering_mode
+            .clone()
+            .unwrap_or_else(|| "one-at-a-time".into()),
+        follow_up_mode: settings
+            .follow_up_mode
+            .clone()
+            .unwrap_or_else(|| "one-at-a-time".into()),
+        transport: settings.transport.clone().unwrap_or_else(|| "auto".into()),
+        http_idle_timeout: pi_tui::format_http_idle_timeout(
+            settings.http_idle_timeout_ms.unwrap_or(300_000),
+        ),
+        hide_thinking: settings.hide_thinking_block.unwrap_or(false),
+        cache_miss_notices: settings.show_cache_miss_notices.unwrap_or(false),
+        collapse_changelog: settings.collapse_changelog.unwrap_or(false),
+        install_telemetry: settings.enable_install_telemetry.unwrap_or(false),
+        default_project_trust: default_project_trust_label(
+            settings.default_project_trust.as_deref(),
+        ),
+        tui_mode: settings
+            .tui_mode
+            .clone()
+            .unwrap_or_else(|| "regular".into()),
+        fullscreen_exit_output: settings
+            .fullscreen_exit_output
+            .clone()
+            .unwrap_or_else(|| "transcript".into()),
+        fullscreen_scrollbar: settings
+            .fullscreen_scrollbar
+            .clone()
+            .unwrap_or_else(|| "auto".into()),
+        fullscreen_copy_on_select: settings.fullscreen_copy_on_select.unwrap_or(true),
+        show_images: settings.show_images.unwrap_or(true),
+        image_width_cells: settings.image_width_cells.unwrap_or(80),
+        auto_resize_images: settings.auto_resize_images.unwrap_or(true),
+        block_images: settings.block_images.unwrap_or(false),
+        skill_commands: settings.enable_skill_commands.unwrap_or(true),
+        show_hardware_cursor: settings.show_hardware_cursor.unwrap_or(false),
+        editor_padding: settings.editor_padding_x.unwrap_or(0),
+        output_padding: settings.output_pad.unwrap_or(1),
+        clear_on_shrink: settings.clear_on_shrink.unwrap_or(false),
+        terminal_progress: settings.show_terminal_progress.unwrap_or(true),
     }
 }
 
@@ -116,5 +256,29 @@ mod tests {
         set_enable_analytics(&mut settings, false);
         set_enable_analytics(&mut settings, true);
         assert_eq!(settings.tracking_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn interactive_config_maps_ts_settings() {
+        let mut settings = Settings {
+            hide_thinking_block: Some(true),
+            http_idle_timeout_ms: Some(0),
+            default_project_trust: Some("never".into()),
+            steering_mode: Some("all".into()),
+            ..Settings::default()
+        };
+        settings.tree_filter_mode = Some("user-only".into());
+        let config = to_interactive_config(&settings, "dark");
+        assert!(config.hide_thinking);
+        assert_eq!(config.http_idle_timeout, "disabled");
+        assert_eq!(config.default_project_trust, "Never trust");
+        assert_eq!(config.steering_mode, "all");
+        assert_eq!(config.tree_filter_mode, "user-only");
+        let list = pi_tui::interactive_settings_list(&config);
+        let ids: Vec<_> = list.items.iter().map(|item| item.id.as_str()).collect();
+        assert!(ids.contains(&"http-idle-timeout"));
+        assert!(ids.contains(&"hide-thinking"));
+        assert!(ids.contains(&"cache-miss-notices"));
+        assert!(ids.contains(&"steering-mode"));
     }
 }

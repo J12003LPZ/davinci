@@ -29,6 +29,7 @@ pub struct LoginDialog {
     pub input_enabled: bool,
     pub cancelled: bool,
     pub complete_message: Option<String>,
+    pub opened_browser: Option<String>,
 }
 
 impl LoginDialog {
@@ -48,6 +49,7 @@ impl LoginDialog {
             input_enabled: false,
             cancelled: false,
             complete_message: None,
+            opened_browser: None,
         }
     }
 
@@ -70,6 +72,7 @@ impl LoginDialog {
         if let Some(instructions) = instructions {
             self.lines.push(instructions.to_string());
         }
+        self.opened_browser = Some(crate::open_browser::open_browser(url));
     }
 
     pub fn show_device_code(&mut self, info: &DeviceCodeInfo) {
@@ -188,6 +191,7 @@ mod tests {
     fn login_dialog_matches_ts_chrome() {
         let mut dialog = LoginDialog::new("openai", None, None);
         assert_eq!(dialog.title, "Login to openai");
+        std::env::set_var("PI_OPEN_BROWSER_DRY_RUN", "1");
         dialog.show_auth("https://example.test/auth", Some("Open the URL"));
         let rendered = dialog.render(80).join("\n");
         assert!(rendered.contains(
@@ -196,6 +200,14 @@ mod tests {
         assert!(rendered.contains(LoginDialog::click_hint()));
         assert!(rendered.contains("Ctrl+click to open") || rendered.contains("Cmd+click to open"));
         assert!(rendered.contains("Open the URL"));
+        std::env::set_var("PI_OPEN_BROWSER_DRY_RUN", "1");
+        let mut launched = LoginDialog::new("openai", None, None);
+        launched.show_auth("https://example.test/auth", None);
+        assert!(launched
+            .opened_browser
+            .as_deref()
+            .is_some_and(|cmd| cmd.contains("https://example.test/auth")));
+        std::env::remove_var("PI_OPEN_BROWSER_DRY_RUN");
         dialog.show_device_code(&DeviceCodeInfo {
             verification_uri: "https://example.test/device".into(),
             user_code: "ABCD-1234".into(),

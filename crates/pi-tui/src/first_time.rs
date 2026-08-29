@@ -195,10 +195,24 @@ impl Component for FirstTimeSetup {
 }
 
 pub fn detect_terminal_theme(theme: &Theme) -> String {
-    if theme.name == "light" {
-        "light".into()
-    } else {
-        "dark".into()
+    detect_terminal_theme_auto(Some(&theme.name))
+}
+
+pub fn detect_terminal_theme_auto(fallback_name: Option<&str>) -> String {
+    let colorfgbg = std::env::var("COLORFGBG").ok();
+    let osc11 = std::env::var("PI_OSC11_REPLY").ok();
+    let scheme = std::env::var("PI_COLOR_SCHEME_REPLY").ok();
+    let detected = crate::osc::detect_terminal_theme_for_auto(
+        scheme.as_deref(),
+        osc11.as_deref(),
+        colorfgbg.as_deref(),
+    );
+    if detected.source != "fallback" {
+        return detected.theme;
+    }
+    match fallback_name {
+        Some("light") => "light".into(),
+        _ => "dark".into(),
     }
 }
 
@@ -238,5 +252,20 @@ mod tests {
         );
         let mut cancelled = FirstTimeSetup::new("light", "pi");
         assert_eq!(cancelled.handle_key("\x1b"), FirstTimeAction::Cancel);
+    }
+
+    #[test]
+    fn auto_theme_prefers_osc_and_colorfgbg() {
+        std::env::remove_var("PI_COLOR_SCHEME_REPLY");
+        std::env::remove_var("PI_OSC11_REPLY");
+        std::env::set_var("COLORFGBG", "0;15");
+        assert_eq!(detect_terminal_theme_auto(Some("dark")), "light");
+        std::env::set_var("PI_OSC11_REPLY", "\x1b]11;#000000\x07");
+        assert_eq!(detect_terminal_theme_auto(Some("light")), "dark");
+        std::env::set_var("PI_COLOR_SCHEME_REPLY", "\x1b[?997;2n");
+        assert_eq!(detect_terminal_theme_auto(Some("dark")), "light");
+        std::env::remove_var("COLORFGBG");
+        std::env::remove_var("PI_OSC11_REPLY");
+        std::env::remove_var("PI_COLOR_SCHEME_REPLY");
     }
 }

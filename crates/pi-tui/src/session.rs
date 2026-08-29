@@ -62,6 +62,11 @@ pub enum SessionAction {
     LoginSubmit(String),
     PersistScopedModels(EnabledIds),
     ChangeScopedModels(EnabledIds),
+    CopyText(Option<String>),
+    TreeLabel {
+        id: String,
+        label: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +169,8 @@ impl InteractiveSession {
         out.push_str(MOUSE_ENABLE);
         out.push_str(BRACKETED_PASTE_ENABLE);
         out.push_str(KITTY_KEYBOARD_QUERY);
+        out.push_str(crate::osc::OSC_11_QUERY);
+        out.push_str(crate::osc::COLOR_SCHEME_QUERY);
         out
     }
 
@@ -415,6 +422,27 @@ impl InteractiveSession {
         if data.is_empty() {
             return SessionAction::None;
         }
+        if crate::osc::is_osc11_background_color_response(data)
+            || crate::osc::parse_terminal_color_scheme_report(data).is_some()
+        {
+            if let Some(setup) = &mut self.chrome.first_time {
+                let scheme = crate::osc::parse_terminal_color_scheme_report(data);
+                let osc11 = crate::osc::parse_osc11_background_color(data).map(|_| data);
+                let colorfgbg = std::env::var("COLORFGBG").ok();
+                let detected =
+                    crate::osc::detect_terminal_theme_for_auto(scheme, osc11, colorfgbg.as_deref());
+                if detected.source != "fallback" {
+                    setup.detected_theme = detected.theme.clone();
+                    if let Some(index) = crate::first_time::THEME_OPTIONS
+                        .iter()
+                        .position(|(value, _)| *value == detected.theme)
+                    {
+                        setup.theme_index = index;
+                    }
+                }
+            }
+            return SessionAction::None;
+        }
         if let Some(mut buf) = self.paste_buf.take() {
             if let Some(end) = data.find("\x1b[201~") {
                 buf.push_str(&data[..end]);
@@ -573,6 +601,8 @@ impl InteractiveSession {
                     self.close_overlays();
                     SessionAction::CloseOverlay
                 }
+                TreeAction::Copy(text) => SessionAction::CopyText(text),
+                TreeAction::LabelChange { id, label } => SessionAction::TreeLabel { id, label },
             });
         }
         if let Some(scoped) = &mut self.chrome.scoped_models {
@@ -784,6 +814,8 @@ mod tests {
         assert!(enter.contains("\x1b[?1004h"));
         assert!(enter.contains(BRACKETED_PASTE_ENABLE));
         assert!(enter.contains(KITTY_KEYBOARD_QUERY));
+        assert!(enter.contains(crate::osc::OSC_11_QUERY));
+        assert!(enter.contains(crate::osc::COLOR_SCHEME_QUERY));
         let leave = InteractiveSession::leave_sequences(true);
         assert!(leave.contains(KITTY_KEYBOARD_DISABLE));
         assert!(leave.contains(BRACKETED_PASTE_DISABLE));
@@ -910,6 +942,11 @@ mod tests {
             Some("u1".into()),
         );
         assert!(session.render_frame().contains("Session Tree"));
+        assert_eq!(
+            session.handle_bytes("\x18"),
+            SessionAction::CopyText(Some("hello".into()))
+        );
+        assert!(session.chrome.tree.is_some());
         assert_eq!(
             session.handle_bytes("\r"),
             SessionAction::SelectTreeEntry("u1".into())

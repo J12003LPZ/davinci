@@ -8,6 +8,7 @@ use crate::themes::Theme;
 pub struct TranscriptLine {
     pub role: String,
     pub text: String,
+    pub custom_lines: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,8 @@ pub struct Transcript {
     pub lines: Vec<TranscriptLine>,
     pub scroll: usize,
     pub mermaid_mode: MermaidMode,
+    pub hide_thinking_block: bool,
+    pub renderers: crate::custom_message::MessageRendererRegistry,
 }
 
 impl Default for Transcript {
@@ -23,6 +26,8 @@ impl Default for Transcript {
             lines: Vec::new(),
             scroll: 0,
             mermaid_mode: MermaidMode::Streaming,
+            hide_thinking_block: false,
+            renderers: crate::custom_message::MessageRendererRegistry::default(),
         }
     }
 }
@@ -32,6 +37,22 @@ impl Transcript {
         self.lines.push(TranscriptLine {
             role: role.into(),
             text: text.into(),
+            custom_lines: None,
+        });
+    }
+
+    pub fn push_custom(
+        &mut self,
+        custom_type: impl Into<String>,
+        content: impl Into<String>,
+        custom_lines: Option<Vec<String>>,
+    ) {
+        let custom_type = custom_type.into();
+        let content = content.into();
+        self.lines.push(TranscriptLine {
+            role: "custom".into(),
+            text: format!("{custom_type}\n{content}"),
+            custom_lines,
         });
     }
 
@@ -49,6 +70,11 @@ impl Component for Transcript {
     fn render(&self, width: usize) -> Vec<String> {
         let mut out = Vec::new();
         for line in self.lines.iter().skip(self.scroll) {
+            if self.hide_thinking_block
+                && (line.role == "thinking" || line.role == "assistant-thinking")
+            {
+                continue;
+            }
             let heading = format!("{}:", line.role);
             out.push(truncate(&heading, width));
             if line.role == "image" {
@@ -60,7 +86,12 @@ impl Component for Transcript {
                     .text
                     .split_once('\n')
                     .unwrap_or((line.text.as_str(), ""));
-                out.extend(CustomMessage::new(custom_type, content).render(width));
+                let mut message = CustomMessage::new(custom_type, content);
+                message.renderer_lines = line.custom_lines.clone();
+                if message.renderer_lines.is_none() {
+                    message.renderer = self.renderers.get(custom_type);
+                }
+                out.extend(message.render(width));
             } else if line.role == "assistant" {
                 let transformed = transform_mermaid(
                     &line.text,

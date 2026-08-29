@@ -49,6 +49,7 @@ pub struct LoadedJsExtension {
     pub handlers: Vec<String>,
     pub tools: Vec<String>,
     pub commands: Vec<String>,
+    pub message_renderers: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +58,7 @@ pub struct ExtensionHost {
     pub manifests: Vec<ExtensionManifest>,
     pub js: Vec<LoadedJsExtension>,
     pub last_js_result: Option<Value>,
+    pub message_renderers: std::collections::HashMap<String, String>,
 }
 
 impl ExtensionHost {
@@ -67,6 +69,7 @@ impl ExtensionHost {
             manifests,
             js: Vec::new(),
             last_js_result: None,
+            message_renderers: std::collections::HashMap::new(),
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -78,8 +81,13 @@ impl ExtensionHost {
                 };
                 if let Ok(loaded) = run_js_extension(&module, "load", &serde_json::json!({})) {
                     if loaded.ok {
+                        let path = module.display().to_string();
+                        for custom_type in &loaded.message_renderers {
+                            host.message_renderers
+                                .insert(custom_type.clone(), path.clone());
+                        }
                         host.js.push(LoadedJsExtension {
-                            path: module.display().to_string(),
+                            path,
                             handlers: loaded.handlers,
                             tools: loaded.tools.into_iter().map(|tool| tool.name).collect(),
                             commands: loaded
@@ -87,6 +95,7 @@ impl ExtensionHost {
                                 .into_iter()
                                 .map(|command| command.name)
                                 .collect(),
+                            message_renderers: loaded.message_renderers,
                         });
                     }
                 }
@@ -119,6 +128,44 @@ impl ExtensionHost {
             .and_then(|value| value.get("block"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    }
+
+    pub fn get_message_renderer(&self, custom_type: &str) -> Option<&str> {
+        self.message_renderers.get(custom_type).map(String::as_str)
+    }
+
+    pub fn render_custom_message(
+        &self,
+        custom_type: &str,
+        content: &str,
+        expanded: bool,
+        output_pad: usize,
+        width: usize,
+    ) -> Option<Vec<String>> {
+        let module = self.message_renderers.get(custom_type)?;
+        let rendered = run_js_extension(
+            Path::new(module),
+            "renderMessage",
+            &serde_json::json!({
+                "customType": custom_type,
+                "content": content,
+                "message": {
+                    "role": "custom",
+                    "customType": custom_type,
+                    "content": content,
+                    "display": true
+                },
+                "options": { "expanded": expanded, "outputPad": output_pad },
+                "width": width
+            }),
+        )
+        .ok()?;
+        rendered.result?.get("lines")?.as_array().map(|lines| {
+            lines
+                .iter()
+                .filter_map(|line| line.as_str().map(str::to_string))
+                .collect()
+        })
     }
 
     pub fn execute_named_tool(&self, name: &str, cwd: &Path) -> Option<Result<String, String>> {
@@ -170,10 +217,11 @@ impl ExtensionHost {
             .iter()
             .map(|ext| {
                 format!(
-                    "{} handlers={} commands={}",
+                    "{} handlers={} commands={} renderers={}",
                     ext.path,
                     ext.handlers.join(","),
-                    ext.commands.join(",")
+                    ext.commands.join(","),
+                    ext.message_renderers.join(",")
                 )
             })
             .collect::<Vec<_>>()

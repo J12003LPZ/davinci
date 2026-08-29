@@ -24,12 +24,13 @@ use pi_ai::{
 };
 use pi_session::{
     default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir,
-    resolve_session_ref, JsonlSession,
+    resolve_session_ref, JsonlSession, SessionEntry,
 };
 use pi_tui::{
-    builtin_themes, default_interactive_settings, detect_terminal_theme, encode_kitty, ChatChrome,
-    Component, DoubleEscapeAction, FilterMode, InteractiveSession, MermaidMode, ScopedModel,
-    SessionAction, SessionTreeEntry, SlashCommandSpec, ToolCard, TuiMode, FALLBACK_PREVIEW_LINES,
+    builtin_themes, copy_text, detect_terminal_theme, encode_kitty, interactive_settings_list,
+    parse_http_idle_timeout, ChatChrome, Component, CustomMessage, DoubleEscapeAction, FilterMode,
+    InteractiveSession, MermaidMode, ScopedModel, SessionAction, SessionTreeEntry,
+    SlashCommandSpec, ToolCard, TuiMode, FALLBACK_PREVIEW_LINES,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -41,8 +42,8 @@ use extension_host::{ExtensionEvent, ExtensionHost};
 use packages::handle_package_command;
 use rpc::{handle_rpc, RpcCommand, RpcRuntime};
 use settings::{
-    is_trusted, load_settings, save_settings, set_enable_analytics, settings_path,
-    should_run_first_time_setup,
+    default_project_trust_value, is_trusted, load_settings, save_settings, set_enable_analytics,
+    settings_path, should_run_first_time_setup, to_interactive_config,
 };
 use slash::SlashAction;
 
@@ -609,7 +610,16 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     session.mermaid_mode =
         MermaidMode::parse(stored.markdown.mermaid.as_deref().unwrap_or("streaming"));
     session.chrome.transcript.mermaid_mode = session.mermaid_mode;
+    session.chrome.transcript.hide_thinking_block = stored.hide_thinking_block.unwrap_or(false);
     session.enabled_model_ids = stored.enabled_models.clone();
+    let mut extensions = stored.extensions.clone();
+    extensions.extend(parsed.extensions.clone());
+    let host = if parsed.no_extensions {
+        ExtensionHost::default()
+    } else {
+        ExtensionHost::load(&default_agent_dir(), &extensions)
+    };
+    replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
     if should_run_first_time_setup(&settings_path(&default_agent_dir())) {
         session.open_first_time_setup(&detect_terminal_theme(&session.chrome.theme), APP_NAME);
@@ -661,6 +671,8 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
             KeyCode::Char('o') | KeyCode::Char('O') => "\x0f".into(),
             KeyCode::Char('s') | KeyCode::Char('S') => "\x13".into(),
             KeyCode::Char('x') | KeyCode::Char('X') => "\x18".into(),
+            KeyCode::Left => "\x1b[1;5D".into(),
+            KeyCode::Right => "\x1b[1;5C".into(),
             _ => String::new(),
         };
     }
@@ -668,6 +680,8 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
         return match key.code {
             KeyCode::Up => "\x1b[1;3A".into(),
             KeyCode::Down => "\x1b[1;3B".into(),
+            KeyCode::Left => "\x1b[1;3D".into(),
+            KeyCode::Right => "\x1b[1;3C".into(),
             _ => String::new(),
         };
     }
@@ -679,6 +693,10 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
         KeyCode::Backspace => "\x7f".into(),
         KeyCode::Up => "\x1b[A".into(),
         KeyCode::Down => "\x1b[B".into(),
+        KeyCode::Left => "\x1b[D".into(),
+        KeyCode::Right => "\x1b[C".into(),
+        KeyCode::PageUp => "\x1b[5~".into(),
+        KeyCode::PageDown => "\x1b[6~".into(),
         KeyCode::Char(ch) => ch.to_string(),
         _ => String::new(),
     }
@@ -835,6 +853,26 @@ fn apply_session_action(
             session.enabled_model_ids = ids;
             Ok(true)
         }
+        SessionAction::CopyText(text) => {
+            if let Some(text) = text {
+                let launched = copy_text(&text);
+                session.chrome.status = format!("copied {launched}");
+                println!("{text}");
+            }
+            Ok(true)
+        }
+        SessionAction::TreeLabel { id, label } => {
+            if let Some(store) = agent.session.as_mut() {
+                store
+                    .append_entry(SessionEntry::label_change(&id, label.as_deref()))
+                    .map_err(|err| err.to_string())?;
+            }
+            session.chrome.status = match &label {
+                Some(value) => format!("label={id}:{value}"),
+                None => format!("label={id}:cleared"),
+            };
+            Ok(true)
+        }
         SessionAction::OpenFork => handle_user_line(parsed, agent, &mut session.chrome, "/fork"),
         SessionAction::RunBash(command) => {
             match crate::js_host::execute_command_tool(&command, &agent.cwd) {
@@ -931,15 +969,8 @@ fn handle_user_line(
         }
         SlashAction::Settings => {
             let stored = load_settings(&default_agent_dir());
-            let list = default_interactive_settings(
-                stored.theme.as_deref().unwrap_or(&chrome.theme.name),
-                stored.double_escape_action.as_deref().unwrap_or("tree"),
-                stored.quiet_startup,
-                stored.autocomplete_max_visible.unwrap_or(8),
-                stored.tree_filter_mode.as_deref().unwrap_or("default"),
-                stored.markdown.mermaid.as_deref().unwrap_or("streaming"),
-                stored.enable_analytics.unwrap_or(false),
-            );
+            let list =
+                interactive_settings_list(&to_interactive_config(&stored, &chrome.theme.name));
             chrome.settings_list = Some(list);
             chrome.status = "Settings".into();
             if let Some(settings) = &chrome.settings_list {
@@ -1190,6 +1221,9 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
             session.mermaid_mode = MermaidMode::parse(value);
             session.chrome.transcript.mermaid_mode = session.mermaid_mode;
         }
+        "hide-thinking" => {
+            session.chrome.transcript.hide_thinking_block = value == "true";
+        }
         _ => {}
     }
     let dir = default_agent_dir();
@@ -1204,6 +1238,32 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
         "tree-filter-mode" => stored.tree_filter_mode = Some(value.to_string()),
         "mermaid-rendering" => stored.markdown.mermaid = Some(value.to_string()),
         "enable-analytics" => set_enable_analytics(&mut stored, value == "true"),
+        "autocompact" => stored.auto_compact = Some(value == "true"),
+        "steering-mode" => stored.steering_mode = Some(value.to_string()),
+        "follow-up-mode" => stored.follow_up_mode = Some(value.to_string()),
+        "transport" => stored.transport = Some(value.to_string()),
+        "http-idle-timeout" => stored.http_idle_timeout_ms = parse_http_idle_timeout(value),
+        "hide-thinking" => stored.hide_thinking_block = Some(value == "true"),
+        "cache-miss-notices" => stored.show_cache_miss_notices = Some(value == "true"),
+        "collapse-changelog" => stored.collapse_changelog = Some(value == "true"),
+        "install-telemetry" => stored.enable_install_telemetry = Some(value == "true"),
+        "default-project-trust" => {
+            stored.default_project_trust = Some(default_project_trust_value(value).into());
+        }
+        "tui-mode" => stored.tui_mode = Some(value.to_string()),
+        "fullscreen-exit-output" => stored.fullscreen_exit_output = Some(value.to_string()),
+        "fullscreen-scrollbar" => stored.fullscreen_scrollbar = Some(value.to_string()),
+        "fullscreen-copy-on-select" => stored.fullscreen_copy_on_select = Some(value == "true"),
+        "show-images" => stored.show_images = Some(value == "true"),
+        "image-width-cells" => stored.image_width_cells = value.parse().ok(),
+        "auto-resize-images" => stored.auto_resize_images = Some(value == "true"),
+        "block-images" => stored.block_images = Some(value == "true"),
+        "skill-commands" => stored.enable_skill_commands = Some(value == "true"),
+        "show-hardware-cursor" => stored.show_hardware_cursor = Some(value == "true"),
+        "editor-padding" => stored.editor_padding_x = value.parse().ok(),
+        "output-padding" => stored.output_pad = value.parse().ok(),
+        "clear-on-shrink" => stored.clear_on_shrink = Some(value == "true"),
+        "terminal-progress" => stored.show_terminal_progress = Some(value == "true"),
         _ => {}
     }
     save_settings(&dir, &stored)?;
@@ -1297,6 +1357,48 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+fn replay_custom_messages(agent: &Agent, session: &mut InteractiveSession, host: &ExtensionHost) {
+    let Some(store) = agent.session.as_ref() else {
+        return;
+    };
+    for entry in &store.entries {
+        if entry.entry_type != "custom_message" && entry.entry_type != "custom" {
+            continue;
+        }
+        let custom_type = entry
+            .custom_type
+            .clone()
+            .or_else(|| {
+                entry
+                    .extra
+                    .get("customType")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "custom".into());
+        let content = entry
+            .message
+            .as_ref()
+            .map(CustomMessage::text_content)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                entry
+                    .extra
+                    .get("content")
+                    .map(CustomMessage::text_content)
+                    .filter(|text| !text.is_empty())
+            })
+            .unwrap_or_default();
+        let lines = host.get_message_renderer(&custom_type).and_then(|_| {
+            host.render_custom_message(&custom_type, &content, false, 1, session.width)
+        });
+        session
+            .chrome
+            .transcript
+            .push_custom(custom_type, content, lines);
+    }
+}
+
 fn tree_entry_from_session(entry: &pi_session::SessionEntry) -> SessionTreeEntry {
     let message = entry.message.clone().unwrap_or(serde_json::Value::Null);
     SessionTreeEntry {
@@ -1307,7 +1409,6 @@ fn tree_entry_from_session(entry: &pi_session::SessionEntry) -> SessionTreeEntry
             .get("role")
             .and_then(|value| value.as_str())
             .map(str::to_string),
-        content: message.get("content").cloned(),
         stop_reason: message
             .get("stopReason")
             .and_then(|value| value.as_str())
@@ -1328,7 +1429,20 @@ fn tree_entry_from_session(entry: &pi_session::SessionEntry) -> SessionTreeEntry
             .get("command")
             .and_then(|value| value.as_str())
             .map(str::to_string),
-        custom_type: entry.custom_type.clone(),
+        custom_type: entry.custom_type.clone().or_else(|| {
+            entry
+                .extra
+                .get("customType")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        }),
+        content: if entry.entry_type == "label" {
+            Some(serde_json::json!({
+                "targetId": entry.extra.get("targetId").and_then(|value| value.as_str()).unwrap_or("")
+            }))
+        } else {
+            message.get("content").cloned()
+        },
         model_id: entry
             .extra
             .get("modelId")

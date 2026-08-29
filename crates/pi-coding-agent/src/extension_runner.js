@@ -170,7 +170,16 @@ async function main() {
 	const payload = input.trim() ? JSON.parse(input) : {};
 	const mod = await loadModule(extPath);
 	const factory = typeof mod === "function" ? mod : mod.default || mod.factory;
-	const recorded = { handlers: {}, tools: [], commands: [], flags: [], shortcuts: [] };
+	const recorded = {
+		handlers: {},
+		tools: [],
+		commands: [],
+		flags: [],
+		shortcuts: [],
+		messageRenderers: {},
+		markdownTransformers: [],
+		entryRenderers: {},
+	};
 	const pi = {
 		on(event, handler) {
 			if (!recorded.handlers[event]) recorded.handlers[event] = [];
@@ -188,9 +197,15 @@ async function main() {
 		registerShortcut(key) {
 			recorded.shortcuts.push(key);
 		},
-		registerMessageRenderer() {},
-		registerMarkdownTransformer() {},
-		registerEntryRenderer() {},
+		registerMessageRenderer(customType, renderer) {
+			recorded.messageRenderers[customType] = renderer;
+		},
+		registerMarkdownTransformer(transformer) {
+			recorded.markdownTransformers.push(transformer);
+		},
+		registerEntryRenderer(customType, renderer) {
+			recorded.entryRenderers[customType] = renderer;
+		},
 		sendMessage() {},
 		sendUserMessage() {},
 		appendEntry() {},
@@ -243,6 +258,41 @@ async function main() {
 				break;
 			}
 		}
+	} else if (op === "renderMessage") {
+		const renderer = recorded.messageRenderers[payload.customType];
+		const theme = {
+			fg(_role, text) {
+				return text;
+			},
+			bg(_role, text) {
+				return text;
+			},
+			bold(text) {
+				return text;
+			},
+		};
+		if (typeof renderer === "function") {
+			const component = renderer(
+				payload.message || {
+					role: "custom",
+					customType: payload.customType,
+					content: payload.content || "",
+				},
+				payload.options || { expanded: false, outputPad: 1 },
+				theme,
+			);
+			if (component == null) {
+				result = { lines: null };
+			} else if (typeof component.render === "function") {
+				result = { lines: component.render(payload.width || 80) };
+			} else if (typeof component === "string") {
+				result = { lines: [component] };
+			} else if (Array.isArray(component)) {
+				result = { lines: component };
+			} else if (component && Array.isArray(component.lines)) {
+				result = { lines: component.lines };
+			}
+		}
 	}
 	process.stdout.write(
 		JSON.stringify({
@@ -252,6 +302,8 @@ async function main() {
 			commands: recorded.commands,
 			flags: recorded.flags,
 			shortcuts: recorded.shortcuts,
+			messageRenderers: Object.keys(recorded.messageRenderers),
+			entryRenderers: Object.keys(recorded.entryRenderers),
 			result,
 		}),
 	);

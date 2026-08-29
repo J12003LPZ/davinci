@@ -132,6 +132,8 @@ pub enum TreeAction {
     None,
     Select(String),
     Cancel,
+    Copy(Option<String>),
+    LabelChange { id: String, label: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +147,10 @@ pub struct TreeSelector {
     max_visible: usize,
     folded: Vec<String>,
     multiple_roots: bool,
+    show_label_timestamps: bool,
+    label_edit: Option<(String, String)>,
+    visible_parent: std::collections::HashMap<String, Option<String>>,
+    visible_children: std::collections::HashMap<Option<String>, Vec<String>>,
 }
 
 impl TreeSelector {
@@ -164,6 +170,10 @@ impl TreeSelector {
             max_visible: max_visible.max(5),
             folded: Vec::new(),
             multiple_roots: roots.len() > 1,
+            show_label_timestamps: false,
+            label_edit: None,
+            visible_parent: std::collections::HashMap::new(),
+            visible_children: std::collections::HashMap::new(),
         };
         selector.flat = flatten_tree(&roots, selector.current_leaf_id.as_deref());
         selector.apply_filter();
@@ -176,7 +186,51 @@ impl TreeSelector {
             .map(|node| node.node.entry.id.clone())
     }
 
+    pub fn selected_copy_text(&self) -> Option<String> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|node| entry_copy_text(&node.node))
+    }
+
+    pub fn update_node_label(&mut self, entry_id: &str, label: Option<String>) {
+        for flat in self.flat.iter_mut().chain(self.filtered.iter_mut()) {
+            if flat.node.entry.id == entry_id {
+                flat.node.label = label.clone();
+                flat.node.label_timestamp = label.as_ref().map(|_| "now".into());
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, data: &str) -> TreeAction {
+        if let Some((id, mut buffer)) = self.label_edit.take() {
+            return match data {
+                "\r" | "\n" => {
+                    let label = buffer.trim();
+                    let label = if label.is_empty() {
+                        None
+                    } else {
+                        Some(label.to_string())
+                    };
+                    self.update_node_label(&id, label.clone());
+                    TreeAction::LabelChange { id, label }
+                }
+                "\x1b" => TreeAction::None,
+                "\x7f" | "\x08" => {
+                    buffer.pop();
+                    self.label_edit = Some((id, buffer));
+                    TreeAction::None
+                }
+                other if !other.chars().any(char::is_control) => {
+                    buffer.push_str(other);
+                    self.label_edit = Some((id, buffer));
+                    TreeAction::None
+                }
+                _ => {
+                    self.label_edit = Some((id, buffer));
+                    TreeAction::None
+                }
+            };
+        }
         match data {
             "\x1b[A" | "k" => {
                 self.move_sel(-1);
@@ -258,6 +312,34 @@ impl TreeSelector {
                 self.apply_filter();
                 TreeAction::None
             }
+            "\x1b[1;5D" | "\x1b[1;3D" | "\x1b[5D" | "\x1b[3D" => self.fold_or_up(),
+            "\x1b[1;5C" | "\x1b[1;3C" | "\x1b[5C" | "\x1b[3C" => self.unfold_or_down(),
+            "\x18" => TreeAction::Copy(self.selected_copy_text()),
+            "L" => {
+                if let Some(id) = self.selected_id() {
+                    let current = self
+                        .filtered
+                        .get(self.selected)
+                        .and_then(|node| node.node.label.clone())
+                        .unwrap_or_default();
+                    self.label_edit = Some((id, current));
+                }
+                TreeAction::None
+            }
+            "T" => {
+                self.show_label_timestamps = !self.show_label_timestamps;
+                TreeAction::None
+            }
+            "\x1b[D" | "\x1b[5~" => {
+                self.selected = self.selected.saturating_sub(self.max_visible);
+                TreeAction::None
+            }
+            "\x1b[C" | "\x1b[6~" => {
+                if !self.filtered.is_empty() {
+                    self.selected = (self.selected + self.max_visible).min(self.filtered.len() - 1);
+                }
+                TreeAction::None
+            }
             "\x7f" | "\x08" => {
                 self.search_query.pop();
                 self.folded.clear();
@@ -276,6 +358,127 @@ impl TreeSelector {
                 TreeAction::None
             }
             _ => TreeAction::None,
+        }
+    }
+
+    fn fold_or_up(&mut self) -> TreeAction {
+        let current_id = self.selected_id();
+        if let Some(id) = current_id {
+            if self.is_foldable(&id) && !self.folded.iter().any(|item| item == &id) {
+                self.folded.push(id);
+                self.apply_filter();
+                return TreeAction::None;
+            }
+        }
+        self.selected = self.find_branch_segment_start(-1);
+        TreeAction::None
+    }
+
+    fn unfold_or_down(&mut self) -> TreeAction {
+        let current_id = self.selected_id();
+        if let Some(id) = &current_id {
+            if let Some(index) = self.folded.iter().position(|item| item == id) {
+                self.folded.remove(index);
+                self.apply_filter();
+                return TreeAction::None;
+            }
+        }
+        self.selected = self.find_branch_segment_start(1);
+        TreeAction::None
+    }
+
+    fn is_foldable(&self, entry_id: &str) -> bool {
+        let children = self.visible_children.get(&Some(entry_id.to_string()));
+        if children.is_none_or(|items| items.is_empty()) {
+            return false;
+        }
+        match self.visible_parent.get(entry_id) {
+            None | Some(None) => true,
+            Some(Some(parent)) => self
+                .visible_children
+                .get(&Some(parent.clone()))
+                .is_some_and(|siblings| siblings.len() > 1),
+        }
+    }
+
+    fn find_branch_segment_start(&self, direction: isize) -> usize {
+        let Some(selected_id) = self.selected_id() else {
+            return self.selected;
+        };
+        let index_by_id: std::collections::HashMap<String, usize> = self
+            .filtered
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (node.node.entry.id.clone(), i))
+            .collect();
+        let mut current_id = selected_id;
+        if direction > 0 {
+            loop {
+                let children = self
+                    .visible_children
+                    .get(&Some(current_id.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                if children.is_empty() {
+                    return *index_by_id.get(&current_id).unwrap_or(&self.selected);
+                }
+                if children.len() > 1 {
+                    return *index_by_id.get(&children[0]).unwrap_or(&self.selected);
+                }
+                current_id = children[0].clone();
+            }
+        }
+        loop {
+            let parent = self.visible_parent.get(&current_id).cloned().flatten();
+            let Some(parent_id) = parent else {
+                return *index_by_id.get(&current_id).unwrap_or(&self.selected);
+            };
+            let children = self
+                .visible_children
+                .get(&Some(parent_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            if children.len() > 1 {
+                if let Some(&segment) = index_by_id.get(&current_id) {
+                    if segment < self.selected {
+                        return segment;
+                    }
+                }
+            }
+            current_id = parent_id;
+        }
+    }
+
+    fn rebuild_visible_maps(&mut self) {
+        self.visible_parent.clear();
+        self.visible_children.clear();
+        self.visible_children.insert(None, Vec::new());
+        let visible: std::collections::HashSet<String> = self
+            .filtered
+            .iter()
+            .map(|node| node.node.entry.id.clone())
+            .collect();
+        let entry_parent: std::collections::HashMap<String, Option<String>> = self
+            .flat
+            .iter()
+            .map(|node| {
+                (
+                    node.node.entry.id.clone(),
+                    node.node.entry.parent_id.clone(),
+                )
+            })
+            .collect();
+        for flat in &self.filtered {
+            let id = flat.node.entry.id.clone();
+            let mut ancestor = entry_parent.get(&id).cloned().flatten();
+            while let Some(current) = ancestor.clone() {
+                if visible.contains(&current) {
+                    break;
+                }
+                ancestor = entry_parent.get(&current).cloned().flatten();
+            }
+            self.visible_parent.insert(id.clone(), ancestor.clone());
+            self.visible_children.entry(ancestor).or_default().push(id);
         }
     }
 
@@ -317,12 +520,11 @@ impl TreeSelector {
                 .retain(|flat| !skip.iter().any(|id| id == &flat.node.entry.id));
         }
         recalculate_visual(&mut self.filtered, &self.flat);
+        self.rebuild_visible_maps();
         self.multiple_roots = self
-            .filtered
-            .iter()
-            .filter(|node| node.node.entry.parent_id.is_none())
-            .count()
-            > 1;
+            .visible_children
+            .get(&None)
+            .is_some_and(|roots| roots.len() > 1);
         if let Some(id) = last_id {
             if let Some(index) = self
                 .filtered
@@ -339,11 +541,16 @@ impl TreeSelector {
     }
 
     fn status_line(&self) -> String {
+        let extra = if self.show_label_timestamps {
+            " [+label time]"
+        } else {
+            ""
+        };
         if self.filtered.is_empty() {
-            format!("  (0/0){}", self.filter_mode.status_label())
+            format!("  (0/0){}{extra}", self.filter_mode.status_label())
         } else {
             format!(
-                "  ({}/{}){}",
+                "  ({}/{}){}{extra}",
                 self.selected + 1,
                 self.filtered.len(),
                 self.filter_mode.status_label()
@@ -426,6 +633,65 @@ fn extract_content(content: &Option<serde_json::Value>) -> String {
         return text.chars().take(200).collect();
     }
     String::new()
+}
+
+fn extract_full_content(content: &Option<serde_json::Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    if let Some(items) = content.as_array() {
+        return items
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    item.get("text").and_then(|t| t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+    String::new()
+}
+
+fn entry_copy_text(node: &SessionTreeNode) -> Option<String> {
+    let entry = &node.entry;
+    let text = match entry.entry_type.as_str() {
+        "message" if entry.role.as_deref() == Some("bashExecution") => entry.command.clone(),
+        "message" => {
+            let content = extract_full_content(&entry.content);
+            if content.is_empty() && entry.role.as_deref() == Some("assistant") {
+                entry.error_message.clone()
+            } else {
+                Some(content)
+            }
+        }
+        "custom_message" => Some(extract_full_content(&entry.content)),
+        "compaction" | "branch_summary" => entry.summary.clone(),
+        _ => None,
+    };
+    text.filter(|value| !value.trim().is_empty())
+}
+
+fn slice_by_column(text: &str, start: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if col + w <= start {
+            col += w;
+            continue;
+        }
+        if crate::render::visible_width(&out) + w > width {
+            break;
+        }
+        out.push(ch);
+        col += w;
+    }
+    out
 }
 
 fn searchable_text(node: &SessionTreeNode) -> String {
@@ -698,7 +964,7 @@ pub fn build_session_tree(entries: Vec<SessionTreeEntry>) -> Vec<SessionTreeNode
             if let Some(target) = entry
                 .content
                 .as_ref()
-                .and_then(|value| value.get("targetId"))
+                .and_then(|value| value.get("targetId").or_else(|| value.get("target_id")))
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
                 .or_else(|| entry.parent_id.clone())
@@ -747,11 +1013,46 @@ pub fn build_session_tree(entries: Vec<SessionTreeEntry>) -> Vec<SessionTreeNode
         .collect()
 }
 
+const TREE_GUTTER_WIDTH: usize = 2;
+const MIN_VISIBLE_ANCHOR_CONTENT_WIDTH: usize = 4;
+const MAX_VISIBLE_ANCHOR_CONTENT_WIDTH: usize = 20;
+const MIN_ANCHOR_CONTEXT_WIDTH: usize = 2;
+const MAX_ANCHOR_CONTEXT_WIDTH: usize = 12;
+
+fn render_horizontal_viewport(
+    gutter: &str,
+    body: &str,
+    anchor_col: usize,
+    is_selected: bool,
+    width: usize,
+) -> String {
+    let gutter_width = crate::render::visible_width(gutter).max(TREE_GUTTER_WIDTH);
+    let viewport_width = width.saturating_sub(gutter_width);
+    let body_width = crate::render::visible_width(body);
+    let max_scroll = body_width.saturating_sub(viewport_width);
+    let mut scroll = 0;
+    if is_selected && max_scroll > 0 {
+        let min_visible = MAX_VISIBLE_ANCHOR_CONTENT_WIDTH
+            .min(MIN_VISIBLE_ANCHOR_CONTENT_WIDTH.max(viewport_width / 3));
+        if anchor_col > viewport_width.saturating_sub(min_visible) {
+            let context =
+                MAX_ANCHOR_CONTEXT_WIDTH.min(MIN_ANCHOR_CONTEXT_WIDTH.max(viewport_width / 4));
+            scroll = max_scroll.min(anchor_col.saturating_sub(context));
+        }
+    }
+    let clipped = if scroll > 0 || body_width > viewport_width {
+        slice_by_column(body, scroll, viewport_width)
+    } else {
+        body.to_string()
+    };
+    format!("{gutter}{clipped}")
+}
+
 impl Component for TreeSelector {
-    fn render(&self, _width: usize) -> Vec<String> {
+    fn render(&self, width: usize) -> Vec<String> {
         let mut lines = vec![
             "  Session Tree".into(),
-            "  ↑↓ move · filters · cycle".into(),
+            "  ↑↓ move · ←→ page · branch · L label · ctrl+x copy · filters · cycle".into(),
         ];
         if self.search_query.is_empty() {
             lines.push("  Type to search:".into());
@@ -802,7 +1103,15 @@ impl Component for TreeSelector {
                                 '├'
                             }
                         }
-                        1 => '─',
+                        1 => {
+                            if self.folded.iter().any(|id| id == &flat.node.entry.id) {
+                                '⊞'
+                            } else if self.is_foldable(&flat.node.entry.id) {
+                                '⊟'
+                            } else {
+                                '─'
+                            }
+                        }
                         _ => ' ',
                     });
                 } else {
@@ -815,11 +1124,42 @@ impl Component for TreeSelector {
                 .as_ref()
                 .map(|label| format!("[{label}] "))
                 .unwrap_or_default();
+            let timestamp = if self.show_label_timestamps && flat.node.label.is_some() {
+                flat.node
+                    .label_timestamp
+                    .as_deref()
+                    .map(|value| format!("{value} "))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let content = display_text(&flat.node);
-            lines.push(format!("{cursor}{prefix}{label}{content}"));
+            let body = format!("{prefix}{label}{timestamp}{content}");
+            let viewport = render_horizontal_viewport(
+                cursor,
+                &body,
+                crate::render::visible_width(&prefix),
+                index == self.selected,
+                width,
+            );
+            lines.push(viewport);
+        }
+        if let Some((_, buffer)) = &self.label_edit {
+            lines.push("  Label (empty to remove):".into());
+            lines.push(format!("  {buffer}"));
+            lines.push("  enter save  escape cancel".into());
         }
         lines.push(self.status_line());
         lines
+            .into_iter()
+            .map(|line| {
+                if crate::render::visible_width(&line) <= width {
+                    line
+                } else {
+                    slice_by_column(&line, 0, width)
+                }
+            })
+            .collect()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -899,5 +1239,55 @@ mod tests {
         assert_eq!(tree.handle_key("\x1b"), TreeAction::None);
         assert!(tree.search_query.is_empty());
         assert_eq!(tree.handle_key("\x1b"), TreeAction::Cancel);
+    }
+
+    #[test]
+    fn fold_copy_label_and_viewport_match_ts() {
+        let mut roots = sample_tree();
+        if let Some(child) = roots
+            .get_mut(0)
+            .and_then(|root| root.children.iter_mut().find(|node| node.entry.id == "u2"))
+        {
+            child.label = Some("checkpoint".into());
+        }
+        let mut tree = TreeSelector::new(roots, Some("u2".into()), 12, FilterMode::Default);
+        tree.selected = 0;
+        tree.handle_key("\x1b[1;5D");
+        assert!(
+            tree.folded.contains(&"u1".to_string()),
+            "root with visible children should fold: {:?}",
+            tree.folded
+        );
+        tree.handle_key("\x1b[1;5C");
+        tree.selected = tree
+            .filtered
+            .iter()
+            .position(|node| node.node.entry.id == "u1")
+            .unwrap_or(0);
+        assert_eq!(
+            tree.handle_key("\x18"),
+            TreeAction::Copy(Some("hello".into()))
+        );
+        tree.handle_key("L");
+        assert!(tree
+            .render(80)
+            .join("\n")
+            .contains("Label (empty to remove):"));
+        tree.handle_key("saved");
+        assert_eq!(
+            tree.handle_key("\r"),
+            TreeAction::LabelChange {
+                id: "u1".into(),
+                label: Some("saved".into()),
+            }
+        );
+        tree.handle_key("T");
+        assert!(tree.render(80).join("\n").contains("[+label time]"));
+        let narrow = tree.render(12);
+        assert!(narrow
+            .iter()
+            .all(|line| crate::render::visible_width(line) <= 12
+                || line.contains("Session Tree")
+                || line.contains("move")));
     }
 }

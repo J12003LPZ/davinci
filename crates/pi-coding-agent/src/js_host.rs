@@ -23,6 +23,10 @@ pub struct JsExtensionResult {
     pub flags: Vec<String>,
     #[serde(default)]
     pub shortcuts: Vec<String>,
+    #[serde(default, rename = "messageRenderers")]
+    pub message_renderers: Vec<String>,
+    #[serde(default, rename = "entryRenderers")]
+    pub entry_renderers: Vec<String>,
     #[serde(default)]
     pub result: Option<Value>,
     #[serde(default)]
@@ -228,6 +232,53 @@ export default (pi) => {
         assert_eq!(loaded.tools[0].name, "ticket");
         assert!(loaded.tools[0].description.contains("0.84.4"));
         assert!(loaded.handlers.contains(&"tool_call".into()));
+    }
+
+    #[test]
+    fn registers_and_renders_message_renderer() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerMessageRenderer("status-update", (message, options) => {
+    const pad = " ".repeat(options.outputPad || 0);
+    return { render: (width) => [`${pad}${message.customType}:${message.content}:${width}`] };
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        assert_eq!(loaded.message_renderers, ["status-update"]);
+        let rendered = run_js_extension(
+            &module,
+            "renderMessage",
+            &serde_json::json!({
+                "customType": "status-update",
+                "message": {"role":"custom","customType":"status-update","content":"ok"},
+                "options": {"expanded": false, "outputPad": 1},
+                "width": 40
+            }),
+        )
+        .unwrap();
+        let lines = rendered.result.as_ref().unwrap()["lines"]
+            .as_array()
+            .expect("lines");
+        assert_eq!(lines[0], " status-update:ok:40");
+        assert!(run_js_extension(
+            &module,
+            "renderMessage",
+            &serde_json::json!({"customType":"missing"})
+        )
+        .unwrap()
+        .result
+        .is_none());
     }
 
     #[test]
