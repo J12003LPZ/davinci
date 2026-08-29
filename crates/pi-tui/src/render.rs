@@ -1,9 +1,29 @@
+use std::any::Any;
+
 use unicode_width::UnicodeWidthStr;
 
-pub trait Component {
+pub trait AsAny {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<T: Any> AsAny for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+pub trait Component: AsAny {
     fn render(&self, width: usize) -> Vec<String>;
     fn handle_input(&mut self, _data: &str) {}
     fn invalidate(&mut self);
+    fn wants_key_release(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -186,8 +186,8 @@ fn add_entry(
 }
 
 pub struct VStack {
-    entries: Vec<StackLayoutEntry>,
-    gap: usize,
+    pub entries: Vec<StackLayoutEntry>,
+    pub gap: usize,
 }
 
 impl VStack {
@@ -242,9 +242,9 @@ impl Component for VStack {
 }
 
 pub struct HStack {
-    entries: Vec<StackLayoutEntry>,
-    gap: usize,
-    align: StackAlign,
+    pub entries: Vec<StackLayoutEntry>,
+    pub gap: usize,
+    pub align: StackAlign,
 }
 
 impl HStack {

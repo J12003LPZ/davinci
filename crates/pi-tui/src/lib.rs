@@ -1,5 +1,6 @@
 //! Terminal UI matching `@earendil-works/pi-tui`.
 
+mod alt_screen_search;
 mod ansi;
 mod autocomplete;
 mod box_comp;
@@ -14,10 +15,12 @@ mod footer;
 mod fuzzy;
 mod image;
 mod input;
+mod item_select_list;
 mod keybindings;
 mod keys;
 mod kill_ring;
 mod latex;
+mod layout;
 mod loader;
 mod login_dialog;
 mod markdown;
@@ -46,16 +49,22 @@ mod transcript;
 mod tree;
 mod truncated_text;
 mod trust_selector;
+mod tui_runtime;
 mod tui_text;
 mod undo_stack;
 mod word_nav;
 mod word_wrap;
 
+pub use alt_screen_search::{
+    find_alt_screen_search_matches, get_alt_screen_search_match_key, AltScreenSearchComponent,
+    AltScreenSearchMatch, AltScreenSearchSegment,
+};
 pub use ansi::{
-    extract_ansi_code, extract_segments, grapheme_width, normalize_terminal_output,
-    slice_with_width, strip_terminal_sequences as strip_ansi_sequences,
-    truncate_to_width as truncate_to_width_ansi, visible_width as visible_width_ansi,
-    wrap_text_with_ansi, ExtractedSegments, SlicedText,
+    extract_ansi_code, extract_segments, get_grapheme_cell_range, grapheme_width,
+    normalize_terminal_output, slice_by_column, slice_with_width,
+    strip_terminal_sequences as strip_ansi_sequences, truncate_to_width as truncate_to_width_ansi,
+    visible_width as visible_width_ansi, wrap_text_with_ansi, ExtractedSegments, GraphemeCellRange,
+    SlicedText,
 };
 pub use autocomplete::{
     apply_completion, autocomplete_debounce_ms, suggestions, AutocompleteItem,
@@ -85,13 +94,24 @@ pub use footer::{
 };
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use image::{
-    delete_all_kitty_images, delete_kitty_image, encode_kitty, iterm_image, kitty_image_chunk,
-    kitty_image_ids, parse_kitty_image_header, KittyImageHeader, KITTY_IMAGE_PREFIX,
+    crop_kitty_image_line, delete_all_kitty_images, delete_all_kitty_placements,
+    delete_kitty_image, encode_kitty, get_cell_dimensions, get_kitty_image_metadata, is_image_line,
+    iterm_image, kitty_image_chunk, kitty_image_ids, parse_kitty_image_header,
+    register_kitty_image_metadata, set_cell_dimensions, CellDimensions, KittyImageHeader,
+    KittyImageMetadata, KITTY_IMAGE_PREFIX,
 };
 pub use input::{Input, InputAction};
+pub use item_select_list::{
+    ItemSelectList, SelectItem, SelectListLayoutOptions, SelectListTheme,
+    SelectListTruncatePrimaryContext,
+};
 pub use keybindings::{key_to_bytes, Keybindings};
-pub use keys::{decode_kitty_printable, parse_key, Key};
+pub use keys::{decode_kitty_printable, is_key_release, parse_key, Key};
 pub use latex::render_latex;
+pub use layout::{
+    get_scroll_view_box, get_scroll_views_at, get_scrollbar_geometry, render_layout_frame,
+    LayoutBox, LayoutFrame, LayoutRect, ScrollbarGeometry,
+};
 pub use loader::{
     CancellableLoader, Loader, LoaderIndicatorOptions, DEFAULT_LOADER_FRAMES,
     DEFAULT_LOADER_INTERVAL_MS,
@@ -128,7 +148,9 @@ pub use scoped_models::{
     clear_all, enable_all, get_sorted_ids, is_enabled, move_id, toggle, EnabledIds, ScopedModel,
     ScopedModelsAction, ScopedModelsSelector,
 };
-pub use scroll::ScrollView;
+pub use scroll::{
+    ScrollFollow, ScrollOverscroll, ScrollView, ScrollViewOptions, ScrollViewScrollbar,
+};
 pub use session::{
     DoubleEscapeAction, InteractiveSession, OverlayKind, SessionAction, BRACKETED_PASTE_DISABLE,
     BRACKETED_PASTE_ENABLE, DISABLE_AUTOWRAP, DOUBLE_ESCAPE_MS, ENABLE_AUTOWRAP,
@@ -154,10 +176,11 @@ pub use stack::{
 pub use stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvents};
 pub use terminal::{
     is_apple_terminal_session, is_keyboard_protocol_negotiation_sequence_prefix,
-    normalize_apple_terminal_input, normalize_native_shift_enter_input,
+    is_kitty_protocol_active, normalize_apple_terminal_input, normalize_native_shift_enter_input,
     parse_keyboard_protocol_negotiation_sequence, resolve_escape_timeout_ms,
-    resolve_escape_timeout_ms_from_env, rewrite_shift_enter_input,
-    KeyboardProtocolNegotiationSequence, DEFAULT_ESCAPE_TIMEOUT_MS, DEFAULT_SSH_ESCAPE_TIMEOUT_MS,
+    resolve_escape_timeout_ms_from_env, rewrite_shift_enter_input, set_kitty_protocol_active,
+    KeyboardProtocolNegotiationSequence, MemoryTerminal, ProcessTerminal, TerminalIo,
+    DEFAULT_ESCAPE_TIMEOUT_MS, DEFAULT_SSH_ESCAPE_TIMEOUT_MS,
     DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS, KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS,
     KITTY_KEYBOARD_PROTOCOL_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE,
     NATIVE_SHIFT_ENTER_SEQUENCE,
@@ -175,6 +198,10 @@ pub use tree::{
 pub use truncated_text::TruncatedText;
 pub use trust_selector::{
     TrustOption, TrustSavedDecision, TrustSelector, TrustSelectorAction, TrustUpdate,
+};
+pub use tui_runtime::{
+    TuiAltScreen, TuiAltScreenOptions, TuiMainScreen, TuiMainScreenRenderState, TuiRuntimeMode,
+    TuiStopOptions,
 };
 pub use tui_text::{apply_background_to_line, TuiText};
 

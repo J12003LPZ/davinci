@@ -1,7 +1,119 @@
 //! Kitty / iTerm image protocol helpers matching `vendor/pi/packages/tui/src/terminal-image.ts`.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 pub const KITTY_IMAGE_PREFIX: &str = "\x1b_G";
 pub const KITTY_IMAGE_SUFFIX: &str = "\x1b\\";
+pub const ITERM2_IMAGE_PREFIX: &str = "\x1b]1337;File=";
+
+/// TS `isImageLine`.
+pub fn is_image_line(line: &str) -> bool {
+    line.starts_with(KITTY_IMAGE_PREFIX)
+        || line.starts_with(ITERM2_IMAGE_PREFIX)
+        || line.contains(KITTY_IMAGE_PREFIX)
+        || line.contains(ITERM2_IMAGE_PREFIX)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KittyImageMetadata {
+    pub image_id: u32,
+    pub columns: u32,
+    pub rows: u32,
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
+struct RegisteredKittyImage {
+    metadata: KittyImageMetadata,
+}
+
+fn kitty_metadata() -> &'static Mutex<HashMap<u32, RegisteredKittyImage>> {
+    static STORE: OnceLock<Mutex<HashMap<u32, RegisteredKittyImage>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// TS `registerKittyImageMetadata`.
+pub fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
+    let mut store = kitty_metadata()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    store.remove(&metadata.image_id);
+    store.insert(metadata.image_id, RegisteredKittyImage { metadata });
+    if store.len() > 1000 {
+        if let Some(oldest) = store.keys().next().copied() {
+            store.remove(&oldest);
+        }
+    }
+}
+
+fn kitty_controls(line: &str) -> Option<&str> {
+    let start = line.find(KITTY_IMAGE_PREFIX)?;
+    let after = &line[start + KITTY_IMAGE_PREFIX.len()..];
+    after.split_once(';').map(|(controls, _)| controls)
+}
+
+fn image_id_from_controls(controls: &str) -> Option<u32> {
+    for part in controls.split(',') {
+        if let Some(value) = part.strip_prefix("i=") {
+            return value.parse().ok();
+        }
+    }
+    None
+}
+
+/// TS `getKittyImageMetadata`.
+pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
+    let controls = kitty_controls(line)?;
+    let image_id = image_id_from_controls(controls)?;
+    let store = kitty_metadata()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    store.get(&image_id).map(|item| item.metadata)
+}
+
+/// TS `cropKittyImageLine`.
+pub fn crop_kitty_image_line(line: &str, hidden_rows: u32, visible_rows: u32) -> String {
+    let Some(metadata) = get_kitty_image_metadata(line) else {
+        return line.to_string();
+    };
+    let Some(match_start) = line.find(KITTY_IMAGE_PREFIX) else {
+        return line.to_string();
+    };
+    let Some(controls) = kitty_controls(line) else {
+        return line.to_string();
+    };
+    if hidden_rows >= metadata.rows || visible_rows == 0 {
+        return line.to_string();
+    }
+    let cropped_rows = visible_rows.min(metadata.rows - hidden_rows);
+    if hidden_rows == 0 && cropped_rows == metadata.rows {
+        return line.to_string();
+    }
+    let source_y = (metadata.height_px * hidden_rows) / metadata.rows;
+    let source_end = {
+        let num = metadata.height_px * (hidden_rows + cropped_rows);
+        num.div_ceil(metadata.rows)
+    };
+    let source_height = 1.max(metadata.height_px.min(source_end).saturating_sub(source_y));
+    let mut kept: Vec<String> = controls
+        .split(',')
+        .filter(|control| {
+            !control.starts_with("y=") && !control.starts_with("h=") && !control.starts_with("r=")
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    kept.push(format!("y={source_y}"));
+    kept.push(format!("h={source_height}"));
+    kept.push(format!("r={cropped_rows}"));
+    let rest_start = match_start + KITTY_IMAGE_PREFIX.len() + controls.len() + 1;
+    format!(
+        "{}{KITTY_IMAGE_PREFIX}{};{}",
+        &line[..match_start],
+        kept.join(","),
+        &line[rest_start..]
+    )
+}
 
 pub fn kitty_image_chunk(payload_b64: &str, last: bool) -> String {
     let more = if last { 0 } else { 1 };
@@ -71,6 +183,44 @@ pub fn delete_kitty_image(image_id: u32) -> String {
 /// TS `deleteAllKittyImages`.
 pub fn delete_all_kitty_images() -> String {
     format!("{KITTY_IMAGE_PREFIX}a=d,d=A,q=2{KITTY_IMAGE_SUFFIX}")
+}
+
+/// TS `deleteAllKittyPlacements`.
+pub fn delete_all_kitty_placements() -> String {
+    format!("{KITTY_IMAGE_PREFIX}a=d,d=a,q=2{KITTY_IMAGE_SUFFIX}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellDimensions {
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
+fn cell_dimensions() -> &'static Mutex<CellDimensions> {
+    static STORE: OnceLock<Mutex<CellDimensions>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        Mutex::new(CellDimensions {
+            width_px: 9,
+            height_px: 18,
+        })
+    })
+}
+
+/// TS `getCellDimensions`.
+pub fn get_cell_dimensions() -> CellDimensions {
+    *cell_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+/// TS `setCellDimensions`.
+pub fn set_cell_dimensions(width_px: u32, height_px: u32) {
+    *cell_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = CellDimensions {
+        width_px,
+        height_px,
+    };
 }
 
 pub fn iterm_image(payload_b64: &str) -> String {

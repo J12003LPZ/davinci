@@ -1277,6 +1277,48 @@ pub fn slice_with_width(line: &str, start_col: usize, length: usize, strict: boo
     }
 }
 
+/// TS `sliceByColumn`.
+pub fn slice_by_column(line: &str, start_col: usize, length: usize, strict: bool) -> String {
+    slice_with_width(line, start_col, length, strict).text
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphemeCellRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// TS `getGraphemeCellRange`.
+pub fn get_grapheme_cell_range(line: &str, column: usize) -> Option<GraphemeCellRange> {
+    let mut current_col = 0usize;
+    let mut i = 0usize;
+    while i < line.len() {
+        if let Some((_, len)) = extract_ansi_code(line, i) {
+            i += len;
+            continue;
+        }
+        let mut text_end = i;
+        while text_end < line.len() && extract_ansi_code(line, text_end).is_none() {
+            text_end += line[text_end..]
+                .chars()
+                .next()
+                .map_or(1, |ch| ch.len_utf8());
+        }
+        for segment in line[i..text_end].graphemes(true) {
+            let width = grapheme_width(segment);
+            if width > 0 && column >= current_col && column < current_col + width {
+                return Some(GraphemeCellRange {
+                    start: current_col,
+                    end: current_col + width,
+                });
+            }
+            current_col += width;
+        }
+        i = text_end;
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedSegments {
     pub before: String,

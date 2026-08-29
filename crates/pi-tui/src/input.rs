@@ -51,6 +51,10 @@ impl Default for Input {
 }
 
 impl Input {
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
     pub fn new() -> Self {
         Self {
             value: String::new(),

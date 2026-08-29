@@ -104,3 +104,18 @@ pub fn decode_kitty_printable(data: &str) -> Option<String> {
     }
     char::from_u32(effective).map(|ch| ch.to_string())
 }
+
+/// TS `isKeyRelease`.
+pub fn is_key_release(data: &str) -> bool {
+    if data.contains("\x1b[200~") {
+        return false;
+    }
+    data.contains(":3u")
+        || data.contains(":3~")
+        || data.contains(":3A")
+        || data.contains(":3B")
+        || data.contains(":3C")
+        || data.contains(":3D")
+        || data.contains(":3H")
+        || data.contains(":3F")
+}
