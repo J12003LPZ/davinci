@@ -1,0 +1,31 @@
+[package]
+name = "pi-coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Coding agent CLI matching @earendil-works/pi-coding-agent"
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+pi-agent = { path = "../pi-agent" }
+pi-ai = { path = "../pi-ai" }
+pi-client = { path = "../pi-client" }
+pi-evals = { path = "../pi-evals" }
+pi-protocol = { path = "../pi-protocol" }
+pi-server = { path = "../pi-server" }
+pi-session = { path = "../pi-session" }
+pi-session-sqlite = { path = "../pi-session-sqlite" }
+pi-telemetry = { path = "../pi-telemetry" }
+pi-tui = { path = "../pi-tui" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

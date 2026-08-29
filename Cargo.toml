@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pi-protocol",
+    "crates/pi-session",
+    "crates/pi-session-sqlite",
+    "crates/pi-ai",
+    "crates/pi-agent",
+    "crates/pi-tui",
+    "crates/pi-client",
+    "crates/pi-server",
+    "crates/pi-telemetry",
+    "crates/pi-evals",
+    "crates/pi-coding-agent",
+    "crates/pi-parity",
+]
+
+[workspace.package]
+version = "0.84.4"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/earendil-works/pi"
+rust-version = "1.83"
+
+[workspace.dependencies]
+base64 = "=0.22.1"
+crossterm = "=0.28.1"
+dirs = "=5.0.1"
+percent-encoding = "=2.3.1"
+pulldown-cmark = { version = "=0.12.2", default-features = false }
+regex = "=1.11.1"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde = { version = "=1.0.216", features = ["derive"] }
+serde_json = "=1.0.134"
+similar = "=2.6.0"
+unicode-segmentation = "=1.12.0"
+unicode-width = "=0.2.0"
+walkdir = "=2.5.0"
+clap = { version = "=4.5.23", features = ["derive"] }
+uuid = { version = "=1.11.0", features = ["v4", "serde"] }
+tempfile = "=3.14.0"
+thiserror = "=1.0.69"
+ureq = { version = "=2.10.1", default-features = false, features = ["json", "tls"] }
+url = "=2.5.0"
+rustls = { version = "=0.23.19", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-pki-types = "=1.10.1"
+webpki-roots = "=0.26.7"
+zeroize = { version = "=1.8.1", features = ["serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
