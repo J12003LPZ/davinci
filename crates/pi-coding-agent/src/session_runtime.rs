@@ -52,6 +52,11 @@ pub struct SessionRuntime {
     pub theme: String,
     pub flag_values: BTreeMap<String, Value>,
     pub pending_custom_lines: Vec<(String, String)>,
+    pub pending_next_turn: Vec<Value>,
+    pub pending_custom_messages: Vec<Value>,
+    pub pending_trigger_turn: bool,
+    pub running_turn: bool,
+    pub last_extension_turn_events: Vec<AgentEvent>,
 }
 
 impl SessionRuntime {
@@ -306,6 +311,7 @@ impl SessionRuntime {
         if self.aborted {
             self.aborted = false;
         }
+        self.flush_pending_next_turn();
         self.messages.push(AgentMessage {
             role: "user".into(),
             content: text.to_string(),
@@ -316,15 +322,16 @@ impl SessionRuntime {
     }
 
     pub fn run_turn(&mut self) -> Result<Vec<AgentEvent>, String> {
+        self.running_turn = true;
         self.bus.emit(
             "agent_start",
             json!({"provider": self.provider, "model": self.model_id}),
         );
+        self.is_streaming = true;
         let _ = self.fire_extensions(
             "turn_start",
             &json!({"provider": self.provider, "model": self.model_id}),
         );
-        self.is_streaming = true;
         let config = self.config();
         let events = run_agent(
             &config,
@@ -343,8 +350,17 @@ impl SessionRuntime {
             }
         }
         self.is_streaming = false;
+        self.flush_pending_custom_messages();
         self.bus.emit("agent_end", json!({"ok": true}));
         let _ = self.fire_extensions("turn_end", &json!({"ok": true}));
+        self.running_turn = false;
+        let mut events = events;
+        if self.pending_trigger_turn {
+            self.pending_trigger_turn = false;
+            if let Ok(more) = self.run_turn() {
+                events.extend(more);
+            }
+        }
         Ok(events)
     }
 
@@ -389,23 +405,17 @@ impl SessionRuntime {
                 }
                 Some("sendMessage") => {
                     if let Some(message) = call.get("message") {
-                        self.append_custom_message(message);
-                        if message.get("display").and_then(|v| v.as_bool()) != Some(false) {
-                            for line in self.render_custom_message(message, 80) {
-                                self.pending_custom_lines.push(("custom".into(), line));
-                            }
-                        }
+                        self.send_custom_message(
+                            message,
+                            call.get("options").unwrap_or(&json!({})),
+                        );
                     }
                 }
                 Some("sendUserMessage") => {
-                    if let Some(content) = call.get("content").and_then(|v| v.as_str()) {
-                        self.messages.push(AgentMessage {
-                            role: "user".into(),
-                            content: content.to_string(),
-                            images: vec![],
-                        });
-                        self.append_message("user", content);
-                    }
+                    self.send_user_message_action(
+                        call.get("content").unwrap_or(&json!("")),
+                        call.get("options").unwrap_or(&json!({})),
+                    );
                 }
                 _ => {}
             }
@@ -433,9 +443,8 @@ impl SessionRuntime {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         self.append_typed(
-            "message",
+            "custom_message",
             json!({
-                "role": "custom",
                 "customType": custom_type,
                 "content": message.get("content").cloned().unwrap_or(json!("")),
                 "display": display,
@@ -443,6 +452,139 @@ impl SessionRuntime {
                 "id": uuid::Uuid::new_v4().to_string(),
             }),
         );
+    }
+
+    fn custom_text(message: &Value) -> String {
+        match message.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    }
+
+    fn custom_agent_message(message: &Value) -> AgentMessage {
+        AgentMessage {
+            role: "custom".into(),
+            content: Self::custom_text(message),
+            images: vec![],
+        }
+    }
+
+    fn commit_custom_message(&mut self, message: &Value) {
+        self.append_custom_message(message);
+        self.messages.push(Self::custom_agent_message(message));
+        if message.get("display").and_then(|v| v.as_bool()) != Some(false) {
+            for line in self.render_custom_message(message, 80) {
+                self.pending_custom_lines.push(("custom".into(), line));
+            }
+        }
+    }
+
+    /// TypeScript `sendCustomMessage` triggerTurn / deliverAs.
+    pub fn send_custom_message(&mut self, message: &Value, options: &Value) {
+        let deliver = options.get("deliverAs").and_then(|v| v.as_str());
+        let trigger = options.get("triggerTurn").and_then(|v| v.as_bool());
+        if deliver == Some("nextTurn") {
+            self.pending_next_turn.push(message.clone());
+            return;
+        }
+        if self.is_streaming && trigger != Some(false) {
+            let agent_msg = Self::custom_agent_message(message);
+            if deliver == Some("followUp") {
+                self.follow_up.enqueue(agent_msg);
+            } else {
+                self.steer.enqueue(agent_msg);
+            }
+            self.pending_custom_messages.push(message.clone());
+            return;
+        }
+        if trigger == Some(true) {
+            self.commit_custom_message(message);
+            self.trigger_agent_turn();
+            return;
+        }
+        if self.is_streaming {
+            self.pending_custom_messages.push(message.clone());
+            return;
+        }
+        self.commit_custom_message(message);
+    }
+
+    fn send_user_message_action(&mut self, content: &Value, options: &Value) {
+        let text = match content {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        let images = match content {
+            Value::Array(parts) => parts
+                .iter()
+                .filter(|part| part.get("type").and_then(|v| v.as_str()) == Some("image"))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let deliver = options.get("deliverAs").and_then(|v| v.as_str());
+        if self.is_streaming {
+            let msg = AgentMessage {
+                role: "user".into(),
+                content: text,
+                images,
+            };
+            if deliver == Some("followUp") {
+                self.follow_up.enqueue(msg);
+            } else {
+                self.steer.enqueue(msg);
+            }
+            return;
+        }
+        if self.running_turn {
+            self.messages.push(AgentMessage {
+                role: "user".into(),
+                content: text.clone(),
+                images,
+            });
+            self.append_message("user", &text);
+            self.pending_trigger_turn = true;
+            return;
+        }
+        let _ = self.prompt(&text, images);
+    }
+
+    fn trigger_agent_turn(&mut self) {
+        if self.running_turn || self.is_streaming {
+            self.pending_trigger_turn = true;
+            return;
+        }
+        if let Ok(events) = self.run_turn() {
+            self.last_extension_turn_events.extend(events);
+        }
+    }
+
+    fn flush_pending_next_turn(&mut self) {
+        let pending = std::mem::take(&mut self.pending_next_turn);
+        for message in pending {
+            self.commit_custom_message(&message);
+        }
+    }
+
+    fn flush_pending_custom_messages(&mut self) {
+        let pending = std::mem::take(&mut self.pending_custom_messages);
+        for message in pending {
+            self.commit_custom_message(&message);
+        }
+    }
+
+    pub fn take_extension_turn_events(&mut self) -> Vec<AgentEvent> {
+        std::mem::take(&mut self.last_extension_turn_events)
     }
 
     pub fn transform_markdown(
@@ -964,6 +1106,11 @@ mod tests {
             theme: "dark".into(),
             flag_values: Default::default(),
             pending_custom_lines: Vec::new(),
+            pending_next_turn: Vec::new(),
+            pending_custom_messages: Vec::new(),
+            pending_trigger_turn: false,
+            running_turn: false,
+            last_extension_turn_events: Vec::new(),
         };
         runtime.registry.providers.push(RegisteredProviderMeta {
             name: "my-proxy".into(),
@@ -1053,5 +1200,61 @@ mod tests {
         unknown.insert("also".into(), FlagValue::String("x".into()));
         let err = runtime.apply_cli_flags(&unknown).unwrap_err();
         assert!(err.iter().any(|e| e == "Unknown options: --also, --nope"));
+    }
+
+    #[test]
+    fn send_message_queues_and_writes_custom_message_entries() {
+        let mut runtime = runtime_with_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        std::fs::write(&path, "").unwrap();
+        runtime.session_path = Some(path.clone());
+
+        runtime.send_custom_message(
+            &json!({"customType":"note","content":"idle","display":true}),
+            &json!({}),
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"type\":\"custom_message\""));
+        assert!(raw.contains("\"customType\":\"note\""));
+        assert_eq!(runtime.messages.last().unwrap().role, "custom");
+        assert!(runtime.steer.items.is_empty());
+
+        runtime.is_streaming = true;
+        runtime.send_custom_message(
+            &json!({"customType":"note","content":"steer-me","display":true}),
+            &json!({}),
+        );
+        assert_eq!(runtime.steer.items.len(), 1);
+        assert_eq!(runtime.steer.items[0].content, "steer-me");
+        runtime.send_custom_message(
+            &json!({"customType":"note","content":"follow","display":true}),
+            &json!({"deliverAs":"followUp"}),
+        );
+        assert_eq!(runtime.follow_up.items.len(), 1);
+        runtime.send_custom_message(
+            &json!({"customType":"note","content":"later","display":true}),
+            &json!({"deliverAs":"nextTurn"}),
+        );
+        assert_eq!(runtime.pending_next_turn.len(), 1);
+        runtime.send_custom_message(
+            &json!({"customType":"note","content":"defer","display":false}),
+            &json!({"triggerTurn": false}),
+        );
+        assert_eq!(runtime.pending_custom_messages.len(), 3);
+
+        runtime.is_streaming = false;
+        runtime.flush_pending_custom_messages();
+        runtime.flush_pending_next_turn();
+        assert!(runtime.messages.iter().any(|m| m.content == "later"));
+        assert!(runtime.messages.iter().any(|m| m.content == "defer"));
+
+        runtime.is_streaming = true;
+        runtime.send_user_message_action(&json!("queued-user"), &json!({"deliverAs":"followUp"}));
+        assert!(runtime
+            .follow_up
+            .items
+            .iter()
+            .any(|m| m.content == "queued-user"));
     }
 }

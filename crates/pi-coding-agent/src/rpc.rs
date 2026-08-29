@@ -446,6 +446,11 @@ mod tests {
             theme: "dark".into(),
             flag_values: Default::default(),
             pending_custom_lines: Vec::new(),
+            pending_next_turn: Vec::new(),
+            pending_custom_messages: Vec::new(),
+            pending_trigger_turn: false,
+            running_turn: false,
+            last_extension_turn_events: Vec::new(),
         }
     }
 

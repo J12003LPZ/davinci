@@ -491,9 +491,8 @@ impl InteractiveMode {
                             for event in events {
                                 self.apply_ui_request(&event);
                             }
-                            for (kind, line) in self.runtime.take_custom_lines() {
-                                self.chat.push(&kind, line);
-                            }
+                            let extra = self.runtime.take_extension_turn_events();
+                            self.show_agent_events(extra);
                             self.chat.push("system", format!("/{other}"));
                         }
                         Err(err) => self.chat.push("error", err),
@@ -513,6 +512,11 @@ impl InteractiveMode {
         self.chat.push("user", user);
         let events = self.runtime.prompt(text, vec![])?;
         self.last_json_events = events.iter().map(to_json_event).collect();
+        self.show_agent_events(events);
+        Ok(())
+    }
+
+    fn show_agent_events(&mut self, events: Vec<pi_agent::AgentEvent>) {
         for event in events {
             match event {
                 pi_agent::AgentEvent::Message { message } => {
@@ -543,7 +547,6 @@ impl InteractiveMode {
         for (kind, line) in self.runtime.take_custom_lines() {
             self.chat.push(&kind, line);
         }
-        Ok(())
     }
 
     pub fn handle_line(&mut self, line: &str) -> Result<bool, String> {
@@ -606,9 +609,8 @@ impl InteractiveMode {
                     for event in events {
                         self.apply_ui_request(&event);
                     }
-                    for (kind, line) in self.runtime.take_custom_lines() {
-                        self.chat.push(&kind, line);
-                    }
+                    let extra = self.runtime.take_extension_turn_events();
+                    self.show_agent_events(extra);
                     self.chat.push("system", format!("shortcut {id}"));
                     return Ok(true);
                 }

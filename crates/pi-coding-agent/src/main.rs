@@ -293,6 +293,11 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         theme: parsed.use_theme.clone().unwrap_or_else(|| "dark".into()),
         flag_values: Default::default(),
         pending_custom_lines: Vec::new(),
+        pending_next_turn: Vec::new(),
+        pending_custom_messages: Vec::new(),
+        pending_trigger_turn: false,
+        running_turn: false,
+        last_extension_turn_events: Vec::new(),
     };
     runtime.bind_extensions();
     if let Err(errors) = runtime.apply_cli_flags(&parsed.unknown_flags) {

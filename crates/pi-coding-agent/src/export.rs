@@ -355,4 +355,14 @@ mod tests {
             .contains("TODO"));
         assert!(data["renderedTools"].get("call-2").is_none());
     }
+
+    #[test]
+    fn custom_message_entries_reach_html_session_data() {
+        let raw = r#"{"type":"custom_message","id":"cm1","customType":"note","content":"hello custom","display":true}"#;
+        let html = session_to_html(raw, "s");
+        let data = session_payload(&html);
+        assert_eq!(data["entries"][0]["type"], "custom_message");
+        assert_eq!(data["entries"][0]["customType"], "note");
+        assert!(html.contains("custom_message") || html.contains("hook-type"));
+    }
 }
