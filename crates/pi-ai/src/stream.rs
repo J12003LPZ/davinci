@@ -6,7 +6,39 @@ use thiserror::Error;
 use crate::events::{AssistantMessage, AssistantMessageEvent, ModelRef, StopReason};
 use crate::http::{post_sse, LiveRequest};
 use crate::request::{resolve_api, RequestContext};
+use crate::transport::{CodexWebsocketCache, Transport, TransportDecision};
 use crate::types::{ContentBlock, Message, ToolCall, Usage};
+use std::sync::{Mutex, OnceLock};
+
+fn codex_cache() -> std::sync::MutexGuard<'static, CodexWebsocketCache> {
+    static CACHE: OnceLock<Mutex<CodexWebsocketCache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(CodexWebsocketCache::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Resolve Codex/OpenAI Responses transport. Live websockets are not opened here:
+/// a failed open increments the TypeScript fallback and later turns stay on SSE.
+pub fn decide_transport(
+    requested: Transport,
+    account: &str,
+    session_id: &str,
+    websocket_open: bool,
+) -> TransportDecision {
+    let mut cache = codex_cache();
+    cache.resolve(requested, account, session_id, websocket_open)
+}
+
+fn requested_transport(options: &StreamOptions) -> Transport {
+    options
+        .transport
+        .unwrap_or(if options.provider == "openai-codex" {
+            Transport::Auto
+        } else {
+            Transport::Sse
+        })
+}
 
 #[derive(Debug, Error)]
 pub enum StreamError {
@@ -27,6 +59,8 @@ pub struct StreamOptions {
     pub fixture: Option<FixtureResponse>,
     pub extra_headers: Vec<(String, String)>,
     pub allow_network: bool,
+    pub transport: Option<crate::transport::Transport>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +452,15 @@ pub fn stream_complete(options: &StreamOptions) -> Result<Vec<AssistantMessageEv
         }
     }
     if options.allow_network {
+        let requested = requested_transport(options);
+        if requested != Transport::Sse {
+            let account = options
+                .api_key
+                .as_deref()
+                .unwrap_or(options.provider.as_str());
+            let session = options.session_id.as_deref().unwrap_or("default");
+            let _decision = decide_transport(requested, account, session, false);
+        }
         let api_key = options
             .api_key
             .clone()
@@ -532,5 +575,29 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.to_string(), "No API key for provider: openai");
+    }
+
+    #[test]
+    fn codex_websocket_cached_falls_back_to_sse_fixture_path() {
+        let events = stream_complete(&StreamOptions {
+            provider: "openai-codex".into(),
+            model: "gpt-5.5".into(),
+            transport: Some(Transport::WebsocketCached),
+            session_id: Some("sess-1".into()),
+            fixture: Some(FixtureResponse {
+                events: vec![],
+                sse: Some(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Ok\"}\n".into(),
+                ),
+            }),
+            ..StreamOptions::default()
+        })
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AssistantMessageEvent::TextDelta { delta, .. } if delta == "Ok")));
+        let decision = decide_transport(Transport::WebsocketCached, "acct", "sess-1", false);
+        assert_eq!(decision.transport, Transport::Sse);
+        assert!(decision.websocket_fallback_active);
     }
 }

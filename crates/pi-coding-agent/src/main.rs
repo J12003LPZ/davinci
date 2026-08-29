@@ -2,6 +2,7 @@ mod args;
 mod commands;
 mod event_bus;
 mod export;
+mod extension_ui;
 mod extensions;
 mod interactive;
 mod rpc;
@@ -276,6 +277,7 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         bus,
         max_turns: 16,
         context_window: 128_000,
+        ui: crate::extension_ui::ExtensionUiHost::default(),
     };
 
     match app_mode {

@@ -65,6 +65,7 @@ pub fn endpoint_url(api: &str, base_url: &str, model_id: &str, api_key: Option<&
         "openai-responses" | "openai-codex-responses" | "azure-openai-responses" => {
             format!("{base}/v1/responses")
         }
+        "bedrock-converse-stream" => format!("{base}/model/{model_id}/converse-stream"),
         "mistral-conversations" => format!("{base}/v1/conversations"),
         _ => format!("{base}/v1/chat/completions"),
     }
@@ -83,8 +84,13 @@ pub fn default_base_url(provider: &str) -> &'static str {
         "together" => "https://api.together.xyz",
         "fireworks" => "https://api.fireworks.ai/inference",
         "cerebras" => "https://api.cerebras.ai",
+        "amazon-bedrock" => "https://bedrock-runtime.us-east-1.amazonaws.com",
         _ => "https://api.openai.com",
     }
+}
+
+pub fn bedrock_runtime_base(region: &str) -> String {
+    format!("https://bedrock-runtime.{region}.amazonaws.com")
 }
 
 pub fn request_headers(api: &str, provider: &str, api_key: &str) -> Vec<(String, String)> {

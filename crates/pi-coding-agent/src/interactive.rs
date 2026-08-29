@@ -11,8 +11,8 @@ use pi_session::{default_sessions_root, discover_sessions};
 use pi_tui::component::Component;
 use pi_tui::{
     default_keybindings, disable_mouse, disable_raw_input, enable_mouse, enable_raw_input,
-    enter_alt_screen, leave_alt_screen, ChatView, Editor, Key, Markdown, Overlay, OverlayOptions,
-    SelectList, SettingsList, Tui, TuiMode,
+    enter_alt_screen, leave_alt_screen, set_title, ChatView, Editor, Key, Markdown, Overlay,
+    OverlayOptions, SelectList, SettingsList, Tui, TuiMode,
 };
 use serde_json::json;
 use std::io::{self, BufRead, Read, Write};
@@ -58,20 +58,118 @@ impl InteractiveMode {
     }
 
     pub fn footer_lines(&self) -> Vec<String> {
-        vec![format!(
+        let mut line = format!(
             " {}/{}  think:{}  msgs:{}  theme:{}  /help",
             self.runtime.provider,
             self.runtime.model_id,
             self.runtime.thinking.as_str(),
             self.runtime.messages.len(),
             self.theme
-        )]
+        );
+        let statuses = self.runtime.ui.status_line();
+        if !statuses.is_empty() {
+            line.push_str("  ");
+            line.push_str(&statuses);
+        }
+        if let Some((_, message)) = self.runtime.ui.notifications.last() {
+            line.push_str("  ");
+            line.push_str(message);
+        }
+        vec![line]
+    }
+
+    pub fn apply_ui_request(&mut self, request: &serde_json::Value) {
+        match request.get("method").and_then(|v| v.as_str()) {
+            Some("setTitle") => {
+                if let Some(title) = request.get("title").and_then(|v| v.as_str()) {
+                    let _ = set_title(&mut io::stdout(), title);
+                    if let Some(name) = self.runtime.ui.title.clone() {
+                        self.chat.push("title", name);
+                    }
+                }
+            }
+            Some("setStatus") => {}
+            Some("setWidget") => {
+                for line in self.runtime.ui.widget_lines("aboveEditor") {
+                    self.chat.push("widget", line);
+                }
+            }
+            Some("notify") => {
+                if let Some(message) = request.get("message").and_then(|v| v.as_str()) {
+                    self.chat.push(
+                        request
+                            .get("notifyType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("info"),
+                        message,
+                    );
+                }
+            }
+            Some("set_editor_text") => {
+                if let Some(text) = request.get("text").and_then(|v| v.as_str()) {
+                    self.editor.buffer = text.to_string();
+                    self.editor.cursor = text.chars().count();
+                }
+            }
+            Some("select") => {
+                let options = request
+                    .get("options")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.show_selector(
+                    request
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("select"),
+                    options,
+                );
+            }
+            Some("confirm") => {
+                self.show_selector(
+                    request
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("confirm"),
+                    vec!["Yes".into(), "No".into()],
+                );
+            }
+            Some("input" | "editor") => {
+                if let Some(prefill) = request
+                    .get("prefill")
+                    .or_else(|| request.get("placeholder"))
+                    .and_then(|v| v.as_str())
+                {
+                    self.editor.buffer = prefill.to_string();
+                    self.editor.cursor = prefill.chars().count();
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn redraw(&mut self, force: bool) -> String {
         self.tui.clear_children();
         let mut lines = self.chat.render(self.tui.columns);
+        lines.extend(
+            self.runtime
+                .ui
+                .widget_lines("aboveEditor")
+                .into_iter()
+                .map(|line| format!(" {line}")),
+        );
         lines.extend(self.footer_lines());
+        lines.extend(
+            self.runtime
+                .ui
+                .widget_lines("belowEditor")
+                .into_iter()
+                .map(|line| format!(" {line}")),
+        );
         lines.extend(self.editor.render(self.tui.columns));
         self.tui.add_child_lines(lines);
         self.tui.render_now(force)
@@ -297,6 +395,8 @@ impl InteractiveMode {
                 self.runtime.new_session(None)?;
                 self.chat = ChatView::default();
                 self.chat.push("system", "new session");
+                let title = self.runtime.ui.set_title("pi");
+                self.apply_ui_request(&title);
             }
             "compact" => {
                 let data = self
@@ -402,6 +502,10 @@ impl InteractiveMode {
         }
         if !line.trim().is_empty() {
             self.submit_prompt(line)?;
+            if !self.runtime.ui.editor_text.is_empty() {
+                self.editor.buffer = self.runtime.ui.editor_text.clone();
+                self.editor.cursor = self.editor.buffer.chars().count();
+            }
         }
         Ok(false)
     }

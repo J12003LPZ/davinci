@@ -62,3 +62,12 @@ pub fn enter_raw_mode() -> io::Result<()> {
 pub fn leave_raw_mode() -> io::Result<()> {
     disable_raw_input()
 }
+
+/// OSC 0 window title, matching TypeScript `terminal.setTitle`.
+pub fn set_title(out: &mut impl Write, title: &str) -> io::Result<()> {
+    let cleaned: String = title
+        .chars()
+        .filter(|c| *c != '\u{1b}' && *c != '\u{07}')
+        .collect();
+    write!(out, "\u{1b}]0;{cleaned}\u{07}")
+}

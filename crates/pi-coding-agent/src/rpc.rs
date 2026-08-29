@@ -34,19 +34,14 @@ pub fn error(id: Option<&Value>, command: &str, message: impl Into<String>) -> V
 }
 
 pub fn extension_ui_request(method: &str, fields: Value) -> Value {
-    let mut out = json!({
-        "type": "extension_ui_request",
-        "id": uuid::Uuid::new_v4().to_string(),
-        "method": method,
-    });
-    if let Some(obj) = fields.as_object() {
-        if let Some(dst) = out.as_object_mut() {
-            for (k, v) in obj {
-                dst.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    out
+    crate::extension_ui::ExtensionUiHost::request(method, fields)
+}
+
+fn emit_ui(runtime: &mut SessionRuntime, method: &str, fields: &Value) -> Value {
+    runtime
+        .ui
+        .dispatch(method, fields)
+        .unwrap_or_else(|| extension_ui_request(method, fields.clone()))
 }
 
 /// Handle one RPC command. Prompt returns `(response, events)` so the caller can stream.
@@ -54,10 +49,8 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
     let id = command.get("id");
     let ty = command.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if ty == "extension_ui_response" {
-        return (
-            success(id, "extension_ui_response", command.get("value").cloned()),
-            vec![],
-        );
+        let data = runtime.ui.apply_response(command);
+        return (success(id, "extension_ui_response", Some(data)), vec![]);
     }
     match ty {
         "prompt" => {
@@ -132,11 +125,25 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
         }
         "new_session" => {
             match runtime.new_session(command.get("parentSession").and_then(|v| v.as_str())) {
-                Ok(()) => (
-                    success(id, "new_session", Some(json!({"cancelled": false}))),
-                    vec![extension_ui_request("setTitle", json!({"title": "pi"}))],
-                ),
+                Ok(()) => {
+                    let mut events = runtime.ui.reset();
+                    events.push(runtime.ui.set_title("pi"));
+                    (
+                        success(id, "new_session", Some(json!({"cancelled": false}))),
+                        events,
+                    )
+                }
                 Err(err) => (error(id, "new_session", err), vec![]),
+            }
+        }
+        "extension_ui" => {
+            let method = command.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            match runtime.ui.dispatch(method, command) {
+                Some(request) => (success(id, "extension_ui", None), vec![request]),
+                None => (
+                    error(id, "extension_ui", format!("Unknown command: {method}")),
+                    vec![emit_ui(runtime, method, command)],
+                ),
             }
         }
         "get_state" => (success(id, "get_state", Some(runtime.state())), vec![]),
@@ -357,7 +364,7 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
             }
         }
         other => (
-            error(id, other, format!("Unknown RPC command {other}")),
+            error(id, other, format!("Unknown command: {other}")),
             vec![],
         ),
     }
@@ -396,6 +403,7 @@ mod tests {
             bus: EventBus::new(),
             max_turns: 2,
             context_window: 128_000,
+            ui: crate::extension_ui::ExtensionUiHost::default(),
         }
     }
 
@@ -415,5 +423,51 @@ mod tests {
         assert!(reply["data"]["commands"].as_array().unwrap().len() >= 20);
         let (reply, _) = handle_rpc(&json!({"type":"unknown_cmd"}), &mut rt);
         assert_eq!(reply["success"], false);
+        assert_eq!(reply["error"], "Unknown command: unknown_cmd");
+    }
+
+    #[test]
+    fn extension_ui_request_and_response() {
+        let mut rt = runtime();
+        let select = rt
+            .ui
+            .select("Dangerous command", &["Allow".into(), "Block".into()], None);
+        assert_eq!(select["type"], "extension_ui_request");
+        assert_eq!(select["method"], "select");
+        let id = select["id"].clone();
+        let (reply, _) = handle_rpc(
+            &json!({"type":"extension_ui_response","id": id, "value":"Allow"}),
+            &mut rt,
+        );
+        assert_eq!(reply["success"], true);
+        assert_eq!(reply["data"]["value"], "Allow");
+
+        let confirm = rt
+            .ui
+            .confirm("Clear session?", "All messages will be lost.", None);
+        let id = confirm["id"].clone();
+        let (reply, _) = handle_rpc(
+            &json!({"type":"extension_ui_response","id": id, "confirmed": true}),
+            &mut rt,
+        );
+        assert_eq!(reply["data"]["confirmed"], true);
+
+        let (reply, events) = handle_rpc(
+            &json!({"type":"extension_ui","method":"notify","message":"hello","notifyType":"info"}),
+            &mut rt,
+        );
+        assert_eq!(reply["success"], true);
+        assert_eq!(events[0]["method"], "notify");
+        assert_eq!(
+            extension_ui_request("notify", json!({"message": "hello"}))["method"],
+            "notify"
+        );
+        let status = rt.ui.set_status("rpc-demo", Some("Turns: 1"));
+        assert_eq!(status["method"], "setStatus");
+        let widget = rt
+            .ui
+            .set_widget("rpc-demo", Some(&["ready".into()]), Some("belowEditor"));
+        assert_eq!(widget["method"], "setWidget");
+        assert_eq!(rt.ui.set_editor_text("hi")["method"], "set_editor_text");
     }
 }

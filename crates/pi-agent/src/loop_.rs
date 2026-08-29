@@ -29,6 +29,8 @@ pub struct AgentConfig {
     pub max_turns: u32,
     pub fixture: Option<pi_ai::stream::FixtureResponse>,
     pub permission: Box<dyn PermissionPolicy>,
+    pub transport: Option<pi_ai::Transport>,
+    pub session_id: Option<String>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -59,6 +61,8 @@ impl Clone for AgentConfig {
             max_turns: self.max_turns,
             fixture: self.fixture.clone(),
             permission: Box::new(AllowAllPermissionPolicy),
+            transport: self.transport,
+            session_id: self.session_id.clone(),
         }
     }
 }
@@ -133,6 +137,8 @@ pub fn run_agent(
             messages: to_ai_messages(&transcript),
             tools: tools.schemas(),
             fixture: config.fixture.clone(),
+            transport: config.transport,
+            session_id: config.session_id.clone(),
             ..StreamOptions::default()
         }) {
             Ok(assistant) => {
@@ -291,6 +297,8 @@ mod tests {
             max_turns: 4,
             fixture: Some(fixture),
             permission: Box::new(AllowAllPermissionPolicy),
+            transport: None,
+            session_id: None,
         };
         let mut steer = SteerQueue::default();
         let mut follow = FollowUpQueue::default();
@@ -348,6 +356,8 @@ mod tests {
             max_turns: 1,
             fixture: Some(fixture),
             permission: Box::new(AllowAllPermissionPolicy),
+            transport: None,
+            session_id: None,
         };
         let events = run_agent(
             &config,

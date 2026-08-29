@@ -9,8 +9,11 @@ pub mod oauth;
 pub mod providers;
 pub mod request;
 pub mod retry;
+pub mod sigv4;
 pub mod stream;
+pub mod transport;
 pub mod types;
+pub mod vertex;
 
 pub use auth::{
     AuthResult, AuthStorage, Credential, CredentialKind, FileAuthStorage, InMemoryCredentialStore,
@@ -25,10 +28,13 @@ pub use oauth::{
 };
 pub use request::{build_request_body, resolve_api, RequestContext};
 pub use retry::{is_retryable_assistant_error, RetryPolicy};
+pub use sigv4::{sign_bedrock_post, AwsCredentials};
 pub use stream::{complete, stream_complete, StreamEvent, StreamOptions};
+pub use transport::{CodexWebsocketCache, Transport, TransportDecision};
 pub use types::{
     ContentBlock, KnownApi, KnownProvider, Message, Role, ThinkingLevel, ToolCall, Usage,
 };
+pub use vertex::{resolve_vertex_auth, VertexAuth, GCP_VERTEX_CREDENTIALS_MARKER};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

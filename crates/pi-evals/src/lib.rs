@@ -37,6 +37,8 @@ pub fn run_eval(case: &EvalCase) -> EvalResult {
         max_turns: 8,
         fixture: Some(case.fixture.clone()),
         permission: Box::new(pi_agent::AllowAllPermissionPolicy),
+        transport: None,
+        session_id: None,
     };
     let events = run_agent(
         &config,

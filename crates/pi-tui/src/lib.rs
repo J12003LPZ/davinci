@@ -25,7 +25,7 @@ pub use screen::{OverlayHandle, OverlayOptions, Tui};
 pub use selectors::SelectList;
 pub use terminal::{
     disable_mouse, disable_raw_input, enable_mouse, enable_raw_input, enter_alt_screen,
-    enter_raw_mode, leave_alt_screen, leave_raw_mode, TuiMode,
+    enter_raw_mode, leave_alt_screen, leave_raw_mode, set_title, TuiMode,
 };
 pub use themes::Theme;
 pub use widgets::{BoxWidget, HStack, Input, ScrollView, SettingsList, VStack};
@@ -61,6 +61,9 @@ mod tests {
         assert_eq!(parse_key("enter"), Key::Enter);
         assert_eq!(parse_bytes(&[0x03]), Key::Ctrl('c'));
         assert_eq!(parse_bytes(b"\x1b[D"), Key::Left);
+        let mut title_buf = Vec::new();
+        crate::terminal::set_title(&mut title_buf, "pi").unwrap();
+        assert_eq!(title_buf, b"\x1b]0;pi\x07");
         let mut editor = Editor::default();
         editor.handle_key(&Key::Char('π'));
         editor.handle_key(&Key::Left);

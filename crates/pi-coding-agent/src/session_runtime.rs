@@ -2,6 +2,7 @@
 
 use crate::event_bus::EventBus;
 use crate::export;
+use crate::extension_ui::ExtensionUiHost;
 use pi_agent::{
     compact_messages, run_agent, AgentConfig, AgentEvent, AgentMessage, AllowAllPermissionPolicy,
     FollowUpQueue, QueueMode, SteerQueue, ThinkingLevel, ToolRegistry,
@@ -41,6 +42,7 @@ pub struct SessionRuntime {
     pub bus: EventBus,
     pub max_turns: u32,
     pub context_window: usize,
+    pub ui: ExtensionUiHost,
 }
 
 impl SessionRuntime {
@@ -53,6 +55,7 @@ impl SessionRuntime {
         self.messages.clear();
         self.steer.clear();
         self.follow_up.clear();
+        let _ = self.ui.reset();
         if let Some(parent) = parent {
             if let Some(path) = &self.session_path {
                 let _ = append_entry(
@@ -79,6 +82,12 @@ impl SessionRuntime {
             max_turns: self.max_turns,
             fixture: self.fixture.clone(),
             permission: Box::new(AllowAllPermissionPolicy),
+            transport: if self.provider == "openai-codex" {
+                Some(pi_ai::Transport::Auto)
+            } else {
+                None
+            },
+            session_id: Some(self.session_id.clone()),
         }
     }
 
