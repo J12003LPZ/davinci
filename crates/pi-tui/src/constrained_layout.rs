@@ -11,8 +11,8 @@ use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutRect {
-    pub x: usize,
-    pub y: usize,
+    pub x: i32,
+    pub y: i32,
     pub width: usize,
     pub height: usize,
 }
@@ -21,18 +21,23 @@ impl LayoutRect {
     fn intersect(self, other: Self) -> Self {
         let x = self.x.max(other.x);
         let y = self.y.max(other.y);
-        let right = (self.x + self.width).min(other.x + other.width);
-        let bottom = (self.y + self.height).min(other.y + other.height);
+        let right = (self.x + self.width as i32).min(other.x + other.width as i32);
+        let bottom = (self.y + self.height as i32).min(other.y + other.height as i32);
         Self {
             x,
             y,
-            width: right.saturating_sub(x),
-            height: bottom.saturating_sub(y),
+            width: (right - x).max(0) as usize,
+            height: (bottom - y).max(0) as usize,
         }
     }
 
     fn contains(self, x: usize, y: usize) -> bool {
-        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+        let x = x as i32;
+        let y = y as i32;
+        x >= self.x
+            && x < self.x + self.width as i32
+            && y >= self.y
+            && y < self.y + self.height as i32
     }
 }
 
@@ -303,12 +308,8 @@ fn distribute(sizes: &mut [usize], entries: &[StackEntry], amount: usize, grow: 
     }
 }
 
-fn translate_box(box_: &mut LayoutBox, delta_y: isize) {
-    if delta_y >= 0 {
-        box_.rect.y = box_.rect.y.saturating_add(delta_y as usize);
-    } else {
-        box_.rect.y = box_.rect.y.saturating_sub((-delta_y) as usize);
-    }
+fn translate_box(box_: &mut LayoutBox, delta_y: i32) {
+    box_.rect.y += delta_y;
     for child in &mut box_.children {
         translate_box(child, delta_y);
     }
@@ -325,8 +326,8 @@ fn update_clips(box_: &mut LayoutBox, parent_clip: LayoutRect) {
 fn layout_component(
     context: &mut LayoutContext,
     component: &Node,
-    x: usize,
-    y: usize,
+    x: i32,
+    y: i32,
     width: usize,
     height: Option<usize>,
     clip: LayoutRect,
@@ -341,7 +342,7 @@ fn layout_component(
                 context,
                 &child,
                 x,
-                y.saturating_sub(previous),
+                y - previous as i32,
                 content_width,
                 None,
                 clip,
@@ -349,7 +350,7 @@ fn layout_component(
             let content_height = child_box.rect.height;
             let viewport_height = height.unwrap_or(content_height);
             scroll.update_layout(content_height, viewport_height);
-            let delta = previous as isize - scroll.scroll_top() as isize;
+            let delta = previous as i32 - scroll.scroll_top() as i32;
             translate_box(&mut child_box, delta);
             if scroll.inner.borrow().primary || context.primary.is_none() {
                 context.primary = Some(scroll.clone());
@@ -414,7 +415,7 @@ fn layout_component(
                     Some(sizes[index]),
                     box_.clip,
                 ));
-                child_y += sizes[index] + stack.gap;
+                child_y += sizes[index] as i32 + stack.gap as i32;
             }
             box_
         }
@@ -490,7 +491,7 @@ fn layout_component(
                         box_.clip,
                     ));
                 }
-                child_x += widths[index] + stack.gap;
+                child_x += widths[index] as i32 + stack.gap as i32;
             }
             box_
         }
@@ -588,15 +589,15 @@ pub fn get_scrollbar_geometry(box_: &LayoutBox) -> Option<ScrollbarGeometry> {
     } else {
         (scroll.scroll_top() * max_thumb_top + max_scroll_top / 2) / max_scroll_top
     };
-    let column = box_.rect.x + box_.rect.width - 1;
-    if column < box_.clip.x || column >= box_.clip.x + box_.clip.width {
+    let column = box_.rect.x + box_.rect.width as i32 - 1;
+    if column < box_.clip.x || column >= box_.clip.x + box_.clip.width as i32 {
         return None;
     }
     Some(ScrollbarGeometry {
-        column,
-        track_top: box_.rect.y,
+        column: column.max(0) as usize,
+        track_top: box_.rect.y.max(0) as usize,
         track_height,
-        thumb_top: box_.rect.y + thumb_offset,
+        thumb_top: (box_.rect.y + thumb_offset as i32).max(0) as usize,
         thumb_height,
         max_scroll_top,
     })
@@ -612,7 +613,10 @@ fn paint_scrollbar(box_: &LayoutBox, screen: &mut [String], total_width: usize) 
     let style = scroll.inner.borrow().scrollbar_style;
     for offset in 0..geometry.thumb_height {
         let row = geometry.thumb_top + offset;
-        if row < box_.clip.y || row >= box_.clip.y + box_.clip.height || row >= screen.len() {
+        if (row as i32) < box_.clip.y
+            || (row as i32) >= box_.clip.y + box_.clip.height as i32
+            || row >= screen.len()
+        {
             continue;
         }
         screen[row] = style_scrollbar_cell(&screen[row], geometry.column, total_width, style);
@@ -622,19 +626,24 @@ fn paint_scrollbar(box_: &LayoutBox, screen: &mut [String], total_width: usize) 
 fn paint_box(box_: &LayoutBox, screen: &mut [String], total_width: usize) {
     if let Some(lines) = &box_.lines {
         let offset = box_.line_offset;
-        let first = box_.rect.y.max(box_.clip.y);
-        let last = (box_.rect.y + box_.rect.height)
-            .min(box_.clip.y + box_.clip.height)
-            .min(screen.len());
+        let first = box_.rect.y.max(box_.clip.y).max(0) as usize;
+        let last = (box_.rect.y + box_.rect.height as i32)
+            .min(box_.clip.y + box_.clip.height as i32)
+            .min(screen.len() as i32)
+            .max(0) as usize;
         for row in first..last {
-            let Some(source) = lines.get(offset + row - box_.rect.y) else {
+            let source_index = offset as i32 + row as i32 - box_.rect.y;
+            if source_index < 0 {
+                continue;
+            }
+            let Some(source) = lines.get(source_index as usize) else {
                 continue;
             };
             let mut line = crate::ansi_text::strip_osc133_zone_prefix(source);
             if let Some(metadata) = get_kitty_image_metadata(&line) {
-                let clip_bottom = screen.len().min(box_.clip.y + box_.clip.height);
+                let clip_bottom = (screen.len() as i32).min(box_.clip.y + box_.clip.height as i32);
                 let visible_rows =
-                    (metadata.rows as usize).min(clip_bottom.saturating_sub(row)) as u32;
+                    (metadata.rows as i32).min(clip_bottom - row as i32).max(0) as u32;
                 if visible_rows < metadata.rows {
                     line = crop_kitty_image_line(&line, 0, visible_rows);
                 }
@@ -648,7 +657,7 @@ fn paint_box(box_: &LayoutBox, screen: &mut [String], total_width: usize) {
                 screen[row] = composite_tui_line(
                     &screen[row],
                     &line,
-                    box_.rect.x,
+                    box_.rect.x.max(0) as usize,
                     box_.rect.width,
                     total_width,
                 );
@@ -667,8 +676,8 @@ fn paint_box(box_: &LayoutBox, screen: &mut [String], total_width: usize) {
                     if hidden < metadata.rows {
                         let visible = (box_.rect.height as u32).min(metadata.rows - hidden);
                         let cropped = crop_kitty_image_line(image_line, hidden, visible);
-                        if box_.rect.x == 0 && box_.rect.width >= total_width {
-                            screen[box_.rect.y] = cropped;
+                        if box_.rect.x == 0 && box_.rect.width >= total_width && box_.rect.y >= 0 {
+                            screen[box_.rect.y as usize] = cropped;
                         }
                     }
                     break;

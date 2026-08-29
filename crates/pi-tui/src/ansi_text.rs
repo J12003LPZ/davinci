@@ -283,3 +283,14 @@ pub fn strip_osc133_zone_prefix(line: &str) -> String {
 pub fn is_osc133_prompt_start(line: &str) -> bool {
     line.starts_with("\u{1b}]133;A\u{07}") || line.starts_with("\u{1b}]133;A\u{1b}\\")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_segment_reset() {
+        let line = format!("line 7{}", crate::diff::SEGMENT_RESET);
+        assert_eq!(strip_terminal_sequences(&line), "line 7");
+    }
+}

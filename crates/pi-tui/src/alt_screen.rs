@@ -993,10 +993,12 @@ impl TuiAltScreen {
                 if let Some(layout) = &self.current_layout {
                     if let Some(box_) = get_scroll_view_box(layout, &scroll) {
                         if box_.rect.height > 0 && box_.clip.height > 0 {
-                            let visible_top = box_.rect.y.max(box_.clip.y);
-                            let visible_bottom = (self.rows.saturating_sub(1))
-                                .min(box_.rect.y + box_.rect.height.saturating_sub(1))
-                                .min(box_.clip.y + box_.clip.height.saturating_sub(1));
+                            let visible_top = as_pos(box_.rect.y.max(box_.clip.y));
+                            let visible_bottom = as_pos(
+                                (self.rows.saturating_sub(1) as i32)
+                                    .min(box_.rect.y + box_.rect.height.saturating_sub(1) as i32)
+                                    .min(box_.clip.y + box_.clip.height.saturating_sub(1) as i32),
+                            );
                             if visible_bottom >= visible_top {
                                 let pointer_row = y.clamp(visible_top, visible_bottom);
                                 let max_row = box_
@@ -1005,10 +1007,12 @@ impl TuiAltScreen {
                                     .map(|lines| lines.len().saturating_sub(1))
                                     .unwrap_or(0);
                                 return SelectionPoint {
-                                    row: (scroll.scroll_top() + pointer_row - box_.rect.y)
-                                        .min(max_row),
-                                    col: x
-                                        .saturating_sub(box_.rect.x)
+                                    row: as_pos(
+                                        scroll.scroll_top() as i32 + pointer_row as i32
+                                            - box_.rect.y,
+                                    )
+                                    .min(max_row),
+                                    col: as_pos(x as i32 - box_.rect.x)
                                         .min(box_.rect.width.saturating_sub(1)),
                                     scroll: Some(id),
                                     boundary: false,
@@ -1184,10 +1188,12 @@ impl TuiAltScreen {
             self.selection_auto_dir = 0;
             return;
         };
-        let visible_top = box_.rect.y.max(box_.clip.y);
-        let visible_bottom = (self.rows.saturating_sub(1))
-            .min(box_.rect.y + box_.rect.height.saturating_sub(1))
-            .min(box_.clip.y + box_.clip.height.saturating_sub(1));
+        let visible_top = as_pos(box_.rect.y.max(box_.clip.y));
+        let visible_bottom = as_pos(
+            (self.rows.saturating_sub(1) as i32)
+                .min(box_.rect.y + box_.rect.height.saturating_sub(1) as i32)
+                .min(box_.clip.y + box_.clip.height.saturating_sub(1) as i32),
+        );
         self.selection_auto_dir = if y <= visible_top {
             -1
         } else if y >= visible_bottom {
@@ -1435,26 +1441,27 @@ impl TuiAltScreen {
             return screen.to_vec();
         };
         let scrollbar_col = get_scrollbar_geometry(box_).map(|g| g.column);
-        let min_row = box_.rect.y.max(box_.clip.y);
-        let max_row = screen
-            .len()
-            .min(box_.rect.y + box_.rect.height)
-            .min(box_.clip.y + box_.clip.height);
-        let min_col = box_.rect.x.max(box_.clip.x);
+        let min_row = as_pos(box_.rect.y.max(box_.clip.y));
+        let max_row = as_pos(
+            (screen.len() as i32)
+                .min(box_.rect.y + box_.rect.height as i32)
+                .min(box_.clip.y + box_.clip.height as i32),
+        );
+        let min_col = as_pos(box_.rect.x.max(box_.clip.x));
         let max_col = self
             .columns
-            .min(box_.rect.x + box_.rect.width)
-            .min(box_.clip.x + box_.clip.width)
+            .min(as_pos(box_.rect.x + box_.rect.width as i32))
+            .min(as_pos(box_.clip.x + box_.clip.width as i32))
             .min(scrollbar_col.unwrap_or(usize::MAX));
         let mut ranges: Vec<(usize, usize, usize, bool)> = Vec::new();
         for (match_index, match_) in search.matches.iter().enumerate() {
             for segment in &match_.segments {
-                let row = box_.rect.y + segment.row - scroll.scroll_top();
+                let row = as_pos(box_.rect.y + segment.row as i32 - scroll.scroll_top() as i32);
                 if row < min_row || row >= max_row {
                     continue;
                 }
-                let start = (box_.rect.x + segment.start_col).max(min_col);
-                let end = (box_.rect.x + segment.end_col).min(max_col);
+                let start = as_pos(box_.rect.x + segment.start_col as i32).max(min_col);
+                let end = as_pos(box_.rect.x + segment.end_col as i32).min(max_col);
                 if end <= start {
                     continue;
                 }
@@ -1508,26 +1515,26 @@ impl TuiAltScreen {
             let Some(box_) = get_scroll_view_box(layout, &scroll) else {
                 return screen.to_vec();
             };
-            min_row = box_.rect.y.max(box_.clip.y);
-            max_row = screen
-                .len()
-                .saturating_sub(1)
-                .min(box_.rect.y + box_.rect.height.saturating_sub(1))
-                .min(box_.clip.y + box_.clip.height.saturating_sub(1));
-            min_col = box_.rect.x.max(box_.clip.x);
+            min_row = as_pos(box_.rect.y.max(box_.clip.y));
+            max_row = as_pos(
+                (screen.len().saturating_sub(1) as i32)
+                    .min(box_.rect.y + box_.rect.height.saturating_sub(1) as i32)
+                    .min(box_.clip.y + box_.clip.height.saturating_sub(1) as i32),
+            );
+            min_col = as_pos(box_.rect.x.max(box_.clip.x));
             max_col = self
                 .columns
-                .min(box_.rect.x + box_.rect.width)
-                .min(box_.clip.x + box_.clip.width);
+                .min(as_pos(box_.rect.x + box_.rect.width as i32))
+                .min(as_pos(box_.clip.x + box_.clip.width as i32));
             screen_sel = (
                 SelectionPoint {
-                    row: box_.rect.y + selection.0.row - scroll.scroll_top(),
-                    col: box_.rect.x + selection.0.col,
+                    row: as_pos(box_.rect.y + selection.0.row as i32 - scroll.scroll_top() as i32),
+                    col: as_pos(box_.rect.x + selection.0.col as i32),
                     ..selection.0
                 },
                 SelectionPoint {
-                    row: box_.rect.y + selection.1.row - scroll.scroll_top(),
-                    col: box_.rect.x + selection.1.col,
+                    row: as_pos(box_.rect.y + selection.1.row as i32 - scroll.scroll_top() as i32),
+                    col: as_pos(box_.rect.x + selection.1.col as i32),
                     ..selection.1
                 },
             );
@@ -1727,6 +1734,10 @@ impl TuiAltScreen {
     pub fn request_render(&mut self) {
         self.render_now();
     }
+}
+
+fn as_pos(value: i32) -> usize {
+    value.max(0) as usize
 }
 
 fn apply_search_style(
@@ -1991,6 +2002,7 @@ mod tests {
         tui.set_layout_root(layout_transcript_and_dock(transcript.clone(), dock));
         tui.set_focus_editor();
         tui.start();
+        assert_eq!(tui.viewport_top(), 5);
         tui.handle_input("\u{1b}[102;6u");
         tui.handle_input("n");
         tui.handle_input("e");
@@ -2003,10 +2015,13 @@ mod tests {
             .viewport()
             .iter()
             .any(|line| line.contains("Find transcript") && line.contains("2/2")));
-        assert!(tui
-            .viewport()
-            .iter()
-            .any(|line| line.contains("line 10 needle two")));
+        assert!(
+            trim_view(&tui)
+                .iter()
+                .any(|line| line.contains("line 10 needle two")),
+            "view={:?}",
+            trim_view(&tui)
+        );
         assert!(tui.focus_inputs.borrow().is_empty());
         assert!(tui
             .writes
@@ -2022,8 +2037,7 @@ mod tests {
             .viewport()
             .iter()
             .any(|line| line.contains("Find transcript") && line.contains("1/2")));
-        assert!(tui
-            .viewport()
+        assert!(trim_view(&tui)
             .iter()
             .any(|line| line.contains("line 5 needle one")));
         tui.handle_input("\u{1b}[103;6u");
@@ -2299,7 +2313,11 @@ mod tests {
     fn trim_view(tui: &TuiAltScreen) -> Vec<String> {
         tui.viewport()
             .into_iter()
-            .map(|line| line.trim_end().to_string())
+            .map(|line| {
+                crate::ansi_text::strip_terminal_sequences(&line)
+                    .trim_end()
+                    .to_string()
+            })
             .collect()
     }
 }
