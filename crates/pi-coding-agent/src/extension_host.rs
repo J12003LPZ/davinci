@@ -26,7 +26,10 @@ pub enum ExtensionEvent {
     #[serde(rename = "session_start")]
     SessionStart,
     #[serde(rename = "session_shutdown")]
-    SessionShutdown,
+    SessionShutdown {
+        #[serde(default)]
+        reason: String,
+    },
     #[serde(rename = "session_before_compact")]
     SessionBeforeCompact,
     #[serde(rename = "session_before_switch")]
@@ -761,7 +764,7 @@ impl ExtensionHost {
                 ExtensionEvent::AgentEnd => "agent_end",
                 ExtensionEvent::AgentSettled => "agent_settled",
                 ExtensionEvent::SessionStart => "session_start",
-                ExtensionEvent::SessionShutdown => "session_shutdown",
+                ExtensionEvent::SessionShutdown { .. } => "session_shutdown",
                 ExtensionEvent::SessionBeforeCompact => "session_before_compact",
                 ExtensionEvent::SessionBeforeSwitch => "session_before_switch",
                 ExtensionEvent::SessionBeforeFork => "session_before_fork",

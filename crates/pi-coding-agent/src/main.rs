@@ -43,8 +43,8 @@ use pi_coding_agent::interactive_tui::{
     switch_tui_mode, ChromePanes, CopyCommandResult, InteractiveTui, InteractiveTuiOptions,
 };
 use pi_session::{
-    default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir_from,
-    resolve_session_ref, JsonlSession, SessionEntry,
+    default_agent_dir, discover_sessions, encode_header, latest_session, now_ms,
+    resolve_session_dir_from, resolve_session_ref, JsonlSession, SessionEntry,
 };
 use pi_tui::{
     builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto,
@@ -164,9 +164,9 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     }
     if parsed.help {
         let host = loaded_extension_host(&parsed);
-        println!(
-            "{}",
-            args::print_help_with_extension_flags(&host.registered_flags())
+        write_cli_text(
+            &parsed,
+            &args::print_help_with_extension_flags(&host.registered_flags()),
         );
         return Ok(0);
     }
@@ -175,7 +175,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         return Ok(0);
     }
     if let Some(list) = &parsed.list_models {
-        return list_models(list);
+        return list_models(list, should_take_over_stdout(&parsed));
     }
     if let Some(export) = &parsed.export {
         return export_session(&parsed, export);
@@ -779,7 +779,7 @@ fn render_models_table(models: &[&pi_ai::Model]) -> String {
     lines.join("\n")
 }
 
-fn list_models(list: &ListModels) -> Result<i32, String> {
+fn list_models(list: &ListModels, takeover: bool) -> Result<i32, String> {
     let snapshot = load_model_runtime(&Args::default());
     if let Some(error) = snapshot.get_error() {
         if snapshot.all.is_empty() {
@@ -793,9 +793,9 @@ fn list_models(list: &ListModels) -> Result<i32, String> {
             eprintln!("{NO_MODELS_AVAILABLE}");
             return Ok(1);
         }
-        println!(
-            "{}",
-            format_no_models_available_message(&coding_agent_docs_dir())
+        write_text(
+            takeover,
+            &format_no_models_available_message(&coding_agent_docs_dir()),
         );
         return Ok(0);
     }
@@ -805,12 +805,44 @@ fn list_models(list: &ListModels) -> Result<i32, String> {
     };
     if selected.is_empty() {
         if let ListModels::Query(query) = list {
-            println!("No models matching \"{query}\"");
+            write_text(takeover, &format!("No models matching \"{query}\""));
             return Ok(0);
         }
     }
-    println!("{}", render_models_table(&selected));
+    write_text(takeover, &render_models_table(&selected));
     Ok(0)
+}
+
+/// TS `takeOverStdout`: non-interactive JSON/RPC/print keep stdout for the protocol.
+fn should_take_over_stdout(parsed: &Args) -> bool {
+    let plain_metadata =
+        !parsed.print && parsed.mode.is_none() && (parsed.help || parsed.list_models.is_some());
+    if plain_metadata {
+        return false;
+    }
+    parsed.mode == Some(Mode::Rpc)
+        || parsed.mode == Some(Mode::Json)
+        || parsed.print
+        || !io::stdin().is_terminal()
+        || !io::stdout().is_terminal()
+}
+
+fn write_cli_text(parsed: &Args, text: &str) {
+    write_text(should_take_over_stdout(parsed), text);
+}
+
+fn write_text(takeover: bool, text: &str) {
+    if takeover {
+        eprint!("{text}");
+        if !text.ends_with('\n') {
+            eprintln!();
+        }
+    } else {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
 }
 
 fn export_session(parsed: &Args, export: &str) -> Result<i32, String> {
@@ -1222,8 +1254,14 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         &agent.cwd,
         settings.image_auto_resize(),
     )?;
+    let json_mode = parsed.mode == Some(Mode::Json);
+    if json_mode {
+        if let Some(session) = &agent.session {
+            print!("{}", encode_header(&session.header));
+        }
+    }
     let mut last_reply = String::new();
-    let mut last_events = Vec::new();
+    let mut all_events = Vec::new();
     if let Some(prompt) = &prepared.text {
         if !prompt.trim().is_empty() || !prepared.images.is_empty() {
             match prepare_user_input(parsed, agent, prompt, &prepared.images, "print", None)? {
@@ -1232,7 +1270,10 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                     agent.prompt_with(&text, &images);
                     let (reply, events) = complete_prompt(parsed, agent);
                     last_reply = reply;
-                    last_events = events;
+                    if json_mode {
+                        write_print_json_events(&events)?;
+                    }
+                    all_events.extend(events);
                 }
             }
         }
@@ -1247,24 +1288,110 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 agent.prompt_with(&text, &images);
                 let (reply, events) = complete_prompt(parsed, agent);
                 last_reply = reply;
-                last_events = events;
+                if json_mode {
+                    write_print_json_events(&events)?;
+                }
+                all_events.extend(events);
             }
         }
     }
-    if last_reply.is_empty() && last_events.is_empty() {
-        return Ok(0);
-    }
-    if parsed.mode == Some(Mode::Json) {
-        for event in last_events {
-            println!(
-                "{}",
-                serde_json::to_string(&event).map_err(|err| err.to_string())?
-            );
+    let (exit_code, error) = print_text_exit(&all_events);
+    if !json_mode {
+        if let Some(error) = error {
+            eprintln!("{error}");
+        } else if !last_reply.is_empty() {
+            println!("{last_reply}");
         }
-    } else {
-        println!("{last_reply}");
     }
-    Ok(0)
+    loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
+        reason: "quit".into(),
+    });
+    Ok(exit_code)
+}
+
+fn write_print_json_events(events: &[AgentEvent]) -> Result<(), String> {
+    for event in events {
+        println!(
+            "{}",
+            serde_json::to_string(&to_json_print_event(event)?).map_err(|err| err.to_string())?
+        );
+    }
+    Ok(())
+}
+
+/// TS `toJsonEvent` — strip cumulative `partial` snapshots from `message_update`.
+fn to_json_print_event(event: &AgentEvent) -> Result<serde_json::Value, String> {
+    match event {
+        AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } => {
+            if message.role != "assistant" {
+                return Err("message_update message is not an assistant message".into());
+            }
+            let mut assistant =
+                serde_json::to_value(assistant_message_event).map_err(|err| err.to_string())?;
+            if let Some(object) = assistant.as_object_mut() {
+                if object.get("type").and_then(serde_json::Value::as_str) == Some("toolcall_start")
+                {
+                    if let Some(index) = object
+                        .get("contentIndex")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        let Some(ContentBlock::ToolCall { id, name, .. }) = assistant_message_event
+                            .message()
+                            .content
+                            .get(index as usize)
+                        else {
+                            return Err("toolcall_start content at index is not a tool call".into());
+                        };
+                        object.insert("id".into(), serde_json::Value::String(id.clone()));
+                        object.insert("toolName".into(), serde_json::Value::String(name.clone()));
+                    }
+                }
+                object.remove("partial");
+            }
+            Ok(serde_json::json!({
+                "type": "message_update",
+                "usage": assistant_message_event.message().usage,
+                "assistantMessageEvent": assistant,
+            }))
+        }
+        other => serde_json::to_value(other).map_err(|err| err.to_string()),
+    }
+}
+
+fn print_text_exit(events: &[AgentEvent]) -> (i32, Option<String>) {
+    for event in events.iter().rev() {
+        let AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let message = assistant_message_event.message();
+        match message.stop_reason {
+            Some(StopReason::Error) | Some(StopReason::Aborted) => {
+                let label = if message.stop_reason == Some(StopReason::Aborted) {
+                    "aborted"
+                } else {
+                    "error"
+                };
+                return (
+                    1,
+                    Some(
+                        message
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| format!("Request {label}")),
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+    (0, None)
 }
 
 fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
@@ -4125,7 +4252,9 @@ fn apply_host_session_calls(
                     continue;
                 }
             }
-            Some("reload") => host.emit(ExtensionEvent::SessionShutdown),
+            Some("reload") => host.emit(ExtensionEvent::SessionShutdown {
+                reason: "reload".into(),
+            }),
             _ => {}
         }
         allowed.push(call.clone());
@@ -6064,5 +6193,89 @@ mod tests {
             .chrome
             .status
             .contains("No stored credentials to remove"));
+    }
+
+    #[test]
+    fn print_mode_exits_nonzero_on_assistant_error() {
+        let message = AssistantMessage {
+            id: "m1".into(),
+            role: "assistant".into(),
+            content: vec![],
+            model: "x".into(),
+            usage: None,
+            stop_reason: Some(StopReason::Error),
+            error_message: Some("provider failure".into()),
+        };
+        let events = vec![AgentEvent::MessageUpdate {
+            message: pi_ai::ChatMessage::text("assistant", ""),
+            assistant_message_event: pi_ai::AssistantMessageEvent::Error {
+                reason: StopReason::Error,
+                error: message,
+            },
+        }];
+        assert_eq!(
+            print_text_exit(&events),
+            (1, Some("provider failure".into()))
+        );
+        let aborted = AssistantMessage {
+            id: "m2".into(),
+            role: "assistant".into(),
+            content: vec![],
+            model: "x".into(),
+            usage: None,
+            stop_reason: Some(StopReason::Aborted),
+            error_message: None,
+        };
+        let events = vec![AgentEvent::MessageUpdate {
+            message: pi_ai::ChatMessage::text("assistant", ""),
+            assistant_message_event: pi_ai::AssistantMessageEvent::Error {
+                reason: StopReason::Aborted,
+                error: aborted,
+            },
+        }];
+        assert_eq!(
+            print_text_exit(&events),
+            (1, Some("Request aborted".into()))
+        );
+    }
+
+    #[test]
+    fn print_json_event_strips_partial_and_adds_toolcall_ids() {
+        let message = AssistantMessage {
+            id: "m1".into(),
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            }],
+            model: "x".into(),
+            usage: None,
+            stop_reason: None,
+            error_message: None,
+        };
+        let json = to_json_print_event(&AgentEvent::MessageUpdate {
+            message: pi_ai::ChatMessage::text("assistant", ""),
+            assistant_message_event: pi_ai::AssistantMessageEvent::ToolcallStart {
+                content_index: 0,
+                partial: message,
+            },
+        })
+        .unwrap();
+        assert_eq!(json["type"], "message_update");
+        assert!(json["assistantMessageEvent"].get("partial").is_none());
+        assert_eq!(json["assistantMessageEvent"]["id"], "call-1");
+        assert_eq!(json["assistantMessageEvent"]["toolName"], "bash");
+        assert_eq!(json["assistantMessageEvent"]["type"], "toolcall_start");
+    }
+
+    #[test]
+    fn json_mode_help_takes_over_stdout() {
+        let help = parse_args(&["--help".into()]);
+        assert!(!should_take_over_stdout(&help));
+        let json_help = parse_args(&["--mode".into(), "json".into(), "--help".into()]);
+        assert!(should_take_over_stdout(&json_help));
+        let print_help = parse_args(&["-p".into(), "--help".into()]);
+        assert!(should_take_over_stdout(&print_help));
     }
 }

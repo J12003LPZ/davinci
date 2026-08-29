@@ -139,6 +139,8 @@ Closed this slice: sparse 1e9-line scroll clip (`RenderedLines` / `SparseLines`,
 
 Closed this slice: interactive `OAuthSelector` for bare `/login` / `/logout` (auth-type picker, provider search, stored-credential logout list, empty-logout copy), ambient “configured outside pi” dialog when a provider has no interactive login, model-scoped thinking levels (`getSupportedThinkingLevels` / `thinkingLevelMap`) on RPC `get_available_thinking_levels` / `cycle_thinking_level` (null when `!reasoning`), TUI `/thinking` + cycle, and server model metadata. RPC `extension_ui_request` copies optional `timeout`. Eval harness `{ type: "reload" }` calls `Agent::reload()`.
 
+Closed this slice: print mode matches TS `runPrintMode` — session header then `toJsonEvent` JSON lines (`message_update` strips `partial`, toolcall_start keeps `id`/`toolName`), text mode exits 1 on assistant `error`/`aborted` with the TS stderr copy, and dispose emits `session_shutdown` `{ reason: "quit" }`. `--mode json --help` / `--print --help` take over stdout (help and `--list-models` go to stderr) like TS `takeOverStdout`.
+
 ## Remaining product gaps
 
 None.
