@@ -22,17 +22,38 @@ pub struct Image {
     cached_lines: RefCell<Option<(usize, Vec<String>)>>,
 }
 
+pub struct ImageOptions {
+    pub max_width_cells: Option<u32>,
+    pub max_height_cells: Option<u32>,
+    pub filename: Option<String>,
+    pub image_id: Option<u32>,
+}
+
+impl Default for ImageOptions {
+    fn default() -> Self {
+        Self {
+            max_width_cells: None,
+            max_height_cells: None,
+            filename: None,
+            image_id: None,
+        }
+    }
+}
+
 impl Image {
     pub fn new(
         base64_data: impl Into<String>,
         mime_type: impl Into<String>,
         fallback_color: fn(&str) -> String,
-        max_width_cells: Option<u32>,
-        max_height_cells: Option<u32>,
-        filename: Option<String>,
-        image_id: Option<u32>,
+        options: ImageOptions,
         dimensions: Option<ImageDimensions>,
     ) -> Self {
+        let ImageOptions {
+            max_width_cells,
+            max_height_cells,
+            filename,
+            image_id,
+        } = options;
         let base64_data = base64_data.into();
         let mime_type = mime_type.into();
         let dimensions = dimensions
@@ -169,6 +190,7 @@ mod tests {
 
     #[test]
     fn image_square_box_and_padding_match_typescript() {
+        let _lock = crate::terminal_image::capabilities_lock();
         set_capabilities(TerminalCapabilities {
             images: Some(ImageProtocol::Kitty),
             true_color: true,
@@ -182,10 +204,10 @@ mod tests {
             "AAAA",
             "image/png",
             identity,
-            Some(10),
-            None,
-            None,
-            None,
+            ImageOptions {
+                max_width_cells: Some(10),
+                ..ImageOptions::default()
+            },
             Some(ImageDimensions {
                 width_px: 10,
                 height_px: 100,
@@ -202,10 +224,10 @@ mod tests {
             "AAAA",
             "image/png",
             identity,
-            Some(2),
-            None,
-            None,
-            None,
+            ImageOptions {
+                max_width_cells: Some(2),
+                ..ImageOptions::default()
+            },
             Some(ImageDimensions {
                 width_px: 20,
                 height_px: 20,
@@ -227,6 +249,7 @@ mod tests {
 
     #[test]
     fn image_fallback_truncates_and_shortens_home() {
+        let _lock = crate::terminal_image::capabilities_lock();
         set_capabilities(TerminalCapabilities {
             images: None,
             true_color: false,
@@ -241,10 +264,10 @@ mod tests {
             "AAAA",
             "image/png",
             yellow,
-            None,
-            None,
-            Some(long_path),
-            None,
+            ImageOptions {
+                filename: Some(long_path),
+                ..ImageOptions::default()
+            },
             Some(ImageDimensions {
                 width_px: 1280,
                 height_px: 720,

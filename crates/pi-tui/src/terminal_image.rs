@@ -119,6 +119,11 @@ impl Default for ImageState {
     }
 }
 
+pub fn capabilities_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().expect("capabilities")
+}
+
 fn state() -> std::sync::MutexGuard<'static, ImageState> {
     static STATE: OnceLock<Mutex<ImageState>> = OnceLock::new();
     STATE
@@ -642,14 +647,21 @@ fn home_dir() -> Option<String> {
     std::env::var("HOME")
         .ok()
         .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var("USERPROFILE").ok().filter(|value| !value.is_empty()))
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn shorten_image_path(filename: &str) -> String {
     let Some(home) = home_dir() else {
         return filename.to_string();
     };
-    if filename == home || filename.starts_with(&format!("{home}/")) || filename.starts_with(&format!("{home}\\")) {
+    if filename == home
+        || filename.starts_with(&format!("{home}/"))
+        || filename.starts_with(&format!("{home}\\"))
+    {
         format!("~{}", &filename[home.len()..])
     } else {
         filename.to_string()
@@ -696,7 +708,12 @@ fn decode_base64(data: &str) -> Option<Vec<u8>> {
 
 pub fn get_png_dimensions(base64_data: &str) -> Option<ImageDimensions> {
     let buffer = decode_base64(base64_data)?;
-    if buffer.len() < 24 || buffer[0] != 0x89 || buffer[1] != 0x50 || buffer[2] != 0x4e || buffer[3] != 0x47 {
+    if buffer.len() < 24
+        || buffer[0] != 0x89
+        || buffer[1] != 0x50
+        || buffer[2] != 0x4e
+        || buffer[3] != 0x47
+    {
         return None;
     }
     Some(ImageDimensions {
@@ -719,8 +736,10 @@ pub fn get_jpeg_dimensions(base64_data: &str) -> Option<ImageDimensions> {
         let marker = buffer[offset + 1];
         if (0xc0..=0xc2).contains(&marker) {
             return Some(ImageDimensions {
-                width_px: u16::from_be_bytes(buffer[offset + 7..offset + 9].try_into().ok()?) as u32,
-                height_px: u16::from_be_bytes(buffer[offset + 5..offset + 7].try_into().ok()?) as u32,
+                width_px: u16::from_be_bytes(buffer[offset + 7..offset + 9].try_into().ok()?)
+                    as u32,
+                height_px: u16::from_be_bytes(buffer[offset + 5..offset + 7].try_into().ok()?)
+                    as u32,
             });
         }
         if offset + 3 >= buffer.len() {
@@ -827,7 +846,11 @@ pub fn parse_kitty_image_header(line: &str) -> Option<(Vec<u32>, u32)> {
     Some((ids, rows))
 }
 
-pub fn kitty_image_reserved_rows(lines: &[String], index: usize, max_index: Option<usize>) -> usize {
+pub fn kitty_image_reserved_rows(
+    lines: &[String],
+    index: usize,
+    max_index: Option<usize>,
+) -> usize {
     let rows = parse_kitty_image_header(lines.get(index).map(String::as_str).unwrap_or(""))
         .map(|(_, rows)| rows)
         .unwrap_or(1) as usize;
@@ -835,10 +858,15 @@ pub fn kitty_image_reserved_rows(lines: &[String], index: usize, max_index: Opti
         return 1;
     }
     let last = max_index.unwrap_or(lines.len().saturating_sub(1));
-    let max_rows = rows.min(last.saturating_sub(index) + 1).min(lines.len().saturating_sub(index));
+    let max_rows = rows
+        .min(last.saturating_sub(index) + 1)
+        .min(lines.len().saturating_sub(index));
     let mut reserved = 1usize;
     while reserved < max_rows {
-        let line = lines.get(index + reserved).map(String::as_str).unwrap_or("");
+        let line = lines
+            .get(index + reserved)
+            .map(String::as_str)
+            .unwrap_or("");
         if is_image_line(line) || crate::diff::visible_width(line) > 0 {
             break;
         }
@@ -853,11 +881,8 @@ pub fn emit_reserved_image_block(line: &str, reserved_rows: usize) -> String {
     }
     let offset = reserved_rows - 1;
     format!(
-        "{}{}{}{}",
-        "\r\n".repeat(offset),
-        format!("\x1b[{offset}A"),
-        line,
-        format!("\x1b[{offset}B")
+        "{}\x1b[{offset}A{line}\x1b[{offset}B",
+        "\r\n".repeat(offset)
     )
 }
 
@@ -882,10 +907,9 @@ pub fn prepare_kitty_screen(
                     estimated_decoded_bytes: placement.estimated_decoded_bytes,
                 },
             );
-            if cached
-                .as_ref()
-                .is_some_and(|cached| cached.transmission_generation == placement.transmission_generation)
-            {
+            if cached.as_ref().is_some_and(|cached| {
+                cached.transmission_generation == placement.transmission_generation
+            }) {
                 placement.replacement_line
             } else {
                 line.clone()
@@ -952,6 +976,7 @@ mod tests {
 
     fn with_env<T>(overrides: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
         static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _cap = capabilities_lock();
         let _env = ENV_LOCK.lock().expect("env");
         let saved: Vec<(String, Option<String>)> = ENV_KEYS
             .iter()
@@ -1107,6 +1132,7 @@ mod tests {
 
     #[test]
     fn render_crop_and_placement_match_typescript() {
+        let _lock = capabilities_lock();
         set_capabilities(TerminalCapabilities {
             images: Some(ImageProtocol::Kitty),
             true_color: true,
@@ -1213,6 +1239,7 @@ mod tests {
 
     #[test]
     fn image_fallback_and_png_dimensions_match_typescript() {
+        let _lock = capabilities_lock();
         set_capabilities(TerminalCapabilities {
             images: None,
             true_color: false,
@@ -1289,6 +1316,7 @@ mod tests {
 
     #[test]
     fn prepare_kitty_screen_reuses_generation_and_evicts() {
+        let _lock = capabilities_lock();
         register_kitty_image_metadata(KittyImageMetadata {
             image_id: 7,
             columns: 2,

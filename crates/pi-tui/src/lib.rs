@@ -23,7 +23,7 @@ pub use diff::{
     normalize_terminal_output, truncate_to_width, visible_width, DiffScreen,
 };
 pub use editor::Editor;
-pub use image::Image;
+pub use image::{Image, ImageOptions};
 pub use keys::{default_keybindings, parse_bytes, parse_key, read_key, Key, Keybinding};
 pub use layout::{ChatView, Container, Overlay};
 pub use markdown::Markdown;
