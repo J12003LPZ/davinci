@@ -600,6 +600,7 @@ dependencies = [
  "base64",
  "pi-protocol",
  "pi-telemetry",
+ "regex",
  "rustls",
  "rustls-pki-types",
  "serde",

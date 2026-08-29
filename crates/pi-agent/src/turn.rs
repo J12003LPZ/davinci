@@ -78,7 +78,7 @@ impl Agent {
                 }
             }
 
-            let assistant = match self.complete_with_retry(&mut complete) {
+            let assistant = match self.complete_with_retry(&mut complete, &mut events) {
                 Ok(message) => message,
                 Err(err) => {
                     self.is_streaming = false;
@@ -264,18 +264,31 @@ impl Agent {
         }
     }
 
-    fn complete_with_retry<F>(&mut self, complete: &mut F) -> Result<AssistantMessage, String>
+    fn complete_with_retry<F>(
+        &mut self,
+        complete: &mut F,
+        events: &mut Vec<AgentEvent>,
+    ) -> Result<AssistantMessage, String>
     where
         F: FnMut(&Agent) -> Result<AssistantMessage, String>,
     {
-        let attempts = if self.auto_retry {
-            self.retry_attempts.max(1)
+        let max_retries = if self.auto_retry {
+            self.retry_attempts
         } else {
-            1
+            0
         };
+        let attempts = max_retries.max(1);
         let mut last_error = None;
+        let mut scheduled_attempt = 0_u32;
         for attempt in 0..attempts {
             if self.aborted {
+                if scheduled_attempt > 0 {
+                    events.push(AgentEvent::AutoRetryEnd {
+                        success: false,
+                        attempt: scheduled_attempt,
+                        final_error: Some("Retry cancelled".into()),
+                    });
+                }
                 return Ok(AssistantMessage {
                     id: crate::new_message_id(),
                     role: "assistant".into(),
@@ -287,14 +300,63 @@ impl Agent {
                 });
             }
             match complete(self) {
-                Ok(message) => return Ok(message),
+                Ok(message) => {
+                    if message.stop_reason == Some(StopReason::Error)
+                        && pi_ai::is_retryable_assistant_error(&message)
+                        && attempt + 1 < attempts
+                    {
+                        scheduled_attempt = attempt + 1;
+                        let delay = retry_delay_ms(self.retry_base_delay_ms, attempt);
+                        events.push(AgentEvent::AutoRetryStart {
+                            attempt: scheduled_attempt,
+                            max_attempts: max_retries,
+                            delay_ms: delay,
+                            error_message: message
+                                .error_message
+                                .clone()
+                                .unwrap_or_else(|| "Unknown error".into()),
+                        });
+                        sleep_retry_delay(delay);
+                        continue;
+                    }
+                    if scheduled_attempt > 0 {
+                        let success = message.stop_reason != Some(StopReason::Error);
+                        events.push(AgentEvent::AutoRetryEnd {
+                            success,
+                            attempt: scheduled_attempt,
+                            final_error: if success {
+                                None
+                            } else {
+                                message.error_message.clone()
+                            },
+                        });
+                    }
+                    return Ok(message);
+                }
                 Err(err) => {
-                    last_error = Some(err);
-                    if attempt + 1 < attempts {
+                    last_error = Some(err.clone());
+                    if attempt + 1 < attempts && pi_ai::is_retryable_error_text(&err) {
+                        scheduled_attempt = attempt + 1;
+                        let delay = retry_delay_ms(self.retry_base_delay_ms, attempt);
+                        events.push(AgentEvent::AutoRetryStart {
+                            attempt: scheduled_attempt,
+                            max_attempts: max_retries,
+                            delay_ms: delay,
+                            error_message: err,
+                        });
+                        sleep_retry_delay(delay);
+                    } else if attempt + 1 < attempts {
                         sleep_retry_delay(retry_delay_ms(self.retry_base_delay_ms, attempt));
                     }
                 }
             }
+        }
+        if scheduled_attempt > 0 {
+            events.push(AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt: scheduled_attempt,
+                final_error: last_error.clone(),
+            });
         }
         Err(last_error.unwrap_or_else(|| "Provider request failed".into()))
     }

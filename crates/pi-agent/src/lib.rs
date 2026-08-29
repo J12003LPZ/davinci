@@ -10,11 +10,16 @@ mod tools;
 mod turn;
 
 pub use compaction::{
-    calculate_context_tokens, compact_messages, compact_messages_with, compute_file_lists,
-    estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
-    format_file_operations, should_compact, CompactionDetails, CompactionResult,
-    CompactionSettings, CutPointResult, FileOperations, DEFAULT_KEEP_RECENT_TOKENS,
-    DEFAULT_RESERVE_TOKENS, SUMMARIZATION_PROMPT,
+    build_history_prompt, calculate_context_tokens, compact_messages, compact_messages_with,
+    compact_messages_with_options, compaction_context_message, compute_file_lists, convert_to_llm,
+    env_summarizer, estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
+    format_file_operations, generate_summary_with_usage, get_summarization_failure,
+    serialize_conversation, should_compact, CompactionDetails, CompactionResult,
+    CompactionSettings, CutPointResult, FileOperations, SummarizeRequest, SummarizeResponse,
+    Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX,
+    COMPACTION_SUMMARY_SUFFIX, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
+    SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
+    UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use context::{load_context_files, ContextFile};
 pub use events::AgentEvent;
@@ -96,6 +101,7 @@ pub struct Agent {
     pub model_id: String,
     pub tool_execution_mode: ToolExecutionMode,
     pub custom_tool_executor: Option<CustomToolExecutor>,
+    pub summarizer: Option<Summarizer>,
 }
 
 impl Agent {
@@ -128,6 +134,7 @@ impl Agent {
             model_id: String::new(),
             tool_execution_mode: ToolExecutionMode::Sequential,
             custom_tool_executor: None,
+            summarizer: None,
         }
     }
 
@@ -174,18 +181,46 @@ impl Agent {
 
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
         self.is_compacting = true;
-        let result = compact_messages_with(
+        let previous_summary = self.session.as_ref().and_then(|session| {
+            session
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.entry_type == "compaction")
+                .and_then(|entry| {
+                    entry
+                        .extra
+                        .get("summary")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+        });
+        let provider = self.provider.clone();
+        let model_id = self.model_id.clone();
+        let bound = self.summarizer.clone().map(|inner| {
+            Summarizer::new(move |request| {
+                let mut request = request.clone();
+                if request.provider.is_empty() {
+                    request.provider = provider.clone();
+                }
+                if request.model_id.is_empty() {
+                    request.model_id = model_id.clone();
+                }
+                inner.summarize(&request)
+            })
+        });
+        let mut result = compact_messages_with_options(
             &self.messages,
             custom_instructions,
             self.compaction.keep_recent_tokens,
+            self.compaction.reserve_tokens,
+            previous_summary.as_deref(),
+            bound.as_ref(),
         );
         if result.compacted {
             if let Some(session) = &mut self.session {
-                let first_kept = session
-                    .entries
-                    .last()
-                    .map(|entry| entry.id.clone())
-                    .unwrap_or_default();
+                let first_kept = first_kept_entry_id(session, &self.messages, &result.messages);
+                result.first_kept_entry_id = first_kept.clone();
                 let mut extra = serde_json::Map::new();
                 extra.insert("summary".into(), serde_json::json!(result.summary));
                 extra.insert("firstKeptEntryId".into(), serde_json::json!(first_kept));
@@ -194,6 +229,12 @@ impl Agent {
                     serde_json::to_value(&result.details).unwrap_or_default(),
                 );
                 extra.insert("fromHook".into(), serde_json::json!(false));
+                if let Some(usage) = &result.usage {
+                    extra.insert(
+                        "usage".into(),
+                        serde_json::to_value(usage).unwrap_or_default(),
+                    );
+                }
                 let _ = session.append_entry(SessionEntry {
                     id: String::new(),
                     entry_type: "compaction".into(),
@@ -206,7 +247,9 @@ impl Agent {
                 });
             }
         }
-        self.messages = result.messages.clone();
+        if result.compacted {
+            self.messages = result.messages.clone();
+        }
         self.is_compacting = false;
         result
     }
@@ -216,7 +259,7 @@ impl Agent {
     }
 
     pub fn load_from_session(&mut self, session: JsonlSession) {
-        self.messages = session.entries.iter().filter_map(entry_to_chat).collect();
+        self.messages = messages_from_session(&session);
         self.session = Some(session);
     }
 
@@ -257,8 +300,76 @@ impl Agent {
 }
 
 fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
+    if entry.entry_type == "compaction" {
+        let summary = entry.extra.get("summary")?.as_str()?;
+        return Some(compaction_context_message(summary));
+    }
     let message = entry.message.as_ref()?;
     serde_json::from_value(message.clone()).ok()
+}
+
+fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {
+    let Some(index) = session
+        .entries
+        .iter()
+        .rposition(|entry| entry.entry_type == "compaction")
+    else {
+        return session.entries.iter().filter_map(entry_to_chat).collect();
+    };
+    let first_kept_id = session.entries[index]
+        .extra
+        .get("firstKeptEntryId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let first_kept_index = session
+        .entries
+        .iter()
+        .position(|entry| entry.id == first_kept_id)
+        .unwrap_or(index + 1);
+    let mut messages = Vec::new();
+    if let Some(summary) = session.entries[index]
+        .extra
+        .get("summary")
+        .and_then(Value::as_str)
+    {
+        messages.push(compaction_context_message(summary));
+    }
+    for entry in session.entries.iter().skip(first_kept_index) {
+        if entry.entry_type == "compaction" {
+            continue;
+        }
+        if let Some(message) = entry_to_chat(entry) {
+            messages.push(message);
+        }
+    }
+    messages
+}
+
+fn first_kept_entry_id(
+    session: &JsonlSession,
+    before: &[ChatMessage],
+    after: &[ChatMessage],
+) -> String {
+    let kept = after.len().saturating_sub(1);
+    let first_kept_index = before.len().saturating_sub(kept);
+    let mut message_index = 0usize;
+    for entry in &session.entries {
+        if entry.entry_type == "compaction" {
+            continue;
+        }
+        if entry_to_chat(entry).is_none() {
+            continue;
+        }
+        if message_index == first_kept_index {
+            return entry.id.clone();
+        }
+        message_index += 1;
+    }
+    session
+        .entries
+        .last()
+        .map(|entry| entry.id.clone())
+        .unwrap_or_default()
 }
 
 pub fn default_system_prompt() -> String {
@@ -286,6 +397,49 @@ mod tests {
         let compacted = agent.compact(Some("keep decisions"));
         assert!(compacted.summary.contains("keep decisions"));
         assert!(!agent.messages.is_empty());
+    }
+
+    #[test]
+    fn auto_retry_emits_ts_session_events() {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+
+        let mut agent = Agent::new(default_system_prompt());
+        agent.retry_attempts = 2;
+        agent.retry_base_delay_ms = 0;
+        agent.prompt("retry me");
+        let mut calls = 0;
+        let events = agent
+            .run_loop(|_| {
+                calls += 1;
+                if calls == 1 {
+                    return Ok(AssistantMessage {
+                        id: "e1".into(),
+                        role: "assistant".into(),
+                        content: Vec::new(),
+                        model: "fixture".into(),
+                        usage: None,
+                        stop_reason: Some(StopReason::Error),
+                        error_message: Some("overloaded_error".into()),
+                    });
+                }
+                Ok(AssistantMessage {
+                    id: "ok".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "recovered".into(),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+        let kinds: Vec<_> = events.iter().map(AgentEvent::kind).collect();
+        assert!(kinds.contains(&"auto_retry_start"));
+        assert!(kinds.contains(&"auto_retry_end"));
+        assert_eq!(calls, 2);
+        assert_eq!(agent.last_assistant_text().as_deref(), Some("recovered"));
     }
 
     #[test]

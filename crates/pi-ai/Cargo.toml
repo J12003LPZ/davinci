@@ -10,6 +10,7 @@ description = "Unified multi-provider LLM API matching @earendil-works/pi-ai"
 pi-protocol = { path = "../pi-protocol" }
 pi-telemetry = { path = "../pi-telemetry" }
 base64.workspace = true
+regex.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true

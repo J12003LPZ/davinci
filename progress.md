@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (compaction file-ops + checkpoint serialize). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (LLM compaction completeSimple + provider Retry-After). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -67,7 +67,10 @@ Closed this slice: `packages` object form (`source`/`autoload`/resource globs) p
 
 Closed this slice: compaction file-ops (`read`/`write`/`edit` → `<read-files>`/`<modified-files>`), TS conversation serialize, checkpoint prompt, and JSONL `compaction` entries with `details`.
 
+Closed this slice: compaction `completeSimple` checkpoint generation — TS structured `## Goal` / update / turn-prefix prompts, `SUMMARIZATION_SYSTEM_PROMPT`, serialize with `[... N more characters truncated]`, split-turn merge, usage on JSONL `compaction` entries, `firstKeptEntryId` reload, fixture `PI_COMPACTION_REPLY`. Provider HTTP retries honor `retry-after` / `retry-after-ms` / `x-should-retry` (undici-style cap), and the agent loop emits `auto_retry_start` / `auto_retry_end` for retryable assistant errors.
+
 Still not product-equivalent:
 
-- Compaction still uses a local serialize+file-ops summary rather than `completeSimple` LLM checkpoint generation
-- Provider SDK retries (`maxRetries`/`maxRetryDelayMs` on the HTTP client) are stored and timeout is applied; undici-style retry-after is not
+- Branch-tree “Summarize branch?” still writes a status string instead of `completeSummarization` LLM branch summaries
+- `markdown.codeBlockIndent` is parsed but not applied to the TUI markdown renderer
+- `websocketConnectTimeoutMs` is exported to `PI_WEBSOCKET_CONNECT_TIMEOUT_MS` but Codex websocket connect does not read it

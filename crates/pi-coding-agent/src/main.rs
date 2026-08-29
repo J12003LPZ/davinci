@@ -22,11 +22,12 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use pi_agent::{
-    default_system_prompt, discover_prompt_templates, discover_skills, load_context_files, Agent,
-    AgentEvent, CustomToolExecutor,
+    default_system_prompt, discover_prompt_templates, discover_skills, env_summarizer,
+    load_context_files, Agent, AgentEvent, CustomToolExecutor, SummarizeRequest, SummarizeResponse,
+    Summarizer,
 };
 use pi_ai::{
-    apply_config_auth_with_shell, apply_models_config, content_text, find_model,
+    apply_config_auth_with_shell, apply_models_config, complete_simple, content_text, find_model,
     format_no_models_available_message, fuzzy_models, live_complete_with, load_builtin_models,
     models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
     ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
@@ -316,7 +317,127 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             let _ = storage.login_api_key(&agent.provider, key);
         }
     }
+    agent.summarizer = Some(live_compaction_summarizer(parsed, &agent));
     Ok(agent)
+}
+
+fn live_compaction_summarizer(parsed: &Args, agent: &Agent) -> Summarizer {
+    let parsed = parsed.clone();
+    let timeout_ms = agent.provider_timeout_ms;
+    let max_retries = agent.provider_max_retries;
+    let max_retry_delay_ms = Some(agent.provider_max_retry_delay_ms);
+    let thinking_level = agent.thinking_level;
+    let thinking_budgets = agent.thinking_budgets.clone();
+    Summarizer::new(move |request| {
+        if let Some(env) = env_summarizer() {
+            return env.summarize(request);
+        }
+        complete_simple_summarization(
+            &parsed,
+            request,
+            timeout_ms,
+            max_retries,
+            max_retry_delay_ms,
+            thinking_level,
+            thinking_budgets.clone(),
+        )
+    })
+}
+
+fn complete_simple_summarization(
+    parsed: &Args,
+    request: &SummarizeRequest,
+    timeout_ms: Option<u64>,
+    max_retries: Option<u32>,
+    max_retry_delay_ms: Option<u64>,
+    thinking_level: pi_protocol::ThinkingLevel,
+    thinking_budgets: Option<pi_ai::ThinkingBudgets>,
+) -> Result<SummarizeResponse, String> {
+    let offline = parsed.offline
+        || matches!(
+            std::env::var("PI_OFFLINE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+    if offline {
+        return Err("Summarization failed: offline".into());
+    }
+    let models = available_models(parsed);
+    let model = find_model(&models, &request.provider, &request.model_id)
+        .cloned()
+        .or_else(|| {
+            models
+                .iter()
+                .find(|item| item.provider == request.provider)
+                .cloned()
+        })
+        .or_else(|| models.first().cloned())
+        .ok_or_else(|| "Summarization failed: no model available".to_string())?;
+    let mut storage = AuthStorage::create().ok();
+    if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
+        storage.set_runtime_override(&request.provider, key);
+    }
+    if let Some(storage) = storage.as_mut() {
+        let _ = storage.maybe_refresh(&request.provider, now_ms(), 0, false);
+    }
+    let env = std::env::vars().collect();
+    let mut auth = storage
+        .as_ref()
+        .and_then(|storage| resolve_provider_auth(&request.provider, storage, &env, true))
+        .unwrap_or(ResolvedAuth {
+            api_key: None,
+            headers: Default::default(),
+            source: "none".into(),
+        });
+    let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
+    let shell_path = load_settings(&default_agent_dir()).shell_path;
+    apply_config_auth_with_shell(
+        &mut auth,
+        &config,
+        &request.provider,
+        Some(&model),
+        &env,
+        shell_path.as_deref(),
+    );
+    if auth.api_key.is_none() && auth.headers.is_empty() && auth.source == "none" {
+        return Err("Summarization failed: no credentials".into());
+    }
+    let options = StreamOptions {
+        thinking_level: if model.reasoning && thinking_level != pi_protocol::ThinkingLevel::Off {
+            Some(thinking_level)
+        } else {
+            None
+        },
+        thinking_budgets,
+        timeout_ms,
+        max_retries,
+        max_retry_delay_ms,
+        max_tokens: Some(request.max_tokens),
+    };
+    let response = complete_simple(
+        &model,
+        &request.prompt,
+        Some(&request.system),
+        &auth,
+        &options,
+    )?;
+    Ok(SummarizeResponse {
+        text: response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        usage: response.usage.unwrap_or_default(),
+        stop_reason: response.stop_reason,
+        error_message: response.error_message,
+        has_tool_call: response
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall { .. })),
+    })
 }
 
 fn resolve_or_create_session(
@@ -780,6 +901,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                         timeout_ms: current.provider_timeout_ms,
                         max_retries: current.provider_max_retries,
                         max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
+                        max_tokens: None,
                     },
                 ),
                 _ => Ok(AssistantMessage {
@@ -1939,6 +2061,29 @@ fn apply_tool_events(chrome: &mut ChatChrome, events: &[AgentEvent]) {
                     .find(|card| card.tool_call_id == *tool_call_id)
                 {
                     card.update_partial(partial_result);
+                }
+            }
+            AgentEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            } => {
+                chrome.status =
+                    format!("Retrying ({attempt}/{max_attempts}) in {delay_ms}ms: {error_message}");
+            }
+            AgentEvent::AutoRetryEnd {
+                success,
+                attempt,
+                final_error,
+            } => {
+                if *success {
+                    chrome.status.clear();
+                } else {
+                    chrome.status = format!(
+                        "Retry failed after {attempt} attempts: {}",
+                        final_error.as_deref().unwrap_or("Unknown error")
+                    );
                 }
             }
             AgentEvent::ToolExecutionEnd {

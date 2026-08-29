@@ -56,6 +56,23 @@ pub enum AgentEvent {
         #[serde(rename = "isError")]
         is_error: bool,
     },
+    #[serde(rename = "auto_retry_start")]
+    AutoRetryStart {
+        attempt: u32,
+        #[serde(rename = "maxAttempts")]
+        max_attempts: u32,
+        #[serde(rename = "delayMs")]
+        delay_ms: u64,
+        #[serde(rename = "errorMessage")]
+        error_message: String,
+    },
+    #[serde(rename = "auto_retry_end")]
+    AutoRetryEnd {
+        success: bool,
+        attempt: u32,
+        #[serde(rename = "finalError", skip_serializing_if = "Option::is_none")]
+        final_error: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -71,6 +88,8 @@ impl AgentEvent {
             Self::ToolExecutionStart { .. } => "tool_execution_start",
             Self::ToolExecutionUpdate { .. } => "tool_execution_update",
             Self::ToolExecutionEnd { .. } => "tool_execution_end",
+            Self::AutoRetryStart { .. } => "auto_retry_start",
+            Self::AutoRetryEnd { .. } => "auto_retry_end",
         }
     }
 }

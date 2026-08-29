@@ -19,6 +19,7 @@ pub struct StreamOptions {
     pub timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_retry_delay_ms: Option<u64>,
+    pub max_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,36 +317,80 @@ pub fn live_complete_with(
 ) -> Result<AssistantMessage, String> {
     let body = request_body_with(model, messages, system, tools, options);
     let url = request_url(model, auth);
-    let mut request = ureq::post(&url);
-    if let Some(timeout_ms) = options.timeout_ms.filter(|ms| *ms > 0) {
-        request = request.timeout(std::time::Duration::from_millis(timeout_ms));
-    }
-    let _ = (options.max_retries, options.max_retry_delay_ms);
+    let headers = collect_request_headers(model, auth);
+    let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
+    let text = crate::provider_retry::retry_provider_request(
+        || send_provider_body(&url, &headers, &body, timeout_ms),
+        crate::provider_retry::ProviderRetryOptions {
+            max_retries: options.max_retries.unwrap_or(0),
+            max_retry_delay_ms: options.max_retry_delay_ms,
+        },
+    )
+    .map_err(|err| err.message)?;
+    Ok(parse_provider_response(model, &text))
+}
+
+fn collect_request_headers(model: &Model, auth: &ResolvedAuth) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
     for (key, value) in &auth.headers {
-        request = request.set(key, value);
+        headers.push((key.clone(), value.clone()));
     }
     for (key, value) in &model.headers {
-        request = request.set(key, value);
+        headers.push((key.clone(), value.clone()));
     }
     if let Some(key) = &auth.api_key {
         if model.api.starts_with("google") {
-            // key is already in the URL for Gemini
         } else if model.api == "anthropic-messages" {
-            request = request
-                .set("x-api-key", key)
-                .set("anthropic-version", "2023-06-01");
+            headers.push(("x-api-key".into(), key.clone()));
+            headers.push(("anthropic-version".into(), "2023-06-01".into()));
         } else {
-            request = request.set("Authorization", &format!("Bearer {key}"));
+            headers.push(("Authorization".into(), format!("Bearer {key}")));
         }
     }
-    request = request.set("content-type", "application/json");
+    headers.push(("content-type".into(), "application/json".into()));
+    headers
+}
+
+fn send_provider_body(
+    url: &str,
+    headers: &[(String, String)],
+    body: &Value,
+    timeout_ms: Option<u64>,
+) -> Result<String, crate::provider_retry::ProviderError> {
+    let mut request = ureq::post(url);
+    if let Some(timeout_ms) = timeout_ms {
+        request = request.timeout(std::time::Duration::from_millis(timeout_ms));
+    }
+    for (key, value) in headers {
+        request = request.set(key, value);
+    }
     let response = request
         .send_string(&body.to_string())
-        .map_err(|err| format!("Provider request failed: {err}"))?;
-    let text = response
-        .into_string()
-        .map_err(|err| format!("Unable to read provider response: {err}"))?;
-    Ok(parse_provider_response(model, &text))
+        .map_err(crate::provider_retry::provider_error_from_ureq)?;
+    response.into_string().map_err(|err| {
+        crate::provider_retry::ProviderError::new(
+            None,
+            format!("Unable to read provider response: {err}"),
+        )
+    })
+}
+
+/// TS `completeSimple`: one-shot user prompt with no tools.
+pub fn complete_simple(
+    model: &Model,
+    prompt: &str,
+    system: Option<&str>,
+    auth: &ResolvedAuth,
+    options: &StreamOptions,
+) -> Result<AssistantMessage, String> {
+    live_complete_with(
+        model,
+        &[ChatMessage::text("user", prompt)],
+        auth,
+        system,
+        &[],
+        options,
+    )
 }
 
 pub fn request_body(
@@ -364,7 +409,7 @@ pub fn request_body_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Value {
-    match model.api.as_str() {
+    let mut body = match model.api.as_str() {
         "anthropic-messages" | "pi-messages" => {
             anthropic_body(model, messages, system, tools, options)
         }
@@ -374,6 +419,26 @@ pub fn request_body_with(
         "bedrock-converse-stream" => bedrock_body(model, messages, system, tools),
         "mistral-conversations" => mistral_body(model, messages, system, tools),
         _ => openai_body(model, messages, system, tools, options),
+    };
+    apply_max_tokens_override(&mut body, options);
+    body
+}
+
+fn apply_max_tokens_override(body: &mut Value, options: &StreamOptions) {
+    let Some(max_tokens) = options.max_tokens.filter(|value| *value > 0) else {
+        return;
+    };
+    let Value::Object(map) = body else {
+        return;
+    };
+    if map.contains_key("max_tokens") {
+        map.insert("max_tokens".into(), Value::from(max_tokens));
+    }
+    if map.contains_key("max_completion_tokens") {
+        map.insert("max_completion_tokens".into(), Value::from(max_tokens));
+    }
+    if let Some(Value::Object(config)) = map.get_mut("generationConfig") {
+        config.insert("maxOutputTokens".into(), Value::from(max_tokens));
     }
 }
 
@@ -1085,5 +1150,68 @@ mod tests {
         openai.max_tokens = 8192;
         let openai_body = request_body_with(&openai, &[], None, &[], &options);
         assert_eq!(openai_body["thinking_budget"], 4096);
+    }
+
+    #[test]
+    fn live_complete_retries_429_with_retry_after() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        use crate::auth::ResolvedAuth;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        let server_hits = hits.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let n = server_hits.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if n == 0 {
+                    ("429 Too Many Requests", r#"{"error":"rate limited"}"#)
+                } else {
+                    ("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nretry-after-ms: 1\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api.contains("openai"))
+            .expect("openai");
+        model.base_url = Some(format!("http://{addr}"));
+        let auth = ResolvedAuth {
+            api_key: Some("test".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let message = live_complete_with(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &auth,
+            None,
+            &[],
+            &StreamOptions {
+                max_retries: Some(1),
+                max_retry_delay_ms: Some(1000),
+                ..StreamOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(
+            content_text(&assistant_to_chat(&message).content).contains("ok")
+                || message.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text.contains("ok"))
+                )
+        );
     }
 }

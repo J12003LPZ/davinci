@@ -9,7 +9,9 @@ mod models_store;
 mod oauth;
 mod oauth_callback;
 mod oauth_providers;
+mod provider_retry;
 mod providers;
+mod retry;
 mod shell;
 mod stream;
 mod thinking;
@@ -59,16 +61,21 @@ pub use oauth_providers::{
     oauth_providers, parse_authorization_input, token_exchange_request, AuthorizeRequest, Pkce,
     TokenExchangeRequest,
 };
+pub use provider_retry::{
+    is_retryable_provider_error, provider_error_from_ureq, retry_delay_from_headers,
+    retry_provider_request, ProviderError, ProviderRetryOptions,
+};
 pub use providers::{builtin_providers, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS};
+pub use retry::{is_retryable_assistant_error, is_retryable_error_text};
 pub use shell::{
     command_timeout_from_env, execute_config_command, is_legacy_wsl_bash_path,
     resolve_shell_config, CommandTransport, ResolveCommandOptions, ShellConfig,
 };
 pub use stream::{
-    assistant_to_chat, complete_from_events, events_from_complete, fixture_complete, live_complete,
-    live_complete_with, live_stream, parse_sse_block, replay_sse_events, request_body,
-    request_body_with, request_url, AssistantMessage, AssistantMessageEvent, ContentBlock,
-    StopReason, StreamEvent, StreamOptions,
+    assistant_to_chat, complete_from_events, complete_simple, events_from_complete,
+    fixture_complete, live_complete, live_complete_with, live_stream, parse_sse_block,
+    replay_sse_events, request_body, request_body_with, request_url, AssistantMessage,
+    AssistantMessageEvent, ContentBlock, StopReason, StreamEvent, StreamOptions,
 };
 pub use thinking::{
     clamp_reasoning, clamp_thinking_budget_to_answer_room, google_thinking_budget,
