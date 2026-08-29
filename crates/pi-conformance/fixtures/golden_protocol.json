@@ -1,0 +1,33 @@
+{
+  "test_cases": [
+    {
+      "name": "session_metadata_roundtrip",
+      "payload": {
+        "id": "sess-golden-1",
+        "title": "Conformance Session",
+        "createdAt": 1700000000000,
+        "updatedAt": 1700000005000,
+        "tags": ["rust", "typescript", "conformance"]
+      }
+    },
+    {
+      "name": "message_roundtrip",
+      "payload": {
+        "id": "msg-golden-1",
+        "sessionId": "sess-golden-1",
+        "role": "user",
+        "content": "Perform migration check",
+        "timestamp": 1700000001000
+      }
+    },
+    {
+      "name": "writer_lease_roundtrip",
+      "payload": {
+        "sessionId": "sess-golden-1",
+        "holderId": "worker-alpha",
+        "acquiredAt": 1700000000000,
+        "expiresAt": 1700000030000
+      }
+    }
+  ]
+}
