@@ -89,6 +89,10 @@ pub enum SessionAction {
         id: String,
         name: String,
     },
+    DeleteSession {
+        id: String,
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -785,6 +789,9 @@ impl InteractiveSession {
                 }
                 SessionSelectorAction::Rename { id, name } => {
                     SessionAction::RenameSession { id, name }
+                }
+                SessionSelectorAction::Delete { id, path } => {
+                    SessionAction::DeleteSession { id, path }
                 }
             });
         }

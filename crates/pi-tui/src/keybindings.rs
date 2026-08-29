@@ -78,6 +78,9 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("app.session.togglePath", &["ctrl+p"]),
         ("app.session.toggleSort", &["ctrl+s"]),
         ("app.session.rename", &["ctrl+r"]),
+        ("app.session.toggleNamedFilter", &["ctrl+n"]),
+        ("app.session.delete", &["ctrl+d"]),
+        ("app.session.deleteNoninvasive", &["ctrl+backspace"]),
         ("app.tree.foldOrUp", &["ctrl+left", "alt+left"]),
         ("app.tree.unfoldOrDown", &["ctrl+right", "alt+right"]),
         ("app.tree.editLabel", &["shift+l"]),
@@ -87,8 +90,11 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
 
 pub fn key_to_bytes(key: &str) -> String {
     match key {
+        "ctrl+d" => "\x04".into(),
         "ctrl+e" => "\x05".into(),
         "ctrl+g" => "\x07".into(),
+        "ctrl+n" => "\x0e".into(),
+        "ctrl+backspace" => "\x1b[3;5~".into(),
         "ctrl+v" => "\x16".into(),
         "ctrl+x" => "\x18".into(),
         "ctrl+q" => "\x11".into(),

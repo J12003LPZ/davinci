@@ -72,7 +72,9 @@ pub use session::{
     BRACKETED_PASTE_ENABLE, DISABLE_AUTOWRAP, DOUBLE_ESCAPE_MS, ENABLE_AUTOWRAP,
     KITTY_KEYBOARD_DISABLE, KITTY_KEYBOARD_QUERY, OSC_QUERY_TIMEOUT_MS,
 };
-pub use session_selector::{SessionItem, SessionSelector, SessionSelectorAction, SortMode};
+pub use session_selector::{
+    NameFilter, SessionItem, SessionScope, SessionSelector, SessionSelectorAction, SortMode,
+};
 pub use settings::{
     default_interactive_settings, format_http_idle_timeout, interactive_settings_list,
     parse_http_idle_timeout, InteractiveSettingsConfig, SettingItem, SettingsList,

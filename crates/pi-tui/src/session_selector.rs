@@ -4,6 +4,50 @@ use crate::fuzzy::fuzzy_match;
 use crate::render::Component;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionScope {
+    Current,
+    All,
+}
+
+impl SessionScope {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Current => Self::All,
+            Self::All => Self::Current,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "Current Folder",
+            Self::All => "All",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameFilter {
+    All,
+    Named,
+}
+
+impl NameFilter {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::All => Self::Named,
+            Self::Named => Self::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Named => "named",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
     Threaded,
     Recent,
@@ -52,6 +96,7 @@ pub enum SessionSelectorAction {
     Select(String),
     Cancel,
     Rename { id: String, name: String },
+    Delete { id: String, path: String },
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +107,10 @@ pub struct SessionSelector {
     pub sort_mode: SortMode,
     pub show_path: bool,
     pub query: String,
+    pub scope: SessionScope,
+    pub name_filter: NameFilter,
+    pub current_cwd: String,
+    confirming_delete: bool,
     rename: Option<(String, String)>,
 }
 
@@ -74,6 +123,10 @@ impl SessionSelector {
             sort_mode: SortMode::Threaded,
             show_path: false,
             query: String::new(),
+            scope: SessionScope::Current,
+            name_filter: NameFilter::All,
+            current_cwd: String::new(),
+            confirming_delete: false,
             rename: None,
         };
         selector.apply_filter();
@@ -82,6 +135,17 @@ impl SessionSelector {
 
     pub fn selected_id(&self) -> Option<String> {
         self.filtered.get(self.selected).map(|item| item.id.clone())
+    }
+
+    pub fn set_cwd(&mut self, cwd: impl Into<String>) {
+        self.current_cwd = cwd.into();
+        self.apply_filter();
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        self.items.retain(|item| item.id != id);
+        self.confirming_delete = false;
+        self.apply_filter();
     }
 
     pub fn apply_rename(&mut self, id: &str, name: &str) {
@@ -96,6 +160,25 @@ impl SessionSelector {
     }
 
     pub fn handle_key(&mut self, data: &str) -> SessionSelectorAction {
+        if self.confirming_delete {
+            return match data {
+                "\r" | "\n" => {
+                    self.confirming_delete = false;
+                    self.filtered
+                        .get(self.selected)
+                        .map(|item| SessionSelectorAction::Delete {
+                            id: item.id.clone(),
+                            path: item.path.clone(),
+                        })
+                        .unwrap_or(SessionSelectorAction::None)
+                }
+                "\x1b" => {
+                    self.confirming_delete = false;
+                    SessionSelectorAction::None
+                }
+                _ => SessionSelectorAction::None,
+            };
+        }
         if let Some((id, mut buffer)) = self.rename.take() {
             return match data {
                 "\r" | "\n" => SessionSelectorAction::Rename {
@@ -161,9 +244,36 @@ impl SessionSelector {
                 }
                 SessionSelectorAction::None
             }
-            "\x7f" | "\x08" => {
-                self.query.pop();
+            "\t" => {
+                self.scope = self.scope.cycle();
                 self.apply_filter();
+                SessionSelectorAction::None
+            }
+            "\x0e" => {
+                self.name_filter = self.name_filter.cycle();
+                self.apply_filter();
+                SessionSelectorAction::None
+            }
+            "\x04" => {
+                self.confirming_delete = self.selected_id().is_some();
+                SessionSelectorAction::None
+            }
+            "\x1b[3;5~" => {
+                if self.query.is_empty() {
+                    self.confirming_delete = self.selected_id().is_some();
+                } else {
+                    self.query.pop();
+                    self.apply_filter();
+                }
+                SessionSelectorAction::None
+            }
+            "\x7f" | "\x08" => {
+                if self.query.is_empty() && data == "\x08" {
+                    self.confirming_delete = self.selected_id().is_some();
+                } else {
+                    self.query.pop();
+                    self.apply_filter();
+                }
                 SessionSelectorAction::None
             }
             other if !other.chars().any(char::is_control) => {
@@ -186,18 +296,14 @@ impl SessionSelector {
     fn apply_filter(&mut self) {
         let last = self.selected_id();
         let mut items = self.items.clone();
+        if self.scope == SessionScope::Current && !self.current_cwd.is_empty() {
+            items.retain(|item| item.cwd == self.current_cwd);
+        }
+        if self.name_filter == NameFilter::Named {
+            items.retain(|item| item.name.as_ref().is_some_and(|name| !name.is_empty()));
+        }
         if !self.query.is_empty() {
-            items.retain(|item| {
-                let hay = format!(
-                    "{} {} {} {}",
-                    item.id,
-                    item.name.as_deref().unwrap_or(""),
-                    item.path,
-                    item.cwd
-                );
-                fuzzy_match(&self.query, &hay).matches
-                    || hay.to_lowercase().contains(&self.query.to_lowercase())
-            });
+            items.retain(|item| item_matches_query(item, &self.query));
         }
         match self.sort_mode {
             SortMode::Recent => items.sort_by(|a, b| b.modified_at.cmp(&a.modified_at)),
@@ -233,10 +339,12 @@ impl Component for SessionSelector {
     fn render(&self, width: usize) -> Vec<String> {
         let path_state = if self.show_path { "(on)" } else { "(off)" };
         let mut lines = vec![
-            "  Sessions".into(),
+            format!("  Resume Session ({})", self.scope.label()),
             format!(
-                "  {} · path {path_state} · ctrl+p path · ctrl+s sort · ctrl+r rename",
-                self.sort_mode.label()
+                "  {} · path {path_state} · {} · named {} · ctrl+p path · ctrl+s sort · ctrl+r rename · ctrl+n named · ctrl+d delete · tab scope",
+                self.sort_mode.label(),
+                self.scope.label(),
+                self.name_filter.label()
             ),
         ];
         if self.query.is_empty() {
@@ -270,6 +378,10 @@ impl Component for SessionSelector {
             lines.push(format!("  {buffer}"));
             lines.push("  enter save  escape cancel".into());
         }
+        if self.confirming_delete {
+            lines.push("  Delete selected session?".into());
+            lines.push("  enter confirm  escape cancel".into());
+        }
         lines
     }
 
@@ -278,6 +390,82 @@ impl Component for SessionSelector {
     }
 
     fn invalidate(&mut self) {}
+}
+
+fn item_matches_query(item: &SessionItem, query: &str) -> bool {
+    let hay = format!(
+        "{} {} {} {}",
+        item.id,
+        item.name.as_deref().unwrap_or(""),
+        item.path,
+        item.cwd
+    );
+    if let Some(pattern) = query.strip_prefix("re:") {
+        return regex_is_match(pattern, &hay);
+    }
+    if query.len() >= 2 && query.starts_with('"') && query.ends_with('"') {
+        let phrase = &query[1..query.len() - 1];
+        return hay.to_lowercase().contains(&phrase.to_lowercase());
+    }
+    fuzzy_match(query, &hay).matches || hay.to_lowercase().contains(&query.to_lowercase())
+}
+
+fn regex_is_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    (0..=text.len()).any(|start| match_here(&pattern, &text[start..]))
+}
+
+fn match_here(pattern: &[char], text: &[char]) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    let (atom, rest) = match pattern {
+        ['\\', escaped, rest @ ..] => (*escaped, rest),
+        [atom, rest @ ..] => (*atom, rest),
+        [] => return true,
+    };
+    let quant = rest.first().copied();
+    let (min, rest) = match quant {
+        Some('*') => (0, &rest[1..]),
+        Some('+') => (1, &rest[1..]),
+        Some('?') => {
+            if match_atom(atom, text.first().copied())
+                && match_here(rest.get(1..).unwrap_or(&[]), text.get(1..).unwrap_or(&[]))
+            {
+                return true;
+            }
+            return match_here(rest.get(1..).unwrap_or(&[]), text);
+        }
+        _ => {
+            return match_atom(atom, text.first().copied())
+                && match_here(rest, text.get(1..).unwrap_or(&[]));
+        }
+    };
+    let mut consumed = 0usize;
+    while consumed < min {
+        if !match_atom(atom, text.get(consumed).copied()) {
+            return false;
+        }
+        consumed += 1;
+    }
+    loop {
+        if match_here(rest, text.get(consumed..).unwrap_or(&[])) {
+            return true;
+        }
+        if !match_atom(atom, text.get(consumed).copied()) {
+            return false;
+        }
+        consumed += 1;
+    }
+}
+
+fn match_atom(atom: char, next: Option<char>) -> bool {
+    match next {
+        Some(_) if atom == '.' => true,
+        Some(ch) => atom == ch,
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -309,12 +497,15 @@ mod tests {
     fn path_sort_and_rename_match_ts() {
         let mut selector = SessionSelector::new(sample());
         let rendered = selector.render(80).join("\n");
-        assert!(rendered.contains("Sessions"));
+        assert!(rendered.contains("Resume Session (Current Folder)"));
         assert!(rendered.contains("Threaded"));
         assert!(rendered.contains("path (off)"));
         assert!(rendered.contains("ctrl+p path"));
         assert!(rendered.contains("ctrl+s sort"));
         assert!(rendered.contains("ctrl+r rename"));
+        assert!(rendered.contains("ctrl+n named"));
+        assert!(rendered.contains("ctrl+d delete"));
+        assert!(rendered.contains("tab scope"));
         assert!(!rendered.contains("/tmp/aaa.jsonl"));
         selector.handle_key("\x10");
         assert!(selector.show_path);
@@ -341,6 +532,61 @@ mod tests {
             SessionSelectorAction::Rename {
                 id: selector.filtered[0].id.clone(),
                 name: "renamed".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn scope_named_delete_and_search_match_ts() {
+        let mut items = sample();
+        items.push(SessionItem {
+            id: "ccc".into(),
+            name: Some("other".into()),
+            path: "/tmp/ccc.jsonl".into(),
+            cwd: "/elsewhere".into(),
+            modified_at: 5,
+            parent_id: None,
+        });
+        let mut selector = SessionSelector::new(items);
+        selector.set_cwd("/work");
+        assert_eq!(selector.filtered.len(), 2);
+        selector.handle_key("\t");
+        assert_eq!(selector.scope, SessionScope::All);
+        assert!(selector
+            .render(80)
+            .join("\n")
+            .contains("Resume Session (All)"));
+        assert_eq!(selector.filtered.len(), 3);
+        selector.handle_key("\x0e");
+        assert_eq!(selector.name_filter, NameFilter::Named);
+        assert_eq!(selector.filtered.len(), 2);
+        selector.handle_key("\t");
+        assert_eq!(selector.scope, SessionScope::Current);
+        assert_eq!(selector.filtered.len(), 1);
+        selector.query.clear();
+        selector.name_filter = NameFilter::All;
+        selector.scope = SessionScope::All;
+        selector.apply_filter();
+        selector.handle_key("re:aa+");
+        assert_eq!(selector.filtered.len(), 1);
+        assert_eq!(selector.filtered[0].id, "aaa");
+        selector.query.clear();
+        selector.apply_filter();
+        selector.handle_key("\"other\"");
+        assert_eq!(selector.filtered.len(), 1);
+        selector.query.clear();
+        selector.apply_filter();
+        selector.selected = 0;
+        selector.handle_key("\x04");
+        assert!(selector
+            .render(80)
+            .join("\n")
+            .contains("Delete selected session?"));
+        assert_eq!(
+            selector.handle_key("\r"),
+            SessionSelectorAction::Delete {
+                id: selector.filtered[0].id.clone(),
+                path: selector.filtered[0].path.clone(),
             }
         );
     }

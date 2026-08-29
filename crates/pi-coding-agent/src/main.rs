@@ -1,5 +1,6 @@
 mod args;
 mod auth_cmd;
+mod changelog;
 mod export;
 mod extension_host;
 mod extensions;
@@ -671,6 +672,7 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
             KeyCode::Char('q') | KeyCode::Char('Q') => "\x11".into(),
             KeyCode::Char('r') | KeyCode::Char('R') => "\x12".into(),
             KeyCode::Char('t') | KeyCode::Char('T') => "\x14".into(),
+            KeyCode::Char('n') | KeyCode::Char('N') => "\x0e".into(),
             KeyCode::Char('l') | KeyCode::Char('L') => "\x0c".into(),
             KeyCode::Char('d') | KeyCode::Char('D') => "\x04".into(),
             KeyCode::Char('u') | KeyCode::Char('U') => "\x15".into(),
@@ -837,6 +839,10 @@ fn apply_session_action(
             rename_discovered_session(parsed, agent, session, &id, &name)?;
             Ok(true)
         }
+        SessionAction::DeleteSession { id, path } => {
+            delete_discovered_session(agent, session, &id, &path)?;
+            Ok(true)
+        }
         SessionAction::CycleSetting => {
             if let Some(item) = session
                 .chrome
@@ -980,6 +986,13 @@ fn apply_session_action(
             SlashAction::Resume => {
                 open_session_selector(parsed, agent, session)?;
                 Ok(true)
+            }
+            SlashAction::Reload => {
+                session.keybindings = Keybindings::load(&default_agent_dir());
+                handle_user_line(parsed, agent, &mut session.chrome, &text)
+            }
+            SlashAction::Import(_) | SlashAction::Share | SlashAction::Changelog => {
+                handle_user_line(parsed, agent, &mut session.chrome, &text)
             }
             _ => handle_user_line(parsed, agent, &mut session.chrome, &text),
         },
@@ -1142,7 +1155,9 @@ fn handle_user_line(
         }
         SlashAction::Resume => {
             let items = discover_session_items(parsed, agent)?;
-            chrome.session_selector = Some(pi_tui::SessionSelector::new(items.clone()));
+            let mut selector = pi_tui::SessionSelector::new(items.clone());
+            selector.set_cwd(agent.cwd.to_string_lossy().into_owned());
+            chrome.session_selector = Some(selector);
             chrome.selector = None;
             chrome.status = "Select session".into();
             for item in items {
@@ -1179,8 +1194,84 @@ fn handle_user_line(
             agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
             agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
             agent.context_files = load_context_files(&agent.cwd, true);
+            chrome.status = "reloaded".into();
             println!("reloaded");
             Ok(true)
+        }
+        SlashAction::Import(path) => {
+            if path.is_empty() {
+                chrome.status = "Usage: /import <path.jsonl>".into();
+                println!("{}", chrome.status);
+                return Ok(true);
+            }
+            let expanded = pi_session::expand_tilde(&path);
+            let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
+            agent.load_from_session(next);
+            chrome.status = format!(
+                "imported {}",
+                agent
+                    .session
+                    .as_ref()
+                    .map(|item| item.header.id.clone())
+                    .unwrap_or_default()
+            );
+            println!("{}", chrome.status);
+            Ok(true)
+        }
+        SlashAction::Share => {
+            chrome.status = share_current_session(agent)?;
+            println!("{}", chrome.status);
+            Ok(true)
+        }
+        SlashAction::Changelog => {
+            let entries = changelog::parse_changelog(&changelog::changelog_path());
+            let text = changelog::format_changelog(&entries);
+            chrome.transcript.push("changelog", &text);
+            chrome.status = "changelog".into();
+            println!("{text}");
+            Ok(true)
+        }
+    }
+}
+
+fn share_current_session(agent: &Agent) -> Result<String, String> {
+    if std::env::var("PI_SHARE_DRY_RUN").is_ok() {
+        let viewer = std::env::var("PI_SHARE_VIEWER_URL")
+            .unwrap_or_else(|_| "https://pi.dev/session/".into());
+        let url = format!("{viewer}dry-run");
+        return Ok(format!("Share URL: {url}"));
+    }
+    if let Ok(url) = std::env::var("PI_SHARE_URL") {
+        return Ok(format!("Share URL: {url}"));
+    }
+    let Some(session) = &agent.session else {
+        return Ok("No session to share".into());
+    };
+    let tmp = std::env::temp_dir().join("pi-share-session.html");
+    export::export_html(session, &tmp)?;
+    let output = std::process::Command::new("gh")
+        .args(["gist", "create", "--public=false"])
+        .arg(&tmp)
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+    match output {
+        Ok(result) if result.status.success() => {
+            let gist_url = String::from_utf8_lossy(&result.stdout).trim().to_string();
+            let gist_id = gist_url.rsplit('/').next().unwrap_or_default();
+            let viewer = std::env::var("PI_SHARE_VIEWER_URL")
+                .unwrap_or_else(|_| "https://pi.dev/session/".into());
+            Ok(format!("Share URL: {viewer}{gist_id}\nGist: {gist_url}"))
+        }
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            if stderr.contains("not logged in") || stderr.contains("auth") {
+                Ok("GitHub CLI is not logged in. Run 'gh auth login' first.".into())
+            } else {
+                Ok(format!("Failed to create gist: {}", stderr.trim()))
+            }
+        }
+        Err(_) => {
+            Ok("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/".into())
         }
     }
 }
@@ -1638,10 +1729,9 @@ fn paste_clipboard(session: &mut InteractiveSession) {
     }
 }
 
-fn discover_session_items(parsed: &Args, agent: &Agent) -> Result<Vec<SessionItem>, String> {
+fn discover_session_items(parsed: &Args, _agent: &Agent) -> Result<Vec<SessionItem>, String> {
     let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
-    let sessions = discover_sessions(&session_dir, Some(&agent.cwd.to_string_lossy()))
-        .map_err(|err| err.to_string())?;
+    let sessions = discover_sessions(&session_dir, None).map_err(|err| err.to_string())?;
     Ok(sessions
         .into_iter()
         .map(|summary| SessionItem {
@@ -1662,6 +1752,9 @@ fn open_session_selector(
 ) -> Result<(), String> {
     let items = discover_session_items(parsed, agent)?;
     session.open_session_selector(items);
+    if let Some(selector) = &mut session.chrome.session_selector {
+        selector.set_cwd(agent.cwd.to_string_lossy().into_owned());
+    }
     if let Some(selector) = &session.chrome.session_selector {
         println!("{}", selector.render(80).join("\n"));
     }
@@ -1708,6 +1801,40 @@ fn rename_discovered_session(
     } else {
         format!("session {id} renamed to {name}")
     };
+    Ok(())
+}
+
+fn delete_discovered_session(
+    agent: &Agent,
+    session: &mut InteractiveSession,
+    id: &str,
+    path: &str,
+) -> Result<(), String> {
+    if agent
+        .session
+        .as_ref()
+        .is_some_and(|current| current.header.id == id)
+    {
+        session.chrome.status = "Cannot delete the currently active session".into();
+        return Ok(());
+    }
+    if std::env::var("PI_SESSION_DELETE_DRY_RUN").is_err() {
+        let trash = std::process::Command::new("trash").arg(path).status();
+        let trashed = trash.map(|status| status.success()).unwrap_or(false);
+        if !trashed {
+            std::fs::remove_file(path).map_err(|err| err.to_string())?;
+        }
+        session.chrome.status = if trashed {
+            "Session moved to trash".into()
+        } else {
+            "Session deleted".into()
+        };
+    } else {
+        session.chrome.status = "Session deleted".into();
+    }
+    if let Some(selector) = &mut session.chrome.session_selector {
+        selector.remove(id);
+    }
     Ok(())
 }
 
@@ -1871,6 +1998,18 @@ mod tests {
         assert!(matches!(
             slash::parse_line("/tree"),
             slash::SlashAction::Tree
+        ));
+        assert!(matches!(
+            slash::parse_line("/import ./foo.jsonl"),
+            slash::SlashAction::Import(_)
+        ));
+        assert!(matches!(
+            slash::parse_line("/share"),
+            slash::SlashAction::Share
+        ));
+        assert!(matches!(
+            slash::parse_line("/changelog"),
+            slash::SlashAction::Changelog
         ));
     }
 }
