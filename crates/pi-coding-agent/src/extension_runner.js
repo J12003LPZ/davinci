@@ -32,13 +32,128 @@ const VIRTUAL_SPECIFIERS = [
 const VIRTUAL_FILES = {};
 const virtualRoot = path.join(os.tmpdir(), "pi-virtual-modules");
 fs.mkdirSync(virtualRoot, { recursive: true });
+
+const TUI_VIRTUAL = `
+class Editor {
+	constructor() {
+		this.buffer = "";
+		this.cursor = 0;
+		this.onSubmit = undefined;
+		this.onChange = undefined;
+	}
+	getText() { return this.buffer; }
+	setText(text) {
+		this.buffer = text == null ? "" : String(text);
+		this.cursor = this.buffer.length;
+	}
+	handleInput(data) {
+		if (data === "\\x7f" || data === "\\x08") {
+			this.buffer = this.buffer.slice(0, -1);
+			this.cursor = this.buffer.length;
+			return;
+		}
+		if (data === "\\x1b[D") {
+			this.cursor = Math.max(0, this.cursor - 1);
+			return;
+		}
+		if (data === "\\x1b[C") {
+			this.cursor = Math.min(this.buffer.length, this.cursor + 1);
+			return;
+		}
+		if (data === "\\r" || data === "\\n") {
+			if (typeof this.onSubmit === "function") this.onSubmit(this.buffer);
+			return;
+		}
+		if (typeof data === "string" && data.length > 0 && !/[\\x00-\\x1f]/.test(data)) {
+			this.buffer = this.buffer.slice(0, this.cursor) + data + this.buffer.slice(this.cursor);
+			this.cursor += data.length;
+		}
+	}
+	render(width) {
+		const line = "> " + this.buffer;
+		return [line.length > width ? line.slice(0, width) : line];
+	}
+	isShowingAutocomplete() { return false; }
+}
+function matchesKey(data, name) {
+	const key = String(name || "").toLowerCase();
+	if (key === "escape" || key === "esc") return data === "\\x1b";
+	if (key === "enter" || key === "return") return data === "\\r" || data === "\\n";
+	if (key === "backspace") return data === "\\x7f" || data === "\\x08";
+	if (key === "left") return data === "\\x1b[D";
+	if (key === "right") return data === "\\x1b[C";
+	if (key === "up") return data === "\\x1b[A";
+	if (key === "down") return data === "\\x1b[B";
+	if (key === "delete") return data === "\\x1b[3~";
+	return data === name;
+}
+function visibleWidth(text) {
+	return String(text || "").replace(/\\x1b\\[[0-9;]*m/g, "").length;
+}
+function truncateToWidth(text, width, suffix) {
+	const value = String(text || "");
+	if (visibleWidth(value) <= width) return value;
+	return value.slice(0, Math.max(0, width - (suffix || "").length)) + (suffix || "");
+}
+const exported = {
+	__esModule: true,
+	__piVirtual: "@earendil-works/pi-tui",
+	name: "@earendil-works/pi-tui",
+	version: "0.84.4",
+	Editor,
+	matchesKey,
+	visibleWidth,
+	truncateToWidth,
+};
+exported.default = exported;
+module.exports = exported;
+`;
+
+const CODING_VIRTUAL = `
+const tui = require("@earendil-works/pi-tui");
+class CustomEditor extends tui.Editor {
+	constructor(tuiInst, theme, keybindings) {
+		super(tuiInst, theme);
+		this.keybindings = keybindings || { matches() { return false; } };
+		this.actionHandlers = new Map();
+		this.onEscape = undefined;
+		this.onCtrlD = undefined;
+		this.onPasteImage = undefined;
+		this.onExtensionShortcut = undefined;
+	}
+	onAction(action, handler) { this.actionHandlers.set(action, handler); }
+	handleInput(data) {
+		if (typeof this.onExtensionShortcut === "function" && this.onExtensionShortcut(data)) return;
+		if (typeof this.onEscape === "function" && data === "\\x1b") { this.onEscape(); return; }
+		super.handleInput(data);
+	}
+}
+const exported = {
+	__esModule: true,
+	__piVirtual: "@earendil-works/pi-coding-agent",
+	name: "@earendil-works/pi-coding-agent",
+	version: "0.84.4",
+	CustomEditor,
+	Editor: tui.Editor,
+};
+exported.default = exported;
+module.exports = exported;
+`;
+
 for (const name of VIRTUAL_SPECIFIERS) {
 	const file = path.join(virtualRoot, `${name.replace(/[@/]/g, "_")}.js`);
-	const source = [
-		"const exported = { __esModule: true, __piVirtual: " + JSON.stringify(name) + ", name: " + JSON.stringify(name) + ', version: "0.84.4" };',
-		"exported.default = exported;",
-		"module.exports = exported;",
-	].join("\n");
+	let source;
+	if (name === "@earendil-works/pi-tui" || name === "@mariozechner/pi-tui") {
+		source = TUI_VIRTUAL;
+	} else if (name === "@earendil-works/pi-coding-agent" || name === "@mariozechner/pi-coding-agent") {
+		source = CODING_VIRTUAL;
+	} else {
+		source = [
+			"const exported = { __esModule: true, __piVirtual: " + JSON.stringify(name) + ", name: " + JSON.stringify(name) + ', version: "0.84.4" };',
+			"exported.default = exported;",
+			"module.exports = exported;",
+		].join("\n");
+	}
 	fs.writeFileSync(file, source);
 	VIRTUAL_FILES[name] = file;
 }
@@ -183,6 +298,9 @@ async function main() {
 		entryRenderers: {},
 		uiCalls: [],
 	};
+	let editorFactory;
+	let customComponent;
+	let pendingCustom;
 	function uiReply(kind) {
 		const raw = process.env.PI_EXTENSION_UI_REPLY;
 		if (raw === undefined || raw === "") return kind === "confirm" ? false : undefined;
@@ -254,16 +372,43 @@ async function main() {
 			pasteToEditor(text) {
 				recorded.uiCalls.push({ op: "pasteToEditor", text });
 			},
-			setEditorComponent() {},
+			setEditorComponent(factory) {
+				editorFactory = factory;
+				recorded.uiCalls.push({ op: "setEditorComponent", enabled: factory != null });
+			},
 			getEditorComponent() {
-				return undefined;
+				return editorFactory;
 			},
 			addAutocompleteProvider() {},
 			onTerminalInput() {
 				return () => {};
 			},
-			custom() {
-				return Promise.resolve(uiReply("custom"));
+			async custom(factory) {
+				recorded.uiCalls.push({ op: "custom" });
+				if (typeof factory !== "function") {
+					return uiReply("custom");
+				}
+				let settled;
+				const done = (value) => {
+					settled = value;
+				};
+				const component = await factory({}, ui.theme, {}, done);
+				customComponent = component;
+				restoreEditor(component, payload.snapshot);
+				if ((op === "customInput" || payload.data) && component && typeof component.handleInput === "function") {
+					component.handleInput(payload.data || "");
+				}
+				if (settled !== undefined) return settled;
+				pendingCustom = {
+					snapshot: snapshotEditor(component),
+					lines:
+						component && typeof component.render === "function"
+							? component.render(payload.width || 80)
+							: [],
+				};
+				const pending = new Error("pending custom UI");
+				pending.__piPendingCustom = true;
+				throw pending;
 			},
 			theme: { fg(_role, text) { return text; }, bg(_role, text) { return text; }, bold(text) { return text; } },
 			getAllThemes() {
@@ -359,10 +504,45 @@ async function main() {
 		await factory(pi);
 	}
 	let result = null;
+	function snapshotEditor(editor) {
+		const extra = {};
+		for (const key of Object.keys(editor || {})) {
+			const value = editor[key];
+			if (typeof value === "function" || key === "actionHandlers" || key === "keybindings") continue;
+			if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value == null) {
+				extra[key] = value;
+			}
+		}
+		return {
+			text: editor && typeof editor.getText === "function" ? editor.getText() : (editor && editor.buffer) || "",
+			extra,
+		};
+	}
+	function restoreEditor(editor, snap) {
+		if (!editor || !snap) return;
+		if (typeof editor.setText === "function") editor.setText(snap.text || "");
+		if (snap.extra) Object.assign(editor, snap.extra);
+	}
+	async function activateEditor() {
+		const ctx = { ui, mode: "tui" };
+		for (const handler of recorded.handlers.session_start || []) {
+			await handler({}, ctx);
+		}
+		if (typeof editorFactory !== "function") return undefined;
+		const editor = editorFactory({}, ui.theme, {
+			matches() {
+				return false;
+			},
+		});
+		restoreEditor(editor, payload.snapshot);
+		return editor;
+	}
 	if (op === "emit") {
 		const eventName = payload.type || payload.event;
+		const ctx = Object.assign({ ui, mode: "tui" }, payload.ctx || {});
+		ctx.ui = ui;
 		for (const handler of recorded.handlers[eventName] || []) {
-			result = await handler(payload, payload.ctx || {});
+			result = await handler(payload, ctx);
 			if (result && (result.block || result.cancel || result.action === "handled")) {
 				break;
 			}
@@ -461,13 +641,56 @@ async function main() {
 			ctx.ui = ctx.ui || ui;
 			result = await handler(ctx);
 		}
-	} else if (op === "command") {
+	} else if (op === "command" || op === "customInput") {
 		const name = String(payload.name || "");
 		const handler = recorded.commandHandlers[name];
 		if (typeof handler === "function") {
 			const ctx = payload.ctx || { mode: "tui" };
 			ctx.ui = ctx.ui || ui;
-			result = await handler(payload.args || "", ctx);
+			try {
+				result = await handler(payload.args || "", ctx);
+			} catch (error) {
+				if (error && error.__piPendingCustom && pendingCustom) {
+					result = Object.assign({ pending: true }, pendingCustom);
+				} else {
+					throw error;
+				}
+			}
+		}
+	} else if (op === "editorInput" || op === "editorRender") {
+		const editor = await activateEditor();
+		if (!editor) {
+			result = { enabled: false };
+		} else {
+			let submitted;
+			let aborted;
+			if (typeof editor === "object") {
+				editor.onSubmit = (text) => {
+					submitted = text == null ? "" : String(text);
+				};
+				if (typeof editor.onEscape !== "function") {
+					editor.onEscape = () => {
+						aborted = true;
+					};
+				}
+			}
+			if (op === "editorInput") {
+				editor.handleInput(payload.data || "");
+			}
+			const snap = snapshotEditor(editor);
+			let action;
+			if (submitted !== undefined) action = "submit";
+			else if (aborted) action = "abort";
+			result = {
+				enabled: true,
+				text: submitted !== undefined ? submitted : snap.text,
+				snapshot: snap,
+				lines:
+					typeof editor.render === "function"
+						? editor.render(payload.width || 80)
+						: ["> " + snap.text],
+				action,
+			};
 		}
 	}
 	process.stdout.write(
@@ -482,6 +705,8 @@ async function main() {
 			entryRenderers: Object.keys(recorded.entryRenderers),
 			markdownTransformers: recorded.markdownTransformers.length,
 			uiCalls: recorded.uiCalls,
+			hasEditor: typeof editorFactory === "function",
+			hasCustom: Boolean(customComponent),
 			result,
 		}),
 	);

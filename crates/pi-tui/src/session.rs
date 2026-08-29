@@ -109,6 +109,8 @@ pub enum SessionAction {
     ExtensionInput(Option<String>),
     ExtensionEditor(Option<String>),
     ExtensionConfirm(bool),
+    CustomEditorInput(String),
+    CustomOverlayInput(String),
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +134,8 @@ pub struct InteractiveSession {
     pub keybindings: Keybindings,
     pub extension_shortcuts: Vec<(String, String)>,
     pub extension_dialog_context: Option<String>,
+    pub custom_editor_path: Option<String>,
+    pub custom_editor_snapshot: Option<serde_json::Value>,
     pub follow_up_queue: Vec<String>,
     pub model_thinking_levels: BTreeMap<String, String>,
     pub warnings_anthropic_extra_usage: bool,
@@ -220,6 +224,8 @@ impl InteractiveSession {
             keybindings: Keybindings::defaults(),
             extension_shortcuts: Vec::new(),
             extension_dialog_context: None,
+            custom_editor_path: None,
+            custom_editor_snapshot: None,
             follow_up_queue: Vec::new(),
             model_thinking_levels: BTreeMap::new(),
             warnings_anthropic_extra_usage: true,
@@ -367,6 +373,10 @@ impl InteractiveSession {
         self.chrome.extension_input = None;
         self.chrome.extension_editor = None;
         self.chrome.extension_confirm = None;
+        self.chrome.custom_overlay_lines = None;
+        self.chrome.custom_overlay_path = None;
+        self.chrome.custom_overlay_command = None;
+        self.chrome.custom_overlay_snapshot = None;
         self.overlay_kind = OverlayKind::None;
         self.chrome.status.clear();
     }
@@ -384,6 +394,8 @@ impl InteractiveSession {
             || self.chrome.extension_input.is_some()
             || self.chrome.extension_editor.is_some()
             || self.chrome.extension_confirm.is_some()
+            || self.chrome.custom_overlay_path.is_some()
+            || self.chrome.custom_overlay_lines.is_some()
     }
 
     pub fn apply_extension_ui_calls(&mut self, calls: &[serde_json::Value]) {
@@ -418,6 +430,21 @@ impl InteractiveSession {
         self.overlay_kind = OverlayKind::ExtensionEditor;
         self.chrome.extension_editor = Some(ExtensionEditor::new(title, prefill));
         self.chrome.status = "Extension editor".into();
+    }
+
+    pub fn open_custom_overlay(
+        &mut self,
+        path: impl Into<String>,
+        command: impl Into<String>,
+        lines: Vec<String>,
+        snapshot: Option<serde_json::Value>,
+    ) {
+        self.close_overlays();
+        self.chrome.custom_overlay_path = Some(path.into());
+        self.chrome.custom_overlay_command = Some(command.into());
+        self.chrome.custom_overlay_snapshot = snapshot;
+        self.chrome.custom_overlay_lines = Some(lines);
+        self.chrome.status = "Extension custom UI".into();
     }
 
     pub fn open_extension_confirm(&mut self, title: impl Into<String>, message: impl Into<String>) {
@@ -671,6 +698,17 @@ impl InteractiveSession {
         }
         if let Some(action) = self.handle_special_overlay(data) {
             return action;
+        }
+        if self.chrome.custom_overlay_path.is_some() {
+            if data == "\x03" {
+                self.close_overlays();
+                return SessionAction::CloseOverlay;
+            }
+            return SessionAction::CustomOverlayInput(data.to_string());
+        }
+        if !self.overlay_open() && self.custom_editor_path.is_some() && is_custom_editor_input(data)
+        {
+            return SessionAction::CustomEditorInput(data.to_string());
         }
         if !self.overlay_open() {
             if let Some((key, path)) = self.matching_extension_shortcut(data) {
@@ -1180,6 +1218,9 @@ impl InteractiveSession {
             self.chrome.handle_input(data);
             return SessionAction::None;
         }
+        if self.custom_editor_path.is_some() {
+            return SessionAction::CustomEditorInput(data.to_string());
+        }
         self.chrome.editor.handle_input(data);
         self.refresh_autocomplete(false);
         SessionAction::None
@@ -1249,6 +1290,24 @@ impl InteractiveSession {
             (crate::keybindings::key_to_bytes(key) == data).then(|| (key.clone(), path.clone()))
         })
     }
+}
+
+fn is_custom_editor_input(data: &str) -> bool {
+    matches!(
+        data,
+        "\x1b"
+            | "\r"
+            | "\n"
+            | "\x7f"
+            | "\x08"
+            | "\x1b[A"
+            | "\x1b[B"
+            | "\x1b[C"
+            | "\x1b[D"
+            | "\x1b[3~"
+            | "\x01"
+            | "\x05"
+    ) || (!data.is_empty() && data.chars().all(|ch| !ch.is_control()))
 }
 
 #[cfg(test)]
@@ -1554,5 +1613,52 @@ mod tests {
             session.handle_bytes("y"),
             SessionAction::ExtensionConfirm(true)
         );
+    }
+
+    #[test]
+    fn custom_editor_path_routes_keys_to_js_host() {
+        let mut session =
+            InteractiveSession::new(crate::themes::builtin_themes()[0].clone(), "pi", vec![]);
+        session.custom_editor_path = Some("/tmp/modal.js".into());
+        assert_eq!(
+            session.handle_bytes("i"),
+            SessionAction::CustomEditorInput("i".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::CustomEditorInput("\r".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\n"),
+            SessionAction::CustomEditorInput("\n".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\x1b"),
+            SessionAction::CustomEditorInput("\x1b".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\x1b[D"),
+            SessionAction::CustomEditorInput("\x1b[D".into())
+        );
+        assert_eq!(session.handle_bytes("\x03"), SessionAction::Quit);
+        assert_eq!(session.handle_bytes("\x0c"), SessionAction::OpenModel);
+    }
+
+    #[test]
+    fn custom_overlay_routes_keys_until_closed() {
+        let mut session =
+            InteractiveSession::new(crate::themes::builtin_themes()[0].clone(), "pi", vec![]);
+        session.open_custom_overlay("/tmp/board.js", "board", vec!["open".into()], None);
+        assert!(session.render_frame().contains("open"));
+        assert_eq!(
+            session.handle_bytes("x"),
+            SessionAction::CustomOverlayInput("x".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\x1b"),
+            SessionAction::CustomOverlayInput("\x1b".into())
+        );
+        assert_eq!(session.handle_bytes("\x03"), SessionAction::CloseOverlay);
+        assert!(session.chrome.custom_overlay_path.is_none());
     }
 }

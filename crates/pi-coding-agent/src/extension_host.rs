@@ -54,6 +54,7 @@ pub struct LoadedJsExtension {
     pub entry_renderers: Vec<String>,
     pub markdown_transformers: u32,
     pub shortcuts: Vec<String>,
+    pub has_editor: bool,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +67,7 @@ pub struct ExtensionHost {
     pub entry_renderers: std::collections::HashMap<String, String>,
     pub markdown_modules: Vec<String>,
     pub ui_calls: Vec<Value>,
+    pub editor_modules: Vec<String>,
 }
 
 impl ExtensionHost {
@@ -80,6 +82,7 @@ impl ExtensionHost {
             entry_renderers: std::collections::HashMap::new(),
             markdown_modules: Vec::new(),
             ui_calls: Vec::new(),
+            editor_modules: Vec::new(),
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -104,6 +107,11 @@ impl ExtensionHost {
                             host.markdown_modules.push(path.clone());
                         }
                         host.ui_calls.extend(loaded.ui_calls.clone());
+                        let has_editor = loaded.has_editor
+                            || loaded.handlers.iter().any(|name| name == "session_start");
+                        if has_editor {
+                            host.editor_modules.push(path.clone());
+                        }
                         host.js.push(LoadedJsExtension {
                             path,
                             handlers: loaded.handlers,
@@ -117,6 +125,7 @@ impl ExtensionHost {
                             entry_renderers: loaded.entry_renderers,
                             markdown_transformers: loaded.markdown_transformers,
                             shortcuts: loaded.shortcuts,
+                            has_editor,
                         });
                     }
                 }
@@ -334,10 +343,31 @@ impl ExtensionHost {
     }
 
     pub fn invoke_command(&mut self, path: &str, name: &str) -> Result<Option<Value>, String> {
+        self.invoke_command_with(path, name, "", None, 80)
+    }
+
+    pub fn invoke_command_with(
+        &mut self,
+        path: &str,
+        name: &str,
+        data: &str,
+        snapshot: Option<&Value>,
+        width: usize,
+    ) -> Result<Option<Value>, String> {
         let result = run_js_extension(
             Path::new(path),
-            "command",
-            &serde_json::json!({ "name": name, "ctx": { "mode": "tui" } }),
+            if data.is_empty() {
+                "command"
+            } else {
+                "customInput"
+            },
+            &serde_json::json!({
+                "name": name,
+                "data": data,
+                "snapshot": snapshot,
+                "width": width,
+                "ctx": { "mode": "tui" }
+            }),
         )?;
         if !result.ok {
             return Err(result
@@ -348,18 +378,47 @@ impl ExtensionHost {
         Ok(result.result)
     }
 
+    pub fn editor_input(
+        &self,
+        path: &str,
+        data: &str,
+        snapshot: Option<&Value>,
+        width: usize,
+    ) -> Result<Value, String> {
+        let result = run_js_extension(
+            Path::new(path),
+            if data.is_empty() {
+                "editorRender"
+            } else {
+                "editorInput"
+            },
+            &serde_json::json!({
+                "data": data,
+                "snapshot": snapshot,
+                "width": width
+            }),
+        )?;
+        if !result.ok {
+            return Err(result.error.unwrap_or_else(|| "Editor host error".into()));
+        }
+        result
+            .result
+            .ok_or_else(|| "Editor host returned no result".into())
+    }
+
     pub fn describe_js(&self) -> String {
         self.js
             .iter()
             .map(|ext| {
                 format!(
-                    "{} handlers={} commands={} renderers={} entries={} md={}",
+                    "{} handlers={} commands={} renderers={} entries={} md={} editor={}",
                     ext.path,
                     ext.handlers.join(","),
                     ext.commands.join(","),
                     ext.message_renderers.join(","),
                     ext.entry_renderers.join(","),
-                    ext.markdown_transformers
+                    ext.markdown_transformers,
+                    ext.has_editor
                 )
             })
             .collect::<Vec<_>>()

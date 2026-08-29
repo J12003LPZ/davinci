@@ -47,6 +47,11 @@ pub struct ChatChrome {
     pub extension_input: Option<ExtensionInput>,
     pub extension_editor: Option<ExtensionEditor>,
     pub extension_confirm: Option<ExtensionConfirm>,
+    pub custom_editor_lines: Option<Vec<String>>,
+    pub custom_overlay_lines: Option<Vec<String>>,
+    pub custom_overlay_path: Option<String>,
+    pub custom_overlay_command: Option<String>,
+    pub custom_overlay_snapshot: Option<serde_json::Value>,
 }
 
 impl ChatChrome {
@@ -79,6 +84,11 @@ impl ChatChrome {
             extension_input: None,
             extension_editor: None,
             extension_confirm: None,
+            custom_editor_lines: None,
+            custom_overlay_lines: None,
+            custom_overlay_path: None,
+            custom_overlay_command: None,
+            custom_overlay_snapshot: None,
         }
     }
 
@@ -206,6 +216,11 @@ impl ChatChrome {
                     self.editor.handle_input(text);
                 }
             }
+            "setEditorComponent" => {
+                if call.get("enabled").and_then(|value| value.as_bool()) == Some(false) {
+                    self.custom_editor_lines = None;
+                }
+            }
             _ => {}
         }
     }
@@ -282,11 +297,18 @@ impl Component for ChatChrome {
         } else if let Some(confirm) = &self.extension_confirm {
             lines.push(String::new());
             lines.extend(confirm.render(width));
+        } else if let Some(custom) = &self.custom_overlay_lines {
+            lines.push(String::new());
+            lines.extend(custom.iter().cloned());
         } else {
             for widget in &self.widgets_above {
                 lines.extend(widget.lines.iter().cloned());
             }
-            lines.extend(self.editor.render(width));
+            if let Some(custom) = &self.custom_editor_lines {
+                lines.extend(custom.iter().cloned());
+            } else {
+                lines.extend(self.editor.render(width));
+            }
             for widget in &self.widgets_below {
                 lines.extend(widget.lines.iter().cloned());
             }

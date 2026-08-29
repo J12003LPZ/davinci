@@ -886,6 +886,13 @@ fn apply_session_action(
             handle_extension_confirm(session, value);
             Ok(true)
         }
+        SessionAction::CustomEditorInput(data) => {
+            handle_custom_editor_input(parsed, agent, session, &data)
+        }
+        SessionAction::CustomOverlayInput(data) => {
+            handle_custom_overlay_input(parsed, session, &data);
+            Ok(true)
+        }
         SessionAction::CycleSetting => {
             if let Some(item) = session
                 .chrome
@@ -1739,9 +1746,110 @@ fn apply_extension_shortcuts(session: &mut InteractiveSession, host: &ExtensionH
     let (shortcuts, diagnostics) = host.resolve_shortcuts(&session.keybindings);
     session.extension_shortcuts = shortcuts;
     session.apply_extension_ui_calls(&host.ui_calls);
+    activate_custom_editor(session, host);
     if let Some(warning) = diagnostics.first() {
         session.chrome.status = warning.clone();
     }
+}
+
+fn activate_custom_editor(session: &mut InteractiveSession, host: &ExtensionHost) {
+    for path in host
+        .editor_modules
+        .iter()
+        .chain(host.js.iter().map(|ext| &ext.path))
+    {
+        if let Ok(result) = host.editor_input(
+            path,
+            "",
+            session.custom_editor_snapshot.as_ref(),
+            session.width,
+        ) {
+            if result.get("enabled").and_then(|value| value.as_bool()) != Some(true) {
+                continue;
+            }
+            session.custom_editor_path = Some(path.clone());
+            if let Some(snapshot) = result.get("snapshot").cloned() {
+                session.custom_editor_snapshot = Some(snapshot);
+            }
+            if let Some(lines) = result.get("lines").and_then(|value| value.as_array()) {
+                session.chrome.custom_editor_lines = Some(
+                    lines
+                        .iter()
+                        .filter_map(|line| line.as_str().map(str::to_string))
+                        .collect(),
+                );
+            }
+            return;
+        }
+    }
+}
+
+fn apply_editor_host_result(session: &mut InteractiveSession, result: &serde_json::Value) {
+    if result.get("enabled").and_then(|value| value.as_bool()) == Some(false) {
+        session.custom_editor_path = None;
+        session.custom_editor_snapshot = None;
+        session.chrome.custom_editor_lines = None;
+        return;
+    }
+    if let Some(snapshot) = result.get("snapshot").cloned() {
+        session.custom_editor_snapshot = Some(snapshot);
+    }
+    if let Some(lines) = result.get("lines").and_then(|value| value.as_array()) {
+        session.chrome.custom_editor_lines = Some(
+            lines
+                .iter()
+                .filter_map(|line| line.as_str().map(str::to_string))
+                .collect(),
+        );
+    }
+}
+
+fn handle_custom_editor_input(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    data: &str,
+) -> Result<bool, String> {
+    let Some(path) = session.custom_editor_path.clone() else {
+        return Ok(true);
+    };
+    let host = loaded_extension_host(parsed);
+    match host.editor_input(
+        &path,
+        data,
+        session.custom_editor_snapshot.as_ref(),
+        session.width,
+    ) {
+        Ok(result) => {
+            apply_editor_host_result(session, &result);
+            match result.get("action").and_then(|value| value.as_str()) {
+                Some("submit") => {
+                    let text = result
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !text.is_empty() {
+                        return apply_session_action(
+                            parsed,
+                            agent,
+                            session,
+                            SessionAction::Submit(text),
+                        );
+                    }
+                }
+                Some("abort") => {
+                    session.chrome.status = "aborted".into();
+                }
+                Some("quit") => return Ok(false),
+                _ => {}
+            }
+        }
+        Err(err) => {
+            session.chrome.status = format!("Editor host error: {err}");
+        }
+    }
+    Ok(true)
 }
 
 fn host_invoke_shortcut(
@@ -1766,13 +1874,72 @@ fn try_extension_slash(parsed: &Args, chrome: &mut ChatChrome, name: &str) -> Re
     let Some(path) = path else {
         return Ok(false);
     };
-    host.invoke_command(&path, name)?;
+    let result = host.invoke_command(&path, name)?;
     for call in &host.ui_calls {
         chrome.apply_ui_call(call);
     }
+    apply_custom_overlay_result(chrome, &path, name, result.as_ref());
     chrome.status = format!("/{name}");
     println!("{}", chrome.status);
     Ok(true)
+}
+
+fn apply_custom_overlay_result(
+    chrome: &mut ChatChrome,
+    path: &str,
+    name: &str,
+    result: Option<&serde_json::Value>,
+) {
+    let Some(result) = result else {
+        return;
+    };
+    if result.get("pending").and_then(|value| value.as_bool()) != Some(true) {
+        chrome.custom_overlay_path = None;
+        chrome.custom_overlay_command = None;
+        chrome.custom_overlay_snapshot = None;
+        chrome.custom_overlay_lines = None;
+        return;
+    }
+    chrome.custom_overlay_path = Some(path.to_string());
+    chrome.custom_overlay_command = Some(name.to_string());
+    chrome.custom_overlay_snapshot = result.get("snapshot").cloned();
+    chrome.custom_overlay_lines =
+        result
+            .get("lines")
+            .and_then(|value| value.as_array())
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| line.as_str().map(str::to_string))
+                    .collect()
+            });
+}
+
+fn handle_custom_overlay_input(parsed: &Args, session: &mut InteractiveSession, data: &str) {
+    let Some(path) = session.chrome.custom_overlay_path.clone() else {
+        return;
+    };
+    let name = session
+        .chrome
+        .custom_overlay_command
+        .clone()
+        .unwrap_or_default();
+    let snapshot = session.chrome.custom_overlay_snapshot.clone();
+    let mut host = loaded_extension_host(parsed);
+    match host.invoke_command_with(&path, &name, data, snapshot.as_ref(), session.width) {
+        Ok(result) => {
+            apply_custom_overlay_result(&mut session.chrome, &path, &name, result.as_ref());
+            if session.chrome.custom_overlay_lines.is_none() {
+                if let Some(value) = result {
+                    session.chrome.status = format!("custom={}", value);
+                }
+            }
+        }
+        Err(err) => {
+            session.close_overlays();
+            session.chrome.status = format!("Custom UI error: {err}");
+        }
+    }
 }
 
 fn loaded_extension_host(parsed: &Args) -> ExtensionHost {
@@ -2060,7 +2227,63 @@ fn handle_extension_select(
         }
         if choice == "Download model" {
             session.extension_dialog_context = Some(format!("llama-download:{url}"));
-            session.open_extension_input("Hugging Face model", "org/model:Q4_K_M");
+            session.open_extension_input("Hugging Face model", "search or org/model:Q4_K_M");
+            return Ok(true);
+        }
+        if let Some(target) = context
+            .as_deref()
+            .and_then(|value| value.strip_prefix("llama-hf-pick:"))
+        {
+            let id = choice
+                .split_once(" · ")
+                .map(|(id, _)| id)
+                .unwrap_or(choice.as_str());
+            begin_llama_download(session, target, id);
+            return Ok(true);
+        }
+        if let Some(rest) = context
+            .as_deref()
+            .and_then(|value| value.strip_prefix("llama-hf-gated:"))
+        {
+            if let Some((model, target)) = rest.split_once('@') {
+                if choice == "Continue" {
+                    continue_llama_download(session, target, model, None, true);
+                } else {
+                    session.chrome.status = "llama download cancelled".into();
+                }
+            }
+            return Ok(true);
+        }
+        if let Some(rest) = context
+            .as_deref()
+            .and_then(|value| value.strip_prefix("llama-hf-quant:"))
+        {
+            if let Some((model, target)) = rest.split_once('@') {
+                let quant = choice
+                    .split_once(" · ")
+                    .map(|(name, _)| name)
+                    .unwrap_or(choice.as_str());
+                finish_llama_download(session, target, &format!("{model}:{quant}"));
+            }
+            return Ok(true);
+        }
+        if let Some(rest) = context
+            .as_deref()
+            .and_then(|value| value.strip_prefix("llama-load:"))
+        {
+            if let Some((model, target)) = rest.split_once('@') {
+                match choice.as_str() {
+                    "Cancel" => session.chrome.status = "llama load cancelled".into(),
+                    "Unload all and load" => {
+                        let catalog = llama::list_models(target).unwrap_or_default();
+                        for loaded in llama::loaded_models(&catalog, Some(model)) {
+                            let _ = llama::unload_and_wait(target, &loaded.id);
+                        }
+                        session.chrome.status = load_llama_model(target, model)?;
+                    }
+                    _ => session.chrome.status = load_llama_model(target, model)?,
+                }
+            }
             return Ok(true);
         }
         let catalog = llama::list_models(url).unwrap_or_default();
@@ -2075,13 +2298,26 @@ fn handle_extension_select(
                 return Ok(true);
             }
             if llama::model_is_selectable(model, autoload) || model.status.value == "unloaded" {
-                llama::load_model(url, &model.id)?;
-                let progress = llama::parse_load_progress(&serde_json::json!({
-                    "progress": { "stage": "starting" }
-                }));
-                session.chrome.status = progress
-                    .map(|item| format!("{} {}", item.message, model.id))
-                    .unwrap_or_else(|| format!("Load started for {}", model.id));
+                let loaded = llama::loaded_models(&catalog, Some(&model.id));
+                if !loaded.is_empty() {
+                    session.extension_dialog_context =
+                        Some(format!("llama-load:{}@{url}", model.id));
+                    let title = if loaded.len() == 1 {
+                        "1 model is loaded".into()
+                    } else {
+                        format!("{} models are loaded", loaded.len())
+                    };
+                    session.open_extension_selector(
+                        title,
+                        vec![
+                            "Unload all and load".into(),
+                            "Keep loaded and load".into(),
+                            "Cancel".into(),
+                        ],
+                    );
+                    return Ok(true);
+                }
+                session.chrome.status = load_llama_model(url, &model.id)?;
                 return Ok(true);
             }
             session.chrome.status = format!("{} is {}", model.id, model.status.value);
@@ -2094,6 +2330,112 @@ fn handle_extension_select(
     Ok(true)
 }
 
+fn load_llama_model(url: &str, model: &str) -> Result<String, String> {
+    let mut status = format!("Load started for {model}");
+    let loaded = llama::load_and_wait(url, model, |progress| {
+        status = format!("{} {model}", progress.message);
+    })?;
+    Ok(if loaded.status.value == "loaded" {
+        format!("Loaded {}", loaded.id)
+    } else {
+        status
+    })
+}
+
+fn begin_llama_download(session: &mut InteractiveSession, url: &str, value: &str) {
+    let (repository, quantization) = llama::parse_hugging_face_model(value);
+    if !repository.contains('/') && repository.len() >= 2 {
+        match llama::search_hugging_face(&repository) {
+            Ok(results) if !results.is_empty() => {
+                session.extension_dialog_context = Some(format!("llama-hf-pick:{url}"));
+                session.open_extension_selector(
+                    "Hugging Face models",
+                    results
+                        .iter()
+                        .map(llama::hugging_face_search_label)
+                        .collect(),
+                );
+            }
+            Ok(_) => session.chrome.status = "No Hugging Face models matched".into(),
+            Err(err) => session.chrome.status = err,
+        }
+        return;
+    }
+    continue_llama_download(session, url, &repository, quantization.as_deref(), false);
+}
+
+fn continue_llama_download(
+    session: &mut InteractiveSession,
+    url: &str,
+    repository: &str,
+    quantization: Option<&str>,
+    skip_gated: bool,
+) {
+    match llama::hugging_face_details(repository) {
+        Ok(details) => {
+            if !skip_gated && details.gated != llama::HuggingFaceGated::False {
+                let approval = match details.gated {
+                    llama::HuggingFaceGated::Manual => "Manual approval is required",
+                    _ => "Accept the access terms",
+                };
+                session.extension_dialog_context =
+                    Some(format!("llama-hf-gated:{}@{url}", details.id));
+                session.open_extension_selector(
+                    format!(
+                        "Hugging Face access required\n{}\n\n{approval} at:\nhttps://huggingface.co/{}",
+                        details.id, details.id
+                    ),
+                    vec!["Continue".into(), "Back".into()],
+                );
+                return;
+            }
+            if quantization.is_none() && !details.quantizations.is_empty() {
+                session.extension_dialog_context =
+                    Some(format!("llama-hf-quant:{}@{url}", details.id));
+                session.open_extension_selector(
+                    format!("Select quantization\n{}", details.id),
+                    details
+                        .quantizations
+                        .iter()
+                        .map(llama::quantization_option_label)
+                        .collect(),
+                );
+                return;
+            }
+            let model = match quantization {
+                Some(name) => format!("{}:{name}", details.id),
+                None => details.id,
+            };
+            finish_llama_download(session, url, &model);
+        }
+        Err(_) => {
+            let model = match quantization {
+                Some(name) => format!("{repository}:{name}"),
+                None => repository.to_string(),
+            };
+            finish_llama_download(session, url, &model);
+        }
+    }
+}
+
+fn finish_llama_download(session: &mut InteractiveSession, url: &str, model: &str) {
+    let token = llama::find_hugging_face_token();
+    match llama::download_and_wait(url, model, |_| {}) {
+        Ok(_) => {
+            session.chrome.status = format!(
+                "Downloaded {model} hf={}",
+                token.as_deref().unwrap_or("missing")
+            );
+        }
+        Err(err) => {
+            session.chrome.status = format!(
+                "download {model} via {url} hf={} {err}",
+                token.as_deref().unwrap_or("missing")
+            );
+        }
+    }
+}
+
 fn handle_extension_input(session: &mut InteractiveSession, value: Option<String>) {
     let context = session.extension_dialog_context.take();
     let Some(value) = value else {
@@ -2104,24 +2446,7 @@ fn handle_extension_input(session: &mut InteractiveSession, value: Option<String
         .as_deref()
         .and_then(|item| item.strip_prefix("llama-download:"))
     {
-        let (repository, quantization) = llama::parse_hugging_face_model(&value);
-        let token = llama::find_hugging_face_token();
-        let model = match quantization {
-            Some(name) => format!("{repository}:{name}"),
-            None => repository.clone(),
-        };
-        llama::download_model(url, &model).ok();
-        let progress = llama::parse_download_progress(&serde_json::json!({
-            "model.gguf": { "done": 512, "total": 1024 }
-        }));
-        let detail = progress
-            .as_ref()
-            .and_then(|item| item.detail.clone())
-            .unwrap_or_else(|| llama::format_bytes(0.0));
-        session.chrome.status = format!(
-            "download {model} via {url} hf={} {detail}",
-            token.as_deref().unwrap_or("missing")
-        );
+        begin_llama_download(session, url, &value);
         return;
     }
     session.chrome.status = format!("extension-input={value}");
@@ -2135,7 +2460,7 @@ fn handle_extension_confirm(session: &mut InteractiveSession, confirmed: bool) {
     {
         if confirmed {
             if let Some((model, url)) = rest.split_once('@') {
-                let _ = llama::unload_model(url, model);
+                let _ = llama::unload_and_wait(url, model);
                 session.chrome.status = format!("Unloaded {model}");
             } else {
                 session.chrome.status = format!("Unloaded {rest}");

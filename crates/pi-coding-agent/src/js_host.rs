@@ -31,6 +31,10 @@ pub struct JsExtensionResult {
     pub markdown_transformers: u32,
     #[serde(default, rename = "uiCalls")]
     pub ui_calls: Vec<Value>,
+    #[serde(default, rename = "hasEditor")]
+    pub has_editor: bool,
+    #[serde(default, rename = "hasCustom")]
+    pub has_custom: bool,
     #[serde(default)]
     pub result: Option<Value>,
     #[serde(default)]
@@ -396,5 +400,163 @@ module.exports = (pi) => {
         let dir = tempdir().unwrap();
         let out = execute_command_tool("printf fixture-ok", dir.path()).unwrap();
         assert_eq!(out, "fixture-ok");
+    }
+
+    #[test]
+    fn hosts_js_custom_editor_from_session_start() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+const { Editor, matchesKey } = require("@earendil-works/pi-tui");
+class ModalEditor extends Editor {
+  constructor() {
+    super();
+    this.mode = "insert";
+  }
+  handleInput(data) {
+    if (matchesKey(data, "escape")) {
+      if (this.mode === "insert") { this.mode = "normal"; return; }
+      super.handleInput(data);
+      return;
+    }
+    if (this.mode === "normal" && data === "i") { this.mode = "insert"; return; }
+    super.handleInput(data);
+  }
+  render(width) {
+    const lines = super.render(width);
+    lines.push(this.mode === "normal" ? " NORMAL " : " INSERT ");
+    return lines;
+  }
+}
+module.exports = (pi) => {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.setEditorComponent(() => new ModalEditor());
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        assert!(loaded.handlers.contains(&"session_start".into()));
+        let rendered =
+            run_js_extension(&module, "editorRender", &serde_json::json!({ "width": 40 })).unwrap();
+        assert_eq!(rendered.result.as_ref().unwrap()["enabled"], true);
+        let lines = rendered.result.as_ref().unwrap()["lines"]
+            .as_array()
+            .expect("lines");
+        assert!(
+            lines.iter().any(|line| line.as_str() == Some(" INSERT ")),
+            "{lines:?}"
+        );
+        let after_escape = run_js_extension(
+            &module,
+            "editorInput",
+            &serde_json::json!({ "data": "\u{1b}", "width": 40 }),
+        )
+        .unwrap();
+        let escape_lines = after_escape.result.as_ref().unwrap()["lines"]
+            .as_array()
+            .expect("lines");
+        assert!(
+            escape_lines
+                .iter()
+                .any(|line| line.as_str() == Some(" NORMAL ")),
+            "{escape_lines:?}"
+        );
+        let typed = run_js_extension(
+            &module,
+            "editorInput",
+            &serde_json::json!({
+                "data": "h",
+                "snapshot": { "text": "", "extra": { "mode": "insert" } },
+                "width": 40
+            }),
+        )
+        .unwrap();
+        assert_eq!(typed.result.as_ref().unwrap()["text"], "h");
+        let submitted = run_js_extension(
+            &module,
+            "editorInput",
+            &serde_json::json!({
+                "data": "\r",
+                "snapshot": { "text": "hello", "extra": { "mode": "insert" } },
+                "width": 40
+            }),
+        )
+        .unwrap();
+        assert_eq!(submitted.result.as_ref().unwrap()["action"], "submit");
+        assert_eq!(submitted.result.as_ref().unwrap()["text"], "hello");
+    }
+
+    #[test]
+    fn hosts_js_custom_overlay_until_done() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerCommand("board", {
+    description: "board",
+    handler: async (_args, ctx) => {
+      return ctx.ui.custom((_tui, _theme, _kb, done) => {
+        return {
+          label: "open",
+          handleInput(data) {
+            if (data === "q") done("closed");
+            else this.label = data;
+          },
+          render() { return [this.label]; },
+        };
+      });
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let opened = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "board", "ctx": { "mode": "tui" } }),
+        )
+        .unwrap();
+        assert!(opened.ok, "{:?}", opened.error);
+        assert_eq!(opened.result.as_ref().unwrap()["pending"], true);
+        assert_eq!(opened.result.as_ref().unwrap()["lines"][0], "open");
+        let typed = run_js_extension(
+            &module,
+            "customInput",
+            &serde_json::json!({
+                "name": "board",
+                "data": "x",
+                "snapshot": { "text": "", "extra": { "label": "open" } },
+                "ctx": { "mode": "tui" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(typed.result.as_ref().unwrap()["pending"], true);
+        assert_eq!(typed.result.as_ref().unwrap()["lines"][0], "x");
+        let closed = run_js_extension(
+            &module,
+            "customInput",
+            &serde_json::json!({
+                "name": "board",
+                "data": "q",
+                "snapshot": typed.result.as_ref().unwrap()["snapshot"],
+                "ctx": { "mode": "tui" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(closed.result.as_ref().unwrap(), "closed");
     }
 }
