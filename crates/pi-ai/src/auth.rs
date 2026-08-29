@@ -111,6 +111,122 @@ impl AuthStorage {
         self.data.keys().cloned().collect()
     }
 
+    pub fn login_api_key(
+        &mut self,
+        provider: &str,
+        key: impl Into<String>,
+    ) -> Result<(), AuthStorageError> {
+        self.set(
+            provider,
+            Credential {
+                kind: CredentialKind::ApiKey,
+                key: Some(key.into()),
+                access: None,
+                refresh: None,
+                expires: None,
+                env: HashMap::new(),
+            },
+        )
+    }
+
+    pub fn login_oauth(
+        &mut self,
+        provider: &str,
+        access: impl Into<String>,
+        refresh: Option<String>,
+        expires: Option<u64>,
+    ) -> Result<(), AuthStorageError> {
+        self.set(
+            provider,
+            Credential {
+                kind: CredentialKind::Oauth,
+                key: None,
+                access: Some(access.into()),
+                refresh,
+                expires,
+                env: HashMap::new(),
+            },
+        )
+    }
+
+    pub fn maybe_refresh(
+        &mut self,
+        provider: &str,
+        now_ms: u64,
+        min_expiry_ms: u64,
+        no_refresh: bool,
+    ) -> Result<bool, AuthStorageError> {
+        if no_refresh {
+            return Ok(false);
+        }
+        let Some(cred) = self.get(provider).cloned() else {
+            return Ok(false);
+        };
+        if cred.kind != CredentialKind::Oauth {
+            return Ok(false);
+        }
+        let expired = cred
+            .expires
+            .map(|exp| exp <= now_ms.saturating_add(min_expiry_ms))
+            .unwrap_or(false);
+        if !expired {
+            return Ok(false);
+        }
+        let refresh = cred.refresh.clone().unwrap_or_default();
+        let fixture = refresh.starts_with("pi-fixture-")
+            || matches!(
+                std::env::var("PI_OAUTH_FIXTURE").as_deref(),
+                Ok("1") | Ok("true")
+            );
+        if fixture {
+            return self
+                .login_oauth(
+                    provider,
+                    format!("{refresh}-access"),
+                    Some(refresh),
+                    Some(now_ms.saturating_add(3_600_000)),
+                )
+                .map(|_| true);
+        }
+        if let Ok(url) = std::env::var("PI_OAUTH_REFRESH_URL") {
+            let body = serde_json::json!({
+                "provider": provider,
+                "refresh": refresh,
+            });
+            let response = ureq::post(&url)
+                .set("content-type", "application/json")
+                .send_string(&body.to_string())
+                .map_err(|err| AuthStorageError::Read(err.to_string()))?;
+            let text = response
+                .into_string()
+                .map_err(|err| AuthStorageError::Read(err.to_string()))?;
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|err| AuthStorageError::Invalid(err.to_string()))?;
+            let access = value
+                .get("access")
+                .or_else(|| value.get("access_token"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    AuthStorageError::Invalid("refresh response missing access".into())
+                })?;
+            let next_refresh = value
+                .get("refresh")
+                .or_else(|| value.get("refresh_token"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or(Some(refresh));
+            let expires = value
+                .get("expires")
+                .or_else(|| value.get("expires_at"))
+                .and_then(|v| v.as_u64())
+                .or(Some(now_ms.saturating_add(3_600_000)));
+            return self
+                .login_oauth(provider, access, next_refresh, expires)
+                .map(|_| true);
+        }
+        Ok(false)
+    }
+
     fn persist(&self) -> Result<(), AuthStorageError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|err| AuthStorageError::Write(err.to_string()))?;
@@ -232,5 +348,27 @@ mod tests {
         let resolved = resolve_provider_auth("openai", &storage, &env, true).unwrap();
         assert_eq!(resolved.api_key.as_deref(), Some("sk-stored"));
         assert_eq!(resolved.source, "stored credential");
+    }
+
+    #[test]
+    fn fixture_oauth_refresh_extends_expiry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut storage = AuthStorage::open(&path).unwrap();
+        storage
+            .login_oauth(
+                "anthropic",
+                "expired",
+                Some("pi-fixture-refresh".into()),
+                Some(1),
+            )
+            .unwrap();
+        assert!(storage
+            .maybe_refresh("anthropic", 10_000, 0, false)
+            .unwrap());
+        let cred = storage.get("anthropic").unwrap();
+        assert_eq!(cred.access.as_deref(), Some("pi-fixture-refresh-access"));
+        assert!(cred.expires.unwrap() > 10_000);
+        assert!(!storage.maybe_refresh("anthropic", 10_000, 0, true).unwrap());
     }
 }

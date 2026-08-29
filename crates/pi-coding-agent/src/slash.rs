@@ -81,6 +81,96 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
     .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashAction {
+    Quit,
+    Status(String),
+    Prompt(String),
+    NewSession,
+    Compact(Option<String>),
+    SetModel(String),
+    SetThinking(String),
+    Export(Option<String>),
+    Login {
+        provider: String,
+        key: Option<String>,
+    },
+    Logout {
+        provider: Option<String>,
+    },
+    Name(String),
+    Fork,
+    Clone,
+    Resume,
+    Tree,
+    Copy,
+    Trust,
+    Reload,
+    Settings,
+    Hotkeys,
+    SessionInfo,
+}
+
+pub fn parse_line(line: &str) -> SlashAction {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('/') {
+        return SlashAction::Prompt(trimmed.to_string());
+    }
+    let rest = trimmed.trim_start_matches('/');
+    let (name, args) = rest
+        .split_once(char::is_whitespace)
+        .map(|(name, args)| (name, args.trim()))
+        .unwrap_or((rest, ""));
+    match name {
+        "quit" | "exit" | "q" => SlashAction::Quit,
+        "new" => SlashAction::NewSession,
+        "compact" => SlashAction::Compact(if args.is_empty() {
+            None
+        } else {
+            Some(args.to_string())
+        }),
+        "model" if !args.is_empty() => SlashAction::SetModel(args.to_string()),
+        "thinking" if !args.is_empty() => SlashAction::SetThinking(args.to_string()),
+        "export" => SlashAction::Export(if args.is_empty() {
+            None
+        } else {
+            Some(args.to_string())
+        }),
+        "login" => {
+            let mut parts = args.split_whitespace();
+            let provider = parts.next().unwrap_or("").to_string();
+            let key = parts.next().map(str::to_string);
+            SlashAction::Login { provider, key }
+        }
+        "logout" => SlashAction::Logout {
+            provider: if args.is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            },
+        },
+        "name" => SlashAction::Name(args.to_string()),
+        "fork" => SlashAction::Fork,
+        "clone" => SlashAction::Clone,
+        "resume" => SlashAction::Resume,
+        "tree" => SlashAction::Tree,
+        "copy" => SlashAction::Copy,
+        "trust" => SlashAction::Trust,
+        "reload" => SlashAction::Reload,
+        "settings" => SlashAction::Settings,
+        "hotkeys" => SlashAction::Hotkeys,
+        "session" => SlashAction::SessionInfo,
+        "help" => SlashAction::Status(
+            builtin_slash_commands()
+                .into_iter()
+                .map(|c| format!("/{} — {}", c.name, c.description))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        other => SlashAction::Status(format!("Unknown command /{other}")),
+    }
+}
+
 pub fn rpc_commands() -> Vec<serde_json::Value> {
     builtin_slash_commands()
         .into_iter()

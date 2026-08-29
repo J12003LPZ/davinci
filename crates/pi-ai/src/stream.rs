@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::auth::ResolvedAuth;
 use crate::catalog::Model;
 use crate::content_text;
-use crate::ChatMessage;
+use crate::{ChatMessage, MessageContent, ToolSpec};
 use pi_protocol::Usage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,16 +242,46 @@ pub fn fixture_complete(
     complete_from_events(&replay_sse_events(model, corpus)).expect("fixture stream")
 }
 
+pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".into(),
+        content: message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => MessageContent::Text { text: text.clone() },
+                ContentBlock::Thinking { thinking } => MessageContent::Thinking {
+                    thinking: thinking.clone(),
+                    redacted: None,
+                },
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => MessageContent::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                },
+            })
+            .collect(),
+        tool_call_id: None,
+        tool_name: None,
+        is_error: None,
+    }
+}
+
 pub fn live_complete(
     model: &Model,
     messages: &[ChatMessage],
     auth: &ResolvedAuth,
     system: Option<&str>,
+    tools: &[ToolSpec],
 ) -> Result<AssistantMessage, String> {
     let body = match model.api.as_str() {
-        "anthropic-messages" => anthropic_body(model, messages, system),
-        "google-generative-ai" | "google-vertex" => google_body(model, messages, system),
-        _ => openai_body(model, messages, system),
+        "anthropic-messages" => anthropic_body(model, messages, system, tools),
+        "google-generative-ai" | "google-vertex" => google_body(model, messages, system, tools),
+        _ => openai_body(model, messages, system, tools),
     };
     let url = request_url(model, auth);
     let mut request = ureq::post(&url);
@@ -301,32 +331,135 @@ fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
     }
 }
 
-fn openai_body(model: &Model, messages: &[ChatMessage], system: Option<&str>) -> Value {
+fn openai_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+) -> Value {
     let mut out = Vec::new();
     if let Some(system) = system {
         out.push(serde_json::json!({"role":"system","content":system}));
     }
     for message in messages {
-        out.push(serde_json::json!({
-            "role": message.role,
-            "content": content_text(&message.content),
-        }));
+        if message.role == "toolResult" {
+            out.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": message.tool_call_id,
+                "content": content_text(&message.content),
+            }));
+        } else if message
+            .content
+            .iter()
+            .any(|block| matches!(block, MessageContent::ToolCall { .. }))
+        {
+            let tool_calls: Vec<Value> = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    MessageContent::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => Some(serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string(),
+                        }
+                    })),
+                    _ => None,
+                })
+                .collect();
+            out.push(serde_json::json!({
+                "role": "assistant",
+                "content": content_text(&message.content),
+                "tool_calls": tool_calls,
+            }));
+        } else {
+            out.push(serde_json::json!({
+                "role": message.role,
+                "content": content_text(&message.content),
+            }));
+        }
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model.id,
         "messages": out,
         "stream": false,
-    })
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    body
 }
 
-fn anthropic_body(model: &Model, messages: &[ChatMessage], system: Option<&str>) -> Value {
+fn anthropic_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+) -> Value {
     let converted: Vec<Value> = messages
         .iter()
         .map(|message| {
-            serde_json::json!({
-                "role": if message.role == "assistant" { "assistant" } else { "user" },
-                "content": content_text(&message.content),
-            })
+            if message.role == "toolResult" {
+                serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": message.tool_call_id,
+                        "content": content_text(&message.content),
+                    }],
+                })
+            } else if message.role == "assistant"
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, MessageContent::ToolCall { .. }))
+            {
+                let content: Vec<Value> = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        MessageContent::Text { text } if !text.is_empty() => {
+                            Some(serde_json::json!({"type":"text","text": text}))
+                        }
+                        MessageContent::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => Some(serde_json::json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": arguments,
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                serde_json::json!({"role":"assistant","content": content})
+            } else {
+                serde_json::json!({
+                    "role": if message.role == "assistant" { "assistant" } else { "user" },
+                    "content": content_text(&message.content),
+                })
+            }
         })
         .collect();
     let mut body = serde_json::json!({
@@ -338,10 +471,29 @@ fn anthropic_body(model: &Model, messages: &[ChatMessage], system: Option<&str>)
     if let Some(system) = system {
         body["system"] = Value::String(system.to_string());
     }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
+                    })
+                })
+                .collect(),
+        );
+    }
     body
 }
 
-fn google_body(model: &Model, messages: &[ChatMessage], system: Option<&str>) -> Value {
+fn google_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+) -> Value {
     let contents: Vec<Value> = messages
         .iter()
         .map(|message| {
@@ -355,6 +507,15 @@ fn google_body(model: &Model, messages: &[ChatMessage], system: Option<&str>) ->
     if let Some(system) = system {
         body["systemInstruction"] = serde_json::json!({"parts":[{"text":system}]});
     }
+    if !tools.is_empty() {
+        body["tools"] = serde_json::json!([{
+            "functionDeclarations": tools.iter().map(|tool| serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            })).collect::<Vec<_>>()
+        }]);
+    }
     let _ = model;
     body
 }
@@ -364,7 +525,8 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
         return fixture_complete(model, &[], raw);
     }
     let value: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
-    let text = value
+    let mut content = Vec::new();
+    if let Some(text) = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .or_else(|| value.pointer("/content/0/text").and_then(Value::as_str))
@@ -374,8 +536,84 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
                 .and_then(Value::as_str)
         })
         .or_else(|| value.pointer("/output_text").and_then(Value::as_str))
-        .unwrap_or(raw)
-        .to_string();
+    {
+        if !text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: text.to_string(),
+            });
+        }
+    }
+    if let Some(calls) = value
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+    {
+        for call in calls {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let arguments = call
+                .pointer("/function/arguments")
+                .and_then(|value| match value {
+                    Value::String(raw) => serde_json::from_str(raw).ok(),
+                    other => Some(other.clone()),
+                })
+                .unwrap_or(Value::Object(Default::default()));
+            content.push(ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+    }
+    if let Some(blocks) = value.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                content.push(ContentBlock::ToolCall {
+                    id: block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    name: block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    arguments: block.get("input").cloned().unwrap_or(Value::Null),
+                });
+            }
+        }
+    }
+    if let Some(parts) = value
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+    {
+        for part in parts {
+            if let Some(call) = part.get("functionCall") {
+                content.push(ContentBlock::ToolCall {
+                    id: Uuid::new_v4().to_string(),
+                    name: call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    arguments: call.get("args").cloned().unwrap_or(Value::Null),
+                });
+            }
+        }
+    }
+    if content.is_empty() {
+        content.push(ContentBlock::Text {
+            text: raw.to_string(),
+        });
+    }
     let usage = value.get("usage").map(|usage| Usage {
         input: usage
             .get("prompt_tokens")
@@ -396,13 +634,21 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
             .unwrap_or(0),
         cost: Default::default(),
     });
+    let stop_reason = if content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
+    {
+        Some(StopReason::ToolUse)
+    } else {
+        Some(StopReason::Stop)
+    };
     AssistantMessage {
         id: Uuid::new_v4().to_string(),
         role: "assistant".into(),
-        content: vec![ContentBlock::Text { text }],
+        content,
         model: format!("{}/{}", model.provider, model.id),
         usage,
-        stop_reason: Some(StopReason::Stop),
+        stop_reason,
         error_message: None,
     }
 }
@@ -437,5 +683,30 @@ mod tests {
         );
         let done = complete_from_events(&events).unwrap();
         assert_eq!(done.usage.unwrap().input, 3);
+    }
+
+    #[test]
+    fn parses_openai_and_anthropic_tool_calls() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.provider == "openai")
+            .expect("openai model");
+        let openai = parse_provider_response(
+            &model,
+            r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]}}]}"#,
+        );
+        assert!(matches!(openai.content[0], ContentBlock::ToolCall { .. }));
+        assert_eq!(openai.stop_reason, Some(StopReason::ToolUse));
+        let anthropic = parse_provider_response(
+            &model,
+            r#"{"content":[{"type":"tool_use","id":"c2","name":"bash","input":{"command":"ls"}}]}"#,
+        );
+        assert!(matches!(
+            anthropic
+                .content
+                .iter()
+                .find(|b| matches!(b, ContentBlock::ToolCall { .. })),
+            Some(ContentBlock::ToolCall { .. })
+        ));
     }
 }

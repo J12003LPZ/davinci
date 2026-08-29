@@ -85,13 +85,29 @@ pub fn assistant_usage_corpus() -> Result<ParityReport, String> {
 }
 
 pub fn agent_events_corpus() -> Result<ParityReport, String> {
+    use pi_ai::{AssistantMessage, ContentBlock, StopReason};
     let mut agent = pi_agent::Agent::new("test");
     agent.prompt("hello");
-    agent.record_assistant("world");
+    let events = agent
+        .run_loop(|_| {
+            Ok(AssistantMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "world".into(),
+                }],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(StopReason::Stop),
+                error_message: None,
+            })
+        })
+        .map_err(|err| err.to_string())?;
+    let kinds: Vec<_> = events.iter().map(pi_agent::AgentEvent::kind).collect();
     Ok(ParityReport {
         name: "agent-events",
-        passed: agent.messages.len() == 2,
-        detail: format!("messages={}", agent.messages.len()),
+        passed: kinds.first() == Some(&"agent_start") && kinds.last() == Some(&"agent_end"),
+        detail: kinds.join(","),
     })
 }
 

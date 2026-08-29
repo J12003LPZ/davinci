@@ -1,4 +1,4 @@
-use pi_ai::{content_text, ChatMessage, MessageContent};
+use pi_ai::{content_text, ChatMessage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,13 +31,7 @@ pub fn compact_messages(
         summary.push_str(instructions);
     }
     let last = messages.last().cloned();
-    let mut compacted = vec![ChatMessage {
-        role: "user".into(),
-        content: vec![MessageContent::Text {
-            text: summary.clone(),
-        }],
-        tool_call_id: None,
-    }];
+    let mut compacted = vec![ChatMessage::text("user", summary.clone())];
     if let Some(last) = last {
         if last.role == "assistant" {
             compacted.push(last);

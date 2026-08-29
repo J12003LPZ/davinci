@@ -1,18 +1,28 @@
 //! Terminal UI matching `@earendil-works/pi-tui`.
 
+mod box_comp;
+mod chrome;
 mod editor;
 mod fuzzy;
 mod keys;
 mod markdown;
+mod mouse;
 mod render;
+mod scroll;
 mod themes;
+mod transcript;
 
+pub use box_comp::TuiBox;
+pub use chrome::ChatChrome;
 pub use editor::Editor;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use keys::{parse_key, Key};
 pub use markdown::render_markdown;
+pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
 pub use render::{visible_width, Component, Text};
+pub use scroll::ScrollView;
 pub use themes::{builtin_themes, Theme};
+pub use transcript::{Transcript, TranscriptLine};
 
 pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 pub const ALT_BUFFER_ENTER: &str = "\x1b[?1049h";
@@ -60,6 +70,7 @@ pub fn get_keybindings() -> Vec<Keybinding> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
 pub struct SelectList {
     pub items: Vec<String>,
     pub selected: usize,
@@ -128,5 +139,11 @@ mod tests {
         let lines = render_markdown("# Title\n\nHello **world**", 40);
         assert!(lines.iter().any(|line| line.contains("Title")));
         assert!(get_keybindings().iter().any(|b| b.action == "cycle-model"));
+        let mut chrome = ChatChrome::new(builtin_themes()[0].clone(), "pi 0.84.4");
+        chrome.transcript.push("user", "hi");
+        chrome.transcript.push("assistant", "# hello");
+        let rendered = chrome.render(40);
+        assert!(rendered.iter().any(|line| line.contains("pi 0.84.4")));
+        assert!(parse_mouse_sgr("\x1b[<0;2;2M").is_some());
     }
 }

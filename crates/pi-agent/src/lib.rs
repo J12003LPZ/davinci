@@ -2,22 +2,26 @@
 
 mod compaction;
 mod context;
+mod events;
 mod queues;
 mod skills;
 mod templates;
 mod tools;
+mod turn;
 
 pub use compaction::{compact_messages, CompactionResult};
 pub use context::{load_context_files, ContextFile};
+pub use events::AgentEvent;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
 pub use skills::{discover_skills, Skill};
 pub use templates::{discover_prompt_templates, PromptTemplate};
 pub use tools::{execute_tool, tool_specs, AgentTool, ToolError, ToolResult, BUILTIN_TOOLS};
 
-use pi_ai::{content_text, ChatMessage, MessageContent};
+use pi_ai::{content_text, ChatMessage};
 use pi_protocol::ThinkingLevel;
 use pi_session::{JsonlSession, SessionEntry};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,18 +29,6 @@ use uuid::Uuid;
 pub enum ToolExecutionMode {
     Sequential,
     Parallel,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentEvent {
-    #[serde(rename = "type")]
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<ChatMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool: Option<String>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +45,11 @@ pub struct Agent {
     pub templates: Vec<PromptTemplate>,
     pub context_files: Vec<ContextFile>,
     pub session: Option<JsonlSession>,
+    pub cwd: PathBuf,
+    pub aborted: bool,
+    pub provider: String,
+    pub model_id: String,
+    pub tool_execution_mode: ToolExecutionMode,
 }
 
 impl Agent {
@@ -70,17 +67,16 @@ impl Agent {
             templates: Vec::new(),
             context_files: Vec::new(),
             session: None,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            aborted: false,
+            provider: "google".into(),
+            model_id: String::new(),
+            tool_execution_mode: ToolExecutionMode::Sequential,
         }
     }
 
     pub fn prompt(&mut self, text: &str) -> ChatMessage {
-        let message = ChatMessage {
-            role: "user".into(),
-            content: vec![MessageContent::Text {
-                text: text.to_string(),
-            }],
-            tool_call_id: None,
-        };
+        let message = ChatMessage::text("user", text);
         self.messages.push(message.clone());
         if let Some(session) = &mut self.session {
             let _ = session.append_entry(SessionEntry::message(
@@ -92,13 +88,7 @@ impl Agent {
     }
 
     pub fn record_assistant(&mut self, text: &str) {
-        let message = ChatMessage {
-            role: "assistant".into(),
-            content: vec![MessageContent::Text {
-                text: text.to_string(),
-            }],
-            tool_call_id: None,
-        };
+        let message = ChatMessage::text("assistant", text);
         self.messages.push(message);
         if let Some(session) = &mut self.session {
             let _ = session.append_entry(SessionEntry::message(
@@ -131,6 +121,55 @@ impl Agent {
         self.messages = result.messages.clone();
         result
     }
+
+    pub fn abort(&mut self) {
+        self.aborted = true;
+    }
+
+    pub fn load_from_session(&mut self, session: JsonlSession) {
+        self.messages = session.entries.iter().filter_map(entry_to_chat).collect();
+        self.session = Some(session);
+    }
+
+    pub fn session_tree(&self) -> Vec<serde_json::Value> {
+        self.session
+            .as_ref()
+            .map(|session| {
+                session
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "id": entry.id,
+                            "parentId": entry.parent_id,
+                            "type": entry.entry_type,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn entries_since(&self, since: Option<&str>) -> Vec<pi_session::SessionEntry> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        match since {
+            Some(id) => session
+                .entries
+                .iter()
+                .skip_while(|entry| entry.id != id)
+                .skip(1)
+                .cloned()
+                .collect(),
+            None => session.entries.clone(),
+        }
+    }
+}
+
+fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
+    let message = entry.message.as_ref()?;
+    serde_json::from_value(message.clone()).ok()
 }
 
 pub fn default_system_prompt() -> String {
@@ -158,5 +197,66 @@ mod tests {
         let compacted = agent.compact(Some("keep decisions"));
         assert!(compacted.summary.contains("keep decisions"));
         assert!(!agent.messages.is_empty());
+    }
+
+    #[test]
+    fn agent_loop_emits_ts_event_names_and_runs_tools() {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), "hello").unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.prompt("read the note");
+        let events = agent
+            .run_loop(|current| {
+                if current.messages.iter().any(|m| m.role == "toolResult") {
+                    return Ok(AssistantMessage {
+                        id: "a2".into(),
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        model: "fixture".into(),
+                        usage: None,
+                        stop_reason: Some(StopReason::Stop),
+                        error_message: None,
+                    });
+                }
+                Ok(AssistantMessage {
+                    id: "a1".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolCall {
+                        id: "call_1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "note.txt"}),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::ToolUse),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+        let kinds: Vec<_> = events.iter().map(AgentEvent::kind).collect();
+        assert_eq!(kinds.first().copied(), Some("agent_start"));
+        assert!(kinds.contains(&"tool_execution_start"));
+        assert!(kinds.contains(&"tool_execution_end"));
+        assert_eq!(kinds.last().copied(), Some("agent_end"));
+        assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn continue_loop_matches_ts_errors() {
+        let mut agent = Agent::new("x");
+        assert_eq!(
+            agent.continue_loop(|_| unreachable!()).unwrap_err(),
+            "Cannot continue: no messages in context"
+        );
+        agent.record_assistant("hi");
+        assert_eq!(
+            agent.continue_loop(|_| unreachable!()).unwrap_err(),
+            "Cannot continue from message role: assistant"
+        );
     }
 }

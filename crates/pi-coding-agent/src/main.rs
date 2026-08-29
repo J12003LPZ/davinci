@@ -1,6 +1,7 @@
 mod args;
 mod auth_cmd;
 mod export;
+mod extensions;
 mod packages;
 mod rpc;
 mod settings;
@@ -11,16 +12,21 @@ use std::path::{Path, PathBuf};
 
 use pi_agent::{
     default_system_prompt, discover_prompt_templates, discover_skills, load_context_files, Agent,
+    AgentEvent,
 };
 use pi_ai::{
     content_text, find_model, fuzzy_models, live_complete, load_builtin_models,
-    resolve_provider_auth, AuthStorage, Credential, CredentialKind,
+    resolve_provider_auth, AssistantMessage, AuthStorage, ContentBlock, Credential, CredentialKind,
+    StopReason, ToolSpec,
 };
 use pi_session::{
-    default_agent_dir, discover_sessions, latest_session, resolve_session_dir, resolve_session_ref,
-    JsonlSession,
+    default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir,
+    resolve_session_ref, JsonlSession,
 };
-use pi_tui::{builtin_themes, Component, Editor, TuiMode};
+use pi_tui::{
+    builtin_themes, ChatChrome, Component, TuiMode, ALT_BUFFER_ENTER, ALT_BUFFER_LEAVE,
+    MOUSE_DISABLE, MOUSE_ENABLE,
+};
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
 use auth_cmd::{
@@ -28,8 +34,9 @@ use auth_cmd::{
     AuthCommandKind,
 };
 use packages::handle_package_command;
-use rpc::{handle_rpc, RpcCommand};
-use settings::{is_trusted, load_settings};
+use rpc::{handle_rpc, RpcCommand, RpcRuntime};
+use settings::{is_trusted, load_settings, save_settings};
+use slash::SlashAction;
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -159,8 +166,26 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     let settings = load_settings(&default_agent_dir());
     let _trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
-    if !parsed.extensions.is_empty() {
-        agent.apply_extension_tools(&parsed.extensions);
+    let mut extensions = settings.extensions.clone();
+    extensions.extend(parsed.extensions.clone());
+    if !parsed.no_extensions && !extensions.is_empty() {
+        let manifests = extensions::discover_extensions(&default_agent_dir(), &extensions);
+        let mut names = extensions.clone();
+        names.extend(extensions::extension_tool_names(&manifests));
+        agent.apply_extension_tools(&names);
+    }
+    agent.cwd = cwd.to_path_buf();
+    let (provider, model_id) = parse_model_ref(
+        parsed.provider.as_deref().unwrap_or("google"),
+        parsed.model.as_deref(),
+    );
+    agent.provider = provider;
+    agent.model_id = model_id;
+    if let Some(key) = &parsed.api_key {
+        if let Ok(mut storage) = AuthStorage::create() {
+            storage.set_runtime_override(&agent.provider, key);
+            let _ = storage.login_api_key(&agent.provider, key);
+        }
     }
     Ok(agent)
 }
@@ -270,7 +295,13 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
     let Some(provider) = provider else {
         return Err("Auth commands require --provider <provider> or --model <model>".into());
     };
-    let storage = AuthStorage::create().map_err(|err| err.to_string())?;
+    let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+    let _ = storage.maybe_refresh(
+        &provider,
+        now_ms(),
+        command.min_expiry_ms.unwrap_or(0),
+        command.no_refresh,
+    );
     let env = std::env::vars().collect();
     let resolved = resolve_provider_auth(&provider, &storage, &env, true);
     match command.kind {
@@ -314,50 +345,94 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
     }
 }
 
-fn complete_prompt(parsed: &Args, agent: &mut Agent) -> String {
+fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>) {
     let offline = parsed.offline
         || matches!(
             std::env::var("PI_OFFLINE").as_deref(),
             Ok("1") | Ok("true") | Ok("yes")
         );
     let models = load_builtin_models();
-    let (provider, model_id) = parse_model_ref(
-        parsed.provider.as_deref().unwrap_or("google"),
-        parsed.model.as_deref(),
-    );
-    let model = find_model(&models, &provider, &model_id)
+    let model = find_model(&models, &agent.provider, &agent.model_id)
         .cloned()
-        .or_else(|| models.iter().find(|m| m.provider == provider).cloned())
+        .or_else(|| {
+            models
+                .iter()
+                .find(|m| m.provider == agent.provider)
+                .cloned()
+        })
         .or_else(|| models.first().cloned());
-    let storage = AuthStorage::create().ok();
+    let mut storage = AuthStorage::create().ok();
+    if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
+        storage.set_runtime_override(&agent.provider, key);
+    }
+    if let Some(storage) = storage.as_mut() {
+        let _ = storage.maybe_refresh(&agent.provider, now_ms(), 0, false);
+    }
     let env = std::env::vars().collect();
     let auth = storage
         .as_ref()
-        .and_then(|storage| resolve_provider_auth(&provider, storage, &env, true));
-    let last_user = agent
-        .messages
-        .last()
-        .map(|m| content_text(&m.content).len())
-        .unwrap_or(0);
-    let reply = match (offline, model, auth) {
-        (false, Some(model), Some(auth)) => {
-            match live_complete(&model, &agent.messages, &auth, Some(&agent.system_prompt)) {
-                Ok(message) => message
-                    .content
-                    .into_iter()
-                    .filter_map(|block| match block {
-                        pi_ai::ContentBlock::Text { text } => Some(text),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(""),
-                Err(err) => format!("Provider error: {err}"),
+        .and_then(|storage| resolve_provider_auth(&agent.provider, storage, &env, true));
+    let tools: Vec<ToolSpec> = pi_agent::tool_specs()
+        .into_iter()
+        .filter(|tool| agent.tools.iter().any(|name| name == &tool.name))
+        .map(|tool| ToolSpec {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+        })
+        .collect();
+    let events = agent
+        .run_loop(|current| {
+            let last_user = current
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| content_text(&m.content).len())
+                .unwrap_or(0);
+            match (offline, model.as_ref(), auth.as_ref()) {
+                (false, Some(model), Some(auth)) => live_complete(
+                    model,
+                    &current.messages,
+                    auth,
+                    Some(&current.system_prompt),
+                    &tools,
+                ),
+                _ => Ok(AssistantMessage {
+                    id: pi_agent::new_message_id(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: format!("(offline) received {last_user} characters"),
+                    }],
+                    model: format!("{}/{}", current.provider, current.model_id),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                }),
             }
-        }
-        _ => format!("(offline) received {last_user} characters"),
-    };
-    agent.record_assistant(&reply);
-    reply
+        })
+        .unwrap_or_else(|err| {
+            vec![AgentEvent::AgentEnd {
+                messages: vec![pi_ai::ChatMessage::text(
+                    "assistant",
+                    format!("Provider error: {err}"),
+                )],
+            }]
+        });
+    let reply = agent
+        .last_assistant_text()
+        .or_else(|| {
+            events.iter().rev().find_map(|event| match event {
+                AgentEvent::AgentEnd { messages } => messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .map(|m| content_text(&m.content)),
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+    (reply, events)
 }
 
 fn parse_model_ref(provider: &str, model: Option<&str>) -> (String, String) {
@@ -390,16 +465,14 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         return Ok(0);
     }
     agent.prompt(&prompt);
-    let reply = complete_prompt(parsed, agent);
+    let (reply, events) = complete_prompt(parsed, agent);
     if parsed.mode == Some(Mode::Json) {
-        println!(
-            "{}",
-            serde_json::json!({
-                "type": "message",
-                "role": "assistant",
-                "content": reply,
-            })
-        );
+        for event in events {
+            println!(
+                "{}",
+                serde_json::to_string(&event).map_err(|err| err.to_string())?
+            );
+        }
     } else {
         println!("{reply}");
     }
@@ -407,6 +480,18 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
 }
 
 fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
+    let session_dir = agent
+        .session
+        .as_ref()
+        .and_then(|session| session.path.parent())
+        .map(|path| path.parent().unwrap_or(path).to_path_buf())
+        .unwrap_or_else(pi_session::default_session_dir);
+    let cwd = agent.cwd.clone();
+    let mut runtime = RpcRuntime::new(
+        std::mem::replace(agent, Agent::new(default_system_prompt())),
+        session_dir,
+        cwd,
+    );
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.map_err(|err| err.to_string())?;
@@ -414,57 +499,257 @@ fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
             continue;
         }
         let command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
-        let response = handle_rpc(agent, command);
+        let is_prompt = command.kind == "prompt";
+        let response = handle_rpc(&mut runtime, command.clone());
+        println!(
+            "{}",
+            serde_json::to_string(&response).map_err(|err| err.to_string())?
+        );
+        if is_prompt {
+            let parsed = Args {
+                offline: matches!(
+                    std::env::var("PI_OFFLINE").as_deref(),
+                    Ok("1") | Ok("true") | Ok("yes")
+                ),
+                ..Args::default()
+            };
+            let (_reply, events) = complete_prompt(&parsed, &mut runtime.agent);
+            for event in events {
+                println!(
+                    "{}",
+                    serde_json::to_string(&event).map_err(|err| err.to_string())?
+                );
+            }
+        }
         println!(
             "{}",
             serde_json::to_string(&response).map_err(|err| err.to_string())?
         );
         io::stdout().flush().ok();
     }
+    *agent = runtime.agent;
     Ok(0)
 }
 
 fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
-    if parsed.tui_mode == Some(TuiMode::Fullscreen) {
-        print!("{}", pi_tui::ALT_BUFFER_ENTER);
+    let fullscreen = parsed.tui_mode == Some(TuiMode::Fullscreen);
+    if fullscreen {
+        print!("{ALT_BUFFER_ENTER}{MOUSE_ENABLE}");
     }
-    let theme = parsed
-        .use_theme
-        .clone()
-        .or_else(|| builtin_themes().into_iter().next().map(|t| t.name));
-    println!(
-        "{APP_NAME} {VERSION}  theme={}",
-        theme.unwrap_or_else(|| "dark".into())
-    );
+    let theme = builtin_themes()
+        .into_iter()
+        .find(|theme| parsed.use_theme.as_deref() == Some(theme.name.as_str()))
+        .or_else(|| builtin_themes().into_iter().next())
+        .expect("theme");
+    let mut chrome = ChatChrome::new(theme, format!("{APP_NAME} {VERSION}"));
+    println!("{}", chrome.render(80).join("\n"));
     if !parsed.messages.is_empty() {
         let prompt = parsed.messages.join("\n");
-        agent.prompt(&prompt);
-        let reply = complete_prompt(parsed, agent);
-        println!("{reply}");
+        handle_user_line(parsed, agent, &mut chrome, &prompt)?;
     }
-    let mut editor = Editor::new();
-    print!("> ");
-    io::stdout().flush().ok();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).ok().unwrap_or(0) > 0 {
-        editor.handle_input(input.trim_end());
-        let text = editor.submit();
-        if text == "/quit" {
-            if parsed.tui_mode == Some(TuiMode::Fullscreen) {
-                print!("{}", pi_tui::ALT_BUFFER_LEAVE);
-            }
-            return Ok(0);
+    let stdin = io::stdin();
+    loop {
+        print!("> ");
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        if stdin.lock().read_line(&mut input).ok().unwrap_or(0) == 0 {
+            break;
         }
-        if !text.is_empty() {
-            agent.prompt(&text);
-            let reply = complete_prompt(parsed, agent);
-            println!("{reply}");
+        let text = input.trim_end().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        if !handle_user_line(parsed, agent, &mut chrome, &text)? {
+            break;
         }
     }
-    if parsed.tui_mode == Some(TuiMode::Fullscreen) {
-        print!("{}", pi_tui::ALT_BUFFER_LEAVE);
+    if fullscreen {
+        print!("{MOUSE_DISABLE}{ALT_BUFFER_LEAVE}");
     }
     Ok(0)
+}
+
+fn handle_user_line(
+    parsed: &Args,
+    agent: &mut Agent,
+    chrome: &mut ChatChrome,
+    text: &str,
+) -> Result<bool, String> {
+    match slash::parse_line(text) {
+        SlashAction::Quit => Ok(false),
+        SlashAction::Prompt(prompt) => {
+            chrome.transcript.push("user", &prompt);
+            agent.prompt(&prompt);
+            let (reply, _events) = complete_prompt(parsed, agent);
+            chrome.transcript.push("assistant", &reply);
+            chrome.editor.handle_input("");
+            println!("{reply}");
+            Ok(true)
+        }
+        SlashAction::Status(message) => {
+            chrome.status = message.clone();
+            println!("{message}");
+            Ok(true)
+        }
+        SlashAction::Hotkeys => {
+            let keys = pi_tui::get_keybindings()
+                .into_iter()
+                .map(|b| format!("{}: {}", b.action, b.keys.join(", ")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            chrome.status = keys.clone();
+            println!("{keys}");
+            Ok(true)
+        }
+        SlashAction::Settings => {
+            let keys = pi_tui::get_keybindings()
+                .into_iter()
+                .map(|b| format!("{}: {}", b.action, b.keys.join(", ")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            println!("{keys}");
+            Ok(true)
+        }
+        SlashAction::SessionInfo => {
+            let info = format!(
+                "session={} messages={}",
+                agent
+                    .session
+                    .as_ref()
+                    .map(|s| s.header.id.clone())
+                    .unwrap_or_else(|| "(none)".into()),
+                agent.messages.len()
+            );
+            println!("{info}");
+            Ok(true)
+        }
+        SlashAction::NewSession => {
+            let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+            let session = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
+                .map_err(|err| err.to_string())?;
+            agent.messages.clear();
+            agent.session = Some(session);
+            println!("Started new session");
+            Ok(true)
+        }
+        SlashAction::Compact(instructions) => {
+            let result = agent.compact(instructions.as_deref());
+            println!("{}", result.summary);
+            Ok(true)
+        }
+        SlashAction::SetModel(value) => {
+            let (provider, model_id) = parse_model_ref("google", Some(&value));
+            agent.provider = provider;
+            agent.model_id = model_id;
+            println!("model={}/{}", agent.provider, agent.model_id);
+            Ok(true)
+        }
+        SlashAction::SetThinking(level) => {
+            if let Some(level) = pi_protocol::ThinkingLevel::parse(&level) {
+                agent.thinking_level = level;
+            }
+            println!("thinking={}", agent.thinking_level.as_str());
+            Ok(true)
+        }
+        SlashAction::Export(path) => {
+            if let Some(session) = &agent.session {
+                let output = PathBuf::from(path.unwrap_or_else(|| "session.html".into()));
+                println!("{}", export::export_html(session, &output)?);
+            }
+            Ok(true)
+        }
+        SlashAction::Login { provider, key } => {
+            let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+            if let Some(key) = key {
+                storage
+                    .login_api_key(&provider, key)
+                    .map_err(|e| e.to_string())?;
+                println!("stored api key for {provider}");
+            } else if let (Ok(access), refresh) = (
+                std::env::var("PI_OAUTH_ACCESS"),
+                std::env::var("PI_OAUTH_REFRESH").ok(),
+            ) {
+                storage
+                    .login_oauth(&provider, access, refresh, None)
+                    .map_err(|e| e.to_string())?;
+                println!("stored oauth token for {provider}");
+            } else {
+                println!("Usage: /login <provider> <api-key>");
+            }
+            Ok(true)
+        }
+        SlashAction::Logout { provider } => {
+            let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+            if let Some(provider) = provider {
+                storage.remove(&provider).map_err(|e| e.to_string())?;
+                println!("removed {provider}");
+            }
+            Ok(true)
+        }
+        SlashAction::Name(name) => {
+            if let Some(session) = agent.session.as_mut() {
+                session.set_name(&name).map_err(|e| e.to_string())?;
+            }
+            Ok(true)
+        }
+        SlashAction::Fork => {
+            if let Some(session) = &agent.session {
+                let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+                let next = session
+                    .fork(
+                        session.leaf_id.as_deref().unwrap_or(&session.header.id),
+                        &session_dir,
+                    )
+                    .map_err(|e| e.to_string())?;
+                agent.load_from_session(next);
+                println!("session={}", agent.session.as_ref().unwrap().header.id);
+            }
+            Ok(true)
+        }
+        SlashAction::Clone => {
+            if let Some(session) = &agent.session {
+                let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+                let next = session
+                    .clone_session(&session_dir)
+                    .map_err(|e| e.to_string())?;
+                agent.load_from_session(next);
+                println!("session={}", agent.session.as_ref().unwrap().header.id);
+            }
+            Ok(true)
+        }
+        SlashAction::Resume | SlashAction::Tree => {
+            let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+            let sessions = discover_sessions(&session_dir, Some(&agent.cwd.to_string_lossy()))
+                .map_err(|e| e.to_string())?;
+            for summary in sessions {
+                println!("{}  {}", summary.id, summary.path.display());
+            }
+            Ok(true)
+        }
+        SlashAction::Copy => {
+            if let Some(text) = agent.last_assistant_text() {
+                println!("{text}");
+            }
+            Ok(true)
+        }
+        SlashAction::Trust => {
+            let mut settings = load_settings(&default_agent_dir());
+            let cwd = agent.cwd.display().to_string();
+            if !settings.trusted_projects.contains(&cwd) {
+                settings.trusted_projects.push(cwd);
+            }
+            save_settings(&default_agent_dir(), &settings)?;
+            println!("trusted");
+            Ok(true)
+        }
+        SlashAction::Reload => {
+            agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
+            agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
+            agent.context_files = load_context_files(&agent.cwd, true);
+            println!("reloaded");
+            Ok(true)
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -528,5 +813,13 @@ mod tests {
         assert!(command.no_refresh);
         assert!(auth_cmd::parsed_auth_args(&command).provider.is_some());
         assert!(command.min_expiry_ms.is_none());
+        assert!(matches!(
+            slash::parse_line("/quit"),
+            slash::SlashAction::Quit
+        ));
+        assert!(matches!(
+            slash::parse_line("hello"),
+            slash::SlashAction::Prompt(_)
+        ));
     }
 }

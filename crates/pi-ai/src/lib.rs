@@ -2,6 +2,7 @@
 
 mod auth;
 mod catalog;
+mod oauth;
 mod providers;
 mod stream;
 
@@ -11,10 +12,12 @@ pub use auth::{
 pub use catalog::{
     builtin_provider_ids, flatten_catalog, load_builtin_models, Model, ModelCost, KNOWN_PROVIDERS,
 };
+pub use oauth::{poll_oauth_device_code_flow, DeviceCodePoller, DevicePollStatus};
 pub use providers::{builtin_providers, load_models_json, Provider, ProviderSpec, PROVIDER_SPECS};
 pub use stream::{
-    complete_from_events, fixture_complete, live_complete, parse_sse_block, replay_sse_events,
-    AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason, StreamEvent,
+    assistant_to_chat, complete_from_events, fixture_complete, live_complete, parse_sse_block,
+    replay_sse_events, AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason,
+    StreamEvent,
 };
 
 use pi_protocol::Usage;
@@ -59,6 +62,46 @@ pub struct ChatMessage {
     pub content: Vec<MessageContent>,
     #[serde(rename = "toolCallId", skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(rename = "toolName", skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+}
+
+impl ChatMessage {
+    pub fn text(role: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: vec![MessageContent::Text { text: text.into() }],
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+        }
+    }
+
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            role: "toolResult".into(),
+            content: vec![MessageContent::Text {
+                text: content.into(),
+            }],
+            tool_call_id: Some(tool_call_id.into()),
+            tool_name: Some(tool_name.into()),
+            is_error: Some(is_error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 pub fn content_text(content: &[MessageContent]) -> String {
