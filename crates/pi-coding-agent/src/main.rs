@@ -1574,7 +1574,7 @@ fn run_interactive(
             tui.render_now(false);
         }
     }
-    let result = if let Some((tui, chrome_lines)) = tui_host.take() {
+    if let Some((tui, chrome_lines)) = tui_host.take() {
         run_raw_session(
             parsed,
             agent,
@@ -1588,8 +1588,7 @@ fn run_interactive(
         let result = run_line_session(parsed, agent, &mut session);
         print!("{}", InteractiveSession::leave_sequences(fullscreen));
         result
-    };
-    result
+    }
 }
 
 struct RawModeGuard;

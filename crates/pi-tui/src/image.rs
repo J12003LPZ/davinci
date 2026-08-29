@@ -295,10 +295,7 @@ pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
     let mut command_controls = controls.to_string();
     let mut transmission_end;
     loop {
-        let Some(rel) = line[command_start + KITTY_IMAGE_PREFIX.len()..].find(KITTY_IMAGE_SUFFIX)
-        else {
-            return None;
-        };
+        let rel = line[command_start + KITTY_IMAGE_PREFIX.len()..].find(KITTY_IMAGE_SUFFIX)?;
         let terminator = command_start + KITTY_IMAGE_PREFIX.len() + rel;
         transmission_end = terminator + KITTY_IMAGE_SUFFIX.len();
         let is_more = command_controls.split(',').any(|part| part == "m=1");

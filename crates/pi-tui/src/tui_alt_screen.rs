@@ -45,6 +45,9 @@ const DOUBLE_CLICK_INTERVAL_MS: u64 = 500;
 const TERMINAL_WORD_SELECTION_JOINERS: &[char] = &['/', '-'];
 
 type StyleFn = Rc<dyn Fn(&str) -> String>;
+type OpenUrlFn = Box<dyn FnMut(&str)>;
+type RightClickPasteFn = Box<dyn FnMut()>;
+type CopySelectionFn = Box<dyn Fn(&str) -> bool>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionGranularity {
@@ -125,9 +128,9 @@ pub struct TuiAltScreenOptions {
     pub log_directory: Option<PathBuf>,
     pub search_match_style: Option<StyleFn>,
     pub search_current_match_style: Option<StyleFn>,
-    pub open_url: Option<Box<dyn FnMut(&str)>>,
-    pub on_right_click_paste: Option<Box<dyn FnMut()>>,
-    pub copy_selection: Option<Box<dyn Fn(&str) -> bool>>,
+    pub open_url: Option<OpenUrlFn>,
+    pub on_right_click_paste: Option<RightClickPasteFn>,
+    pub copy_selection: Option<CopySelectionFn>,
 }
 
 impl Default for TuiAltScreenOptions {
@@ -168,9 +171,9 @@ pub struct TuiAltScreen {
     keybindings: Keybindings,
     search_match_style: StyleFn,
     search_current_match_style: StyleFn,
-    open_url: Option<Box<dyn FnMut(&str)>>,
-    on_right_click_paste: Option<Box<dyn FnMut()>>,
-    copy_selection: Option<Box<dyn Fn(&str) -> bool>>,
+    open_url: Option<OpenUrlFn>,
+    on_right_click_paste: Option<RightClickPasteFn>,
+    copy_selection: Option<CopySelectionFn>,
     selection_anchor: Option<SelectionPoint>,
     selection_focus: Option<SelectionPoint>,
     selection_granularity: SelectionGranularity,
@@ -2126,8 +2129,8 @@ fn visit_scroll_views(
     }
 }
 
-fn find_scroll_view<'a>(root: Option<&'a dyn Component>, id: usize) -> Option<&'a ScrollView> {
-    fn visit<'b>(component: &'b dyn Component, id: usize) -> Option<&'b ScrollView> {
+fn find_scroll_view(root: Option<&dyn Component>, id: usize) -> Option<&ScrollView> {
+    fn visit(component: &dyn Component, id: usize) -> Option<&ScrollView> {
         let current = component as *const dyn Component as *const () as usize;
         if let Some(scroll) = component.as_any().downcast_ref::<ScrollView>() {
             if current == id {

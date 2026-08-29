@@ -10,6 +10,10 @@ use pi_tui::{
     TuiMainScreenRenderState, TuiMode, TuiRuntimeMode, TuiStopOptions,
 };
 
+type OpenUrlFn = Box<dyn FnMut(&str)>;
+type RightClickPasteFn = Box<dyn FnMut()>;
+type CopySelectionFn = Box<dyn Fn(&str) -> bool>;
+
 /// Live chrome lines mounted as the TUI child (TS document container snapshot).
 pub struct SharedLineView {
     pub lines: Rc<RefCell<Vec<String>>>,
@@ -40,9 +44,9 @@ pub struct InteractiveTuiOptions {
     pub terminal: Box<dyn TerminalIo>,
     pub theme: Theme,
     pub copy_on_select: bool,
-    pub open_url: Option<Box<dyn FnMut(&str)>>,
-    pub on_right_click_paste: Option<Box<dyn FnMut()>>,
-    pub copy_selection: Option<Box<dyn Fn(&str) -> bool>>,
+    pub open_url: Option<OpenUrlFn>,
+    pub on_right_click_paste: Option<RightClickPasteFn>,
+    pub copy_selection: Option<CopySelectionFn>,
 }
 
 impl InteractiveTuiOptions {
@@ -74,8 +78,8 @@ impl InteractiveTuiOptions {
 
 /// TS `createInteractiveTui`.
 pub enum InteractiveTui {
-    Main(TuiMainScreen),
-    Alt(TuiAltScreen),
+    Main(Box<TuiMainScreen>),
+    Alt(Box<TuiAltScreen>),
 }
 
 impl InteractiveTui {
@@ -271,8 +275,8 @@ impl InteractiveTui {
 
     pub fn take_terminal(self) -> Box<dyn TerminalIo> {
         match self {
-            Self::Main(tui) => tui.take_terminal(),
-            Self::Alt(tui) => tui.take_terminal(),
+            Self::Main(tui) => (*tui).take_terminal(),
+            Self::Alt(tui) => (*tui).take_terminal(),
         }
     }
 }
@@ -296,7 +300,7 @@ pub fn create_interactive_tui(options: InteractiveTuiOptions) -> InteractiveTui 
                         ))
                     })
                 };
-            InteractiveTui::Alt(TuiAltScreen::with_options(
+            InteractiveTui::Alt(Box::new(TuiAltScreen::with_options(
                 options.terminal,
                 TuiAltScreenOptions {
                     copy_on_select: options.copy_on_select,
@@ -309,13 +313,13 @@ pub fn create_interactive_tui(options: InteractiveTuiOptions) -> InteractiveTui 
                     copy_selection: options.copy_selection,
                     ..TuiAltScreenOptions::default()
                 },
-            ))
+            )))
         }
-        TuiMode::Regular => InteractiveTui::Main(TuiMainScreen::with_options(
+        TuiMode::Regular => InteractiveTui::Main(Box::new(TuiMainScreen::with_options(
             options.terminal,
             Some(options.show_hardware_cursor),
             Some(options.log_directory),
-        )),
+        ))),
     }
 }
 
