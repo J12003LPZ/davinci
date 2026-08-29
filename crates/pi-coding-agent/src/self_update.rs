@@ -792,6 +792,137 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn encode_uri_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn pi_user_agent() -> String {
+    let os = if cfg!(windows) {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{APP_NAME}/{VERSION} ({os}; rust; {arch})")
+}
+
+fn installer_api_base() -> String {
+    std::env::var("PI_INSTALLER_API_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_INSTALLER_API_BASE.into())
+}
+
+fn fetch_installer_artifact(url: &str, label: &str) -> Result<String, String> {
+    let response = ureq::get(url).set("User-Agent", &pi_user_agent()).call();
+    match response {
+        Ok(resp) => resp.into_string().map_err(|err| {
+            format!("Could not download managed installer {label} from {url}: {err}")
+        }),
+        Err(ureq::Error::Status(code, _)) => Err(format!(
+            "Could not download managed installer {label} from {url}: HTTP {code}"
+        )),
+        Err(err) => Err(format!(
+            "Could not download managed installer {label} from {url}: {err}"
+        )),
+    }
+}
+
+fn load_installer_artifacts(version: &str) -> Result<(String, String), String> {
+    if let Ok(dir) = std::env::var("PI_INSTALLER_FIXTURE") {
+        let root = Path::new(dir.trim());
+        if !dir.trim().is_empty() {
+            let package_json = fs::read_to_string(root.join("package.json")).map_err(|err| {
+                format!(
+                    "Could not download managed installer package.json from {}: {err}",
+                    root.join("package.json").display()
+                )
+            })?;
+            let package_lock =
+                fs::read_to_string(root.join("package-lock.json")).map_err(|err| {
+                    format!(
+                        "Could not download managed installer package-lock.json from {}: {err}",
+                        root.join("package-lock.json").display()
+                    )
+                })?;
+            return Ok((package_json, package_lock));
+        }
+    }
+    let release_url = format!(
+        "{}/{}/",
+        installer_api_base(),
+        encode_uri_component(version)
+    )
+    .trim_end_matches('/')
+    .to_string();
+    let package_url = format!("{release_url}/package.json");
+    if network_disabled() {
+        return Err(format!(
+            "Could not download managed installer package.json from {package_url}: network disabled"
+        ));
+    }
+    let package_json = fetch_installer_artifact(&package_url, "package.json")?;
+    let package_lock = fetch_installer_artifact(
+        &format!("{release_url}/package-lock.json"),
+        "package-lock.json",
+    )?;
+    Ok((package_json, package_lock))
+}
+
+const MANAGED_NPM_CI_ARGS: &[&str] = &[
+    "ci",
+    "--ignore-scripts",
+    "--min-release-age=0",
+    "--omit=dev",
+    "--include=optional",
+    "--no-fund",
+    "--no-audit",
+    "--loglevel=error",
+    "--progress=false",
+];
+
+fn run_managed_npm_ci(stage_dir: &Path) -> Result<(), String> {
+    let display = format!("npm {}", MANAGED_NPM_CI_ARGS.join(" "));
+    let status = Command::new("npm")
+        .args(MANAGED_NPM_CI_ARGS)
+        .current_dir(stage_dir)
+        .status()
+        .map_err(|err| format!("{display} exited with code unknown: {err}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let code = status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    Err(format!("{display} exited with code {code}"))
+}
+
 fn write_version_shim(release_dir: &Path, version: &str) -> Result<(), String> {
     let bin_dir = release_dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
@@ -827,30 +958,38 @@ pub fn run_managed_self_update(managed_root: &Path, version: &str) -> Result<(),
     let _ = fs::remove_dir_all(&stage_dir);
     fs::create_dir_all(&stage_dir).map_err(|e| e.to_string())?;
     if let Ok(fixture) = std::env::var("PI_MANAGED_RELEASE_FIXTURE") {
-        copy_tree(Path::new(&fixture), &stage_dir)?;
-        if !stage_dir
-            .join("node_modules")
-            .join(".bin")
-            .join(APP_NAME)
-            .exists()
-        {
-            write_version_shim(&stage_dir, version)?;
+        if !fixture.trim().is_empty() {
+            copy_tree(Path::new(&fixture), &stage_dir)?;
+            if !stage_dir
+                .join("node_modules")
+                .join(".bin")
+                .join(APP_NAME)
+                .exists()
+            {
+                write_version_shim(&stage_dir, version)?;
+            }
         }
-    } else if network_disabled() {
-        let _ = fs::remove_dir_all(&stage_dir);
-        let base = std::env::var("PI_INSTALLER_API_BASE")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_INSTALLER_API_BASE.into());
-        let base = base.trim_end_matches('/');
-        return Err(format!(
-            "Could not download managed installer package.json from {base}/{version}/package.json: network disabled"
-        ));
-    } else {
-        let _ = fs::remove_dir_all(&stage_dir);
-        return Err(format!(
-            "Could not download managed installer package.json from {DEFAULT_INSTALLER_API_BASE}/{version}/package.json"
-        ));
+    }
+    if !stage_dir
+        .join("node_modules")
+        .join(".bin")
+        .join(APP_NAME)
+        .exists()
+    {
+        let (package_json, package_lock) = load_installer_artifacts(version).inspect_err(|_| {
+            let _ = fs::remove_dir_all(&stage_dir);
+        })?;
+        fs::write(stage_dir.join("package.json"), package_json).map_err(|err| {
+            let _ = fs::remove_dir_all(&stage_dir);
+            err.to_string()
+        })?;
+        fs::write(stage_dir.join("package-lock.json"), package_lock).map_err(|err| {
+            let _ = fs::remove_dir_all(&stage_dir);
+            err.to_string()
+        })?;
+        run_managed_npm_ci(&stage_dir).inspect_err(|_| {
+            let _ = fs::remove_dir_all(&stage_dir);
+        })?;
     }
     verify_managed_release(&stage_dir, version).inspect_err(|_| {
         let _ = fs::remove_dir_all(&stage_dir);

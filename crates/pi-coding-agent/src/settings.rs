@@ -1,6 +1,9 @@
+use crate::args::APP_NAME;
 use serde_json::{json, Value};
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub fn agent_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
@@ -230,14 +233,173 @@ pub fn is_trusted(agent_dir: &Path, cwd: &Path) -> bool {
     trust_decision(agent_dir, cwd) == Some(true)
 }
 
+fn session_trust_cache() -> &'static Mutex<Vec<(PathBuf, bool)>> {
+    static CACHE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+    &CACHE
+}
+
+pub fn remember_session_trust(cwd: &Path, trusted: bool) {
+    let key = canonicalize_path(cwd);
+    let mut cache = session_trust_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(path, _)| path != &key);
+    cache.push((key, trusted));
+}
+
+pub fn cached_session_trust(cwd: &Path) -> Option<bool> {
+    let key = canonicalize_path(cwd);
+    session_trust_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(path, _)| path == &key)
+        .map(|(_, trusted)| *trusted)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_session_trust_cache() {
+    session_trust_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    clear_session_trust_cache();
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn save_trust(agent_dir: &Path, cwd: &Path) {
     set_trust(agent_dir, cwd, Some(true));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTrustOption {
+    pub label: String,
+    pub trusted: bool,
+    pub updates: Vec<(PathBuf, Option<bool>)>,
+}
+
+pub fn project_trust_prompt(cwd: &Path) -> String {
+    format!(
+        "Trust project folder?\n{}\n\nThis allows {APP_NAME} to load .pi settings and resources, install missing project packages, and execute project extensions.",
+        canonicalize_path(cwd).display()
+    )
+}
+
+pub fn project_trust_options(cwd: &Path, include_session_only: bool) -> Vec<ProjectTrustOption> {
+    let trust_path = canonicalize_path(cwd);
+    let mut options = vec![ProjectTrustOption {
+        label: "Trust".into(),
+        trusted: true,
+        updates: vec![(trust_path.clone(), Some(true))],
+    }];
+    if let Some(parent) = trust_path.parent() {
+        if parent != trust_path {
+            options.push(ProjectTrustOption {
+                label: format!("Trust parent folder ({})", parent.display()),
+                trusted: true,
+                updates: vec![
+                    (parent.to_path_buf(), Some(true)),
+                    (trust_path.clone(), None),
+                ],
+            });
+        }
+    }
+    if include_session_only {
+        options.push(ProjectTrustOption {
+            label: "Trust (this session only)".into(),
+            trusted: true,
+            updates: Vec::new(),
+        });
+    }
+    options.push(ProjectTrustOption {
+        label: "Do not trust".into(),
+        trusted: false,
+        updates: vec![(trust_path.clone(), Some(false))],
+    });
+    if include_session_only {
+        options.push(ProjectTrustOption {
+            label: "Do not trust (this session only)".into(),
+            trusted: false,
+            updates: Vec::new(),
+        });
+    }
+    options
+}
+
+pub fn render_project_trust_selector(cwd: &Path) -> String {
+    render_project_trust_options(cwd, true)
+}
+
+pub fn render_project_trust_options(cwd: &Path, include_session_only: bool) -> String {
+    let mut lines = vec![project_trust_prompt(cwd), String::new()];
+    for (index, option) in project_trust_options(cwd, include_session_only)
+        .iter()
+        .enumerate()
+    {
+        lines.push(format!("{}. {}", index + 1, option.label));
+    }
+    lines.join("\n") + "\n"
+}
+
+fn find_trust_option(
+    cwd: &Path,
+    selection: &str,
+    include_session_only: bool,
+) -> Option<ProjectTrustOption> {
+    let options = project_trust_options(cwd, include_session_only);
+    let trimmed = selection.trim();
+    if let Ok(index) = trimmed.parse::<usize>() {
+        if index >= 1 {
+            return options.get(index - 1).cloned();
+        }
+    }
+    options.into_iter().find(|option| option.label == trimmed)
+}
+
+pub fn apply_trust_option(agent_dir: &Path, option: &ProjectTrustOption) {
+    for (path, decision) in &option.updates {
+        match decision {
+            Some(true) => save_trust(agent_dir, path),
+            other => set_trust(agent_dir, path, *other),
+        }
+    }
+}
+
+pub fn apply_project_trust_selection(
+    agent_dir: &Path,
+    cwd: &Path,
+    selection: &str,
+    include_session_only: bool,
+) -> Option<bool> {
+    let option = find_trust_option(cwd, selection, include_session_only)?;
+    apply_trust_option(agent_dir, &option);
+    remember_session_trust(cwd, option.trusted);
+    Some(option.trusted)
+}
+
+pub fn prompt_project_trust(agent_dir: &Path, cwd: &Path) -> Option<bool> {
+    if let Ok(selection) = std::env::var("PI_PROJECT_TRUST_SELECT") {
+        if !selection.trim().is_empty() {
+            return apply_project_trust_selection(agent_dir, cwd, &selection, true);
+        }
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return None;
+    }
+    let mut stderr = io::stderr();
+    let _ = write!(stderr, "{}", render_project_trust_selector(cwd));
+    let _ = write!(stderr, "Select: ");
+    let _ = stderr.flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    apply_project_trust_selection(agent_dir, cwd, line.trim(), true)
 }
 
 pub fn set_trust(agent_dir: &Path, cwd: &Path, decision: Option<bool>) {

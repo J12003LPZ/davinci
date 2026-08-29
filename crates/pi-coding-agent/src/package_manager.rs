@@ -1495,7 +1495,7 @@ pub fn project_is_trusted(approve: Option<bool>, mode: ProjectTrustMode) -> bool
     let cwd = cwd();
     let agent = agent_dir();
     if mode == ProjectTrustMode::SavedOnly {
-        return settings::trust_decision(&agent, &cwd) == Some(true);
+        return settings::is_trusted(&agent, &cwd);
     }
     if !settings::has_trust_requiring_project_resources(&cwd) {
         return true;
@@ -1509,7 +1509,18 @@ pub fn project_is_trusted(approve: Option<bool>, mode: ProjectTrustMode) -> bool
     if let Some(decision) = settings::trust_decision(&agent, &cwd) {
         return decision;
     }
-    SettingsDocument::load(&settings_path(false)).default_project_trust() == "always"
+    match SettingsDocument::load(&settings_path(false)).default_project_trust() {
+        "always" => true,
+        "never" => false,
+        _ => {
+            if let Some(cached) = settings::cached_session_trust(&cwd) {
+                return cached;
+            }
+            let trusted = settings::prompt_project_trust(&agent, &cwd).unwrap_or(false);
+            settings::remember_session_trust(&cwd, trusted);
+            trusted
+        }
+    }
 }
 
 #[cfg(test)]

@@ -124,11 +124,13 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
     }
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    if parsed.project_trust_override == Some(false) {
-        // --no-approve: do not load project-local extensions/skills later
-    } else if parsed.project_trust_override != Some(true)
-        && !settings::is_trusted(&commands::agent_dir(), &cwd)
-        && cwd.join(".pi").exists()
+    let project_trusted = crate::package_manager::project_is_trusted(
+        parsed.project_trust_override,
+        crate::package_manager::ProjectTrustMode::Full,
+    );
+    if parsed.project_trust_override != Some(false)
+        && !project_trusted
+        && settings::has_trust_requiring_project_resources(&cwd)
     {
         eprintln!(
             "Warning: project {} is not trusted. Use --approve or /trust.",
@@ -192,7 +194,11 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         &parsed.append_system_prompt,
         &context,
     );
-    let mut skill_paths = discover_default_skill_dirs(&cwd, &commands::agent_dir());
+    let mut skill_paths = if project_trusted {
+        discover_default_skill_dirs(&cwd, &commands::agent_dir())
+    } else {
+        vec![commands::agent_dir().join("skills")]
+    };
     skill_paths.extend(parsed.skills.iter().map(PathBuf::from));
     let skills = load_skills(&skill_paths, parsed.no_skills);
     let mut system_prompt = system_prompt;
@@ -208,6 +214,7 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         &cwd,
         &parsed.extensions,
         parsed.no_extensions,
+        parsed.project_trust_override,
     );
     let bus = EventBus::new();
     extensions::attach_extensions(&bus, &discovered);

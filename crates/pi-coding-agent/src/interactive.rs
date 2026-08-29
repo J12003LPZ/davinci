@@ -415,9 +415,36 @@ impl InteractiveMode {
                 }
             }
             "trust" => {
-                settings::save_trust(&commands::agent_dir(), &self.runtime.cwd);
-                self.chat
-                    .push("system", format!("trusted {}", self.runtime.cwd.display()));
+                let cwd = self.runtime.cwd.clone();
+                let agent = commands::agent_dir();
+                let options = settings::project_trust_options(&cwd, false);
+                if args.is_empty() {
+                    self.show_selector(
+                        "Project trust",
+                        options.iter().map(|option| option.label.clone()).collect(),
+                    );
+                    self.chat.push(
+                        "system",
+                        format!(
+                            "{}\nUse /trust <option> to save a trust decision.",
+                            settings::render_project_trust_options(&cwd, false).trim_end()
+                        ),
+                    );
+                } else if let Some(trusted) =
+                    settings::apply_project_trust_selection(&agent, &cwd, args, false)
+                {
+                    self.chat.push(
+                        "system",
+                        format!(
+                            "Saved trust decision: {}. Restart {} for this to take effect.",
+                            if trusted { "trusted" } else { "untrusted" },
+                            crate::args::APP_NAME
+                        ),
+                    );
+                } else {
+                    self.chat
+                        .push("error", format!("Unknown trust option: {args}"));
+                }
             }
             "login" => {
                 if let Some(url) = pi_ai::authorize_url(args, "http://127.0.0.1:8765/cb", "pi") {

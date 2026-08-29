@@ -1019,6 +1019,74 @@ mod tests {
     }
 
     #[test]
+    fn list_prompts_project_trust_selector_like_typescript() {
+        with_agent_dir(|| {
+            let cwd = std::env::current_dir().unwrap();
+            let project = cwd.join(".pi");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("settings.json"),
+                r#"{"packages":["npm:@project/pkg"]}"#,
+            )
+            .unwrap();
+            let previous = std::env::var("PI_PROJECT_TRUST_SELECT").ok();
+            std::env::set_var("PI_PROJECT_TRUST_SELECT", "Trust");
+            let trusted = dispatch_subcommand(&["list".into()]);
+            assert!(
+                trusted.stdout.contains("Project packages:"),
+                "{}",
+                trusted.stdout
+            );
+            assert!(crate::settings::is_trusted(&agent_dir(), &cwd));
+
+            crate::settings::set_trust(&agent_dir(), &cwd, None);
+            crate::settings::clear_session_trust_cache();
+            std::env::set_var("PI_PROJECT_TRUST_SELECT", "Do not trust");
+            let denied = dispatch_subcommand(&["list".into()]);
+            assert_eq!(denied.stdout, "No packages installed.\n");
+            assert_eq!(
+                crate::settings::trust_decision(&agent_dir(), &cwd),
+                Some(false)
+            );
+
+            crate::settings::set_trust(&agent_dir(), &cwd, None);
+            crate::settings::clear_session_trust_cache();
+            std::env::set_var("PI_PROJECT_TRUST_SELECT", "Trust (this session only)");
+            let session = dispatch_subcommand(&["list".into()]);
+            assert!(session.stdout.contains("Project packages:"));
+            assert_eq!(crate::settings::trust_decision(&agent_dir(), &cwd), None);
+
+            crate::settings::clear_session_trust_cache();
+            std::env::set_var("PI_PROJECT_TRUST_SELECT", "2");
+            let parent = dispatch_subcommand(&["list".into()]);
+            assert!(parent.stdout.contains("Project packages:"));
+            assert!(crate::settings::is_trusted(&agent_dir(), &cwd));
+            let parent_path = crate::settings::canonicalize_path(&cwd)
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap();
+            assert_eq!(
+                crate::settings::trust_decision(&agent_dir(), &parent_path),
+                Some(true)
+            );
+
+            crate::settings::set_trust(&agent_dir(), &cwd, None);
+            crate::settings::set_trust(&agent_dir(), &parent_path, None);
+            crate::settings::clear_session_trust_cache();
+            std::fs::write(settings_path(false), r#"{"defaultProjectTrust":"never"}"#).unwrap();
+            std::env::set_var("PI_PROJECT_TRUST_SELECT", "Trust");
+            let never = dispatch_subcommand(&["list".into()]);
+            assert_eq!(never.stdout, "No packages installed.\n");
+            assert_eq!(crate::settings::trust_decision(&agent_dir(), &cwd), None);
+
+            match previous {
+                Some(v) => std::env::set_var("PI_PROJECT_TRUST_SELECT", v),
+                None => std::env::remove_var("PI_PROJECT_TRUST_SELECT"),
+            }
+        });
+    }
+
+    #[test]
     fn managed_install_self_update_matches_typescript() {
         with_agent_dir(|| {
             let root = tempdir().unwrap();
@@ -1106,6 +1174,137 @@ mod tests {
             match previous_latest {
                 Some(v) => std::env::set_var("PI_SELF_UPDATE_FIXTURE", v),
                 None => std::env::remove_var("PI_SELF_UPDATE_FIXTURE"),
+            }
+        });
+    }
+
+    #[test]
+    fn managed_install_npm_ci_staging_matches_typescript() {
+        with_agent_dir(|| {
+            let root = tempdir().unwrap();
+            let managed = root.path().join("install");
+            let current_release = managed.join("releases").join(VERSION);
+            let package_dir = current_release
+                .join("node_modules")
+                .join("@earendil-works")
+                .join("pi-coding-agent");
+            std::fs::create_dir_all(&package_dir).unwrap();
+            write_pi_shim(&current_release, VERSION);
+            std::fs::write(managed.join("current-version"), format!("{VERSION}\n")).unwrap();
+            std::fs::write(
+                managed.join("managed-install.json"),
+                r#"{"kind":"pi-managed-install","schemaVersion":1,"layout":"releases-v1"}
+"#,
+            )
+            .unwrap();
+
+            let installer = root.path().join("installer");
+            std::fs::create_dir_all(&installer).unwrap();
+            std::fs::write(installer.join("package.json"), "{}\n").unwrap();
+            std::fs::write(installer.join("package-lock.json"), "{}\n").unwrap();
+
+            let bin = root.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let record = root.path().join("npm-ci-args.txt");
+            let npm = bin.join("npm");
+            std::fs::write(
+                &npm,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nmkdir -p node_modules/.bin\ncat > node_modules/.bin/pi <<'EOF'\n#!/bin/sh\nprintf '%s\\n' 0.84.5\nEOF\nchmod 755 node_modules/.bin/pi\nexit 0\n",
+                    record.display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&npm).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&npm, perms).unwrap();
+            }
+
+            let latest = root.path().join("latest.json");
+            std::fs::write(&latest, r#"{"version":"0.84.5"}"#).unwrap();
+            let previous_root = std::env::var("PI_MANAGED_INSTALL_ROOT").ok();
+            let previous_pkg = std::env::var("PI_PACKAGE_DIR").ok();
+            let previous_latest = std::env::var("PI_SELF_UPDATE_FIXTURE").ok();
+            let previous_installer = std::env::var("PI_INSTALLER_FIXTURE").ok();
+            let previous_path = std::env::var("PATH").ok();
+            std::env::set_var("PI_MANAGED_INSTALL_ROOT", &managed);
+            std::env::set_var("PI_PACKAGE_DIR", &package_dir);
+            std::env::set_var("PI_SELF_UPDATE_FIXTURE", &latest);
+            std::env::set_var("PI_INSTALLER_FIXTURE", &installer);
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    previous_path.as_deref().unwrap_or("/usr/bin")
+                ),
+            );
+
+            let updated = dispatch_subcommand(&["update".into(), "--self".into()]);
+            assert_eq!(updated.exit_code, 0, "{}", updated.stderr);
+            assert!(updated
+                .stdout
+                .contains(&format!("Updated pi from {VERSION} to 0.84.5")));
+            assert_eq!(
+                std::fs::read_to_string(managed.join("current-version"))
+                    .unwrap()
+                    .trim(),
+                "0.84.5"
+            );
+            let recorded = std::fs::read_to_string(&record).unwrap();
+            for flag in [
+                "ci",
+                "--ignore-scripts",
+                "--min-release-age=0",
+                "--omit=dev",
+                "--include=optional",
+                "--no-fund",
+                "--no-audit",
+                "--loglevel=error",
+                "--progress=false",
+            ] {
+                assert!(recorded.contains(flag), "{recorded}");
+            }
+            assert!(managed.join("releases").join("0.84.5").exists());
+
+            std::fs::remove_dir_all(managed.join("releases").join("0.84.5")).unwrap();
+            std::fs::write(managed.join("current-version"), format!("{VERSION}\n")).unwrap();
+            std::fs::write(
+                &npm,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 3\n",
+                    record.display()
+                ),
+            )
+            .unwrap();
+            let failed = dispatch_subcommand(&["update".into(), "--self".into()]);
+            assert_eq!(failed.exit_code, 1, "{}", failed.stderr);
+            assert!(failed.stderr.contains(
+                "npm ci --ignore-scripts --min-release-age=0 --omit=dev --include=optional --no-fund --no-audit --loglevel=error --progress=false exited with code 3"
+            ));
+
+            match previous_root {
+                Some(v) => std::env::set_var("PI_MANAGED_INSTALL_ROOT", v),
+                None => std::env::remove_var("PI_MANAGED_INSTALL_ROOT"),
+            }
+            match previous_pkg {
+                Some(v) => std::env::set_var("PI_PACKAGE_DIR", v),
+                None => std::env::remove_var("PI_PACKAGE_DIR"),
+            }
+            match previous_latest {
+                Some(v) => std::env::set_var("PI_SELF_UPDATE_FIXTURE", v),
+                None => std::env::remove_var("PI_SELF_UPDATE_FIXTURE"),
+            }
+            match previous_installer {
+                Some(v) => std::env::set_var("PI_INSTALLER_FIXTURE", v),
+                None => std::env::remove_var("PI_INSTALLER_FIXTURE"),
+            }
+            match previous_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
             }
         });
     }

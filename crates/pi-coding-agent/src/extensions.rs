@@ -20,6 +20,7 @@ pub fn discover_extensions(
     cwd: &Path,
     extra: &[String],
     no_discover: bool,
+    approve: Option<bool>,
 ) -> Vec<Extension> {
     let mut found = Vec::new();
     for path in extra {
@@ -29,7 +30,7 @@ pub fn discover_extensions(
         return found;
     }
     let trusted = crate::package_manager::project_is_trusted(
-        None,
+        approve,
         crate::package_manager::ProjectTrustMode::Full,
     );
     for ext in crate::package_manager::resolve_resources(agent_dir, cwd, trusted).extensions {
@@ -37,10 +38,11 @@ pub fn discover_extensions(
             push_extension(&ext.path, &mut found);
         }
     }
-    for dir in [
-        cwd.join(".pi").join("extensions"),
-        agent_dir.join("extensions"),
-    ] {
+    let mut dirs = vec![agent_dir.join("extensions")];
+    if trusted {
+        dirs.insert(0, cwd.join(".pi").join("extensions"));
+    }
+    for dir in dirs {
         if dir.is_dir() {
             for entry in WalkDir::new(&dir).max_depth(2).into_iter().flatten() {
                 let path = entry.path();
@@ -1187,7 +1189,7 @@ mod tests {
         fs::create_dir_all(&ext_dir).unwrap();
         let hello = ext_dir.join("hello.js");
         fs::write(&hello, "exports.ping = () => ({ ok: true });").unwrap();
-        let found = discover_extensions(dir.path(), dir.path(), &[], false);
+        let found = discover_extensions(dir.path(), dir.path(), &[], false, Some(true));
         assert!(found.iter().any(|e| e.name == "hello" && e.path == hello));
         let settings = load_settings_value(dir.path().join("missing.json").as_path());
         assert!(settings_packages(&settings).is_empty());
