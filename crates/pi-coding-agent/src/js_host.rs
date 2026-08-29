@@ -27,6 +27,8 @@ pub struct JsExtensionResult {
     pub message_renderers: Vec<String>,
     #[serde(default, rename = "entryRenderers")]
     pub entry_renderers: Vec<String>,
+    #[serde(default, rename = "markdownTransformers")]
+    pub markdown_transformers: u32,
     #[serde(default)]
     pub result: Option<Value>,
     #[serde(default)]
@@ -279,6 +281,43 @@ module.exports = (pi) => {
         .unwrap()
         .result
         .is_none());
+    }
+
+    #[test]
+    fn registers_entry_renderer_and_markdown_transformer() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerEntryRenderer("ticket", (entry) => [`entry:${entry.customType}`]);
+  pi.registerMarkdownTransformer((markdown) => markdown.replace("TODO", "DONE"));
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        assert_eq!(loaded.entry_renderers, ["ticket"]);
+        assert_eq!(loaded.markdown_transformers, 1);
+        let entry = run_js_extension(
+            &module,
+            "renderEntry",
+            &serde_json::json!({"customType":"ticket","entry":{"customType":"ticket"}}),
+        )
+        .unwrap();
+        assert_eq!(entry.result.as_ref().unwrap()["lines"][0], "entry:ticket");
+        let transformed = run_js_extension(
+            &module,
+            "transformMarkdown",
+            &serde_json::json!({"markdown":"TODO now"}),
+        )
+        .unwrap();
+        assert_eq!(transformed.result.as_ref().unwrap()["markdown"], "DONE now");
     }
 
     #[test]

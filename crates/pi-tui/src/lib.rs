@@ -213,9 +213,14 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("Title")));
         assert!(get_keybindings().iter().any(|b| b.action == "cycle-model"));
         let mut chrome = ChatChrome::new(builtin_themes()[0].clone(), "pi 0.84.4");
+        chrome
+            .transcript
+            .extra_transformers
+            .push(|text, _, _| text.replace("hello", "hallo"));
         chrome.transcript.push("user", "hi");
         chrome.transcript.push("assistant", "# hello");
         let rendered = chrome.render(40);
+        assert!(rendered.iter().any(|line| line.contains("hallo")));
         assert!(rendered.iter().any(|line| line.contains("pi 0.84.4")));
         assert!(parse_mouse_sgr("\x1b[<0;2;2M").is_some());
         assert_eq!(render_latex("\\pi", false).as_deref(), Some("π"));

@@ -293,6 +293,57 @@ async function main() {
 				result = { lines: component.lines };
 			}
 		}
+	} else if (op === "renderEntry") {
+		const renderer = recorded.entryRenderers[payload.customType];
+		const theme = {
+			fg(_role, text) {
+				return text;
+			},
+			bg(_role, text) {
+				return text;
+			},
+			bold(text) {
+				return text;
+			},
+		};
+		if (typeof renderer === "function") {
+			const component = renderer(
+				payload.entry || {
+					type: "custom",
+					customType: payload.customType,
+					data: payload.data || {},
+				},
+				payload.options || { expanded: false },
+				theme,
+			);
+			if (component == null) {
+				result = { lines: null };
+			} else if (typeof component.render === "function") {
+				result = { lines: component.render(payload.width || 80) };
+			} else if (typeof component === "string") {
+				result = { lines: [component] };
+			} else if (Array.isArray(component)) {
+				result = { lines: component };
+			} else if (component && Array.isArray(component.lines)) {
+				result = { lines: component.lines };
+			}
+		}
+	} else if (op === "transformMarkdown") {
+		let text = payload.markdown || payload.text || "";
+		const context = payload.context || {
+			messageType: "assistant",
+			isStreaming: false,
+			availableWidth: payload.width || 80,
+		};
+		for (const transformer of recorded.markdownTransformers) {
+			if (typeof transformer === "function") {
+				const next = transformer(text, context);
+				if (typeof next === "string") {
+					text = next;
+				}
+			}
+		}
+		result = { markdown: text };
 	}
 	process.stdout.write(
 		JSON.stringify({
@@ -304,6 +355,7 @@ async function main() {
 			shortcuts: recorded.shortcuts,
 			messageRenderers: Object.keys(recorded.messageRenderers),
 			entryRenderers: Object.keys(recorded.entryRenderers),
+			markdownTransformers: recorded.markdownTransformers.length,
 			result,
 		}),
 	);

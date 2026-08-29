@@ -612,13 +612,7 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     session.chrome.transcript.mermaid_mode = session.mermaid_mode;
     session.chrome.transcript.hide_thinking_block = stored.hide_thinking_block.unwrap_or(false);
     session.enabled_model_ids = stored.enabled_models.clone();
-    let mut extensions = stored.extensions.clone();
-    extensions.extend(parsed.extensions.clone());
-    let host = if parsed.no_extensions {
-        ExtensionHost::default()
-    } else {
-        ExtensionHost::load(&default_agent_dir(), &extensions)
-    };
+    let host = loaded_extension_host(parsed);
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
     if should_run_first_time_setup(&settings_path(&default_agent_dir())) {
@@ -947,6 +941,8 @@ fn handle_user_line(
             agent.prompt(&prompt);
             let (reply, events) = complete_prompt(parsed, agent);
             apply_tool_events(chrome, &events);
+            let host = loaded_extension_host(parsed);
+            let reply = host.transform_markdown(&reply, "assistant", false, 80);
             chrome.transcript.push("assistant", &reply);
             chrome.editor.handle_input("");
             println!("{reply}");
@@ -1357,6 +1353,17 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+fn loaded_extension_host(parsed: &Args) -> ExtensionHost {
+    let stored = load_settings(&default_agent_dir());
+    let mut extensions = stored.extensions.clone();
+    extensions.extend(parsed.extensions.clone());
+    if parsed.no_extensions {
+        ExtensionHost::default()
+    } else {
+        ExtensionHost::load(&default_agent_dir(), &extensions)
+    }
+}
+
 fn replay_custom_messages(agent: &Agent, session: &mut InteractiveSession, host: &ExtensionHost) {
     let Some(store) = agent.session.as_ref() else {
         return;
@@ -1389,9 +1396,19 @@ fn replay_custom_messages(agent: &Agent, session: &mut InteractiveSession, host:
                     .filter(|text| !text.is_empty())
             })
             .unwrap_or_default();
-        let lines = host.get_message_renderer(&custom_type).and_then(|_| {
-            host.render_custom_message(&custom_type, &content, false, 1, session.width)
-        });
+        let lines = if entry.entry_type == "custom" {
+            let data = entry
+                .extra
+                .get("data")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            host.get_entry_renderer(&custom_type)
+                .and_then(|_| host.render_custom_entry(&custom_type, &data, false, session.width))
+        } else {
+            host.get_message_renderer(&custom_type).and_then(|_| {
+                host.render_custom_message(&custom_type, &content, false, 1, session.width)
+            })
+        };
         session
             .chrome
             .transcript

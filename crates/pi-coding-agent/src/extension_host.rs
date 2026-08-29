@@ -50,6 +50,8 @@ pub struct LoadedJsExtension {
     pub tools: Vec<String>,
     pub commands: Vec<String>,
     pub message_renderers: Vec<String>,
+    pub entry_renderers: Vec<String>,
+    pub markdown_transformers: u32,
 }
 
 #[derive(Debug, Default)]
@@ -59,6 +61,8 @@ pub struct ExtensionHost {
     pub js: Vec<LoadedJsExtension>,
     pub last_js_result: Option<Value>,
     pub message_renderers: std::collections::HashMap<String, String>,
+    pub entry_renderers: std::collections::HashMap<String, String>,
+    pub markdown_modules: Vec<String>,
 }
 
 impl ExtensionHost {
@@ -70,6 +74,8 @@ impl ExtensionHost {
             js: Vec::new(),
             last_js_result: None,
             message_renderers: std::collections::HashMap::new(),
+            entry_renderers: std::collections::HashMap::new(),
+            markdown_modules: Vec::new(),
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -86,6 +92,13 @@ impl ExtensionHost {
                             host.message_renderers
                                 .insert(custom_type.clone(), path.clone());
                         }
+                        for custom_type in &loaded.entry_renderers {
+                            host.entry_renderers
+                                .insert(custom_type.clone(), path.clone());
+                        }
+                        if loaded.markdown_transformers > 0 {
+                            host.markdown_modules.push(path.clone());
+                        }
                         host.js.push(LoadedJsExtension {
                             path,
                             handlers: loaded.handlers,
@@ -96,6 +109,8 @@ impl ExtensionHost {
                                 .map(|command| command.name)
                                 .collect(),
                             message_renderers: loaded.message_renderers,
+                            entry_renderers: loaded.entry_renderers,
+                            markdown_transformers: loaded.markdown_transformers,
                         });
                     }
                 }
@@ -168,6 +183,76 @@ impl ExtensionHost {
         })
     }
 
+    pub fn get_entry_renderer(&self, custom_type: &str) -> Option<&str> {
+        self.entry_renderers.get(custom_type).map(String::as_str)
+    }
+
+    pub fn render_custom_entry(
+        &self,
+        custom_type: &str,
+        data: &Value,
+        expanded: bool,
+        width: usize,
+    ) -> Option<Vec<String>> {
+        let module = self.entry_renderers.get(custom_type)?;
+        let rendered = run_js_extension(
+            Path::new(module),
+            "renderEntry",
+            &serde_json::json!({
+                "customType": custom_type,
+                "entry": {
+                    "type": "custom",
+                    "customType": custom_type,
+                    "data": data
+                },
+                "options": { "expanded": expanded },
+                "width": width
+            }),
+        )
+        .ok()?;
+        rendered.result?.get("lines")?.as_array().map(|lines| {
+            lines
+                .iter()
+                .filter_map(|line| line.as_str().map(str::to_string))
+                .collect()
+        })
+    }
+
+    pub fn transform_markdown(
+        &self,
+        markdown: &str,
+        message_type: &str,
+        is_streaming: bool,
+        width: usize,
+    ) -> String {
+        let mut text = markdown.to_string();
+        for module in &self.markdown_modules {
+            if let Ok(result) = run_js_extension(
+                Path::new(module),
+                "transformMarkdown",
+                &serde_json::json!({
+                    "markdown": text,
+                    "context": {
+                        "messageType": message_type,
+                        "isStreaming": is_streaming,
+                        "availableWidth": width
+                    },
+                    "width": width
+                }),
+            ) {
+                if let Some(next) = result
+                    .result
+                    .as_ref()
+                    .and_then(|value| value.get("markdown"))
+                    .and_then(Value::as_str)
+                {
+                    text = next.to_string();
+                }
+            }
+        }
+        text
+    }
+
     pub fn execute_named_tool(&self, name: &str, cwd: &Path) -> Option<Result<String, String>> {
         for manifest in &self.manifests {
             for tool in &manifest.tools {
@@ -217,11 +302,13 @@ impl ExtensionHost {
             .iter()
             .map(|ext| {
                 format!(
-                    "{} handlers={} commands={} renderers={}",
+                    "{} handlers={} commands={} renderers={} entries={} md={}",
                     ext.path,
                     ext.handlers.join(","),
                     ext.commands.join(","),
-                    ext.message_renderers.join(",")
+                    ext.message_renderers.join(","),
+                    ext.entry_renderers.join(","),
+                    ext.markdown_transformers
                 )
             })
             .collect::<Vec<_>>()

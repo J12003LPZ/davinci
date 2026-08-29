@@ -18,6 +18,7 @@ pub struct Transcript {
     pub mermaid_mode: MermaidMode,
     pub hide_thinking_block: bool,
     pub renderers: crate::custom_message::MessageRendererRegistry,
+    pub extra_transformers: Vec<fn(&str, &str, usize) -> String>,
 }
 
 impl Default for Transcript {
@@ -28,6 +29,7 @@ impl Default for Transcript {
             mermaid_mode: MermaidMode::Streaming,
             hide_thinking_block: false,
             renderers: crate::custom_message::MessageRendererRegistry::default(),
+            extra_transformers: Vec::new(),
         }
     }
 }
@@ -108,7 +110,17 @@ impl Component for Transcript {
                         accent: String::new(),
                     }),
                 );
+                let transformed = apply_extra_transformers(
+                    &transformed,
+                    &self.extra_transformers,
+                    "assistant",
+                    width,
+                );
                 out.extend(render_markdown(&transformed, width));
+            } else if line.role == "user" {
+                let transformed =
+                    apply_extra_transformers(&line.text, &self.extra_transformers, "user", width);
+                out.extend(crate::render::wrap_text(&transformed, width));
             } else {
                 out.extend(crate::render::wrap_text(&line.text, width));
             }
@@ -118,6 +130,19 @@ impl Component for Transcript {
     }
 
     fn invalidate(&mut self) {}
+}
+
+fn apply_extra_transformers(
+    text: &str,
+    transformers: &[fn(&str, &str, usize) -> String],
+    message_type: &str,
+    width: usize,
+) -> String {
+    transformers
+        .iter()
+        .fold(text.to_string(), |acc, transform| {
+            transform(&acc, message_type, width)
+        })
 }
 
 fn truncate(line: &str, width: usize) -> String {
