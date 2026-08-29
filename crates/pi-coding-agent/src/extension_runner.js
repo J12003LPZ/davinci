@@ -511,6 +511,53 @@ async function main() {
 			return raw;
 		}
 	}
+	function waitForUiReply(kind, opts, extra) {
+		if (process.env.PI_EXTENSION_UI_REPLY !== undefined && process.env.PI_EXTENSION_UI_REPLY !== "") {
+			return Promise.resolve(uiReply(kind));
+		}
+		const channel = process.env.PI_EXTENSION_UI_CHANNEL;
+		const wait = process.env.PI_RPC_UI_WAIT === "1" && channel;
+		if (!wait) return Promise.resolve(uiReply(kind));
+		const fs = require("fs");
+		const path = require("path");
+		const id = `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+		const requestPath = path.join(channel, `${id}.req`);
+		const replyPath = path.join(channel, `${id}.rep`);
+		const timeout = opts && typeof opts.timeout === "number" ? opts.timeout : undefined;
+		fs.writeFileSync(requestPath, JSON.stringify({ id, kind, timeout, ...extra }));
+		return new Promise((resolve) => {
+			const started = Date.now();
+			const timer = setInterval(() => {
+				if (fs.existsSync(replyPath)) {
+					clearInterval(timer);
+					try {
+						const body = fs.readFileSync(replyPath, "utf8");
+						try {
+							fs.unlinkSync(replyPath);
+						} catch (_error) {
+							/* ignore */
+						}
+						if (body === "" || body === "null" || body === "undefined") {
+							resolve(kind === "confirm" ? false : undefined);
+							return;
+						}
+						try {
+							resolve(JSON.parse(body));
+						} catch (_error) {
+							resolve(body);
+						}
+					} catch (_error) {
+						resolve(kind === "confirm" ? false : undefined);
+					}
+					return;
+				}
+				if (timeout !== undefined && Date.now() - started >= timeout) {
+					clearInterval(timer);
+					resolve(kind === "confirm" ? false : undefined);
+				}
+			}, 20);
+		});
+	}
 	function matchesKeySafe(data, name) {
 		const key = String(name || "").toLowerCase();
 		if (key === "escape" || key === "esc") return data === "\x1b";
@@ -524,21 +571,21 @@ async function main() {
 	}
 	function makeUi() {
 		return {
-			select(title, options) {
-				recorded.uiCalls.push({ op: "select", title, options });
-				return Promise.resolve(uiReply("select"));
+			select(title, options, opts) {
+				recorded.uiCalls.push({ op: "select", title, options, timeout: opts && opts.timeout });
+				return waitForUiReply("select", opts, { op: "select", title, options });
 			},
-			confirm(title, message) {
-				recorded.uiCalls.push({ op: "confirm", title, message });
-				return Promise.resolve(uiReply("confirm"));
+			confirm(title, message, opts) {
+				recorded.uiCalls.push({ op: "confirm", title, message, timeout: opts && opts.timeout });
+				return waitForUiReply("confirm", opts, { op: "confirm", title, message });
 			},
-			input(title, placeholder) {
-				recorded.uiCalls.push({ op: "input", title, placeholder });
-				return Promise.resolve(uiReply("input"));
+			input(title, placeholder, opts) {
+				recorded.uiCalls.push({ op: "input", title, placeholder, timeout: opts && opts.timeout });
+				return waitForUiReply("input", opts, { op: "input", title, placeholder });
 			},
-			editor(title, prefill) {
-				recorded.uiCalls.push({ op: "editor", title, prefill });
-				return Promise.resolve(uiReply("editor"));
+			editor(title, prefill, opts) {
+				recorded.uiCalls.push({ op: "editor", title, prefill, timeout: opts && opts.timeout });
+				return waitForUiReply("editor", opts, { op: "editor", title, prefill });
 			},
 			notify(message, type) {
 				recorded.uiCalls.push({ op: "notify", message, type: type || "info" });

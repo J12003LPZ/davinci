@@ -1,10 +1,12 @@
 //! JavaScript extension subprocess runner matching
 //! `vendor/pi/packages/coding-agent/src/core/extensions/loader.ts` when Node is present.
 
-use std::io::{BufRead, BufReader, Write};
+use std::cell::RefCell;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -254,6 +256,56 @@ impl Drop for PersistentJsSession {
 static PERSISTENT_JS: Mutex<Option<PersistentJsSession>> = Mutex::new(None);
 static NODE_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    static UI_WAITER: RefCell<Option<Box<dyn FnMut(&Value) -> Value>>> = const { RefCell::new(None) };
+}
+
+pub fn install_ui_waiter(waiter: Box<dyn FnMut(&Value) -> Value>) {
+    UI_WAITER.with(|slot| {
+        *slot.borrow_mut() = Some(waiter);
+    });
+}
+
+pub fn clear_ui_waiter() {
+    UI_WAITER.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+fn ui_waiter_installed() -> bool {
+    UI_WAITER.with(|slot| slot.borrow().is_some())
+}
+
+fn dispatch_ui_waiter(call: &Value) -> Value {
+    UI_WAITER.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|waiter| waiter(call))
+            .unwrap_or(Value::Null)
+    })
+}
+
+fn poll_ui_channel(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("req") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(call) = serde_json::from_str::<Value>(&body) else {
+            continue;
+        };
+        let reply = dispatch_ui_waiter(&call);
+        let _ = std::fs::write(path.with_extension("rep"), reply.to_string());
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub fn run_persistent_js_extension(
     module: &Path,
     op: &str,
@@ -290,19 +342,52 @@ pub fn run_js_extension(
     let node =
         find_node().ok_or_else(|| "Node.js is not available for JS extensions".to_string())?;
     let runner = runner_path()?;
-    let mut child = Command::new(node)
+    let wait_ui = ui_waiter_installed();
+    let channel = if wait_ui {
+        let dir = std::env::temp_dir().join(format!("pi-ui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        Some(dir)
+    } else {
+        None
+    };
+    let mut command = Command::new(node);
+    command
         .arg(&runner)
         .arg(module)
         .arg(op)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| err.to_string())?;
+        .stderr(Stdio::piped());
+    if let Some(dir) = &channel {
+        command.env("PI_RPC_UI_WAIT", "1");
+        command.env("PI_EXTENSION_UI_CHANNEL", dir);
+        command.env_remove("PI_EXTENSION_UI_REPLY");
+    }
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(payload.to_string().as_bytes())
             .map_err(|err| err.to_string())?;
+    }
+    if let Some(dir) = &channel {
+        while child.try_wait().map_err(|err| err.to_string())?.is_none() {
+            poll_ui_channel(dir);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        poll_ui_channel(dir);
+        let mut stdout = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            pipe.read_to_string(&mut stdout)
+                .map_err(|err| err.to_string())?;
+        }
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        return serde_json::from_str(&stdout).map_err(|err| {
+            format!("extension runner: {err}: {} {stderr}", stdout.trim())
+        });
     }
     let output = child.wait_with_output().map_err(|err| err.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -998,6 +1083,62 @@ module.exports = (pi) => {
         std::env::remove_var("PI_EXTENSION_UI_REPLY");
         assert_eq!(command.result.as_ref().unwrap()["choice"], "a");
         assert!(command.ui_calls.iter().any(|call| call["op"] == "select"));
+    }
+
+    #[test]
+    fn rpc_ui_wait_uses_waiter_and_timeout_default() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerCommand("ask", {
+    description: "ask",
+    handler: async (_args, ctx) => {
+      const choice = await ctx.ui.select("Pick", ["a", "b"]);
+      return { choice: choice ?? "timeout" };
+    },
+  });
+  pi.registerCommand("slow", {
+    description: "slow",
+    handler: async (_args, ctx) => {
+      const choice = await ctx.ui.select("Pick", ["a", "b"], { timeout: 80 });
+      return { choice: choice ?? "timeout" };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        install_ui_waiter(Box::new(|call| {
+            assert_eq!(call["op"], "select");
+            Value::String("a".into())
+        }));
+        let answered = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "ask", "ctx": { "mode": "rpc" } }),
+        )
+        .unwrap();
+        clear_ui_waiter();
+        assert_eq!(answered.result.as_ref().unwrap()["choice"], "a");
+
+        install_ui_waiter(Box::new(|_call| {
+            std::thread::sleep(Duration::from_millis(200));
+            Value::String("late".into())
+        }));
+        let timed = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "slow", "ctx": { "mode": "rpc" } }),
+        )
+        .unwrap();
+        clear_ui_waiter();
+        assert_eq!(timed.result.as_ref().unwrap()["choice"], "timeout");
     }
 
     #[test]

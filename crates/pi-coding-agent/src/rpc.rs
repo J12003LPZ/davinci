@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::export;
+use crate::model_resolver::{
+    resolve_model_scope_from_models, thinking_level_for_model_switch, ScopedModelRef,
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RpcCommand {
@@ -119,6 +122,9 @@ pub struct RpcRuntime {
     pub cwd: PathBuf,
     pub models: Vec<Model>,
     pub scoped_models: Vec<Model>,
+    pub scoped_thinking: std::collections::BTreeMap<String, ThinkingLevel>,
+    pub model_thinking_levels: std::collections::BTreeMap<String, ThinkingLevel>,
+    pub default_thinking_level: Option<ThinkingLevel>,
     pub bash_aborted: bool,
     pub invocable_commands: Vec<Value>,
     pub pending_ui: std::collections::HashMap<String, RpcCommand>,
@@ -134,6 +140,9 @@ impl RpcRuntime {
             cwd,
             models,
             scoped_models: Vec::new(),
+            scoped_thinking: std::collections::BTreeMap::new(),
+            model_thinking_levels: std::collections::BTreeMap::new(),
+            default_thinking_level: None,
             bash_aborted: false,
             invocable_commands: Vec::new(),
             pending_ui: std::collections::HashMap::new(),
@@ -184,73 +193,39 @@ impl RpcRuntime {
     }
 
     pub fn set_scoped_models(&mut self, patterns: &[String]) {
-        self.scoped_models = resolve_scoped_models(&self.models, patterns);
+        let resolved = resolve_model_scope_from_models(patterns, &self.models);
+        self.scoped_models = resolved
+            .scoped_models
+            .iter()
+            .map(|item| item.model.clone())
+            .collect();
+        self.scoped_thinking = resolved
+            .scoped_models
+            .iter()
+            .filter_map(|item| {
+                item.thinking_level
+                    .map(|level| (format!("{}/{}", item.model.provider, item.model.id), level))
+            })
+            .collect();
+    }
+
+    fn apply_thinking_for_switch(&mut self, provider: &str, model_id: &str) {
+        let key = format!("{provider}/{model_id}");
+        self.agent.thinking_level = thinking_level_for_model_switch(
+            self.scoped_thinking.get(&key).copied(),
+            self.model_thinking_levels.get(&key).copied(),
+            self.default_thinking_level,
+            self.agent.thinking_level,
+        );
     }
 }
 
 pub fn resolve_scoped_models(models: &[Model], patterns: &[String]) -> Vec<Model> {
-    let mut scoped = Vec::new();
-    for pattern in patterns {
-        let (glob, _thinking) = pattern
-            .rsplit_once(':')
-            .filter(|(_, suffix)| ThinkingLevel::parse(suffix).is_some())
-            .map(|(glob, _)| (glob, true))
-            .unwrap_or((pattern.as_str(), false));
-        for model in models {
-            let full = format!("{}/{}", model.provider, model.id);
-            if model_pattern_matches(glob, &full, &model.id)
-                && !scoped.iter().any(|existing: &Model| {
-                    existing.provider == model.provider && existing.id == model.id
-                })
-            {
-                scoped.push(model.clone());
-            }
-        }
-    }
-    scoped
-}
-
-fn model_pattern_matches(pattern: &str, full_id: &str, model_id: &str) -> bool {
-    let pattern = pattern.to_lowercase();
-    let full = full_id.to_lowercase();
-    let id = model_id.to_lowercase();
-    if pattern.contains('*') || pattern.contains('?') {
-        return wildcard_match(&pattern, &full) || wildcard_match(&pattern, &id);
-    }
-    full == pattern || id == pattern
-}
-
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return value == pattern;
-    }
-    let mut rest = value;
-    if !pattern.starts_with('*') {
-        let first = parts[0];
-        if !rest.starts_with(first) {
-            return false;
-        }
-        rest = &rest[first.len()..];
-    }
-    if !pattern.ends_with('*') {
-        let last = *parts.last().unwrap_or(&"");
-        if !rest.ends_with(last) {
-            return false;
-        }
-        rest = &rest[..rest.len() - last.len()];
-    }
-    for part in &parts[1..parts.len().saturating_sub(1)] {
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(pos) = rest.find(part) {
-            rest = &rest[pos + part.len()..];
-        } else {
-            return false;
-        }
-    }
-    true
+    resolve_model_scope_from_models(patterns, models)
+        .scoped_models
+        .into_iter()
+        .map(|item: ScopedModelRef| item.model)
+        .collect()
 }
 
 pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse {
@@ -498,6 +473,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 })
                 .unwrap_or(0);
             let next = pool[(current + 1) % pool.len()].clone();
+            runtime.apply_thinking_for_switch(&next.provider, &next.id);
             runtime.agent.provider = next.provider.clone();
             runtime.agent.model_id = next.id.clone();
             ok(
@@ -1060,6 +1036,41 @@ mod tests {
             },
         );
         assert_eq!(single.data, Some(Value::Null));
+    }
+
+    #[test]
+    fn cycle_model_applies_scoped_thinking() {
+        let mut runtime = RpcRuntime::new(
+            pi_agent::Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        runtime.models.truncate(3);
+        runtime.agent.provider = runtime.models[0].provider.clone();
+        runtime.agent.model_id = runtime.models[0].id.clone();
+        runtime.agent.thinking_level = ThinkingLevel::Off;
+        let scoped_ids = resolve_scoped_models(
+            &runtime.models,
+            &[format!(
+                "{}:high",
+                runtime.models[1].id
+            )],
+        );
+        assert!(scoped_ids.iter().any(|model| model.id == runtime.models[1].id));
+        runtime.scoped_models = vec![runtime.models[0].clone(), runtime.models[1].clone()];
+        runtime.scoped_thinking.insert(
+            format!("{}/{}", runtime.models[1].provider, runtime.models[1].id),
+            ThinkingLevel::High,
+        );
+        let scoped = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "cycle_model".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert_eq!(scoped.data.as_ref().unwrap()["thinkingLevel"], "high");
+        assert_eq!(runtime.agent.thinking_level, ThinkingLevel::High);
     }
 
     #[test]

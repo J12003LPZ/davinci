@@ -13,6 +13,7 @@ mod image_convert;
 mod js_host;
 mod llama;
 mod migrations;
+mod model_resolver;
 mod packages;
 mod rpc;
 mod self_update;
@@ -77,6 +78,8 @@ use trust::{
     get_project_trust_options, has_trust_requiring_project_resources, ProjectTrustStore,
     ProjectTrustUpdate,
 };
+
+const NO_SESSION_SELECTED: &str = "__pi_no_session_selected__";
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -183,7 +186,10 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
 
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
-    let mut agent = build_agent(&parsed, &session_dir, &cwd)?;
+    let mut agent = match build_agent(&parsed, &session_dir, &cwd) {
+        Err(err) if err == NO_SESSION_SELECTED => return Ok(0),
+        other => other?,
+    };
 
     if parsed.mode == Some(Mode::Rpc) {
         if !parsed.file_args.is_empty() {
@@ -359,15 +365,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         let _ = host.describe_js();
     }
     agent.cwd = cwd.to_path_buf();
-    let (provider, model_id) = parse_model_ref(
-        parsed.provider.as_deref().unwrap_or("google"),
-        parsed.model.as_deref(),
-    );
-    agent.provider = provider;
-    agent.model_id = model_id;
-    if let Some(model) = find_model(&available_models(parsed), &agent.provider, &agent.model_id) {
-        agent.context_window = model.context_window;
-    }
+    apply_resolved_models(parsed, &mut agent)?;
     if let Some(key) = &parsed.api_key {
         if let Ok(mut storage) = AuthStorage::create() {
             storage.set_runtime_override(&agent.provider, key);
@@ -548,10 +546,12 @@ fn resolve_or_create_session(
         }
     }
     if parsed.resume {
-        let sessions = discover_sessions(session_dir, Some(&cwd.to_string_lossy()))
-            .map_err(|err| err.to_string())?;
-        if let Some(summary) = sessions.first() {
-            return JsonlSession::open(&summary.path).map_err(|err| err.to_string());
+        match select_resume_session(parsed, session_dir, cwd)? {
+            Some(path) => return JsonlSession::open(&path).map_err(|err| err.to_string()),
+            None => {
+                println!("\x1b[2mNo session selected\x1b[0m");
+                return Err(NO_SESSION_SELECTED.into());
+            }
         }
     }
     let session = JsonlSession::create(
@@ -585,6 +585,96 @@ fn persist_selected_backend(session: &JsonlSession, session_dir: &Path) {
 
 fn available_models(parsed: &Args) -> Vec<pi_ai::Model> {
     load_model_runtime(parsed).available
+}
+
+fn has_configured_auth(snapshot: &ModelRuntimeSnapshot, provider: &str) -> bool {
+    snapshot
+        .configured_providers
+        .iter()
+        .any(|item| item == provider)
+        || snapshot.auth.contains_key(provider)
+}
+
+fn session_was_restored(parsed: &Args) -> bool {
+    parsed.continue_session
+        || parsed.resume
+        || parsed.session.is_some()
+        || parsed.fork.is_some()
+        || parsed.session_id.is_some()
+}
+
+fn apply_resolved_models(parsed: &Args, agent: &mut Agent) -> Result<(), String> {
+    let snapshot = load_model_runtime(parsed);
+    let scoped = if parsed.models.is_empty() {
+        model_resolver::ResolveModelScopeResult {
+            scoped_models: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    } else {
+        let result = model_resolver::resolve_model_scope_from_models(&parsed.models, &snapshot.all);
+        for diagnostic in &result.diagnostics {
+            eprintln!("Warning: {}", diagnostic.message);
+        }
+        result
+    };
+
+    if let Some(cli_model) = parsed.model.as_deref() {
+        let resolved = model_resolver::resolve_cli_model(
+            parsed.provider.as_deref(),
+            Some(cli_model),
+            parsed.thinking,
+            &snapshot.all,
+            |provider| has_configured_auth(&snapshot, provider),
+        );
+        if let Some(error) = resolved.error {
+            return Err(error);
+        }
+        if let Some(warning) = resolved.warning {
+            eprintln!("Warning: {warning}");
+        }
+        if let Some(model) = resolved.model {
+            agent.provider = model.provider;
+            agent.model_id = model.id;
+            agent.context_window = model.context_window;
+            if parsed.thinking.is_none() {
+                if let Some(level) = resolved.thinking_level {
+                    agent.thinking_level = level;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    if !scoped.scoped_models.is_empty() && !session_was_restored(parsed) {
+        let settings = load_settings(&default_agent_dir());
+        let saved = match (&settings.default_provider, &settings.default_model) {
+            (Some(provider), Some(id)) => scoped.scoped_models.iter().find(|item| {
+                item.model.provider == *provider && item.model.id == *id
+            }),
+            _ => None,
+        };
+        let chosen = saved.unwrap_or(&scoped.scoped_models[0]);
+        agent.provider = chosen.model.provider.clone();
+        agent.model_id = chosen.model.id.clone();
+        agent.context_window = chosen.model.context_window;
+        if parsed.thinking.is_none() {
+            if let Some(level) = chosen.thinking_level {
+                agent.thinking_level = level;
+            }
+        }
+        return Ok(());
+    }
+
+    let (provider, model_id) = parse_model_ref(
+        parsed.provider.as_deref().unwrap_or("google"),
+        parsed.model.as_deref(),
+    );
+    agent.provider = provider;
+    agent.model_id = model_id;
+    if let Some(model) = find_model(&snapshot.available, &agent.provider, &agent.model_id) {
+        agent.context_window = model.context_window;
+    }
+    Ok(())
 }
 
 fn load_available_models(parsed: &Args) -> (Vec<pi_ai::Model>, Option<String>) {
@@ -851,7 +941,10 @@ fn export_session(parsed: &Args, export: &str) -> Result<i32, String> {
     let session = if Path::new(export).exists() {
         JsonlSession::open(Path::new(export)).map_err(|err| err.to_string())?
     } else {
-        resolve_or_create_session(parsed, &session_dir, &cwd)?
+        match resolve_or_create_session(parsed, &session_dir, &cwd) {
+            Err(err) if err == NO_SESSION_SELECTED => return Ok(0),
+            other => other?,
+        }
     };
     let output = if let Some(next) = parsed.messages.first() {
         PathBuf::from(next)
@@ -933,6 +1026,14 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
 }
 
 fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>) {
+    complete_prompt_with_host(parsed, agent, None)
+}
+
+fn complete_prompt_with_host(
+    parsed: &Args,
+    agent: &mut Agent,
+    existing_host: Option<Arc<Mutex<ExtensionHost>>>,
+) -> (String, Vec<AgentEvent>) {
     let offline = parsed.offline
         || matches!(
             std::env::var("PI_OFFLINE").as_deref(),
@@ -995,7 +1096,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             constrained_sampling: crate::experimental::experimental_tool_sampling(),
         })
         .collect();
-    let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
+    let host = existing_host.unwrap_or_else(|| Arc::new(Mutex::new(loaded_extension_host(parsed))));
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
         host.runtime_active_tools = agent.tools.clone();
@@ -1407,30 +1508,62 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         session_dir,
         cwd,
     );
-    let host = loaded_extension_host(parsed);
-    for provider in host.registered_providers() {
-        runtime.models.extend(pi_ai::models_from_provider_config(
-            &provider.name,
-            &provider.config,
-        ));
+    let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
+    {
+        let host = host.lock().unwrap_or_else(|err| err.into_inner());
+        for provider in host.registered_providers() {
+            runtime.models.extend(pi_ai::models_from_provider_config(
+                &provider.name,
+                &provider.config,
+            ));
+        }
+        runtime.invocable_commands = slash::invocable_commands(
+            &host
+                .js
+                .iter()
+                .flat_map(|ext| {
+                    ext.commands
+                        .iter()
+                        .map(|name| (name.clone(), String::new(), ext.path.clone()))
+                })
+                .collect::<Vec<_>>(),
+            &runtime.agent.templates,
+            &runtime.agent.skills,
+        );
     }
     runtime.set_scoped_models(&parsed.models);
-    runtime.invocable_commands = slash::invocable_commands(
-        &host
-            .js
-            .iter()
-            .flat_map(|ext| {
-                ext.commands
-                    .iter()
-                    .map(|name| (name.clone(), String::new(), ext.path.clone()))
+    let stored = load_settings(&default_agent_dir());
+    runtime.default_thinking_level = stored
+        .default_thinking_level
+        .as_deref()
+        .and_then(pi_protocol::ThinkingLevel::parse);
+    if let Some(levels) = stored.model_thinking_levels {
+        runtime.model_thinking_levels = levels
+            .into_iter()
+            .filter_map(|(key, value)| {
+                pi_protocol::ThinkingLevel::parse(&value).map(|level| (key, level))
             })
-            .collect::<Vec<_>>(),
-        &runtime.agent.templates,
-        &runtime.agent.skills,
-    );
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|err| err.to_string())?;
+            .collect();
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let rx = Arc::new(Mutex::new(rx));
+    let leftover = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
+    crate::js_host::install_ui_waiter({
+        let leftover = leftover.clone();
+        let rx = rx.clone();
+        Box::new(move |call| rpc_emit_and_wait_ui(call, &leftover, &rx))
+    });
+    loop {
+        let Some(line) = rpc_next_line(&leftover, &rx) else {
+            break;
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -1438,11 +1571,9 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         let is_prompt = command.kind == "prompt";
         let response = handle_rpc(&mut runtime, command.clone());
         let mut extras = runtime.take_events();
-        for request in rpc::extension_ui_requests_from_calls(&host.ui_calls) {
-            println!(
-                "{}",
-                serde_json::to_string(&request).map_err(|err| err.to_string())?
-            );
+        {
+            let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+            emit_extension_ui_requests(&std::mem::take(&mut host.ui_calls))?;
         }
         if is_prompt {
             let prompt_args = Args {
@@ -1454,12 +1585,15 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 no_extensions: parsed.no_extensions,
                 ..Args::default()
             };
-            let (_reply, events) = complete_prompt(&prompt_args, &mut runtime.agent);
-            for request in rpc::extension_ui_requests_from_calls(&host.ui_calls) {
-                println!(
-                    "{}",
-                    serde_json::to_string(&request).map_err(|err| err.to_string())?
-                );
+            let (_reply, events) =
+                complete_prompt_with_host(&prompt_args, &mut runtime.agent, Some(host.clone()));
+            {
+                let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+                let remaining: Vec<_> = std::mem::take(&mut host.ui_calls)
+                    .into_iter()
+                    .filter(|call| !is_dialog_ui_call(call))
+                    .collect();
+                emit_extension_ui_requests(&remaining)?;
             }
             for event in events {
                 println!(
@@ -1481,8 +1615,118 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         );
         io::stdout().flush().ok();
     }
+    crate::js_host::clear_ui_waiter();
     *agent = runtime.agent;
     Ok(0)
+}
+
+fn is_dialog_ui_call(call: &serde_json::Value) -> bool {
+    matches!(
+        call.get("op").and_then(|value| value.as_str()),
+        Some("select" | "confirm" | "input" | "editor")
+    )
+}
+
+fn emit_extension_ui_requests(calls: &[serde_json::Value]) -> Result<(), String> {
+    for request in rpc::extension_ui_requests_from_calls(calls) {
+        println!(
+            "{}",
+            serde_json::to_string(&request).map_err(|err| err.to_string())?
+        );
+    }
+    Ok(())
+}
+
+fn rpc_next_line(
+    leftover: &Mutex<std::collections::VecDeque<String>>,
+    rx: &Mutex<std::sync::mpsc::Receiver<String>>,
+) -> Option<String> {
+    if let Ok(mut queue) = leftover.lock() {
+        if let Some(line) = queue.pop_front() {
+            return Some(line);
+        }
+    }
+    rx.lock().ok()?.recv().ok()
+}
+
+fn rpc_emit_and_wait_ui(
+    call: &serde_json::Value,
+    leftover: &Mutex<std::collections::VecDeque<String>>,
+    rx: &Mutex<std::sync::mpsc::Receiver<String>>,
+) -> serde_json::Value {
+    let requests = rpc::extension_ui_requests_from_calls(std::slice::from_ref(call));
+    let default = if call.get("op").and_then(|value| value.as_str()) == Some("confirm") {
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::Value::Null
+    };
+    let Some(request) = requests.first() else {
+        return default;
+    };
+    if let Ok(encoded) = serde_json::to_string(request) {
+        println!("{encoded}");
+        io::stdout().flush().ok();
+    }
+    let id = request
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let timeout_ms = call.get("timeout").and_then(|value| value.as_u64());
+    let deadline = timeout_ms.map(|ms| {
+        std::time::Instant::now() + std::time::Duration::from_millis(ms)
+    });
+    let mut parked = std::collections::VecDeque::new();
+    loop {
+        if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+            if let Ok(mut queue) = leftover.lock() {
+                queue.extend(parked);
+            }
+            return default;
+        }
+        let remaining = deadline.map_or(std::time::Duration::from_millis(200), |end| {
+            end.saturating_duration_since(std::time::Instant::now())
+        });
+        let line = leftover
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.pop_front())
+            .or_else(|| {
+                rx.lock()
+                    .ok()
+                    .and_then(|rx| rx.recv_timeout(remaining).ok())
+            });
+        let Some(line) = line else {
+            continue;
+        };
+        if let Some(value) = parse_rpc_ui_response(&line, &id) {
+            if let Ok(mut queue) = leftover.lock() {
+                queue.extend(parked);
+            }
+            return value;
+        }
+        parked.push_back(line);
+    }
+}
+
+fn parse_rpc_ui_response(line: &str, id: &str) -> Option<serde_json::Value> {
+    let command: RpcCommand = serde_json::from_str(line).ok()?;
+    if command.kind != "extension_ui_response" {
+        return None;
+    }
+    if command.id.as_deref() != Some(id) {
+        return None;
+    }
+    if command.cancelled == Some(true) {
+        return Some(serde_json::Value::Null);
+    }
+    if let Some(value) = command.value {
+        return Some(serde_json::Value::String(value));
+    }
+    if let Some(confirmed) = command.confirmed {
+        return Some(serde_json::Value::Bool(confirmed));
+    }
+    Some(serde_json::Value::Null)
 }
 
 fn finish_interactive_tui(
@@ -1592,6 +1836,42 @@ fn run_interactive(
     session.chrome.transcript.hide_thinking_block = stored.hide_thinking_block.unwrap_or(false);
     session.chrome.transcript.code_block_indent = stored.code_block_indent().to_string();
     session.enabled_model_ids = stored.enabled_models.clone();
+    if !parsed.models.is_empty() {
+        let snapshot = load_model_runtime(parsed);
+        let scoped =
+            model_resolver::resolve_model_scope_from_models(&parsed.models, &snapshot.all);
+        for diagnostic in &scoped.diagnostics {
+            eprintln!("Warning: {}", diagnostic.message);
+        }
+        if !scoped.scoped_models.is_empty() {
+            session.enabled_model_ids = Some(
+                scoped
+                    .scoped_models
+                    .iter()
+                    .map(|item| format!("{}/{}", item.model.provider, item.model.id))
+                    .collect(),
+            );
+            session.scoped_thinking_levels = scoped
+                .scoped_models
+                .iter()
+                .filter_map(|item| {
+                    item.thinking_level.map(|level| {
+                        (
+                            format!("{}/{}", item.model.provider, item.model.id),
+                            level.as_str().to_string(),
+                        )
+                    })
+                })
+                .collect();
+            if let Some(index) = session
+                .models
+                .iter()
+                .position(|item| item == &format!("{}/{}", agent.provider, agent.model_id))
+            {
+                session.model_index = index;
+            }
+        }
+    }
     session.default_model = match (&stored.default_provider, &stored.default_model) {
         (Some(provider), Some(id)) => Some(format!("{provider}/{id}")),
         (None, Some(id)) if id.contains('/') => Some(id.clone()),
@@ -2152,8 +2432,10 @@ fn apply_session_action(
         SessionAction::CycleModel | SessionAction::CycleModelBackward => {
             if let Some(model) = session.current_model() {
                 let (provider, model_id) = parse_model_ref("google", Some(model));
+                apply_model_switch_thinking(agent, session, &provider, &model_id);
                 agent.provider = provider;
                 agent.model_id = model_id;
+                sync_session_thinking(session, agent);
             }
             Ok(true)
         }
@@ -5520,6 +5802,119 @@ fn current_runtime_model(agent: &Agent) -> Option<pi_ai::Model> {
     find_model(&models, &agent.provider, &agent.model_id).cloned()
 }
 
+fn apply_model_switch_thinking(
+    agent: &mut Agent,
+    session: &InteractiveSession,
+    provider: &str,
+    model_id: &str,
+) {
+    let key = format!("{provider}/{model_id}");
+    let explicit = session
+        .scoped_thinking_levels
+        .get(&key)
+        .and_then(|level| pi_protocol::ThinkingLevel::parse(level));
+    let per_model = session
+        .model_thinking_levels
+        .get(&key)
+        .and_then(|level| pi_protocol::ThinkingLevel::parse(level));
+    let default_level = load_settings(&default_agent_dir())
+        .default_thinking_level
+        .as_deref()
+        .and_then(pi_protocol::ThinkingLevel::parse);
+    agent.thinking_level = model_resolver::thinking_level_for_model_switch(
+        explicit,
+        per_model,
+        default_level,
+        agent.thinking_level,
+    );
+}
+
+fn select_resume_session(
+    parsed: &Args,
+    session_dir: &Path,
+    cwd: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if let Ok(selected) = std::env::var("PI_RESUME_SESSION") {
+        let selected = selected.trim();
+        if !selected.is_empty() {
+            let path = PathBuf::from(selected);
+            if path.exists() {
+                return Ok(Some(path));
+            }
+            if let Ok(summary) =
+                resolve_session_ref(session_dir, Some(&cwd.to_string_lossy()), selected)
+            {
+                return Ok(Some(summary.path));
+            }
+        }
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(None);
+    }
+    let mut dummy = Agent::new(default_system_prompt());
+    dummy.cwd = cwd.to_path_buf();
+    let items = discover_session_items(parsed, &dummy)?;
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let theme = builtin_themes().into_iter().next().expect("theme");
+    let mut session = InteractiveSession::new(theme, format!("{APP_NAME} {VERSION}"), Vec::new());
+    session.cwd = cwd.to_path_buf();
+    session.open_session_selector(items.clone());
+    if let Some(selector) = &mut session.chrome.session_selector {
+        selector.set_cwd(cwd.to_string_lossy().into_owned());
+    }
+    let _raw = RawModeGuard::enter()?;
+    let (mut width, _height) = crossterm::terminal::size().unwrap_or((80, 24));
+    session.width = width as usize;
+    print!("{}", InteractiveSession::enter_sequences(true));
+    io::stdout().flush().ok();
+    loop {
+        if let Some(selector) = &session.chrome.session_selector {
+            print!("\x1b[H\x1b[J{}", selector.render(width as usize).join("\n"));
+            io::stdout().flush().ok();
+        }
+        if !crossterm::event::poll(std::time::Duration::from_millis(50))
+            .map_err(|err| err.to_string())?
+        {
+            continue;
+        }
+        match crossterm::event::read().map_err(|err| err.to_string())? {
+            crossterm::event::Event::Key(key) => {
+                if key.kind != crossterm::event::KeyEventKind::Press
+                    && key.kind != crossterm::event::KeyEventKind::Repeat
+                {
+                    continue;
+                }
+                match session.handle_bytes(&key_event_to_bytes(&key)) {
+                    SessionAction::SelectSession(id) => {
+                        print!("{}", InteractiveSession::leave_sequences(true));
+                        if let Some(item) = items.iter().find(|item| item.id == id) {
+                            return Ok(Some(PathBuf::from(&item.path)));
+                        }
+                        if let Ok(summary) =
+                            resolve_session_ref(session_dir, Some(&cwd.to_string_lossy()), &id)
+                        {
+                            return Ok(Some(summary.path));
+                        }
+                        return Ok(None);
+                    }
+                    SessionAction::CloseOverlay | SessionAction::Quit | SessionAction::Abort => {
+                        print!("{}", InteractiveSession::leave_sequences(true));
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+            }
+            crossterm::event::Event::Resize(next_width, _) => {
+                width = next_width;
+                session.width = next_width as usize;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn sync_session_thinking(session: &mut InteractiveSession, agent: &Agent) {
     if let Some(model) = current_runtime_model(agent) {
         let levels = get_supported_thinking_levels(&model);
@@ -6277,5 +6672,40 @@ mod tests {
         assert!(should_take_over_stdout(&json_help));
         let print_help = parse_args(&["-p".into(), "--help".into()]);
         assert!(should_take_over_stdout(&print_help));
+    }
+
+    #[test]
+    fn apply_resolved_models_fuzzy_and_thinking_suffix() {
+        let mut parsed = Args::default();
+        parsed.model = Some("sonnet:high".into());
+        let mut agent = Agent::new(default_system_prompt());
+        apply_resolved_models(&parsed, &mut agent).expect("resolve");
+        assert!(agent.model_id.to_ascii_lowercase().contains("sonnet"));
+        assert_eq!(agent.thinking_level, pi_protocol::ThinkingLevel::High);
+        assert_eq!(agent.provider, "anthropic");
+    }
+
+    #[test]
+    fn apply_resolved_models_unknown_is_error() {
+        let mut parsed = Args::default();
+        parsed.model = Some("definitely-not-a-real-model-xyz".into());
+        let mut agent = Agent::new(default_system_prompt());
+        let err = apply_resolved_models(&parsed, &mut agent).unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn resume_fixture_opens_selected_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "/tmp/resume-pick", Some("picked")).unwrap();
+        std::env::set_var("PI_RESUME_SESSION", session.path.display().to_string());
+        let parsed = Args {
+            resume: true,
+            ..Args::default()
+        };
+        let selected = select_resume_session(&parsed, dir.path(), Path::new("/tmp/resume-pick"))
+            .expect("select");
+        std::env::remove_var("PI_RESUME_SESSION");
+        assert_eq!(selected.unwrap(), session.path);
     }
 }
