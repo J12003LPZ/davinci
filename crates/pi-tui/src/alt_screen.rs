@@ -247,6 +247,12 @@ struct InputOverlayState {
     inputs: Vec<String>,
 }
 
+impl Default for InputOverlay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InputOverlay {
     pub fn new() -> Self {
         Self {
