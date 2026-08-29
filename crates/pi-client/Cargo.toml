@@ -1,0 +1,17 @@
+[package]
+name = "pi-client"
+version = "0.84.4"
+edition = "2021"
+
+[dependencies]
+pi-protocol = { path = "../pi-protocol" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "pi-server"
+version = "0.84.4"
+edition = "2021"
+
+[dependencies]
+pi-protocol = { path = "../pi-protocol" }
+pi-session = { path = "../pi-session" }
+pi-agent = { path = "../pi-agent" }
+pi-ai = { path = "../pi-ai" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

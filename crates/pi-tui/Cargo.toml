@@ -1,0 +1,17 @@
+[package]
+name = "pi-tui"
+version = "0.84.4"
+edition = "2021"
+
+[dependencies]
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
