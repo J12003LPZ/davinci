@@ -13,6 +13,10 @@ pub struct Settings {
     pub quiet_startup: bool,
     #[serde(default)]
     pub trusted_projects: Vec<String>,
+    #[serde(default)]
+    pub double_escape_action: Option<String>,
+    #[serde(default)]
+    pub autocomplete_max_visible: Option<u32>,
 }
 
 pub fn settings_path(agent_dir: &Path) -> PathBuf {

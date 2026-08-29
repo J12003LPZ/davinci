@@ -26,7 +26,11 @@ use pi_session::{
     default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir,
     resolve_session_ref, JsonlSession,
 };
-use pi_tui::{builtin_themes, ChatChrome, Component, InteractiveSession, SessionAction, TuiMode};
+use pi_tui::{
+    builtin_themes, default_interactive_settings, encode_kitty, ChatChrome, Component,
+    DoubleEscapeAction, InteractiveSession, SessionAction, SlashCommandSpec, ToolCard, TuiMode,
+    FALLBACK_PREVIEW_LINES,
+};
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
 use auth_cmd::{
@@ -579,6 +583,25 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     {
         session.model_index = index;
     }
+    session.cwd = agent.cwd.clone();
+    session.slash_commands = slash::builtin_slash_commands()
+        .into_iter()
+        .map(|command| SlashCommandSpec {
+            name: command.name,
+            description: command.description,
+            argument_hint: command.argument_hint,
+        })
+        .collect();
+    session.login_providers = pi_ai::oauth_providers()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let stored = load_settings(&default_agent_dir());
+    session.double_escape_action =
+        DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
+    session.autocomplete_max_visible =
+        stored.autocomplete_max_visible.unwrap_or(8).clamp(3, 20) as usize;
+    let _ = FALLBACK_PREVIEW_LINES;
     print!("{}", InteractiveSession::enter_sequences(fullscreen));
     println!("{}", session.chrome.render(session.width).join("\n"));
     if !parsed.messages.is_empty() {
@@ -625,7 +648,9 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
     }
     match key.code {
         KeyCode::Esc => "\x1b".into(),
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => "\n".into(),
         KeyCode::Enter => "\r".into(),
+        KeyCode::Tab => "\t".into(),
         KeyCode::Backspace => "\x7f".into(),
         KeyCode::Up => "\x1b[A".into(),
         KeyCode::Down => "\x1b[B".into(),
@@ -722,7 +747,35 @@ fn apply_session_action(
             Ok(true)
         }
         SessionAction::SelectSetting(value) => {
-            session.chrome.status = value;
+            apply_interactive_setting(session, &value)?;
+            Ok(true)
+        }
+        SessionAction::CycleSetting => {
+            if let Some(item) = session
+                .chrome
+                .settings_list
+                .as_ref()
+                .and_then(|list| list.selected_item())
+            {
+                apply_interactive_setting(session, &format!("{}={}", item.id, item.current_value))?;
+            }
+            Ok(true)
+        }
+        SessionAction::OpenTree => handle_user_line(parsed, agent, &mut session.chrome, "/tree"),
+        SessionAction::OpenFork => handle_user_line(parsed, agent, &mut session.chrome, "/fork"),
+        SessionAction::RunBash(command) => {
+            match crate::js_host::execute_command_tool(&command, &agent.cwd) {
+                Ok(out) => {
+                    session.chrome.transcript.push("bash", &out);
+                    session.chrome.status = "bash done".into();
+                    println!("{out}");
+                }
+                Err(err) => {
+                    session.chrome.transcript.push("bash", &err);
+                    session.chrome.status = "bash error".into();
+                    eprintln!("{err}");
+                }
+            }
             Ok(true)
         }
         SessionAction::Quit => Ok(false),
@@ -767,7 +820,8 @@ fn handle_user_line(
         SlashAction::Prompt(prompt) => {
             chrome.transcript.push("user", &prompt);
             agent.prompt(&prompt);
-            let (reply, _events) = complete_prompt(parsed, agent);
+            let (reply, events) = complete_prompt(parsed, agent);
+            apply_tool_events(chrome, &events);
             chrome.transcript.push("assistant", &reply);
             chrome.editor.handle_input("");
             println!("{reply}");
@@ -789,13 +843,18 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Settings => {
-            let items = pi_tui::get_keybindings()
-                .into_iter()
-                .map(|b| format!("{}: {}", b.action, b.keys.join(", ")))
-                .collect::<Vec<_>>();
-            chrome.selector = Some(pi_tui::SelectList::new(items.clone()));
+            let stored = load_settings(&default_agent_dir());
+            let list = default_interactive_settings(
+                stored.theme.as_deref().unwrap_or(&chrome.theme.name),
+                stored.double_escape_action.as_deref().unwrap_or("tree"),
+                stored.quiet_startup,
+                stored.autocomplete_max_visible.unwrap_or(8),
+            );
+            chrome.settings_list = Some(list);
             chrome.status = "Settings".into();
-            println!("{}", items.join("\n"));
+            if let Some(settings) = &chrome.settings_list {
+                println!("{}", settings.render(80).join("\n"));
+            }
             Ok(true)
         }
         SlashAction::SessionInfo => {
@@ -941,6 +1000,104 @@ fn handle_user_line(
             Ok(true)
         }
     }
+}
+
+fn apply_tool_events(chrome: &mut ChatChrome, events: &[AgentEvent]) {
+    for event in events {
+        match event {
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => {
+                chrome
+                    .tool_cards
+                    .push(ToolCard::start(tool_name, tool_call_id, args.clone()));
+            }
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial_result,
+                ..
+            } => {
+                if let Some(card) = chrome
+                    .tool_cards
+                    .iter_mut()
+                    .find(|card| card.tool_call_id == *tool_call_id)
+                {
+                    card.update_partial(partial_result);
+                }
+            }
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                is_error,
+                ..
+            } => {
+                let finished = chrome
+                    .tool_cards
+                    .iter_mut()
+                    .find(|card| card.tool_call_id == *tool_call_id)
+                    .map(|card| {
+                        card.finish(result, *is_error);
+                        (card.image_payloads(), card.format_tool_execution())
+                    });
+                if let Some((images, formatted)) = finished {
+                    let base_id = chrome.tool_cards.len() as u32;
+                    for (index, (data, _)) in images.into_iter().enumerate() {
+                        chrome.transcript.push(
+                            "image",
+                            encode_kitty(
+                                &data,
+                                Some(40),
+                                Some(1),
+                                Some(base_id + index as u32),
+                                false,
+                            ),
+                        );
+                    }
+                    chrome.transcript.push("tool", formatted);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Result<(), String> {
+    let (id, value) = spec.split_once('=').unwrap_or((spec, ""));
+    session.chrome.status = spec.to_string();
+    match id {
+        "double-escape-action" => {
+            session.double_escape_action = DoubleEscapeAction::parse(value);
+        }
+        "autocomplete-max-visible" => {
+            if let Ok(n) = value.parse::<u32>() {
+                session.autocomplete_max_visible = n.clamp(3, 20) as usize;
+            }
+        }
+        "theme" => {
+            if let Some(theme) = builtin_themes()
+                .into_iter()
+                .find(|theme| theme.name == value)
+            {
+                session.chrome.theme = theme;
+            }
+        }
+        _ => {}
+    }
+    let dir = default_agent_dir();
+    let mut stored = load_settings(&dir);
+    match id {
+        "double-escape-action" => stored.double_escape_action = Some(value.to_string()),
+        "autocomplete-max-visible" => {
+            stored.autocomplete_max_visible = value.parse().ok();
+        }
+        "theme" => stored.theme = Some(value.to_string()),
+        "quiet-startup" => stored.quiet_startup = value == "true",
+        _ => {}
+    }
+    save_settings(&dir, &stored)?;
+    Ok(())
 }
 
 fn looks_like_oauth_input(value: &str) -> bool {

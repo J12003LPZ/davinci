@@ -8,6 +8,71 @@ pub fn kitty_image_chunk(payload_b64: &str, last: bool) -> String {
     format!("{KITTY_IMAGE_PREFIX}a=T,f=100,m={more};{payload_b64}{KITTY_IMAGE_SUFFIX}")
 }
 
+/// TS `encodeKitty` from `terminal-image.ts`: `a=T,f=100,q=2` plus optional placement.
+pub fn encode_kitty(
+    base64_data: &str,
+    columns: Option<u32>,
+    rows: Option<u32>,
+    image_id: Option<u32>,
+    move_cursor: bool,
+) -> String {
+    const CHUNK_SIZE: usize = 4096;
+    let mut params = vec!["a=T".into(), "f=100".into(), "q=2".into()];
+    if !move_cursor {
+        params.push("C=1".into());
+    }
+    if let Some(columns) = columns {
+        params.push(format!("c={columns}"));
+    }
+    if let Some(rows) = rows {
+        params.push(format!("r={rows}"));
+    }
+    if let Some(image_id) = image_id {
+        params.push(format!("i={image_id}"));
+    }
+    if base64_data.len() <= CHUNK_SIZE {
+        return format!(
+            "{KITTY_IMAGE_PREFIX}{};{base64_data}{KITTY_IMAGE_SUFFIX}",
+            params.join(",")
+        );
+    }
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    let mut first = true;
+    while offset < base64_data.len() {
+        let end = (offset + CHUNK_SIZE).min(base64_data.len());
+        let chunk = &base64_data[offset..end];
+        let last = end == base64_data.len();
+        if first {
+            chunks.push(format!(
+                "{KITTY_IMAGE_PREFIX}{},m=1;{chunk}{KITTY_IMAGE_SUFFIX}",
+                params.join(",")
+            ));
+            first = false;
+        } else if last {
+            chunks.push(format!(
+                "{KITTY_IMAGE_PREFIX}m=0;{chunk}{KITTY_IMAGE_SUFFIX}"
+            ));
+        } else {
+            chunks.push(format!(
+                "{KITTY_IMAGE_PREFIX}m=1;{chunk}{KITTY_IMAGE_SUFFIX}"
+            ));
+        }
+        offset = end;
+    }
+    chunks.join("")
+}
+
+/// TS `deleteKittyImage`.
+pub fn delete_kitty_image(image_id: u32) -> String {
+    format!("{KITTY_IMAGE_PREFIX}a=d,d=I,i={image_id},q=2{KITTY_IMAGE_SUFFIX}")
+}
+
+/// TS `deleteAllKittyImages`.
+pub fn delete_all_kitty_images() -> String {
+    format!("{KITTY_IMAGE_PREFIX}a=d,d=A,q=2{KITTY_IMAGE_SUFFIX}")
+}
+
 pub fn iterm_image(payload_b64: &str) -> String {
     format!("\x1b]1337;File=inline=1:{payload_b64}\u{7}")
 }
@@ -56,5 +121,11 @@ mod tests {
         let header = parse_kitty_image_header("\x1b_Gi=7,r=2;QQ==\x1b\\").unwrap();
         assert_eq!(header.ids, ["7"]);
         assert_eq!(header.rows, 2);
+        let encoded = encode_kitty("QQ==", Some(2), Some(3), Some(42), false);
+        assert!(encoded.contains("a=T,f=100,q=2,C=1,c=2,r=3,i=42"));
+        assert_eq!(delete_kitty_image(42), "\x1b_Ga=d,d=I,i=42,q=2\x1b\\");
+        let big = encode_kitty(&"A".repeat(5000), None, None, None, true);
+        assert!(big.contains(",m=1;"));
+        assert!(big.contains("m=0;"));
     }
 }

@@ -17,6 +17,11 @@ impl Editor {
         }
     }
 
+    pub fn insert_str(&mut self, text: &str) {
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
     pub fn insert(&mut self, ch: char) {
         self.buffer.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();

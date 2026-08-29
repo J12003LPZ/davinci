@@ -1,5 +1,6 @@
 //! Terminal UI matching `@earendil-works/pi-tui`.
 
+mod autocomplete;
 mod box_comp;
 mod chrome;
 mod editor;
@@ -15,15 +16,19 @@ mod scroll;
 mod session;
 mod settings;
 mod themes;
+mod tool_card;
 mod transcript;
 
+pub use autocomplete::{
+    apply_completion, suggestions, AutocompleteItem, AutocompleteSuggestions, SlashCommandSpec,
+};
 pub use box_comp::TuiBox;
 pub use chrome::ChatChrome;
 pub use editor::Editor;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use image::{
-    iterm_image, kitty_image_chunk, kitty_image_ids, parse_kitty_image_header, KittyImageHeader,
-    KITTY_IMAGE_PREFIX,
+    delete_all_kitty_images, delete_kitty_image, encode_kitty, iterm_image, kitty_image_chunk,
+    kitty_image_ids, parse_kitty_image_header, KittyImageHeader, KITTY_IMAGE_PREFIX,
 };
 pub use keys::{decode_kitty_printable, parse_key, Key};
 pub use latex::render_latex;
@@ -33,12 +38,13 @@ pub use overlay::Overlay;
 pub use render::{visible_width, Component, Text};
 pub use scroll::ScrollView;
 pub use session::{
-    InteractiveSession, OverlayKind, SessionAction, BRACKETED_PASTE_DISABLE,
-    BRACKETED_PASTE_ENABLE, DISABLE_AUTOWRAP, ENABLE_AUTOWRAP, KITTY_KEYBOARD_DISABLE,
-    KITTY_KEYBOARD_QUERY,
+    DoubleEscapeAction, InteractiveSession, OverlayKind, SessionAction, BRACKETED_PASTE_DISABLE,
+    BRACKETED_PASTE_ENABLE, DISABLE_AUTOWRAP, DOUBLE_ESCAPE_MS, ENABLE_AUTOWRAP,
+    KITTY_KEYBOARD_DISABLE, KITTY_KEYBOARD_QUERY,
 };
-pub use settings::{SettingItem, SettingsList};
+pub use settings::{default_interactive_settings, SettingItem, SettingsList};
 pub use themes::{builtin_themes, Theme};
+pub use tool_card::{ToolCard, ToolCardState, FALLBACK_PREVIEW_LINES};
 pub use transcript::{Transcript, TranscriptLine};
 
 pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";

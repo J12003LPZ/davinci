@@ -1,6 +1,9 @@
+use crate::autocomplete::AutocompleteSuggestions;
 use crate::editor::Editor;
 use crate::render::Component;
+use crate::settings::SettingsList;
 use crate::themes::Theme;
+use crate::tool_card::ToolCard;
 use crate::transcript::Transcript;
 use crate::SelectList;
 
@@ -10,6 +13,10 @@ pub struct ChatChrome {
     pub transcript: Transcript,
     pub editor: Editor,
     pub selector: Option<SelectList>,
+    pub settings_list: Option<SettingsList>,
+    pub tool_cards: Vec<ToolCard>,
+    pub autocomplete: Option<AutocompleteSuggestions>,
+    pub autocomplete_selected: usize,
     pub theme: Theme,
     pub status: String,
     pub title: String,
@@ -21,6 +28,10 @@ impl ChatChrome {
             transcript: Transcript::default(),
             editor: Editor::new(),
             selector: None,
+            settings_list: None,
+            tool_cards: Vec::new(),
+            autocomplete: None,
+            autocomplete_selected: 0,
             theme,
             status: String::new(),
             title: title.into(),
@@ -45,17 +56,40 @@ impl Component for ChatChrome {
             lines.push(self.status.clone());
         }
         lines.extend(self.transcript.render(width));
-        if let Some(selector) = &self.selector {
+        for card in &self.tool_cards {
+            lines.extend(card.render(width));
+        }
+        if let Some(settings) = &self.settings_list {
+            lines.push(String::new());
+            lines.extend(settings.render(width));
+        } else if let Some(selector) = &self.selector {
             lines.push(String::new());
             lines.extend(selector.render(width));
         } else {
             lines.extend(self.editor.render(width));
+            if let Some(suggestions) = &self.autocomplete {
+                for (index, item) in suggestions.items.iter().enumerate() {
+                    let prefix = if index == self.autocomplete_selected {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    let desc = item
+                        .description
+                        .as_deref()
+                        .map(|value| format!("  {value}"))
+                        .unwrap_or_default();
+                    lines.push(format!("{prefix}{}{desc}", item.label));
+                }
+            }
         }
         lines
     }
 
     fn handle_input(&mut self, data: &str) {
-        if let Some(selector) = &mut self.selector {
+        if let Some(settings) = &mut self.settings_list {
+            settings.handle_input(data);
+        } else if let Some(selector) = &mut self.selector {
             selector.query.push_str(data);
         } else {
             self.editor.handle_input(data);

@@ -37,7 +37,11 @@ impl Component for Transcript {
         for line in self.lines.iter().skip(self.scroll) {
             let heading = format!("{}:", line.role);
             out.push(truncate(&heading, width));
-            if line.role == "assistant" {
+            if line.role == "image" {
+                out.push(line.text.clone());
+            } else if line.role == "tool" {
+                out.extend(crate::render::wrap_text(&line.text, width));
+            } else if line.role == "assistant" {
                 out.extend(render_markdown(&line.text, width));
             } else {
                 out.extend(crate::render::wrap_text(&line.text, width));
