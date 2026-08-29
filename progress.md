@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (LLM branch summaries, markdown codeBlockIndent, Codex websocket connect timeout, leaf-path session context). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (edit `edits[]` + bash timeout). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -73,12 +73,12 @@ Closed this slice: LLM branch-tree summarization (`BRANCH_SUMMARY_PREAMBLE` / `B
 
 Closed this slice: `/tree` “Summarize branch?” runs TS `completeSummarization` (structured `## Goal` prompt, 2048 tokens, preamble + file-ops XML, `branch_summary` JSONL via `branchWithSummary`, user/custom targets restore editor text). Session reload uses TS `buildContextEntries` (leaf path + latest compaction `firstKeptEntryId`). TUI markdown applies `markdown.codeBlockIndent` (default two spaces) to fenced code. Codex websocket connect honors `websocketConnectTimeoutMs` / `PI_WEBSOCKET_CONNECT_TIMEOUT_MS` (default 15000; fixture `PI_CODEX_WS_REPLY=timeout`).
 
+Closed this slice: edit tool accepts TS `edits[]` (JSON-string / single-object / legacy `oldText`+`newText`), unique non-overlapping matches, fuzzy whitespace/quote/dash normalize, BOM + line-ending restore, and locked not-found / duplicate / overlap / empty / no-change strings. Bash tool honors `timeout` seconds (`Invalid timeout: must be a finite number of seconds`, `Command timed out after N seconds`).
+
 Still not product-equivalent:
 
-- Edit tool is legacy single `oldText`/`newText`; TS `edits[]` multi-replacement, uniqueness, overlap, and fuzzy match are missing
 - `images.blockImages` / `images.autoResize` and tool-result image normalization are parsed but not applied on the LLM path
 - Codex `transport` (`auto`/`sse`/`websocket`) is stored in settings but not passed into stream options
-- Bash tool has no `timeout` (TS kills after N seconds)
 - Provider attribution headers (OpenRouter referer, NIM, Cloudflare, OpenCode session) are not sent
 - RPC `abort_retry` is a no-op; RPC `images` on prompt/steer/follow_up are dropped
 - Interactive polish: cache-miss notices, OSC 9;4 terminal progress, git-branch footer, `quietStartup` banners, post-update changelog overlay

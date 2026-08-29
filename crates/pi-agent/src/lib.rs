@@ -3,6 +3,7 @@
 mod branch;
 mod compaction;
 mod context;
+mod edit_diff;
 mod events;
 mod queues;
 mod skills;

@@ -63,13 +63,33 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "edit".into(),
-            description: "Edit files with find/replace".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"]}),
+            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},
+                    "edits":{
+                        "type":"array",
+                        "description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally.",
+                        "items":{
+                            "type":"object",
+                            "properties":{
+                                "oldText":{"type":"string"},
+                                "newText":{"type":"string"}
+                            },
+                            "required":["oldText","newText"]
+                        }
+                    },
+                    "oldText":{"type":"string"},
+                    "newText":{"type":"string"}
+                },
+                "required":["path"]
+            }),
         },
         AgentTool {
             name: "bash".into(),
             description: "Execute bash commands".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+            parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}},"required":["command"]}),
         },
         AgentTool {
             name: "powershell".into(),
@@ -114,28 +134,8 @@ pub fn execute_tool(
                 details: None,
             })
         }
-        "edit" => {
-            let path = resolve(cwd, required_str(input, "path")?)?;
-            let old = required_str(input, "oldText")?;
-            let new = required_str(input, "newText")?;
-            let original =
-                fs::read_to_string(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
-            if !original.contains(old) {
-                return Ok(ToolResult {
-                    content: format!("oldText not found in {}", path.display()),
-                    is_error: true,
-                    details: None,
-                });
-            }
-            fs::write(&path, original.replacen(old, new, 1))
-                .map_err(|err| ToolError::Failed(err.to_string()))?;
-            Ok(ToolResult {
-                content: format!("Edited {}", path.display()),
-                is_error: false,
-                details: None,
-            })
-        }
-        "bash" => shell_tool(cwd, required_str(input, "command")?),
+        "edit" => edit_tool(cwd, input),
+        "bash" => shell_tool(cwd, input),
         "powershell" => powershell_tool(cwd, required_str(input, "command")?),
         "ls" => ls_tool(cwd, input),
         "grep" => grep_tool(cwd, input),
@@ -258,7 +258,72 @@ fn detect_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn shell_tool(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {
+fn edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let (display_path, edits) =
+        crate::edit_diff::prepare_edit_arguments(input).map_err(ToolError::Failed)?;
+    let path = resolve(cwd, &display_path)?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) => {
+            return Err(ToolError::Failed(format!(
+                "Could not edit file: {display_path}. Error code: {}.",
+                err.raw_os_error()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| err.to_string())
+            )));
+        }
+    };
+    let (bom, content) = crate::edit_diff::split_bom(&raw);
+    let ending = crate::edit_diff::detect_line_ending(content);
+    let normalized = crate::edit_diff::normalize_to_lf(content);
+    let applied =
+        crate::edit_diff::apply_edits_to_normalized_content(&normalized, &edits, &display_path)
+            .map_err(ToolError::Failed)?;
+    let final_content = format!(
+        "{bom}{}",
+        crate::edit_diff::restore_line_endings(&applied.new_content, ending)
+    );
+    fs::write(&path, final_content).map_err(|err| ToolError::Failed(err.to_string()))?;
+    Ok(ToolResult {
+        content: format!("Edited {display_path}"),
+        is_error: false,
+        details: Some(serde_json::json!({
+            "path": display_path,
+            "edits": edits.len(),
+            "tokensBefore": applied.base_content.len(),
+        })),
+    })
+}
+
+fn resolve_bash_timeout_ms(input: &serde_json::Value) -> Result<Option<u64>, ToolError> {
+    let Some(value) = input.get("timeout") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let seconds = value.as_f64().ok_or_else(|| {
+        ToolError::Failed("Invalid timeout: must be a finite number of seconds".into())
+    })?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(ToolError::Failed(
+            "Invalid timeout: must be a finite number of seconds".into(),
+        ));
+    }
+    let timeout_ms = seconds * 1000.0;
+    const MAX_TIMEOUT_MS: f64 = 2_147_483_647.0;
+    if timeout_ms > MAX_TIMEOUT_MS {
+        return Err(ToolError::Failed(format!(
+            "Invalid timeout: maximum is {} seconds",
+            MAX_TIMEOUT_MS / 1000.0
+        )));
+    }
+    Ok(Some(timeout_ms as u64))
+}
+
+fn shell_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let command = required_str(input, "command")?;
+    let timeout_ms = resolve_bash_timeout_ms(input)?;
     let command = match std::env::var("PI_SHELL_COMMAND_PREFIX") {
         Ok(prefix) if !prefix.is_empty() => format!("{prefix}; {command}"),
         _ => command.to_string(),
@@ -273,28 +338,30 @@ fn shell_tool(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let output = match config.command_transport {
-        pi_ai::CommandTransport::Argv => process
-            .arg(&command)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|err| ToolError::Failed(err.to_string()))?,
+    match config.command_transport {
+        pi_ai::CommandTransport::Argv => {
+            process.arg(&command).stdin(std::process::Stdio::null());
+        }
         pi_ai::CommandTransport::Stdin => {
             process.stdin(std::process::Stdio::piped());
-            let mut child = process
-                .spawn()
-                .map_err(|err| ToolError::Failed(err.to_string()))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                stdin
-                    .write_all(command.as_bytes())
-                    .map_err(|err| ToolError::Failed(err.to_string()))?;
-            }
-            child
-                .wait_with_output()
-                .map_err(|err| ToolError::Failed(err.to_string()))?
         }
-    };
+    }
+    let mut child = process
+        .spawn()
+        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    if matches!(config.command_transport, pi_ai::CommandTransport::Stdin) {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin
+                .write_all(command.as_bytes())
+                .map_err(|err| ToolError::Failed(err.to_string()))?;
+        }
+    }
+    let timeout_label = input.get("timeout").map(|value| match value {
+        serde_json::Value::Number(number) => number.to_string(),
+        other => other.to_string(),
+    });
+    let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref())?;
     let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
         if !content.is_empty() {
@@ -306,6 +373,80 @@ fn shell_tool(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {
         content,
         is_error: !output.status.success(),
         details: Some(serde_json::json!({"exitCode": output.status.code()})),
+    })
+}
+
+fn wait_shell_output(
+    mut child: std::process::Child,
+    timeout_ms: Option<u64>,
+    timeout_label: Option<&str>,
+) -> Result<std::process::Output, ToolError> {
+    use std::io::Read;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_handle = stdout.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = stderr.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let status = if let Some(timeout_ms) = timeout_ms {
+        let start = std::time::Instant::now();
+        let limit = std::time::Duration::from_millis(timeout_ms);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if start.elapsed() >= limit => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stdout = stdout_handle
+                        .map(|handle| handle.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let stderr = stderr_handle
+                        .map(|handle| handle.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let mut content = String::from_utf8_lossy(&stdout).into_owned();
+                    if !stderr.is_empty() {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&String::from_utf8_lossy(&stderr));
+                    }
+                    let seconds = timeout_label.unwrap_or("0");
+                    let status = format!("Command timed out after {seconds} seconds");
+                    return Err(ToolError::Failed(if content.is_empty() {
+                        status
+                    } else {
+                        format!("{content}\n\n{status}")
+                    }));
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(err) => return Err(ToolError::Failed(err.to_string())),
+            }
+        }
+    } else {
+        child
+            .wait()
+            .map_err(|err| ToolError::Failed(err.to_string()))?
+    };
+    let stdout = stdout_handle
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
     })
 }
 
@@ -888,6 +1029,59 @@ mod tests {
             sliced.details.as_ref().unwrap()["truncation"]["totalLines"],
             3
         );
+        execute_tool(
+            dir.path(),
+            "write",
+            &serde_json::json!({"path":"c.txt","content":"alpha\nbeta\ngamma\n"}),
+        )
+        .unwrap();
+        execute_tool(
+            dir.path(),
+            "edit",
+            &serde_json::json!({
+                "path":"c.txt",
+                "edits":[
+                    {"oldText":"alpha","newText":"ALPHA"},
+                    {"oldText":"gamma","newText":"GAMMA"}
+                ]
+            }),
+        )
+        .unwrap();
+        let on_disk = fs::read_to_string(dir.path().join("c.txt")).unwrap();
+        assert_eq!(on_disk, "ALPHA\nbeta\nGAMMA\n");
+        let missing = execute_tool(
+            dir.path(),
+            "edit",
+            &serde_json::json!({"path":"c.txt","edits":[{"oldText":"nope","newText":"x"}]}),
+        )
+        .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("Could not find the exact text in c.txt"));
+    }
+
+    #[test]
+    fn bash_timeout_matches_ts_errors() {
+        let dir = tempdir().unwrap();
+        let invalid = execute_tool(
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command":"true","timeout":0}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid.to_string(),
+            "Invalid timeout: must be a finite number of seconds"
+        );
+        let timed_out = execute_tool(
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command":"sleep 2","timeout":0.2}),
+        )
+        .unwrap_err();
+        assert!(timed_out
+            .to_string()
+            .contains("Command timed out after 0.2 seconds"));
     }
 
     #[test]
