@@ -1,11 +1,14 @@
-//! SQLite session backend with FTS, writer leases, and v3→v4 migrate.
+//! SQLite session backend matching `packages/session-backends/sqlite-node`.
 
 use pi_session::{discover_sessions, migrate_v3_to_v4, parse_header, SessionInfo};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+const INITIAL_SQL: &str = include_str!("migrations/001_initial.sql");
 
 #[derive(Debug, Error)]
 pub enum SqliteError {
@@ -29,41 +32,11 @@ impl SessionSqlite {
             fs::create_dir_all(parent).map_err(|e| SqliteError::Message(e.to_string()))?;
         }
         let conn = Connection::open(&path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        apply_migrations(&conn)?;
         conn.execute_batch(
-            r#"
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                applied_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                path TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                modified_at INTEGER NOT NULL,
-                source_format INTEGER NOT NULL,
-                name TEXT,
-                parent_session_id TEXT
-            );
-            CREATE TABLE IF NOT EXISTS entries (
-                session_id TEXT NOT NULL,
-                seq INTEGER NOT NULL,
-                type TEXT NOT NULL,
-                body TEXT NOT NULL,
-                PRIMARY KEY (session_id, seq)
-            );
-            CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-                session_id, type, body, content='entries', content_rowid='seq'
-            );
-            CREATE TABLE IF NOT EXISTS writer_leases (
-                session_id TEXT PRIMARY KEY,
-                owner TEXT NOT NULL,
-                expires_at INTEGER NOT NULL
-            );
-            "#,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(session_id, type, body);",
         )?;
-        migrate_schema(&conn)?;
         Ok(Self { conn, path })
     }
 
@@ -71,25 +44,40 @@ impl SessionSqlite {
         &self.path
     }
 
+    pub fn table_names(&self) -> Result<Vec<String>, SqliteError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn migration_ids(&self) -> Result<Vec<String>, SqliteError> {
+        let mut stmt = self.conn.prepare("SELECT id FROM migrations ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn upsert_session(&self, info: &SessionInfo) -> Result<(), SqliteError> {
+        let metadata = json!({
+            "path": info.path.to_string_lossy(),
+            "name": info.name,
+            "modified_at": info.modified_at,
+            "source_format": info.source_format
+        });
         self.conn.execute(
-            "INSERT INTO sessions(id, path, cwd, created_at, modified_at, source_format, name, parent_session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO sessions(id, created_at, cwd, parent_session_id, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET
-                path=excluded.path,
                 cwd=excluded.cwd,
-                modified_at=excluded.modified_at,
-                name=excluded.name,
-                parent_session_id=excluded.parent_session_id",
+                parent_session_id=excluded.parent_session_id,
+                metadata=excluded.metadata",
             params![
                 info.id,
-                info.path.to_string_lossy(),
-                info.cwd,
                 info.created_at,
-                info.modified_at,
-                info.source_format,
-                info.name,
-                info.parent_session_id
+                info.cwd,
+                info.parent_session_id,
+                metadata.to_string()
             ],
         )?;
         Ok(())
@@ -125,16 +113,25 @@ impl SessionSqlite {
             if line.trim().is_empty() {
                 continue;
             }
-            let value: serde_json::Value =
-                serde_json::from_str(line).unwrap_or(serde_json::Value::Null);
+            let value: Value = serde_json::from_str(line).unwrap_or(Value::Null);
             let ty = value
                 .get("type")
                 .or_else(|| value.get("kind"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
+            let id = value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("e{}", seq + 1));
+            let ts = value
+                .get("timestamp")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(info.created_at);
             self.conn.execute(
-                "INSERT OR REPLACE INTO entries(session_id, seq, type, body) VALUES (?1, ?2, ?3, ?4)",
-                params![info.id, (seq as i64) + 1, ty, line],
+                "INSERT OR REPLACE INTO entries(session_id, seq, id, parent_id, type, timestamp, payload)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+                params![info.id, (seq as i64) + 1, id, ty, ts, line],
             )?;
             let _ = self.conn.execute(
                 "INSERT INTO entries_fts(session_id, type, body) VALUES (?1, ?2, ?3)",
@@ -153,42 +150,78 @@ impl SessionSqlite {
         self.search_like(query)
     }
 
-    fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
+    fn row_to_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
+        let metadata_raw: Option<String> = row.get(4)?;
+        let metadata: Value = metadata_raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
         Ok(SessionInfo {
             id: row.get(0)?,
-            path: PathBuf::from(row.get::<_, String>(1)?),
+            path: PathBuf::from(
+                metadata
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            ),
             cwd: row.get(2)?,
-            created_at: row.get(3)?,
-            modified_at: row.get(4)?,
-            source_format: row.get(5)?,
-            name: row.get(6)?,
-            parent_session_id: row.get(7)?,
+            created_at: row.get(1)?,
+            modified_at: metadata
+                .get("modified_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            source_format: metadata
+                .get("source_format")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4) as u8,
+            name: metadata
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            parent_session_id: row.get(3)?,
         })
     }
 
     fn search_fts(&self, query: &str) -> Result<Vec<SessionInfo>, SqliteError> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT s.id, s.path, s.cwd, s.created_at, s.modified_at, s.source_format, s.name, s.parent_session_id
+            "SELECT DISTINCT s.id, s.created_at, s.cwd, s.parent_session_id, s.metadata
              FROM sessions s
              JOIN entries_fts f ON f.session_id = s.id
              WHERE entries_fts MATCH ?1
-             ORDER BY s.modified_at DESC",
+             ORDER BY s.created_at DESC",
         )?;
-        let rows = stmt.query_map([query], Self::map_session_row)?;
+        let rows = stmt.query_map([query], Self::row_to_info)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     fn search_like(&self, query: &str) -> Result<Vec<SessionInfo>, SqliteError> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT s.id, s.path, s.cwd, s.created_at, s.modified_at, s.source_format, s.name, s.parent_session_id
+            "SELECT DISTINCT s.id, s.created_at, s.cwd, s.parent_session_id, s.metadata
              FROM sessions s
              JOIN entries e ON e.session_id = s.id
-             WHERE e.body LIKE ?1 OR s.name LIKE ?1 OR s.id LIKE ?1
-             ORDER BY s.modified_at DESC",
+             WHERE e.payload LIKE ?1 OR s.id LIKE ?1 OR s.metadata LIKE ?1
+             ORDER BY s.created_at DESC",
         )?;
         let pattern = format!("%{query}%");
-        let rows = stmt.query_map([&pattern], Self::map_session_row)?;
+        let rows = stmt.query_map([&pattern], Self::row_to_info)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn validate_lease_timing(
+        ttl_ms: i64,
+        heartbeat_interval_ms: i64,
+    ) -> Result<(), SqliteError> {
+        if ttl_ms <= 0 {
+            return Err(SqliteError::Message(
+                "writerLease.ttlMs must be positive".into(),
+            ));
+        }
+        if heartbeat_interval_ms <= 0 || heartbeat_interval_ms >= ttl_ms {
+            return Err(SqliteError::Message(
+                "writerLease.heartbeatIntervalMs must be positive and less than ttlMs".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn acquire_lease(
@@ -199,30 +232,36 @@ impl SessionSqlite {
     ) -> Result<bool, SqliteError> {
         let now = now_ms();
         let expires = now + ttl_ms;
-        let existing: Option<(String, i64)> = self
+        let existing: Option<(String, i64, i64)> = self
             .conn
             .query_row(
-                "SELECT owner, expires_at FROM writer_leases WHERE session_id = ?1",
+                "SELECT owner_id, fence, expires_at_ms FROM writer_leases WHERE session_id = ?1",
                 [session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some((current_owner, exp)) = existing {
+        let mut fence = 1;
+        if let Some((current_owner, current_fence, exp)) = existing {
             if exp > now && current_owner != owner {
                 return Ok(false);
             }
+            fence = current_fence + 1;
         }
         self.conn.execute(
-            "INSERT INTO writer_leases(session_id, owner, expires_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(session_id) DO UPDATE SET owner=excluded.owner, expires_at=excluded.expires_at",
-            params![session_id, owner, expires],
+            "INSERT INTO writer_leases(session_id, owner_id, fence, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET
+                owner_id=excluded.owner_id,
+                fence=excluded.fence,
+                expires_at_ms=excluded.expires_at_ms",
+            params![session_id, owner, fence, expires],
         )?;
         Ok(true)
     }
 
     pub fn release_lease(&self, session_id: &str, owner: &str) -> Result<(), SqliteError> {
         self.conn.execute(
-            "DELETE FROM writer_leases WHERE session_id = ?1 AND owner = ?2",
+            "DELETE FROM writer_leases WHERE session_id = ?1 AND owner_id = ?2",
             params![session_id, owner],
         )?;
         Ok(())
@@ -237,18 +276,25 @@ impl SessionSqlite {
     }
 }
 
-fn migrate_schema(conn: &Connection) -> Result<(), SqliteError> {
-    let version: i64 = conn
+fn apply_migrations(conn: &Connection) -> Result<(), SqliteError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS migrations (
+            id TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );",
+    )?;
+    let applied: Option<String> = conn
         .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            "SELECT id FROM migrations WHERE id = '001_initial.sql'",
             [],
             |row| row.get(0),
         )
-        .unwrap_or(0);
-    if version < 1 {
+        .optional()?;
+    if applied.is_none() {
+        conn.execute_batch(INITIAL_SQL)?;
         conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
-            [now_ms()],
+            "INSERT INTO migrations(id, applied_at) VALUES ('001_initial.sql', ?1)",
+            [iso_now()],
         )?;
     }
     Ok(())
@@ -259,6 +305,10 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn iso_now() -> String {
+    format!("{}Z", now_ms())
 }
 
 #[cfg(test)]
@@ -284,5 +334,37 @@ mod tests {
         assert!(!db.acquire_lease("lease-1", "owner-b", 60_000).unwrap());
         db.release_lease("lease-1", "owner-a").unwrap();
         assert!(db.acquire_lease("lease-1", "owner-b", 60_000).unwrap());
+    }
+
+    #[test]
+    fn ts_migration_conformance() {
+        let dir = tempdir().unwrap();
+        let db = SessionSqlite::open(dir.path().join("sessions.sqlite")).unwrap();
+        apply_migrations(&db.conn).unwrap();
+        assert_eq!(db.migration_ids().unwrap(), vec!["001_initial.sql"]);
+        let names = db.table_names().unwrap();
+        for required in [
+            "migrations",
+            "sessions",
+            "entries",
+            "session_sequences",
+            "session_stats",
+            "branch_entries",
+            "branch_tips",
+            "lanes",
+            "records",
+            "lane_moves",
+            "facts",
+            "writer_leases",
+        ] {
+            assert!(names.iter().any(|n| n == required), "missing {required}");
+        }
+        let err = SessionSqlite::validate_lease_timing(0, 1).unwrap_err();
+        assert_eq!(err.to_string(), "writerLease.ttlMs must be positive");
+        let err = SessionSqlite::validate_lease_timing(100, 100).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "writerLease.heartbeatIntervalMs must be positive and less than ttlMs"
+        );
     }
 }

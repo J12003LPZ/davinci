@@ -33,6 +33,16 @@ mod tests {
     fn wrap_ansi_and_keys_match_ts_fixtures() {
         let wrapped = crate::component::wrap("one two three four", 8);
         assert!(wrapped.iter().all(|l| display_width(l) <= 8));
+        let underline_on = "\u{1b}[4m";
+        let underline_off = "\u{1b}[24m";
+        let url = "https://example.com/very/long/path/that/will/wrap";
+        let ansi = crate::component::wrap_text_with_ansi(
+            &format!("read this thread {underline_on}{url}{underline_off}"),
+            40,
+        );
+        assert_eq!(ansi[0], "read this thread");
+        assert!(ansi[1].starts_with(underline_on));
+        assert!(ansi[1].contains("https://"));
         assert_eq!(parse_key("\u{1b}[A"), Key::Up);
         assert_eq!(parse_key("ctrl+c"), Key::Ctrl('c'));
         assert_eq!(parse_key("enter"), Key::Enter);
