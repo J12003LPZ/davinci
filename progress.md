@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (TUI autocomplete `#` / `fd` / extension providers). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (extension setActiveTools / setThinkingLevel / working indicator). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -98,6 +98,8 @@ Closed this slice: TUI Editor wrap/page/paste-delete matches TS `editor.ts` / `e
 Closed this slice: Codex WebSocket **live socket reuse** matches TS `acquireWebSocket` / `websocketSessionCache` — park the RFC 6455 stream per session+account, reuse when idle and not expired (`SESSION_WEBSOCKET_CACHE_TTL_MS` / `MAX_AGE`), open a side connection when busy, drop on send/read failure or `closeOpenAICodexWebSocketSessions`. Debug `connectionsCreated` / `connectionsReused` count sockets, not continuation hits. Loopback test: one TCP accept, two `response.create` cycles.
 
 Closed this slice: TUI autocomplete matches TS `autocomplete.ts` / `editor.ts` / extension APIs — Combined `@` file search uses `fd` fuzzy/gitignore (`buildFdPathQuery`, depth-1 + recursive walks, score/sort top 20) with `PI_FD_REPLY` / `PI_FD_PATH` fixtures (readdir fallback when `fd` is absent); `#` is an extension trigger, never a file attach; `ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS = 20` on `@`/`#` tokens (0 on Tab/force); `SlashCommandSpec.argument_items` ports `getArgumentCompletions`; JS `registerCommand` snapshots static completers and `ui.addAutocompleteProvider` records `triggerCharacters` + `PI_EXTENSION_AUTOCOMPLETE_REPLY` items onto `InteractiveSession.extra_autocomplete`. Tests: `vendor/pi/packages/tui/test/autocomplete.test.ts` fd cases plus `examples/extensions/commands.ts` / `github-issue-autocomplete.ts`.
+
+Closed this slice: JS `pi.setActiveTools` / `pi.setThinkingLevel` match TS `setActiveToolsByName` / `setThinkingLevel` (registry filter, unknown names ignored, thinking string parse) and `ctx.ui.setWorkingVisible` / `setWorkingIndicator` (`frames` / `intervalMs`, empty frames hide). `getActiveTools` / `getAllTools` / `getThinkingLevel` read the invoke payload. Interactive `/thinking` cycle includes `xhigh` and `max`. Tests: plan-mode / preset / working-indicator extension APIs.
 
 Still not product-equivalent:
 

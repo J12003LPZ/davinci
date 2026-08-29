@@ -554,8 +554,15 @@ async function main() {
 			setWorkingMessage(message) {
 				recorded.uiCalls.push({ op: "setWorkingMessage", message });
 			},
-			setWorkingVisible() {},
-			setWorkingIndicator() {},
+			setWorkingVisible(visible) {
+				recorded.uiCalls.push({ op: "setWorkingVisible", visible: Boolean(visible) });
+			},
+			setWorkingIndicator(options) {
+				recorded.uiCalls.push({
+					op: "setWorkingIndicator",
+					options: options === undefined ? null : options,
+				});
+			},
 			setHiddenThinkingLabel(label) {
 				recorded.uiCalls.push({ op: "setHiddenThinkingLabel", label });
 			},
@@ -770,22 +777,30 @@ async function main() {
 			});
 		},
 		getActiveTools() {
-			return [];
+			return Array.isArray(payload.activeTools) ? payload.activeTools : [];
 		},
 		getAllTools() {
-			return [];
+			if (Array.isArray(payload.allTools)) return payload.allTools;
+			return Array.isArray(payload.activeTools) ? payload.activeTools : [];
 		},
-		setActiveTools() {},
+		setActiveTools(toolNames) {
+			recorded.sessionCalls.push({
+				op: "setActiveTools",
+				toolNames: Array.isArray(toolNames) ? toolNames : [],
+			});
+		},
 		getCommands() {
-			return [];
+			return Array.isArray(payload.commands) ? payload.commands : [];
 		},
 		setModel() {
 			return Promise.resolve(false);
 		},
 		getThinkingLevel() {
-			return "off";
+			return payload.thinkingLevel || "off";
 		},
-		setThinkingLevel() {},
+		setThinkingLevel(level) {
+			recorded.sessionCalls.push({ op: "setThinkingLevel", level: String(level || "off") });
+		},
 		unregisterProvider(name) {
 			recorded.providers = recorded.providers.filter((provider) => provider.name !== name);
 		},

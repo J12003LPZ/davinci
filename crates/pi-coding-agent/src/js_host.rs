@@ -552,6 +552,62 @@ module.exports = (pi) => {
     }
 
     #[test]
+    fn records_active_tools_thinking_and_working_indicator() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerCommand("plan", {
+    description: "plan",
+    handler: async (_args, ctx) => {
+      const current = pi.getActiveTools();
+      pi.setActiveTools(["read", "bash"]);
+      pi.setThinkingLevel("max");
+      ctx.ui.setWorkingVisible(false);
+      ctx.ui.setWorkingIndicator({ frames: ["●"], intervalMs: 80 });
+      return { current, thinking: pi.getThinkingLevel() };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let command = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({
+                "name": "plan",
+                "activeTools": ["read", "bash", "edit"],
+                "thinkingLevel": "high",
+                "ctx": { "mode": "tui" }
+            }),
+        )
+        .unwrap();
+        let ops: Vec<&str> = command
+            .session_calls
+            .iter()
+            .filter_map(|call| call.get("op").and_then(|value| value.as_str()))
+            .collect();
+        assert!(ops.contains(&"setActiveTools"));
+        assert!(ops.contains(&"setThinkingLevel"));
+        assert_eq!(command.result.as_ref().unwrap()["current"][0], "read");
+        assert_eq!(command.result.as_ref().unwrap()["thinking"], "high");
+        assert!(command
+            .ui_calls
+            .iter()
+            .any(|call| call["op"] == "setWorkingVisible" && call["visible"] == false));
+        assert!(command
+            .ui_calls
+            .iter()
+            .any(|call| call["op"] == "setWorkingIndicator"));
+    }
+
+    #[test]
     fn loads_typescript_factory_with_virtual_packages() {
         let Some(_) = find_node() else {
             return;

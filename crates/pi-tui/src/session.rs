@@ -227,6 +227,8 @@ impl InteractiveSession {
                 "low".into(),
                 "medium".into(),
                 "high".into(),
+                "xhigh".into(),
+                "max".into(),
             ],
             thinking_index: 0,
             aborted: false,
@@ -1942,12 +1944,27 @@ mod tests {
             serde_json::json!({ "op": "setStatus", "key": "job", "text": "running" }),
             serde_json::json!({ "op": "setHeader", "lines": ["ext header"] }),
             serde_json::json!({ "op": "notify", "message": "ready", "type": "info" }),
+            serde_json::json!({ "op": "setWorkingMessage", "message": "Thinking…" }),
+            serde_json::json!({
+                "op": "setWorkingIndicator",
+                "options": { "frames": ["●"], "intervalMs": 80 }
+            }),
         ]);
         let frame = session.render_frame();
         assert!(frame.contains("hello widget"));
         assert!(frame.contains("job: running"));
         assert!(frame.contains("ext header"));
         assert!(frame.contains("info: ready"));
+        assert!(frame.contains("●"));
+        session.apply_extension_ui_calls(&[serde_json::json!({
+            "op": "setWorkingVisible",
+            "visible": false
+        })]);
+        let hidden = session.render_frame();
+        assert!(!hidden.contains("●"));
+        assert!(!hidden.contains("Thinking…"));
+        assert!(session.thinking_levels.contains(&"xhigh".into()));
+        assert!(session.thinking_levels.contains(&"max".into()));
 
         session.open_extension_selector("Pick", vec!["one".into(), "two".into()]);
         assert_eq!(session.handle_bytes("\x1b[B"), SessionAction::None);

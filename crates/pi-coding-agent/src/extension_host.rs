@@ -73,6 +73,10 @@ pub struct ExtensionHost {
     pub ui_calls: Vec<Value>,
     pub session_calls: Vec<Value>,
     pub editor_modules: Vec<String>,
+    pub runtime_active_tools: Vec<String>,
+    pub runtime_all_tools: Vec<String>,
+    pub runtime_thinking_level: String,
+    pub runtime_commands: Vec<Value>,
 }
 
 impl ExtensionHost {
@@ -89,6 +93,10 @@ impl ExtensionHost {
             ui_calls: Vec::new(),
             session_calls: Vec::new(),
             editor_modules: Vec::new(),
+            runtime_active_tools: Vec::new(),
+            runtime_all_tools: Vec::new(),
+            runtime_thinking_level: "off".into(),
+            runtime_commands: Vec::new(),
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -429,7 +437,11 @@ impl ExtensionHost {
                 "snapshot": snapshot,
                 "width": width,
                 "height": 24,
-                "ctx": { "mode": "tui" }
+                "ctx": { "mode": "tui" },
+                "activeTools": self.runtime_active_tools,
+                "allTools": self.runtime_all_tools,
+                "thinkingLevel": self.runtime_thinking_level,
+                "commands": self.runtime_commands,
             }),
         )?;
         if !result.ok {

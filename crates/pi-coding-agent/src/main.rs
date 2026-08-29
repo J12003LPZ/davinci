@@ -2694,6 +2694,9 @@ fn try_extension_slash(
     let Some(path) = path else {
         return Ok(false);
     };
+    host.runtime_active_tools = agent.tools.clone();
+    host.runtime_all_tools = agent.tool_registry.clone();
+    host.runtime_thinking_level = agent.thinking_level.as_str().to_string();
     let result = host.invoke_command(&path, name)?;
     session.apply_extension_ui_calls(&host.ui_calls);
     apply_session_calls(agent, &mut session.chrome, &host.session_calls);
@@ -2759,6 +2762,9 @@ fn handle_custom_overlay_input(
         .unwrap_or_default();
     let snapshot = session.chrome.custom_overlay_snapshot.clone();
     let mut host = loaded_extension_host(parsed);
+    host.runtime_active_tools = agent.tools.clone();
+    host.runtime_all_tools = agent.tool_registry.clone();
+    host.runtime_thinking_level = agent.thinking_level.as_str().to_string();
     match host.invoke_command_with(&path, &name, data, snapshot.as_ref(), session.width) {
         Ok(result) => {
             session.apply_extension_ui_calls(&host.ui_calls);
@@ -3278,6 +3284,30 @@ fn apply_session_calls(agent: &mut Agent, chrome: &mut ChatChrome, calls: &[serd
             }
             Some("fork") => {
                 chrome.status = "fork".into();
+            }
+            Some("setActiveTools") => {
+                let names: Vec<String> = call
+                    .get("toolNames")
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                agent.set_active_tools_by_name(&names);
+                chrome.status = format!("tools {}", agent.tools.join(","));
+            }
+            Some("setThinkingLevel") => {
+                if let Some(level) = call
+                    .get("level")
+                    .and_then(|value| value.as_str())
+                    .and_then(pi_protocol::ThinkingLevel::parse)
+                {
+                    agent.thinking_level = level;
+                    chrome.status = format!("thinking {}", level.as_str());
+                }
             }
             _ => {}
         }

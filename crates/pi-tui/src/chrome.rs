@@ -46,6 +46,9 @@ pub struct ChatChrome {
     pub extension_footer: Option<Vec<String>>,
     pub extension_statuses: Vec<(String, String)>,
     pub working_message: Option<String>,
+    pub working_visible: bool,
+    pub working_indicator_frames: Vec<String>,
+    pub working_indicator_interval_ms: Option<u64>,
     pub hidden_thinking_label: Option<String>,
     pub extension_selector: Option<ExtensionSelector>,
     pub extension_input: Option<ExtensionInput>,
@@ -93,6 +96,9 @@ impl ChatChrome {
             extension_footer: None,
             extension_statuses: Vec::new(),
             working_message: None,
+            working_visible: true,
+            working_indicator_frames: Vec::new(),
+            working_indicator_interval_ms: None,
             hidden_thinking_label: None,
             extension_selector: None,
             extension_input: None,
@@ -216,6 +222,36 @@ impl ChatChrome {
                     .and_then(|value| value.as_str())
                     .map(str::to_string);
             }
+            "setWorkingVisible" => {
+                self.working_visible = call
+                    .get("visible")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+            }
+            "setWorkingIndicator" => {
+                if call.get("options").is_none()
+                    || call.get("options").is_some_and(|value| value.is_null())
+                {
+                    self.working_indicator_frames.clear();
+                    self.working_indicator_interval_ms = None;
+                } else {
+                    self.working_indicator_frames = call
+                        .get("options")
+                        .and_then(|value| value.get("frames"))
+                        .and_then(|value| value.as_array())
+                        .map(|frames| {
+                            frames
+                                .iter()
+                                .filter_map(|frame| frame.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.working_indicator_interval_ms = call
+                        .get("options")
+                        .and_then(|value| value.get("intervalMs"))
+                        .and_then(|value| value.as_u64());
+                }
+            }
             "setHiddenThinkingLabel" => {
                 self.hidden_thinking_label = call
                     .get("label")
@@ -280,8 +316,14 @@ impl Component for ChatChrome {
                     .join(" · "),
             );
         }
-        if let Some(working) = &self.working_message {
-            lines.push(working.clone());
+        if self.working_visible {
+            if let Some(frame) = self.working_indicator_frames.first() {
+                if !frame.is_empty() {
+                    lines.push(frame.clone());
+                }
+            } else if let Some(working) = &self.working_message {
+                lines.push(working.clone());
+            }
         }
         lines.extend(self.transcript.render(width));
         for card in &self.tool_cards {

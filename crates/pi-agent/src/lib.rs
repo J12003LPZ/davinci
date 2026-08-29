@@ -102,6 +102,7 @@ pub struct Agent {
     pub context_window: u64,
     pub queues: SteerFollowUpQueues,
     pub tools: Vec<String>,
+    pub tool_registry: Vec<String>,
     pub skills: Vec<Skill>,
     pub templates: Vec<PromptTemplate>,
     pub context_files: Vec<ContextFile>,
@@ -140,6 +141,7 @@ impl Agent {
             context_window: 200_000,
             queues: SteerFollowUpQueues::default(),
             tools: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
+            tool_registry: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             skills: Vec::new(),
             templates: Vec::new(),
             context_files: Vec::new(),
@@ -221,10 +223,22 @@ impl Agent {
 
     pub fn apply_extension_tools(&mut self, names: &[String]) {
         for name in names {
+            if !self.tool_registry.contains(name) {
+                self.tool_registry.push(name.clone());
+            }
             if !self.tools.contains(name) {
                 self.tools.push(name.clone());
             }
         }
+    }
+
+    /// TS `setActiveToolsByName` — only registry names are enabled; unknown names ignored.
+    pub fn set_active_tools_by_name(&mut self, names: &[String]) {
+        self.tools = names
+            .iter()
+            .filter(|name| self.tool_registry.iter().any(|known| known == *name))
+            .cloned()
+            .collect();
     }
 
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
@@ -814,5 +828,17 @@ mod tests {
             .messages
             .iter()
             .any(|message| content_text(&message.content) == "other"));
+    }
+
+    #[test]
+    fn set_active_tools_by_name_ignores_unknown_and_rebuilds_active_set() {
+        let mut agent = Agent::new("x");
+        agent.apply_extension_tools(&["ticket".into()]);
+        assert!(agent.tools.contains(&"ticket".into()));
+        agent.set_active_tools_by_name(&["read".into(), "missing".into(), "ticket".into()]);
+        assert_eq!(agent.tools, vec!["read".to_string(), "ticket".to_string()]);
+        agent.set_active_tools_by_name(&["bash".into(), "read".into()]);
+        assert_eq!(agent.tools, vec!["bash".to_string(), "read".to_string()]);
+        assert!(agent.tool_registry.contains(&"ticket".into()));
     }
 }
