@@ -487,6 +487,8 @@ async function main() {
 		oauthRefresh: {},
 		oauthGetApiKey: {},
 		editorText: typeof payload.editorText === "string" ? payload.editorText : "",
+		toolRenderers: {},
+		toolUpdates: [],
 	};
 	const eventBus = {};
 	let editorFactory;
@@ -541,21 +543,35 @@ async function main() {
 				recorded.uiCalls.push({ op: "setStatus", key, text });
 			},
 			setWidget(key, content, options) {
-				const lines = Array.isArray(content) ? content : content == null ? undefined : [String(content)];
+				const lines =
+					content == null
+						? undefined
+						: typeof content === "function" || Array.isArray(content)
+							? renderFactory(content, [], options && options.width)
+							: [String(content)];
 				recorded.uiCalls.push({
 					op: "setWidget",
 					key,
 					lines,
+					factory: typeof content === "function",
 					placement: options && options.placement ? options.placement : "aboveEditor",
 				});
 			},
 			setHeader(factory) {
-				const lines = typeof factory === "function" ? undefined : factory;
-				recorded.uiCalls.push({ op: "setHeader", lines });
+				const lines = factory == null ? undefined : renderFactory(factory, []);
+				recorded.uiCalls.push({
+					op: "setHeader",
+					lines,
+					factory: typeof factory === "function",
+				});
 			},
 			setFooter(factory) {
-				const lines = typeof factory === "function" ? undefined : factory;
-				recorded.uiCalls.push({ op: "setFooter", lines });
+				const lines = factory == null ? undefined : renderFactory(factory, [{}]);
+				recorded.uiCalls.push({
+					op: "setFooter",
+					lines,
+					factory: typeof factory === "function",
+				});
 			},
 			setTitle(title) {
 				recorded.uiCalls.push({ op: "setTitle", title });
@@ -698,6 +714,23 @@ async function main() {
 		};
 	}
 	const ui = makeUi();
+	function renderFactory(factory, extraArgs, width) {
+		if (factory == null) return undefined;
+		if (Array.isArray(factory)) return factory.map((line) => String(line));
+		if (typeof factory !== "function") return [String(factory)];
+		try {
+			const { TUI } = require("@earendil-works/pi-tui");
+			const tui = new TUI();
+			tui.terminal = { columns: width || payload.width || 80, rows: payload.height || 24 };
+			const component = factory(tui, {}, ...(extraArgs || []));
+			if (!component) return [];
+			if (typeof component.render === "function") return component.render(width || payload.width || 80);
+			if (Array.isArray(component)) return component.map((line) => String(line));
+			return [String(component)];
+		} catch {
+			return [];
+		}
+	}
 	const pi = {
 		on(event, handler) {
 			if (!recorded.handlers[event]) recorded.handlers[event] = [];
@@ -708,7 +741,15 @@ async function main() {
 				name: tool.name,
 				description: tool.description || "",
 				parameters: tool.parameters || null,
+				executionMode: tool.executionMode || null,
+				renderShell: tool.renderShell || "default",
+				hasRenderCall: typeof tool.renderCall === "function",
+				hasRenderResult: typeof tool.renderResult === "function",
 			});
+			recorded.toolRenderers[tool.name] = {
+				renderCall: tool.renderCall,
+				renderResult: tool.renderResult,
+			};
 			if (typeof tool.execute === "function") {
 				recorded.toolHandlers[tool.name] = tool.execute;
 			} else if (typeof tool.handler === "function") {
@@ -1136,14 +1177,43 @@ async function main() {
 				}
 			}
 		}
+	} else if (op === "renderToolCall" || op === "renderToolResult") {
+		const renderer = recorded.toolRenderers[payload.name] || {};
+		const fn = op === "renderToolCall" ? renderer.renderCall : renderer.renderResult;
+		if (typeof fn === "function") {
+			try {
+				const component =
+					op === "renderToolCall"
+						? fn(payload.args || {}, {}, payload.context || {})
+						: fn(payload.result || {}, { expanded: Boolean(payload.expanded) }, {}, payload.context || {});
+				result = {
+					lines:
+						component && typeof component.render === "function"
+							? component.render(payload.width || 80)
+							: Array.isArray(component)
+								? component.map((line) => String(line))
+								: component == null
+									? []
+									: [String(component)],
+				};
+			} catch (error) {
+				result = { lines: [], error: error && error.message ? error.message : String(error) };
+			}
+		} else {
+			result = { lines: [] };
+		}
 	} else if (op === "tool") {
 		const handler = recorded.toolHandlers[payload.name];
 		if (typeof handler === "function") {
+			recorded.toolUpdates = [];
+			const onUpdate = (partial) => {
+				recorded.toolUpdates.push(partial);
+			};
 			const out = await handler(
 				payload.toolCallId || "call",
 				payload.args || {},
 				undefined,
-				undefined,
+				onUpdate,
 				payload.ctx || { cwd: payload.cwd },
 			);
 			if (typeof out === "string") {
@@ -1351,6 +1421,7 @@ async function main() {
 				triggerCharacters: provider.triggerCharacters,
 				items: provider.items || [],
 			})),
+			updates: recorded.toolUpdates,
 			result,
 		};
 	}

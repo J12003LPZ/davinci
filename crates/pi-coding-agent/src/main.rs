@@ -502,6 +502,7 @@ fn resolve_or_create_session(
         )
         .map_err(|err| err.to_string())?;
         session.header.id = id.clone();
+        persist_selected_backend(&session, session_dir);
         return Ok(session);
     }
     if parsed.continue_session {
@@ -518,7 +519,7 @@ fn resolve_or_create_session(
             return JsonlSession::open(&summary.path).map_err(|err| err.to_string());
         }
     }
-    JsonlSession::create(
+    let session = JsonlSession::create(
         session_dir,
         &cwd.to_string_lossy(),
         parsed
@@ -527,7 +528,24 @@ fn resolve_or_create_session(
             .and_then(args::normalize_session_name)
             .as_deref(),
     )
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    persist_selected_backend(&session, session_dir);
+    Ok(session)
+}
+
+fn persist_selected_backend(session: &JsonlSession, session_dir: &Path) {
+    let backend = std::env::var("PI_SESSION_BACKEND").unwrap_or_else(|_| {
+        load_settings(&default_agent_dir())
+            .session_backend()
+            .to_string()
+    });
+    if backend != "sqlite" {
+        return;
+    }
+    if let Ok(store) = pi_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db"))
+    {
+        let _ = store.upsert_session(session);
+    }
 }
 
 fn available_models(parsed: &Args) -> Vec<pi_ai::Model> {
@@ -905,6 +923,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             name: tool.name,
             description: tool.description,
             parameters: tool.parameters,
+            constrained_sampling: crate::experimental::experimental_tool_sampling(),
         })
         .collect();
     let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
@@ -1434,6 +1453,7 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
             KeyCode::Char('s') | KeyCode::Char('S') => "\x13".into(),
             KeyCode::Char('v') | KeyCode::Char('V') => "\x16".into(),
             KeyCode::Char('x') | KeyCode::Char('X') => "\x18".into(),
+            KeyCode::Char('z') | KeyCode::Char('Z') => "\x1a".into(),
             KeyCode::Left => "\x1b[1;5D".into(),
             KeyCode::Right => "\x1b[1;5C".into(),
             _ => String::new(),
@@ -1758,6 +1778,10 @@ fn apply_session_action(
             }
             Ok(true)
         }
+        SessionAction::Suspend => {
+            apply_suspend(session);
+            Ok(true)
+        }
         SessionAction::Quit => Ok(false),
         SessionAction::Abort => {
             session.chrome.status = "aborted".into();
@@ -1938,9 +1962,9 @@ fn submit_user_message(
     session.chrome.transcript.push("user", prompt);
     agent.prompt_with(prompt, images);
     let (reply, events) = complete_prompt(parsed, agent);
-    apply_tool_events(&mut session.chrome, &events);
-    apply_progress_events(session, &events);
     let host = loaded_extension_host(parsed);
+    apply_tool_events(&mut session.chrome, &events, Some(&host), session.width);
+    apply_progress_events(session, &events);
     let reply = host.transform_markdown(&reply, "assistant", false, 80);
     session.chrome.transcript.push("assistant", &reply);
     apply_cache_miss_notices(
@@ -2373,7 +2397,30 @@ fn upload_radius_artifact(agent: &Agent, token: &str) -> Result<String, String> 
     parse_radius_artifact_reply(&text)
 }
 
-fn apply_tool_events(chrome: &mut ChatChrome, events: &[AgentEvent]) {
+fn apply_suspend(session: &mut InteractiveSession) {
+    if cfg!(windows) {
+        session.chrome.status = "Suspend to background is not supported on Windows".into();
+        return;
+    }
+    if std::env::var("PI_SUSPEND_DRY_RUN").is_ok() {
+        session.chrome.status = "Suspended".into();
+        return;
+    }
+    print!("{}", InteractiveSession::leave_sequences(false));
+    let _ = io::stdout().flush();
+    let _ = std::process::Command::new("kill")
+        .args(["-TSTP", "0"])
+        .status();
+    print!("{}", InteractiveSession::enter_sequences(false));
+    let _ = io::stdout().flush();
+}
+
+fn apply_tool_events(
+    chrome: &mut ChatChrome,
+    events: &[AgentEvent],
+    host: Option<&ExtensionHost>,
+    width: usize,
+) {
     for event in events {
         match event {
             AgentEvent::AgentStart => {}
@@ -2383,9 +2430,14 @@ fn apply_tool_events(chrome: &mut ChatChrome, events: &[AgentEvent]) {
                 tool_name,
                 args,
             } => {
-                chrome
-                    .tool_cards
-                    .push(ToolCard::start(tool_name, tool_call_id, args.clone()));
+                let mut card = ToolCard::start(tool_name, tool_call_id, args.clone());
+                if let Some(host) = host {
+                    if let Some((_, tool)) = host.js_tool(tool_name) {
+                        card.render_shell = tool.render_shell.clone();
+                    }
+                    card.call_lines = host.render_tool_call_lines(tool_name, args, width);
+                }
+                chrome.tool_cards.push(card);
             }
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id,
@@ -2435,6 +2487,10 @@ fn apply_tool_events(chrome: &mut ChatChrome, events: &[AgentEvent]) {
                     .find(|card| card.tool_call_id == *tool_call_id)
                     .map(|card| {
                         card.finish(result, *is_error);
+                        if let Some(host) = host {
+                            card.result_lines =
+                                host.render_tool_result_lines(&card.tool_name, result, width);
+                        }
                         (card.image_payloads(), card.format_tool_execution())
                     });
                 if let Some((images, formatted)) = finished {
@@ -5152,5 +5208,29 @@ mod tests {
             .iter()
             .any(|line| line.role == "exec" && line.text == "ok"));
         assert!(chrome.status.contains("newSession") || chrome.status.contains("model="));
+    }
+
+    #[test]
+    fn suspend_dry_run_sets_status() {
+        let theme = builtin_themes().into_iter().next().expect("theme");
+        let mut session = InteractiveSession::new(theme, "pi", vec!["google/gemini".into()]);
+        std::env::set_var("PI_SUSPEND_DRY_RUN", "1");
+        apply_suspend(&mut session);
+        std::env::remove_var("PI_SUSPEND_DRY_RUN");
+        assert_eq!(session.chrome.status, "Suspended");
+    }
+
+    #[test]
+    fn sqlite_session_backend_upserts_created_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::env::set_var("PI_SESSION_BACKEND", "sqlite");
+        let session = JsonlSession::create(&session_dir, "/tmp/work", Some("sqlite-demo")).unwrap();
+        persist_selected_backend(&session, &session_dir);
+        std::env::remove_var("PI_SESSION_BACKEND");
+        let store =
+            pi_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db")).unwrap();
+        let listed = store.list_sessions(None).unwrap();
+        assert!(listed.iter().any(|item| item.id == session.header.id));
     }
 }

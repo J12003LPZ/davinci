@@ -22,6 +22,9 @@ pub struct ToolCard {
     pub output: String,
     pub state: ToolCardState,
     pub expanded: bool,
+    pub call_lines: Vec<String>,
+    pub result_lines: Vec<String>,
+    pub render_shell: Option<String>,
 }
 
 impl ToolCard {
@@ -37,6 +40,9 @@ impl ToolCard {
             output: String::new(),
             state: ToolCardState::Pending,
             expanded: false,
+            call_lines: Vec::new(),
+            result_lines: Vec::new(),
+            render_shell: None,
         }
     }
 
@@ -55,7 +61,25 @@ impl ToolCard {
     }
 
     /// TS `formatToolExecution`: bold tool name, pretty-printed args, then output.
+    /// Extension `renderCall` / `renderResult` lines replace the default dump.
     pub fn format_tool_execution(&self) -> String {
+        if !self.call_lines.is_empty() || !self.result_lines.is_empty() {
+            let mut text = if self.call_lines.is_empty() {
+                self.tool_name.clone()
+            } else {
+                self.call_lines.join("\n")
+            };
+            if !self.result_lines.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&self.result_lines.join("\n"));
+            } else if !self.output.is_empty() {
+                text.push('\n');
+                text.push_str(&self.output);
+            }
+            return text;
+        }
         let mut text = self.tool_name.clone();
         let content = serde_json::to_string_pretty(&self.args).unwrap_or_default();
         if !content.is_empty() && content != "null" {
@@ -202,5 +226,13 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains('…')));
         long.expanded = true;
         assert!(!long.render(40).iter().any(|line| line.contains('…')));
+        let mut custom = ToolCard::start("demo", "c3", serde_json::json!({"x": 1}));
+        custom.call_lines = vec!["CALL".into()];
+        custom.result_lines = vec!["RESULT".into()];
+        custom.render_shell = Some("self".into());
+        let formatted = custom.format_tool_execution();
+        assert!(formatted.contains("CALL"));
+        assert!(formatted.contains("RESULT"));
+        assert!(!formatted.contains("\"x\""));
     }
 }

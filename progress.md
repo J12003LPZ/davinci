@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (`@file` attachments, `/thinking` selector, RPC `cycle_model.isScoped`, extension `getEditorText` / event results). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (JS header/footer/widget factories, extension tool UI, live `pi server` runtime, experimental tool sampling, Ctrl+Z suspend, markdown OSC-8, `create_agent_session` embed API, sqlite session backend selection). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -109,12 +109,10 @@ Closed this slice: `refreshModels` runs during interactive catalog refresh, `/sc
 
 Closed this slice: `@file` CLI arguments match TS `processFileArguments` / `buildInitialMessage` (text wrappers, image attachments + resize hints, empty-file skip, `Error: File not found`, stdin + first message join). Interactive and print attach images via `prompt_with`. RPC rejects `@file` with `Error: @file arguments are not supported in RPC mode`. Bare `/thinking` opens `ThinkingSelector` (search, descriptions, Enter / Ctrl+S / Esc); unknown levels use the TS error string. RPC `cycle_model` reports `isScoped` from `--models` and returns `null` when the pool has ≤1 model. Extension `ctx.ui.getEditorText()` reads the live editor (or `PI_EXTENSION_EDITOR_TEXT`). `before_agent_start` can replace `systemPrompt`; `session_before_compact` / fork / tree / switch honor `{ cancel: true }`. RPC no longer prints a duplicate response.
 
+Closed this slice: JS `setHeader`/`setFooter`/`setWidget` function factories evaluate virtual TUI `Text`/`Container` and persist rendered `lines`. `registerTool` records `executionMode` / `renderShell` / `renderCall` / `renderResult`; `onUpdate` becomes `_piUpdates` and emits `ToolExecutionUpdate`; tool cards prefer factory lines. `PI_EXPERIMENTAL=1` attaches `{type:json_schema,strict:prefer}` and OpenAI function tools get `strict: true`. Ctrl+Z `app.suspend` restores the TUI after `kill -TSTP 0` (`PI_SUSPEND_DRY_RUN` records `Suspended`; Windows status matches TS). Markdown links emit OSC-8 when `PI_HYPERLINKS`/`PI_TERMINAL_HYPERLINKS` is on, otherwise `text (href)`. `pi server` keeps a live runtime (phase, transcript, queued steer, Busy errors, builtin `models`). `pi_coding_agent::create_agent_session` is the TS `createAgentSession` embed API. `settings.sessionBackend` / `PI_SESSION_BACKEND=sqlite` upserts JSONL sessions into `sessions.db`.
+
 Still not product-equivalent:
 
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
 - TypeScript under `vendor/pi` remains the behavioral spec.
-- JS header/footer/widget **function** factories (Rust chrome renders string line arrays).
-- Extension `registerTool` UI (`renderCall` / `renderResult` / `renderShell`, `onUpdate`, per-tool `executionMode`).
-- `pi server` live `PiSessionRuntime` (schema-complete; dispatch is still a snapshot stub).
-- Experimental `getExperimentalToolSampling()` / SDK `createAgentSession()` library embed API.
-- Ctrl+Z `app.suspend`, markdown OSC-8 hyperlinks, image-generation UX, sqlite session backend selection.
+- Image-generation UX (openrouter-images API is ported; TS coding-agent has no generate-images product path).

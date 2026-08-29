@@ -4,9 +4,10 @@ use std::path::Path;
 
 use crate::extensions::{discover_extensions, ExtensionManifest};
 use crate::js_host::{
-    execute_command_tool, execute_js_tool, node_available, resolve_extension_module,
-    run_js_extension, run_persistent_js_extension, stop_persistent_js_extension,
-    JsAutocompleteProvider, JsExtensionResult, JsRegisteredCommand, JsRegisteredProvider,
+    execute_command_tool, execute_js_tool, node_available, render_js_tool_call,
+    render_js_tool_result, resolve_extension_module, run_js_extension, run_persistent_js_extension,
+    stop_persistent_js_extension, JsAutocompleteProvider, JsExtensionResult, JsRegisteredCommand,
+    JsRegisteredProvider, JsRegisteredTool,
 };
 use pi_tui::Keybindings;
 
@@ -93,6 +94,7 @@ pub struct LoadedJsExtension {
     pub path: String,
     pub handlers: Vec<String>,
     pub tools: Vec<String>,
+    pub tool_defs: Vec<JsRegisteredTool>,
     pub commands: Vec<String>,
     pub command_details: Vec<JsRegisteredCommand>,
     pub autocomplete_providers: Vec<JsAutocompleteProvider>,
@@ -180,7 +182,8 @@ impl ExtensionHost {
                         host.js.push(LoadedJsExtension {
                             path,
                             handlers: loaded.handlers,
-                            tools: loaded.tools.into_iter().map(|tool| tool.name).collect(),
+                            tools: loaded.tools.iter().map(|tool| tool.name.clone()).collect(),
+                            tool_defs: loaded.tools,
                             commands: loaded
                                 .commands
                                 .iter()
@@ -442,6 +445,40 @@ impl ExtensionHost {
             }
         }
         text
+    }
+
+    pub fn js_tool(&self, name: &str) -> Option<(&Path, &JsRegisteredTool)> {
+        for ext in &self.js {
+            if let Some(tool) = ext.tool_defs.iter().find(|tool| tool.name == name) {
+                return Some((Path::new(&ext.path), tool));
+            }
+        }
+        None
+    }
+
+    pub fn render_tool_call_lines(&self, name: &str, args: &Value, width: usize) -> Vec<String> {
+        let Some((path, tool)) = self.js_tool(name) else {
+            return Vec::new();
+        };
+        if !tool.has_render_call {
+            return Vec::new();
+        }
+        render_js_tool_call(path, name, args, width)
+    }
+
+    pub fn render_tool_result_lines(
+        &self,
+        name: &str,
+        result: &Value,
+        width: usize,
+    ) -> Vec<String> {
+        let Some((path, tool)) = self.js_tool(name) else {
+            return Vec::new();
+        };
+        if !tool.has_render_result {
+            return Vec::new();
+        }
+        render_js_tool_result(path, name, result, width)
     }
 
     pub fn execute_named_tool(&self, name: &str, cwd: &Path) -> Option<Result<String, String>> {

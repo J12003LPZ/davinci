@@ -48,6 +48,8 @@ pub struct JsExtensionResult {
     pub result: Option<Value>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub updates: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -57,6 +59,14 @@ pub struct JsRegisteredTool {
     pub description: String,
     #[serde(default)]
     pub parameters: Option<Value>,
+    #[serde(default, rename = "executionMode")]
+    pub execution_mode: Option<String>,
+    #[serde(default, rename = "renderShell")]
+    pub render_shell: Option<String>,
+    #[serde(default, rename = "hasRenderCall")]
+    pub has_render_call: bool,
+    #[serde(default, rename = "hasRenderResult")]
+    pub has_render_result: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -509,6 +519,16 @@ pub fn execute_js_tool(
         ));
     }
     let value = result.result.unwrap_or(Value::Null);
+    let mut details = value.get("details").cloned();
+    if !result.updates.is_empty() {
+        let mut map = details
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        map.insert("_piUpdates".into(), Value::Array(result.updates.clone()));
+        details = Some(Value::Object(map));
+    }
     Ok(pi_agent::ToolResult {
         content: value
             .get("content")
@@ -519,8 +539,60 @@ pub fn execute_js_tool(
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        details: value.get("details").cloned(),
+        details,
     })
+}
+
+pub fn render_js_tool_call(module: &Path, name: &str, args: &Value, width: usize) -> Vec<String> {
+    render_js_tool(module, "renderToolCall", name, args, width)
+}
+
+pub fn render_js_tool_result(
+    module: &Path,
+    name: &str,
+    result: &Value,
+    width: usize,
+) -> Vec<String> {
+    let payload = serde_json::json!({
+        "name": name,
+        "result": result,
+        "width": width,
+        "expanded": false,
+    });
+    run_js_extension(module, "renderToolResult", &payload)
+        .ok()
+        .and_then(|loaded| loaded.result)
+        .and_then(|value| {
+            value.get("lines").and_then(Value::as_array).map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn render_js_tool(module: &Path, op: &str, name: &str, args: &Value, width: usize) -> Vec<String> {
+    let payload = serde_json::json!({
+        "name": name,
+        "args": args,
+        "width": width,
+    });
+    run_js_extension(module, op, &payload)
+        .ok()
+        .and_then(|loaded| loaded.result)
+        .and_then(|value| {
+            value.get("lines").and_then(Value::as_array).map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 pub fn execute_command_tool(command: &str, cwd: &Path) -> Result<String, String> {
@@ -1533,5 +1605,88 @@ module.exports = (pi) => {
             false
         );
         stop_persistent_js_extension();
+    }
+
+    #[test]
+    fn set_header_factory_renders_text_component() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+const { Text } = require("@earendil-works/pi-tui");
+module.exports = (pi) => {
+  pi.ui.setHeader(() => new Text("hello"));
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        let header = loaded
+            .ui_calls
+            .iter()
+            .find(|call| call["op"] == "setHeader")
+            .expect("setHeader");
+        assert_eq!(header["factory"], true);
+        assert_eq!(header["lines"][0], "hello");
+    }
+
+    #[test]
+    fn register_tool_renders_call_result_and_updates() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+const { Text } = require("@earendil-works/pi-tui");
+module.exports = (pi) => {
+  pi.registerTool({
+    name: "demo",
+    description: "demo",
+    executionMode: "sequential",
+    renderShell: "self",
+    renderCall: (args) => new Text("CALL " + args.x),
+    renderResult: (result) => new Text("RESULT " + result.content),
+    execute: (_id, args, _ctx, onUpdate) => {
+      onUpdate({ content: "partial" });
+      return { content: "done " + args.x, isError: false };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        assert_eq!(
+            loaded.tools[0].execution_mode.as_deref(),
+            Some("sequential")
+        );
+        assert_eq!(loaded.tools[0].render_shell.as_deref(), Some("self"));
+        assert!(loaded.tools[0].has_render_call);
+        assert!(loaded.tools[0].has_render_result);
+        let call = render_js_tool_call(&module, "demo", &serde_json::json!({"x": "1"}), 80);
+        assert_eq!(call, vec!["CALL 1".to_string()]);
+        let result =
+            render_js_tool_result(&module, "demo", &serde_json::json!({"content": "ok"}), 80);
+        assert_eq!(result, vec!["RESULT ok".to_string()]);
+        let executed =
+            execute_js_tool(&module, "demo", &serde_json::json!({"x": "9"}), dir.path()).unwrap();
+        assert_eq!(executed.content, "done 9");
+        let updates = executed
+            .details
+            .as_ref()
+            .and_then(|value| value.get("_piUpdates"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(updates[0]["content"], "partial");
     }
 }

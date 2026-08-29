@@ -91,8 +91,9 @@ pub use shell::{
 pub use stream::{
     assistant_to_chat, complete_from_events, complete_simple, events_from_complete,
     fixture_complete, live_complete, live_complete_with, live_stream, parse_sse_block,
-    replay_sse_events, request_body, request_body_with, request_url, AssistantMessage,
-    AssistantMessageEvent, ContentBlock, StopReason, StreamEvent, StreamOptions,
+    replay_sse_events, request_body, request_body_with, request_url,
+    resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
+    StopReason, StreamEvent, StreamOptions,
 };
 pub use thinking::{
     clamp_reasoning, clamp_thinking_budget_to_answer_room, google_thinking_budget,
@@ -181,6 +182,11 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    #[serde(
+        rename = "constrainedSampling",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub constrained_sampling: Option<serde_json::Value>,
 }
 
 pub fn content_text(content: &[MessageContent]) -> String {

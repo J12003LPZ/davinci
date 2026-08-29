@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "Coding agent CLI matching @earendil-works/pi-coding-agent"
 
+[lib]
+name = "pi_coding_agent"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pi"
 path = "src/main.rs"

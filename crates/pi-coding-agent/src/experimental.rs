@@ -183,9 +183,29 @@ pub fn is_experimental_command(command: Option<&str>) -> bool {
     matches!(command, Some("server") | Some("client"))
 }
 
+/// TS `areExperimentalFeaturesEnabled` — `PI_EXPERIMENTAL === "1"`.
+pub fn experimental_features_enabled() -> bool {
+    matches!(
+        std::env::var("PI_EXPERIMENTAL").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// TS `getExperimentalToolSampling` — `{ type: "json_schema", strict: "prefer" }`.
+pub fn experimental_tool_sampling() -> Option<serde_json::Value> {
+    if experimental_features_enabled() {
+        Some(serde_json::json!({"type":"json_schema","strict":"prefer"}))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parses_unix_listen_and_rejects_authority() {
@@ -215,5 +235,20 @@ mod tests {
             parse_client_command(&["--connect".into(), "unix:///tmp/pi.sock".into()]).unwrap();
         assert!(run_client(client).unwrap().contains("unix:///tmp/pi.sock"));
         std::env::remove_var("PI_CLIENT_DRY_RUN");
+    }
+
+    #[test]
+    fn experimental_tool_sampling_matches_ts() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PI_EXPERIMENTAL");
+        assert!(!experimental_features_enabled());
+        assert_eq!(experimental_tool_sampling(), None);
+        std::env::set_var("PI_EXPERIMENTAL", "1");
+        assert!(experimental_features_enabled());
+        assert_eq!(
+            experimental_tool_sampling(),
+            Some(serde_json::json!({"type":"json_schema","strict":"prefer"}))
+        );
+        std::env::remove_var("PI_EXPERIMENTAL");
     }
 }

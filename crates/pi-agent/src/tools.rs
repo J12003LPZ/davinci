@@ -4,6 +4,7 @@ use std::process::Command;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 pub const BUILTIN_TOOLS: &[&str] = &[
@@ -39,6 +40,18 @@ pub struct ToolResult {
     pub is_error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
+}
+
+impl ToolResult {
+    pub fn take_updates(details: &mut Option<serde_json::Value>) -> Vec<serde_json::Value> {
+        let Some(Value::Object(map)) = details.as_mut() else {
+            return Vec::new();
+        };
+        match map.remove("_piUpdates") {
+            Some(Value::Array(items)) => items,
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]

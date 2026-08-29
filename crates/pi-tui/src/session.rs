@@ -119,6 +119,7 @@ pub enum SessionAction {
     ExtensionProgressCancel,
     CustomEditorInput(String),
     CustomOverlayInput(String),
+    Suspend,
 }
 
 #[derive(Debug, Clone)]
@@ -923,6 +924,9 @@ impl InteractiveSession {
             }
             if self.keybindings.matches(data, "app.session.resume") {
                 return SessionAction::OpenResume;
+            }
+            if self.keybindings.matches(data, "app.suspend") {
+                return SessionAction::Suspend;
             }
             if self.keybindings.matches(data, "app.clear") && !self.chrome.editor.buffer.is_empty()
             {
@@ -1878,6 +1882,7 @@ mod tests {
             session.handle_bytes("\r"),
             SessionAction::Submit("hi".into())
         );
+        assert_eq!(session.handle_bytes("\x1a"), SessionAction::Suspend);
         assert_eq!(session.handle_bytes("\x03"), SessionAction::Quit);
         assert_eq!(session.handle_bytes("\x1b[<0;1;2M"), SessionAction::None);
         assert_eq!(session.handle_bytes("\u{1b}[57399u"), SessionAction::None);

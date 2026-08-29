@@ -44,6 +44,8 @@ pub struct Settings {
     pub http_proxy: Option<String>,
     #[serde(default, rename = "sessionDir")]
     pub session_dir: Option<String>,
+    #[serde(default, rename = "sessionBackend")]
+    pub session_backend: Option<String>,
     #[serde(default, rename = "defaultThinkingLevel")]
     pub default_thinking_level: Option<String>,
     #[serde(default, rename = "websocketConnectTimeoutMs")]
@@ -732,6 +734,14 @@ impl Settings {
             .as_deref()
             .map(|dir| pi_session::expand_tilde(dir).to_string_lossy().into_owned())
     }
+
+    /// `jsonl` (default, TS coding-agent) or `sqlite`.
+    pub fn session_backend(&self) -> &str {
+        match self.session_backend.as_deref() {
+            Some(value) if !value.is_empty() => value,
+            _ => "jsonl",
+        }
+    }
 }
 
 pub fn save_settings(agent_dir: &Path, settings: &Settings) -> Result<(), String> {
@@ -1050,6 +1060,15 @@ mod tests {
         .expect("write");
         let merged = load_merged_settings(&agent_dir, &project);
         assert_eq!(merged.session_dir.as_deref(), Some("./sessions"));
+        assert_eq!(Settings::default().session_backend(), "jsonl");
+        assert_eq!(
+            Settings {
+                session_backend: Some("sqlite".into()),
+                ..Settings::default()
+            }
+            .session_backend(),
+            "sqlite"
+        );
         assert_eq!(
             Settings {
                 session_dir: Some("~/sessions".into()),

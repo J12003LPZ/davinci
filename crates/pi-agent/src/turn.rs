@@ -416,6 +416,15 @@ impl Agent {
                     },
                 }
             };
+        let mut details = result.details.clone();
+        for partial in crate::ToolResult::take_updates(&mut details) {
+            events.push(AgentEvent::ToolExecutionUpdate {
+                tool_call_id: id.to_string(),
+                tool_name: name.to_string(),
+                args: args.clone(),
+                partial_result: partial,
+            });
+        }
         events.push(AgentEvent::ToolExecutionUpdate {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),

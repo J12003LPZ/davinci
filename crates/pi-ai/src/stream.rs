@@ -754,13 +754,17 @@ fn openai_body(
             tools
                 .iter()
                 .map(|tool| {
+                    let mut function = serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    });
+                    if resolve_json_schema_strict_sampling(tool).unwrap_or(false) {
+                        function["strict"] = Value::Bool(true);
+                    }
                     serde_json::json!({
                         "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        }
+                        "function": function,
                     })
                 })
                 .collect(),
@@ -768,6 +772,25 @@ fn openai_body(
     }
     apply_openai_thinking(&mut body, model, options);
     body
+}
+
+/// TS `resolveJsonSchemaStrictSampling` — attach `strict: true` when the tool
+/// asks for JSON-schema constrained sampling and the schema is an object.
+pub fn resolve_json_schema_strict_sampling(tool: &ToolSpec) -> Option<bool> {
+    let config = tool.constrained_sampling.as_ref()?;
+    if config.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return None;
+    }
+    let require = config.get("strict").and_then(Value::as_str) == Some("require");
+    let is_object = tool.parameters.get("type").and_then(Value::as_str) == Some("object")
+        || tool.parameters.get("properties").is_some();
+    if is_object {
+        return Some(true);
+    }
+    if require {
+        return None;
+    }
+    None
 }
 
 fn apply_openai_thinking(body: &mut Value, model: &Model, options: &StreamOptions) {
@@ -1286,5 +1309,34 @@ mod tests {
                     |block| matches!(block, ContentBlock::Text { text } if text.contains("ok"))
                 )
         );
+    }
+
+    #[test]
+    fn openai_tools_attach_strict_when_json_schema_sampling() {
+        let mut openai = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api.contains("openai"))
+            .expect("openai");
+        openai.api = "openai-completions".into();
+        let tools = [ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+            constrained_sampling: Some(serde_json::json!({"type":"json_schema","strict":"prefer"})),
+        }];
+        let body = request_body_with(&openai, &[], None, &tools, &StreamOptions::default());
+        assert_eq!(body["tools"][0]["function"]["strict"], true);
+        assert_eq!(resolve_json_schema_strict_sampling(&tools[0]), Some(true));
+        let off = ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: tools[0].parameters.clone(),
+            constrained_sampling: None,
+        };
+        assert_eq!(resolve_json_schema_strict_sampling(&off), None);
     }
 }
