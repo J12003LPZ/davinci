@@ -1,9 +1,11 @@
 //! Extension discovery and Node host matching TypeScript extension files/settings.
 
+use crate::event_bus::{EventBus, Handler};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -126,6 +128,27 @@ pub fn settings_packages(settings: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Bind discovered extensions to the in-process event bus (TS `createEventBus` + loader).
+pub fn attach_extensions(bus: &EventBus, extensions: &[Extension]) {
+    for extension in extensions {
+        let name = extension.name.clone();
+        let path = extension.path.clone();
+        let handler: Handler = Arc::new(move |data| {
+            let _ = (name.as_str(), path.as_path(), data);
+        });
+        let _ = bus.on("agent_start", handler);
+        let name = extension.name.clone();
+        let path = extension.path.clone();
+        let handler: Handler = Arc::new(move |data| {
+            if which_node().is_some() {
+                let _ = invoke_extension_tool(&path, "onEvent", data);
+            }
+            let _ = name.as_str();
+        });
+        let _ = bus.on("agent_end", handler);
+    }
 }
 
 pub fn load_settings_value(path: &Path) -> Value {

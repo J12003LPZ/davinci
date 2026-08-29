@@ -1,5 +1,6 @@
 mod args;
 mod commands;
+mod event_bus;
 mod export;
 mod extensions;
 mod rpc;
@@ -14,6 +15,7 @@ use args::{
     normalize_session_name, parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION,
 };
 use commands::dispatch_subcommand;
+use event_bus::EventBus;
 use pi_agent::context::{load_context_files, render_system_prompt};
 use pi_agent::{
     run_agent, AgentConfig, AgentEvent, AgentMessage, AllowAllPermissionPolicy, FollowUpQueue,
@@ -28,8 +30,8 @@ use pi_session::{
 };
 use pi_tui::component::Component;
 use pi_tui::{
-    enter_alt_screen, leave_alt_screen, ChatView, Editor, Markdown, Overlay, SelectList, Text,
-    TuiMode,
+    disable_mouse, enable_mouse, enter_alt_screen, leave_alt_screen, ChatView, Editor, Markdown,
+    Overlay, OverlayOptions, SelectList, Text, Tui, TuiMode,
 };
 
 fn main() -> ExitCode {
@@ -151,6 +153,15 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         &parsed.extensions,
         parsed.no_extensions,
     );
+    let bus = EventBus::new();
+    extensions::attach_extensions(&bus, &discovered);
+    if parsed.verbose {
+        eprintln!("event-bus channels: {}", bus.channel_count());
+    }
+    bus.emit(
+        "session_start",
+        serde_json::json!({"cwd": cwd.display().to_string()}),
+    );
     if parsed.verbose {
         let settings = extensions::load_settings_value(&commands::settings_path(false));
         let packages = extensions::settings_packages(&settings);
@@ -210,6 +221,7 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
             &mut steer,
             &mut follow_up,
             app_mode == AppMode::Json,
+            &bus,
         ),
         AppMode::Interactive => run_interactive(
             &parsed,
@@ -220,6 +232,8 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
             &tools,
             &messages,
             session.as_ref().map(|s| s.path.clone()),
+            &bus,
+            &discovered,
         ),
     }
 }
@@ -326,11 +340,16 @@ fn run_print(
     steer: &mut SteerQueue,
     follow_up: &mut FollowUpQueue,
     json: bool,
+    bus: &EventBus,
 ) -> Result<i32, String> {
     if messages.is_empty() {
         eprintln!("Error: print mode requires a prompt");
         return Ok(1);
     }
+    bus.emit(
+        "agent_start",
+        serde_json::json!({"provider": provider, "model": model_id}),
+    );
     let config = agent_config(parsed, cwd, provider, model_id, system_prompt);
     let events =
         run_agent(&config, messages, tools, steer, follow_up).map_err(|e| e.to_string())?;
@@ -345,6 +364,7 @@ fn run_print(
             }
         }
     }
+    bus.emit("agent_end", serde_json::json!({"ok": true}));
     let _ = parsed;
     Ok(0)
 }
@@ -380,12 +400,16 @@ fn run_interactive(
     tools: &ToolRegistry,
     initial: &[AgentMessage],
     session_path: Option<PathBuf>,
+    bus: &EventBus,
+    discovered: &[extensions::Extension],
 ) -> Result<i32, String> {
     let fullscreen = parsed.tui_mode == Some(TuiMode::Fullscreen);
     let mut stdout = io::stdout();
     if fullscreen {
         enter_alt_screen(&mut stdout).ok();
+        enable_mouse(&mut stdout).ok();
     }
+    let mut tui = Tui::new(parsed.tui_mode.unwrap_or(TuiMode::Regular), 80, 24);
     let mut chat = ChatView::default();
     chat.push(
         "system",
@@ -394,18 +418,22 @@ fn run_interactive(
     if let Some(path) = &session_path {
         chat.push("session", path.display().to_string());
     }
-    for line in chat.render(80) {
-        println!("{line}");
-    }
+    tui.add_child_lines(chat.render(80));
     let commands: Vec<String> = slash::BUILTIN_SLASH_COMMANDS
         .iter()
         .map(|(n, _)| format!("/{n}"))
         .collect();
     let selector = SelectList::new(commands);
     let overlay = Overlay::new("slash commands", selector.filtered());
-    for line in overlay.render(80) {
-        println!("{line}");
-    }
+    tui.show_overlay(
+        overlay.render(40),
+        OverlayOptions {
+            width: Some(40),
+            ..OverlayOptions::default()
+        },
+    );
+    print!("{}", tui.render_now(true));
+    println!();
     let _ = tools;
     let editor = Editor::default();
     for line in editor.render(80) {
@@ -426,6 +454,7 @@ fn run_interactive(
             &mut steer,
             &mut follow,
             session_path.as_deref(),
+            bus,
         )?;
     } else {
         println!("Type a prompt, or /help. Ctrl+C to quit.");
@@ -435,9 +464,18 @@ fn run_interactive(
         if line.trim().is_empty() {
             continue;
         }
+        if let Some((_, hit)) = tui.hit_test_mouse(&line) {
+            bus.emit("mouse", serde_json::json!({"overlay": hit, "raw": line}));
+            continue;
+        }
         if let Some((cmd, args)) = slash::parse_slash(&line) {
             match cmd {
                 "quit" | "exit" => break,
+                "reload" => {
+                    bus.clear();
+                    extensions::attach_extensions(bus, discovered);
+                    println!("Reloaded extensions ({} channels)", bus.channel_count());
+                }
                 "help" => {
                     let body = slash::BUILTIN_SLASH_COMMANDS
                         .iter()
@@ -490,9 +528,11 @@ fn run_interactive(
             &mut steer,
             &mut follow,
             session_path.as_deref(),
+            bus,
         )?;
     }
     if fullscreen {
+        disable_mouse(&mut stdout).ok();
         leave_alt_screen(&mut stdout).ok();
     }
     Ok(0)
@@ -554,7 +594,12 @@ fn print_agent_turn(
     steer: &mut SteerQueue,
     follow_up: &mut FollowUpQueue,
     session_path: Option<&Path>,
+    bus: &EventBus,
 ) -> Result<i32, String> {
+    bus.emit(
+        "agent_start",
+        serde_json::json!({"provider": provider, "model": model_id}),
+    );
     let config = agent_config(parsed, cwd, provider, model_id, system_prompt);
     let events =
         run_agent(&config, messages, tools, steer, follow_up).map_err(|e| e.to_string())?;
@@ -580,6 +625,7 @@ fn print_agent_turn(
             _ => {}
         }
     }
+    bus.emit("agent_end", serde_json::json!({"ok": true}));
     Ok(0)
 }
 
