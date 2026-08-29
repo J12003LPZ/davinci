@@ -324,12 +324,12 @@ impl Agent {
             let message = self.prompt_with(&queued.text, &queued.images);
             new_messages.push(message.clone());
             self.push_event(
-                &mut events,
+                events,
                 AgentEvent::MessageStart {
                     message: message.clone(),
                 },
             );
-            self.push_event(&mut events, AgentEvent::MessageEnd { message });
+            self.push_event(events, AgentEvent::MessageEnd { message });
         }
     }
 
@@ -354,7 +354,7 @@ impl Agent {
             if self.aborted || self.retry_aborted {
                 if scheduled_attempt > 0 {
                     self.push_event(
-                        &mut events,
+                        events,
                         AgentEvent::AutoRetryEnd {
                             success: false,
                             attempt: scheduled_attempt,
@@ -386,7 +386,7 @@ impl Agent {
                         scheduled_attempt = attempt + 1;
                         let delay = retry_delay_ms(self.retry_base_delay_ms, attempt);
                         self.push_event(
-                            &mut events,
+                            events,
                             AgentEvent::AutoRetryStart {
                                 attempt: scheduled_attempt,
                                 max_attempts: max_retries,
@@ -403,7 +403,7 @@ impl Agent {
                     if scheduled_attempt > 0 {
                         let success = message.stop_reason != Some(StopReason::Error);
                         self.push_event(
-                            &mut events,
+                            events,
                             AgentEvent::AutoRetryEnd {
                                 success,
                                 attempt: scheduled_attempt,
@@ -423,7 +423,7 @@ impl Agent {
                         scheduled_attempt = attempt + 1;
                         let delay = retry_delay_ms(self.retry_base_delay_ms, attempt);
                         self.push_event(
-                            &mut events,
+                            events,
                             AgentEvent::AutoRetryStart {
                                 attempt: scheduled_attempt,
                                 max_attempts: max_retries,
@@ -440,7 +440,7 @@ impl Agent {
         }
         if scheduled_attempt > 0 {
             self.push_event(
-                &mut events,
+                events,
                 AgentEvent::AutoRetryEnd {
                     success: false,
                     attempt: scheduled_attempt,
@@ -460,7 +460,7 @@ impl Agent {
         events: &mut Vec<AgentEvent>,
     ) -> ChatMessage {
         self.push_event(
-            &mut events,
+            events,
             AgentEvent::ToolExecutionStart {
                 tool_call_id: id.to_string(),
                 tool_name: name.to_string(),
@@ -511,7 +511,7 @@ impl Agent {
         let mut details = result.details.clone();
         for partial in crate::ToolResult::take_updates(&mut details) {
             self.push_event(
-                &mut events,
+                events,
                 AgentEvent::ToolExecutionUpdate {
                     tool_call_id: id.to_string(),
                     tool_name: name.to_string(),
@@ -521,7 +521,7 @@ impl Agent {
             );
         }
         self.push_event(
-            &mut events,
+            events,
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id: id.to_string(),
                 tool_name: name.to_string(),
@@ -530,7 +530,7 @@ impl Agent {
             },
         );
         self.push_event(
-            &mut events,
+            events,
             AgentEvent::ToolExecutionEnd {
                 tool_call_id: id.to_string(),
                 tool_name: name.to_string(),
