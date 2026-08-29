@@ -40,7 +40,9 @@ mod word_nav;
 mod word_wrap;
 
 pub use autocomplete::{
-    apply_completion, suggestions, AutocompleteItem, AutocompleteSuggestions, SlashCommandSpec,
+    apply_completion, autocomplete_debounce_ms, suggestions, AutocompleteItem,
+    AutocompleteSuggestions, ExtraAutocompleteProvider, SlashCommandSpec, SuggestionQuery,
+    ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS, DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS,
 };
 pub use box_comp::TuiBox;
 pub use chrome::ChatChrome;

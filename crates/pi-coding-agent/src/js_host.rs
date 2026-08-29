@@ -22,6 +22,8 @@ pub struct JsExtensionResult {
     pub providers: Vec<JsRegisteredProvider>,
     #[serde(default)]
     pub commands: Vec<JsRegisteredCommand>,
+    #[serde(default, rename = "autocompleteProviders")]
+    pub autocomplete_providers: Vec<JsAutocompleteProvider>,
     #[serde(default)]
     pub flags: Vec<String>,
     #[serde(default)]
@@ -63,10 +65,30 @@ pub struct JsRegisteredProvider {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JsAutocompleteItem {
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JsAutocompleteProvider {
+    #[serde(default, rename = "triggerCharacters")]
+    pub trigger_characters: Vec<String>,
+    #[serde(default)]
+    pub items: Vec<JsAutocompleteItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JsRegisteredCommand {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default, rename = "argumentItems")]
+    pub argument_items: Vec<JsAutocompleteItem>,
 }
 
 pub fn find_node() -> Option<PathBuf> {
@@ -366,6 +388,48 @@ module.exports = (pi) => {
             emitted.result.as_ref().unwrap()["reason"],
             "blocked by fixture"
         );
+    }
+
+    #[test]
+    fn records_argument_completions_and_autocomplete_providers() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r##"
+module.exports = (pi) => {
+  pi.registerCommand("commands", {
+    description: "List commands",
+    getArgumentCompletions: (prefix) => {
+      const sources = ["extension", "prompt", "skill"];
+      return sources.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s }));
+    },
+  });
+  pi.ui.addAutocompleteProvider((current) => ({
+    ...current,
+    triggerCharacters: ["#"],
+    getSuggestions: async () => ({ items: [{ value: "#42", label: "#42" }], prefix: "#" }),
+  }));
+};
+"##,
+        )
+        .unwrap();
+        std::env::set_var(
+            "PI_EXTENSION_AUTOCOMPLETE_REPLY",
+            r##"[{"value":"#42","label":"#42","description":"[open] Login crash"}]"##,
+        );
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        std::env::remove_var("PI_EXTENSION_AUTOCOMPLETE_REPLY");
+        assert_eq!(loaded.commands[0].name, "commands");
+        assert!(loaded.commands[0]
+            .argument_items
+            .iter()
+            .any(|item| item.value == "extension"));
+        assert_eq!(loaded.autocomplete_providers[0].trigger_characters, ["#"]);
+        assert_eq!(loaded.autocomplete_providers[0].items[0].value, "#42");
     }
 
     #[test]

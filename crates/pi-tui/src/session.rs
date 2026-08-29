@@ -131,6 +131,8 @@ pub struct InteractiveSession {
     pub overlay_kind: OverlayKind,
     pub double_escape_action: DoubleEscapeAction,
     pub slash_commands: Vec<SlashCommandSpec>,
+    pub extra_autocomplete: Vec<crate::autocomplete::ExtraAutocompleteProvider>,
+    pub last_autocomplete_debounce_ms: u64,
     pub cwd: PathBuf,
     pub login_providers: Vec<String>,
     pub autocomplete_max_visible: usize,
@@ -232,6 +234,8 @@ impl InteractiveSession {
             overlay_kind: OverlayKind::None,
             double_escape_action: DoubleEscapeAction::Tree,
             slash_commands: Vec::new(),
+            extra_autocomplete: Vec::new(),
+            last_autocomplete_debounce_ms: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             login_providers: Vec::new(),
             autocomplete_max_visible: 8,
@@ -656,15 +660,21 @@ impl InteractiveSession {
 
     pub fn refresh_autocomplete(&mut self, force_path: bool) {
         let text = self.chrome.editor.buffer.clone();
-        let found = suggestions(
-            &text,
-            &self.slash_commands,
-            &self.models,
-            &self.thinking_levels,
-            &self.login_providers,
-            &self.cwd,
+        self.last_autocomplete_debounce_ms = crate::autocomplete::autocomplete_debounce_ms(
             force_path,
+            &text,
+            &self.extra_autocomplete,
         );
+        let found = suggestions(crate::autocomplete::SuggestionQuery {
+            text: &text,
+            commands: &self.slash_commands,
+            models: &self.models,
+            thinking_levels: &self.thinking_levels,
+            login_providers: &self.login_providers,
+            extra_providers: &self.extra_autocomplete,
+            cwd: &self.cwd,
+            force_path,
+        });
         if let Some(mut found) = found {
             found.items.truncate(self.autocomplete_max_visible);
             self.chrome.autocomplete_selected = 0;
@@ -1716,7 +1726,32 @@ mod tests {
             name: "model".into(),
             description: "Select model".into(),
             argument_hint: Some("<provider/model>".into()),
+            argument_items: Vec::new(),
         }];
+        session.extra_autocomplete = vec![crate::autocomplete::ExtraAutocompleteProvider {
+            trigger_characters: vec!['#'],
+            items: vec![crate::autocomplete::AutocompleteItem {
+                value: "#42".into(),
+                label: "#42".into(),
+                description: Some("[open] Login crash".into()),
+            }],
+        }];
+        session.chrome.editor.buffer = "#4".into();
+        session.chrome.editor.cursor = 2;
+        session.refresh_autocomplete(false);
+        assert_eq!(
+            session.last_autocomplete_debounce_ms,
+            crate::autocomplete::ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS
+        );
+        assert_eq!(
+            session
+                .chrome
+                .autocomplete
+                .as_ref()
+                .and_then(|found| found.items.first())
+                .map(|item| item.value.as_str()),
+            Some("#42")
+        );
         session.chrome.editor.buffer = "/mo".into();
         session.chrome.editor.cursor = 3;
         assert_eq!(session.handle_bytes("\t"), SessionAction::None);

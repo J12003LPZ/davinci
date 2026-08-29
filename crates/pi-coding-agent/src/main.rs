@@ -41,10 +41,11 @@ use pi_session::{
 use pi_tui::{
     builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto,
     drain_osc_tty, encode_kitty, interactive_settings_list, load_themes_from_dir, parse_auto_theme,
-    parse_http_idle_timeout, resolve_git_branch, ChatChrome, Component, CustomMessage,
-    DoubleEscapeAction, FilterMode, InteractiveSession, Keybindings, MermaidMode,
-    ModelSelectorItem, ScopedModel, SessionAction, SessionItem, SessionTreeEntry, SlashCommandSpec,
-    Theme, ThemeDetection, ToolCard, TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
+    parse_http_idle_timeout, resolve_git_branch, AutocompleteItem, ChatChrome, Component,
+    CustomMessage, DoubleEscapeAction, ExtraAutocompleteProvider, FilterMode, InteractiveSession,
+    Keybindings, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction, SessionItem,
+    SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TuiMode,
+    FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -1143,6 +1144,7 @@ fn run_interactive(
     }
     session.cwd = agent.cwd.clone();
     session.slash_commands = interactive_slash_commands(agent, parsed);
+    session.extra_autocomplete = interactive_extra_autocomplete(parsed);
     session.login_providers = pi_ai::oauth_providers()
         .iter()
         .map(|name| (*name).to_string())
@@ -1184,6 +1186,7 @@ fn run_interactive(
     let host = loaded_extension_host(parsed);
     apply_extension_shortcuts(&mut session, agent, &host);
     session.slash_commands = interactive_slash_commands(agent, parsed);
+    session.extra_autocomplete = interactive_extra_autocomplete(parsed);
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
     refresh_interactive_models(parsed, &mut session);
@@ -1957,6 +1960,7 @@ fn reload_interactive_resources(
     let host = loaded_extension_host(parsed);
     apply_extension_shortcuts(session, agent, &host);
     session.slash_commands = interactive_slash_commands(agent, parsed);
+    session.extra_autocomplete = interactive_extra_autocomplete(parsed);
     replay_custom_messages(agent, session, &host);
     let current = session.chrome.theme.name.clone();
     apply_theme_value(session, &current);
@@ -2417,6 +2421,7 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
             name: command.name,
             description: command.description,
             argument_hint: command.argument_hint,
+            argument_items: Vec::new(),
         })
         .collect();
     for spec in slash::invocable_commands(
@@ -2446,9 +2451,60 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
                 .unwrap_or("")
                 .to_string(),
             argument_hint: None,
+            argument_items: Vec::new(),
         });
     }
+    for command in &mut commands {
+        if let Some(detail) = host
+            .js
+            .iter()
+            .flat_map(|ext| ext.command_details.iter())
+            .find(|item| item.name == command.name)
+        {
+            command.argument_items = detail
+                .argument_items
+                .iter()
+                .map(|item| AutocompleteItem {
+                    value: item.value.clone(),
+                    label: if item.label.is_empty() {
+                        item.value.clone()
+                    } else {
+                        item.label.clone()
+                    },
+                    description: item.description.clone(),
+                })
+                .collect();
+        }
+    }
     commands
+}
+
+fn interactive_extra_autocomplete(parsed: &Args) -> Vec<ExtraAutocompleteProvider> {
+    loaded_extension_host(parsed)
+        .js
+        .iter()
+        .flat_map(|ext| ext.autocomplete_providers.iter())
+        .map(|provider| ExtraAutocompleteProvider {
+            trigger_characters: provider
+                .trigger_characters
+                .iter()
+                .filter_map(|value| value.chars().next())
+                .collect(),
+            items: provider
+                .items
+                .iter()
+                .map(|item| AutocompleteItem {
+                    value: item.value.clone(),
+                    label: if item.label.is_empty() {
+                        item.value.clone()
+                    } else {
+                        item.label.clone()
+                    },
+                    description: item.description.clone(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn format_session_info(

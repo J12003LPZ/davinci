@@ -5,8 +5,8 @@ use std::path::Path;
 use crate::extensions::{discover_extensions, ExtensionManifest};
 use crate::js_host::{
     execute_command_tool, execute_js_tool, node_available, resolve_extension_module,
-    run_js_extension, run_persistent_js_extension, stop_persistent_js_extension, JsExtensionResult,
-    JsRegisteredProvider,
+    run_js_extension, run_persistent_js_extension, stop_persistent_js_extension,
+    JsAutocompleteProvider, JsExtensionResult, JsRegisteredCommand, JsRegisteredProvider,
 };
 use pi_tui::Keybindings;
 
@@ -51,6 +51,8 @@ pub struct LoadedJsExtension {
     pub handlers: Vec<String>,
     pub tools: Vec<String>,
     pub commands: Vec<String>,
+    pub command_details: Vec<JsRegisteredCommand>,
+    pub autocomplete_providers: Vec<JsAutocompleteProvider>,
     pub message_renderers: Vec<String>,
     pub entry_renderers: Vec<String>,
     pub markdown_transformers: u32,
@@ -123,9 +125,11 @@ impl ExtensionHost {
                             tools: loaded.tools.into_iter().map(|tool| tool.name).collect(),
                             commands: loaded
                                 .commands
-                                .into_iter()
-                                .map(|command| command.name)
+                                .iter()
+                                .map(|command| command.name.clone())
                                 .collect(),
+                            command_details: loaded.commands,
+                            autocomplete_providers: loaded.autocomplete_providers,
                             message_renderers: loaded.message_renderers,
                             entry_renderers: loaded.entry_renderers,
                             markdown_transformers: loaded.markdown_transformers,

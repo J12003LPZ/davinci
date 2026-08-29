@@ -478,6 +478,7 @@ async function main() {
 		uiCalls: [],
 		sessionCalls: [],
 		providers: [],
+		autocompleteProviders: [],
 	};
 	let editorFactory;
 	let customComponent;
@@ -574,7 +575,38 @@ async function main() {
 			getEditorComponent() {
 				return editorFactory;
 			},
-			addAutocompleteProvider() {},
+			addAutocompleteProvider(factory) {
+				try {
+					const current = {
+						triggerCharacters: ["@"],
+						getSuggestions: async () => null,
+						applyCompletion() {
+							return { lines: [], cursorLine: 0, cursorCol: 0 };
+						},
+					};
+					const wrapped = typeof factory === "function" ? factory(current) : factory;
+					if (!wrapped) return;
+					const triggers =
+						Array.isArray(wrapped.triggerCharacters) && wrapped.triggerCharacters.length
+							? wrapped.triggerCharacters
+							: ["#"];
+					let items = [];
+					const fixture = process.env.PI_EXTENSION_AUTOCOMPLETE_REPLY;
+					if (fixture) {
+						try {
+							items = JSON.parse(fixture);
+						} catch {}
+					} else if (typeof wrapped.getSuggestions === "function") {
+						try {
+							const result = wrapped.getSuggestions([""], 0, 0, { signal: { aborted: false } });
+							if (result && typeof result.then !== "function" && Array.isArray(result.items)) {
+								items = result.items;
+							}
+						} catch {}
+					}
+					recorded.autocompleteProviders.push({ triggerCharacters: triggers, items });
+				} catch {}
+			},
 			onTerminalInput() {
 				return () => {};
 			},
@@ -657,7 +689,18 @@ async function main() {
 			}
 		},
 		registerCommand(name, options) {
-			recorded.commands.push({ name, description: (options && options.description) || "" });
+			const rec = {
+				name,
+				description: (options && options.description) || "",
+				argumentItems: [],
+			};
+			if (options && typeof options.getArgumentCompletions === "function") {
+				try {
+					const items = options.getArgumentCompletions("");
+					if (Array.isArray(items)) rec.argumentItems = items;
+				} catch {}
+			}
+			recorded.commands.push(rec);
 			if (options && typeof options.handler === "function") {
 				recorded.commandHandlers[name] = options.handler;
 			}
@@ -1035,6 +1078,7 @@ async function main() {
 			hasEditor: typeof editorFactory === "function",
 			hasCustom: Boolean(customComponent),
 			providers: recorded.providers,
+			autocompleteProviders: recorded.autocompleteProviders,
 			result,
 		};
 	}
