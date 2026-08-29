@@ -1,4 +1,3 @@
-use anyhow::Result;
 use pi_core::Message;
 use ratatui::{
     layout::{Constraint, Direction, Layout},

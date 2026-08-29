@@ -1,35 +1,35 @@
-use async_trait::async_trait;
-use pi_agent::Agent;
-use pi_ai::MockLanguageModel;
-use pi_client::{ClientError, ClientTransport, PiClient};
-use pi_core::{AgentEvent, Message, Role, RpcRequest, RpcResponse, SessionMetadata, WriterLease};
-use pi_server::PiServer;
-use pi_session_sqlite::{SessionStore, SqliteSessionStore};
-use std::fs;
-use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-
-struct DirectTransport {
-    server: PiServer,
-}
-
-#[async_trait]
-impl ClientTransport for DirectTransport {
-    async fn send(&self, request: RpcRequest) -> Result<RpcResponse, ClientError> {
-        let res = self.server.handle_rpc(request, None).await;
-        Ok(res)
-    }
-
-    async fn subscribe_events(&self) -> Result<mpsc::Receiver<AgentEvent>, ClientError> {
-        let (_tx, rx) = mpsc::channel(10);
-        Ok(rx)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use async_trait::async_trait;
+    use pi_agent::Agent;
+    use pi_ai::MockLanguageModel;
+    use pi_client::{ClientError, ClientTransport, PiClient};
+    use pi_core::{
+        AgentEvent, Message, Role, RpcRequest, RpcResponse, SessionMetadata, WriterLease,
+    };
+    use pi_server::PiServer;
+    use pi_session_sqlite::SqliteSessionStore;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    struct DirectTransport {
+        server: PiServer,
+    }
+
+    #[async_trait]
+    impl ClientTransport for DirectTransport {
+        async fn send(&self, request: RpcRequest) -> Result<RpcResponse, ClientError> {
+            let res = self.server.handle_rpc(request, None).await;
+            Ok(res)
+        }
+
+        async fn subscribe_events(&self) -> Result<mpsc::Receiver<AgentEvent>, ClientError> {
+            let (_tx, rx) = mpsc::channel(10);
+            Ok(rx)
+        }
+    }
 
     #[test]
     fn test_golden_protocol_fixtures() {

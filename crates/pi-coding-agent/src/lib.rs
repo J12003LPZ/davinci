@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use pi_agent::{AgentError, AgentTool, Result};
 use pi_ai::ToolDefinition;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::path::PathBuf;
 
 pub struct ReadFileTool {

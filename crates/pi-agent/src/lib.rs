@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use pi_ai::{CompletionOptions, DynLanguageModel, ToolDefinition};
-use pi_core::{AgentEvent, Message, Role, ToolCall};
+use pi_core::{AgentEvent, Message, Role};
 use pi_session_sqlite::{SessionStore, SqliteSessionStore};
 use std::collections::HashMap;
 use std::sync::Arc;
