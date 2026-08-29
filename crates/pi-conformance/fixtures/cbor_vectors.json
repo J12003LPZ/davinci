@@ -1,0 +1,20 @@
+{
+  "vectors": [
+    { "hex": "f6", "json": null },
+    { "hex": "f4", "json": false },
+    { "hex": "f5", "json": true },
+    { "hex": "00", "json": 0 },
+    { "hex": "01", "json": 1 },
+    { "hex": "0a", "json": 10 },
+    { "hex": "17", "json": 23 },
+    { "hex": "1818", "json": 24 },
+    { "hex": "1864", "json": 100 },
+    { "hex": "1903e8", "json": 1000 },
+    { "hex": "20", "json": -1 },
+    { "hex": "29", "json": -10 },
+    { "hex": "60", "json": "" },
+    { "hex": "6449455446", "json": "IETF" },
+    { "hex": "80", "json": [] },
+    { "hex": "83010203", "json": [1, 2, 3] }
+  ]
+}
