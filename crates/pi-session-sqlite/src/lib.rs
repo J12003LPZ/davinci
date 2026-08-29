@@ -5,7 +5,7 @@ mod repo;
 
 pub use leases::{
     acquire_writer_lease, delete_writer_lease, release_writer_lease, renew_writer_lease,
-    WriterLease, WriterLeaseOptions,
+    LeaseHeartbeat, WriterLease, WriterLeaseOptions,
 };
 pub use repo::{apply_migrations, open_database, SqliteSessionRepository, SqliteSessionStorage};
 

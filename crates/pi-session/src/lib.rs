@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use conformance::{run_conformance, ConformanceReport};
-pub use jsonl::{jsonl_session_directory_name, JsonlSessionRepository, JsonlSessionStorage};
+pub use jsonl::{JsonlSession, JsonlSessionRepository};
 pub use memory::MemorySessionRepository;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
