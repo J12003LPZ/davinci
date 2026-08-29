@@ -11,14 +11,17 @@ use crate::trust_selector::{TrustSelector, TrustSelectorAction};
 use pi_agent::ThinkingLevel;
 use pi_session::{default_sessions_root, discover_sessions};
 use pi_tui::component::Component;
+use pi_tui::fuzzy::fuzzy_filter;
 use pi_tui::{
     default_keybindings, disable_mouse, disable_raw_input, enable_mouse, enable_raw_input,
-    enter_alt_screen, layout_transcript_and_dock, leave_alt_screen, set_title, ChatView, Editor,
-    Key, Markdown, Node, Overlay, OverlayOptions, SelectList, SettingsList, Tui, TuiAltScreen,
-    TuiAltScreenOptions, TuiMode, ViewportScroll, ViewportScrollOptions,
+    enter_alt_screen, layout_transcript_and_dock, leave_alt_screen, set_title, AutocompleteItem,
+    ChatView, CombinedAutocompleteProvider, Editor, Key, Markdown, Node, Overlay, OverlayOptions,
+    SelectList, SettingsList, SlashCommand, Tui, TuiAltScreen, TuiAltScreenOptions, TuiMode,
+    ViewportScroll, ViewportScrollOptions,
 };
 use serde_json::json;
 use std::io::{self, BufRead, Read, Write};
+use std::rc::Rc;
 
 pub struct InteractiveMode {
     pub runtime: SessionRuntime,
@@ -72,7 +75,7 @@ impl InteractiveMode {
         } else {
             (None, None, None)
         };
-        Self {
+        let mut mode = Self {
             runtime,
             tui,
             chat,
@@ -86,7 +89,140 @@ impl InteractiveMode {
             alt,
             transcript,
             dock,
+        };
+        let _ = mode.tui.query_terminal_background_color();
+        mode.install_autocomplete();
+        mode
+    }
+
+    fn install_autocomplete(&mut self) {
+        let mut commands: Vec<SlashCommand> = BUILTIN_SLASH_COMMANDS
+            .iter()
+            .map(|(name, description)| SlashCommand {
+                name: (*name).to_string(),
+                description: Some((*description).to_string()),
+                argument_hint: None,
+                argument_completions: None,
+            })
+            .collect();
+        let models: Vec<AutocompleteItem> = self
+            .runtime
+            .available_models()
+            .iter()
+            .map(|model| AutocompleteItem {
+                value: format!(
+                    "{}/{}",
+                    model.get("provider").and_then(|v| v.as_str()).unwrap_or(""),
+                    model.get("id").and_then(|v| v.as_str()).unwrap_or("")
+                ),
+                label: model
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                description: model
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
+            .collect();
+        let models = Rc::new(models);
+        if let Some(command) = commands.iter_mut().find(|command| command.name == "model") {
+            let models = models.clone();
+            command.argument_completions = Some(Rc::new(move |prefix: &str| {
+                let labels: Vec<String> = models
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{} {} {}",
+                            item.value,
+                            item.description.as_deref().unwrap_or(""),
+                            item.label
+                        )
+                    })
+                    .collect();
+                fuzzy_filter(prefix, &labels)
+                    .into_iter()
+                    .filter_map(|matched| {
+                        models
+                            .iter()
+                            .find(|item| matched.item.starts_with(&item.value))
+                            .cloned()
+                    })
+                    .collect()
+            }));
         }
+        if let Some(command) = commands
+            .iter_mut()
+            .find(|command| command.name == "thinking")
+        {
+            command.argument_completions = Some(Rc::new(|prefix: &str| {
+                let levels: Vec<String> = ThinkingLevel::all()
+                    .iter()
+                    .map(|level| level.as_str().to_string())
+                    .collect();
+                fuzzy_filter(prefix, &levels)
+                    .into_iter()
+                    .map(|matched| AutocompleteItem {
+                        value: matched.item.clone(),
+                        label: matched.item,
+                        description: None,
+                    })
+                    .collect()
+            }));
+        }
+        let providers: Vec<AutocompleteItem> = login::login_providers(None)
+            .into_iter()
+            .map(|provider| AutocompleteItem {
+                value: provider.id.clone(),
+                label: provider.id,
+                description: Some(provider.name),
+            })
+            .collect();
+        let providers = Rc::new(providers);
+        let builtin_names: Vec<String> = commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect();
+        for command in &self.runtime.registry.commands {
+            if builtin_names.iter().any(|name| name == &command.name) {
+                continue;
+            }
+            commands.push(SlashCommand {
+                name: command.name.clone(),
+                description: command.description.clone(),
+                argument_hint: None,
+                argument_completions: None,
+            });
+        }
+        if let Some(command) = commands.iter_mut().find(|command| command.name == "login") {
+            let providers = providers.clone();
+            command.argument_completions = Some(Rc::new(move |prefix: &str| {
+                let labels: Vec<String> = providers
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{} {}",
+                            item.value,
+                            item.description.as_deref().unwrap_or("")
+                        )
+                    })
+                    .collect();
+                fuzzy_filter(prefix, &labels)
+                    .into_iter()
+                    .filter_map(|matched| {
+                        providers
+                            .iter()
+                            .find(|item| matched.item.starts_with(&item.value))
+                            .cloned()
+                    })
+                    .collect()
+            }));
+        }
+        let cwd = self.runtime.cwd.clone();
+        self.editor
+            .set_autocomplete_provider(Rc::new(CombinedAutocompleteProvider::new(commands, cwd)));
+        self.editor.set_sync_autocomplete(true);
     }
 
     pub fn footer_lines(&self) -> Vec<String> {
@@ -841,8 +977,17 @@ impl InteractiveMode {
                     format!("thinking {}", self.runtime.thinking.as_str()),
                 );
             }
-            Key::Escape => self.tui.hide_all_overlays(),
+            Key::Escape => {
+                if self.editor.is_showing_autocomplete() {
+                    self.editor.handle_key(&Key::Escape);
+                } else {
+                    self.tui.hide_all_overlays();
+                }
+            }
             Key::Enter => {
+                if self.editor.is_showing_autocomplete() && !self.editor.confirm_autocomplete() {
+                    return Ok(false);
+                }
                 let text = std::mem::take(&mut self.editor.buffer);
                 self.editor.cursor = 0;
                 if self.handle_line(&text)? {
@@ -928,6 +1073,12 @@ pub fn run_interactive(mut mode: InteractiveMode, fullscreen: bool) -> Result<i3
             }
             pending.extend_from_slice(&buf[..n]);
             let raw_str = String::from_utf8_lossy(&pending).to_string();
+            if mode.tui.dispatch_input(&raw_str).is_none() {
+                pending.clear();
+                print!("{}", mode.redraw(false));
+                let _ = stdout.flush();
+                continue;
+            }
             if mode.tui.hit_test_mouse(&raw_str).is_some() {
                 let _ = mode.handle_line(&raw_str)?;
                 pending.clear();

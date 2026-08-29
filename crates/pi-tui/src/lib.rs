@@ -2,6 +2,7 @@
 
 pub mod alt_screen;
 pub mod ansi_text;
+pub mod autocomplete;
 pub mod component;
 pub mod constrained_layout;
 pub mod diff;
@@ -10,12 +11,14 @@ pub mod fuzzy;
 pub mod image;
 pub mod keybindings;
 pub mod keys;
+pub mod latex;
 pub mod layout;
 pub mod markdown;
 pub mod mouse;
 pub mod screen;
 pub mod selectors;
 pub mod terminal;
+pub mod terminal_colors;
 pub mod terminal_image;
 pub mod themes;
 pub mod viewport;
@@ -24,6 +27,10 @@ pub mod word_nav;
 
 pub use alt_screen::{
     find_alt_screen_search_matches, layout_transcript_and_dock, TuiAltScreen, TuiAltScreenOptions,
+};
+pub use autocomplete::{
+    ApplyLinesResult, AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions,
+    CombinedAutocompleteProvider, SlashCommand,
 };
 pub use component::{wrap_text_with_ansi, Component, Text};
 pub use constrained_layout::{LayoutHStack, LayoutVStack, Node, StackEntry};
@@ -35,6 +42,7 @@ pub use editor::Editor;
 pub use image::{Image, ImageOptions};
 pub use keybindings::{matches_key, reset_alt_screen_bindings, set_alt_screen_bindings};
 pub use keys::{default_keybindings, parse_bytes, parse_key, read_key, Key, Keybinding};
+pub use latex::{render_latex, RenderLatexOptions};
 pub use layout::{ChatView, Container, Overlay};
 pub use markdown::Markdown;
 pub use mouse::{parse_sgr_mouse, MouseEvent};
@@ -43,6 +51,10 @@ pub use selectors::SelectList;
 pub use terminal::{
     disable_mouse, disable_raw_input, enable_mouse, enable_raw_input, enter_alt_screen,
     enter_raw_mode, leave_alt_screen, leave_raw_mode, set_title, TuiMode,
+};
+pub use terminal_colors::{
+    is_osc11_background_color_response, parse_osc11_background_color,
+    parse_terminal_color_scheme_report, RgbColor, TerminalColorScheme, OSC11_QUERY,
 };
 pub use terminal_image::{
     allocate_image_id, calculate_image_cell_size, crop_kitty_image_line, delete_all_kitty_images,

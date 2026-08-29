@@ -4,6 +4,9 @@ use crate::component::Component;
 use crate::diff::{composite_tui_line, visible_width, DiffScreen};
 use crate::mouse::{overlay_rect, parse_sgr_mouse, MouseEvent, Rect};
 use crate::terminal::TuiMode;
+use crate::terminal_colors::{
+    is_osc11_background_color_response, parse_osc11_background_color, RgbColor, OSC11_QUERY,
+};
 use crate::terminal_image::{
     get_capabilities, prepare_kitty_screen, CachedKittyImage, ImageProtocol,
 };
@@ -53,6 +56,8 @@ pub struct Tui {
     screen: DiffScreen,
     image_protocol: Option<ImageProtocol>,
     uploaded_kitty: IndexMap<u32, CachedKittyImage>,
+    consume_osc11: bool,
+    osc11_reply: Option<Option<RgbColor>>,
 }
 
 impl Tui {
@@ -67,7 +72,29 @@ impl Tui {
             screen: DiffScreen::new(columns, rows),
             image_protocol: get_capabilities().images,
             uploaded_kitty: IndexMap::new(),
+            consume_osc11: false,
+            osc11_reply: None,
         }
+    }
+
+    /// TypeScript `Tui.queryTerminalBackgroundColor`: write OSC 11 and consume replies.
+    pub fn query_terminal_background_color(&mut self) -> &'static str {
+        self.consume_osc11 = true;
+        self.osc11_reply = None;
+        OSC11_QUERY
+    }
+
+    pub fn take_osc11_reply(&mut self) -> Option<Option<RgbColor>> {
+        self.osc11_reply.take()
+    }
+
+    /// Returns `None` when the chunk was consumed as an OSC 11 reply.
+    pub fn dispatch_input<'a>(&mut self, data: &'a str) -> Option<&'a str> {
+        if self.consume_osc11 && is_osc11_background_color_response(data) {
+            self.osc11_reply = Some(parse_osc11_background_color(data));
+            return None;
+        }
+        Some(data)
     }
 
     pub fn add_child_lines(&mut self, lines: Vec<String>) {
@@ -303,5 +330,29 @@ mod tests {
         assert!(!seq.contains(crate::widgets::CURSOR_MARKER));
         assert!(seq.contains("\u{1b}[2;3H"));
         assert!(seq.contains("abcd") || seq.contains("ab") && seq.contains("cd"));
+    }
+
+    #[test]
+    fn query_terminal_background_color_writes_and_consumes_osc11() {
+        let mut tui = Tui::new(TuiMode::Regular, 80, 24);
+        assert_eq!(tui.query_terminal_background_color(), OSC11_QUERY);
+        assert!(tui.dispatch_input("x").is_some());
+        assert!(tui.take_osc11_reply().is_none());
+        assert!(tui.dispatch_input("\u{1b}]11;#ffffff\u{07}").is_none());
+        assert_eq!(
+            tui.take_osc11_reply(),
+            Some(Some(RgbColor {
+                r: 255,
+                g: 255,
+                b: 255
+            }))
+        );
+        assert!(tui.dispatch_input("\u{1b}]11;not-a-color\u{07}").is_none());
+        assert_eq!(tui.take_osc11_reply(), Some(None));
+        assert!(tui.dispatch_input("\u{1b}]11;#000000\u{07}").is_none());
+        assert_eq!(
+            tui.take_osc11_reply(),
+            Some(Some(RgbColor { r: 0, g: 0, b: 0 }))
+        );
     }
 }
