@@ -1,0 +1,6 @@
+{
+  "activeWriter": "SQLite session {id} already has an active writer",
+  "lostWriter": "SQLite session {id} writer lease was lost",
+  "ttl": "writerLease.ttlMs must be positive",
+  "heartbeat": "writerLease.heartbeatIntervalMs must be positive and less than ttlMs"
+}

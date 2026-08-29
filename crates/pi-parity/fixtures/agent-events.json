@@ -1,0 +1,11 @@
+{
+  "lifecycle": [
+    "AgentStart",
+    "TurnStart",
+    "MessageStart",
+    "MessageUpdate",
+    "MessageEnd",
+    "TurnEnd",
+    "AgentEnd"
+  ]
+}

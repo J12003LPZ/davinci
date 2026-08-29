@@ -1,0 +1,8 @@
+{
+  "name": "pi",
+  "private": true,
+  "description": "Pi agent harness. TypeScript packages remain authoritative until the Phase 8 Rust gate.",
+  "workspaces": [
+    "packages/*"
+  ]
+}

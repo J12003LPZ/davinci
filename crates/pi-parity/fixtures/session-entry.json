@@ -1,0 +1,12 @@
+{
+  "type": "message",
+  "id": "entry-golden-1",
+  "seq": 1,
+  "parentId": null,
+  "timestamp": 1700000000000,
+  "message": {
+    "role": "user",
+    "content": "hello",
+    "timestamp": 1700000000000
+  }
+}
