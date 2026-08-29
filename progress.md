@@ -28,12 +28,15 @@ A TypeScript `pi` user can install Rust `pi` and use the same flags, `~/.pi` ses
 
 ## What remains
 
+- TypeScript editor autocomplete is not ported: `CombinedAutocompleteProvider` (slash commands, `@` files, `#` skills, custom trigger characters, Tab/debounce/abort) from `vendor/pi/packages/tui/src/autocomplete.ts`. Rust slash handling runs after submit only.
+- TypeScript TUI LaTeX (`latex.ts` symbol/superscript rendering in markdown) has no Rust module or fixture tests.
+- TypeScript terminal color queries (`queryTerminalBackgroundColor` / OSC 11, color-scheme reports) are not ported.
 - Cargo/source installs print the TypeScript `unknown` self-update refusal; that is equivalent, not a missing product feature.
 - Done-bar audit is still open: `progress.md` stays at 99% until every `vendor/pi/packages/*` crate/module, CLI flag/subcommand, and product surface is requirement-checked against TypeScript `853a80d26c90a14c1886f0ebb8ffaae133ca2185` with green workspace gates. Do not write 100% from the absence of a remaining-edge-case list.
 
 ## Next crate/module
 
-Re-audit the Done bar against `vendor/pi/packages/*` and the numbered backlog. Do not mark 100% until that audit is evidence-backed.
+Port editor autocomplete (slash / `@` / `#`) from TypeScript fixtures, then LaTeX and terminal-color queries. Do not mark 100% until the Done bar is evidence-backed.
 
 ## Gates
 
