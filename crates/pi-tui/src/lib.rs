@@ -59,8 +59,9 @@ mod word_wrap;
 
 pub use alt_screen_flash::AltScreenFlashContainer;
 pub use alt_screen_search::{
-    find_alt_screen_search_matches, get_alt_screen_search_match_key, AltScreenSearchComponent,
-    AltScreenSearchMatch, AltScreenSearchSegment,
+    find_alt_screen_search_matches, find_alt_screen_search_matches_in,
+    get_alt_screen_search_match_key, AltScreenSearchComponent, AltScreenSearchMatch,
+    AltScreenSearchSegment,
 };
 pub use ansi::{
     extract_ansi_code, extract_segments, get_grapheme_cell_range, get_osc8_link_at_column,
@@ -79,7 +80,7 @@ pub use chrome::ChatChrome;
 pub use config_selector::{
     ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector, ConfigSelectorAction,
 };
-pub use container::Container;
+pub use container::{Container, SharedComponent};
 pub use custom_message::{
     CustomMessage, MessageRenderOptions, MessageRenderer, MessageRendererRegistry,
 };
@@ -145,7 +146,8 @@ pub use overlay::{
     OverlayMargin, OverlayOptions, SizeValue,
 };
 pub use render::{
-    strip_terminal_sequences, visible_width, visible_width_stripped, Component, Text,
+    strip_terminal_sequences, visible_width, visible_width_stripped, Component, RenderedLines,
+    SparseLines, Text,
 };
 pub use scoped_models::{
     clear_all, enable_all, get_sorted_ids, is_enabled, move_id, toggle, EnabledIds, ScopedModel,

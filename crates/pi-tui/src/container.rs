@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::render::Component;
+use crate::render::{Component, RenderedLines};
 
 pub struct Container {
     pub children: Vec<Box<dyn Component>>,
@@ -53,12 +53,71 @@ impl Component for SharedContainer {
         self.inner.borrow().render(width)
     }
 
+    fn rendered_lines(&self, width: usize) -> RenderedLines {
+        self.inner.borrow().rendered_lines(width)
+    }
+
     fn handle_input(&mut self, data: &str) {
         self.inner.borrow_mut().handle_input(data);
     }
 
     fn invalidate(&mut self) {
         self.inner.borrow_mut().invalidate();
+    }
+
+    fn wants_key_release(&self) -> bool {
+        self.inner.borrow().wants_key_release()
+    }
+}
+
+/// Cloneable component handle matching TS remount of the same child object.
+pub struct SharedComponent {
+    inner: Rc<RefCell<dyn Component>>,
+}
+
+impl SharedComponent {
+    pub fn new(component: impl Component + 'static) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(component)),
+        }
+    }
+
+    pub fn inner(&self) -> Rc<RefCell<dyn Component>> {
+        self.inner.clone()
+    }
+
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        Rc::ptr_eq(&left.inner, &right.inner)
+    }
+}
+
+impl Clone for SharedComponent {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Component for SharedComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.inner.borrow().render(width)
+    }
+
+    fn rendered_lines(&self, width: usize) -> RenderedLines {
+        self.inner.borrow().rendered_lines(width)
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        self.inner.borrow_mut().handle_input(data);
+    }
+
+    fn invalidate(&mut self) {
+        self.inner.borrow_mut().invalidate();
+    }
+
+    fn wants_key_release(&self) -> bool {
+        self.inner.borrow().wants_key_release()
     }
 }
 

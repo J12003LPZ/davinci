@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ansi::{get_grapheme_cell_range, slice_by_column, visible_width};
+use crate::container::SharedComponent;
 use crate::image::{crop_kitty_image_line, get_kitty_image_metadata, is_image_line};
 use crate::overlay::composite_tui_line;
-use crate::render::Component;
+use crate::render::{Component, RenderedLines};
 use crate::scroll::ScrollView;
 use crate::stack::{
     allocate_stack_sizes, HStack, LayoutViewport, StackAlign, StackBasis, StackLayoutEntry, VStack,
@@ -27,10 +28,10 @@ pub struct LayoutBox {
     pub rect: LayoutRect,
     pub clip: LayoutRect,
     pub children: Vec<LayoutBox>,
-    pub lines: Option<Vec<String>>,
+    pub lines: Option<RenderedLines>,
     pub line_offset: usize,
     pub scroll_top: usize,
-    pub scroll_content_lines: Option<Vec<String>>,
+    pub scroll_content_lines: Option<RenderedLines>,
     pub scrollbar: Option<ScrollbarPaint>,
     pub scroll_id: Option<usize>,
     pub layer: usize,
@@ -60,7 +61,7 @@ pub struct ScrollbarGeometry {
 
 struct LayoutContext {
     viewport: LayoutViewport,
-    render_cache: HashMap<(usize, usize), Vec<String>>,
+    render_cache: HashMap<(usize, usize), RenderedLines>,
     primary_scroll_id: Option<usize>,
 }
 
@@ -85,13 +86,13 @@ fn render_cached(
     context: &mut LayoutContext,
     component: &dyn Component,
     width: usize,
-) -> Vec<String> {
+) -> RenderedLines {
     let safe_width = width.max(1);
     let key = (component_id(component), safe_width);
     if let Some(lines) = context.render_cache.get(&key) {
         return lines.clone();
     }
-    let lines = component.render(safe_width);
+    let lines = component.rendered_lines(safe_width);
     context.render_cache.insert(key, lines.clone());
     lines
 }
@@ -101,11 +102,7 @@ fn measure_height(context: &mut LayoutContext, component: &dyn Component, width:
 }
 
 fn measure_width(context: &mut LayoutContext, component: &dyn Component, width: usize) -> usize {
-    render_cached(context, component, width)
-        .iter()
-        .map(|line| visible_width(line))
-        .max()
-        .unwrap_or(0)
+    render_cached(context, component, width).max_visible_width()
 }
 
 fn translate_box(box_: &mut LayoutBox, delta_y: isize) {
@@ -166,6 +163,14 @@ fn layout_component(
     height: Option<usize>,
     clip: LayoutRect,
 ) -> LayoutBox {
+    if component.as_any().is::<SharedComponent>() {
+        let inner = component
+            .as_any()
+            .downcast_ref::<SharedComponent>()
+            .expect("shared")
+            .inner();
+        return layout_component(context, &mut *inner.borrow_mut(), x, y, width, height, clip);
+    }
     let safe_width = width.max(1);
     if let Some(scroll) = component.as_any_mut().downcast_mut::<ScrollView>() {
         return layout_scroll(context, scroll, x, y, safe_width, height, clip);
@@ -180,7 +185,7 @@ fn layout_component(
     let allocated_height = height.unwrap_or(lines.len());
     let mut line_offset = 0usize;
     if lines.len() > allocated_height && allocated_height > 0 {
-        if let Some(cursor_line) = lines.iter().position(|line| line.contains(CURSOR_MARKER)) {
+        if let Some(cursor_line) = lines.find_containing(CURSOR_MARKER) {
             if cursor_line >= allocated_height {
                 line_offset = cursor_line - allocated_height + 1;
             }
@@ -488,7 +493,7 @@ pub fn get_scrollbar_geometry(box_: &LayoutBox) -> Option<ScrollbarGeometry> {
         .children
         .first()
         .map(|child| child.rect.height)
-        .or_else(|| box_.scroll_content_lines.as_ref().map(Vec::len))
+        .or_else(|| box_.scroll_content_lines.as_ref().map(RenderedLines::len))
         .unwrap_or(0);
     let track_height = box_.rect.height;
     let min_thumb_height = 2.min(track_height);
@@ -588,8 +593,10 @@ fn paint_box(box_: &LayoutBox, screen: &mut [String], total_width: usize) {
     if box_.scrollbar.is_some() {
         if let Some(content) = &box_.scroll_content_lines {
             if box_.scroll_top > 0 && box_.rect.height > 0 {
-                for image_row in (0..box_.scroll_top).rev() {
-                    let image_line = content.get(image_row).map(String::as_str).unwrap_or("");
+                for (image_row, image_line) in content.defined().into_iter().rev() {
+                    if image_row >= box_.scroll_top {
+                        continue;
+                    }
                     if let Some(metadata) = get_kitty_image_metadata(image_line) {
                         let hidden_rows = box_.scroll_top - image_row;
                         if hidden_rows < metadata.rows as usize {
@@ -792,6 +799,29 @@ mod tests {
         );
         render_layout_frame(&mut root, 10, 3);
         assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn paints_only_clipped_rows_from_very_large_scroll_content() {
+        let line_count = 1_000_000_000usize;
+        let mut lines = crate::render::SparseLines::new(line_count);
+        lines.set(line_count - 4, "before");
+        lines.set(line_count - 3, "visible 1");
+        lines.set(line_count - 2, "visible 2");
+        lines.set(line_count - 1, "visible 3");
+        let mut transcript = ScrollView::new(
+            Box::new(lines),
+            ScrollViewOptions {
+                follow: ScrollFollow::End,
+                ..ScrollViewOptions::default()
+            },
+        )
+        .unwrap();
+        let frame = render_layout_frame(&mut transcript, 10, 3);
+        assert_eq!(
+            visible_lines(&frame.lines),
+            vec!["visible 1", "visible 2", "visible 3"]
+        );
     }
 
     #[test]
@@ -1137,7 +1167,13 @@ mod tests {
             StackEntryOptions::default(),
         );
         let first = render_layout_frame(&mut root, 10, 4);
-        assert_eq!(first.root.children[0].lines.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            first.root.children[0]
+                .lines
+                .as_ref()
+                .map(RenderedLines::len),
+            Some(1)
+        );
         root.entries[0]
             .component
             .as_any_mut()
@@ -1146,7 +1182,10 @@ mod tests {
             .set_text("one\ntwo\nthree");
         let second = render_layout_frame(&mut root, 10, 4);
         assert_eq!(
-            second.root.children[0].lines.as_ref().map(Vec::len),
+            second.root.children[0]
+                .lines
+                .as_ref()
+                .map(RenderedLines::len),
             Some(3)
         );
     }

@@ -1,4 +1,6 @@
 use std::any::Any;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -17,8 +19,103 @@ impl<T: Any> AsAny for T {
     }
 }
 
+/// Dense or sparse line buffer matching JS `string[]` holes used by huge transcripts.
+#[derive(Clone)]
+pub struct RenderedLines {
+    inner: Rc<RenderedLinesInner>,
+}
+
+enum RenderedLinesInner {
+    Dense(Vec<String>),
+    Sparse {
+        count: usize,
+        lines: BTreeMap<usize, String>,
+    },
+}
+
+impl RenderedLines {
+    pub fn dense(lines: Vec<String>) -> Self {
+        Self {
+            inner: Rc::new(RenderedLinesInner::Dense(lines)),
+        }
+    }
+
+    pub fn sparse(count: usize, lines: BTreeMap<usize, String>) -> Self {
+        Self {
+            inner: Rc::new(RenderedLinesInner::Sparse { count, lines }),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::dense(Vec::new())
+    }
+
+    pub fn len(&self) -> usize {
+        match self.inner.as_ref() {
+            RenderedLinesInner::Dense(lines) => lines.len(),
+            RenderedLinesInner::Sparse { count, .. } => *count,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&str> {
+        match self.inner.as_ref() {
+            RenderedLinesInner::Dense(lines) => lines.get(index).map(String::as_str),
+            RenderedLinesInner::Sparse { lines, .. } => lines.get(&index).map(String::as_str),
+        }
+    }
+
+    pub fn defined(&self) -> Vec<(usize, &str)> {
+        match self.inner.as_ref() {
+            RenderedLinesInner::Dense(lines) => lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| (index, line.as_str()))
+                .collect(),
+            RenderedLinesInner::Sparse { lines, .. } => lines
+                .iter()
+                .map(|(index, line)| (*index, line.as_str()))
+                .collect(),
+        }
+    }
+
+    pub fn max_visible_width(&self) -> usize {
+        self.defined()
+            .into_iter()
+            .map(|(_, line)| visible_width(line))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn find_containing(&self, needle: &str) -> Option<usize> {
+        self.defined()
+            .into_iter()
+            .find(|(_, line)| line.contains(needle))
+            .map(|(index, _)| index)
+    }
+
+    pub fn to_dense_vec(&self) -> Option<Vec<String>> {
+        match self.inner.as_ref() {
+            RenderedLinesInner::Dense(lines) => Some(lines.clone()),
+            RenderedLinesInner::Sparse { .. } => None,
+        }
+    }
+}
+
+impl Default for RenderedLines {
+    fn default() -> Self {
+        Self::dense(Vec::new())
+    }
+}
+
 pub trait Component: AsAny {
     fn render(&self, width: usize) -> Vec<String>;
+    fn rendered_lines(&self, width: usize) -> RenderedLines {
+        RenderedLines::dense(self.render(width))
+    }
     fn handle_input(&mut self, _data: &str) {}
     fn invalidate(&mut self);
     fn wants_key_release(&self) -> bool {
@@ -34,6 +131,37 @@ pub struct Text {
 impl Component for Text {
     fn render(&self, width: usize) -> Vec<String> {
         wrap_text(&self.value, width)
+    }
+
+    fn invalidate(&mut self) {}
+}
+
+/// Non-allocating huge transcript source (JS sparse `string[]`).
+pub struct SparseLines {
+    pub count: usize,
+    pub lines: BTreeMap<usize, String>,
+}
+
+impl SparseLines {
+    pub fn new(count: usize) -> Self {
+        Self {
+            count,
+            lines: BTreeMap::new(),
+        }
+    }
+
+    pub fn set(&mut self, index: usize, line: impl Into<String>) {
+        self.lines.insert(index, line.into());
+    }
+}
+
+impl Component for SparseLines {
+    fn render(&self, _width: usize) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn rendered_lines(&self, _width: usize) -> RenderedLines {
+        RenderedLines::sparse(self.count, self.lines.clone())
     }
 
     fn invalidate(&mut self) {}

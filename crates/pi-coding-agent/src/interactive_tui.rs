@@ -6,9 +6,9 @@ use std::rc::Rc;
 
 use pi_tui::{
     copy_text, open_browser, Component, MemoryTerminal, OverlayHandle, OverlayOptions,
-    ProcessTerminal, ScrollFollow, ScrollView, ScrollViewOptions, StackBasis, StackEntryOptions,
-    TerminalIo, Theme, TuiAltScreen, TuiAltScreenOptions, TuiMainScreen, TuiMainScreenRenderState,
-    TuiMode, TuiRuntimeMode, TuiStopOptions, VStack,
+    ProcessTerminal, ScrollFollow, ScrollView, ScrollViewOptions, SharedComponent, StackBasis,
+    StackEntryOptions, TerminalIo, Theme, TuiAltScreen, TuiAltScreenOptions, TuiMainScreen,
+    TuiMainScreenRenderState, TuiMode, TuiRuntimeMode, TuiStopOptions, VStack,
 };
 
 type OpenUrlFn = Box<dyn FnMut(&str)>;
@@ -63,17 +63,67 @@ impl Component for CombinedLineView {
 }
 
 /// TS document ScrollView + editor/footer dock panes.
+///
+/// Component handles are created once and remounted by identity (TS `switchTuiMode`).
 #[derive(Clone)]
 pub struct ChromePanes {
     pub document: Rc<RefCell<Vec<String>>>,
     pub dock: Rc<RefCell<Vec<String>>>,
+    pub document_view: SharedComponent,
+    pub dock_view: SharedComponent,
+    pub fullscreen_root: SharedComponent,
+    pub combined_view: SharedComponent,
 }
 
 impl ChromePanes {
     pub fn new(document: Vec<String>, dock: Vec<String>) -> Self {
+        let document = Rc::new(RefCell::new(document));
+        let dock = Rc::new(RefCell::new(dock));
+        let document_view = SharedComponent::new(SharedLineView {
+            lines: document.clone(),
+        });
+        let dock_view = SharedComponent::new(SharedLineView {
+            lines: dock.clone(),
+        });
+        let scroll = ScrollView::new(
+            Box::new(document_view.clone()),
+            ScrollViewOptions {
+                follow: ScrollFollow::End,
+                primary: true,
+                ..ScrollViewOptions::default()
+            },
+        )
+        .expect("scroll view");
+        let mut root = VStack::new(0);
+        root.add_child(
+            Box::new(scroll),
+            StackEntryOptions {
+                basis: Some(StackBasis::Fixed(0)),
+                grow: Some(1),
+                min_size: Some(1),
+                ..StackEntryOptions::default()
+            },
+        );
+        root.add_child(
+            Box::new(dock_view.clone()),
+            StackEntryOptions {
+                basis: Some(StackBasis::Auto),
+                min_size: Some(1),
+                ..StackEntryOptions::default()
+            },
+        );
+        let fullscreen_root = SharedComponent::new(root);
+        let combined_view = SharedComponent::new(CombinedLineView {
+            document: document.clone(),
+            dock: dock.clone(),
+        });
         Self {
-            document: Rc::new(RefCell::new(document)),
-            dock: Rc::new(RefCell::new(dock)),
+            document,
+            dock,
+            document_view,
+            dock_view,
+            fullscreen_root,
+            combined_view,
         }
     }
 
@@ -164,6 +214,13 @@ impl InteractiveTui {
     pub fn set_layout_root(&mut self, component: Box<dyn Component>) {
         if let Self::Alt(tui) = self {
             tui.set_layout_root(component);
+        }
+    }
+
+    pub fn layout_root_is(&self, component: &dyn Component) -> bool {
+        match self {
+            Self::Alt(tui) => tui.layout_root_is(component),
+            Self::Main(_) => false,
         }
     }
 
@@ -462,46 +519,10 @@ pub fn remount_chrome(tui: &mut InteractiveTui, lines: Rc<RefCell<Vec<String>>>)
 
 pub fn remount_chrome_panes(tui: &mut InteractiveTui, panes: &ChromePanes) {
     if tui.is_viewport_tui() {
-        let scroll = ScrollView::new(
-            Box::new(SharedLineView {
-                lines: panes.document.clone(),
-            }),
-            ScrollViewOptions {
-                follow: ScrollFollow::End,
-                primary: true,
-                ..ScrollViewOptions::default()
-            },
-        )
-        .expect("scroll view");
-        let mut root = VStack::new(0);
-        root.add_child(
-            Box::new(scroll),
-            StackEntryOptions {
-                basis: Some(StackBasis::Fixed(0)),
-                grow: Some(1),
-                min_size: Some(1),
-                ..StackEntryOptions::default()
-            },
-        );
-        root.add_child(
-            Box::new(SharedLineView {
-                lines: panes.dock.clone(),
-            }),
-            StackEntryOptions {
-                basis: Some(StackBasis::Auto),
-                min_size: Some(1),
-                ..StackEntryOptions::default()
-            },
-        );
-        tui.set_layout_root(Box::new(root));
-        tui.add_child(Box::new(SharedLineView {
-            lines: panes.document.clone(),
-        }));
+        tui.set_layout_root(Box::new(panes.fullscreen_root.clone()));
+        tui.add_child(Box::new(panes.document_view.clone()));
     } else {
-        tui.add_child(Box::new(CombinedLineView {
-            document: panes.document.clone(),
-            dock: panes.dock.clone(),
-        }));
+        tui.add_child(Box::new(panes.combined_view.clone()));
     }
     tui.set_focus_child(0);
 }
@@ -670,5 +691,47 @@ mod tests {
             vec!["line 5", "line 6", "line 7", "line 8", "editor", "footer"]
         );
         tui.stop(TuiStopOptions::default());
+    }
+
+    #[test]
+    fn switch_tui_mode_remounts_same_chrome_component_identity() {
+        let panes = ChromePanes::new(
+            (1..=8).map(|index| format!("line {index}")).collect(),
+            vec!["editor".into(), "footer".into()],
+        );
+        let mut tui = create_interactive_tui(memory_options(TuiMode::Fullscreen, 20, 6));
+        remount_chrome_panes(&mut tui, &panes);
+        assert!(tui.layout_root_is(&panes.fullscreen_root));
+        let (mut next, ok) = switch_tui_mode(
+            tui,
+            TuiMode::Regular,
+            memory_options(TuiMode::Regular, 20, 6),
+            false,
+        );
+        assert!(ok);
+        remount_chrome_panes(&mut next, &panes);
+        let (mut back, ok) = switch_tui_mode(
+            next,
+            TuiMode::Fullscreen,
+            memory_options(TuiMode::Fullscreen, 20, 6),
+            true,
+        );
+        assert!(ok);
+        remount_chrome_panes(&mut back, &panes);
+        assert!(back.layout_root_is(&panes.fullscreen_root));
+        assert!(SharedComponent::ptr_eq(
+            &panes.fullscreen_root,
+            &panes.fullscreen_root.clone()
+        ));
+        back.start();
+        let view = match &back {
+            InteractiveTui::Alt(inner) => inner.viewport_lines(),
+            InteractiveTui::Main(_) => Vec::new(),
+        };
+        assert_eq!(
+            view,
+            vec!["line 5", "line 6", "line 7", "line 8", "editor", "footer"]
+        );
+        back.stop(TuiStopOptions::default());
     }
 }

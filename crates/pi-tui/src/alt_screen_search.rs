@@ -2,7 +2,7 @@
 
 use crate::ansi::{strip_terminal_sequences, truncate_to_width, visible_width};
 use crate::input::Input;
-use crate::render::Component;
+use crate::render::{Component, RenderedLines};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,11 +42,14 @@ fn escape_regexp(text: &str) -> String {
     out
 }
 
-fn build_search_corpus(lines: &[String]) -> (String, Vec<Option<SearchSourceSpan>>) {
+fn build_search_corpus<'a, I>(lines: I) -> (String, Vec<Option<SearchSourceSpan>>)
+where
+    I: IntoIterator<Item = (usize, &'a str)>,
+{
     let mut text = String::new();
     let mut source = Vec::new();
     let mut pending_separator = false;
-    for (row, line) in lines.iter().enumerate() {
+    for (row, line) in lines {
         let stripped = strip_terminal_sequences(line);
         let mut column = 0usize;
         for grapheme in stripped.graphemes(true) {
@@ -81,8 +84,10 @@ fn build_search_corpus(lines: &[String]) -> (String, Vec<Option<SearchSourceSpan
     (text, source)
 }
 
-/// TS `findAltScreenSearchMatches`.
-pub fn find_alt_screen_search_matches(lines: &[String], query: &str) -> Vec<AltScreenSearchMatch> {
+fn find_alt_screen_search_matches_iter<'a, I>(lines: I, query: &str) -> Vec<AltScreenSearchMatch>
+where
+    I: IntoIterator<Item = (usize, &'a str)>,
+{
     let normalized = normalize_query(query);
     if normalized.is_empty() {
         return Vec::new();
@@ -118,6 +123,25 @@ pub fn find_alt_screen_search_matches(lines: &[String], query: &str) -> Vec<AltS
         }
     }
     matches
+}
+
+/// TS `findAltScreenSearchMatches`.
+pub fn find_alt_screen_search_matches(lines: &[String], query: &str) -> Vec<AltScreenSearchMatch> {
+    find_alt_screen_search_matches_iter(
+        lines
+            .iter()
+            .enumerate()
+            .map(|(row, line)| (row, line.as_str())),
+        query,
+    )
+}
+
+/// Search defined rows only so sparse 1e9-line transcripts skip holes.
+pub fn find_alt_screen_search_matches_in(
+    lines: &RenderedLines,
+    query: &str,
+) -> Vec<AltScreenSearchMatch> {
+    find_alt_screen_search_matches_iter(lines.defined(), query)
 }
 
 /// TS `getAltScreenSearchMatchKey`.

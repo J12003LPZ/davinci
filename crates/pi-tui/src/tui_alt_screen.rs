@@ -7,13 +7,14 @@ use std::rc::Rc;
 
 use crate::alt_screen_flash::AltScreenFlashContainer;
 use crate::alt_screen_search::{
-    find_alt_screen_search_matches, get_alt_screen_search_match_key, AltScreenSearchComponent,
+    find_alt_screen_search_matches_in, get_alt_screen_search_match_key, AltScreenSearchComponent,
     AltScreenSearchMatch,
 };
 use crate::ansi::{
     extract_ansi_code, get_grapheme_cell_range, get_osc8_link_at_column, slice_by_column,
     strip_terminal_sequences, visible_width,
 };
+use crate::container::SharedComponent;
 use crate::container::{Container, SharedContainer};
 use crate::image::{
     delete_all_kitty_images, delete_all_kitty_placements, delete_kitty_image,
@@ -26,7 +27,7 @@ use crate::layout::{
     LayoutFrame,
 };
 use crate::overlay::{composite_tui_line, OverlayAnchor, OverlayMargin, OverlayOptions, SizeValue};
-use crate::render::Component;
+use crate::render::{Component, RenderedLines};
 use crate::scroll::{ScrollFollow, ScrollOverscroll, ScrollView, ScrollViewOptions};
 use crate::stack::{HStack, VStack};
 use crate::terminal::TerminalIo;
@@ -283,6 +284,19 @@ impl TuiAltScreen {
         self.base.request_render(false);
     }
 
+    pub fn layout_root_is(&self, component: &dyn Component) -> bool {
+        let Some(root) = self.layout_root.as_ref() else {
+            return false;
+        };
+        if let (Some(left), Some(right)) = (
+            root.as_any().downcast_ref::<SharedComponent>(),
+            component.as_any().downcast_ref::<SharedComponent>(),
+        ) {
+            return SharedComponent::ptr_eq(left, right);
+        }
+        std::ptr::eq(root.as_ref(), component)
+    }
+
     pub fn has_layout_root(&self) -> bool {
         self.layout_root.is_some()
     }
@@ -505,11 +519,11 @@ impl TuiAltScreen {
                 .and_then(|layout| get_scroll_view_box(layout, scroll_id))
                 .and_then(|box_| box_.scroll_content_lines.clone())?
         } else {
-            self.previous_screen.clone()
+            RenderedLines::dense(self.previous_screen.clone())
         };
         let mut lines = Vec::new();
         for row in selection.0.row..=selection.1.row {
-            let line = source_lines.get(row).map(String::as_str).unwrap_or("");
+            let line = source_lines.get(row).unwrap_or("");
             let columns = self.get_selection_columns(line, row, &selection, 0, visible_width(line));
             lines.push(
                 strip_terminal_sequences(&slice_by_column(
@@ -1082,7 +1096,7 @@ impl TuiAltScreen {
             if let Some(lines) = get_scroll_view_box(layout, scroll_id)
                 .and_then(|box_| box_.scroll_content_lines.as_ref())
             {
-                return lines.get(point.row).cloned().unwrap_or_default();
+                return lines.get(point.row).unwrap_or("").to_string();
             }
         }
         self.previous_screen
@@ -1787,9 +1801,9 @@ impl TuiAltScreen {
             }
             return false;
         }
-        let lines = lines.unwrap_or_default();
+        let lines = lines.unwrap_or_else(RenderedLines::empty);
         let should_reveal = search.selection_mode != SearchSelectionMode::Retain;
-        let matches = find_alt_screen_search_matches(&lines, &query);
+        let matches = find_alt_screen_search_matches_in(&lines, &query);
         let exact_index = search
             .selected_key
             .as_ref()
@@ -1912,13 +1926,18 @@ impl TuiAltScreen {
             return;
         };
         let start = self.primary_scroll_top() as isize + direction as isize;
-        let mut row = start;
-        while row >= 0 && (row as usize) < lines.len() {
-            if lines[row as usize].starts_with(OSC133_PROMPT_START) {
-                self.with_primary_scroll_mut(|scroll| scroll.scroll_to(row as usize, false));
-                return;
-            }
-            row += direction as isize;
+        let defined = lines.defined();
+        let found = if direction < 0 {
+            defined.into_iter().rev().find(|(row, line)| {
+                (*row as isize) <= start && line.starts_with(OSC133_PROMPT_START)
+            })
+        } else {
+            defined.into_iter().find(|(row, line)| {
+                (*row as isize) >= start && line.starts_with(OSC133_PROMPT_START)
+            })
+        };
+        if let Some((row, _)) = found {
+            self.with_primary_scroll_mut(|scroll| scroll.scroll_to(row, false));
         }
     }
 
