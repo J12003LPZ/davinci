@@ -299,23 +299,19 @@ pub fn resolve_provider_auth(
                         });
                     }
                 }
-                if provider == "amazon-bedrock" {
-                    if env_nonempty(cred.env.get("AWS_PROFILE")) {
-                        return Some(ResolvedAuth {
-                            api_key: None,
-                            headers: HashMap::new(),
-                            source: "stored credential".into(),
-                        });
-                    }
+                if provider == "amazon-bedrock" && env_nonempty(cred.env.get("AWS_PROFILE")) {
+                    return Some(ResolvedAuth {
+                        api_key: None,
+                        headers: HashMap::new(),
+                        source: "stored credential".into(),
+                    });
                 }
-                if provider == "llama.cpp" {
-                    if env_nonempty(cred.env.get("LLAMA_BASE_URL")) {
-                        return Some(ResolvedAuth {
-                            api_key: cred.key.clone(),
-                            headers: HashMap::new(),
-                            source: "stored credential".into(),
-                        });
-                    }
+                if provider == "llama.cpp" && env_nonempty(cred.env.get("LLAMA_BASE_URL")) {
+                    return Some(ResolvedAuth {
+                        api_key: cred.key.clone(),
+                        headers: HashMap::new(),
+                        source: "stored credential".into(),
+                    });
                 }
                 if provider == "google-vertex" {
                     if let Some(resolved) = vertex_ambient_auth(Some(cred), env) {
