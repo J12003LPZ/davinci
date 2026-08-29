@@ -279,6 +279,16 @@ impl ExtensionUiHost {
         }
     }
 
+    pub fn apply_calls(&mut self, calls: &[Value]) -> Vec<Value> {
+        calls
+            .iter()
+            .filter_map(|call| {
+                let method = call.get("method").and_then(|v| v.as_str())?;
+                self.dispatch(method, call)
+            })
+            .collect()
+    }
+
     pub fn parse_response(command: &Value) -> UiResponse {
         if command.get("cancelled").and_then(|v| v.as_bool()) == Some(true) {
             return UiResponse::Cancelled;

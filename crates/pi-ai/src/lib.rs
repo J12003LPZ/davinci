@@ -37,6 +37,17 @@ pub use types::{
 pub use vertex::{resolve_vertex_auth, VertexAuth, GCP_VERTEX_CREDENTIALS_MARKER};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// TypeScript `DEFAULT_RADIUS_GATEWAY` from `providers/radius-config.ts`.
+pub const DEFAULT_RADIUS_GATEWAY: &str = "https://radius.pi.dev";
+
+pub fn normalize_radius_gateway_url(value: &str) -> String {
+    let with_scheme = if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_string()
+    } else {
+        format!("https://{value}")
+    };
+    with_scheme.trim_end_matches('/').to_string()
+}
 
 pub fn env_api_key_vars(provider: &str) -> Option<&'static [&'static str]> {
     Some(match provider {
@@ -129,6 +140,11 @@ mod tests {
             );
         }
         assert!(list_models(None).len() >= 50);
+        assert_eq!(DEFAULT_RADIUS_GATEWAY, "https://radius.pi.dev");
+        assert_eq!(
+            normalize_radius_gateway_url("radius.pi.dev/"),
+            "https://radius.pi.dev"
+        );
     }
 
     #[test]
@@ -138,5 +154,10 @@ mod tests {
         assert!(env_api_key_vars("anthropic")
             .unwrap()
             .contains(&"ANTHROPIC_API_KEY"));
+        assert_eq!(DEFAULT_RADIUS_GATEWAY, "https://radius.pi.dev");
+        assert_eq!(
+            normalize_radius_gateway_url("radius.pi.dev/"),
+            "https://radius.pi.dev"
+        );
     }
 }

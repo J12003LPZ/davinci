@@ -3,6 +3,7 @@
 use crate::event_bus::EventBus;
 use crate::export;
 use crate::extension_ui::ExtensionUiHost;
+use crate::extensions::{self, Extension};
 use pi_agent::{
     compact_messages, run_agent, AgentConfig, AgentEvent, AgentMessage, AllowAllPermissionPolicy,
     FollowUpQueue, QueueMode, SteerQueue, ThinkingLevel, ToolRegistry,
@@ -43,10 +44,11 @@ pub struct SessionRuntime {
     pub max_turns: u32,
     pub context_window: usize,
     pub ui: ExtensionUiHost,
+    pub extensions: Vec<Extension>,
 }
 
 impl SessionRuntime {
-    pub fn new_session(&mut self, parent: Option<&str>) -> Result<(), String> {
+    pub fn new_session(&mut self, parent: Option<&str>) -> Result<Vec<Value>, String> {
         let dest = create_session(&default_sessions_root(), &self.cwd.to_string_lossy(), None)
             .map_err(|e| e.to_string())?;
         self.session_id = dest.id.clone();
@@ -56,6 +58,10 @@ impl SessionRuntime {
         self.steer.clear();
         self.follow_up.clear();
         let _ = self.ui.reset();
+        let events = self.fire_extensions(
+            "session_start",
+            &json!({"reason": if parent.is_some() { "parent" } else { "new" }}),
+        );
         if let Some(parent) = parent {
             if let Some(path) = &self.session_path {
                 let _ = append_entry(
@@ -64,7 +70,7 @@ impl SessionRuntime {
                 );
             }
         }
-        Ok(())
+        Ok(events)
     }
 
     pub fn config(&self) -> AgentConfig {
@@ -109,6 +115,10 @@ impl SessionRuntime {
             "agent_start",
             json!({"provider": self.provider, "model": self.model_id}),
         );
+        let _ = self.fire_extensions(
+            "turn_start",
+            &json!({"provider": self.provider, "model": self.model_id}),
+        );
         self.is_streaming = true;
         let config = self.config();
         let events = run_agent(
@@ -129,7 +139,20 @@ impl SessionRuntime {
         }
         self.is_streaming = false;
         self.bus.emit("agent_end", json!({"ok": true}));
+        let _ = self.fire_extensions("turn_end", &json!({"ok": true}));
         Ok(events)
+    }
+
+    pub fn fire_extensions(&mut self, event: &str, data: &Value) -> Vec<Value> {
+        let paths: Vec<_> = self.extensions.iter().map(|e| e.path.clone()).collect();
+        let mut events = Vec::new();
+        for path in paths {
+            if let Ok(invoked) = extensions::invoke_extension_event(&path, event, data, &json!({}))
+            {
+                events.extend(self.ui.apply_calls(&invoked.ui_calls));
+            }
+        }
+        events
     }
 
     fn append_message(&self, role: &str, content: &str) {

@@ -141,9 +141,10 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
         }
         "new_session" => {
             match runtime.new_session(command.get("parentSession").and_then(|v| v.as_str())) {
-                Ok(()) => {
-                    let mut events = runtime.ui.reset();
-                    events.push(runtime.ui.set_title("pi"));
+                Ok(mut events) => {
+                    if events.is_empty() {
+                        events.push(runtime.ui.set_title("pi"));
+                    }
                     (
                         success(id, "new_session", Some(json!({"cancelled": false}))),
                         events,
@@ -420,6 +421,7 @@ mod tests {
             max_turns: 2,
             context_window: 128_000,
             ui: crate::extension_ui::ExtensionUiHost::default(),
+            extensions: vec![],
         }
     }
 

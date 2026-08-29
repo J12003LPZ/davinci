@@ -64,44 +64,132 @@ fn push_extension(path: &Path, found: &mut Vec<Extension>) {
     });
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ExtensionInvoke {
+    pub result: Value,
+    pub ui_calls: Vec<Value>,
+}
+
+const EXTENSION_HOST: &str = r#"
+const path = process.argv[1];
+const kind = process.argv[2];
+const name = process.argv[3];
+const payload = JSON.parse(process.argv[4] || '{}');
+const replies = JSON.parse(process.argv[5] || '{}');
+const uiCalls = [];
+const ui = {
+  select: async (title, options, opts) => {
+    uiCalls.push({ method: 'select', title, options, timeout: opts && opts.timeout });
+    return replies.select;
+  },
+  confirm: async (title, message, opts) => {
+    uiCalls.push({ method: 'confirm', title, message, timeout: opts && opts.timeout });
+    return replies.confirm === true;
+  },
+  input: async (title, placeholder, opts) => {
+    uiCalls.push({ method: 'input', title, placeholder, timeout: opts && opts.timeout });
+    return replies.input;
+  },
+  editor: async (title, prefill) => {
+    uiCalls.push({ method: 'editor', title, prefill });
+    return replies.editor;
+  },
+  notify: (message, notifyType) => { uiCalls.push({ method: 'notify', message, notifyType }); },
+  setStatus: (statusKey, statusText) => { uiCalls.push({ method: 'setStatus', statusKey, statusText }); },
+  setWidget: (widgetKey, widgetLines, options) => {
+    uiCalls.push({ method: 'setWidget', widgetKey, widgetLines, widgetPlacement: options && options.placement });
+  },
+  setTitle: (title) => { uiCalls.push({ method: 'setTitle', title }); },
+  setEditorText: (text) => { uiCalls.push({ method: 'set_editor_text', text }); },
+  pasteToEditor: (text) => { uiCalls.push({ method: 'set_editor_text', text }); },
+};
+const ctx = { ui, hasUI: true };
+async function load() {
+  let mod = require(path);
+  if (mod && mod.default) mod = mod.default;
+  return mod;
+}
+async function main() {
+  const mod = await load();
+  if (kind === 'tool') {
+    const fn = (typeof mod === 'function' ? null : (mod[name] || (mod.tools && mod.tools[name]) || mod.execute));
+    if (typeof fn !== 'function') {
+      console.log(JSON.stringify({ ok: false, error: 'tool not found: ' + name, uiCalls }));
+      return;
+    }
+    const result = await fn(payload, ctx);
+    console.log(JSON.stringify({ ok: true, result, uiCalls }));
+    return;
+  }
+  const handlers = {};
+  const pi = {
+    on(event, handler) { handlers[event] = handler; },
+  };
+  if (typeof mod === 'function') {
+    const maybe = mod(pi);
+    if (maybe && typeof maybe.then === 'function') await maybe;
+  }
+  const handler = handlers[name];
+  if (typeof handler !== 'function') {
+    console.log(JSON.stringify({ ok: true, result: null, uiCalls }));
+    return;
+  }
+  const result = await handler(payload, ctx);
+  console.log(JSON.stringify({ ok: true, result, uiCalls }));
+}
+main().catch((err) => {
+  console.log(JSON.stringify({ ok: false, error: String(err), uiCalls }));
+});
+"#;
+
 /// Invoke a JS/TS extension tool via Node when present. Fixture-safe: no network.
 pub fn invoke_extension_tool(
     extension: &Path,
     tool_name: &str,
     input: &Value,
 ) -> Result<Value, String> {
-    let node = which_node().ok_or_else(|| "node is not installed".to_string())?;
-    let runner = r#"
-const fs = require('fs');
-const path = process.argv[1];
-const tool = process.argv[2];
-const input = JSON.parse(process.argv[3] || '{}');
-async function main() {
-  let mod = require(path);
-  if (mod && mod.default) mod = mod.default;
-  const fn = mod[tool] || (mod.tools && mod.tools[tool]) || mod.execute;
-  if (typeof fn !== 'function') {
-    console.log(JSON.stringify({ ok: false, error: 'tool not found: ' + tool }));
-    return;
-  }
-  const result = await fn(input);
-  console.log(JSON.stringify({ ok: true, result }));
+    Ok(invoke_extension(extension, "tool", tool_name, input, &json!({}))?.result)
 }
-main().catch((err) => {
-  console.log(JSON.stringify({ ok: false, error: String(err) }));
-});
-"#;
+
+pub fn invoke_extension_event(
+    extension: &Path,
+    event: &str,
+    data: &Value,
+    replies: &Value,
+) -> Result<ExtensionInvoke, String> {
+    invoke_extension(extension, "event", event, data, replies)
+}
+
+fn invoke_extension(
+    extension: &Path,
+    kind: &str,
+    name: &str,
+    payload: &Value,
+    replies: &Value,
+) -> Result<ExtensionInvoke, String> {
+    let node = which_node().ok_or_else(|| "node is not installed".to_string())?;
     let output = Command::new(node)
         .arg("-e")
-        .arg(runner)
+        .arg(EXTENSION_HOST)
         .arg(extension)
-        .arg(tool_name)
-        .arg(input.to_string())
+        .arg(kind)
+        .arg(name)
+        .arg(payload.to_string())
+        .arg(replies.to_string())
         .output()
         .map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.lines().last().unwrap_or("{}"))
-        .map_err(|e| format!("extension JSON: {e}: {stdout}"))
+    let value: Value = serde_json::from_str(stdout.lines().last().unwrap_or("{}"))
+        .map_err(|e| format!("extension JSON: {e}: {stdout}"))?;
+    let ui_calls = value
+        .get("uiCalls")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(ExtensionInvoke {
+        result: value,
+        ui_calls,
+    })
 }
 
 fn which_node() -> Option<PathBuf> {
@@ -177,6 +265,35 @@ mod tests {
         if which_node().is_some() {
             let result = invoke_extension_tool(&hello, "ping", &json!({})).unwrap();
             assert_eq!(result["ok"], true);
+            let ui_ext = ext_dir.join("ui.js");
+            fs::write(
+                &ui_ext,
+                r#"
+module.exports = function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    ctx.ui.setTitle(event.reason === "new" ? "pi RPC Demo (new session)" : "pi RPC Demo");
+    ctx.ui.setWidget("rpc-demo", ["ready"]);
+    ctx.ui.setStatus("rpc-demo", "Turns: 0");
+  });
+};
+"#,
+            )
+            .unwrap();
+            let invoked = invoke_extension_event(
+                &ui_ext,
+                "session_start",
+                &json!({"reason": "new"}),
+                &json!({}),
+            )
+            .unwrap();
+            assert!(invoked
+                .ui_calls
+                .iter()
+                .any(|c| c["method"] == "setTitle" && c["title"] == "pi RPC Demo (new session)"));
+            assert!(invoked
+                .ui_calls
+                .iter()
+                .any(|c| c["method"] == "setStatus" && c["statusKey"] == "rpc-demo"));
         }
     }
 }

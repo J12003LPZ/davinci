@@ -281,6 +281,7 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         max_turns: 16,
         context_window: 128_000,
         ui: crate::extension_ui::ExtensionUiHost::default(),
+        extensions: discovered.clone(),
     };
 
     match app_mode {

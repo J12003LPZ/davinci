@@ -325,21 +325,33 @@ impl InteractiveMode {
                     self.chat.push("system", format!("imported {args}"));
                 }
             }
-            "share" => match self.runtime.export_html(None) {
-                Ok(path) => match crate::share::share_via_gist(&path) {
-                    Ok(shared) => self.chat.push(
-                        "system",
-                        format!(
-                            "Share URL: {}\nGist: {}",
-                            shared.preview_url, shared.gist_url
-                        ),
-                    ),
-                    Err(err) => self.chat.push("error", err),
-                },
-                Err(err) => self
-                    .chat
-                    .push("error", format!("Failed to export session: {err}")),
-            },
+            "share" => {
+                let html = self.runtime.export_html(None);
+                let jsonl = self.runtime.session_path.clone();
+                match html {
+                    Ok(html_path) => {
+                        let token = if self.runtime.provider == "radius" {
+                            self.runtime.api_key.as_deref()
+                        } else {
+                            None
+                        };
+                        let jsonl_path = jsonl.unwrap_or_else(|| html_path.clone());
+                        match crate::share::share_session(&jsonl_path, &html_path, token, None) {
+                            Ok(shared) => {
+                                let mut msg = format!("Share URL: {}", shared.preview_url);
+                                if !shared.gist_url.is_empty() {
+                                    msg.push_str(&format!("\nGist: {}", shared.gist_url));
+                                }
+                                self.chat.push("system", msg);
+                            }
+                            Err(err) => self.chat.push("error", err),
+                        }
+                    }
+                    Err(err) => self
+                        .chat
+                        .push("error", format!("Failed to export session: {err}")),
+                }
+            }
             "copy" => match self.runtime.last_assistant() {
                 Some(text) => match crate::clipboard::copy_to_clipboard(&text) {
                     Ok(()) => self
@@ -401,11 +413,17 @@ impl InteractiveMode {
                 self.chat.push("system", format!("logged out {args}"));
             }
             "new" => {
-                self.runtime.new_session(None)?;
+                let events = self.runtime.new_session(None)?;
                 self.chat = ChatView::default();
                 self.chat.push("system", "new session");
-                let title = self.runtime.ui.set_title("pi");
-                self.apply_ui_request(&title);
+                if events.is_empty() {
+                    let title = self.runtime.ui.set_title("pi");
+                    self.apply_ui_request(&title);
+                } else {
+                    for event in events {
+                        self.apply_ui_request(&event);
+                    }
+                }
             }
             "compact" => {
                 let data = self
