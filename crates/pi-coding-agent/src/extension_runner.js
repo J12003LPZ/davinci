@@ -486,6 +486,7 @@ async function main() {
 		oauthLogin: {},
 		oauthRefresh: {},
 		oauthGetApiKey: {},
+		editorText: typeof payload.editorText === "string" ? payload.editorText : "",
 	};
 	const eventBus = {};
 	let editorFactory;
@@ -578,6 +579,12 @@ async function main() {
 				recorded.uiCalls.push({ op: "setEditorText", text });
 			},
 			getEditorText() {
+				if (typeof recorded.editorText === "string") {
+					return recorded.editorText;
+				}
+				if (typeof process.env.PI_EXTENSION_EDITOR_TEXT === "string") {
+					return process.env.PI_EXTENSION_EDITOR_TEXT;
+				}
 				return "";
 			},
 			pasteToEditor(text) {

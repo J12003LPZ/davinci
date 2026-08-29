@@ -8,6 +8,7 @@ mod export;
 mod extension_host;
 mod extensions;
 mod external_editor;
+mod file_processor;
 mod image_convert;
 mod js_host;
 mod llama;
@@ -56,6 +57,7 @@ use auth_cmd::{
 };
 use extension_host::{ExtensionEvent, ExtensionHost};
 use external_editor::{clipboard_image_png, clipboard_text, ExternalEditor};
+use file_processor::{prepare_initial_message, RPC_FILE_ARGS_ERROR};
 use packages::handle_package_command;
 use rpc::{handle_rpc, RpcCommand, RpcRuntime};
 use settings::{
@@ -157,6 +159,10 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     let mut agent = build_agent(&parsed, &session_dir, &cwd)?;
 
     if parsed.mode == Some(Mode::Rpc) {
+        if !parsed.file_args.is_empty() {
+            eprintln!("{RPC_FILE_ARGS_ERROR}");
+            return Ok(1);
+        }
         return run_rpc(&parsed, &mut agent);
     }
 
@@ -908,7 +914,11 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
         host.runtime_all_tools = agent.tool_registry.clone();
         host.runtime_thinking_level = agent.thinking_level.as_str().to_string();
         host.runtime_flag_values = flag_values_json(parsed);
+        host.runtime_system_prompt = agent.system_prompt.clone();
         host.emit(ExtensionEvent::BeforeAgentStart);
+        if let Some(prompt) = host.last_result_system_prompt() {
+            agent.system_prompt = prompt;
+        }
         host.emit(ExtensionEvent::AgentStart);
         host.emit(ExtensionEvent::TurnStart);
         host.emit(ExtensionEvent::BeforeProviderRequest {
@@ -1124,30 +1134,55 @@ fn parse_model_ref(provider: &str, model: Option<&str>) -> (String, String) {
 }
 
 fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
-    let mut prompt = parsed.messages.join("\n");
-    for file in &parsed.file_args {
-        if let Ok(body) = std::fs::read_to_string(file) {
-            prompt.push_str("\n\n");
-            prompt.push_str(&body);
+    let stdin_content = if !io::stdin().is_terminal() {
+        let text = io::read_to_string(io::stdin()).unwrap_or_default();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    } else {
+        None
+    };
+    let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+    let prepared = prepare_initial_message(
+        &parsed.messages,
+        &parsed.file_args,
+        stdin_content.as_deref(),
+        &agent.cwd,
+        settings.image_auto_resize(),
+    )?;
+    let mut last_reply = String::new();
+    let mut last_events = Vec::new();
+    if let Some(prompt) = &prepared.text {
+        if !prompt.trim().is_empty() || !prepared.images.is_empty() {
+            agent.prompt_with(prompt, &prepared.images);
+            let (reply, events) = complete_prompt(parsed, agent);
+            last_reply = reply;
+            last_events = events;
         }
     }
-    if prompt.is_empty() && !io::stdin().is_terminal() {
-        prompt = io::read_to_string(io::stdin()).unwrap_or_default();
+    for extra in &prepared.remaining_messages {
+        if extra.trim().is_empty() {
+            continue;
+        }
+        agent.prompt(extra);
+        let (reply, events) = complete_prompt(parsed, agent);
+        last_reply = reply;
+        last_events = events;
     }
-    if prompt.trim().is_empty() {
+    if last_reply.is_empty() && last_events.is_empty() {
         return Ok(0);
     }
-    agent.prompt(&prompt);
-    let (reply, events) = complete_prompt(parsed, agent);
     if parsed.mode == Some(Mode::Json) {
-        for event in events {
+        for event in last_events {
             println!(
                 "{}",
                 serde_json::to_string(&event).map_err(|err| err.to_string())?
             );
         }
     } else {
-        println!("{reply}");
+        println!("{last_reply}");
     }
     Ok(0)
 }
@@ -1172,6 +1207,7 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             &provider.config,
         ));
     }
+    runtime.set_scoped_models(&parsed.models);
     runtime.invocable_commands = slash::invocable_commands(
         &host
             .js
@@ -1194,10 +1230,6 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         let command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
         let is_prompt = command.kind == "prompt";
         let response = handle_rpc(&mut runtime, command.clone());
-        println!(
-            "{}",
-            serde_json::to_string(&response).map_err(|err| err.to_string())?
-        );
         for request in rpc::extension_ui_requests_from_calls(&host.ui_calls) {
             println!(
                 "{}",
@@ -1205,14 +1237,16 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             );
         }
         if is_prompt {
-            let parsed = Args {
+            let prompt_args = Args {
                 offline: matches!(
                     std::env::var("PI_OFFLINE").as_deref(),
                     Ok("1") | Ok("true") | Ok("yes")
                 ),
+                extensions: parsed.extensions.clone(),
+                no_extensions: parsed.no_extensions,
                 ..Args::default()
             };
-            let (_reply, events) = complete_prompt(&parsed, &mut runtime.agent);
+            let (_reply, events) = complete_prompt(&prompt_args, &mut runtime.agent);
             for request in rpc::extension_ui_requests_from_calls(&host.ui_calls) {
                 println!(
                     "{}",
@@ -1337,9 +1371,21 @@ fn run_interactive(
     }
     print!("{}", InteractiveSession::enter_sequences(fullscreen));
     println!("{}", session.chrome.render(session.width).join("\n"));
-    if !parsed.messages.is_empty() {
-        let prompt = parsed.messages.join("\n");
-        if !apply_session_action(parsed, agent, &mut session, SessionAction::Submit(prompt))? {
+    let prepared = prepare_initial_message(
+        &parsed.messages,
+        &parsed.file_args,
+        None,
+        &agent.cwd,
+        stored.image_auto_resize(),
+    )?;
+    if let Some(prompt) = &prepared.text {
+        if !submit_user_message(parsed, agent, &mut session, prompt, &prepared.images)? {
+            print!("{}", InteractiveSession::leave_sequences(fullscreen));
+            return Ok(0);
+        }
+    }
+    for extra in &prepared.remaining_messages {
+        if !submit_user_message(parsed, agent, &mut session, extra, &[])? {
             print!("{}", InteractiveSession::leave_sequences(fullscreen));
             return Ok(0);
         }
@@ -1731,6 +1777,18 @@ fn apply_session_action(
             }
             Ok(true)
         }
+        SessionAction::OpenThinking => {
+            session.open_thinking_selector(
+                load_settings(&default_agent_dir())
+                    .default_thinking_level
+                    .as_deref(),
+            );
+            Ok(true)
+        }
+        SessionAction::SelectThinking(level) => apply_thinking_level(agent, session, &level, false),
+        SessionAction::SelectThinkingAsDefault(level) => {
+            apply_thinking_level(agent, session, &level, true)
+        }
         SessionAction::ToggleHideThinking => {
             apply_interactive_setting(
                 session,
@@ -1821,6 +1879,83 @@ fn apply_session_action(
     }
 }
 
+fn unknown_thinking_error(search: &str) -> String {
+    let levels = pi_protocol::ThinkingLevel::all()
+        .iter()
+        .map(|level| level.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Unknown thinking level \"{search}\". Available levels: {levels}.")
+}
+
+fn apply_thinking_level(
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    level: &str,
+    persist: bool,
+) -> Result<bool, String> {
+    let Some(parsed) = pi_protocol::ThinkingLevel::parse(level) else {
+        let message = unknown_thinking_error(level);
+        session.chrome.status = message.clone();
+        eprintln!("{message}");
+        return Ok(true);
+    };
+    agent.thinking_level = parsed;
+    if let Some(index) = session
+        .thinking_levels
+        .iter()
+        .position(|item| item == level)
+    {
+        session.thinking_index = index;
+    }
+    if persist {
+        let dir = default_agent_dir();
+        let mut stored = load_settings(&dir);
+        stored.default_thinking_level = Some(level.to_string());
+        save_settings(&dir, &stored)?;
+        session.chrome.status = format!("Default thinking level: {level}");
+    } else {
+        session.chrome.status = format!("Thinking level: {level}");
+    }
+    println!("{}", session.chrome.status);
+    Ok(true)
+}
+
+fn submit_user_message(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    prompt: &str,
+    images: &[pi_ai::MessageContent],
+) -> Result<bool, String> {
+    let mut host = loaded_extension_host(parsed);
+    host.runtime_flag_values = flag_values_json(parsed);
+    host.editor_text = session.chrome.editor.get_text().to_string();
+    host.emit(ExtensionEvent::Input {
+        text: prompt.to_string(),
+    });
+    session.apply_extension_ui_calls(&host.ui_calls);
+    session.chrome.transcript.push("user", prompt);
+    agent.prompt_with(prompt, images);
+    let (reply, events) = complete_prompt(parsed, agent);
+    apply_tool_events(&mut session.chrome, &events);
+    apply_progress_events(session, &events);
+    let host = loaded_extension_host(parsed);
+    let reply = host.transform_markdown(&reply, "assistant", false, 80);
+    session.chrome.transcript.push("assistant", &reply);
+    apply_cache_miss_notices(
+        &mut session.chrome,
+        agent,
+        load_merged_settings(&default_agent_dir(), &agent.cwd)
+            .show_cache_miss_notices
+            .unwrap_or(false),
+    );
+    refresh_chrome_footer(session, agent);
+    session.chrome.editor.handle_input("");
+    println!("{reply}");
+    Ok(true)
+}
+
 fn handle_user_line(
     parsed: &Args,
     agent: &mut Agent,
@@ -1829,31 +1964,15 @@ fn handle_user_line(
 ) -> Result<bool, String> {
     match slash::parse_line(text) {
         SlashAction::Quit => Ok(false),
-        SlashAction::Prompt(prompt) => {
-            let mut host = loaded_extension_host(parsed);
-            host.runtime_flag_values = flag_values_json(parsed);
-            host.emit(ExtensionEvent::Input {
-                text: prompt.clone(),
-            });
-            session.apply_extension_ui_calls(&host.ui_calls);
-            session.chrome.transcript.push("user", &prompt);
-            agent.prompt(&prompt);
-            let (reply, events) = complete_prompt(parsed, agent);
-            apply_tool_events(&mut session.chrome, &events);
-            apply_progress_events(session, &events);
-            let host = loaded_extension_host(parsed);
-            let reply = host.transform_markdown(&reply, "assistant", false, 80);
-            session.chrome.transcript.push("assistant", &reply);
-            apply_cache_miss_notices(
-                &mut session.chrome,
-                agent,
-                load_merged_settings(&default_agent_dir(), &agent.cwd)
-                    .show_cache_miss_notices
-                    .unwrap_or(false),
+        SlashAction::Prompt(prompt) => submit_user_message(parsed, agent, session, &prompt, &[]),
+        SlashAction::OpenThinking => {
+            session.open_thinking_selector(
+                load_settings(&default_agent_dir())
+                    .default_thinking_level
+                    .as_deref(),
             );
-            refresh_chrome_footer(session, agent);
-            session.chrome.editor.handle_input("");
-            println!("{reply}");
+            session.chrome.status = "Select thinking level".into();
+            println!("{}", session.chrome.status);
             Ok(true)
         }
         SlashAction::Status(message) => {
@@ -1913,6 +2032,14 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Compact(instructions) => {
+            let mut host = loaded_extension_host(parsed);
+            host.runtime_flag_values = flag_values_json(parsed);
+            host.emit(ExtensionEvent::SessionBeforeCompact);
+            if host.last_result_cancelled() {
+                session.chrome.status = "Compaction cancelled".into();
+                println!("{}", session.chrome.status);
+                return Ok(true);
+            }
             let result = agent.compact(instructions.as_deref());
             println!("{}", result.summary);
             Ok(true)
@@ -1935,13 +2062,7 @@ fn handle_user_line(
             println!("model={}/{}", agent.provider, agent.model_id);
             Ok(true)
         }
-        SlashAction::SetThinking(level) => {
-            if let Some(level) = pi_protocol::ThinkingLevel::parse(&level) {
-                agent.thinking_level = level;
-            }
-            println!("thinking={}", agent.thinking_level.as_str());
-            Ok(true)
-        }
+        SlashAction::SetThinking(level) => apply_thinking_level(agent, session, &level, false),
         SlashAction::Export(path) => {
             if let Some(session) = &agent.session {
                 let output = PathBuf::from(path.unwrap_or_else(|| "session.html".into()));
@@ -1968,6 +2089,14 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Fork => {
+            let mut host = loaded_extension_host(parsed);
+            host.runtime_flag_values = flag_values_json(parsed);
+            host.emit(ExtensionEvent::SessionBeforeFork);
+            if host.last_result_cancelled() {
+                session.chrome.status = "Fork cancelled".into();
+                println!("{}", session.chrome.status);
+                return Ok(true);
+            }
             if let Some(session) = &agent.session {
                 let session_dir = resolved_session_dir(parsed, &agent.cwd);
                 let next = session
@@ -2014,6 +2143,14 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Tree => {
+            let mut host = loaded_extension_host(parsed);
+            host.runtime_flag_values = flag_values_json(parsed);
+            host.emit(ExtensionEvent::SessionBeforeTree);
+            if host.last_result_cancelled() {
+                session.chrome.status = "Tree navigation cancelled".into();
+                println!("{}", session.chrome.status);
+                return Ok(true);
+            }
             session.chrome.status = "Session Tree".into();
             println!("{}", session.chrome.status);
             Ok(true)
@@ -3492,20 +3629,37 @@ fn apply_host_session_calls(
 ) {
     let mut host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
+    let mut allowed = Vec::new();
     for call in calls {
         match call.get("op").and_then(|value| value.as_str()) {
-            Some("fork") => host.emit(ExtensionEvent::SessionBeforeFork),
-            Some("switchSession") => host.emit(ExtensionEvent::SessionBeforeSwitch),
-            Some("navigateTree") => host.emit(ExtensionEvent::SessionBeforeTree),
+            Some("fork") => {
+                host.emit(ExtensionEvent::SessionBeforeFork);
+                if host.last_result_cancelled() {
+                    continue;
+                }
+            }
+            Some("switchSession") => {
+                host.emit(ExtensionEvent::SessionBeforeSwitch);
+                if host.last_result_cancelled() {
+                    continue;
+                }
+            }
+            Some("navigateTree") => {
+                host.emit(ExtensionEvent::SessionBeforeTree);
+                if host.last_result_cancelled() {
+                    continue;
+                }
+            }
             Some("reload") => host.emit(ExtensionEvent::SessionShutdown),
             _ => {}
         }
+        allowed.push(call.clone());
     }
     apply_session_calls(
         Some(parsed),
         agent,
         Some(&mut session.chrome),
-        calls,
+        &allowed,
         trigger_turns,
     );
     if calls
@@ -4862,6 +5016,18 @@ mod tests {
             slash::parse_line("/model"),
             slash::SlashAction::OpenModel
         ));
+        assert!(matches!(
+            slash::parse_line("/thinking"),
+            slash::SlashAction::OpenThinking
+        ));
+        assert!(matches!(
+            slash::parse_line("/thinking high"),
+            slash::SlashAction::SetThinking(_)
+        ));
+        assert_eq!(
+            unknown_thinking_error("nope"),
+            "Unknown thinking level \"nope\". Available levels: off, minimal, low, medium, high, xhigh, max."
+        );
         assert!(matches!(
             slash::parse_line("/scoped-models"),
             slash::SlashAction::ScopedModels

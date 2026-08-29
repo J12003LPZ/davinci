@@ -32,6 +32,7 @@ mod session_selector;
 mod settings;
 mod settings_submenu;
 mod themes;
+mod thinking_selector;
 mod tool_card;
 mod transcript;
 mod tree;
@@ -117,6 +118,9 @@ pub use settings_submenu::{
     SettingsSubmenuKind, AUTOMATIC_THEME_VALUE,
 };
 pub use themes::{builtin_themes, load_themes_from_dir, Theme};
+pub use thinking_selector::{
+    ThinkingSelector, ThinkingSelectorAction, LEVEL_DESCRIPTIONS as THINKING_LEVEL_DESCRIPTIONS,
+};
 pub use tool_card::{ToolCard, ToolCardState, FALLBACK_PREVIEW_LINES};
 pub use transcript::{Transcript, TranscriptLine};
 pub use tree::{

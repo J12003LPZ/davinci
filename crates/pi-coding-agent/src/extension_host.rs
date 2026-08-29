@@ -122,6 +122,8 @@ pub struct ExtensionHost {
     pub runtime_thinking_level: String,
     pub runtime_commands: Vec<Value>,
     pub runtime_flag_values: Value,
+    pub editor_text: String,
+    pub runtime_system_prompt: String,
 }
 
 impl ExtensionHost {
@@ -143,6 +145,8 @@ impl ExtensionHost {
             runtime_thinking_level: "off".into(),
             runtime_commands: Vec::new(),
             runtime_flag_values: Value::Object(serde_json::Map::new()),
+            editor_text: String::new(),
+            runtime_system_prompt: String::new(),
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -222,6 +226,11 @@ impl ExtensionHost {
             object.insert(
                 "thinkingLevel".into(),
                 Value::String(self.runtime_thinking_level.clone()),
+            );
+            object.insert("editorText".into(), Value::String(self.editor_text.clone()));
+            object.insert(
+                "systemPrompt".into(),
+                Value::String(self.runtime_system_prompt.clone()),
             );
         }
         let mut emits = Vec::new();
@@ -309,6 +318,22 @@ impl ExtensionHost {
             .and_then(|value| value.get("block"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    }
+
+    pub fn last_result_cancelled(&self) -> bool {
+        self.last_js_result
+            .as_ref()
+            .and_then(|value| value.get("cancel"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn last_result_system_prompt(&self) -> Option<String> {
+        self.last_js_result
+            .as_ref()
+            .and_then(|value| value.get("systemPrompt"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     pub fn get_message_renderer(&self, custom_type: &str) -> Option<&str> {

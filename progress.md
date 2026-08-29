@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (JS refreshModels + OAuth login/refresh/getApiKey). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (`@file` attachments, `/thinking` selector, RPC `cycle_model.isScoped`, extension `getEditorText` / event results). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -107,7 +107,14 @@ Closed this slice: live `#` `getSuggestions` on each keystroke via persistent JS
 
 Closed this slice: `refreshModels` runs during interactive catalog refresh, `/scoped-models`, and `pi update --models`. JS `oauth.login` / `refreshToken` / `getApiKey` run on `/login`, token refresh, and request auth; those providers appear in `/login` completions.
 
+Closed this slice: `@file` CLI arguments match TS `processFileArguments` / `buildInitialMessage` (text wrappers, image attachments + resize hints, empty-file skip, `Error: File not found`, stdin + first message join). Interactive and print attach images via `prompt_with`. RPC rejects `@file` with `Error: @file arguments are not supported in RPC mode`. Bare `/thinking` opens `ThinkingSelector` (search, descriptions, Enter / Ctrl+S / Esc); unknown levels use the TS error string. RPC `cycle_model` reports `isScoped` from `--models` and returns `null` when the pool has ≤1 model. Extension `ctx.ui.getEditorText()` reads the live editor (or `PI_EXTENSION_EDITOR_TEXT`). `before_agent_start` can replace `systemPrompt`; `session_before_compact` / fork / tree / switch honor `{ cancel: true }`. RPC no longer prints a duplicate response.
+
 Still not product-equivalent:
 
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
 - TypeScript under `vendor/pi` remains the behavioral spec.
+- JS header/footer/widget **function** factories (Rust chrome renders string line arrays).
+- Extension `registerTool` UI (`renderCall` / `renderResult` / `renderShell`, `onUpdate`, per-tool `executionMode`).
+- `pi server` live `PiSessionRuntime` (schema-complete; dispatch is still a snapshot stub).
+- Experimental `getExperimentalToolSampling()` / SDK `createAgentSession()` library embed API.
+- Ctrl+Z `app.suspend`, markdown OSC-8 hyperlinks, image-generation UX, sqlite session backend selection.

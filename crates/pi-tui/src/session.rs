@@ -29,6 +29,7 @@ use crate::settings_submenu::{
     parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
 };
 use crate::themes::Theme;
+use crate::thinking_selector::{ThinkingSelector, ThinkingSelectorAction};
 use crate::tool_card::ToolCard;
 use crate::tree::{FilterMode, SessionTreeNode, TreeAction, TreeSelector};
 use crate::{SelectList, ALT_BUFFER_ENTER, ALT_BUFFER_LEAVE};
@@ -61,8 +62,11 @@ pub enum SessionAction {
     OpenResume,
     Clear,
     OpenModel,
+    OpenThinking,
     SelectModel(String),
     SelectModelAsDefault(String),
+    SelectThinking(String),
+    SelectThinkingAsDefault(String),
     SelectSession(String),
     SelectSetting(String),
     CycleSetting,
@@ -196,6 +200,7 @@ impl DoubleEscapeAction {
 pub enum OverlayKind {
     None,
     Model,
+    Thinking,
     Session,
     Settings,
     SettingsSubmenu,
@@ -353,6 +358,19 @@ impl InteractiveSession {
         self.chrome.status = "Select model".into();
     }
 
+    pub fn open_thinking_selector(&mut self, default_level: Option<&str>) {
+        self.overlay_kind = OverlayKind::Thinking;
+        self.chrome.thinking_selector = Some(
+            ThinkingSelector::new(
+                self.current_thinking().to_string(),
+                self.thinking_levels.clone(),
+                default_level.unwrap_or("off"),
+            )
+            .with_theme(self.chrome.theme.clone()),
+        );
+        self.chrome.status = "Select thinking level".into();
+    }
+
     pub fn open_session_overlay(&mut self, sessions: Vec<String>) {
         self.overlay_kind = OverlayKind::Session;
         self.chrome.selector = Some(SelectList::new(sessions));
@@ -437,6 +455,7 @@ impl InteractiveSession {
     pub fn close_overlays(&mut self) {
         self.chrome.selector = None;
         self.chrome.model_selector = None;
+        self.chrome.thinking_selector = None;
         self.chrome.settings_list = None;
         self.chrome.settings_submenu = None;
         self.chrome.session_selector = None;
@@ -466,6 +485,7 @@ impl InteractiveSession {
             || self.chrome.scoped_models.is_some()
             || self.chrome.selector.is_some()
             || self.chrome.model_selector.is_some()
+            || self.chrome.thinking_selector.is_some()
             || self.chrome.settings_list.is_some()
             || self.chrome.settings_submenu.is_some()
             || self.chrome.session_selector.is_some()
@@ -728,6 +748,17 @@ impl InteractiveSession {
         if trimmed == "/scoped-models" {
             return SessionAction::OpenScopedModels;
         }
+        if trimmed == "/thinking"
+            || (trimmed.starts_with("/thinking ") && trimmed["/thinking ".len()..].is_empty())
+        {
+            self.open_thinking_selector(None);
+            return SessionAction::OpenThinking;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/thinking ") {
+            if !rest.is_empty() {
+                return SessionAction::SelectThinking(rest.to_string());
+            }
+        }
         if trimmed == "/model"
             || (trimmed.starts_with("/model ") && trimmed["/model ".len()..].is_empty())
         {
@@ -968,6 +999,31 @@ impl InteractiveSession {
     }
 
     fn handle_special_overlay(&mut self, data: &str) -> Option<SessionAction> {
+        if let Some(selector) = &mut self.chrome.thinking_selector {
+            return Some(match selector.handle_key(data) {
+                ThinkingSelectorAction::None => SessionAction::None,
+                ThinkingSelectorAction::Select(value) => {
+                    if let Some(index) = self.thinking_levels.iter().position(|item| item == &value)
+                    {
+                        self.thinking_index = index;
+                    }
+                    self.close_overlays();
+                    SessionAction::SelectThinking(value)
+                }
+                ThinkingSelectorAction::SelectAsDefault(value) => {
+                    if let Some(index) = self.thinking_levels.iter().position(|item| item == &value)
+                    {
+                        self.thinking_index = index;
+                    }
+                    self.close_overlays();
+                    SessionAction::SelectThinkingAsDefault(value)
+                }
+                ThinkingSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
         if let Some(selector) = &mut self.chrome.model_selector {
             return Some(match selector.handle_key(data) {
                 ModelSelectorAction::None => SessionAction::None,
@@ -1222,6 +1278,9 @@ impl InteractiveSession {
         } else if let Some(selector) = &mut self.chrome.model_selector {
             let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
             let _ = selector.handle_key(key);
+        } else if let Some(selector) = &mut self.chrome.thinking_selector {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = selector.handle_key(key);
         } else if let Some(selector) = &mut self.chrome.selector {
             selector.move_by(delta);
         } else if let Some(suggestions) = &self.chrome.autocomplete {
@@ -1266,6 +1325,11 @@ impl InteractiveSession {
     fn handle_enter(&mut self) -> SessionAction {
         if self.accept_autocomplete() {
             return SessionAction::None;
+        }
+        if self.chrome.thinking_selector.is_some() {
+            return self
+                .handle_special_overlay("\r")
+                .unwrap_or(SessionAction::None);
         }
         if self.chrome.settings_submenu.is_some() {
             return self
@@ -1341,7 +1405,8 @@ impl InteractiveSession {
                     | OverlayKind::ExtensionInput
                     | OverlayKind::ExtensionEditor
                     | OverlayKind::ExtensionConfirm
-                    | OverlayKind::ExtensionProgress => SessionAction::CloseOverlay,
+                    | OverlayKind::ExtensionProgress
+                    | OverlayKind::Thinking => SessionAction::CloseOverlay,
                 };
             }
             self.chrome.selector = None;
@@ -1507,7 +1572,13 @@ impl InteractiveSession {
     }
 
     fn handle_printable(&mut self, data: &str) -> SessionAction {
-        if self.chrome.selector.is_some() {
+        if self.chrome.selector.is_some()
+            || self.chrome.thinking_selector.is_some()
+            || self.chrome.model_selector.is_some()
+        {
+            if let Some(action) = self.handle_special_overlay(data) {
+                return action;
+            }
             self.chrome.handle_input(data);
             return SessionAction::None;
         }
@@ -1675,6 +1746,32 @@ mod tests {
         session.last_escape = Some(Instant::now());
         assert_eq!(session.handle_bytes("\x1b"), SessionAction::OpenTree);
         session.aborted = false;
+        assert_eq!(
+            session.handle_line("/thinking"),
+            SessionAction::OpenThinking
+        );
+        assert!(session.chrome.thinking_selector.is_some());
+        let thinking_frame = session
+            .chrome
+            .thinking_selector
+            .as_ref()
+            .unwrap()
+            .render(80);
+        assert!(thinking_frame
+            .iter()
+            .any(|line| line.contains("Thinking Level")));
+        assert!(thinking_frame
+            .iter()
+            .any(|line| line.contains("Enter to select · Ctrl+S to set as default")));
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectThinking("minimal".into())
+        );
+        assert!(session.chrome.thinking_selector.is_none());
+        assert_eq!(
+            session.handle_line("/thinking high"),
+            SessionAction::SelectThinking("high".into())
+        );
         assert_eq!(session.handle_line("/model"), SessionAction::OpenModel);
         assert!(session.chrome.model_selector.is_some());
         assert!(session.render_frame().contains('┌'));

@@ -84,6 +84,7 @@ pub struct RpcRuntime {
     pub session_dir: PathBuf,
     pub cwd: PathBuf,
     pub models: Vec<Model>,
+    pub scoped_models: Vec<Model>,
     pub bash_aborted: bool,
     pub invocable_commands: Vec<Value>,
     pub pending_ui: std::collections::HashMap<String, RpcCommand>,
@@ -97,6 +98,7 @@ impl RpcRuntime {
             session_dir,
             cwd,
             models,
+            scoped_models: Vec::new(),
             bash_aborted: false,
             invocable_commands: Vec::new(),
             pending_ui: std::collections::HashMap::new(),
@@ -115,6 +117,75 @@ impl RpcRuntime {
     fn model_json(model: &Model) -> Value {
         serde_json::to_value(model).unwrap_or(Value::Null)
     }
+
+    pub fn set_scoped_models(&mut self, patterns: &[String]) {
+        self.scoped_models = resolve_scoped_models(&self.models, patterns);
+    }
+}
+
+pub fn resolve_scoped_models(models: &[Model], patterns: &[String]) -> Vec<Model> {
+    let mut scoped = Vec::new();
+    for pattern in patterns {
+        let (glob, _thinking) = pattern
+            .rsplit_once(':')
+            .filter(|(_, suffix)| ThinkingLevel::parse(suffix).is_some())
+            .map(|(glob, _)| (glob, true))
+            .unwrap_or((pattern.as_str(), false));
+        for model in models {
+            let full = format!("{}/{}", model.provider, model.id);
+            if model_pattern_matches(glob, &full, &model.id)
+                && !scoped.iter().any(|existing: &Model| {
+                    existing.provider == model.provider && existing.id == model.id
+                })
+            {
+                scoped.push(model.clone());
+            }
+        }
+    }
+    scoped
+}
+
+fn model_pattern_matches(pattern: &str, full_id: &str, model_id: &str) -> bool {
+    let pattern = pattern.to_lowercase();
+    let full = full_id.to_lowercase();
+    let id = model_id.to_lowercase();
+    if pattern.contains('*') || pattern.contains('?') {
+        return wildcard_match(&pattern, &full) || wildcard_match(&pattern, &id);
+    }
+    full == pattern || id == pattern
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return value == pattern;
+    }
+    let mut rest = value;
+    if !pattern.starts_with('*') {
+        let first = parts[0];
+        if !rest.starts_with(first) {
+            return false;
+        }
+        rest = &rest[first.len()..];
+    }
+    if !pattern.ends_with('*') {
+        let last = *parts.last().unwrap_or(&"");
+        if !rest.ends_with(last) {
+            return false;
+        }
+        rest = &rest[..rest.len() - last.len()];
+    }
+    for part in &parts[1..parts.len().saturating_sub(1)] {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(pos) = rest.find(part) {
+            rest = &rest[pos + part.len()..];
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse {
@@ -296,26 +367,31 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             }
         }
         "cycle_model" => {
-            if runtime.models.is_empty() {
+            let scoped = !runtime.scoped_models.is_empty();
+            let pool: Vec<Model> = if scoped {
+                runtime.scoped_models.clone()
+            } else {
+                runtime.models.clone()
+            };
+            if pool.len() <= 1 {
                 return ok(id, &kind, Some(Value::Null));
             }
-            let current = runtime
-                .models
+            let current = pool
                 .iter()
                 .position(|model| {
                     model.provider == runtime.agent.provider && model.id == runtime.agent.model_id
                 })
                 .unwrap_or(0);
-            let next = &runtime.models[(current + 1) % runtime.models.len()];
+            let next = pool[(current + 1) % pool.len()].clone();
             runtime.agent.provider = next.provider.clone();
             runtime.agent.model_id = next.id.clone();
             ok(
                 id,
                 &kind,
                 Some(serde_json::json!({
-                    "model": RpcRuntime::model_json(next),
+                    "model": RpcRuntime::model_json(&next),
                     "thinkingLevel": runtime.agent.thinking_level,
-                    "isScoped": false,
+                    "isScoped": scoped,
                 })),
             )
         }
@@ -769,5 +845,50 @@ mod tests {
         );
         assert!(abort.success);
         assert!(runtime.agent.retry_aborted);
+    }
+
+    #[test]
+    fn cycle_model_reports_is_scoped_from_scoped_pool() {
+        let mut runtime = RpcRuntime::new(
+            pi_agent::Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        runtime.models.truncate(3);
+        assert!(runtime.models.len() >= 2);
+        runtime.agent.provider = runtime.models[0].provider.clone();
+        runtime.agent.model_id = runtime.models[0].id.clone();
+        let unscoped = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "cycle_model".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert_eq!(unscoped.data.as_ref().unwrap()["isScoped"], false);
+        runtime.scoped_models = vec![runtime.models[0].clone(), runtime.models[1].clone()];
+        runtime.agent.provider = runtime.models[0].provider.clone();
+        runtime.agent.model_id = runtime.models[0].id.clone();
+        let scoped = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "cycle_model".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert_eq!(scoped.data.as_ref().unwrap()["isScoped"], true);
+        assert_eq!(
+            scoped.data.as_ref().unwrap()["model"]["id"],
+            runtime.models[1].id
+        );
+        runtime.scoped_models = vec![runtime.models[0].clone()];
+        let single = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "cycle_model".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert_eq!(single.data, Some(Value::Null));
     }
 }

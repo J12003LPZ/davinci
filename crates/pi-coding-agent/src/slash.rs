@@ -90,6 +90,7 @@ pub enum SlashAction {
     NewSession,
     Compact(Option<String>),
     OpenModel,
+    OpenThinking,
     SetModel(String),
     SetThinking(String),
     Export(Option<String>),
@@ -138,7 +139,8 @@ pub fn parse_line(line: &str) -> SlashAction {
         }),
         "model" if args.is_empty() => SlashAction::OpenModel,
         "model" => SlashAction::SetModel(args.to_string()),
-        "thinking" if !args.is_empty() => SlashAction::SetThinking(args.to_string()),
+        "thinking" if args.is_empty() => SlashAction::OpenThinking,
+        "thinking" => SlashAction::SetThinking(args.to_string()),
         "export" => SlashAction::Export(if args.is_empty() {
             None
         } else {
