@@ -43,6 +43,7 @@ mod settings;
 mod settings_submenu;
 mod spacer;
 mod stack;
+mod startup_header;
 mod stdin_buffer;
 mod terminal;
 mod themes;
@@ -190,6 +191,7 @@ pub use stack::{
     allocate_stack_sizes, HStack, LayoutViewport, StackAlign, StackBasis, StackEntryOptions,
     StackLayoutEntry, VStack,
 };
+pub use startup_header::{build_startup_header, format_key_text, key_hint, key_text, raw_key_hint};
 pub use stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvents};
 pub use terminal::{
     is_apple_terminal_session, is_keyboard_protocol_negotiation_sequence_prefix,

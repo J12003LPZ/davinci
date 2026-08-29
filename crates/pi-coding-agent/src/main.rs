@@ -14,10 +14,12 @@ mod js_host;
 mod llama;
 mod migrations;
 mod model_resolver;
+mod output;
 mod packages;
 mod rpc;
 mod self_update;
 mod settings;
+mod shutdown;
 mod slash;
 mod startup;
 mod trust;
@@ -48,16 +50,17 @@ use pi_session::{
     resolve_session_dir_from, resolve_session_ref, JsonlSession, SessionEntry,
 };
 use pi_tui::{
-    builtin_themes, collect_name_collisions, copy_text, detect_terminal_theme,
-    detect_terminal_theme_for_auto, drain_osc_tty, encode_kitty, format_collision_diagnostic,
-    format_context_path, format_display_path, infer_source_info, interactive_settings_list,
-    load_themes_from_dir, parse_auto_theme, parse_http_idle_timeout, resolve_git_branch,
-    theme_files_from_dir, AuthSelectorMode, AuthSelectorProvider, AutocompleteItem, ChatChrome,
-    Component, CustomMessage, DoubleEscapeAction, ExtraAutocompleteProvider, FilterMode,
-    InteractiveSession, Keybindings, LiveAutocompleteQuery, LoadedResourceItem, MermaidMode,
-    ModelSelectorItem, ScopedModel, SessionAction, SessionItem, SessionTreeEntry, SlashCommandSpec,
-    Theme, ThemeDetection, ToolCard, TrustOption, TrustSavedDecision, TrustSelector, TrustUpdate,
-    TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
+    build_startup_header, builtin_themes, collect_name_collisions, copy_text,
+    detect_terminal_theme, detect_terminal_theme_for_auto, drain_osc_tty, encode_kitty,
+    format_collision_diagnostic, format_context_path, format_display_path, infer_source_info,
+    interactive_settings_list, load_themes_from_dir, parse_auto_theme, parse_http_idle_timeout,
+    resolve_git_branch, theme_files_from_dir, AuthSelectorMode, AuthSelectorProvider,
+    AutocompleteItem, ChatChrome, Component, CustomMessage, DoubleEscapeAction,
+    ExtraAutocompleteProvider, FilterMode, InteractiveSession, Keybindings, LiveAutocompleteQuery,
+    LoadedResourceItem, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction, SessionItem,
+    SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TrustOption,
+    TrustSavedDecision, TrustSelector, TrustUpdate, TuiMode, FALLBACK_PREVIEW_LINES,
+    OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -1118,8 +1121,7 @@ fn complete_prompt_with_host(
         agent.event_sink = Some(EventSink(Arc::new(|event| {
             if let Ok(value) = to_json_print_event(event) {
                 if let Ok(encoded) = serde_json::to_string(&value) {
-                    println!("{encoded}");
-                    io::stdout().flush().ok();
+                    let _ = output::write_raw_stdout_line(&encoded);
                 }
             }
         })));
@@ -1319,6 +1321,10 @@ fn parse_model_ref(provider: &str, model: Option<&str>) -> (String, String) {
 }
 
 fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
+    if let Some(code) = immediate_shutdown_if_fixture(parsed) {
+        return Ok(code);
+    }
+    install_mode_shutdown_watchers(parsed);
     let stdin_content = if !io::stdin().is_terminal() {
         let text = io::read_to_string(io::stdin()).unwrap_or_default();
         if text.is_empty() {
@@ -1462,6 +1468,10 @@ fn print_text_exit(events: &[AgentEvent]) -> (i32, Option<String>) {
 }
 
 fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
+    if let Some(code) = immediate_shutdown_if_fixture(parsed) {
+        return Ok(code);
+    }
+    install_mode_shutdown_watchers(parsed);
     let session_dir = agent
         .session
         .as_ref()
@@ -1536,6 +1546,27 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         let command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
         let is_prompt = command.kind == "prompt";
         let response = handle_rpc(&mut runtime, command.clone());
+        if matches!(
+            command.kind.as_str(),
+            "new_session" | "clone" | "fork" | "switch_session"
+        ) && response.success
+        {
+            let mut locked = host.lock().unwrap_or_else(|err| err.into_inner());
+            rebind_print_extensions(parsed, &mut runtime.agent, &mut locked);
+            runtime.invocable_commands = slash::invocable_commands(
+                &locked
+                    .js
+                    .iter()
+                    .flat_map(|ext| {
+                        ext.commands
+                            .iter()
+                            .map(|name| (name.clone(), String::new(), ext.path.clone()))
+                    })
+                    .collect::<Vec<_>>(),
+                &runtime.agent.templates,
+                &runtime.agent.skills,
+            );
+        }
         let mut extras = runtime.take_events();
         {
             let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
@@ -1566,26 +1597,26 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 emit_extension_ui_requests(&remaining)?;
             }
             for event in events {
-                println!(
-                    "{}",
-                    serde_json::to_string(&event).map_err(|err| err.to_string())?
-                );
+                output::write_raw_stdout_line(
+                    &serde_json::to_string(&event).map_err(|err| err.to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
             }
             extras.push(rpc::RpcSessionEvent::AgentSettled);
         }
         for event in extras {
-            println!(
-                "{}",
-                serde_json::to_string(&event).map_err(|err| err.to_string())?
-            );
+            output::write_raw_stdout_line(
+                &serde_json::to_string(&event).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())?;
         }
-        println!(
-            "{}",
-            serde_json::to_string(&response).map_err(|err| err.to_string())?
-        );
-        io::stdout().flush().ok();
+        output::write_raw_stdout_line(
+            &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
     }
     crate::js_host::clear_ui_waiter();
+    emit_session_shutdown(parsed);
     *agent = runtime.agent;
     Ok(0)
 }
@@ -1599,10 +1630,10 @@ fn is_dialog_ui_call(call: &serde_json::Value) -> bool {
 
 fn emit_extension_ui_requests(calls: &[serde_json::Value]) -> Result<(), String> {
     for request in rpc::extension_ui_requests_from_calls(calls) {
-        println!(
-            "{}",
-            serde_json::to_string(&request).map_err(|err| err.to_string())?
-        );
+        output::write_raw_stdout_line(
+            &serde_json::to_string(&request).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
     }
     Ok(())
 }
@@ -1725,6 +1756,131 @@ fn finish_interactive_tui(
     }
 }
 
+fn emit_session_shutdown(parsed: &Args) {
+    loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
+        reason: "quit".into(),
+    });
+}
+
+fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
+    let code = shutdown::fixture_shutdown_signal()?;
+    emit_session_shutdown(parsed);
+    Some(code)
+}
+
+fn install_mode_shutdown_watchers(parsed: &Args) {
+    let parsed = parsed.clone();
+    shutdown::install_shutdown_watchers(move |_| {
+        emit_session_shutdown(&parsed);
+    });
+}
+
+fn apply_startup_header(session: &mut InteractiveSession, verbose: bool) {
+    if session.quiet_startup {
+        session.chrome.startup_header = None;
+        return;
+    }
+    session.chrome.startup_header = Some(build_startup_header(
+        &session.chrome.theme,
+        APP_NAME,
+        VERSION,
+        &session.keybindings,
+        verbose || session.chrome.tools_expanded,
+    ));
+}
+
+fn model_scope_startup_line(session: &InteractiveSession) -> Option<String> {
+    if session.quiet_startup {
+        return None;
+    }
+    let ids = session
+        .enabled_model_ids
+        .as_ref()
+        .filter(|ids| !ids.is_empty())?;
+    let list = ids
+        .iter()
+        .map(|id| {
+            let model = id.rsplit('/').next().unwrap_or(id);
+            match session.scoped_thinking_levels.get(id) {
+                Some(level) => format!("{model}:{level}"),
+                None => model.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cycle = session.keybindings.keys_for("app.model.cycleForward");
+    let hint = if cycle.is_empty() {
+        String::new()
+    } else {
+        session.chrome.theme.fg(
+            "muted",
+            &format!(
+                " ({} to cycle)",
+                pi_tui::format_key_text(&cycle.join("/"), true)
+            ),
+        )
+    };
+    Some(
+        session
+            .chrome
+            .theme
+            .fg("dim", &format!("Model scope: {list}{hint}")),
+    )
+}
+
+fn resume_command_for_agent(parsed: &Args, agent: &Agent) -> Option<String> {
+    let stdout_tty = io::stdout().is_terminal()
+        || matches!(
+            std::env::var("PI_RESUME_HINT").as_deref(),
+            Ok("1") | Ok("true")
+        );
+    let session = agent.session.as_ref()?;
+    let default_dir = pi_session::resolve_session_dir_from(
+        parsed.session_dir.as_deref(),
+        load_settings(&default_agent_dir()).session_dir.as_deref(),
+    );
+    let uses_default = parsed.session_dir.is_none()
+        && std::env::var("PI_CODING_AGENT_SESSION_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_none();
+    let session_dir = session
+        .path
+        .parent()
+        .and_then(|parent| parent.parent())
+        .unwrap_or(&default_dir);
+    shutdown::format_resume_command(
+        stdout_tty,
+        true,
+        Some(&session.path),
+        Some(&session.header.id),
+        Some(&session_dir.display().to_string()),
+        uses_default,
+    )
+}
+
+fn print_resume_hint(parsed: &Args, agent: &Agent, session: &InteractiveSession) {
+    if let Some(command) = resume_command_for_agent(parsed, agent) {
+        println!(
+            "{} {command}",
+            session.chrome.theme.fg("dim", "To resume this session:")
+        );
+    }
+}
+
+fn dispose_interactive(
+    parsed: &Args,
+    agent: &Agent,
+    tui_host: Option<(InteractiveTui, ChromePanes)>,
+    session: &InteractiveSession,
+    stored: &settings::Settings,
+    fullscreen: bool,
+) {
+    finish_interactive_tui(tui_host, session, stored, fullscreen);
+    emit_session_shutdown(parsed);
+    print_resume_hint(parsed, agent, session);
+}
+
 fn tui_options_from_session(
     session: &InteractiveSession,
     stored: &settings::Settings,
@@ -1753,6 +1909,10 @@ fn run_interactive(
     agent: &mut Agent,
     migrated_auth_providers: &[String],
 ) -> Result<i32, String> {
+    if let Some(code) = immediate_shutdown_if_fixture(parsed) {
+        return Ok(code);
+    }
+    install_mode_shutdown_watchers(parsed);
     let theme = builtin_themes()
         .into_iter()
         .find(|theme| parsed.use_theme.as_deref() == Some(theme.name.as_str()))
@@ -1878,6 +2038,10 @@ fn run_interactive(
         migrated_auth_providers,
     );
     show_loaded_resources(&mut session, agent, &host, parsed);
+    apply_startup_header(&mut session, parsed.verbose);
+    if let Some(line) = model_scope_startup_line(&session) {
+        println!("{line}");
+    }
     apply_project_trust_warning(&mut session, parsed, agent);
     apply_changelog_overlay(&mut session, agent, &stored, &default_agent_dir());
     refresh_chrome_footer(&mut session, agent);
@@ -1932,7 +2096,14 @@ fn run_interactive(
     )?;
     if let Some(prompt) = &prepared.text {
         if !submit_user_message(parsed, agent, &mut session, prompt, &prepared.images)? {
-            finish_interactive_tui(tui_host.take(), &session, &stored, fullscreen);
+            dispose_interactive(
+                parsed,
+                agent,
+                tui_host.take(),
+                &session,
+                &stored,
+                fullscreen,
+            );
             return Ok(0);
         }
         if let Some((tui, panes)) = &mut tui_host {
@@ -1941,7 +2112,14 @@ fn run_interactive(
     }
     for extra in &prepared.remaining_messages {
         if !submit_user_message(parsed, agent, &mut session, extra, &[])? {
-            finish_interactive_tui(tui_host.take(), &session, &stored, fullscreen);
+            dispose_interactive(
+                parsed,
+                agent,
+                tui_host.take(),
+                &session,
+                &stored,
+                fullscreen,
+            );
             return Ok(0);
         }
         if let Some((tui, panes)) = &mut tui_host {
@@ -1953,6 +2131,8 @@ fn run_interactive(
     } else {
         let result = run_line_session(parsed, agent, &mut session);
         print!("{}", InteractiveSession::leave_sequences(fullscreen));
+        emit_session_shutdown(parsed);
+        print_resume_hint(parsed, agent, &session);
         result
     }
 }
@@ -2138,7 +2318,7 @@ fn run_raw_session(
         }
         sync_hosted_chrome(&mut tui, &panes, session);
     }
-    finish_interactive_tui(Some((tui, panes)), session, &stored, false);
+    dispose_interactive(parsed, agent, Some((tui, panes)), session, &stored, false);
     Ok(0)
 }
 
@@ -2995,6 +3175,7 @@ fn reload_interactive_resources(
     let current = session.chrome.theme.name.clone();
     apply_theme_value(session, &current);
     show_loaded_resources(session, agent, &host, parsed);
+    apply_startup_header(session, parsed.verbose);
 }
 
 fn available_themes_with(parsed: Option<&Args>) -> Vec<Theme> {
@@ -6792,6 +6973,33 @@ mod tests {
             Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
+    }
+
+    #[test]
+    fn startup_header_and_model_scope_match_ts() {
+        let theme = builtin_themes()[0].clone();
+        let mut session = InteractiveSession::new(theme, "pi", vec!["anthropic/sonnet".into()]);
+        session.enabled_model_ids = Some(vec!["anthropic/sonnet".into()]);
+        session
+            .scoped_thinking_levels
+            .insert("anthropic/sonnet".into(), "high".into());
+        apply_startup_header(&mut session, false);
+        let collapsed = session.chrome.render_document(80).join("\n");
+        assert!(
+            collapsed.contains("full startup help and loaded resources"),
+            "{collapsed}"
+        );
+        assert!(collapsed.contains("ctrl+o"), "{collapsed}");
+        session.chrome.set_tools_expanded(true);
+        let expanded = session.chrome.render_document(80).join("\n");
+        assert!(expanded.contains("to expand tools"), "{expanded}");
+        let line = model_scope_startup_line(&session).expect("scope");
+        assert!(line.contains("Model scope:"), "{line}");
+        assert!(line.contains("sonnet:high"), "{line}");
+        session.quiet_startup = true;
+        apply_startup_header(&mut session, false);
+        assert!(session.chrome.startup_header.is_none());
+        assert!(model_scope_startup_line(&session).is_none());
     }
 
     #[test]

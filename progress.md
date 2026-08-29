@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: 100% after interactive loaded-resources listing slice.** TypeScript under `vendor/pi` stays as the behavioral reference (desired end state, not a gap).
+**Complete: 100% after startup header / RPC rebind / signal-dispose slice.** TypeScript under `vendor/pi` stays as the behavioral reference (desired end state, not a gap).
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -146,6 +146,8 @@ Closed this slice: TS `model-resolver` in Rust (`resolveCliModel` / `parseModelP
 Closed this slice: Ctrl+O / `app.tools.expand` / `setToolsExpanded` toggles every tool card and custom-message body (`Tool output: expanded|collapsed`). Print `--mode json` subscribes via `Agent.event_sink` and writes `toJsonEvent` lines as the agent loop emits them. Print/RPC `rebind_print_extensions` rediscovers skills/prompts/context, reloads the JS host, reattaches extension tools, and emits `session_start` after `reload` / `newSession` / `fork` / `switchSession`.
 
 Closed this slice: interactive `showLoadedResources` — `[Context]` / `[Skills]` / `[Prompts]` / `[Extensions]` / `[Themes]` expandable sections (compact comma list vs project/user/path + npm/git groups), skill/prompt collision diagnostics, `quietStartup` hides the listing, Ctrl+O expands the sections. Startup, `/reload`, and print rebind share `apply_discovered_resources`: CLI `--skill`/`--prompt-template`, user `{agentDir}` roots, trusted project `.pi`, settings extras, and package resources. Untrusted projects skip `.pi` skills/prompts like TS.
+
+Closed this slice: expandable built-in startup header (logo, compact/expanded key hints, Ctrl+O onboarding), `Model scope: … (Ctrl+P to cycle)` when `--models` is set, RPC `rebindSession` after `new_session`/`clone`/`fork`/`switch_session`, print/RPC/interactive SIGTERM=143 / SIGHUP=129 dispose (`PI_SHUTDOWN_SIGNAL` fixture), interactive `session_shutdown` + `To resume this session:` (`formatResumeCommand` quoting), and print/RPC JSON stdout backpressure retry (ENOBUFS/EAGAIN, `PI_STDOUT_BACKPRESSURE`).
 
 ## Remaining product gaps
 

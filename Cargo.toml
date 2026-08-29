@@ -51,6 +51,7 @@ rustls = { version = "=0.23.19", default-features = false, features = ["std", "t
 rustls-pki-types = "=1.10.1"
 webpki-roots = "=0.26.7"
 zeroize = { version = "=1.8.1", features = ["serde"] }
+signal-hook = "=0.3.18"
 zstd = "=0.13.2"
 
 [profile.release]

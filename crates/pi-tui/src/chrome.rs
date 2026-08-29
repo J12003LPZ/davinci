@@ -6,7 +6,7 @@ use crate::extension_ui::{
 };
 use crate::first_time::FirstTimeSetup;
 use crate::footer::{format_pwd_line, truncate_to_width};
-use crate::loaded_resources::LoadedResources;
+use crate::loaded_resources::{ExpandableText, LoadedResources};
 use crate::login_dialog::LoginDialog;
 use crate::model_selector::ModelSelector;
 use crate::oauth_selector::OAuthSelector;
@@ -76,6 +76,7 @@ pub struct ChatChrome {
     pub footer_session_name: Option<String>,
     pub footer_stats: Option<String>,
     pub tools_expanded: bool,
+    pub startup_header: Option<ExpandableText>,
     pub loaded_resources: LoadedResources,
     pub available_themes: Vec<Theme>,
     pub terminal_input_registered: bool,
@@ -133,6 +134,7 @@ impl ChatChrome {
             footer_session_name: None,
             footer_stats: None,
             tools_expanded: false,
+            startup_header: None,
             loaded_resources: LoadedResources::default(),
             available_themes: builtin_themes(),
             terminal_input_registered: false,
@@ -186,6 +188,9 @@ impl ChatChrome {
         self.tools_expanded = expanded;
         self.transcript.tools_expanded = expanded;
         self.loaded_resources.set_expanded(expanded);
+        if let Some(header) = &mut self.startup_header {
+            header.set_expanded(expanded);
+        }
         for card in &mut self.tool_cards {
             card.expanded = expanded;
         }
@@ -390,7 +395,10 @@ impl ChatChrome {
     /// Transcript / header / tool cards (TS `documentContainer` + chat).
     pub fn render_document(&self, width: usize) -> Vec<String> {
         let mut lines = Vec::new();
-        if !self.quiet_startup || self.extension_header.is_some() {
+        if let Some(header) = &self.startup_header {
+            lines.extend(header.current().lines().map(str::to_string));
+            lines.push(String::new());
+        } else if !self.quiet_startup || self.extension_header.is_some() {
             lines.push(format!("{}  theme={}", self.title, self.theme.name));
         }
         if let Some(header) = &self.extension_header {
