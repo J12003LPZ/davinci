@@ -89,6 +89,15 @@ use trust::{
 
 const NO_SESSION_SELECTED: &str = "__pi_no_session_selected__";
 
+/// TS `main()`: `--offline` or truthy `PI_OFFLINE` sets `PI_OFFLINE=1` and `PI_SKIP_VERSION_CHECK=1`.
+fn apply_offline_mode(raw: &[String]) {
+    let from_flag = raw.iter().any(|arg| arg == "--offline");
+    if from_flag || tools_manager::is_offline_mode_enabled() {
+        std::env::set_var("PI_OFFLINE", "1");
+        std::env::set_var("PI_SKIP_VERSION_CHECK", "1");
+    }
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     match run(raw) {
@@ -101,6 +110,7 @@ fn main() {
 }
 
 fn run(raw: Vec<String>) -> Result<i32, String> {
+    apply_offline_mode(&raw);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     apply_http_proxy_settings(
         load_merged_settings(&default_agent_dir(), &cwd)
@@ -6741,6 +6751,25 @@ fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_flag_sets_ts_env_vars() {
+        let previous_offline = std::env::var("PI_OFFLINE").ok();
+        let previous_skip = std::env::var("PI_SKIP_VERSION_CHECK").ok();
+        std::env::remove_var("PI_OFFLINE");
+        std::env::remove_var("PI_SKIP_VERSION_CHECK");
+        apply_offline_mode(&["--offline".into()]);
+        assert_eq!(std::env::var("PI_OFFLINE").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("PI_SKIP_VERSION_CHECK").as_deref(), Ok("1"));
+        match previous_offline {
+            Some(value) => std::env::set_var("PI_OFFLINE", value),
+            None => std::env::remove_var("PI_OFFLINE"),
+        }
+        match previous_skip {
+            Some(value) => std::env::set_var("PI_SKIP_VERSION_CHECK", value),
+            None => std::env::remove_var("PI_SKIP_VERSION_CHECK"),
+        }
+    }
 
     #[test]
     fn parses_print_and_thinking_like_ts() {
