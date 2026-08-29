@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (cache-miss notices, OSC 9;4, git footer, quietStartup, changelog overlay, package persist/update/manifest, extension ctx session APIs). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (editor word-nav, settings.json.lock, sqlite lease/FTS/cwd conformance). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
