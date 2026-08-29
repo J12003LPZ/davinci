@@ -181,6 +181,7 @@ impl ChatChrome {
 
     pub fn set_tools_expanded(&mut self, expanded: bool) {
         self.tools_expanded = expanded;
+        self.transcript.tools_expanded = expanded;
         for card in &mut self.tool_cards {
             card.expanded = expanded;
         }

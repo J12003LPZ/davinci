@@ -48,26 +48,32 @@ impl Agent {
         self.retry_aborted = false;
         let mut events = Vec::new();
         let mut new_messages: Vec<ChatMessage> = Vec::new();
-        events.push(AgentEvent::AgentStart);
-        events.push(AgentEvent::TurnStart);
+        self.push_event(&mut events, AgentEvent::AgentStart);
+        self.push_event(&mut events, AgentEvent::TurnStart);
 
         if emit_prompt_messages {
             if let Some(prompt) = self.messages.last().cloned() {
                 if prompt.role == "user" {
-                    events.push(AgentEvent::MessageStart {
-                        message: prompt.clone(),
-                    });
-                    events.push(AgentEvent::MessageEnd { message: prompt });
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::MessageStart {
+                            message: prompt.clone(),
+                        },
+                    );
+                    self.push_event(&mut events, AgentEvent::MessageEnd { message: prompt });
                 }
             }
         }
 
         loop {
             if self.aborted {
-                events.push(AgentEvent::AgentEnd {
-                    messages: new_messages,
-                    will_retry: false,
-                });
+                self.push_event(
+                    &mut events,
+                    AgentEvent::AgentEnd {
+                        messages: new_messages,
+                        will_retry: false,
+                    },
+                );
                 self.is_streaming = false;
                 return Ok(events);
             }
@@ -95,32 +101,47 @@ impl Agent {
             self.messages.push(chat.clone());
             self.persist_assistant(&assistant, &chat);
             new_messages.push(chat.clone());
-            events.push(AgentEvent::MessageStart {
-                message: chat.clone(),
-            });
+            self.push_event(
+                &mut events,
+                AgentEvent::MessageStart {
+                    message: chat.clone(),
+                },
+            );
             let updates = stream_events.unwrap_or_else(|| pi_ai::events_from_complete(&assistant));
             for assistant_message_event in updates {
-                events.push(AgentEvent::MessageUpdate {
-                    message: chat.clone(),
-                    assistant_message_event,
-                });
+                self.push_event(
+                    &mut events,
+                    AgentEvent::MessageUpdate {
+                        message: chat.clone(),
+                        assistant_message_event,
+                    },
+                );
             }
-            events.push(AgentEvent::MessageEnd {
-                message: chat.clone(),
-            });
+            self.push_event(
+                &mut events,
+                AgentEvent::MessageEnd {
+                    message: chat.clone(),
+                },
+            );
 
             if matches!(
                 assistant.stop_reason,
                 Some(StopReason::Error) | Some(StopReason::Aborted)
             ) {
-                events.push(AgentEvent::TurnEnd {
-                    message: chat,
-                    tool_results: Vec::new(),
-                });
-                events.push(AgentEvent::AgentEnd {
-                    messages: new_messages,
-                    will_retry: false,
-                });
+                self.push_event(
+                    &mut events,
+                    AgentEvent::TurnEnd {
+                        message: chat,
+                        tool_results: Vec::new(),
+                    },
+                );
+                self.push_event(
+                    &mut events,
+                    AgentEvent::AgentEnd {
+                        messages: new_messages,
+                        will_retry: false,
+                    },
+                );
                 self.is_streaming = false;
                 return Ok(events);
             }
@@ -149,35 +170,47 @@ impl Agent {
                             "Tool call arguments were truncated by the output token limit",
                             true,
                         );
-                        events.push(AgentEvent::ToolExecutionStart {
-                            tool_call_id: id.clone(),
-                            tool_name: name.clone(),
-                            args: args.clone(),
-                        });
-                        events.push(AgentEvent::ToolExecutionEnd {
-                            tool_call_id: id.clone(),
-                            tool_name: name.clone(),
-                            result: Value::String(
-                                result
-                                    .content
-                                    .first()
-                                    .and_then(|c| match c {
-                                        MessageContent::Text { text } => Some(text.clone()),
-                                        _ => None,
-                                    })
-                                    .unwrap_or_default(),
-                            ),
-                            is_error: true,
-                        });
+                        self.push_event(
+                            &mut events,
+                            AgentEvent::ToolExecutionStart {
+                                tool_call_id: id.clone(),
+                                tool_name: name.clone(),
+                                args: args.clone(),
+                            },
+                        );
+                        self.push_event(
+                            &mut events,
+                            AgentEvent::ToolExecutionEnd {
+                                tool_call_id: id.clone(),
+                                tool_name: name.clone(),
+                                result: Value::String(
+                                    result
+                                        .content
+                                        .first()
+                                        .and_then(|c| match c {
+                                            MessageContent::Text { text } => Some(text.clone()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_default(),
+                                ),
+                                is_error: true,
+                            },
+                        );
                         self.messages.push(result.clone());
                         self.persist_chat(&result);
                         new_messages.push(result.clone());
-                        events.push(AgentEvent::MessageStart {
-                            message: result.clone(),
-                        });
-                        events.push(AgentEvent::MessageEnd {
-                            message: result.clone(),
-                        });
+                        self.push_event(
+                            &mut events,
+                            AgentEvent::MessageStart {
+                                message: result.clone(),
+                            },
+                        );
+                        self.push_event(
+                            &mut events,
+                            AgentEvent::MessageEnd {
+                                message: result.clone(),
+                            },
+                        );
                         tool_results.push(result);
                     }
                 } else {
@@ -192,12 +225,18 @@ impl Agent {
                                 self.messages.push(result.clone());
                                 self.persist_chat(&result);
                                 new_messages.push(result.clone());
-                                events.push(AgentEvent::MessageStart {
-                                    message: result.clone(),
-                                });
-                                events.push(AgentEvent::MessageEnd {
-                                    message: result.clone(),
-                                });
+                                self.push_event(
+                                    &mut events,
+                                    AgentEvent::MessageStart {
+                                        message: result.clone(),
+                                    },
+                                );
+                                self.push_event(
+                                    &mut events,
+                                    AgentEvent::MessageEnd {
+                                        message: result.clone(),
+                                    },
+                                );
                                 tool_results.push(result);
                             }
                         }
@@ -211,12 +250,18 @@ impl Agent {
                                 self.messages.push(result.clone());
                                 self.persist_chat(&result);
                                 new_messages.push(result.clone());
-                                events.push(AgentEvent::MessageStart {
-                                    message: result.clone(),
-                                });
-                                events.push(AgentEvent::MessageEnd {
-                                    message: result.clone(),
-                                });
+                                self.push_event(
+                                    &mut events,
+                                    AgentEvent::MessageStart {
+                                        message: result.clone(),
+                                    },
+                                );
+                                self.push_event(
+                                    &mut events,
+                                    AgentEvent::MessageEnd {
+                                        message: result.clone(),
+                                    },
+                                );
                                 tool_results.push(result);
                             }
                         }
@@ -224,23 +269,26 @@ impl Agent {
                 }
             }
 
-            events.push(AgentEvent::TurnEnd {
-                message: chat,
-                tool_results,
-            });
+            self.push_event(
+                &mut events,
+                AgentEvent::TurnEnd {
+                    message: chat,
+                    tool_results,
+                },
+            );
 
             if had_tools && !self.aborted {
-                events.push(AgentEvent::TurnStart);
+                self.push_event(&mut events, AgentEvent::TurnStart);
                 continue;
             }
 
             if !self.queues.steer.is_empty() {
-                events.push(AgentEvent::TurnStart);
+                self.push_event(&mut events, AgentEvent::TurnStart);
                 continue;
             }
 
             if !self.queues.follow_up.is_empty() {
-                events.push(AgentEvent::TurnStart);
+                self.push_event(&mut events, AgentEvent::TurnStart);
                 self.inject_queued(&mut events, &mut new_messages, false);
                 continue;
             }
@@ -248,10 +296,13 @@ impl Agent {
             break;
         }
 
-        events.push(AgentEvent::AgentEnd {
-            messages: new_messages,
-            will_retry: false,
-        });
+        self.push_event(
+            &mut events,
+            AgentEvent::AgentEnd {
+                messages: new_messages,
+                will_retry: false,
+            },
+        );
         self.is_streaming = false;
         Ok(events)
     }
@@ -272,10 +323,13 @@ impl Agent {
         for queued in drained {
             let message = self.prompt_with(&queued.text, &queued.images);
             new_messages.push(message.clone());
-            events.push(AgentEvent::MessageStart {
-                message: message.clone(),
-            });
-            events.push(AgentEvent::MessageEnd { message });
+            self.push_event(
+                &mut events,
+                AgentEvent::MessageStart {
+                    message: message.clone(),
+                },
+            );
+            self.push_event(&mut events, AgentEvent::MessageEnd { message });
         }
     }
 
@@ -299,11 +353,14 @@ impl Agent {
         for attempt in 0..attempts {
             if self.aborted || self.retry_aborted {
                 if scheduled_attempt > 0 {
-                    events.push(AgentEvent::AutoRetryEnd {
-                        success: false,
-                        attempt: scheduled_attempt,
-                        final_error: Some("Retry cancelled".into()),
-                    });
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::AutoRetryEnd {
+                            success: false,
+                            attempt: scheduled_attempt,
+                            final_error: Some("Retry cancelled".into()),
+                        },
+                    );
                 }
                 return Ok((
                     AssistantMessage {
@@ -328,29 +385,35 @@ impl Agent {
                     {
                         scheduled_attempt = attempt + 1;
                         let delay = retry_delay_ms(self.retry_base_delay_ms, attempt);
-                        events.push(AgentEvent::AutoRetryStart {
-                            attempt: scheduled_attempt,
-                            max_attempts: max_retries,
-                            delay_ms: delay,
-                            error_message: message
-                                .error_message
-                                .clone()
-                                .unwrap_or_else(|| "Unknown error".into()),
-                        });
+                        self.push_event(
+                            &mut events,
+                            AgentEvent::AutoRetryStart {
+                                attempt: scheduled_attempt,
+                                max_attempts: max_retries,
+                                delay_ms: delay,
+                                error_message: message
+                                    .error_message
+                                    .clone()
+                                    .unwrap_or_else(|| "Unknown error".into()),
+                            },
+                        );
                         sleep_retry_delay(delay);
                         continue;
                     }
                     if scheduled_attempt > 0 {
                         let success = message.stop_reason != Some(StopReason::Error);
-                        events.push(AgentEvent::AutoRetryEnd {
-                            success,
-                            attempt: scheduled_attempt,
-                            final_error: if success {
-                                None
-                            } else {
-                                message.error_message.clone()
+                        self.push_event(
+                            &mut events,
+                            AgentEvent::AutoRetryEnd {
+                                success,
+                                attempt: scheduled_attempt,
+                                final_error: if success {
+                                    None
+                                } else {
+                                    message.error_message.clone()
+                                },
                             },
-                        });
+                        );
                     }
                     return Ok((message, output.stream_events));
                 }
@@ -359,12 +422,15 @@ impl Agent {
                     if attempt + 1 < attempts && pi_ai::is_retryable_error_text(&err) {
                         scheduled_attempt = attempt + 1;
                         let delay = retry_delay_ms(self.retry_base_delay_ms, attempt);
-                        events.push(AgentEvent::AutoRetryStart {
-                            attempt: scheduled_attempt,
-                            max_attempts: max_retries,
-                            delay_ms: delay,
-                            error_message: err,
-                        });
+                        self.push_event(
+                            &mut events,
+                            AgentEvent::AutoRetryStart {
+                                attempt: scheduled_attempt,
+                                max_attempts: max_retries,
+                                delay_ms: delay,
+                                error_message: err,
+                            },
+                        );
                         sleep_retry_delay(delay);
                     } else if attempt + 1 < attempts {
                         sleep_retry_delay(retry_delay_ms(self.retry_base_delay_ms, attempt));
@@ -373,11 +439,14 @@ impl Agent {
             }
         }
         if scheduled_attempt > 0 {
-            events.push(AgentEvent::AutoRetryEnd {
-                success: false,
-                attempt: scheduled_attempt,
-                final_error: last_error.clone(),
-            });
+            self.push_event(
+                &mut events,
+                AgentEvent::AutoRetryEnd {
+                    success: false,
+                    attempt: scheduled_attempt,
+                    final_error: last_error.clone(),
+                },
+            );
         }
         Err(last_error.unwrap_or_else(|| "Provider request failed".into()))
     }
@@ -390,11 +459,14 @@ impl Agent {
         args: &Value,
         events: &mut Vec<AgentEvent>,
     ) -> ChatMessage {
-        events.push(AgentEvent::ToolExecutionStart {
-            tool_call_id: id.to_string(),
-            tool_name: name.to_string(),
-            args: args.clone(),
-        });
+        self.push_event(
+            &mut events,
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: id.to_string(),
+                tool_name: name.to_string(),
+                args: args.clone(),
+            },
+        );
         let result =
             if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
                 crate::ToolResult {
@@ -438,25 +510,34 @@ impl Agent {
             };
         let mut details = result.details.clone();
         for partial in crate::ToolResult::take_updates(&mut details) {
-            events.push(AgentEvent::ToolExecutionUpdate {
+            self.push_event(
+                &mut events,
+                AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: id.to_string(),
+                    tool_name: name.to_string(),
+                    args: args.clone(),
+                    partial_result: partial,
+                },
+            );
+        }
+        self.push_event(
+            &mut events,
+            AgentEvent::ToolExecutionUpdate {
                 tool_call_id: id.to_string(),
                 tool_name: name.to_string(),
                 args: args.clone(),
-                partial_result: partial,
-            });
-        }
-        events.push(AgentEvent::ToolExecutionUpdate {
-            tool_call_id: id.to_string(),
-            tool_name: name.to_string(),
-            args: args.clone(),
-            partial_result: Value::String(result.content.clone()),
-        });
-        events.push(AgentEvent::ToolExecutionEnd {
-            tool_call_id: id.to_string(),
-            tool_name: name.to_string(),
-            result: Value::String(result.content.clone()),
-            is_error: result.is_error,
-        });
+                partial_result: Value::String(result.content.clone()),
+            },
+        );
+        self.push_event(
+            &mut events,
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: id.to_string(),
+                tool_name: name.to_string(),
+                result: Value::String(result.content.clone()),
+                is_error: result.is_error,
+            },
+        );
         tool_result_message(id, name, result, self.auto_resize_images)
     }
 

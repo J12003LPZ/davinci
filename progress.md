@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: 100% after CLI model-resolver / `--resume` picker / RPC UI-wait slice.** TypeScript under `vendor/pi` stays as the behavioral reference (desired end state, not a gap).
+**Complete: 100% after Ctrl+O / live print JSON / print-mode rebind slice.** TypeScript under `vendor/pi` stays as the behavioral reference (desired end state, not a gap).
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -143,9 +143,11 @@ Closed this slice: print mode matches TS `runPrintMode` — session header then 
 
 Closed this slice: TS `model-resolver` in Rust (`resolveCliModel` / `parseModelPattern` / `resolveModelScopeFromModels`) so `--model sonnet`, `provider/id`, globs, and `--model …:<thinking>` resolve and apply. `--models` scopes interactive Ctrl+P and RPC `cycle_model`; cycling restores scoped `:level` then per-model then settings default. `--resume` opens the SessionSelector (TTY) or `PI_RESUME_SESSION` fixture; cancel prints dim `No session selected` and exits 0. RPC extension `ctx.ui.select/confirm/input` emit `extension_ui_request`, block for `extension_ui_response`, and honor `timeout` (default on expiry).
 
+Closed this slice: Ctrl+O / `app.tools.expand` / `setToolsExpanded` toggles every tool card and custom-message body (`Tool output: expanded|collapsed`). Print `--mode json` subscribes via `Agent.event_sink` and writes `toJsonEvent` lines as the agent loop emits them. Print/RPC `rebind_print_extensions` rediscovers skills/prompts/context, reloads the JS host, reattaches extension tools, and emits `session_start` after `reload` / `newSession` / `fork` / `switchSession`.
+
 ## Remaining product gaps
 
-None. Optional polish that is not a shipped TS CLI flag: live print-mode JSON subscribe (events still emit after the turn), Ctrl+O tool-card expand, a `pi eval` runner binary (`run-evals.mjs` is a package script; the harness is library-only in both trees), and print-mode extension rebind after reload.
+None. A `pi eval` runner binary is not a shipped TS CLI (`run-evals.mjs` is a package script; the harness is library-only in both trees).
 
 Native Darwin/Win32 `.node` addons are optional in TypeScript (load fails → `false` / env). Rust matches that fallback: crossterm Shift, `PI_TUI_SHIFT`, `PI_TUI_NATIVE_MODIFIER_*`, and the TS rewrite helpers. Not shipping `.node` binaries is not a product-feature gap.
 

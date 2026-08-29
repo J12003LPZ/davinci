@@ -1008,9 +1008,7 @@ impl InteractiveSession {
                 return SessionAction::OpenModel;
             }
             if self.keybindings.matches(data, "app.tools.expand") {
-                if let Some(card) = self.chrome.tool_cards.last_mut() {
-                    card.expanded = !card.expanded;
-                }
+                self.chrome.set_tools_expanded(!self.chrome.tools_expanded);
                 return SessionAction::ExpandTools;
             }
             if self.keybindings.matches(data, "app.thinking.toggle") {
@@ -1904,7 +1902,40 @@ mod tests {
         assert!(session.chrome.transcript.hide_thinking_block);
         assert_eq!(session.handle_bytes("\x0c"), SessionAction::OpenModel);
         session.close_overlays();
+        session.chrome.tool_cards.push(crate::ToolCard::start(
+            "bash",
+            "call-1",
+            serde_json::json!({}),
+        ));
+        session.chrome.tool_cards.push(crate::ToolCard::start(
+            "read",
+            "call-2",
+            serde_json::json!({}),
+        ));
+        session
+            .chrome
+            .transcript
+            .push_custom("note", "first line\nsecond line", None);
         assert_eq!(session.handle_bytes("\x0f"), SessionAction::ExpandTools);
+        assert!(session.chrome.tools_expanded);
+        assert!(session.chrome.transcript.tools_expanded);
+        assert!(session.chrome.tool_cards.iter().all(|card| card.expanded));
+        assert!(session
+            .chrome
+            .transcript
+            .render(40)
+            .iter()
+            .any(|line| line.contains("second line")));
+        assert_eq!(session.handle_bytes("\x0f"), SessionAction::ExpandTools);
+        assert!(!session.chrome.tools_expanded);
+        assert!(!session.chrome.transcript.tools_expanded);
+        assert!(session.chrome.tool_cards.iter().all(|card| !card.expanded));
+        assert!(!session
+            .chrome
+            .transcript
+            .render(40)
+            .iter()
+            .any(|line| line.contains("second line")));
         session.chrome.editor.handle_input("busy");
         assert_eq!(session.handle_bytes("\x1b"), SessionAction::Abort);
         assert!(session.aborted);

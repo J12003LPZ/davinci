@@ -69,6 +69,16 @@ impl std::fmt::Debug for PreToolHook {
     }
 }
 
+/// Live agent-loop subscriber matching TS `AgentSession.subscribe`.
+#[derive(Clone)]
+pub struct EventSink(pub Arc<dyn Fn(&AgentEvent) + Send + Sync>);
+
+impl std::fmt::Debug for EventSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EventSink")
+    }
+}
+
 /// Injected tool runner for JS/manifest tools so `pi-agent` stays independent of the coding-agent host.
 #[derive(Clone)]
 pub struct CustomToolExecutor {
@@ -139,6 +149,7 @@ pub struct Agent {
     pub transport: Option<String>,
     pub install_telemetry: bool,
     pub reload_count: u32,
+    pub event_sink: Option<EventSink>,
 }
 
 impl Agent {
@@ -180,7 +191,15 @@ impl Agent {
             transport: None,
             install_telemetry: true,
             reload_count: 0,
+            event_sink: None,
         }
+    }
+
+    pub fn push_event(&self, events: &mut Vec<AgentEvent>, event: AgentEvent) {
+        if let Some(sink) = &self.event_sink {
+            (sink.0)(&event);
+        }
+        events.push(event);
     }
 
     /// TS `evalSession.reload()` — isolated evals have no extensions; count the step.
@@ -702,6 +721,44 @@ mod tests {
         assert!(update_types.contains(&"text_delta"));
         assert_eq!(kinds.last().copied(), Some("agent_end"));
         assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn event_sink_receives_events_as_run_loop_emits_them() {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_seen = seen.clone();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.event_sink = Some(EventSink(std::sync::Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event.kind().to_string());
+        })));
+        agent.prompt("hello");
+        let events = agent
+            .run_loop(|_| {
+                Ok(AssistantMessage {
+                    id: "a1".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+        let kinds = seen.lock().unwrap().clone();
+        assert!(
+            kinds.contains(&"agent_start".to_string()),
+            "sink should observe agent_start before run_loop returns: {kinds:?}"
+        );
+        assert_eq!(
+            kinds,
+            events
+                .iter()
+                .map(|event| event.kind().to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

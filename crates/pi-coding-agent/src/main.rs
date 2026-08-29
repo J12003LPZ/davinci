@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 
 use pi_agent::{
     default_system_prompt, discover_prompt_templates, discover_skills, env_summarizer,
-    load_context_files, Agent, AgentEvent, CompleteOutput, CustomToolExecutor, SummarizeRequest,
-    SummarizeResponse, Summarizer,
+    load_context_files, Agent, AgentEvent, CompleteOutput, CustomToolExecutor, EventSink,
+    SummarizeRequest, SummarizeResponse, Summarizer,
 };
 use pi_ai::{
     apply_config_auth_with_shell, apply_models_config, check_auth, complete_simple, content_text,
@@ -1027,13 +1027,14 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
 }
 
 fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>) {
-    complete_prompt_with_host(parsed, agent, None)
+    complete_prompt_with_host(parsed, agent, None, false)
 }
 
 fn complete_prompt_with_host(
     parsed: &Args,
     agent: &mut Agent,
     existing_host: Option<Arc<Mutex<ExtensionHost>>>,
+    stream_json: bool,
 ) -> (String, Vec<AgentEvent>) {
     let offline = parsed.offline
         || matches!(
@@ -1144,6 +1145,16 @@ fn complete_prompt_with_host(
             None
         }
     })));
+    if stream_json {
+        agent.event_sink = Some(EventSink(Arc::new(|event| {
+            if let Ok(value) = to_json_print_event(event) {
+                if let Ok(encoded) = serde_json::to_string(&value) {
+                    println!("{encoded}");
+                    io::stdout().flush().ok();
+                }
+            }
+        })));
+    }
     let events = agent
         .run_loop(|current| {
             let last_user = current
@@ -1214,6 +1225,7 @@ fn complete_prompt_with_host(
                 will_retry: false,
             }]
         });
+    agent.event_sink = None;
     let reply = agent
         .last_assistant_text()
         .or_else(|| {
@@ -1300,7 +1312,7 @@ fn complete_prompt_with_host(
                 Some("newSession" | "fork" | "switchSession" | "reload")
             )
         }) {
-            host.emit(ExtensionEvent::SessionStart);
+            rebind_print_extensions(parsed, agent, &mut host);
         }
         let _ = host.kinds();
     }
@@ -1370,11 +1382,8 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 PreparedInput::Handled => {}
                 PreparedInput::Ready { text, images } => {
                     agent.prompt_with(&text, &images);
-                    let (reply, events) = complete_prompt(parsed, agent);
+                    let (reply, events) = complete_prompt_with_host(parsed, agent, None, json_mode);
                     last_reply = reply;
-                    if json_mode {
-                        write_print_json_events(&events)?;
-                    }
                     all_events.extend(events);
                 }
             }
@@ -1388,11 +1397,8 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             PreparedInput::Handled => {}
             PreparedInput::Ready { text, images } => {
                 agent.prompt_with(&text, &images);
-                let (reply, events) = complete_prompt(parsed, agent);
+                let (reply, events) = complete_prompt_with_host(parsed, agent, None, json_mode);
                 last_reply = reply;
-                if json_mode {
-                    write_print_json_events(&events)?;
-                }
                 all_events.extend(events);
             }
         }
@@ -1409,16 +1415,6 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         reason: "quit".into(),
     });
     Ok(exit_code)
-}
-
-fn write_print_json_events(events: &[AgentEvent]) -> Result<(), String> {
-    for event in events {
-        println!(
-            "{}",
-            serde_json::to_string(&to_json_print_event(event)?).map_err(|err| err.to_string())?
-        );
-    }
-    Ok(())
 }
 
 /// TS `toJsonEvent` — strip cumulative `partial` snapshots from `message_update`.
@@ -1586,8 +1582,12 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 no_extensions: parsed.no_extensions,
                 ..Args::default()
             };
-            let (_reply, events) =
-                complete_prompt_with_host(&prompt_args, &mut runtime.agent, Some(host.clone()));
+            let (_reply, events) = complete_prompt_with_host(
+                &prompt_args,
+                &mut runtime.agent,
+                Some(host.clone()),
+                false,
+            );
             {
                 let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
                 let remaining: Vec<_> = std::mem::take(&mut host.ui_calls)
@@ -2474,7 +2474,17 @@ fn apply_session_action(
             )?;
             Ok(true)
         }
-        SessionAction::ExpandTools => Ok(true),
+        SessionAction::ExpandTools => {
+            session.chrome.status = format!(
+                "Tool output: {}",
+                if session.chrome.tools_expanded {
+                    "expanded"
+                } else {
+                    "collapsed"
+                }
+            );
+            Ok(true)
+        }
         SessionAction::NewSession => handle_user_line(parsed, agent, session, "/new", tui),
         SessionAction::OpenResume => {
             open_session_selector(parsed, agent, session)?;
@@ -3992,6 +4002,42 @@ fn handle_custom_overlay_input(
             session.chrome.status = format!("Custom UI error: {err}");
         }
     }
+}
+
+fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut ExtensionHost) {
+    let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+    if !parsed.no_skills {
+        let mut roots = vec![agent.cwd.join(".pi").join("skills")];
+        if let Some(extra) = &settings.skills {
+            roots.extend(extra.iter().map(PathBuf::from));
+        }
+        for pkg in &settings.packages {
+            roots.extend(settings::collect_package_resources(pkg, "skills"));
+        }
+        agent.skills = discover_skills(&roots);
+    }
+    if !parsed.no_prompt_templates {
+        let mut roots = vec![agent.cwd.join(".pi").join("prompts")];
+        if let Some(extra) = &settings.prompts {
+            roots.extend(extra.iter().map(PathBuf::from));
+        }
+        for pkg in &settings.packages {
+            roots.extend(settings::collect_package_resources(pkg, "prompts"));
+        }
+        agent.templates = discover_prompt_templates(&roots);
+    }
+    agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
+    *host = loaded_extension_host(parsed);
+    host.runtime_flag_values = flag_values_json(parsed);
+    let mut names = parsed.extensions.clone();
+    names.extend(extensions::extension_tool_names(&host.manifests));
+    for ext in &host.js {
+        names.extend(ext.tools.iter().cloned());
+        names.extend(ext.commands.iter().cloned());
+    }
+    agent.apply_extension_tools(&names);
+    attach_tool_executor(agent, host);
+    host.emit(ExtensionEvent::SessionStart);
 }
 
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
@@ -6466,6 +6512,36 @@ mod tests {
             .iter()
             .any(|line| line.role == "exec" && line.text == "ok"));
         assert!(chrome.status.contains("newSession") || chrome.status.contains("model="));
+    }
+
+    #[test]
+    fn rebind_print_extensions_rediscovers_skills_and_emits_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".pi").join("skills").join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo skill\n---\n# Demo\n",
+        )
+        .unwrap();
+        let mut agent = Agent::new("x");
+        agent.cwd = dir.path().to_path_buf();
+        let parsed = Args::default();
+        let mut host = ExtensionHost::default();
+        rebind_print_extensions(&parsed, &mut agent, &mut host);
+        assert!(
+            agent.skills.iter().any(|skill| skill.name == "demo"),
+            "print-mode rebind should rediscover project skills: {:?}",
+            agent
+                .skills
+                .iter()
+                .map(|skill| &skill.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(host
+            .events
+            .iter()
+            .any(|event| { matches!(event, crate::extension_host::ExtensionEvent::SessionStart) }));
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub struct Transcript {
     pub scroll: usize,
     pub mermaid_mode: MermaidMode,
     pub hide_thinking_block: bool,
+    pub tools_expanded: bool,
     pub renderers: crate::custom_message::MessageRendererRegistry,
     pub extra_transformers: Vec<fn(&str, &str, usize) -> String>,
     pub code_block_indent: String,
@@ -29,6 +30,7 @@ impl Default for Transcript {
             scroll: 0,
             mermaid_mode: MermaidMode::Streaming,
             hide_thinking_block: false,
+            tools_expanded: false,
             renderers: crate::custom_message::MessageRendererRegistry::default(),
             extra_transformers: Vec::new(),
             code_block_indent: DEFAULT_CODE_BLOCK_INDENT.into(),
@@ -91,6 +93,7 @@ impl Component for Transcript {
                     .split_once('\n')
                     .unwrap_or((line.text.as_str(), ""));
                 let mut message = CustomMessage::new(custom_type, content);
+                message.set_expanded(self.tools_expanded);
                 message.code_block_indent = self.code_block_indent.clone();
                 message.renderer_lines = line.custom_lines.clone();
                 if message.renderer_lines.is_none() {
