@@ -22,6 +22,8 @@ pub fn provider_display_name(id: &str) -> &'static str {
         "groq" => "Groq",
         "deepseek" => "DeepSeek",
         "xai" => "xAI",
+        "kimi-coding" => "Kimi Code",
+        "radius" => "Radius",
         "google-vertex" => "Google Vertex",
         "azure-openai-responses" => "Azure OpenAI",
         other => Box::leak(other.to_string().into_boxed_str()),

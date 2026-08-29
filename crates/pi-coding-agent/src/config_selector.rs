@@ -373,6 +373,7 @@ impl ConfigSelector {
             search: Input {
                 value: String::new(),
                 placeholder: "Search resources".into(),
+                ..Input::default()
             },
             filtered: Vec::new(),
             selected: 0,

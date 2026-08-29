@@ -10,6 +10,7 @@ mod extension_ui;
 mod extensions;
 mod interactive;
 mod login;
+mod login_dialog;
 mod package_manager;
 mod rpc;
 mod self_update;

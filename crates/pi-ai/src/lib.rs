@@ -3,6 +3,8 @@
 pub mod auth;
 pub mod catalog;
 pub mod cost;
+pub mod device_code;
+pub mod device_oauth;
 pub mod events;
 pub mod http;
 pub mod oauth;
@@ -23,6 +25,14 @@ pub use catalog::{
     builtin_providers, flatten_catalog, get_builtin_model, list_models, Model, ModelCost,
 };
 pub use cost::usage_cost;
+pub use device_code::{
+    poll_oauth_device_code_flow, DevicePollOptions, DevicePollResult, CANCEL_MESSAGE,
+    SLOW_DOWN_TIMEOUT_MESSAGE, TIMEOUT_MESSAGE,
+};
+pub use device_oauth::{
+    device_info_from_json, is_device_oauth_provider, login_device_oauth, oauth_login_label,
+    prefers_device_login, start_device_authorization, supports_device_oauth, DeviceCodeInfo,
+};
 pub use events::{AssistantMessage, AssistantMessageEvent, StopReason};
 pub use oauth::{
     authorize_url, oauth_app, oauth_needs_refresh, parse_token_response, refresh_oauth_token,

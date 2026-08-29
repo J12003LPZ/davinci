@@ -1,11 +1,13 @@
 //! Interactive /login and /logout matching TypeScript login dialogs and OAuth.
 
+use crate::login_dialog::{LoginDialog, LoginDialogKind};
 use pi_ai::auth::{AuthStorage, Credential, FileAuthStorage};
 use pi_ai::oauth::oauth_app;
 use pi_ai::oauth_flow::{
     anthropic_authorize_url, anthropic_redirect_uri, fixture_authorization_input, generate_pkce,
 };
 use pi_ai::providers::{all_providers, provider_display_name};
+use pi_ai::{login_device_oauth, oauth_login_label, prefers_device_login, DeviceCodeInfo};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -102,12 +104,22 @@ pub fn find_login_providers(provider_ref: &str) -> Vec<LoginProvider> {
 }
 
 pub fn render_auth_type_selector(provider_name: Option<&str>) -> String {
+    render_auth_type_selector_for(None, provider_name)
+}
+
+pub fn render_auth_type_selector_for(
+    provider_id: Option<&str>,
+    provider_name: Option<&str>,
+) -> String {
+    let oauth_label = provider_id
+        .and_then(oauth_login_label)
+        .unwrap_or(OAUTH_LOGIN_LABEL);
     let title = if let Some(name) = provider_name {
         format!("Select authentication method for {name}:")
     } else {
         "Select authentication method:".into()
     };
-    format!("1. {OAUTH_LOGIN_LABEL}\n2. {API_KEY_LOGIN_LABEL}\n{title}\n")
+    format!("1. {oauth_label}\n2. {API_KEY_LOGIN_LABEL}\n{title}\n")
 }
 
 pub fn render_login_provider_list(auth_type: LoginAuthType) -> String {
@@ -153,6 +165,13 @@ pub fn render_login_dialog(
     lines.join("\n") + "\n"
 }
 
+pub fn render_device_login_dialog(provider_name: &str, info: &DeviceCodeInfo) -> String {
+    let mut dialog = LoginDialog::new("", provider_name, LoginDialogKind::Device);
+    dialog.show_device_code(info);
+    dialog.show_waiting("Waiting for authentication...");
+    dialog.render()
+}
+
 fn store_credential(
     agent_dir: &Path,
     provider: &str,
@@ -193,7 +212,26 @@ pub fn login_api_key(
     ))
 }
 
+pub fn login_device(agent_dir: &Path, provider: &str) -> Result<String, String> {
+    let name = provider_display_name(provider);
+    let enterprise = std::env::var("PI_LOGIN_ENTERPRISE_DOMAIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (credential, info) = login_device_oauth(provider, enterprise.as_deref())?;
+    let path = store_credential(agent_dir, provider, credential)?;
+    Ok(format!(
+        "{}Logged in to {name}. Credentials saved to {}\nEnter code: {}",
+        render_device_login_dialog(name, &info),
+        path.display(),
+        info.user_code
+    ))
+}
+
 pub fn login_oauth(agent_dir: &Path, provider: &str) -> Result<String, String> {
+    if prefers_device_login(provider, None) {
+        return login_device(agent_dir, provider);
+    }
     let name = provider_display_name(provider);
     let pkce = generate_pkce();
     let (url, token_url, client_id, extra) = if provider == "anthropic" {
@@ -316,18 +354,231 @@ pub fn handle_login_command(agent_dir: &Path, args: &str) -> Result<String, Stri
             };
             login_api_key(agent_dir, &provider, key)
         }
-        LoginAuthType::Oauth => match login_oauth(agent_dir, &provider) {
-            Ok(message) => Ok(format!(
-                "{}{message}",
-                render_login_dialog(
-                    &name,
-                    None,
-                    Some("Complete login in your browser. If the browser is on another machine, paste the final redirect URL here."),
-                )
-            )),
-            Err(err) if err == login_cancelled_message() => Ok(login_cancelled_message().into()),
-            Err(err) => Err(format!("Failed to login to {name}: {err}")),
-        },
+        LoginAuthType::Oauth => {
+            if prefers_device_login(&provider, Some(rest).filter(|value| !value.is_empty())) {
+                match login_device(agent_dir, &provider) {
+                    Ok(message) => return Ok(message),
+                    Err(err) if err == login_cancelled_message() => {
+                        return Ok(login_cancelled_message().into())
+                    }
+                    Err(err) => return Err(format!("Failed to login to {name}: {err}")),
+                }
+            }
+            match login_oauth(agent_dir, &provider) {
+                Ok(message) => Ok(format!(
+                    "{}{message}",
+                    render_login_dialog(
+                        &name,
+                        None,
+                        Some("Complete login in your browser. If the browser is on another machine, paste the final redirect URL here."),
+                    )
+                )),
+                Err(err) if err == login_cancelled_message() => Ok(login_cancelled_message().into()),
+                Err(err) => Err(format!("Failed to login to {name}: {err}")),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum LoginStart {
+    Message(String),
+    Dialog(LoginDialog),
+}
+
+pub fn begin_interactive_login(agent_dir: &Path, args: &str) -> Result<LoginStart, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty()
+        || trimmed == OAUTH_LOGIN_LABEL
+        || trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("oauth")
+        || trimmed == API_KEY_LOGIN_LABEL
+        || trimmed == "2"
+        || trimmed.eq_ignore_ascii_case("api_key")
+    {
+        return handle_login_command(agent_dir, args).map(LoginStart::Message);
+    }
+    let (provider_ref, rest) = trimmed
+        .split_once(' ')
+        .map(|(left, right)| (left, right.trim()))
+        .unwrap_or((trimmed, ""));
+    let matches = find_login_providers(provider_ref);
+    if matches.is_empty() {
+        return Err("usage: /login <provider>".into());
+    }
+    let ids: std::collections::BTreeSet<_> = matches.iter().map(|p| p.id.clone()).collect();
+    if ids.len() > 1 || (matches.len() > 1 && rest.is_empty()) {
+        return handle_login_command(agent_dir, args).map(LoginStart::Message);
+    }
+    let auth_type = if rest.eq_ignore_ascii_case("oauth") || rest == OAUTH_LOGIN_LABEL {
+        LoginAuthType::Oauth
+    } else if rest.eq_ignore_ascii_case("api_key") || rest == API_KEY_LOGIN_LABEL {
+        LoginAuthType::ApiKey
+    } else if matches.len() == 1 {
+        matches[0].auth_type
+    } else {
+        LoginAuthType::ApiKey
+    };
+    let provider = matches[0].id.clone();
+    let name = matches[0].name.clone();
+    match auth_type {
+        LoginAuthType::ApiKey => {
+            let key = if rest.is_empty()
+                || rest.eq_ignore_ascii_case("api_key")
+                || rest == API_KEY_LOGIN_LABEL
+                || rest.eq_ignore_ascii_case("oauth")
+                || rest == OAUTH_LOGIN_LABEL
+            {
+                None
+            } else {
+                Some(rest)
+            };
+            if key.is_some() || std::env::var("PI_LOGIN_API_KEY").is_ok() {
+                return login_api_key(agent_dir, &provider, key).map(LoginStart::Message);
+            }
+            let mut dialog = LoginDialog::new(&provider, &name, LoginDialogKind::ApiKey)
+                .with_title(format!("Login to {name}"));
+            if provider == "amazon-bedrock" {
+                dialog.show_details(&[
+                    "You can also use an AWS profile, IAM keys, or role-based credentials.".into(),
+                    "See:".into(),
+                ]);
+                dialog.show_info("Authentication can also use the environment.", &[], false);
+            }
+            dialog.show_prompt("Enter API key", None);
+            Ok(LoginStart::Dialog(dialog))
+        }
+        LoginAuthType::Oauth => {
+            if prefers_device_login(&provider, Some(rest).filter(|value| !value.is_empty()))
+                && (std::env::var("PI_OAUTH_DEVICE_FIXTURE").is_ok()
+                    || std::env::var("PI_OAUTH_TOKEN_FIXTURE").is_ok())
+            {
+                return login_device(agent_dir, &provider).map(LoginStart::Message);
+            }
+            if prefers_device_login(&provider, Some(rest).filter(|value| !value.is_empty())) {
+                let enterprise = std::env::var("PI_LOGIN_ENTERPRISE_DOMAIN")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                match pi_ai::start_device_authorization(&provider, enterprise.as_deref()) {
+                    Ok(info) => {
+                        let mut dialog =
+                            LoginDialog::new(&provider, &name, LoginDialogKind::Device);
+                        dialog.show_device_code(&info);
+                        dialog.show_waiting("Waiting for authentication...");
+                        return Ok(LoginStart::Dialog(dialog));
+                    }
+                    Err(_) if enterprise.is_none() && provider == "github-copilot" => {
+                        let mut dialog =
+                            LoginDialog::new(&provider, &name, LoginDialogKind::Device);
+                        dialog.show_prompt(
+                            "GitHub Enterprise URL/domain (blank for github.com)",
+                            Some("company.ghe.com"),
+                        );
+                        return Ok(LoginStart::Dialog(dialog));
+                    }
+                    Err(err) => return Err(format!("Failed to login to {name}: {err}")),
+                }
+            }
+            if fixture_authorization_input().is_some()
+                || std::env::var("PI_OAUTH_TOKEN_FIXTURE").is_ok()
+            {
+                return login_oauth(agent_dir, &provider).map(LoginStart::Message);
+            }
+            let mut dialog = LoginDialog::new(&provider, &name, LoginDialogKind::OauthPaste);
+            let pkce = generate_pkce();
+            dialog.oauth_state = Some(pkce.verifier.clone());
+            let url = if provider == "anthropic" {
+                anthropic_authorize_url(&pkce)
+            } else {
+                pi_ai::authorize_url(&provider, &anthropic_redirect_uri(), &pkce.verifier)
+                    .unwrap_or_else(|| anthropic_authorize_url(&pkce))
+            };
+            open_browser(&url);
+            dialog.show_progress("Listening for OAuth callback on http://localhost:53692/callback");
+            dialog.show_auth(
+                &url,
+                Some("Complete login in your browser. If the browser is on another machine, paste the final redirect URL here."),
+            );
+            dialog.show_manual_input(
+                "Complete login in your browser, or paste the authorization code / redirect URL here:",
+            );
+            Ok(LoginStart::Dialog(dialog))
+        }
+    }
+}
+
+pub fn login_oauth_with_input(
+    agent_dir: &Path,
+    provider: &str,
+    input: &str,
+    expected_state: Option<&str>,
+) -> Result<String, String> {
+    let name = provider_display_name(provider);
+    let pkce = generate_pkce();
+    let state = expected_state.unwrap_or(&pkce.verifier);
+    let (code, submitted_state) = pi_ai::parse_authorization_input(input);
+    let code = code.ok_or_else(|| "Missing authorization code".to_string())?;
+    let submitted_state = submitted_state.unwrap_or_else(|| state.to_string());
+    if submitted_state != state {
+        return Err("OAuth state mismatch".into());
+    }
+    let (token_url, client_id, include_state) = if provider == "anthropic" {
+        (
+            pi_ai::oauth_flow::ANTHROPIC_TOKEN_URL.to_string(),
+            pi_ai::oauth_flow::ANTHROPIC_CLIENT_ID.to_string(),
+            true,
+        )
+    } else {
+        let app = oauth_app(provider).ok_or_else(|| "No login methods available.".to_string())?;
+        (app.token_url, app.client_id, false)
+    };
+    let mut body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code": code,
+        "redirect_uri": anthropic_redirect_uri(),
+        "code_verifier": state,
+    });
+    if include_state {
+        body["state"] = serde_json::Value::String(submitted_state);
+    }
+    let credential = pi_ai::oauth_flow::exchange_authorization_code(&token_url, &body)
+        .map_err(|err| err.to_string())?;
+    let path = store_credential(agent_dir, provider, credential)?;
+    Ok(format!(
+        "Logged in to {name}. Credentials saved to {}",
+        path.display()
+    ))
+}
+
+pub fn complete_login_dialog(
+    agent_dir: &Path,
+    dialog: &LoginDialog,
+    submitted: &str,
+) -> Result<String, String> {
+    match dialog.kind {
+        LoginDialogKind::ApiKey => login_api_key(agent_dir, &dialog.provider_id, Some(submitted)),
+        LoginDialogKind::OauthPaste => login_oauth_with_input(
+            agent_dir,
+            &dialog.provider_id,
+            submitted,
+            dialog.oauth_state.as_deref(),
+        ),
+        LoginDialogKind::Device if dialog.provider_id == "github-copilot" => login_device_oauth(
+            &dialog.provider_id,
+            Some(submitted.trim()).filter(|value| !value.is_empty()),
+        )
+        .and_then(|(credential, info)| {
+            let path = store_credential(agent_dir, &dialog.provider_id, credential)?;
+            Ok(format!(
+                "{}Logged in to {}. Credentials saved to {}",
+                render_device_login_dialog(provider_display_name(&dialog.provider_id), &info),
+                provider_display_name(&dialog.provider_id),
+                path.display()
+            ))
+        }),
+        LoginDialogKind::Device => login_device(agent_dir, &dialog.provider_id),
     }
 }
 
@@ -355,6 +606,7 @@ pub fn login_cancelled_message() -> &'static str {
 mod tests {
     use super::*;
     use crate::settings;
+    use pi_tui::keys::Key;
     use tempfile::tempdir;
 
     #[test]
@@ -406,5 +658,55 @@ mod tests {
         assert!(raw.contains("tok"));
         std::env::remove_var("PI_OAUTH_CALLBACK_URL");
         std::env::remove_var("PI_OAUTH_TOKEN_FIXTURE");
+    }
+
+    #[test]
+    fn device_code_login_uses_fixtures() {
+        let _lock = settings::test_env_lock();
+        let dir = tempdir().unwrap();
+        let device = dir.path().join("device.json");
+        std::fs::write(
+            &device,
+            r#"{"device_code":"dev","user_code":"ABCD-1234","verification_uri":"https://github.com/login/device","expires_in":900,"interval":1}"#,
+        )
+        .unwrap();
+        let token = dir.path().join("token.json");
+        std::fs::write(
+            &token,
+            r#"{"access_token":"gh-tok","refresh_token":"gh-ref","expires_in":3600}"#,
+        )
+        .unwrap();
+        std::env::set_var("PI_OAUTH_DEVICE_FIXTURE", &device);
+        std::env::set_var("PI_OAUTH_TOKEN_FIXTURE", &token);
+        std::env::set_var("PI_OAUTH_DEVICE_SLEEP_MS", "0");
+        let saved = handle_login_command(dir.path(), "github-copilot oauth").unwrap();
+        assert!(saved.contains("Enter code: ABCD-1234"));
+        assert!(saved.contains("Waiting for authentication..."));
+        assert!(saved.contains("Logged in to GitHub Copilot"));
+        let raw = std::fs::read_to_string(auth_path(dir.path())).unwrap();
+        assert!(raw.contains("gh-tok"));
+        std::env::remove_var("PI_OAUTH_DEVICE_FIXTURE");
+        std::env::remove_var("PI_OAUTH_TOKEN_FIXTURE");
+        std::env::remove_var("PI_OAUTH_DEVICE_SLEEP_MS");
+    }
+
+    #[test]
+    fn interactive_api_key_login_opens_focused_input_dialog() {
+        let _lock = settings::test_env_lock();
+        std::env::remove_var("PI_LOGIN_API_KEY");
+        let dir = tempdir().unwrap();
+        match begin_interactive_login(dir.path(), "anthropic api_key").unwrap() {
+            LoginStart::Dialog(mut dialog) => {
+                let rendered = dialog.render();
+                assert!(rendered.contains("Login to Anthropic"));
+                assert!(rendered.contains("Enter API key"));
+                assert!(dialog.focused());
+                assert_eq!(
+                    dialog.handle_key(&Key::Escape),
+                    crate::login_dialog::LoginDialogAction::Cancelled
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

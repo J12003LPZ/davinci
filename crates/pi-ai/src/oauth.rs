@@ -50,6 +50,41 @@ pub fn oauth_app(provider: &str) -> Option<OAuthApp> {
             client_id: "Iv1.b507a08c87ecfe98".into(),
             scopes: vec!["read:user".into()],
         },
+        "xai" => OAuthApp {
+            provider: provider.into(),
+            authorize_url: "https://auth.x.ai/oauth2/device/code".into(),
+            token_url: "https://auth.x.ai/oauth2/token".into(),
+            client_id: "b1a00492-073a-47ea-816f-4c329264a828".into(),
+            scopes: vec![
+                "openid".into(),
+                "profile".into(),
+                "email".into(),
+                "offline_access".into(),
+                "grok-cli:access".into(),
+                "api:access".into(),
+            ],
+        },
+        "kimi-coding" => OAuthApp {
+            provider: provider.into(),
+            authorize_url: "https://auth.kimi.com/api/oauth/device_authorization".into(),
+            token_url: "https://auth.kimi.com/api/oauth/token".into(),
+            client_id: "17e5f671-d194-4dfb-9706-5516cb48c098".into(),
+            scopes: vec![],
+        },
+        "openrouter" => OAuthApp {
+            provider: provider.into(),
+            authorize_url: "https://openrouter.ai/auth".into(),
+            token_url: "https://openrouter.ai/api/v1/auth/keys".into(),
+            client_id: "pi".into(),
+            scopes: vec![],
+        },
+        "radius" => OAuthApp {
+            provider: provider.into(),
+            authorize_url: "https://radius.pi.dev/v1/oauth".into(),
+            token_url: "https://radius.pi.dev/v1/oauth/token".into(),
+            client_id: "pi-gateway".into(),
+            scopes: vec!["gateway".into(), "offline_access".into()],
+        },
         _ => return None,
     })
 }
@@ -67,7 +102,7 @@ pub fn authorize_url(provider: &str, redirect_uri: &str, state: &str) -> Option<
     ))
 }
 
-fn urlencoding_lite(value: &str) -> String {
+pub(crate) fn urlencoding_lite(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {
         match ch {
@@ -183,6 +218,10 @@ pub fn providers_with_oauth() -> HashMap<&'static str, OAuthApp> {
         "openai-codex",
         "google",
         "github-copilot",
+        "xai",
+        "kimi-coding",
+        "openrouter",
+        "radius",
     ]
     .into_iter()
     .filter_map(|id| oauth_app(id).map(|app| (id, app)))

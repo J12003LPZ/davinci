@@ -28,7 +28,9 @@ pub use terminal::{
     enter_raw_mode, leave_alt_screen, leave_raw_mode, set_title, TuiMode,
 };
 pub use themes::Theme;
-pub use widgets::{BoxWidget, HStack, Input, ScrollView, SettingsList, VStack};
+pub use widgets::{
+    BoxWidget, HStack, Input, InputAction, ScrollView, SettingsList, VStack, CURSOR_MARKER,
+};
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,8 @@
 
 use crate::commands;
 use crate::extensions::{self, Extension};
-use crate::login;
+use crate::login::{self, LoginStart};
+use crate::login_dialog::{LoginDialog, LoginDialogAction};
 use crate::session_runtime::{to_json_event, SessionRuntime};
 use crate::settings;
 use crate::slash::{self, BUILTIN_SLASH_COMMANDS};
@@ -28,6 +29,7 @@ pub struct InteractiveMode {
     pub auto_approve: bool,
     pub last_json_events: Vec<serde_json::Value>,
     trust_selector: Option<TrustSelector>,
+    login_dialog: Option<LoginDialog>,
 }
 
 impl InteractiveMode {
@@ -58,6 +60,7 @@ impl InteractiveMode {
             auto_approve: true,
             last_json_events: Vec::new(),
             trust_selector: None,
+            login_dialog: None,
         }
     }
 
@@ -174,7 +177,12 @@ impl InteractiveMode {
                 .into_iter()
                 .map(|line| format!(" {line}")),
         );
-        lines.extend(self.editor.render(self.tui.columns));
+        if let Some(dialog) = &self.login_dialog {
+            let _ = (dialog.focused(), dialog.input_value());
+            lines.extend(dialog.render().lines().map(str::to_string));
+        } else {
+            lines.extend(self.editor.render(self.tui.columns));
+        }
         self.tui.add_child_lines(lines);
         self.tui.render_now(force)
     }
@@ -452,8 +460,12 @@ impl InteractiveMode {
                         .push("error", format!("Unknown trust option: {args}"));
                 }
             }
-            "login" => match login::handle_login_command(&commands::agent_dir(), args) {
-                Ok(message) => self.chat.push("system", message),
+            "login" => match login::begin_interactive_login(&commands::agent_dir(), args) {
+                Ok(LoginStart::Message(message)) => self.chat.push("system", message),
+                Ok(LoginStart::Dialog(dialog)) => {
+                    self.chat.push("system", dialog.render());
+                    self.login_dialog = Some(dialog);
+                }
                 Err(err) => self.chat.push("error", err),
             },
             "logout" => match login::handle_logout_command(&commands::agent_dir(), args) {
@@ -576,6 +588,20 @@ impl InteractiveMode {
     }
 
     pub fn handle_line(&mut self, line: &str) -> Result<bool, String> {
+        if self.login_dialog.is_some() {
+            if line == "\u{1b}" || line.eq_ignore_ascii_case("escape") {
+                let _ = self.apply_login_dialog_key(&Key::Escape);
+                return Ok(false);
+            }
+            if let Some(dialog) = self.login_dialog.as_mut() {
+                dialog.set_focused(true);
+                for ch in line.chars() {
+                    let _ = dialog.handle_key(&Key::Char(ch));
+                }
+            }
+            let _ = self.apply_login_dialog_key(&Key::Enter);
+            return Ok(false);
+        }
         if let Some((_, hit)) = self.tui.hit_test_mouse(line) {
             self.runtime
                 .bus
@@ -646,6 +672,32 @@ impl InteractiveMode {
         Ok(false)
     }
 
+    fn apply_login_dialog_key(&mut self, key: &Key) -> bool {
+        let Some(dialog) = self.login_dialog.as_mut() else {
+            return false;
+        };
+        match dialog.handle_key(key) {
+            LoginDialogAction::Continue => {
+                let rendered = dialog.render();
+                self.chat.push("system", rendered);
+                true
+            }
+            LoginDialogAction::Submitted(value) => {
+                let dialog = self.login_dialog.take().expect("login dialog");
+                match login::complete_login_dialog(&commands::agent_dir(), &dialog, &value) {
+                    Ok(message) => self.chat.push("system", message),
+                    Err(err) => self.chat.push("error", err),
+                }
+                true
+            }
+            LoginDialogAction::Cancelled => {
+                self.login_dialog = None;
+                self.chat.push("system", login::login_cancelled_message());
+                true
+            }
+        }
+    }
+
     fn apply_trust_selector_key(&mut self, key: &Key) -> bool {
         let Some(selector) = self.trust_selector.as_mut() else {
             return false;
@@ -684,6 +736,9 @@ impl InteractiveMode {
     }
 
     pub fn handle_key(&mut self, key: &Key) -> Result<bool, String> {
+        if self.apply_login_dialog_key(key) {
+            return Ok(false);
+        }
         if self.apply_trust_selector_key(key) {
             return Ok(false);
         }
