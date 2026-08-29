@@ -1,12 +1,12 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (Codex websocket protocol). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (ICU4X CJK dictionary word-nav). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
 ## What landed
 
-- Workspace on rustc **1.83.0**, edition 2021, pinned clap/uuid/tempfile/thiserror/ureq/url/rustls/webpki/zeroize (+ sha2 for PKCE, fancy-regex 0.14.0, image 0.25.6).
+- Workspace on rustc **1.83.0**, edition 2021, pinned clap/uuid/tempfile/thiserror/ureq/url/rustls/webpki/zeroize (+ sha2 for PKCE, fancy-regex 0.14.0, image 0.25.6, icu_segmenter 1.5.0 compiled_data).
 - `vendor/pi` kept as the TypeScript behavioral spec (not deleted).
 - **pi-protocol**: TS CBOR subset, 4-byte framing, hello/request/response, error strings locked to TS tests.
 - **pi-session / pi-session-sqlite**: JSONL v4, v3→v4 migrate, cwd-encoded discovery (`~/.pi`, `--session-dir`), continue/resume/fork/clone, FTS, writer leases, `001_initial.sql`. Entry types include TS `label`, `session_info`, and `custom_message`. `set_name` clears metadata when the name is empty.
@@ -87,6 +87,8 @@ Closed this slice: JSONL-on-disk `SessionRepo` (`vendor/pi/packages/agent/src/ha
 
 Closed this slice: Codex websocket protocol from `openai-codex-responses.ts` — `resolveCodexUrl` / `resolveCodexWebSocketUrl` (`/codex/responses`, https→wss), JWT `chatgpt_account_id`, SSE headers (`OpenAI-Beta: responses=experimental`, `originator: pi`, `chatgpt-account-id`) and WS headers (`OpenAI-Beta: responses_websockets=2026-02-06`, stripped from handshake like TS), session cache + continuation input deltas + debug stats, connection-limit / missing-`previous_response_id` retries, SSE fallback before first event, idle/connect timeout strings, RFC 6455 client (loopback tests + rustls `wss` for live ChatGPT). Compaction `complete_simple` sends `cacheRetention: none`. Tests use `PI_CODEX_WS_REPLY` / localhost only.
 
+Closed this slice: TUI CJK word segmentation uses ICU4X `WordSegmenter::new_dictionary` on CJK runs (real dictionary, not pair-grouping). Locks TS `你好|世界`, `你好，世界`, mixed `hello你好，world世界`, and Input Ctrl+W `你好世界。你好，世界`. ASCII word-nav fixtures are unchanged (TS punctuation splitter). Editor word-move/delete uses the same path.
+
 Still not product-equivalent:
 
-- Intl.Segmenter CJK dictionary grouping in the TUI editor/input (`你好|世界`) is still walk-to-boundary. Word-nav tests lock per-character CJK (TS `word-navigation.test.ts`). No in-repo ICU; pair-grouping is not invented.
+- None from the prior documented backlog. TypeScript under `vendor/pi` remains the behavioral spec.

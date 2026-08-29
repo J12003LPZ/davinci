@@ -1,4 +1,10 @@
 //! Word cursor movement matching TS `word-navigation.ts`.
+//!
+//! ASCII runs keep the TS punctuation splitter. CJK runs use ICU4X
+//! `WordSegmenter::new_dictionary` (the same dictionary model `Intl.Segmenter`
+//! uses for Chinese/Japanese), not per-character or pair-grouping.
+
+use icu_segmenter::WordSegmenter;
 
 /// ASCII punctuation used as intra-word boundaries (`PUNCTUATION_REGEX`).
 const PUNCTUATION: &[char] = &[
@@ -34,11 +40,11 @@ pub fn default_word_segments(text: &str) -> Vec<WordSegment> {
             continue;
         }
         if is_cjk(ch) {
-            segments.push(WordSegment {
-                text: ch.to_string(),
-                is_word_like: true,
-                is_atomic: false,
-            });
+            let mut run = ch.to_string();
+            while chars.peek().is_some_and(|next| is_cjk(*next)) {
+                run.push(chars.next().expect("peeked"));
+            }
+            segments.extend(dictionary_cjk_segments(&run));
             continue;
         }
         if is_word_char(ch) {
@@ -78,6 +84,36 @@ fn is_cjk(ch: char) -> bool {
         ch as u32,
         0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F
     )
+}
+
+fn dictionary_cjk_segments(run: &str) -> Vec<WordSegment> {
+    if run.is_empty() {
+        return Vec::new();
+    }
+    let segmenter = WordSegmenter::new_dictionary();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (end, word_type) in segmenter.segment_str(run).iter_with_word_type() {
+        if end <= start {
+            continue;
+        }
+        let text = run[start..end].to_string();
+        let is_word_like = word_type.is_word_like() || text.chars().any(is_cjk);
+        segments.push(WordSegment {
+            text,
+            is_word_like,
+            is_atomic: false,
+        });
+        start = end;
+    }
+    if segments.is_empty() {
+        segments.push(WordSegment {
+            text: run.to_string(),
+            is_word_like: true,
+            is_atomic: false,
+        });
+    }
+    segments
 }
 
 fn last_punctuation_end(segment: &str) -> Option<usize> {
@@ -231,21 +267,68 @@ mod tests {
     }
 
     #[test]
-    fn cjk_walks_to_boundaries() {
+    fn cjk_dictionary_matches_ts_word_navigation() {
         let text = "你好世界 test";
-        let mut pos = text.len();
-        while pos > 0 {
-            let next = find_word_backward_default(text, pos);
-            assert!(next < pos);
-            pos = next;
-        }
-        pos = 0;
+        assert_eq!(
+            default_word_segments("你好世界")
+                .into_iter()
+                .map(|segment| segment.text)
+                .collect::<Vec<_>>(),
+            ["你好", "世界"]
+        );
+        assert_eq!(
+            find_word_backward_default(text, text.len()),
+            "你好世界 ".len()
+        );
+        assert_eq!(
+            find_word_backward_default(text, "你好世界 ".len()),
+            "你好".len()
+        );
+        assert_eq!(find_word_backward_default(text, "你好".len()), 0);
+        assert_eq!(find_word_forward_default(text, 0), "你好".len());
+        let mut pos = 0;
         while pos < text.len() {
             let next = find_word_forward_default(text, pos);
             assert!(next > pos);
             pos = next;
         }
         assert_eq!(pos, text.len());
+    }
+
+    #[test]
+    fn cjk_editor_punctuation_matches_ts() {
+        let text = "你好，世界";
+        assert_eq!(find_word_backward_default(text, text.len()), "你好，".len());
+        assert_eq!(
+            find_word_backward_default(text, "你好，".len()),
+            "你好".len()
+        );
+        assert_eq!(find_word_backward_default(text, "你好".len()), 0);
+        assert_eq!(find_word_forward_default(text, 0), "你好".len());
+        assert_eq!(
+            find_word_forward_default(text, "你好".len()),
+            "你好，".len()
+        );
+        assert_eq!(find_word_forward_default(text, "你好，".len()), text.len());
+
+        let mixed = "hello你好，world世界";
+        assert_eq!(
+            find_word_backward_default(mixed, mixed.len()),
+            "hello你好，world".len()
+        );
+        assert_eq!(
+            find_word_backward_default(mixed, "hello你好，world".len()),
+            "hello你好，".len()
+        );
+        assert_eq!(
+            find_word_backward_default(mixed, "hello你好，".len()),
+            "hello你好".len()
+        );
+        assert_eq!(
+            find_word_backward_default(mixed, "hello你好".len()),
+            "hello".len()
+        );
+        assert_eq!(find_word_backward_default(mixed, "hello".len()), 0);
     }
 
     #[test]

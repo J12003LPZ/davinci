@@ -332,6 +332,34 @@ mod tests {
         editor.move_left();
         editor.delete_forward();
         assert_eq!(editor.buffer, "fobar");
+
+        editor.set_text("你好，世界");
+        editor.move_word_backwards();
+        assert_eq!(editor.cursor, "你好，".len());
+        editor.move_word_backwards();
+        assert_eq!(editor.cursor, "你好".len());
+        editor.move_word_backwards();
+        assert_eq!(editor.cursor, 0);
+        editor.move_word_forwards();
+        assert_eq!(editor.cursor, "你好".len());
+        editor.move_word_forwards();
+        assert_eq!(editor.cursor, "你好，".len());
+        editor.move_word_forwards();
+        assert_eq!(editor.cursor, editor.buffer.len());
+
+        editor.set_text("你好世界。你好，世界");
+        editor.delete_word_backwards();
+        assert_eq!(editor.buffer, "你好世界。你好，");
+        editor.delete_word_backwards();
+        assert_eq!(editor.buffer, "你好世界。你好");
+        editor.delete_word_backwards();
+        assert_eq!(editor.buffer, "你好世界。");
+        editor.delete_word_backwards();
+        assert_eq!(editor.buffer, "你好世界");
+        editor.delete_word_backwards();
+        assert_eq!(editor.buffer, "你好");
+        editor.delete_word_backwards();
+        assert_eq!(editor.buffer, "");
     }
 
     #[test]
