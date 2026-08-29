@@ -11,6 +11,7 @@ pub mod mouse;
 pub mod screen;
 pub mod selectors;
 pub mod terminal;
+pub mod terminal_image;
 pub mod themes;
 pub mod widgets;
 pub mod word_nav;
@@ -18,7 +19,7 @@ pub mod word_nav;
 pub use component::{wrap_text_with_ansi, Component, Text};
 pub use diff::{
     apply_line_resets, composite_tui_line, extract_cursor_position, hardware_cursor_sequence,
-    is_image_line, normalize_terminal_output, visible_width, DiffScreen,
+    normalize_terminal_output, visible_width, DiffScreen,
 };
 pub use editor::Editor;
 pub use keys::{default_keybindings, parse_bytes, parse_key, read_key, Key, Keybinding};
@@ -30,6 +31,15 @@ pub use selectors::SelectList;
 pub use terminal::{
     disable_mouse, disable_raw_input, enable_mouse, enable_raw_input, enter_alt_screen,
     enter_raw_mode, leave_alt_screen, leave_raw_mode, set_title, TuiMode,
+};
+pub use terminal_image::{
+    calculate_image_cell_size, crop_kitty_image_line, delete_all_kitty_images,
+    delete_all_kitty_placements, delete_kitty_image, detect_capabilities, encode_iterm2,
+    encode_kitty, get_capabilities, get_kitty_image_metadata, get_kitty_image_placement, hyperlink,
+    is_image_line, register_kitty_image_metadata, render_image, reset_capabilities_cache,
+    set_capabilities, set_capability_overrides, set_cell_dimensions, CellDimensions,
+    ImageDimensions, ImageProtocol, ImageRenderOptions, KittyImageMetadata, KittyImagePlacement,
+    RenderedImage, TerminalCapabilities, ITERM2_PREFIX, KITTY_PREFIX,
 };
 pub use themes::Theme;
 pub use widgets::{

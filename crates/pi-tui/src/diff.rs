@@ -71,7 +71,7 @@ pub fn hardware_cursor_sequence(row: usize, col: usize) -> String {
 }
 
 pub fn is_image_line(line: &str) -> bool {
-    line.contains("\u{1b}_G") || line.contains("\u{1b}]1337;File=")
+    crate::terminal_image::is_image_line(line)
 }
 
 /// TypeScript `normalizeTerminalOutput`: decompose Thai/Lao AM and expand
