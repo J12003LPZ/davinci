@@ -264,7 +264,7 @@ pub fn login_oauth(agent_dir: &Path, provider: &str) -> Result<String, String> {
     } else if provider == "radius" {
         let app = oauth_app(provider).ok_or_else(|| "No login methods available.".to_string())?;
         (
-            pi_ai::radius_authorize_url(&app.authorize_url, &pkce, &pkce.verifier),
+            pi_ai::radius_browser_authorize_url(&pkce, &pkce.verifier)?,
             app.token_url,
             app.client_id,
             None,
@@ -518,9 +518,7 @@ pub fn begin_interactive_login(agent_dir: &Path, args: &str) -> Result<LoginStar
             } else if matches!(provider.as_str(), "openai-codex" | "openai") {
                 pi_ai::openai_codex_authorize_url(&pkce, &pkce.verifier)
             } else if provider == "radius" {
-                let app =
-                    oauth_app("radius").ok_or_else(|| "No login methods available.".to_string())?;
-                pi_ai::radius_authorize_url(&app.authorize_url, &pkce, &pkce.verifier)
+                pi_ai::radius_browser_authorize_url(&pkce, &pkce.verifier)?
             } else {
                 pi_ai::authorize_url(&provider, &options.redirect_uri, &pkce.verifier)
                     .unwrap_or_else(|| anthropic_authorize_url(&pkce))
@@ -759,6 +757,38 @@ mod tests {
         std::env::remove_var("PI_OAUTH_DEVICE_FIXTURE");
         std::env::remove_var("PI_OAUTH_TOKEN_FIXTURE");
         std::env::remove_var("PI_OAUTH_DEVICE_SLEEP_MS");
+    }
+
+    #[test]
+    fn radius_browser_login_uses_discovery_fixture() {
+        let _lock = settings::test_env_lock();
+        let dir = tempdir().unwrap();
+        let token = dir.path().join("token.json");
+        std::fs::write(
+            &token,
+            r#"{"access_token":"rad-tok","refresh_token":"rad-ref","expires_in":3600}"#,
+        )
+        .unwrap();
+        std::env::set_var(
+            "PI_RADIUS_OAUTH_DISCOVERY_FIXTURE",
+            r#"{"authorizationEndpoint":"https://auth.example/authorize"}"#,
+        );
+        std::env::set_var("PI_OAUTH_TOKEN_FIXTURE", &token);
+        std::env::set_var(
+            "PI_OAUTH_CALLBACK_URL",
+            "http://127.0.0.1/oauth/callback?code=abc",
+        );
+        std::env::set_var("PI_OAUTH_LOGIN_METHOD", "browser");
+        std::env::set_var("PI_DISABLE_NETWORK", "1");
+        let saved = login_oauth(dir.path(), "radius").unwrap();
+        assert!(saved.contains("Logged in to Radius"));
+        let raw = std::fs::read_to_string(auth_path(dir.path())).unwrap();
+        assert!(raw.contains("rad-tok"));
+        std::env::remove_var("PI_RADIUS_OAUTH_DISCOVERY_FIXTURE");
+        std::env::remove_var("PI_OAUTH_TOKEN_FIXTURE");
+        std::env::remove_var("PI_OAUTH_CALLBACK_URL");
+        std::env::remove_var("PI_OAUTH_LOGIN_METHOD");
+        std::env::remove_var("PI_DISABLE_NETWORK");
     }
 
     #[test]

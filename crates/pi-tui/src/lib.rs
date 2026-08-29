@@ -13,9 +13,13 @@ pub mod selectors;
 pub mod terminal;
 pub mod themes;
 pub mod widgets;
+pub mod word_nav;
 
 pub use component::{wrap_text_with_ansi, Component, Text};
-pub use diff::{composite_tui_line, visible_width, DiffScreen};
+pub use diff::{
+    apply_line_resets, composite_tui_line, extract_cursor_position, hardware_cursor_sequence,
+    is_image_line, normalize_terminal_output, visible_width, DiffScreen,
+};
 pub use editor::Editor;
 pub use keys::{default_keybindings, parse_bytes, parse_key, read_key, Key, Keybinding};
 pub use layout::{ChatView, Container, Overlay};
@@ -31,6 +35,7 @@ pub use themes::Theme;
 pub use widgets::{
     BoxWidget, HStack, Input, InputAction, ScrollView, SettingsList, VStack, CURSOR_MARKER,
 };
+pub use word_nav::{find_word_backward, find_word_forward};
 
 #[cfg(test)]
 mod tests {

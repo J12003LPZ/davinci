@@ -156,8 +156,14 @@ impl Tui {
     }
 
     pub fn render_now(&mut self, force: bool) -> String {
-        let frame = self.compose_frame();
-        self.screen.render(&frame, force)
+        let mut frame = self.compose_frame();
+        let cursor = crate::diff::extract_cursor_position(&mut frame, self.rows);
+        crate::diff::apply_line_resets(&mut frame);
+        let mut out = self.screen.render(&frame, force);
+        if let Some((row, col)) = cursor {
+            out.push_str(&crate::diff::hardware_cursor_sequence(row, col));
+        }
+        out
     }
 
     pub fn overlay_at(&self, col: usize, row: usize) -> Option<u64> {
@@ -256,5 +262,19 @@ mod tests {
         let click = format!("\u{1b}[<0;{};{}M", rect.col + 1, rect.row + 1);
         let hit = tui.hit_test_mouse(&click);
         assert!(hit.unwrap().1.is_some());
+    }
+
+    #[test]
+    fn render_now_positions_hardware_cursor_from_marker() {
+        let mut tui = Tui::new(TuiMode::Regular, 40, 3);
+        tui.add_child_lines(vec![
+            "top".into(),
+            format!("ab{}cd", crate::widgets::CURSOR_MARKER),
+            "bottom".into(),
+        ]);
+        let seq = tui.render_now(false);
+        assert!(!seq.contains(crate::widgets::CURSOR_MARKER));
+        assert!(seq.contains("\u{1b}[2;3H"));
+        assert!(seq.contains("abcd") || seq.contains("ab") && seq.contains("cd"));
     }
 }

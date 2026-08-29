@@ -2,38 +2,134 @@
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::widgets::CURSOR_MARKER;
+
 pub const SYNC_BEGIN: &str = "\u{1b}[?2026h";
 pub const SYNC_END: &str = "\u{1b}[?2026l";
 pub const SEGMENT_RESET: &str = "\u{1b}[0m\u{1b}]8;;\u{07}";
+
+fn skip_escape(chars: &mut std::iter::Peekable<impl Iterator<Item = char>>) {
+    match chars.peek() {
+        Some('[') => {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        Some(']') | Some('_') | Some('^') | Some('P') => {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\u{07}' {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 pub fn visible_width(text: &str) -> usize {
     let mut width = 0;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-                continue;
-            }
-            if chars.peek() == Some(&']') {
-                chars.next();
-                for next in chars.by_ref() {
-                    if next == '\u{07}' {
-                        break;
-                    }
-                }
-                continue;
-            }
+            skip_escape(&mut chars);
             continue;
         }
         width += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
     }
     width
+}
+
+/// TypeScript `extractCursorPosition`: scan the bottom `height` lines, strip
+/// `CURSOR_MARKER`, and return `{row, col}` where `col` is `visibleWidth` before
+/// the marker.
+pub fn extract_cursor_position(lines: &mut [String], height: usize) -> Option<(usize, usize)> {
+    if lines.is_empty() || height == 0 {
+        return None;
+    }
+    let viewport_top = lines.len().saturating_sub(height);
+    for row in (viewport_top..lines.len()).rev() {
+        if let Some(marker_index) = lines[row].find(CURSOR_MARKER) {
+            let col = visible_width(&lines[row][..marker_index]);
+            let line = &lines[row];
+            lines[row] = format!(
+                "{}{}",
+                &line[..marker_index],
+                &line[marker_index + CURSOR_MARKER.len()..]
+            );
+            return Some((row, col));
+        }
+    }
+    None
+}
+
+pub fn hardware_cursor_sequence(row: usize, col: usize) -> String {
+    format!("\u{1b}[{};{}H", row + 1, col + 1)
+}
+
+pub fn is_image_line(line: &str) -> bool {
+    line.contains("\u{1b}_G") || line.contains("\u{1b}]1337;File=")
+}
+
+/// TypeScript `normalizeTerminalOutput`: decompose Thai/Lao AM and expand
+/// visible tabs to 3 spaces without touching tabs inside escape sequences.
+pub fn normalize_terminal_output(text: &str) -> String {
+    let normalized = text
+        .replace('\u{0e33}', "\u{0e4d}\u{0e32}")
+        .replace('\u{0eb3}', "\u{0ecd}\u{0eb2}");
+    if !normalized.contains('\t') {
+        return normalized;
+    }
+    let mut out = String::new();
+    let mut chars = normalized.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            out.push(ch);
+            match chars.peek() {
+                Some('[') => {
+                    out.push('[');
+                    chars.next();
+                    for next in chars.by_ref() {
+                        out.push(next);
+                        if matches!(next, 'm' | 'G' | 'K' | 'H' | 'J') {
+                            break;
+                        }
+                    }
+                }
+                Some(kind @ (']' | '_')) => {
+                    out.push(*kind);
+                    chars.next();
+                    let mut prev_esc = false;
+                    for next in chars.by_ref() {
+                        out.push(next);
+                        if next == '\u{07}' || (prev_esc && next == '\\') {
+                            break;
+                        }
+                        prev_esc = next == '\u{1b}';
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '\t' {
+            out.push_str("   ");
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn apply_line_resets(lines: &mut [String]) {
+    for line in lines {
+        if !is_image_line(line) {
+            *line = format!("{}{SEGMENT_RESET}", normalize_terminal_output(line));
+        }
+    }
 }
 
 pub fn pad_to_width(text: &str, width: usize) -> String {
@@ -52,15 +148,28 @@ pub fn truncate_visible(text: &str, width: usize) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\u{1b}' {
             out.push(ch);
-            if chars.peek() == Some(&'[') {
-                out.push('[');
-                chars.next();
-                for next in chars.by_ref() {
-                    out.push(next);
-                    if next.is_ascii_alphabetic() {
-                        break;
+            match chars.peek() {
+                Some('[') => {
+                    out.push('[');
+                    chars.next();
+                    for next in chars.by_ref() {
+                        out.push(next);
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
                     }
                 }
+                Some(kind @ (']' | '_' | '^' | 'P')) => {
+                    out.push(*kind);
+                    chars.next();
+                    for next in chars.by_ref() {
+                        out.push(next);
+                        if next == '\u{07}' {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -226,5 +335,33 @@ mod tests {
         assert!(second.contains("\u{1b}[2;1H"));
         let third = screen.render(&["a".into(), "c".into()], false);
         assert!(third.is_empty());
+    }
+
+    #[test]
+    fn extract_cursor_strips_marker_and_uses_visible_width() {
+        let marker = crate::widgets::CURSOR_MARKER;
+        let mut lines = vec![
+            "status".into(),
+            format!("hello{marker}\x1b[7m \x1b[27mworld"),
+            "footer".into(),
+        ];
+        let pos = extract_cursor_position(&mut lines, 3).expect("marker");
+        assert_eq!(pos, (1, 5));
+        assert!(!lines[1].contains(marker));
+        assert!(lines[1].contains("hello"));
+        assert_eq!(visible_width(marker), 0);
+        let seq = hardware_cursor_sequence(pos.0, pos.1);
+        assert_eq!(seq, "\u{1b}[2;6H");
+        let mut above = vec![format!("{marker}hidden"), "visible".into()];
+        assert!(extract_cursor_position(&mut above, 1).is_none());
+        assert!(above[0].contains(marker));
+        assert_eq!(normalize_terminal_output("a\tb"), "a   b");
+        assert_eq!(normalize_terminal_output("\u{0e33}"), "\u{0e4d}\u{0e32}");
+        assert!(!is_image_line("hello"));
+        assert!(is_image_line("\u{1b}_Gabc"));
+        let mut reset = vec!["hi".into()];
+        apply_line_resets(&mut reset);
+        assert!(reset[0].ends_with(SEGMENT_RESET));
+        assert!(reset[0].starts_with("hi"));
     }
 }

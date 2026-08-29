@@ -348,6 +348,62 @@ pub fn openai_codex_authorize_url(pkce: &Pkce, state: &str) -> String {
     )
 }
 
+pub fn parse_radius_oauth_discovery(gateway: &str, raw: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| format!("Invalid Radius OAuth config from {gateway}"))?;
+    value
+        .get("authorizationEndpoint")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("Invalid Radius OAuth config from {gateway}"))
+}
+
+pub fn radius_oauth_discovery_http_error(gateway: &str, status: u16, text: &str) -> String {
+    format!("Could not load Radius OAuth config from {gateway}: {status} {text}")
+}
+
+pub fn load_radius_oauth_discovery(gateway: &str) -> Result<String, String> {
+    let gateway = crate::normalize_radius_gateway_url(gateway);
+    if let Ok(fixture) = std::env::var("PI_RADIUS_OAUTH_DISCOVERY_FIXTURE") {
+        let raw = if fixture.trim_start().starts_with('{') {
+            fixture
+        } else {
+            std::fs::read_to_string(&fixture).map_err(|err| err.to_string())?
+        };
+        return parse_radius_oauth_discovery(&gateway, &raw);
+    }
+    if std::env::var("PI_DISABLE_NETWORK").is_ok() || std::env::var("PI_OFFLINE").is_ok() {
+        return Err(radius_oauth_discovery_http_error(
+            &gateway,
+            0,
+            "network disabled",
+        ));
+    }
+    let url = format!("{gateway}/v1/oauth");
+    match ureq::get(&url).set("accept", "application/json").call() {
+        Ok(response) => {
+            let text = response.into_string().map_err(|err| err.to_string())?;
+            parse_radius_oauth_discovery(&gateway, &text)
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            Err(radius_oauth_discovery_http_error(&gateway, status, &text))
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+pub fn radius_browser_authorize_url(pkce: &Pkce, state: &str) -> Result<String, String> {
+    let gateway = std::env::var("PI_LOGIN_ENTERPRISE_DOMAIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("RADIUS_GATEWAY").ok())
+        .unwrap_or_else(|| crate::DEFAULT_RADIUS_GATEWAY.to_string());
+    let gateway = crate::normalize_radius_gateway_url(&gateway);
+    let endpoint = load_radius_oauth_discovery(&gateway)?;
+    Ok(radius_authorize_url(&endpoint, pkce, state))
+}
+
 pub fn radius_authorize_url(authorization_endpoint: &str, pkce: &Pkce, state: &str) -> String {
     format!(
         "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&handoff=url&state={}",
@@ -667,6 +723,24 @@ mod tests {
         let radius = radius_authorize_url("https://auth.example/authorize", &pkce, "st");
         assert!(radius.contains("handoff=url"));
         assert!(radius.contains("1456"));
+        let gateway = "https://radius.example";
+        assert_eq!(
+            parse_radius_oauth_discovery(
+                gateway,
+                r#"{"authorizationEndpoint":"https://auth.example/authorize"}"#
+            )
+            .unwrap(),
+            "https://auth.example/authorize"
+        );
+        assert_eq!(
+            parse_radius_oauth_discovery(gateway, r#"{"issuer":"https://radius-ui.example"}"#)
+                .unwrap_err(),
+            format!("Invalid Radius OAuth config from {gateway}")
+        );
+        assert_eq!(
+            radius_oauth_discovery_http_error(gateway, 503, "nope"),
+            format!("Could not load Radius OAuth config from {gateway}: 503 nope")
+        );
     }
 
     #[test]
