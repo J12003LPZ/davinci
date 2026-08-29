@@ -9,6 +9,8 @@ pub use leases::{
 };
 pub use repo::{apply_migrations, open_database, SqliteSessionRepository, SqliteSessionStorage};
 
+pub const INITIAL_SCHEMA: &str = include_str!("../migrations/001_initial.sql");
+
 #[cfg(test)]
 mod tests {
     use pi_core::SessionErrorCode;

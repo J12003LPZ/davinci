@@ -327,10 +327,13 @@ dependencies = [
  "pi-agent",
  "pi-ai",
  "pi-client",
+ "pi-coding-agent",
  "pi-core",
  "pi-protocol",
  "pi-server",
  "pi-session",
+ "pi-session-sqlite",
+ "rusqlite",
  "serde",
  "serde_json",
 ]

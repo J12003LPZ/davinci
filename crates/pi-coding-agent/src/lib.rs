@@ -295,6 +295,16 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn clap_help_and_version() {
+        use clap::CommandFactory;
+        let mut cmd = Args::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("print"));
+        assert!(help.contains("sessions"));
+        assert_eq!(cmd.get_version(), Some(VERSION));
+    }
+
+    #[test]
     fn print_mode_echoes_prompt() {
         let out = run_print("hello", false).unwrap();
         assert!(out.contains("hello"));

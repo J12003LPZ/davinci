@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use pi_core::{next_id, now_ms, SessionError};
-use serde_json::Value;
 
 use crate::{
     assign_storage_fields, Entry, EntryQuery, ForkOptions, ForkScope, LaneRecord, LogItem,
@@ -107,28 +107,36 @@ impl SessionInner {
 
 #[derive(Clone)]
 pub struct MemorySession {
-    inner: SessionInner,
+    inner: Arc<Mutex<SessionInner>>,
 }
 
 impl MemorySession {
-    fn from_inner(inner: SessionInner) -> Self {
+    fn from_shared(inner: Arc<Mutex<SessionInner>>) -> Self {
         Self { inner }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, SessionInner>, SessionError> {
+        self.inner
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))
     }
 }
 
 impl SessionStore for MemorySession {
     fn metadata(&self) -> Result<SessionMetadata, SessionError> {
-        let mut meta = self.inner.metadata.clone();
-        meta.name = self.inner.name.clone();
+        let inner = self.lock()?;
+        let mut meta = inner.metadata.clone();
+        meta.name = inner.name.clone();
         Ok(meta)
     }
 
     fn append_entry(&mut self, entry: Entry, lane: &str) -> Result<Entry, SessionError> {
-        self.inner.append_entry(entry, lane)
+        self.lock()?.append_entry(entry, lane)
     }
 
     fn find_entries(&self, query: EntryQuery) -> Result<Vec<Entry>, SessionError> {
-        let mut entries = self.inner.entries.clone();
+        let inner = self.lock()?;
+        let mut entries = inner.entries.clone();
         if let Some(entry_type) = query.entry_type.as_deref() {
             entries.retain(|entry| entry.entry_type() == entry_type);
         }
@@ -142,11 +150,12 @@ impl SessionStore for MemorySession {
     }
 
     fn find_entries_on_branch(&self, start: &str) -> Result<Vec<Entry>, SessionError> {
-        self.inner.branch_path(start)
+        self.lock()?.branch_path(start)
     }
 
     fn append_record(&mut self, mut record: LaneRecord) -> Result<LaneRecord, SessionError> {
-        let seq = self.inner.allocate_seq();
+        let mut inner = self.lock()?;
+        let seq = inner.allocate_seq();
         record = match record {
             LaneRecord::OperationStarted {
                 id,
@@ -186,8 +195,8 @@ impl SessionStore for MemorySession {
                 extra,
                 ..
             } => {
-                self.inner.stats.total_tokens += usage.total_tokens as f64;
-                self.inner.stats.cost_total += usage.cost.total;
+                inner.stats.total_tokens += usage.total_tokens as f64;
+                inner.stats.cost_total += usage.cost.total;
                 LaneRecord::Usage {
                     id,
                     seq,
@@ -213,13 +222,13 @@ impl SessionStore for MemorySession {
                 extra,
             },
         };
-        self.inner.records.push(record.clone());
+        inner.records.push(record.clone());
         Ok(record)
     }
 
     fn find_records(&self, lane: Option<&str>) -> Result<Vec<LaneRecord>, SessionError> {
         Ok(self
-            .inner
+            .lock()?
             .records
             .iter()
             .filter(|record| lane.is_none_or(|wanted| record.lane() == wanted))
@@ -228,27 +237,28 @@ impl SessionStore for MemorySession {
     }
 
     fn get_log(&self, limit: Option<usize>) -> Result<Vec<LogItem>, SessionError> {
+        let inner = self.lock()?;
         let mut items = Vec::new();
-        for entry in &self.inner.entries {
+        for entry in &inner.entries {
             items.push(LogItem::Entry {
                 seq: entry.seq(),
                 entry: entry.clone(),
             });
         }
-        for record in &self.inner.records {
+        for record in &inner.records {
             items.push(LogItem::Record {
                 seq: record.seq(),
                 record: record.clone(),
             });
         }
-        for (seq, lane, leaf_id) in &self.inner.lane_moves {
+        for (seq, lane, leaf_id) in &inner.lane_moves {
             items.push(LogItem::Lane {
                 seq: *seq,
                 lane: lane.clone(),
                 leaf_id: leaf_id.clone(),
             });
         }
-        items.extend(self.inner.facts.iter().cloned());
+        items.extend(inner.facts.iter().cloned());
         items.sort_by_key(|item| match item {
             LogItem::Entry { seq, .. }
             | LogItem::Record { seq, .. }
@@ -263,9 +273,10 @@ impl SessionStore for MemorySession {
     }
 
     fn set_name(&mut self, name: Option<&str>) -> Result<(), SessionError> {
-        let seq = self.inner.allocate_seq();
-        self.inner.name = name.map(str::to_string);
-        self.inner.facts.push(LogItem::Fact {
+        let mut inner = self.lock()?;
+        let seq = inner.allocate_seq();
+        inner.name = name.map(str::to_string);
+        inner.facts.push(LogItem::Fact {
             seq,
             fact: "name".to_string(),
             name: name.map(str::to_string),
@@ -276,11 +287,11 @@ impl SessionStore for MemorySession {
     }
 
     fn get_name(&self) -> Result<Option<String>, SessionError> {
-        Ok(self.inner.name.clone())
+        Ok(self.lock()?.name.clone())
     }
 
     fn get_stats(&self) -> Result<SessionStats, SessionError> {
-        Ok(self.inner.stats.clone())
+        Ok(self.lock()?.stats.clone())
     }
 
     fn release(&mut self) -> Result<(), SessionError> {
@@ -290,7 +301,7 @@ impl SessionStore for MemorySession {
 
 #[derive(Default)]
 pub struct MemorySessionRepository {
-    sessions: BTreeMap<String, SessionInner>,
+    sessions: BTreeMap<String, Arc<Mutex<SessionInner>>>,
     path: String,
 }
 
@@ -327,8 +338,9 @@ impl SessionRepository for MemorySessionRepository {
         if let Some(name) = options.name {
             inner.name = Some(name);
         }
-        self.sessions.insert(id.clone(), inner.clone());
-        Ok(Box::new(MemorySession::from_inner(inner)))
+        let shared = Arc::new(Mutex::new(inner));
+        self.sessions.insert(id, shared.clone());
+        Ok(Box::new(MemorySession::from_shared(shared)))
     }
 
     fn open(&mut self, metadata: &SessionMetadata) -> Result<Box<dyn SessionStore>, SessionError> {
@@ -336,20 +348,22 @@ impl SessionRepository for MemorySessionRepository {
             self.sessions.get(&metadata.id).cloned().ok_or_else(|| {
                 SessionError::not_found(format!("session {} not found", metadata.id))
             })?;
-        Ok(Box::new(MemorySession::from_inner(inner)))
+        Ok(Box::new(MemorySession::from_shared(inner)))
     }
 
     fn list(&self, cwd: Option<&str>) -> Result<Vec<SessionMetadata>, SessionError> {
-        Ok(self
-            .sessions
-            .values()
-            .filter(|session| cwd.is_none_or(|wanted| session.metadata.cwd == wanted))
-            .map(|session| {
-                let mut meta = session.metadata.clone();
-                meta.name = session.name.clone();
-                meta
-            })
-            .collect())
+        let mut listed = Vec::new();
+        for session in self.sessions.values() {
+            let inner = session
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            if cwd.is_none_or(|wanted| inner.metadata.cwd == wanted) {
+                let mut meta = inner.metadata.clone();
+                meta.name = inner.name.clone();
+                listed.push(meta);
+            }
+        }
+        Ok(listed)
     }
 
     fn delete(&mut self, metadata: &SessionMetadata) -> Result<(), SessionError> {
@@ -363,49 +377,49 @@ impl SessionRepository for MemorySessionRepository {
         options: ForkOptions,
     ) -> Result<Box<dyn SessionStore>, SessionError> {
         let source_meta = source.metadata()?;
-        let source_inner = self.sessions.get(&source_meta.id).cloned().ok_or_else(|| {
-            SessionError::not_found(format!("session {} not found", source_meta.id))
-        })?;
-        let created = self.create(SessionCreateOptions {
-            id: None,
-            cwd: options.cwd,
-            parent_session_id: Some(source_meta.id.clone()),
-            metadata: source_meta.metadata.clone(),
-            name: None,
-        })?;
-        let new_id = created.metadata()?.id;
-        let dest = self.sessions.get_mut(&new_id).expect("just created");
         let copied = match options.scope {
-            ForkScope::Tree => source_inner.entries.clone(),
+            ForkScope::Tree => source.find_entries(EntryQuery {
+                order: Some(QueryOrder::OldestFirst),
+                ..EntryQuery::default()
+            })?,
             ForkScope::Branch => {
                 let start = options
                     .entry_id
                     .clone()
                     .or_else(|| {
-                        source_inner
-                            .lanes
-                            .get("main")
-                            .and_then(|lane| lane.leaf_id.clone())
+                        source
+                            .find_entries(EntryQuery {
+                                order: Some(QueryOrder::NewestFirst),
+                                limit: Some(1),
+                                ..EntryQuery::default()
+                            })
+                            .ok()
+                            .and_then(|entries| {
+                                entries
+                                    .into_iter()
+                                    .next()
+                                    .map(|entry| entry.id().to_string())
+                            })
                     })
                     .ok_or_else(|| SessionError::invalid_payload("fork target missing"))?;
-                let mut path = source_inner.branch_path(&start)?;
+                let mut path = source.find_entries_on_branch(&start)?;
                 if matches!(options.position, crate::ForkPosition::Before) {
                     path.pop();
                 }
                 path
             }
         };
-        dest.entries.clear();
-        dest.next_seq = 1;
-        dest.stats = SessionStats::default();
-        dest.lanes
-            .insert("main".to_string(), LaneState { leaf_id: None });
+        let mut created = self.create(SessionCreateOptions {
+            id: None,
+            cwd: options.cwd,
+            parent_session_id: Some(source_meta.id),
+            metadata: source_meta.metadata,
+            name: None,
+        })?;
         for entry in copied {
-            dest.append_entry(strip_storage(entry), "main")?;
+            created.append_entry(strip_storage(entry), "main")?;
         }
-        let inner = dest.clone();
-        let _ = Value::Null;
-        Ok(Box::new(MemorySession::from_inner(inner)))
+        Ok(created)
     }
 }
 

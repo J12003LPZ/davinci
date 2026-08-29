@@ -1,6 +1,11 @@
-use pi_core::SessionError;
+use std::collections::BTreeMap;
 
-use crate::{provision_message, EntryQuery, QueryOrder, SessionCreateOptions, SessionRepository};
+use pi_core::{next_id, SessionError};
+
+use crate::{
+    provision_message, EntryQuery, ForkOptions, ForkScope, LaneRecord, LogItem, QueryOrder,
+    SessionCreateOptions, SessionRepository,
+};
 
 #[derive(Debug, Default)]
 pub struct ConformanceReport {
@@ -99,6 +104,104 @@ pub fn run_conformance(repo: &mut dyn SessionRepository) -> ConformanceReport {
         repo.delete(&meta).map_err(err)?;
         if repo.open(&meta).is_ok() {
             return Err("deleted session should not open".into());
+        }
+        Ok(())
+    });
+
+    check(&mut report, "records and log", || {
+        let mut session = repo
+            .create(SessionCreateOptions {
+                cwd: "/conformance".into(),
+                id: Some("records".into()),
+                ..SessionCreateOptions::default()
+            })
+            .map_err(err)?;
+        session
+            .append_entry(provision_message("logged"), "main")
+            .map_err(err)?;
+        let started = session
+            .append_record(LaneRecord::OperationStarted {
+                id: next_id(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+                run_id: Some("run-1".into()),
+                extra: BTreeMap::new(),
+            })
+            .map_err(err)?;
+        let records = session.find_records(Some("main")).map_err(err)?;
+        if records.len() != 1 || records[0].id() != started.id() {
+            return Err("findRecords did not return the appended lane record".into());
+        }
+        let log = session.get_log(None).map_err(err)?;
+        let has_entry = log.iter().any(|item| matches!(item, LogItem::Entry { .. }));
+        let has_record = log
+            .iter()
+            .any(|item| matches!(item, LogItem::Record { .. }));
+        if !has_entry || !has_record {
+            return Err(
+                "getLog must include both entries and records as separate mutations".into(),
+            );
+        }
+        Ok(())
+    });
+
+    check(&mut report, "repository and forks", || {
+        let mut source = repo
+            .create(SessionCreateOptions {
+                cwd: "/conformance".into(),
+                id: Some("source".into()),
+                name: Some("Source".into()),
+                ..SessionCreateOptions::default()
+            })
+            .map_err(err)?;
+        source
+            .append_entry(provision_message("root"), "main")
+            .map_err(err)?;
+        source
+            .append_entry(provision_message("child"), "main")
+            .map_err(err)?;
+        let source_id = source.metadata().map_err(err)?.id;
+        let source_count = source
+            .find_entries(EntryQuery {
+                order: Some(QueryOrder::OldestFirst),
+                ..EntryQuery::default()
+            })
+            .map_err(err)?
+            .len();
+        let fork = repo
+            .fork(
+                source.as_ref(),
+                ForkOptions {
+                    cwd: "/conformance".into(),
+                    scope: ForkScope::Branch,
+                    position: crate::ForkPosition::At,
+                    entry_id: None,
+                },
+            )
+            .map_err(err)?;
+        let fork_meta = fork.metadata().map_err(err)?;
+        if fork_meta.parent_session_id.as_deref() != Some(source_id.as_str()) {
+            return Err("fork must record parentSessionId".into());
+        }
+        if fork.get_name().map_err(err)?.is_some() {
+            return Err("branch fork should not copy the source name fact".into());
+        }
+        let forked = fork
+            .find_entries(EntryQuery {
+                order: Some(QueryOrder::OldestFirst),
+                ..EntryQuery::default()
+            })
+            .map_err(err)?;
+        if forked.len() != source_count {
+            return Err("branch fork did not copy the source entries".into());
+        }
+        let still_source = source
+            .find_entries(EntryQuery::default())
+            .map_err(err)?
+            .len();
+        if still_source != source_count {
+            return Err("fork must not mutate the source session".into());
         }
         Ok(())
     });

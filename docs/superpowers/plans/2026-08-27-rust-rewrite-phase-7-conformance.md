@@ -1,15 +1,13 @@
-# Phase 7: Differential Conformance
+# Phase 7/8: Differential Conformance
 
-## Overview
-
-Golden fixtures live in `crates/pi-conformance/fixtures/` and are the shared contract between TypeScript packages and Rust crates.
+Golden fixtures live in `crates/pi-parity/fixtures/` and are the shared contract between TypeScript packages and Rust crates. TypeScript under `vendor/pi` remains authoritative.
 
 ## Fixture families
 
-1. **CBOR RFC 8949 vectors** — hex encode/decode parity.
-2. **Writer-lease traces** — acquire / conflict / expire / fence takeover / renew / release.
-3. **Protocol envelopes** — hello, commands, responses, errors (strict objects, no extra fields).
-4. **Agent-loop transcripts** — tool order, length-stop fail-all, abort.
-5. **Session repository traces** — create/list/open/fork/delete + sequence assignment.
+1. **Writer-lease traces** — acquire / conflict / expire / fence takeover / renew / release.
+2. **Protocol envelopes** — hello + CBOR frames.
+3. **Assistant message + usage** — tool-call JSON shape.
+4. **Session entries** — camelCase entry payloads.
+5. **Agent-loop / CLI print events** — lifecycle type names.
 
 Rust tests load these fixtures. TypeScript packages must serialize the same camelCase JSON.

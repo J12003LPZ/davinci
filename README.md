@@ -23,7 +23,7 @@ Upstream spec: `vendor/pi` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185` (`earen
 | `pi-agent` | agent loop, steer, follow-up, tools |
 | `pi-tui` | component `render(width)` |
 | `pi-coding-agent` | `pi` CLI (print mode, sessions, tools) |
-| `pi-parity` | differential fixtures |
+| `pi-parity` | differential fixtures (leases, protocol, entries, agent/CLI events) |
 
 ## Rust
 
