@@ -1,7 +1,10 @@
 [package]
 name = "pi-protocol"
-version = "0.84.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -10,7 +13,3 @@ ciborium = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-bytes = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

@@ -1,114 +1,221 @@
-use crate::types::*;
+use crate::auth::{AuthResolved, Credential, CredentialStore};
+use crate::cost::calculate_cost;
+use crate::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream};
+use crate::types::{
+    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Model, ModelCost,
+    ModelCostRates, SimpleStreamOptions, StopReason, Usage,
+};
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::Arc;
 
-pub static BUILTIN_ANTHROPIC_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/anthropic.json");
-pub static BUILTIN_OPENAI_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/openai.json");
-pub static BUILTIN_GOOGLE_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/google.json");
-pub static BUILTIN_OPENROUTER_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/openrouter.json");
-pub static BUILTIN_MISTRAL_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/mistral.json");
-pub static BUILTIN_GROQ_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/groq.json");
-pub static BUILTIN_CEREBRAS_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/cerebras.json");
-pub static BUILTIN_DEEPSEEK_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/deepseek.json");
-pub static BUILTIN_XAI_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/xai.json");
-pub static BUILTIN_TOGETHER_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/together.json");
-pub static BUILTIN_FIREWORKS_DATA: &str =
-    include_str!("../../../vendor/pi/packages/ai/src/providers/data/fireworks.json");
+pub fn default_anthropic_model() -> Model {
+    Model {
+        id: "claude-sonnet-4-5".to_string(),
+        name: "Claude Sonnet 4.5".to_string(),
+        api: "anthropic-messages".to_string(),
+        provider: "anthropic".to_string(),
+        base_url: "https://api.anthropic.com".to_string(),
+        reasoning: true,
+        thinking_level_map: None,
+        input: vec!["text".to_string(), "image".to_string()],
+        cost: ModelCost {
+            rates: ModelCostRates {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+            },
+            tiers: None,
+        },
+        context_window: 200_000,
+        max_tokens: 8192,
+        sampling_params: None,
+        headers: None,
+        compat: None,
+    }
+}
 
-pub fn parse_models_from_json(json_str: &str) -> Vec<Model> {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
-        return Vec::new();
-    };
-    let mut models = Vec::new();
-    if let serde_json::Value::Object(map) = val {
-        for (_api_key, group_val) in map {
-            if let serde_json::Value::Object(group) = group_val {
-                for (_model_id, m_val) in group {
-                    if let Ok(model) = serde_json::from_value::<Model>(m_val) {
-                        models.push(model);
-                    }
+pub fn default_openai_model() -> Model {
+    Model {
+        id: "gpt-5.6-turbo".to_string(),
+        name: "GPT-5.6 Turbo".to_string(),
+        api: "openai-responses".to_string(),
+        provider: "openai".to_string(),
+        base_url: "https://api.openai.com/v1".to_string(),
+        reasoning: true,
+        thinking_level_map: None,
+        input: vec!["text".to_string(), "image".to_string()],
+        cost: ModelCost {
+            rates: ModelCostRates {
+                input: 2.5,
+                output: 10.0,
+                cache_read: 1.25,
+                cache_write: 2.5,
+            },
+            tiers: None,
+        },
+        context_window: 128_000,
+        max_tokens: 4096,
+        sampling_params: None,
+        headers: None,
+        compat: None,
+    }
+}
+
+pub struct Models {
+    credential_store: Arc<dyn CredentialStore>,
+    providers: HashMap<String, Vec<Model>>,
+}
+
+impl Models {
+    pub fn new(credential_store: Arc<dyn CredentialStore>) -> Self {
+        let mut providers = HashMap::new();
+        providers.insert("anthropic".to_string(), vec![default_anthropic_model()]);
+        providers.insert("openai".to_string(), vec![default_openai_model()]);
+
+        Self {
+            credential_store,
+            providers,
+        }
+    }
+
+    pub fn get_models(&self, provider: Option<&str>) -> Vec<Model> {
+        if let Some(p) = provider {
+            self.providers.get(p).cloned().unwrap_or_default()
+        } else {
+            self.providers.values().flatten().cloned().collect()
+        }
+    }
+
+    pub fn get_model(&self, provider: &str, id: &str) -> Option<Model> {
+        self.providers
+            .get(provider)
+            .and_then(|models| models.iter().find(|m| m.id == id).cloned())
+    }
+
+    pub async fn resolve_auth(&self, provider_id: &str) -> Option<AuthResolved> {
+        if let Some(cred) = self.credential_store.read(provider_id).await {
+            match cred {
+                Credential::ApiKey { key, env } => Some(AuthResolved {
+                    api_key: Some(key),
+                    headers: None,
+                    env,
+                    source: "stored credential".to_string(),
+                }),
+                Credential::OAuth { token, .. } => {
+                    let mut headers = HashMap::new();
+                    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+                    Some(AuthResolved {
+                        api_key: None,
+                        headers: Some(headers),
+                        env: None,
+                        source: "OAuth".to_string(),
+                    })
                 }
+            }
+        } else {
+            let env_var = match provider_id {
+                "anthropic" => "ANTHROPIC_API_KEY",
+                "openai" => "OPENAI_API_KEY",
+                "google" => "GEMINI_API_KEY",
+                _ => return None,
+            };
+            if let Ok(val) = std::env::var(env_var) {
+                Some(AuthResolved {
+                    api_key: Some(val),
+                    headers: None,
+                    env: None,
+                    source: env_var.to_string(),
+                })
+            } else {
+                None
             }
         }
     }
-    models
-}
 
-pub static BUILTIN_MODELS: LazyLock<HashMap<String, Vec<Model>>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    map.insert(
-        "anthropic".to_string(),
-        parse_models_from_json(BUILTIN_ANTHROPIC_DATA),
-    );
-    map.insert(
-        "openai".to_string(),
-        parse_models_from_json(BUILTIN_OPENAI_DATA),
-    );
-    map.insert(
-        "google".to_string(),
-        parse_models_from_json(BUILTIN_GOOGLE_DATA),
-    );
-    map.insert(
-        "openrouter".to_string(),
-        parse_models_from_json(BUILTIN_OPENROUTER_DATA),
-    );
-    map.insert(
-        "mistral".to_string(),
-        parse_models_from_json(BUILTIN_MISTRAL_DATA),
-    );
-    map.insert(
-        "groq".to_string(),
-        parse_models_from_json(BUILTIN_GROQ_DATA),
-    );
-    map.insert(
-        "cerebras".to_string(),
-        parse_models_from_json(BUILTIN_CEREBRAS_DATA),
-    );
-    map.insert(
-        "deepseek".to_string(),
-        parse_models_from_json(BUILTIN_DEEPSEEK_DATA),
-    );
-    map.insert("xai".to_string(), parse_models_from_json(BUILTIN_XAI_DATA));
-    map.insert(
-        "together".to_string(),
-        parse_models_from_json(BUILTIN_TOGETHER_DATA),
-    );
-    map.insert(
-        "fireworks".to_string(),
-        parse_models_from_json(BUILTIN_FIREWORKS_DATA),
-    );
-    map
-});
+    pub fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<&SimpleStreamOptions>,
+    ) -> AssistantMessageEventStream {
+        let (mut sender, stream) = create_assistant_message_event_stream();
+        let model_clone = model.clone();
+        let context_clone = context.clone();
+        let _options_clone = options.cloned();
 
-pub fn get_builtin_model(provider: &str, model_id: &str) -> Option<Model> {
-    if let Some(list) = BUILTIN_MODELS.get(provider) {
-        return list.iter().find(|m| m.id == model_id).cloned();
+        tokio::spawn(async move {
+            let mut usage = Usage {
+                input: 10,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                cache_write_1h: None,
+                reasoning: None,
+                total_tokens: 30,
+                cost: Default::default(),
+            };
+            calculate_cost(&model_clone, &mut usage);
+
+            let initial_msg = AssistantMessage {
+                role: "assistant".to_string(),
+                content: vec![],
+                api: model_clone.api.clone(),
+                provider: model_clone.provider.clone(),
+                model: model_clone.id.clone(),
+                response_model: None,
+                response_id: Some("resp-123".to_string()),
+                usage: usage.clone(),
+                stop_reason: StopReason::Pending,
+                deferred: None,
+                error_message: None,
+                raw_stop_reason: None,
+                end_turn: Some(true),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+
+            sender.push(AssistantMessageEvent::Start {
+                partial: initial_msg.clone(),
+            });
+
+            // Simulate a response or parse mock
+            let text_part = format!("Hello! You sent {} messages.", context_clone.messages.len());
+
+            let mut final_msg = initial_msg.clone();
+            final_msg
+                .content
+                .push(AssistantContent::Text(crate::types::TextContent {
+                    content_type: "text".to_string(),
+                    text: text_part.clone(),
+                    text_signature: None,
+                }));
+            final_msg.stop_reason = StopReason::Stop;
+
+            sender.push(AssistantMessageEvent::TextStart {
+                content_index: 0,
+                partial: final_msg.clone(),
+            });
+
+            sender.push(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: text_part.clone(),
+                partial: final_msg.clone(),
+            });
+
+            sender.push(AssistantMessageEvent::TextEnd {
+                content_index: 0,
+                content: text_part,
+                partial: final_msg.clone(),
+            });
+
+            sender.push(AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message: final_msg.clone(),
+            });
+
+            sender.end(final_msg);
+        });
+
+        stream
     }
-    None
-}
-
-pub fn get_builtin_providers() -> Vec<&'static str> {
-    vec![
-        "anthropic",
-        "openai",
-        "google",
-        "openrouter",
-        "mistral",
-        "groq",
-        "cerebras",
-        "deepseek",
-        "xai",
-        "together",
-        "fireworks",
-    ]
 }

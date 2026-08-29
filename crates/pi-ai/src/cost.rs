@@ -1,33 +1,40 @@
-use crate::types::{ModelCost, ModelCostRates, Usage, UsageCost};
+use crate::types::{Model, Usage};
 
-pub fn calculate_cost(model_cost: &ModelCost, usage: &Usage) -> UsageCost {
-    let mut rates = ModelCostRates {
-        input: model_cost.input,
-        output: model_cost.output,
-        cache_read: model_cost.cache_read,
-        cache_write: model_cost.cache_write,
-    };
+pub fn calculate_cost(model: &Model, usage: &mut Usage) -> f64 {
+    let input_tokens = usage.input + usage.cache_read + usage.cache_write;
+    let mut rates = model.cost.rates.clone();
+    let mut matched_threshold: i64 = -1;
 
-    for tier in &model_cost.tiers {
-        if usage.input >= tier.input_tokens_above {
-            rates.input = tier.input;
-            rates.output = tier.output;
-            rates.cache_read = tier.cache_read;
-            rates.cache_write = tier.cache_write;
+    if let Some(tiers) = &model.cost.tiers {
+        for tier in tiers {
+            if input_tokens > tier.input_tokens_above
+                && (tier.input_tokens_above as i64) > matched_threshold
+            {
+                rates = tier.rates.clone();
+                matched_threshold = tier.input_tokens_above as i64;
+            }
         }
     }
 
-    let input_cost = (usage.input as f64 * rates.input) / 1_000_000.0;
-    let output_cost = (usage.output as f64 * rates.output) / 1_000_000.0;
-    let cache_read_cost = (usage.cache_read as f64 * rates.cache_read) / 1_000_000.0;
-    let cache_write_cost = (usage.cache_write as f64 * rates.cache_write) / 1_000_000.0;
-    let total = input_cost + output_cost + cache_read_cost + cache_write_cost;
+    let long_write = usage.cache_write_1h.unwrap_or(0);
+    let short_write = usage.cache_write.saturating_sub(long_write);
 
-    UsageCost {
-        input: input_cost,
-        output: output_cost,
-        cache_read: cache_read_cost,
-        cache_write: cache_write_cost,
-        total,
+    usage.cost.input = (rates.input / 1_000_000.0) * (usage.input as f64);
+    usage.cost.output = (rates.output / 1_000_000.0) * (usage.output as f64);
+    usage.cost.cache_read = (rates.cache_read / 1_000_000.0) * (usage.cache_read as f64);
+    usage.cost.cache_write = (rates.cache_write * (short_write as f64)
+        + rates.input * 2.0 * (long_write as f64))
+        / 1_000_000.0;
+    usage.cost.total =
+        usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
+
+    usage.cost.total
+}
+
+pub fn calculate_context_tokens(usage: &Usage) -> u64 {
+    if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage.input + usage.output + usage.cache_read + usage.cache_write
     }
 }

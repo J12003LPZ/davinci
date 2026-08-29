@@ -1,53 +1,70 @@
-use crate::error::Result;
-use crate::types::*;
-use std::collections::HashMap;
+use crate::types::{Context, Message, UserContent};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub fn content_text(blocks: &[ContentBlock]) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        if let ContentBlock::Text(t) = b {
-            out.push_str(&t.text);
-        }
-    }
-    out
+const CHARS_PER_TOKEN: usize = 4;
+const ESTIMATED_IMAGE_CHARS: usize = 4800;
+
+static GLOBAL_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+pub fn uuidv7() -> String {
+    let count = GLOBAL_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let now = chrono::Utc::now().timestamp_millis();
+    format!("{}-{:08x}", now, count)
 }
 
-pub fn json_parse_loose(s: &str) -> Result<serde_json::Value> {
-    if let Ok(val) = serde_json::from_str(s) {
-        return Ok(val);
-    }
-    let trimmed = s.trim();
-    if trimmed.starts_with('{') && !trimmed.ends_with('}') {
-        let repaired = format!("{}}}", trimmed);
-        if let Ok(val) = serde_json::from_str(&repaired) {
-            return Ok(val);
-        }
-    }
-    serde_json::from_str(s).map_err(crate::error::Error::JsonError)
+pub fn estimate_text_tokens(text: &str) -> usize {
+    text.len().div_ceil(CHARS_PER_TOKEN)
 }
 
-pub fn sanitize_unicode_surrogates(input: &str) -> String {
-    input.to_string()
-}
-
-pub fn merge_headers(
-    base: Option<&HashMap<String, String>>,
-    custom: Option<&ProviderHeaders>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    if let Some(b) = base {
-        for (k, v) in b {
-            out.insert(k.clone(), v.clone());
+pub fn estimate_content_tokens(content: &[UserContent]) -> usize {
+    let mut chars = 0;
+    for block in content {
+        match block {
+            UserContent::Text(t) => chars += t.text.len(),
+            UserContent::Image(_) => chars += ESTIMATED_IMAGE_CHARS,
         }
     }
-    if let Some(c) = custom {
-        for (k, v) in c {
-            if let Some(val) = v {
-                out.insert(k.clone(), val.clone());
-            } else {
-                out.remove(k);
+    chars.div_ceil(CHARS_PER_TOKEN)
+}
+
+pub fn estimate_message_tokens(message: &Message) -> usize {
+    match message {
+        Message::User(u) => estimate_content_tokens(&u.content),
+        Message::ToolResult(t) => estimate_content_tokens(&t.content),
+        Message::Assistant(a) => {
+            let mut chars = 0;
+            for block in &a.content {
+                match block {
+                    crate::types::AssistantContent::Text(t) => chars += t.text.len(),
+                    crate::types::AssistantContent::Thinking(t) => chars += t.thinking.len(),
+                    crate::types::AssistantContent::ToolCall(tc) => {
+                        chars += tc.name.len() + tc.arguments.to_string().len()
+                    }
+                }
             }
+            chars.div_ceil(CHARS_PER_TOKEN)
         }
     }
-    out
+}
+
+pub fn estimate_context_tokens(context: &Context) -> usize {
+    let mut total = 0;
+    if let Some(sys) = &context.system_prompt {
+        total += estimate_text_tokens(sys);
+    }
+    for msg in &context.messages {
+        total += estimate_message_tokens(msg);
+    }
+    total
+}
+
+pub fn content_text(content: &[crate::types::AssistantContent]) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            crate::types::AssistantContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }

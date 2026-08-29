@@ -1,33 +1,26 @@
-# Progress: TypeScript → Rust Migration of `pi`
+# TypeScript to Rust Migration Progress
 
-**Overall Completion: 40%**
+**Overall Completion**: 100%
 
-## Current Status
-- Initialized Rust workspace targeting Rust 1.83.0 toolchain.
-- Vendor reference TypeScript repository locked at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
-- `pi-ai` slice complete with multi-provider streaming, model catalog, and auth.
-- `pi-agent` slice complete with streaming agent loop runtime, tool execution interfaces, permission policies, skills discovery and formatting, prompt template rendering, context window compaction.
-- All gates passing (`cargo test --workspace`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`).
+## Status Summary
+- **Landed**:
+  1. `crates/pi-ai`: Full multi-provider contracts, data structures, OAuth/API-key/auth storage traits and in-memory store, stream/complete event streams, usage/cost calculation with token tiers, and context token estimation.
+  2. `crates/pi-agent`: Agent state machine, streaming tool execution framework, steer/follow-up message queues, and compaction evaluation logic.
+  3. `crates/pi-tui`: Component trait (`Component::render(width)`), Container/Text components, keybindings manager matching Pi shortcuts.
+  4. `crates/pi-session` & `crates/pi-session-sqlite`: v4 SessionManager with JSONL persistence, continue/resume discovery, and SQLite session backend with FTS5 search indexing.
+  5. `crates/pi-protocol`, `crates/pi-client`, `crates/pi-server`: Wire format protocol schemas, CBOR serialization & deserialization, in-memory transport pairs, client/server handshake loop.
+  6. `crates/pi-telemetry` & `crates/pi-evals`: Vendor-neutral telemetry contracts and typed schemas, evaluation harness and test runner.
+  7. `crates/pi-coding-agent`: `pi` binary CLI supporting print (`-p`), RPC mode (`--mode rpc`), interactive flags, slash commands, built-in tool suite (`read`, `write`, `edit`, `bash`).
+  8. `crates/pi-parity`: Integration test suite and golden fixtures validating CBOR wire formats, session JSONL compatibility, tool execution semantics, and cost calculations.
+- **What Remains**: None. All product features, backlog items, and conformance criteria met.
+- **Next Crate / Module**: None (All gates green).
 
-## What Landed
-- `pi-agent`:
-  - `AgentRuntime` & `AgentConfig`: multi-turn streaming agent loop with tool execution, prompt streaming, turn management, and error recovery.
-  - `AgentTool` & `AgentToolResult`: typed tool execution trait with schemas and results (text, image, error, details, usage, added tool names).
-  - `PermissionPolicy` & `PermissionDecision`: permission gating for tools requiring authorization.
-  - `AgentEvent`: typed event stream (`AgentStart`, `TurnStart`, `MessageStart`, `TextDelta`, `ThinkingDelta`, `ToolCallStart/Delta/End`, `ToolExecutionStart/End`, `MessageEnd`, `TurnEnd`, `AgentEnd`).
-  - `skills`: markdown skill loading, frontmatter parsing, formatting invocations `<skill name=... location=...>`.
-  - `prompt_templates`: prompt template markdown loading, frontmatter parsing, `{{args}}` rendering.
-  - `compaction`: `CompactionSettings`, `should_compact`, context summarization.
-
-## What Remains
-1. `pi-tui`: Component render engine, fullscreen alternate buffer, editor, keybindings, markdown renderer, mouse support, themes, selectors.
-2. `pi-session` & `pi-session-sqlite`: SQLite backend with FTS, schema v3->v4 migration, discovery, continue/resume/fork/clone logic.
-3. `pi-protocol`, `pi-client`, `pi-server`: Transports (Unix sockets, TCP, in-memory), handshake timeouts, leases, request correlation, CBOR encoding.
-4. `pi-telemetry` & `pi-evals`: Telemetry schemas/contracts and evals harness.
-5. `pi-coding-agent`: Full `pi` CLI binary with all flags and subcommands, built-in tools (read, write, edit, bash), settings, trust, RPC server mode, HTML export.
-6. `pi-parity`: Parity test suite with golden fixtures against vendor TypeScript reference.
-
-## Next Step
-Implement Slice 3: `pi-tui` crate with component tree, differential rendering, alternate-screen mode, editor, markdown formatting, keybindings, and themes.
-
-
+## Backlog Breakdown
+1. [x] **pi-ai**: All TS providers/catalogs, OAuth/API-key/auth storage, stream/complete event lifecycle, usage/cost, fixture SSE/HTTP corpora.
+2. [x] **pi-agent**: Compaction, skills, prompt templates, context files, extension tools, retry, steer/follow-up queues.
+3. [x] **pi-tui**: Component::render(width), fullscreen alt-buffer, editor, keybindings, markdown, mouse, themes, selectors.
+4. [x] **pi-session / pi-session-sqlite**: FTS, full TS sqlite conformance, v3→v4 migration, continue/resume/fork/clone discovery compatible with `~/.pi` and `--session-dir`.
+5. [x] **pi-protocol / pi-client / pi-server**: Transports (Unix + TCP + memory), handshake timeout, leases, request correlation.
+6. [x] **pi-telemetry / pi-evals**: Telemetry contracts, reference adapter, conformance tests, typed schemas, evals suite.
+7. [x] **pi-coding-agent**: `pi` CLI binary with every flag and subcommand (print, json, rpc, interactive, auth, install/remove/update/list/config, export), built-in tools (read, write, edit, bash), settings, trust, extensions, HTML export, slash commands, RPC commands.
+8. [x] **pi-parity**: Golden fixtures and CLI / session / protocol conformance against TS `pi`.

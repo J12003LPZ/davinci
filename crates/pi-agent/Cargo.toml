@@ -1,20 +1,25 @@
 [package]
 name = "pi-agent"
-version = "0.84.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
 pi-ai = { path = "../pi-ai" }
+pi-telemetry = { path = "../pi-telemetry" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
-tracing = { workspace = true }
-chrono = { workspace = true }
-schemars = { workspace = true }
 futures = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+glob = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,24 +1,41 @@
-# pi (Rust)
+# Pi (Rust)
 
-A high-performance, product-equivalent Rust implementation of the `pi` coding agent harness.
+A native Rust rewrite and product-equivalent replacement for TypeScript `pi` (`@earendil-works/pi`).
 
-## Crates
-- `pi-ai`: Unified multi-provider LLM API (Anthropic Messages, OpenAI Chat Completions, Google Generative AI, Ollama, OpenRouter, Groq, etc.) with streaming SSE, usage/cost tracking, and credential/auth management.
-- `pi-agent`: Agent runtime, streaming agent loop, compaction, skills, prompt templates, tools, retry policies, and steer/follow-up queues.
-- `pi-tui`: Terminal UI framework with differential rendering, alternate-screen viewport, syntax highlighting, themes, selectors, and synchronized output.
-- `pi-session`: Session management, state tree, fork/resume/continue/clone workflows, JSONL persistence.
-- `pi-session-sqlite`: SQLite backend for sessions with full-text search (FTS5) and schema migrations.
-- `pi-protocol`: Strongly-typed protocol types, CBOR and JSON encoders, frame parsing, leases, and request correlation.
-- `pi-client`: Client SDK for connecting to Pi server backends over Unix sockets, TCP, and memory channels.
-- `pi-server`: Daemon server hosting sessions and agents over IPC/network transports.
-- `pi-telemetry`: Telemetry schemas, span collection, and metrics export.
-- `pi-evals`: Agent and model evaluation harness.
-- `pi-coding-agent`: Interactive CLI binary `pi`, supporting interactive REPL, print mode (`-p`), JSON output, RPC daemon mode, auth management, slash commands, extensions, and themes.
-- `pi-parity`: Comprehensive test suite verifying product parity and fixture compatibility against TypeScript reference implementation.
+## Overview
 
-## Building & Running
+Pi is a stateful coding agent harness featuring:
+- Unified multi-provider LLM integration with cost and usage tracking (`pi-ai`)
+- Agent loop with streaming tool execution, steering, and follow-up queues (`pi-agent`)
+- Fast terminal user interface primitives (`pi-tui`)
+- Robust session storage with JSONL and SQLite full-text search backend (`pi-session`, `pi-session-sqlite`)
+- High-performance binary CBOR wire protocol and client/server architectures (`pi-protocol`, `pi-client`, `pi-server`)
+- Telemetry interfaces and evaluations framework (`pi-telemetry`, `pi-evals`)
+- Comprehensive coding agent CLI executable `pi` (`pi-coding-agent`)
+
+## Toolchain & Building
+
+Requirements:
+- Rust 1.83.0
 
 ```bash
-cargo build --release
-./target/release/pi --help
+# Build the workspace
+cargo build --workspace
+
+# Run all tests
+cargo test --workspace
+
+# Check formatting and linting
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+## Running
+
+```bash
+# Print mode
+cargo run --bin pi -- -p "Hello Pi"
+
+# RPC mode
+cargo run --bin pi -- --mode rpc
 ```

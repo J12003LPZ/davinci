@@ -1,7 +1,10 @@
 [package]
 name = "pi-ai"
-version = "0.84.4"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -9,17 +12,16 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 ureq = { workspace = true }
 url = { workspace = true }
-tokio = { workspace = true }
-tokio-stream = { workspace = true }
-async-trait = { workspace = true }
+uuid = { workspace = true }
 zeroize = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-dirs = { workspace = true }
-regex = { workspace = true }
 base64 = { workspace = true }
-schemars = { workspace = true }
-futures = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
