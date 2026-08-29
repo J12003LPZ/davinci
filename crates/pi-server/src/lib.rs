@@ -413,13 +413,13 @@ fn assistant_content(content: &Value) -> Vec<AssistantContent> {
         .filter_map(|item| {
             if let Some(text) = item.get("text").and_then(Value::as_str) {
                 Some(AssistantContent::Text { text: text.into() })
-            } else if let Some(thinking) = item.get("thinking").and_then(Value::as_str) {
-                Some(AssistantContent::Thinking {
-                    thinking: thinking.into(),
-                    redacted: item.get("redacted").and_then(Value::as_bool),
-                })
             } else {
-                None
+                item.get("thinking")
+                    .and_then(Value::as_str)
+                    .map(|thinking| AssistantContent::Thinking {
+                        thinking: thinking.into(),
+                        redacted: item.get("redacted").and_then(Value::as_bool),
+                    })
             }
         })
         .collect()

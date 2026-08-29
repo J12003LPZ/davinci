@@ -119,9 +119,7 @@ fn initial_tools(options: &CreateAgentSessionOptions) -> Vec<String> {
         .collect::<std::collections::HashSet<_>>();
     let names: Vec<String> = if let Some(tools) = &options.tools {
         tools.clone()
-    } else if options.no_tools.as_deref() == Some("all") {
-        Vec::new()
-    } else if options.no_tools.as_deref() == Some("builtin") {
+    } else if matches!(options.no_tools.as_deref(), Some("all") | Some("builtin")) {
         Vec::new()
     } else {
         DEFAULT_ACTIVE_TOOLS
