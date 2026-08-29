@@ -44,4 +44,4 @@ Wire skill and prompt-template slash names into interactive autocomplete, lock t
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: 2026-08-29 — `pi-tui` + `pi-coding-agent` tests and clippy green after autocomplete / `renderLatex` / OSC 11. Workspace gates pending this commit.
+Last run: 2026-08-29 — `cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings` green on 1.83.0 after editor autocomplete, `renderLatex`, and OSC 11 query fixtures.
