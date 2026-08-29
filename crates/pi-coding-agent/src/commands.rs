@@ -1,4 +1,4 @@
-use crate::args::{parse_args, APP_NAME, VERSION};
+use crate::args::{parse_args, APP_NAME};
 use pi_ai::{get_env_api_key, AuthStorage, FileAuthStorage};
 use std::fs;
 use std::io::{self, Write};
@@ -237,6 +237,65 @@ Auth commands require at least one of --provider or --model. Checks refresh expi
     }
 }
 
+fn is_local_install_source(source: &str) -> bool {
+    let trimmed = source.trim();
+    !(trimmed.starts_with("npm:")
+        || trimmed.starts_with("git:")
+        || trimmed.starts_with("github:")
+        || trimmed.starts_with("http:")
+        || trimmed.starts_with("https:")
+        || trimmed.starts_with("ssh:"))
+}
+
+fn expand_install_path(source: &str) -> PathBuf {
+    if let Some(rest) = source.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(source)
+}
+
+fn package_source_string(value: &serde_json::Value) -> Option<String> {
+    value.as_str().map(str::to_string).or_else(|| {
+        value
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
+}
+
+fn package_is_filtered(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|obj| {
+        obj.contains_key("extensions")
+            || obj.contains_key("skills")
+            || obj.contains_key("prompts")
+            || obj.contains_key("themes")
+            || obj.get("autoload").and_then(|v| v.as_bool()) == Some(false)
+    })
+}
+
+fn load_packages(path: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("packages").and_then(|p| p.as_array()).cloned())
+        .unwrap_or_default()
+}
+
+fn write_packages(path: &std::path::Path, packages: &[serde_json::Value]) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap_or_else(|_| "{}".into()))
+            .unwrap_or(serde_json::json!({}));
+    if let Some(obj) = settings.as_object_mut() {
+        obj.insert("packages".into(), serde_json::json!(packages));
+    }
+    let _ = fs::write(path, serde_json::to_string_pretty(&settings).unwrap());
+}
+
 fn run_package(command: &str, args: &[String]) -> CommandOutcome {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return CommandOutcome::done(0, package_help(command), "");
@@ -245,29 +304,49 @@ fn run_package(command: &str, args: &[String]) -> CommandOutcome {
     let path = settings_path(local);
     match command {
         "list" => {
-            let body = fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
-            CommandOutcome::done(0, format!("{body}\n"), "")
+            let packages = load_packages(&path);
+            if packages.is_empty() {
+                return CommandOutcome::done(0, "No packages installed.\n", "");
+            }
+            let heading = if local {
+                "Project packages:"
+            } else {
+                "User packages:"
+            };
+            let mut out = format!("{heading}\n");
+            for pkg in packages {
+                let source = package_source_string(&pkg).unwrap_or_default();
+                if package_is_filtered(&pkg) {
+                    out.push_str(&format!("  {source} (filtered)\n"));
+                } else {
+                    out.push_str(&format!("  {source}\n"));
+                }
+            }
+            CommandOutcome::done(0, out, "")
         }
         "install" => {
             let source = args.iter().find(|a| !a.starts_with('-'));
             let Some(source) = source else {
                 return CommandOutcome::done(1, "", "Error: install requires a source\n");
             };
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
+            if is_local_install_source(source) {
+                let resolved = expand_install_path(source);
+                if !resolved.exists() {
+                    return CommandOutcome::done(
+                        1,
+                        "",
+                        format!("Error: Path does not exist: {}\n", resolved.display()),
+                    );
+                }
             }
-            let mut settings: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&path).unwrap_or_else(|_| "{}".into()))
-                    .unwrap_or(serde_json::json!({}));
-            let packages = settings
-                .as_object_mut()
-                .unwrap()
-                .entry("packages")
-                .or_insert(serde_json::json!([]));
-            if let Some(arr) = packages.as_array_mut() {
-                arr.push(serde_json::json!(source));
+            let mut packages = load_packages(&path);
+            if !packages
+                .iter()
+                .any(|pkg| package_source_string(pkg).as_deref() == Some(source.as_str()))
+            {
+                packages.push(serde_json::json!(source));
             }
-            let _ = fs::write(&path, serde_json::to_string_pretty(&settings).unwrap());
+            write_packages(&path, &packages);
             CommandOutcome::done(0, format!("Installed {source}\n"), "")
         }
         "remove" | "uninstall" => {
@@ -275,27 +354,54 @@ fn run_package(command: &str, args: &[String]) -> CommandOutcome {
             let Some(source) = source else {
                 return CommandOutcome::done(1, "", "Error: remove requires a source\n");
             };
-            if path.exists() {
-                if let Ok(mut settings) =
-                    serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path).unwrap())
-                {
-                    if let Some(arr) = settings.get_mut("packages").and_then(|v| v.as_array_mut()) {
-                        arr.retain(|v| v.as_str() != Some(source.as_str()));
-                    }
-                    let _ = fs::write(&path, serde_json::to_string_pretty(&settings).unwrap());
-                }
+            let mut packages = load_packages(&path);
+            let before = packages.len();
+            packages.retain(|pkg| package_source_string(pkg).as_deref() != Some(source.as_str()));
+            if packages.len() == before {
+                return CommandOutcome::done(
+                    1,
+                    "",
+                    format!("Error: No matching package found for {source}\n"),
+                );
             }
+            write_packages(&path, &packages);
             CommandOutcome::done(0, format!("Removed {source}\n"), "")
         }
         "update" => {
             let target = args
                 .iter()
                 .find(|a| !a.starts_with('-'))
-                .map(String::as_str)
-                .unwrap_or("all");
+                .map(String::as_str);
+            let packages = load_packages(&path);
+            if let Some(source) = target {
+                if source != "all"
+                    && source != "self"
+                    && source != "pi"
+                    && !packages
+                        .iter()
+                        .any(|pkg| package_source_string(pkg).as_deref() == Some(source))
+                {
+                    return CommandOutcome::done(
+                        1,
+                        "",
+                        format!("Error: No matching package found for {source}\n"),
+                    );
+                }
+            }
+            let offline = std::env::var("PI_OFFLINE")
+                .ok()
+                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+            if offline {
+                return CommandOutcome::done(0, String::new(), "");
+            }
+            let label = target.unwrap_or("packages");
             CommandOutcome::done(
                 0,
-                format!("Updated {target} (Rust {APP_NAME} {VERSION}; catalogs bundled)\n"),
+                if target.is_some() && target != Some("all") {
+                    format!("Updated {label}\n")
+                } else {
+                    "Updated packages\n".into()
+                },
                 "",
             )
         }
@@ -344,4 +450,56 @@ pub fn write_outcome(
         write!(err, "{}", outcome.stderr)?;
     }
     Ok(outcome.exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn with_agent_dir(f: impl FnOnce()) {
+        let dir = tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        f();
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    #[test]
+    fn install_list_remove_match_typescript_local_source() {
+        with_agent_dir(|| {
+            let missing = dispatch_subcommand(&["install".into(), "/no/such/pi-ext".into()]);
+            assert_eq!(missing.exit_code, 1);
+            assert!(missing
+                .stderr
+                .contains("Path does not exist: /no/such/pi-ext"));
+            let empty = dispatch_subcommand(&["list".into()]);
+            assert_eq!(empty.stdout, "No packages installed.\n");
+            let dir = tempdir().unwrap();
+            let ext = dir.path().join("my-ext");
+            fs::create_dir_all(&ext).unwrap();
+            let installed = dispatch_subcommand(&["install".into(), ext.to_string_lossy().into()]);
+            assert_eq!(installed.exit_code, 0);
+            assert!(installed.stdout.starts_with("Installed "));
+            let listed = dispatch_subcommand(&["list".into()]);
+            assert!(listed.stdout.starts_with("User packages:\n"));
+            assert!(listed.stdout.contains(ext.to_string_lossy().as_ref()));
+            let missing_remove = dispatch_subcommand(&["remove".into(), "npm:missing".into()]);
+            assert_eq!(missing_remove.exit_code, 1);
+            assert!(missing_remove
+                .stderr
+                .contains("No matching package found for npm:missing"));
+            let removed = dispatch_subcommand(&["remove".into(), ext.to_string_lossy().into()]);
+            assert_eq!(removed.exit_code, 0);
+            assert!(removed.stdout.starts_with("Removed "));
+            let update_missing = dispatch_subcommand(&["update".into(), "npm:missing".into()]);
+            assert_eq!(update_missing.exit_code, 1);
+            assert!(update_missing
+                .stderr
+                .contains("No matching package found for npm:missing"));
+        });
+    }
 }

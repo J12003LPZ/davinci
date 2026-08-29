@@ -23,11 +23,11 @@ A TypeScript `pi` user can install Rust `pi` and use the same flags, `~/.pi` ses
 
 ## What remains
 
-- `pi install` / `remove` / `update` / `list` / `config` only edit `settings.json` package strings. TypeScript resolves npm/git/local sources, copies package trees, filters resources, and runs a config TUI.
+- `pi install` / `remove` / `update` / `list` match TypeScript local-path validation and list/remove error strings, but npm/git sources are recorded without fetching package trees, and `pi config` is a settings summary rather than the TypeScript resource-enable TUI.
 
 ## Next crate/module
 
-Port the TypeScript package manager (local path first, then git/npm fixtures) and re-audit the Done bar.
+Port npm/git package fetch (fixture-safe) and the config resource TUI, then re-audit the Done bar.
 
 ## Gates
 
@@ -35,4 +35,4 @@ Port the TypeScript package manager (local path first, then git/npm fixtures) an
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: green on 1.83 after `sendMessage` triggerTurn/deliverAs queues and `custom_message` HTML session entries.
+Last run: green on 1.83 after `sendMessage` queues and TypeScript-aligned local package install/list/remove.
