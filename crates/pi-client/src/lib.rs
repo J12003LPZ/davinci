@@ -44,7 +44,7 @@ pub struct PiClient {
 impl PiClient {
     pub fn connect(server: PiServer) -> Result<Self, String> {
         let connection_id = Uuid::now_v7().to_string();
-        let mut client = Self {
+        let client = Self {
             io: ClientIo::Memory {
                 server,
                 connection_id,
@@ -58,7 +58,7 @@ impl PiClient {
 
     pub fn connect_unix(path: impl AsRef<Path>) -> Result<Self, String> {
         let transport = unix::UnixTransport::connect(path)?;
-        let mut client = Self {
+        let client = Self {
             io: ClientIo::Unix(transport),
             snapshot: None,
             leases: HashMap::new(),
@@ -305,7 +305,7 @@ mod tests {
             pi_server::UnixListenerOptions::default(),
         )
         .unwrap();
-        let mut client = PiClient::connect_unix(first.path()).unwrap();
+        let client = PiClient::connect_unix(first.path()).unwrap();
         assert!(client.snapshot.is_some());
 
         let error = pi_server::listen_unix(

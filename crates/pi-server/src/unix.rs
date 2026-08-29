@@ -47,6 +47,14 @@ pub struct UnixServer {
     join: Option<JoinHandle<()>>,
 }
 
+impl std::fmt::Debug for UnixServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnixServer")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl UnixServer {
     pub fn path(&self) -> &Path {
         &self.path
