@@ -1,6 +1,6 @@
 # Rust rewrite progress
 
-**Complete: 96%**
+**Complete: 97%**
 
 TypeScript spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185` (`@earendil-works/pi-*` 0.84.4).
 Toolchain: Rust **1.83.0**, no `edition2024`, no `unsafe`. Remote rust-rewrite placeholders were merged (ours strategy) and harvested for retry/permission shapes; live HTTP is implemented with `ureq` rather than those stubs.
@@ -18,16 +18,17 @@ TypeScript remains in `vendor/pi` as the behavioral reference only. Rust under `
 - **pi-protocol/client/server**: Unix+TCP+memory, handshake timeout, leases, request correlation, CBOR vectors. Server implements the full TypeScript `Command` union (list/create/attach/detach/prompt/steer/abort/set_model/set_thinking).
 - **pi-evals / pi-parity**: fixture evals + required golden corpora. Optional `--parallel-run` / `--diff-jsonl`.
 - **pi binary**: flags/subcommands from `args.ts` / `main.ts`, print/json/rpc/interactive sharing `SessionRuntime`. RPC `{type:"response",command,success}` plus streamed agent events and `extension_ui_request`. Interactive raw-stdin key loop and builtin slash handlers.
+- **HTML export**: themed session dump with TypeScript `escapeHtml` / `sanitizeMarkdownUrl` (`https?|mailto|tel|ftp`, C0 strip). XSS fixtures reject `javascript:` hrefs and unescaped markup.
 
 ## What remains
 
 - Live provider extras (Bedrock SigV4 signing, Vertex ADC, Codex websocket-cached session) still share the common HTTP/SSE path; catalogs, auth, and fixture parsers are present.
-- Styled TypeScript HTML export theme vs the current readable session dump.
+- TypeScript HTML export sidebar/tree/theme JS (`template.js`) is not fully ported — sanitization and message rendering are.
 - Full TypeScript extension host UI API beyond discovery, `invoke`, EventBus, and RPC `extension_ui_request`.
 
 ## Next crate/module
 
-Styled HTML export and remaining live-provider fixture paths.
+HTML export sidebar/tree (`template.js`) or live-provider fixture paths.
 
 ## Gates
 
@@ -35,4 +36,4 @@ Styled HTML export and remaining live-provider fixture paths.
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: resolving rebase of the RPC/session-tree slice onto the `SessionRuntime` merge.
+Last run: green on 1.83 after restoring session-tree conformance, Bedrock/Mistral/Codex SSE, and HTML export sanitization.
