@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
+
 use crate::kill_ring::KillRing;
 use crate::render::{visible_width, Component};
 use crate::undo_stack::UndoStack;
 use crate::CURSOR_MARKER;
+
+const HISTORY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LastAction {
@@ -31,6 +35,11 @@ pub struct Editor {
     last_action: Option<LastAction>,
     jump_mode: Option<JumpMode>,
     undo_stack: UndoStack<EditorState>,
+    history_index: i32,
+    history_draft: Option<EditorState>,
+    pastes: BTreeMap<usize, String>,
+    paste_counter: usize,
+    preferred_col: Option<usize>,
 }
 
 impl Editor {
@@ -43,7 +52,155 @@ impl Editor {
             last_action: None,
             jump_mode: None,
             undo_stack: UndoStack::new(),
+            history_index: -1,
+            history_draft: None,
+            pastes: BTreeMap::new(),
+            paste_counter: 0,
+            preferred_col: None,
         }
+    }
+
+    pub fn get_text(&self) -> &str {
+        &self.buffer
+    }
+
+    pub fn get_expanded_text(&self) -> String {
+        expand_paste_markers(&self.buffer, &self.pastes)
+    }
+
+    pub fn get_cursor(&self) -> (usize, usize) {
+        cursor_line_col(&self.buffer, self.cursor)
+    }
+
+    pub fn add_to_history(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.history.first().is_some_and(|entry| entry == trimmed) {
+            return;
+        }
+        self.history.insert(0, trimmed.to_string());
+        if self.history.len() > HISTORY_LIMIT {
+            self.history.pop();
+        }
+    }
+
+    fn exit_history_browsing(&mut self) {
+        self.history_index = -1;
+        self.history_draft = None;
+    }
+
+    pub fn navigate_history(&mut self, direction: i32) {
+        self.last_action = None;
+        if self.history.is_empty() {
+            return;
+        }
+        let new_index = self.history_index - direction;
+        if new_index < -1 || new_index >= self.history.len() as i32 {
+            return;
+        }
+        if self.history_index == -1 && new_index >= 0 {
+            self.push_undo();
+            self.history_draft = Some(EditorState {
+                buffer: self.buffer.clone(),
+                cursor: self.cursor,
+            });
+        }
+        self.history_index = new_index;
+        if self.history_index == -1 {
+            if let Some(draft) = self.history_draft.take() {
+                self.buffer = draft.buffer;
+                self.cursor = draft.cursor;
+            } else {
+                self.buffer.clear();
+                self.cursor = 0;
+            }
+            self.preferred_col = None;
+        } else {
+            let text = self.history[self.history_index as usize].clone();
+            self.buffer = text;
+            if direction < 0 {
+                self.cursor = 0;
+            } else {
+                self.cursor = self.buffer.len();
+            }
+            self.preferred_col = None;
+        }
+    }
+
+    pub fn cursor_up(&mut self) {
+        let (line, col) = self.get_cursor();
+        if line == 0 && (self.buffer.is_empty() || self.history_index > -1 || col == 0) {
+            self.navigate_history(-1);
+        } else if line == 0 {
+            self.move_line_start();
+        } else {
+            self.move_vertical(-1);
+        }
+    }
+
+    pub fn cursor_down(&mut self) {
+        let (line, _) = self.get_cursor();
+        let last = self.buffer.matches('\n').count();
+        if self.history_index > -1 && line == last {
+            self.navigate_history(1);
+        } else if line == last {
+            self.move_line_end();
+        } else {
+            self.move_vertical(1);
+        }
+    }
+
+    fn move_vertical(&mut self, delta: isize) {
+        let (line, col) = self.get_cursor();
+        let preferred = self.preferred_col.unwrap_or(col);
+        self.preferred_col = Some(preferred);
+        let last = self.buffer.matches('\n').count();
+        let new_line = (line as isize + delta).clamp(0, last as isize) as usize;
+        set_cursor_line_col(&self.buffer, &mut self.cursor, new_line, preferred);
+    }
+
+    pub fn handle_paste(&mut self, pasted_text: &str) {
+        self.exit_history_browsing();
+        self.last_action = None;
+        self.push_undo();
+        let decoded = decode_paste_csi_u(pasted_text);
+        let clean = decoded
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+        let mut filtered: String = clean
+            .chars()
+            .filter(|ch| *ch == '\n' || (*ch as u32) >= 32)
+            .collect();
+        if filtered.starts_with(['/', '~', '.']) {
+            if let Some(before) = self.buffer[..self.cursor].chars().next_back() {
+                if before.is_ascii_alphanumeric() || before == '_' {
+                    filtered.insert(0, ' ');
+                }
+            }
+        }
+        let lines = filtered.split('\n').count();
+        let total_chars = filtered.chars().count();
+        if lines > 10 || total_chars > 1000 {
+            self.paste_counter += 1;
+            let paste_id = self.paste_counter;
+            self.pastes.insert(paste_id, filtered.clone());
+            let marker = if lines > 10 {
+                format!("[paste #{paste_id} +{lines} lines]")
+            } else {
+                format!("[paste #{paste_id} {total_chars} chars]")
+            };
+            self.insert_str_internal(&marker);
+            return;
+        }
+        self.insert_str_internal(&filtered);
+    }
+
+    fn insert_str_internal(&mut self, text: &str) {
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor += text.len();
     }
 
     fn push_undo(&mut self) {
@@ -79,13 +236,16 @@ impl Editor {
     }
 
     pub fn insert_str(&mut self, text: &str) {
+        self.exit_history_browsing();
+        self.preferred_col = None;
         self.push_undo();
-        self.buffer.insert_str(self.cursor, text);
-        self.cursor += text.len();
+        self.insert_str_internal(text);
         self.clear_last_action();
     }
 
     pub fn insert(&mut self, ch: char) {
+        self.exit_history_browsing();
+        self.preferred_col = None;
         if ch.is_whitespace() || self.last_action != Some(LastAction::TypeWord) {
             self.push_undo();
         }
@@ -125,7 +285,12 @@ impl Editor {
 
     pub fn move_left(&mut self) {
         self.clear_last_action();
+        self.preferred_col = None;
         if self.cursor == 0 {
+            return;
+        }
+        if let Some((start, _)) = marker_ending_at(&self.buffer, self.cursor) {
+            self.cursor = start;
             return;
         }
         self.cursor -= self.buffer[..self.cursor]
@@ -137,7 +302,12 @@ impl Editor {
 
     pub fn move_right(&mut self) {
         self.clear_last_action();
+        self.preferred_col = None;
         if self.cursor >= self.buffer.len() {
+            return;
+        }
+        if let Some((_, end)) = marker_starting_at(&self.buffer, self.cursor) {
+            self.cursor = end;
             return;
         }
         self.cursor += self.buffer[self.cursor..]
@@ -293,20 +463,141 @@ impl Editor {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
+        self.exit_history_browsing();
+        self.pastes.clear();
+        self.paste_counter = 0;
+        self.preferred_col = None;
         self.buffer = text.into();
         self.cursor = self.buffer.len();
     }
 
     pub fn submit(&mut self) -> String {
-        let value = std::mem::take(&mut self.buffer);
+        let value = self.get_expanded_text();
+        let result = value.trim().to_string();
+        self.add_to_history(&result);
+        self.buffer.clear();
         self.cursor = 0;
+        self.pastes.clear();
+        self.paste_counter = 0;
+        self.exit_history_browsing();
         self.undo_stack.clear();
         self.last_action = None;
-        if !value.is_empty() {
-            self.history.push(value.clone());
-        }
-        value
+        self.preferred_col = None;
+        result
     }
+}
+
+fn cursor_line_col(buffer: &str, cursor: usize) -> (usize, usize) {
+    let before = &buffer[..cursor.min(buffer.len())];
+    let line = before.matches('\n').count();
+    let col = before.rsplit('\n').next().map(str::len).unwrap_or(0);
+    (line, col)
+}
+
+fn set_cursor_line_col(buffer: &str, cursor: &mut usize, line: usize, col: usize) {
+    let mut pos = 0;
+    for (index, part) in buffer.split('\n').enumerate() {
+        if index == line {
+            *cursor = pos + col.min(part.len());
+            return;
+        }
+        pos += part.len() + 1;
+    }
+    *cursor = buffer.len();
+}
+
+fn expand_paste_markers(text: &str, pastes: &BTreeMap<usize, String>) -> String {
+    let mut result = text.to_string();
+    for (id, content) in pastes {
+        let markers = paste_markers(&result);
+        for (start, end) in markers.into_iter().rev() {
+            if parse_marker_id(&result[start..end]) == Some(*id) {
+                result.replace_range(start..end, content);
+            }
+        }
+    }
+    result
+}
+
+fn paste_markers(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("[paste #") {
+        let start = search + rel;
+        let Some(end_rel) = text[start..].find(']') else {
+            break;
+        };
+        let end = start + end_rel + 1;
+        if parse_marker_id(&text[start..end]).is_some() {
+            out.push((start, end));
+        }
+        search = end;
+    }
+    out
+}
+
+fn parse_marker_id(marker: &str) -> Option<usize> {
+    let inner = marker.strip_prefix("[paste #")?.strip_suffix(']')?;
+    if let Some((id, rest)) = inner.split_once(' ') {
+        let id = id.parse().ok()?;
+        if let Some(count) = rest
+            .strip_prefix('+')
+            .and_then(|rest| rest.strip_suffix(" lines"))
+        {
+            count.parse::<usize>().ok()?;
+            return Some(id);
+        }
+        if let Some(count) = rest.strip_suffix(" chars") {
+            count.parse::<usize>().ok()?;
+            return Some(id);
+        }
+        return None;
+    }
+    inner.parse().ok()
+}
+
+fn marker_starting_at(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    paste_markers(text)
+        .into_iter()
+        .find(|(start, _)| *start == cursor)
+}
+
+fn marker_ending_at(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    paste_markers(text)
+        .into_iter()
+        .find(|(_, end)| *end == cursor)
+}
+
+fn decode_paste_csi_u(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("\x1b[") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('u') {
+            let seq = &after[..end];
+            if let Some((code, "5")) = seq.split_once(";5") {
+                if let Ok(cp) = code.parse::<u32>() {
+                    let decoded = if (97..=122).contains(&cp) {
+                        Some(char::from_u32(cp - 96))
+                    } else if (65..=90).contains(&cp) {
+                        Some(char::from_u32(cp - 64))
+                    } else {
+                        None
+                    };
+                    if let Some(ch) = decoded.flatten() {
+                        out.push(ch);
+                        rest = &after[end + 1..];
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str("\x1b[");
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 impl Default for Editor {
@@ -441,5 +732,183 @@ mod tests {
         assert_eq!(editor.jump_mode(), Some(true));
         editor.cancel_jump();
         assert_eq!(editor.jump_mode(), None);
+    }
+
+    #[test]
+    fn prompt_history_matches_ts_editor_tests() {
+        let mut editor = Editor::new();
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "");
+
+        editor.add_to_history("first prompt");
+        editor.add_to_history("second prompt");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "second prompt");
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("first");
+        editor.add_to_history("second");
+        editor.add_to_history("third");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "third");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "second");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "first");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "first");
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("prompt");
+        editor.set_text("draft");
+        editor.cursor = "dr".len();
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "draft");
+        assert_eq!(editor.get_cursor(), (0, 0));
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "prompt");
+        editor.cursor_down();
+        assert_eq!(editor.get_text(), "draft");
+        assert_eq!(editor.get_cursor(), (0, 0));
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("");
+        editor.add_to_history("   ");
+        editor.add_to_history("valid");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "valid");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "valid");
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("same");
+        editor.add_to_history("same");
+        editor.add_to_history("same");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "same");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "same");
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("first");
+        editor.add_to_history("second");
+        editor.add_to_history("first");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "first");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "second");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "first");
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("history item");
+        editor.set_text("line1\nline2");
+        editor.cursor_up();
+        editor.insert('X');
+        assert_eq!(editor.get_text(), "line1X\nline2");
+
+        editor.set_text("");
+        editor.history.clear();
+        for i in 0..105 {
+            editor.add_to_history(&format!("prompt {i}"));
+        }
+        for _ in 0..100 {
+            editor.cursor_up();
+        }
+        assert_eq!(editor.get_text(), "prompt 5");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "prompt 5");
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("older entry");
+        editor.add_to_history("line1\nline2\nline3");
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "line1\nline2\nline3");
+        assert_eq!(editor.get_cursor(), (0, 0));
+        editor.cursor_up();
+        assert_eq!(editor.get_text(), "older entry");
+        assert_eq!(editor.get_cursor(), (0, 0));
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("older entry");
+        editor.add_to_history("line1\nline2\nline3");
+        editor.add_to_history("newer entry");
+        editor.cursor_up();
+        editor.cursor_up();
+        editor.cursor_up();
+        editor.cursor_down();
+        assert_eq!(editor.get_text(), "line1\nline2\nline3");
+        assert_eq!(editor.get_cursor(), (2, 5));
+        editor.cursor_down();
+        assert_eq!(editor.get_text(), "newer entry");
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("line1\nline2\nline3");
+        editor.cursor_up();
+        assert_eq!(editor.get_cursor(), (0, 0));
+        editor.cursor_down();
+        assert_eq!(editor.get_text(), "line1\nline2\nline3");
+        assert_eq!(editor.get_cursor(), (1, 0));
+        editor.cursor_up();
+        assert_eq!(editor.get_cursor(), (0, 0));
+
+        editor.set_text("");
+        editor.history.clear();
+        editor.add_to_history("old prompt");
+        editor.cursor_up();
+        editor.insert('x');
+        assert_eq!(editor.get_text(), "xold prompt");
+    }
+
+    #[test]
+    fn dedicated_history_keys_browse_without_moving_cursor_first() {
+        let mut editor = Editor::new();
+        editor.add_to_history("older prompt");
+        editor.add_to_history("newer\nmultiline prompt");
+        editor.set_text("draft");
+        editor.cursor = "dr".len();
+        editor.navigate_history(-1);
+        assert_eq!(editor.get_text(), "newer\nmultiline prompt");
+        assert_eq!(editor.get_cursor(), (0, 0));
+        editor.navigate_history(-1);
+        assert_eq!(editor.get_text(), "older prompt");
+        editor.navigate_history(1);
+        assert_eq!(editor.get_text(), "newer\nmultiline prompt");
+        assert_eq!(editor.get_cursor(), (1, 16));
+        editor.navigate_history(1);
+        assert_eq!(editor.get_text(), "draft");
+        assert_eq!(editor.get_cursor(), (0, 2));
+    }
+
+    #[test]
+    fn large_paste_markers_expand_on_submit() {
+        let mut editor = Editor::new();
+        let big = (0..20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.handle_paste(&big);
+        assert!(editor.get_text().contains("[paste #1 +20 lines]"));
+        editor.insert('A');
+        editor.move_line_start();
+        editor.move_right();
+        assert_eq!(editor.cursor, editor.get_text().len() - 1);
+        editor.move_left();
+        assert_eq!(editor.cursor, 0);
+        assert_eq!(editor.submit(), format!("{big}A"));
+
+        let mut editor = Editor::new();
+        editor.handle_paste(&"x".repeat(1001));
+        assert!(editor.get_text().contains("[paste #1 1001 chars]"));
+        assert_eq!(editor.submit(), "x".repeat(1001));
     }
 }

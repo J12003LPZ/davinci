@@ -138,6 +138,10 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("tui.select.down", &["down"]),
         ("tui.select.confirm", &["enter"]),
         ("tui.select.cancel", &["escape"]),
+        ("tui.editor.cursorUp", &["up"]),
+        ("tui.editor.cursorDown", &["down"]),
+        ("tui.editor.historyPrevious", &[]),
+        ("tui.editor.historyNext", &[]),
         ("tui.editor.cursorLeft", &["left", "ctrl+b"]),
         ("tui.editor.cursorRight", &["right", "ctrl+f"]),
         (
@@ -266,6 +270,11 @@ mod tests {
         assert!(Keybindings::defaults().matches("\x1b\x1d", "tui.editor.jumpBackward"));
         assert!(Keybindings::defaults().matches("\x1f", "tui.editor.undo"));
         assert!(Keybindings::defaults().matches("\x1b[45;5u", "tui.editor.undo"));
+        assert!(Keybindings::defaults().matches("\x1b[A", "tui.editor.cursorUp"));
+        assert!(Keybindings::defaults().matches("\x1b[B", "tui.editor.cursorDown"));
+        assert!(Keybindings::defaults()
+            .keys_for("tui.editor.historyPrevious")
+            .is_empty());
         let migrated = Keybindings::from_json(r#"{"clear":"ctrl+u"}"#);
         assert!(migrated.matches("\x15", "app.clear"));
     }

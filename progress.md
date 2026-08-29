@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (TS Input widget, Codex SSE zstd, HTTP CONNECT for WSS). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (editor prompt history, large-paste markers, multiline Up/Down). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -90,6 +90,8 @@ Closed this slice: Codex websocket protocol from `openai-codex-responses.ts` —
 Closed this slice: TUI CJK word segmentation uses ICU4X `WordSegmenter::new_dictionary` on CJK runs (real dictionary, not pair-grouping). Locks TS `你好|世界`, `你好，世界`, mixed `hello你好，world世界`, and Input Ctrl+W `你好世界。你好，世界`. ASCII word-nav fixtures are unchanged (TS punctuation splitter). Editor word-move/delete uses the same path.
 
 Closed this slice: TUI `Input` matches TS `components/input.ts` — grapheme cursor, kill-ring/yank/yank-pop, undo coalescing (`ctrl+-` / Kitty `\x1b[45;5u`), bracketed paste, horizontal CJK scroll, word-nav. `ExtensionInput` and InteractiveSession `/` dialogs use it. Editor undo is wired on the same keybinding. Codex SSE bodies use zstd level 3 + `content-encoding: zstd` (TS `compressRequestBodyZstd`). WSS honors TS `resolveHttpProxyUrlForTarget` (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, SOCKS/PAC reject string) and HTTP CONNECT (Basic proxy auth, 200). Tests: `vendor/pi/packages/tui/test/input.test.ts`, `openai-codex-stream` zstd, `node-http-proxy.test.ts`; CONNECT is loopback only.
+
+Closed this slice: TUI Editor prompt history matches TS `editor.test.ts` / `editor-history-keybindings.test.ts` — newest-first `addToHistory` (trim, skip empty, no consecutive dups, cap 100), Up on first line/col 0 or empty browses history, first Up from a mid-line draft jumps to start then restores the draft on Down, Down at last line while browsing continues, dedicated `historyPrevious`/`historyNext` skip the cursor-first step, typing exits browse. Large pastes (`>10` lines or `>1000` chars) insert `[paste #N +L lines]` / `[paste #N C chars]` markers that are atomic for left/right and expand on submit (TS `.trim()`). InteractiveSession Up/Down and bracketed paste use this path; `\\`+Enter inserts a newline.
 
 Still not product-equivalent:
 

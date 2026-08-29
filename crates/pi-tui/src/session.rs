@@ -765,7 +765,7 @@ impl InteractiveSession {
         if let Some(mut buf) = self.paste_buf.take() {
             if let Some(end) = data.find("\x1b[201~") {
                 buf.push_str(&data[..end]);
-                self.chrome.editor.handle_input(&buf);
+                self.chrome.editor.handle_paste(&buf);
                 let rest = &data[end + "\x1b[201~".len()..];
                 if rest.is_empty() {
                     return SessionAction::None;
@@ -778,7 +778,7 @@ impl InteractiveSession {
         }
         if let Some(rest) = data.strip_prefix("\x1b[200~") {
             if let Some(end) = rest.find("\x1b[201~") {
-                self.chrome.editor.handle_input(&rest[..end]);
+                self.chrome.editor.handle_paste(&rest[..end]);
                 return self.handle_bytes(&rest[end + "\x1b[201~".len()..]);
             }
             self.paste_buf = Some(rest.to_string());
@@ -1336,6 +1336,13 @@ impl InteractiveSession {
             self.overlay_kind = OverlayKind::None;
             return SessionAction::CloseOverlay;
         }
+        if self.chrome.editor.cursor > 0
+            && self.chrome.editor.buffer[..self.chrome.editor.cursor].ends_with('\\')
+        {
+            self.chrome.editor.backspace();
+            self.chrome.editor.insert_str("\n");
+            return SessionAction::None;
+        }
         let submitted = self.chrome.editor.submit();
         if let Some(command) = submitted.trim_start().strip_prefix('!') {
             return SessionAction::RunBash(command.trim().to_string());
@@ -1374,6 +1381,22 @@ impl InteractiveSession {
                 || self.keybindings.matches(data, "tui.editor.jumpBackward"))
         {
             editor.cancel_jump();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.historyPrevious") {
+            editor.navigate_history(-1);
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.historyNext") {
+            editor.navigate_history(1);
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorUp") {
+            editor.cursor_up();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorDown") {
+            editor.cursor_down();
             return true;
         }
         if self.keybindings.matches(data, "tui.editor.cursorWordLeft") {
@@ -1979,5 +2002,27 @@ mod tests {
         assert_eq!(session.handle_bytes("\x1d"), SessionAction::None);
         assert_eq!(session.handle_bytes("t"), SessionAction::None);
         assert_eq!(session.chrome.editor.cursor, 5);
+        session.chrome.editor.add_to_history("older");
+        session.chrome.editor.add_to_history("newer");
+        session.chrome.editor.set_text("");
+        assert_eq!(session.handle_bytes("\x1b[A"), SessionAction::None);
+        assert_eq!(session.chrome.editor.buffer, "newer");
+        assert_eq!(session.handle_bytes("\x1b[A"), SessionAction::None);
+        assert_eq!(session.chrome.editor.buffer, "older");
+        let big = (0..12)
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        session.chrome.editor.set_text("");
+        assert_eq!(
+            session.handle_bytes(&format!("\x1b[200~{big}\x1b[201~")),
+            SessionAction::None
+        );
+        assert!(session
+            .chrome
+            .editor
+            .buffer
+            .contains("[paste #1 +12 lines]"));
+        assert_eq!(session.handle_bytes("\r"), SessionAction::Submit(big));
     }
 }
