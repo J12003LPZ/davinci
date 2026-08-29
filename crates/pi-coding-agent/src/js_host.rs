@@ -1,9 +1,10 @@
 //! JavaScript extension subprocess runner matching
 //! `vendor/pi/packages/coding-agent/src/core/extensions/loader.ts` when Node is present.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -91,11 +92,15 @@ pub fn node_available() -> bool {
 }
 
 fn runner_path() -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join("pi-extension-runner");
-    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join("extension_runner.js");
-    std::fs::write(&path, RUNNER_JS).map_err(|err| err.to_string())?;
-    Ok(path)
+    static PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("pi-extension-runner");
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join(format!("extension_runner-{}.js", std::process::id()));
+        std::fs::write(&path, RUNNER_JS).map_err(|err| err.to_string())?;
+        Ok(path)
+    })
+    .clone()
 }
 
 pub fn resolve_extension_module(dir: &Path) -> Option<PathBuf> {
@@ -130,11 +135,108 @@ pub fn resolve_extension_module(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+struct PersistentJsSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    module: PathBuf,
+}
+
+impl PersistentJsSession {
+    fn start(module: &Path) -> Result<Self, String> {
+        let node =
+            find_node().ok_or_else(|| "Node.js is not available for JS extensions".to_string())?;
+        let runner = runner_path()?;
+        let mut child = Command::new(node)
+            .arg(&runner)
+            .arg(module)
+            .arg("--persistent")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| err.to_string())?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "persistent stdin".to_string())?;
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| "persistent stdout".to_string())?,
+        );
+        let mut session = Self {
+            child,
+            stdin,
+            stdout,
+            module: module.to_path_buf(),
+        };
+        let _ = session.read_line()?;
+        Ok(session)
+    }
+
+    fn send(&mut self, op: &str, payload: &Value) -> Result<JsExtensionResult, String> {
+        let line = serde_json::json!({ "op": op, "payload": payload });
+        self.stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .map_err(|err| err.to_string())?;
+        self.stdin.flush().map_err(|err| err.to_string())?;
+        self.read_line()
+    }
+
+    fn read_line(&mut self) -> Result<JsExtensionResult, String> {
+        let mut line = String::new();
+        self.stdout
+            .read_line(&mut line)
+            .map_err(|err| err.to_string())?;
+        serde_json::from_str(line.trim()).map_err(|err| format!("extension runner: {err}: {line}"))
+    }
+}
+
+impl Drop for PersistentJsSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+static PERSISTENT_JS: Mutex<Option<PersistentJsSession>> = Mutex::new(None);
+static NODE_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn run_persistent_js_extension(
+    module: &Path,
+    op: &str,
+    payload: &Value,
+) -> Result<JsExtensionResult, String> {
+    let _guard = NODE_LOCK.lock().map_err(|err| err.to_string())?;
+    let mut slot = PERSISTENT_JS.lock().map_err(|err| err.to_string())?;
+    if slot
+        .as_ref()
+        .is_some_and(|session| session.module != module)
+    {
+        *slot = None;
+    }
+    if slot.is_none() {
+        *slot = Some(PersistentJsSession::start(module)?);
+    }
+    slot.as_mut()
+        .ok_or_else(|| "persistent JS session missing".to_string())?
+        .send(op, payload)
+}
+
+pub fn stop_persistent_js_extension() {
+    if let Ok(mut slot) = PERSISTENT_JS.lock() {
+        *slot = None;
+    }
+}
+
 pub fn run_js_extension(
     module: &Path,
     op: &str,
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
+    let _guard = NODE_LOCK.lock().map_err(|err| err.to_string())?;
     let node =
         find_node().ok_or_else(|| "Node.js is not available for JS extensions".to_string())?;
     let runner = runner_path()?;
@@ -723,5 +825,61 @@ module.exports = (pi) => {
         )
         .unwrap();
         assert_eq!(selected.result.as_ref().unwrap(), "read");
+    }
+
+    #[test]
+    fn persistent_custom_tick_keeps_live_state() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerCommand("counter", {
+    description: "counter",
+    handler: async (_args, ctx) => {
+      return ctx.ui.custom((tui, _theme, _kb, done) => {
+        let n = 0;
+        tui.requestRender();
+        return {
+          tick() { n += 1; },
+          handleInput(data) { if (data === "q") done(n); },
+          render() { return [String(n)]; },
+        };
+      }, { overlay: true, overlayOptions: { anchor: "center", width: 20 } });
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let opened = run_persistent_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "counter", "ctx": { "mode": "tui" } }),
+        )
+        .unwrap();
+        assert!(opened.ok, "{:?}", opened.error);
+        assert_eq!(opened.result.as_ref().unwrap()["pending"], true);
+        assert_eq!(opened.result.as_ref().unwrap()["overlay"], true);
+        assert_eq!(opened.result.as_ref().unwrap()["lines"][0], "0");
+        let ticked = run_persistent_js_extension(
+            &module,
+            "customTick",
+            &serde_json::json!({ "name": "counter", "width": 40 }),
+        )
+        .unwrap();
+        assert_eq!(ticked.result.as_ref().unwrap()["lines"][0], "1");
+        let again = run_persistent_js_extension(
+            &module,
+            "customTick",
+            &serde_json::json!({ "name": "counter", "width": 40 }),
+        )
+        .unwrap();
+        assert_eq!(again.result.as_ref().unwrap()["lines"][0], "2");
+        stop_persistent_js_extension();
     }
 }

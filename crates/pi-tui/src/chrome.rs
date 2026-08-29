@@ -6,6 +6,8 @@ use crate::extension_ui::{
 };
 use crate::first_time::FirstTimeSetup;
 use crate::login_dialog::LoginDialog;
+use crate::model_selector::ModelSelector;
+use crate::overlay::{composite_overlay_lines, OverlayOptions};
 use crate::render::Component;
 use crate::scoped_models::ScopedModelsSelector;
 use crate::session_selector::SessionSelector;
@@ -23,6 +25,7 @@ pub struct ChatChrome {
     pub transcript: Transcript,
     pub editor: Editor,
     pub selector: Option<SelectList>,
+    pub model_selector: Option<ModelSelector>,
     pub settings_list: Option<SettingsList>,
     pub settings_submenu: Option<SettingsSubmenu>,
     pub session_selector: Option<SessionSelector>,
@@ -53,6 +56,8 @@ pub struct ChatChrome {
     pub custom_overlay_path: Option<String>,
     pub custom_overlay_command: Option<String>,
     pub custom_overlay_snapshot: Option<serde_json::Value>,
+    pub custom_overlay_composite: bool,
+    pub custom_overlay_options: Option<OverlayOptions>,
 }
 
 impl ChatChrome {
@@ -61,6 +66,7 @@ impl ChatChrome {
             transcript: Transcript::default(),
             editor: Editor::new(),
             selector: None,
+            model_selector: None,
             settings_list: None,
             settings_submenu: None,
             session_selector: None,
@@ -91,6 +97,8 @@ impl ChatChrome {
             custom_overlay_path: None,
             custom_overlay_command: None,
             custom_overlay_snapshot: None,
+            custom_overlay_composite: false,
+            custom_overlay_options: None,
         }
     }
 
@@ -284,6 +292,9 @@ impl Component for ChatChrome {
         } else if let Some(settings) = &self.settings_list {
             lines.push(String::new());
             lines.extend(settings.render(width));
+        } else if let Some(selector) = &self.model_selector {
+            lines.push(String::new());
+            lines.extend(selector.render(width));
         } else if let Some(selector) = &self.selector {
             lines.push(String::new());
             lines.extend(selector.render(width));
@@ -303,8 +314,28 @@ impl Component for ChatChrome {
             lines.push(String::new());
             lines.extend(progress.render(width));
         } else if let Some(custom) = &self.custom_overlay_lines {
-            lines.push(String::new());
-            lines.extend(custom.iter().cloned());
+            if self.custom_overlay_composite {
+                let mut base = Vec::new();
+                for widget in &self.widgets_above {
+                    base.extend(widget.lines.iter().cloned());
+                }
+                if let Some(editor) = &self.custom_editor_lines {
+                    base.extend(editor.iter().cloned());
+                } else {
+                    base.extend(self.editor.render(width));
+                }
+                for widget in &self.widgets_below {
+                    base.extend(widget.lines.iter().cloned());
+                }
+                let options = self.custom_overlay_options.clone().unwrap_or_default();
+                let height = base.len().max(custom.len()).max(24);
+                lines.extend(composite_overlay_lines(
+                    &base, custom, &options, width, height,
+                ));
+            } else {
+                lines.push(String::new());
+                lines.extend(custom.iter().cloned());
+            }
         } else {
             for widget in &self.widgets_above {
                 lines.extend(widget.lines.iter().cloned());
@@ -354,6 +385,8 @@ impl Component for ChatChrome {
             sessions.handle_input(data);
         } else if let Some(settings) = &mut self.settings_list {
             settings.handle_input(data);
+        } else if let Some(selector) = &mut self.model_selector {
+            let _ = selector.handle_key(data);
         } else if let Some(selector) = &mut self.selector {
             selector.query.push_str(data);
         } else if let Some(selector) = &mut self.extension_selector {

@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (/llama live SSE + progress/retry UI, JS virtual TUI tree, deprecation warnings, catalog refresh, live npm/git install). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (models.json ModelConfig, ModelSelector search/scope, startup version/package/tmux notices, JS overlay compositing + persistent tick host). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -30,6 +30,10 @@ Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 - **JS virtual TUI:** `@earendil-works/pi-tui` now mounts `Container`, `SelectList`, `Input`, `Text`, `TUI` with `requestRender` / `customTick`.
 - **Startup migrations** (`hooks/` / custom `tools/` deprecation strings + footer + `Press any key to continue...`), commands→prompts, tools→bin, oauth/apiKeys→auth.json.
 - **Model catalog refresh:** `models-store.json`, `https://pi.dev/api/models/providers/{id}`, 4h TTL, interactive `/model` `/scoped-models` startup status strings (`Refreshing model catalogs…`, timeout/error forms).
+- **models.json / ModelConfig:** `~/.pi/agent/models.json` load (ENOENT empty, read/parse/schema errors with TS strings), comment/BOM strip, `models[]` upsert-by-id, `modelOverrides` last, case-insensitive header merge, `apiKey`/`authHeader` overlay into `ResolvedAuth`. Reloaded on `/model` and `--list-models`. Empty catalog: `No models available. Check your installation or add models to models.json.`
+- **ModelSelectorComponent:** search via `getModelSelectorSearchText` (bare id not first), current/default/provider sort, Tab `Scope: all | scoped`, `tab scope (all/scoped)`, `Only showing models from configured providers. Use /login to add providers.`, `→ id [provider] · default ✓`, `No matching models`, `Model Name:`, `(i/n)`, `Enter to select · Ctrl+S to set as default · Esc to cancel`. Ctrl+S persists `defaultProvider`/`defaultModel`.
+- **Startup notices:** `Update Available` / `New version {v} is available. Run pi update` / `Changelog: https://pi.dev/changelog` (`PI_LATEST_VERSION_REPLY`, `PI_SKIP_VERSION_CHECK`, `PI_OFFLINE`); `Package Updates Available` / `pi update --extensions` (`PI_PACKAGE_UPDATES_REPLY`); tmux `extended-keys` / `extended-keys-format` warnings (`PI_TMUX_EXTENDED_KEYS*`); `models.json error:` and `Migrated credentials to auth.json:`.
+- **JS overlay compositing:** `compositeTuiLine` (CJK-boundary fixtures), 9-point anchors / `%` / margin / offset, `ui.custom({ overlay: true, overlayOptions })` composites onto chrome instead of replacing the editor. Persistent Node `--persistent` host keeps `setInterval` / `tick()` state across `customTick`/`customInput`.
 - **pi-parity**: six required corpora + optional `--parallel-run` / `--diff-jsonl`.
 
 Gates on this slice: `cargo test --workspace`, `cargo fmt --check`, `clippy --workspace --all-targets -- -D warnings` green on 1.83.
@@ -42,9 +46,12 @@ Closed this slice: JS `registerTool()` execute via `CustomToolExecutor`, `pi.reg
 
 Closed this slice: `/llama` live SSE + progress overlay + Retry/Close, JS `Container`/`SelectList`/`Input`/`TUI` virtual mount + `customTick`, startup `showDeprecationWarnings` + migrations, `models-store.json` / `pi.dev` catalog refresh on interactive `/model` and `pi update --models`, live `npm`/`git` install argv and dest dirs.
 
+Closed this slice: `models.json` ModelConfig + apply/overrides/auth headers + `/model` hot reload, full ModelSelector search/scope/default chrome, startup version/package/tmux notice strings, `compositeTuiLine` + overlay anchors, persistent JS custom-UI host for live ticks.
+
 Still not product-equivalent:
 
-- **`models.json` / ModelRuntime:** custom provider files, dynamic auth headers, merge-by-id hot reload on `/model` (store overlay exists; full TS `ModelConfig` file is not loaded)
-- **JS overlay compositing:** `ui.custom({ overlay: true })` anchors / `compositeTuiLine`; `setInterval` games still one-shot Node (tick path exists, process is not long-lived)
-- Startup version-check / installed-package-update / tmux keyboard warnings
-- Full TS `ModelSelectorComponent` search/scoped tab chrome (refresh status is wired; picker is still `SelectList`)
+- Live npm `checkForAvailableUpdates` registry probe (UI + `PI_PACKAGE_UPDATES_REPLY` are wired; production does not query npm)
+- Full TypeBox `models.json` keyword error paths (structural/compose errors are locked; not every TypeBox instancePath)
+- ModelSelector ANSI theme roles (`theme.fg` accent/muted/success) — copy and key behavior match
+- Overlay `visible(termWidth, termHeight)` JS callback
+- ModelRuntime availability snapshot (configured/stored provider sets + auth map) beyond merged model lists

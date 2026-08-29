@@ -78,6 +78,8 @@ pub struct Model {
     pub max_tokens: u64,
     #[serde(default)]
     pub compat: serde_json::Value,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 pub fn flatten_catalog(provider: &str, groups: &serde_json::Value) -> Vec<Model> {
@@ -160,6 +162,11 @@ pub fn models_from_provider_config(name: &str, config: &serde_json::Value) -> Ve
                     model["name"] = id;
                 }
             }
+            if model.get("headers").is_none() {
+                if let Some(headers) = config.get("headers") {
+                    model["headers"] = headers.clone();
+                }
+            }
             serde_json::from_value(model).ok()
         })
         .collect()
@@ -183,6 +190,7 @@ pub fn openrouter_image_models() -> Vec<Model> {
         context_window: 32_768,
         max_tokens: 8192,
         compat: serde_json::Value::Null,
+        headers: Default::default(),
     }]
 }
 

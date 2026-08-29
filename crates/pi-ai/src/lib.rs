@@ -3,6 +3,7 @@
 mod auth;
 mod catalog;
 mod codex;
+mod model_config;
 mod models_store;
 mod oauth;
 mod oauth_callback;
@@ -26,6 +27,10 @@ pub use codex::{
     WEBSOCKET_CLOSED_BEFORE_COMPLETED, WEBSOCKET_CONNECTION_LIMIT_REACHED,
     WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
 };
+pub use model_config::{
+    apply_config_auth, apply_models_config, load_models_json, merge_headers, models_json_path,
+    ModelConfig, ModelsJsonProvider, NO_MODELS_AVAILABLE,
+};
 pub use models_store::{
     catalog_url, load_models_store, merge_models, models_store_path, now_ms, parse_remote_catalog,
     save_models_store, ModelsStore, ModelsStoreEntry, DEFAULT_CATALOG_BASE_URL,
@@ -42,9 +47,7 @@ pub use oauth_providers::{
     oauth_providers, parse_authorization_input, token_exchange_request, AuthorizeRequest, Pkce,
     TokenExchangeRequest,
 };
-pub use providers::{
-    builtin_providers, load_models_json, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS,
-};
+pub use providers::{builtin_providers, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS};
 pub use stream::{
     assistant_to_chat, complete_from_events, events_from_complete, fixture_complete, live_complete,
     live_stream, parse_sse_block, replay_sse_events, request_body, request_url, AssistantMessage,
@@ -239,6 +242,7 @@ mod tests {
                 context_window: 1,
                 max_tokens: 1,
                 compat: serde_json::Value::Null,
+                headers: Default::default(),
             };
             let url = request_url(&model, &auth);
             assert!(url.starts_with("https://example.test"), "{api} -> {url}");

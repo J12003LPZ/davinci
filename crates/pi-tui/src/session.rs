@@ -17,6 +17,7 @@ use crate::keybindings::Keybindings;
 use crate::keys::decode_kitty_printable;
 use crate::login_dialog::{LoginDialog, LoginDialogAction};
 use crate::mermaid::MermaidMode;
+use crate::model_selector::{ModelSelector, ModelSelectorAction, ModelSelectorItem};
 use crate::mouse::{parse_mouse_sgr, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
 use crate::osc::ThemeDetection;
 use crate::overlay::Overlay;
@@ -61,6 +62,7 @@ pub enum SessionAction {
     Clear,
     OpenModel,
     SelectModel(String),
+    SelectModelAsDefault(String),
     SelectSession(String),
     SelectSetting(String),
     CycleSetting,
@@ -119,6 +121,8 @@ pub enum SessionAction {
 pub struct InteractiveSession {
     pub chrome: ChatChrome,
     pub models: Vec<String>,
+    pub model_items: Vec<ModelSelectorItem>,
+    pub default_model: Option<String>,
     pub model_index: usize,
     pub thinking_levels: Vec<String>,
     pub thinking_index: usize,
@@ -203,7 +207,12 @@ impl InteractiveSession {
     pub fn new(theme: Theme, title: impl Into<String>, models: Vec<String>) -> Self {
         Self {
             chrome: ChatChrome::new(theme, title),
+            model_items: models
+                .iter()
+                .map(|key| ModelSelectorItem::from_key(key))
+                .collect(),
             models,
+            default_model: None,
             model_index: 0,
             thinking_levels: vec![
                 "off".into(),
@@ -278,7 +287,32 @@ impl InteractiveSession {
 
     pub fn open_model_overlay(&mut self) {
         self.overlay_kind = OverlayKind::Model;
-        self.chrome.selector = Some(SelectList::new(self.models.clone()));
+        self.chrome.selector = None;
+        let items = if self.model_items.is_empty() {
+            self.models
+                .iter()
+                .map(|key| ModelSelectorItem::from_key(key))
+                .collect()
+        } else {
+            self.model_items.clone()
+        };
+        let scoped = self
+            .enabled_model_ids
+            .as_ref()
+            .map(|ids| {
+                items
+                    .iter()
+                    .filter(|item| ids.iter().any(|id| id == &item.key()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.chrome.model_selector = Some(ModelSelector::new(
+            items,
+            self.current_model().map(str::to_string),
+            self.default_model.clone(),
+            scoped,
+        ));
         self.chrome.status = "Select model".into();
     }
 
@@ -365,6 +399,7 @@ impl InteractiveSession {
 
     pub fn close_overlays(&mut self) {
         self.chrome.selector = None;
+        self.chrome.model_selector = None;
         self.chrome.settings_list = None;
         self.chrome.settings_submenu = None;
         self.chrome.session_selector = None;
@@ -381,6 +416,8 @@ impl InteractiveSession {
         self.chrome.custom_overlay_path = None;
         self.chrome.custom_overlay_command = None;
         self.chrome.custom_overlay_snapshot = None;
+        self.chrome.custom_overlay_composite = false;
+        self.chrome.custom_overlay_options = None;
         self.overlay_kind = OverlayKind::None;
         self.chrome.status.clear();
     }
@@ -391,6 +428,7 @@ impl InteractiveSession {
             || self.chrome.tree.is_some()
             || self.chrome.scoped_models.is_some()
             || self.chrome.selector.is_some()
+            || self.chrome.model_selector.is_some()
             || self.chrome.settings_list.is_some()
             || self.chrome.settings_submenu.is_some()
             || self.chrome.session_selector.is_some()
@@ -623,7 +661,10 @@ impl InteractiveSession {
 
     pub fn render_frame(&self) -> String {
         let mut lines = self.chrome.render(self.width);
-        if let Some(selector) = &self.chrome.selector {
+        if let Some(selector) = &self.chrome.model_selector {
+            let overlay = Overlay::new("model", Box::new(selector.clone()));
+            lines.extend(overlay.render(self.width));
+        } else if let Some(selector) = &self.chrome.selector {
             let overlay = Overlay::new("model", Box::new(selector.clone()));
             lines.extend(overlay.render(self.width));
         }
@@ -878,6 +919,30 @@ impl InteractiveSession {
     }
 
     fn handle_special_overlay(&mut self, data: &str) -> Option<SessionAction> {
+        if let Some(selector) = &mut self.chrome.model_selector {
+            return Some(match selector.handle_key(data) {
+                ModelSelectorAction::None => SessionAction::None,
+                ModelSelectorAction::Select(value) => {
+                    if let Some(index) = self.models.iter().position(|item| item == &value) {
+                        self.model_index = index;
+                    }
+                    self.close_overlays();
+                    SessionAction::SelectModel(value)
+                }
+                ModelSelectorAction::SelectAsDefault(value) => {
+                    if let Some(index) = self.models.iter().position(|item| item == &value) {
+                        self.model_index = index;
+                    }
+                    self.default_model = Some(value.clone());
+                    self.close_overlays();
+                    SessionAction::SelectModelAsDefault(value)
+                }
+                ModelSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
         if let Some(selector) = &mut self.chrome.extension_selector {
             return Some(match selector.handle_key(data) {
                 ExtensionDialogAction::None => SessionAction::None,
@@ -1105,6 +1170,9 @@ impl InteractiveSession {
             let _ = sessions.handle_key(key);
         } else if let Some(settings) = &mut self.chrome.settings_list {
             settings.move_by(delta);
+        } else if let Some(selector) = &mut self.chrome.model_selector {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = selector.handle_key(key);
         } else if let Some(selector) = &mut self.chrome.selector {
             selector.move_by(delta);
         } else if let Some(suggestions) = &self.chrome.autocomplete {
@@ -1410,14 +1478,21 @@ mod tests {
         assert_eq!(session.handle_bytes("\x1b"), SessionAction::OpenTree);
         session.aborted = false;
         assert_eq!(session.handle_line("/model"), SessionAction::OpenModel);
-        assert!(session.chrome.selector.is_some());
+        assert!(session.chrome.model_selector.is_some());
         assert!(session.render_frame().contains('┌'));
-        assert_eq!(session.handle_bytes("\x1b[B"), SessionAction::None);
+        assert!(session
+            .chrome
+            .model_selector
+            .as_ref()
+            .unwrap()
+            .render(80)
+            .iter()
+            .any(|line| line.contains("→ sonnet") || line.contains("sonnet")));
         assert_eq!(
             session.handle_bytes("\r"),
             SessionAction::SelectModel("anthropic/sonnet".into())
         );
-        assert!(session.chrome.selector.is_none());
+        assert!(session.chrome.model_selector.is_none());
         session.open_model_overlay();
         assert_eq!(session.handle_bytes("\x1b"), SessionAction::CloseOverlay);
         session.open_session_overlay(vec!["abc".into(), "def".into()]);

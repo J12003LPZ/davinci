@@ -278,6 +278,7 @@ mod tests {
             context_window: 1,
             max_tokens: 1,
             compat: Value::Null,
+            headers: Default::default(),
         }
     }
 

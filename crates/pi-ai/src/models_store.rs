@@ -144,6 +144,7 @@ mod tests {
                 context_window: 1,
                 max_tokens: 1,
                 compat: serde_json::Value::Null,
+                headers: Default::default(),
             }],
             &parsed,
         );

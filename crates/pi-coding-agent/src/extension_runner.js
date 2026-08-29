@@ -194,8 +194,18 @@ class TUI {
 	removeChild(component) { this.children = this.children.filter((item) => item !== component); }
 	clear() { this.children = []; }
 	setFocus() {}
-	showOverlay(component) {
-		return { hide() {}, setHidden() {}, focus() {}, unfocus() {}, isFocused() { return true; }, component };
+	showOverlay(component, options) {
+		this._overlay = { component, options: options || {} };
+		const self = this;
+		return {
+			hide() { self._overlay = null; },
+			setHidden() {},
+			focus() {},
+			unfocus() {},
+			isFocused() { return true; },
+			component,
+			options: options || {},
+		};
 	}
 	hideOverlay() {}
 	requestRender() { this._wantsTick = true; }
@@ -416,12 +426,16 @@ async function loadModule(modPath) {
 
 async function main() {
 	const extPath = path.resolve(process.argv[2] || "");
-	const op = process.argv[3] || "load";
-	let input = "";
-	if (!process.stdin.isTTY) {
-		input = fs.readFileSync(0, "utf8");
+	const persistentMode = process.argv.includes("--persistent");
+	let op = persistentMode ? "load" : (process.argv[3] || "load");
+	let payload = {};
+	if (!persistentMode) {
+		let input = "";
+		if (!process.stdin.isTTY) {
+			input = fs.readFileSync(0, "utf8");
+		}
+		payload = input.trim() ? JSON.parse(input) : {};
 	}
-	const payload = input.trim() ? JSON.parse(input) : {};
 	const mod = await loadModule(extPath);
 	const factory = typeof mod === "function" ? mod : mod.default || mod.factory;
 	const recorded = {
@@ -442,6 +456,9 @@ async function main() {
 	let editorFactory;
 	let customComponent;
 	let pendingCustom;
+	let settledCustom;
+	let lastCustomOverlay = false;
+	let lastCustomOverlayOptions;
 	function uiReply(kind) {
 		const raw = process.env.PI_EXTENSION_UI_REPLY;
 		if (raw === undefined || raw === "") return kind === "confirm" ? false : undefined;
@@ -535,25 +552,30 @@ async function main() {
 			onTerminalInput() {
 				return () => {};
 			},
-			async custom(factory) {
-				recorded.uiCalls.push({ op: "custom" });
+			async custom(factory, options) {
+				const overlay = Boolean(options && options.overlay);
+				const overlayOptions = options && options.overlayOptions ? options.overlayOptions : undefined;
+				recorded.uiCalls.push({ op: "custom", overlay, overlayOptions });
 				if (typeof factory !== "function") {
 					return uiReply("custom");
 				}
-				let settled;
 				const done = (value) => {
-					settled = value;
+					settledCustom = value;
 				};
 				const tui = new (require("@earendil-works/pi-tui").TUI)();
 				const component = await factory(tui, ui.theme, { matches: matchesKeySafe }, done);
 				customComponent = component;
-				restoreEditor(component, payload.snapshot);
+				lastCustomOverlay = overlay || Boolean(tui._overlay);
+				lastCustomOverlayOptions = overlayOptions || (tui._overlay && tui._overlay.options) || undefined;
+				if (!payload.snapshot || !persistentMode) {
+					restoreEditor(component, payload.snapshot);
+				}
 				if (op === "customTick" && component && typeof component.tick === "function") {
 					component.tick();
 				} else if ((op === "customInput" || payload.data) && component && typeof component.handleInput === "function") {
 					component.handleInput(payload.data || "");
 				}
-				if (settled !== undefined) return settled;
+				if (settledCustom !== undefined) return settledCustom;
 				pendingCustom = {
 					snapshot: snapshotEditor(component),
 					lines:
@@ -561,6 +583,8 @@ async function main() {
 							? component.render(payload.width || 80)
 							: [],
 					wantsTick: Boolean(tui._wantsTick),
+					overlay: lastCustomOverlay,
+					overlayOptions: lastCustomOverlayOptions,
 				};
 				const pending = new Error("pending custom UI");
 				pending.__piPendingCustom = true;
@@ -712,6 +736,34 @@ async function main() {
 		});
 		restoreEditor(editor, payload.snapshot);
 		return editor;
+	}
+	async function runOps() {
+	if ((op === "customTick" || op === "customInput") && customComponent && persistentMode) {
+		if (settledCustom !== undefined) {
+			result = settledCustom;
+			return;
+		}
+		if (op === "customTick" && typeof customComponent.tick === "function") {
+			customComponent.tick();
+		} else if (typeof customComponent.handleInput === "function") {
+			customComponent.handleInput(payload.data || "");
+		}
+		if (settledCustom !== undefined) {
+			result = settledCustom;
+			return;
+		}
+		pendingCustom = {
+			snapshot: snapshotEditor(customComponent),
+			lines:
+				customComponent && typeof customComponent.render === "function"
+					? customComponent.render(payload.width || 80)
+					: [],
+			wantsTick: true,
+			overlay: lastCustomOverlay,
+			overlayOptions: lastCustomOverlayOptions,
+		};
+		result = Object.assign({ pending: true }, pendingCustom);
+		return;
 	}
 	if (op === "emit") {
 		const eventName = payload.type || payload.event;
@@ -897,8 +949,9 @@ async function main() {
 			};
 		}
 	}
-	process.stdout.write(
-		JSON.stringify({
+	}
+	function emitResult() {
+		return {
 			ok: true,
 			handlers: Object.keys(recorded.handlers),
 			tools: recorded.tools,
@@ -913,8 +966,27 @@ async function main() {
 			hasCustom: Boolean(customComponent),
 			providers: recorded.providers,
 			result,
-		}),
-	);
+		};
+	}
+	await runOps();
+	if (persistentMode) {
+		process.stdout.write(JSON.stringify(emitResult()) + "\n");
+		const readline = require("readline");
+		const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+		for await (const line of rl) {
+			if (!line.trim()) continue;
+			const msg = JSON.parse(line);
+			op = msg.op;
+			payload = msg.payload || {};
+			recorded.uiCalls = [];
+			result = null;
+			pendingCustom = undefined;
+			await runOps();
+			process.stdout.write(JSON.stringify(emitResult()) + "\n");
+		}
+	} else {
+		process.stdout.write(JSON.stringify(emitResult()));
+	}
 }
 
 main().catch((error) => {

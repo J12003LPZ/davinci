@@ -86,6 +86,10 @@ pub struct Settings {
     pub model_thinking_levels: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, rename = "npmCommand")]
     pub npm_command: Option<Vec<String>>,
+    #[serde(default, rename = "defaultModel")]
+    pub default_model: Option<String>,
+    #[serde(default, rename = "defaultProvider")]
+    pub default_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

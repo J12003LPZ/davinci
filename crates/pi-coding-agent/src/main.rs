@@ -16,6 +16,7 @@ mod rpc;
 mod self_update;
 mod settings;
 mod slash;
+mod startup;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -25,9 +26,10 @@ use pi_agent::{
     AgentEvent, CustomToolExecutor,
 };
 use pi_ai::{
-    content_text, find_model, fuzzy_models, live_complete, load_builtin_models,
-    resolve_provider_auth, AssistantMessage, AuthStorage, ContentBlock, Credential, CredentialKind,
-    StopReason, ToolSpec,
+    apply_config_auth, apply_models_config, content_text, find_model, fuzzy_models, live_complete,
+    load_builtin_models, models_json_path, resolve_provider_auth, AssistantMessage, AuthStorage,
+    ContentBlock, Credential, CredentialKind, ModelConfig, ResolvedAuth, StopReason, ToolSpec,
+    NO_MODELS_AVAILABLE,
 };
 use pi_session::{
     default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir,
@@ -37,8 +39,8 @@ use pi_tui::{
     builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto,
     drain_osc_tty, encode_kitty, interactive_settings_list, load_themes_from_dir, parse_auto_theme,
     parse_http_idle_timeout, ChatChrome, Component, CustomMessage, DoubleEscapeAction, FilterMode,
-    InteractiveSession, Keybindings, MermaidMode, ScopedModel, SessionAction, SessionItem,
-    SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TuiMode,
+    InteractiveSession, Keybindings, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction,
+    SessionItem, SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TuiMode,
     FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
@@ -151,7 +153,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     if !migrations.deprecation_warnings.is_empty() {
         migrations::show_deprecation_warnings(&migrations.deprecation_warnings);
     }
-    run_interactive(&parsed, &mut agent)
+    run_interactive(&parsed, &mut agent, &migrations.migrated_auth_providers)
 }
 
 fn is_package_command(command: Option<&str>) -> bool {
@@ -298,22 +300,48 @@ fn resolve_or_create_session(
 }
 
 fn available_models(parsed: &Args) -> Vec<pi_ai::Model> {
+    load_available_models(parsed).0
+}
+
+fn load_available_models(parsed: &Args) -> (Vec<pi_ai::Model>, Option<String>) {
     let mut models = load_builtin_models();
-    let store = pi_ai::load_models_store(&default_agent_dir());
+    let agent_dir = default_agent_dir();
+    let store = pi_ai::load_models_store(&agent_dir);
     for entry in store.providers.values() {
         models = pi_ai::merge_models(&models, &entry.models);
     }
+    let config = ModelConfig::load(&models_json_path(&agent_dir));
+    let error = config.error().map(str::to_string);
+    models = match apply_models_config(&models, &config) {
+        Ok(applied) => applied,
+        Err(err) => {
+            return (models, Some(error.unwrap_or(err)));
+        }
+    };
     for provider in loaded_extension_host(parsed).registered_providers() {
         models.extend(pi_ai::models_from_provider_config(
             &provider.name,
             &provider.config,
         ));
+        if let Ok(applied) = apply_models_config(&models, &config) {
+            models = applied;
+        }
     }
-    models
+    if models.is_empty() {
+        return (
+            models,
+            Some(error.unwrap_or_else(|| NO_MODELS_AVAILABLE.into())),
+        );
+    }
+    (models, error)
 }
 
 fn list_models(list: &ListModels) -> Result<i32, String> {
-    let models = available_models(&Args::default());
+    let (models, error) = load_available_models(&Args::default());
+    if models.is_empty() {
+        eprintln!("{}", error.as_deref().unwrap_or(NO_MODELS_AVAILABLE));
+        return Ok(1);
+    }
     let selected = match list {
         ListModels::All => models.iter().collect(),
         ListModels::Query(query) => fuzzy_models(&models, query),
@@ -363,7 +391,11 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
         command.no_refresh,
     );
     let env = std::env::vars().collect();
-    let resolved = resolve_provider_auth(&provider, &storage, &env, true);
+    let mut resolved = resolve_provider_auth(&provider, &storage, &env, true);
+    if let Some(auth) = resolved.as_mut() {
+        let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
+        apply_config_auth(auth, &config, &provider, None);
+    }
     match command.kind {
         AuthCommandKind::Check => {
             let status = if resolved.is_some() {
@@ -411,7 +443,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             std::env::var("PI_OFFLINE").as_deref(),
             Ok("1") | Ok("true") | Ok("yes")
         );
-    let models = load_builtin_models();
+    let models = available_models(parsed);
     let model = find_model(&models, &agent.provider, &agent.model_id)
         .cloned()
         .or_else(|| {
@@ -429,9 +461,26 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
         let _ = storage.maybe_refresh(&agent.provider, now_ms(), 0, false);
     }
     let env = std::env::vars().collect();
-    let auth = storage
+    let mut auth = storage
         .as_ref()
-        .and_then(|storage| resolve_provider_auth(&agent.provider, storage, &env, true));
+        .and_then(|storage| resolve_provider_auth(&agent.provider, storage, &env, true))
+        .or_else(|| {
+            Some(ResolvedAuth {
+                api_key: None,
+                headers: Default::default(),
+                source: "none".into(),
+            })
+        });
+    if let Some(auth) = auth.as_mut() {
+        let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
+        let model = find_model(&models, &agent.provider, &agent.model_id);
+        apply_config_auth(auth, &config, &agent.provider, model);
+    }
+    if auth.as_ref().is_some_and(|item| {
+        item.api_key.is_none() && item.headers.is_empty() && item.source == "none"
+    }) {
+        auth = None;
+    }
     let tools: Vec<ToolSpec> = pi_agent::tool_specs()
         .into_iter()
         .filter(|tool| agent.tools.iter().any(|name| name == &tool.name))
@@ -645,18 +694,31 @@ fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
     Ok(0)
 }
 
-fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
+fn run_interactive(
+    parsed: &Args,
+    agent: &mut Agent,
+    migrated_auth_providers: &[String],
+) -> Result<i32, String> {
     let fullscreen = parsed.tui_mode == Some(TuiMode::Fullscreen);
     let theme = builtin_themes()
         .into_iter()
         .find(|theme| parsed.use_theme.as_deref() == Some(theme.name.as_str()))
         .or_else(|| builtin_themes().into_iter().next())
         .expect("theme");
-    let models: Vec<String> = available_models(parsed)
-        .into_iter()
+    let (runtime_models, models_json_error) = load_available_models(parsed);
+    let models: Vec<String> = runtime_models
+        .iter()
         .map(|model| format!("{}/{}", model.provider, model.id))
         .collect();
     let mut session = InteractiveSession::new(theme, format!("{APP_NAME} {VERSION}"), models);
+    session.model_items = runtime_models
+        .iter()
+        .map(|model| ModelSelectorItem {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+            name: model.name.clone(),
+        })
+        .collect();
     if let Some(index) = session
         .models
         .iter()
@@ -683,6 +745,11 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     session.chrome.transcript.mermaid_mode = session.mermaid_mode;
     session.chrome.transcript.hide_thinking_block = stored.hide_thinking_block.unwrap_or(false);
     session.enabled_model_ids = stored.enabled_models.clone();
+    session.default_model = match (&stored.default_provider, &stored.default_model) {
+        (Some(provider), Some(id)) => Some(format!("{provider}/{id}")),
+        (None, Some(id)) if id.contains('/') => Some(id.clone()),
+        _ => None,
+    };
     session.keybindings = Keybindings::load(&default_agent_dir());
     session.warnings_anthropic_extra_usage = stored.warnings.anthropic_extra_usage.unwrap_or(true);
     if let Some(levels) = stored.model_thinking_levels.clone() {
@@ -695,6 +762,12 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
     refresh_interactive_models(parsed, &mut session);
+    apply_startup_notices(
+        &mut session,
+        &stored,
+        models_json_error,
+        migrated_auth_providers,
+    );
     if should_run_first_time_setup(&settings_path(&default_agent_dir())) {
         session.open_first_time_setup(&detect_terminal_theme(&session.chrome.theme), APP_NAME);
     }
@@ -1109,6 +1182,19 @@ fn apply_session_action(
             agent.provider = provider;
             agent.model_id = model_id;
             session.chrome.status = format!("model={}/{}", agent.provider, agent.model_id);
+            Ok(true)
+        }
+        SessionAction::SelectModelAsDefault(value) => {
+            let (provider, model_id) = parse_model_ref("google", Some(&value));
+            agent.provider = provider;
+            agent.model_id = model_id;
+            session.default_model = Some(format!("{}/{}", agent.provider, agent.model_id));
+            let dir = default_agent_dir();
+            let mut stored = load_settings(&dir);
+            stored.default_provider = Some(agent.provider.clone());
+            stored.default_model = Some(agent.model_id.clone());
+            save_settings(&dir, &stored)?;
+            session.chrome.status = format!("default={}/{}", agent.provider, agent.model_id);
             Ok(true)
         }
         SessionAction::Submit(text) => match slash::parse_line(&text) {
@@ -2035,6 +2121,8 @@ fn apply_custom_overlay_result(
         chrome.custom_overlay_command = None;
         chrome.custom_overlay_snapshot = None;
         chrome.custom_overlay_lines = None;
+        chrome.custom_overlay_composite = false;
+        chrome.custom_overlay_options = None;
         return;
     }
     chrome.custom_overlay_path = Some(path.to_string());
@@ -2050,6 +2138,13 @@ fn apply_custom_overlay_result(
                     .filter_map(|line| line.as_str().map(str::to_string))
                     .collect()
             });
+    chrome.custom_overlay_composite = result
+        .get("overlay")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    chrome.custom_overlay_options = result
+        .get("overlayOptions")
+        .map(pi_tui::overlay_options_from_json);
 }
 
 fn handle_custom_overlay_input(parsed: &Args, session: &mut InteractiveSession, data: &str) {
@@ -2314,6 +2409,23 @@ fn paste_clipboard(session: &mut InteractiveSession) {
     }
 }
 
+fn apply_startup_notices(
+    session: &mut InteractiveSession,
+    settings: &settings::Settings,
+    models_json_error: Option<String>,
+    migrated_auth_providers: &[String],
+) {
+    let notices = startup::collect_startup_notices(
+        VERSION,
+        settings,
+        models_json_error,
+        migrated_auth_providers.to_vec(),
+    );
+    for (kind, line) in startup::format_notices(&notices) {
+        session.chrome.transcript.push(&kind, &line);
+    }
+}
+
 fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
     session.chrome.status = catalog_refresh::refresh_status_refreshing().into();
     let agent_dir = default_agent_dir();
@@ -2336,8 +2448,52 @@ fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
         }
     }
     session.models = models;
+    session.model_items = refreshed
+        .models
+        .iter()
+        .map(|model| ModelSelectorItem {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+            name: model.name.clone(),
+        })
+        .collect();
+    if session.model_items.is_empty() {
+        session.model_items = session
+            .models
+            .iter()
+            .map(|key| ModelSelectorItem::from_key(key))
+            .collect();
+    }
     if session.chrome.selector.is_some() {
         session.chrome.selector = Some(pi_tui::SelectList::new(session.models.clone()));
+    }
+    if session.chrome.model_selector.is_some() {
+        let scoped = session
+            .enabled_model_ids
+            .as_ref()
+            .map(|ids| {
+                session
+                    .model_items
+                    .iter()
+                    .filter(|item| ids.iter().any(|id| id == &item.key()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let items = session.model_items.clone();
+        let current = session.current_model().map(str::to_string);
+        let default_model = session.default_model.clone();
+        let success = refreshed.status == catalog_refresh::refresh_status_ok()
+            || refreshed.status == "Model catalogs refreshed.";
+        let status = refreshed.status.clone();
+        let error = load_available_models(parsed).1;
+        if let Some(selector) = &mut session.chrome.model_selector {
+            selector.reload(items, current, default_model, scoped);
+            selector.set_refresh_status(Some(status), success);
+            if let Some(error) = error {
+                selector.error_message = Some(error);
+            }
+        }
     }
     if let Some(scoped) = &mut session.chrome.scoped_models {
         scoped.refresh_status = Some(refreshed.status.clone());

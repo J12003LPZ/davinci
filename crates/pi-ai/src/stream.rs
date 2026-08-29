@@ -289,6 +289,9 @@ pub fn live_complete(
     for (key, value) in &auth.headers {
         request = request.set(key, value);
     }
+    for (key, value) in &model.headers {
+        request = request.set(key, value);
+    }
     if let Some(key) = &auth.api_key {
         if model.api.starts_with("google") {
             // key is already in the URL for Gemini
@@ -340,6 +343,9 @@ pub fn live_stream(
     let url = request_url(model, auth);
     let mut request = ureq::post(&url);
     for (key, value) in &auth.headers {
+        request = request.set(key, value);
+    }
+    for (key, value) in &model.headers {
         request = request.set(key, value);
     }
     if let Some(key) = &auth.api_key {

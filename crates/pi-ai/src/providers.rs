@@ -1,4 +1,4 @@
-use crate::catalog::{flatten_catalog, load_builtin_models, Model};
+use crate::catalog::{load_builtin_models, Model};
 
 #[derive(Debug, Clone)]
 pub struct ProviderSpec {
@@ -429,17 +429,4 @@ pub fn builtin_providers() -> Vec<Provider> {
 
 pub fn provider_spec(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDER_SPECS.iter().find(|spec| spec.id == id)
-}
-
-pub fn load_models_json(path: &std::path::Path) -> Result<Vec<Model>, String> {
-    let raw = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
-    if let Some(providers) = value.get("providers").and_then(|v| v.as_object()) {
-        let mut models = Vec::new();
-        for (provider, catalog) in providers {
-            models.extend(flatten_catalog(provider, catalog));
-        }
-        return Ok(models);
-    }
-    Ok(flatten_catalog("custom", &value))
 }

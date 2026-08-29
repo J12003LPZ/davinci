@@ -5,7 +5,8 @@ use std::path::Path;
 use crate::extensions::{discover_extensions, ExtensionManifest};
 use crate::js_host::{
     execute_command_tool, execute_js_tool, node_available, resolve_extension_module,
-    run_js_extension, JsExtensionResult, JsRegisteredProvider,
+    run_js_extension, run_persistent_js_extension, stop_persistent_js_extension, JsExtensionResult,
+    JsRegisteredProvider,
 };
 use pi_tui::Keybindings;
 
@@ -406,7 +407,7 @@ impl ExtensionHost {
         snapshot: Option<&Value>,
         width: usize,
     ) -> Result<Option<Value>, String> {
-        let result = run_js_extension(
+        let result = run_persistent_js_extension(
             Path::new(path),
             if data.is_empty() {
                 "command"
@@ -422,11 +423,21 @@ impl ExtensionHost {
             }),
         )?;
         if !result.ok {
+            stop_persistent_js_extension();
             return Err(result
                 .error
                 .unwrap_or_else(|| "Command handler error".into()));
         }
         self.ui_calls.extend(result.ui_calls);
+        if result
+            .result
+            .as_ref()
+            .and_then(|value| value.get("pending"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            stop_persistent_js_extension();
+        }
         Ok(result.result)
     }
 
@@ -437,7 +448,7 @@ impl ExtensionHost {
         snapshot: Option<&Value>,
         width: usize,
     ) -> Result<Option<Value>, String> {
-        let result = run_js_extension(
+        let result = run_persistent_js_extension(
             Path::new(path),
             "customTick",
             &serde_json::json!({
@@ -448,11 +459,21 @@ impl ExtensionHost {
             }),
         )?;
         if !result.ok {
+            crate::js_host::stop_persistent_js_extension();
             return Err(result
                 .error
                 .unwrap_or_else(|| "Command handler error".into()));
         }
         self.ui_calls.extend(result.ui_calls);
+        if result
+            .result
+            .as_ref()
+            .and_then(|value| value.get("pending"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            crate::js_host::stop_persistent_js_extension();
+        }
         Ok(result.result)
     }
 

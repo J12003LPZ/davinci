@@ -16,6 +16,7 @@ mod latex;
 mod login_dialog;
 mod markdown;
 mod mermaid;
+mod model_selector;
 mod mouse;
 mod open_browser;
 mod osc;
@@ -62,6 +63,7 @@ pub use latex::render_latex;
 pub use login_dialog::{AuthInfoLink, DeviceCodeInfo, LoginDialog, LoginDialogAction};
 pub use markdown::render_markdown;
 pub use mermaid::{transform_mermaid, MermaidArt, MermaidContext, MermaidMode, MermaidTheme};
+pub use model_selector::{ModelScope, ModelSelector, ModelSelectorAction, ModelSelectorItem};
 pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
 pub use open_browser::{copy_text, open_browser, open_browser_argv, open_browser_dry_run};
 pub use osc::{
@@ -69,7 +71,11 @@ pub use osc::{
     parse_osc11_background_color, parse_terminal_color_scheme_report,
     query_terminal_background_color, ThemeDetection, COLOR_SCHEME_QUERY, OSC_11_QUERY,
 };
-pub use overlay::Overlay;
+pub use overlay::{
+    composite_overlay_lines, composite_tui_line, overlay_options_from_json, resolve_anchor_col,
+    resolve_anchor_row, resolve_overlay_layout, Overlay, OverlayAnchor, OverlayLayout,
+    OverlayOptions, SizeValue,
+};
 pub use render::{visible_width, Component, Text};
 pub use scoped_models::{
     clear_all, enable_all, get_sorted_ids, is_enabled, move_id, toggle, EnabledIds, ScopedModel,
