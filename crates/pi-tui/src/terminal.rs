@@ -291,6 +291,18 @@ impl ProcessTerminal {
         terminal
     }
 
+    /// Live stdout terminal (TS `ProcessTerminal` default). Tests keep `new()` capture.
+    pub fn live() -> Self {
+        let mut terminal = Self::new();
+        terminal.capture_writes = false;
+        terminal
+    }
+
+    pub fn set_size(&mut self, columns: usize, rows: usize) {
+        self.columns_override = Some(columns.max(1));
+        self.rows_override = Some(rows.max(1));
+    }
+
     pub fn captured_writes(&self) -> &[String] {
         &self.writes
     }

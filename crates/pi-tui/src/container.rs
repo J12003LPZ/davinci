@@ -1,5 +1,8 @@
 //! Container matching `vendor/pi/packages/tui/src/tui.ts`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::render::Component;
 
 pub struct Container {
@@ -31,6 +34,31 @@ impl Container {
 impl Default for Container {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Shared children used as the alt-screen implicit document.
+pub struct SharedContainer {
+    pub inner: Rc<RefCell<Container>>,
+}
+
+impl SharedContainer {
+    pub fn new(inner: Rc<RefCell<Container>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Component for SharedContainer {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.inner.borrow().render(width)
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        self.inner.borrow_mut().handle_input(data);
+    }
+
+    fn invalidate(&mut self) {
+        self.inner.borrow_mut().invalidate();
     }
 }
 

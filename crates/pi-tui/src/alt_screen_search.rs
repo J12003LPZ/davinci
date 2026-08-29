@@ -153,7 +153,7 @@ impl AltScreenSearchComponent {
         }
     }
 
-    pub fn set_results(&mut self, count: usize, index: isize) {
+    pub fn set_result(&mut self, index: isize, count: usize) {
         self.result_count = count;
         self.result_index = index;
     }
@@ -165,16 +165,24 @@ impl AltScreenSearchComponent {
 
 impl Component for AltScreenSearchComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        let status = if self.result_count == 0 {
-            "  0/0".to_string()
+        let safe_width = width.max(1);
+        let label = " Find transcript";
+        let query = self.input.value();
+        let status = if query.is_empty() {
+            String::new()
+        } else if self.result_count == 0 {
+            "No matches ".to_string()
         } else {
-            format!("  {}/{}", self.result_index.max(0) + 1, self.result_count)
+            format!("{}/{} ", self.result_index + 1, self.result_count)
         };
+        let label_width = visible_width(label);
         let status_width = visible_width(&status);
-        let query_width = width.saturating_sub(status_width + 2).max(1);
-        let query = truncate_to_width(&format!("/{}", self.input.value()), query_width, "", false);
-        let pad = width.saturating_sub(visible_width(&query) + status_width);
-        vec![format!("{query}{}{status}", " ".repeat(pad))]
+        let gap = " ".repeat(safe_width.saturating_sub(label_width + status_width).max(1));
+        let title = truncate_to_width(&format!("{label}{gap}{status}"), safe_width, "", false);
+        let padding = " ".repeat(safe_width.saturating_sub(visible_width(&title)));
+        let mut lines = vec![format!("\x1b[7m{title}{padding}\x1b[27m")];
+        lines.extend(self.input.render(safe_width));
+        lines
     }
 
     fn handle_input(&mut self, data: &str) {

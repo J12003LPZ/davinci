@@ -29,6 +29,7 @@ impl Theme {
             "error" => format!("\x1b[31m{text}\x1b[39m"),
             "customMessageLabel" => format!("\x1b[35m{text}\x1b[39m"),
             "customMessageText" => text.to_string(),
+            "searchMatchText" => format!("\x1b[30m{text}\x1b[39m"),
             "borderMuted" | "borderAccent" => format!("\x1b[2m{text}\x1b[22m"),
             _ => text.to_string(),
         }
@@ -38,10 +39,19 @@ impl Theme {
         format!("\x1b[1m{text}\x1b[22m")
     }
 
+    pub fn underline(&self, text: &str) -> String {
+        format!("\x1b[4m{text}\x1b[24m")
+    }
+
+    pub fn inverse(&self, text: &str) -> String {
+        format!("\x1b[7m{text}\x1b[27m")
+    }
+
     pub fn bg(&self, role: &str, text: &str) -> String {
         match role {
             "customMessageBg" => format!("\x1b[45m{text}\x1b[49m"),
             "selectedBg" => format!("\x1b[7m{text}\x1b[27m"),
+            "searchMatchBg" => format!("\x1b[43m{text}\x1b[49m"),
             _ => text.to_string(),
         }
     }

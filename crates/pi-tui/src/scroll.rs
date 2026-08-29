@@ -94,6 +94,10 @@ impl ScrollView {
         })
     }
 
+    pub fn child(&self) -> &dyn Component {
+        &*self.child
+    }
+
     pub fn child_mut(&mut self) -> &mut dyn Component {
         &mut *self.child
     }

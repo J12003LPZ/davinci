@@ -65,7 +65,7 @@ impl Keybindings {
     pub fn matches(&self, data: &str, action: &str) -> bool {
         self.keys_for(action)
             .iter()
-            .any(|key| key_to_bytes(key) == data)
+            .any(|key| sequence_matches_key(data, key))
     }
 
     pub fn bindings(&self) -> impl Iterator<Item = (&str, &[String])> {
@@ -173,6 +173,29 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("tui.editor.undo", &["ctrl+-", "\x1b[45;5u"]),
         ("tui.editor.jumpForward", &["ctrl+]"]),
         ("tui.editor.jumpBackward", &["ctrl+alt+]"]),
+        ("tui.altScreen.pageUp", &["pageUp"]),
+        ("tui.altScreen.pageDown", &["pageDown"]),
+        ("tui.altScreen.halfPageUp", &[]),
+        ("tui.altScreen.halfPageDown", &[]),
+        ("tui.altScreen.lineUp", &[]),
+        ("tui.altScreen.lineDown", &[]),
+        (
+            "tui.altScreen.previousPrompt",
+            &["ctrl+shift+up", "ctrl+up"],
+        ),
+        (
+            "tui.altScreen.nextPrompt",
+            &["ctrl+shift+down", "ctrl+down"],
+        ),
+        ("tui.altScreen.search", &["ctrl+shift+f"]),
+        ("tui.altScreen.searchNext", &["enter", "ctrl+g"]),
+        (
+            "tui.altScreen.searchPrevious",
+            &["shift+enter", "ctrl+shift+g"],
+        ),
+        ("tui.altScreen.searchClose", &["escape"]),
+        ("tui.altScreen.top", &["home"]),
+        ("tui.altScreen.bottom", &["end"]),
     ]
 }
 
@@ -243,8 +266,70 @@ pub fn key_to_bytes(key: &str) -> String {
         "ctrl+pageUp" => "\x1b[5;5~".into(),
         "ctrl+pageDown" => "\x1b[6;5~".into(),
         "shift+enter" => "\n".into(),
+        "ctrl+shift+f" => "\x1b[102;6u".into(),
+        "ctrl+shift+g" => "\x1b[103;6u".into(),
+        "ctrl+shift+up" => "\x1b[1;6A".into(),
+        "ctrl+shift+down" => "\x1b[1;6B".into(),
+        "ctrl+up" => "\x1b[1;5A".into(),
+        "ctrl+down" => "\x1b[1;5B".into(),
         other => other.to_string(),
     }
+}
+
+/// Match a key id against legacy, Kitty CSI-u, and `key_to_bytes` encodings.
+pub fn sequence_matches_key(data: &str, key: &str) -> bool {
+    if key_to_bytes(key) == data {
+        return true;
+    }
+    let parsed = crate::keys::parse_key(key);
+    match parsed.name.as_str() {
+        "home" if !parsed.ctrl && !parsed.alt && !parsed.shift => {
+            matches!(data, "\x1b[H" | "\x1bOH" | "\x1b[1~" | "\x1b[7~")
+                || kitty_matches(data, "home", 0)
+        }
+        "end" if !parsed.ctrl && !parsed.alt && !parsed.shift => {
+            matches!(data, "\x1b[F" | "\x1bOF" | "\x1b[4~" | "\x1b[8~")
+                || kitty_matches(data, "end", 0)
+        }
+        "pageup" if !parsed.ctrl && !parsed.alt && !parsed.shift => {
+            matches!(data, "\x1b[5~" | "\x1b[[5~") || kitty_matches(data, "pageup", 0)
+        }
+        "pagedown" if !parsed.ctrl && !parsed.alt && !parsed.shift => {
+            matches!(data, "\x1b[6~" | "\x1b[[6~") || kitty_matches(data, "pagedown", 0)
+        }
+        "up" => {
+            let bits = crate::keys::key_modifier_bits(parsed.ctrl, parsed.alt, parsed.shift);
+            kitty_matches(data, "up", bits)
+                || (bits == 4 && data == "\x1b[1;5A")
+                || (bits == 5 && data == "\x1b[1;6A")
+        }
+        "down" => {
+            let bits = crate::keys::key_modifier_bits(parsed.ctrl, parsed.alt, parsed.shift);
+            kitty_matches(data, "down", bits)
+                || (bits == 4 && data == "\x1b[1;5B")
+                || (bits == 5 && data == "\x1b[1;6B")
+        }
+        name if name.len() == 1 => {
+            let bits = crate::keys::key_modifier_bits(parsed.ctrl, parsed.alt, parsed.shift);
+            let Some(code) = name.chars().next().map(|ch| ch as u32) else {
+                return false;
+            };
+            kitty_code_matches(data, code, bits)
+        }
+        _ => false,
+    }
+}
+
+fn kitty_matches(data: &str, name: &str, bits: u32) -> bool {
+    let Some(code) = crate::keys::kitty_functional_codepoint(name) else {
+        return false;
+    };
+    kitty_code_matches(data, code, bits)
+}
+
+fn kitty_code_matches(data: &str, code: u32, bits: u32) -> bool {
+    crate::keys::parse_kitty_csi_u(data)
+        .is_some_and(|(found, found_bits, _release)| found == code && found_bits == bits)
 }
 
 #[cfg(test)]

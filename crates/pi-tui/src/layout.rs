@@ -18,7 +18,7 @@ const OSC133_ZONE_PREFIX: &str = "\x1b]133;";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutRect {
     pub x: usize,
-    pub y: usize,
+    pub y: isize,
     pub width: usize,
     pub height: usize,
 }
@@ -72,12 +72,12 @@ fn intersect(a: LayoutRect, b: LayoutRect) -> LayoutRect {
     let x = a.x.max(b.x);
     let y = a.y.max(b.y);
     let right = (a.x + a.width).min(b.x + b.width);
-    let bottom = (a.y + a.height).min(b.y + b.height);
+    let bottom = (a.y + a.height as isize).min(b.y + b.height as isize);
     LayoutRect {
         x,
         y,
         width: right.saturating_sub(x),
-        height: bottom.saturating_sub(y),
+        height: bottom.saturating_sub(y).max(0) as usize,
     }
 }
 
@@ -109,11 +109,7 @@ fn measure_width(context: &mut LayoutContext, component: &dyn Component, width: 
 }
 
 fn translate_box(box_: &mut LayoutBox, delta_y: isize) {
-    if delta_y >= 0 {
-        box_.rect.y = box_.rect.y.saturating_add(delta_y as usize);
-    } else {
-        box_.rect.y = box_.rect.y.saturating_sub((-delta_y) as usize);
-    }
+    box_.rect.y += delta_y;
     for child in &mut box_.children {
         translate_box(child, delta_y);
     }
@@ -165,7 +161,7 @@ fn layout_component(
     context: &mut LayoutContext,
     component: &mut dyn Component,
     x: usize,
-    y: usize,
+    y: isize,
     width: usize,
     height: Option<usize>,
     clip: LayoutRect,
@@ -221,7 +217,7 @@ fn layout_scroll(
     context: &mut LayoutContext,
     scroll: &mut ScrollView,
     x: usize,
-    y: usize,
+    y: isize,
     safe_width: usize,
     height: Option<usize>,
     clip: LayoutRect,
@@ -232,7 +228,7 @@ fn layout_scroll(
         context,
         scroll.child_mut(),
         x,
-        y.saturating_sub(previous_scroll_top),
+        y - previous_scroll_top as isize,
         content_width,
         None,
         clip,
@@ -284,7 +280,7 @@ fn layout_vstack(
     context: &mut LayoutContext,
     stack: &mut VStack,
     x: usize,
-    y: usize,
+    y: isize,
     safe_width: usize,
     height: Option<usize>,
     clip: LayoutRect,
@@ -337,7 +333,7 @@ fn layout_vstack(
             parent_clip,
         );
         box_.children.push(child);
-        child_y += size + stack.gap;
+        child_y += (size + stack.gap) as isize;
     }
     box_
 }
@@ -346,7 +342,7 @@ fn layout_hstack(
     context: &mut LayoutContext,
     stack: &mut HStack,
     x: usize,
-    y: usize,
+    y: isize,
     safe_width: usize,
     height: Option<usize>,
     clip: LayoutRect,
@@ -402,9 +398,9 @@ fn layout_hstack(
         };
         let mut child_y = y;
         if stack.align == StackAlign::Center {
-            child_y += allocated_height.saturating_sub(child_height) / 2;
+            child_y += (allocated_height.saturating_sub(child_height) / 2) as isize;
         } else if stack.align == StackAlign::End {
-            child_y += allocated_height.saturating_sub(child_height);
+            child_y += allocated_height.saturating_sub(child_height) as isize;
         }
         let child_width = widths[k];
         if child_width == 0 {
@@ -512,9 +508,9 @@ pub fn get_scrollbar_geometry(box_: &LayoutBox) -> Option<ScrollbarGeometry> {
     }
     Some(ScrollbarGeometry {
         column,
-        track_top: box_.rect.y,
+        track_top: box_.rect.y.max(0) as usize,
         track_height,
-        thumb_top: box_.rect.y + thumb_offset,
+        thumb_top: (box_.rect.y + thumb_offset as isize).max(0) as usize,
         thumb_height,
         max_scroll_top,
     })
@@ -529,7 +525,10 @@ fn paint_scrollbar(box_: &LayoutBox, screen: &mut [String], total_width: usize) 
     };
     for offset in 0..geometry.thumb_height {
         let row = geometry.thumb_top + offset;
-        if row < box_.clip.y || row >= box_.clip.y + box_.clip.height || row >= screen.len() {
+        if (row as isize) < box_.clip.y
+            || (row as isize) >= box_.clip.y + box_.clip.height as isize
+            || row >= screen.len()
+        {
             continue;
         }
         screen[row] = style_scrollbar_cell(
@@ -544,18 +543,25 @@ fn paint_scrollbar(box_: &LayoutBox, screen: &mut [String], total_width: usize) 
 fn paint_box(box_: &LayoutBox, screen: &mut [String], total_width: usize) {
     if let Some(lines) = &box_.lines {
         let offset = box_.line_offset;
-        let first_row = box_.rect.y.max(box_.clip.y);
-        let last_row = (box_.rect.y + box_.rect.height)
-            .min(box_.clip.y + box_.clip.height)
-            .min(screen.len());
+        let first_row = box_.rect.y.max(box_.clip.y).max(0) as usize;
+        let last_row = (box_.rect.y + box_.rect.height as isize)
+            .min(box_.clip.y + box_.clip.height as isize)
+            .min(screen.len() as isize)
+            .max(0) as usize;
         for row in first_row..last_row {
-            let Some(source_line) = lines.get(offset + row - box_.rect.y) else {
+            let source_index = offset as isize + row as isize - box_.rect.y;
+            if source_index < 0 {
+                continue;
+            }
+            let Some(source_line) = lines.get(source_index as usize) else {
                 continue;
             };
             let mut line = strip_osc133_prefix(source_line);
             if let Some(metadata) = get_kitty_image_metadata(&line) {
-                let clip_bottom = screen.len().min(box_.clip.y + box_.clip.height);
-                let visible_rows = (metadata.rows as usize).min(clip_bottom.saturating_sub(row));
+                let clip_bottom =
+                    (screen.len() as isize).min(box_.clip.y + box_.clip.height as isize);
+                let visible_rows =
+                    (metadata.rows as usize).min((clip_bottom - row as isize).max(0) as usize);
                 if visible_rows < metadata.rows as usize {
                     line = crop_kitty_image_line(&line, 0, visible_rows as u32);
                 }
@@ -594,8 +600,14 @@ fn paint_box(box_: &LayoutBox, screen: &mut [String], total_width: usize) {
                                 hidden_rows as u32,
                                 visible_rows as u32,
                             );
-                            if box_.rect.x == 0 && box_.rect.width >= total_width {
-                                screen[box_.rect.y] = cropped;
+                            if box_.rect.x == 0
+                                && box_.rect.width >= total_width
+                                && box_.rect.y >= 0
+                            {
+                                let dest = box_.rect.y as usize;
+                                if dest < screen.len() {
+                                    screen[dest] = cropped;
+                                }
                             }
                         }
                         break;
@@ -649,7 +661,8 @@ pub fn render_layout_frame(root: &mut dyn Component, width: usize, height: usize
 }
 
 fn contains_point(rect: LayoutRect, x: usize, y: usize) -> bool {
-    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    let y = y as isize;
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height as isize
 }
 
 /// TS `getScrollViewBox`.

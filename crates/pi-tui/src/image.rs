@@ -26,6 +26,15 @@ pub struct KittyImageMetadata {
 
 struct RegisteredKittyImage {
     metadata: KittyImageMetadata,
+    transmission_generation: u64,
+}
+
+fn next_kitty_generation() -> u64 {
+    static GENERATION: OnceLock<Mutex<u64>> = OnceLock::new();
+    let cell = GENERATION.get_or_init(|| Mutex::new(0));
+    let mut value = cell.lock().unwrap_or_else(|err| err.into_inner());
+    *value += 1;
+    *value
 }
 
 fn kitty_metadata() -> &'static Mutex<HashMap<u32, RegisteredKittyImage>> {
@@ -39,7 +48,13 @@ pub fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     store.remove(&metadata.image_id);
-    store.insert(metadata.image_id, RegisteredKittyImage { metadata });
+    store.insert(
+        metadata.image_id,
+        RegisteredKittyImage {
+            metadata,
+            transmission_generation: next_kitty_generation(),
+        },
+    );
     if store.len() > 1000 {
         if let Some(oldest) = store.keys().next().copied() {
             store.remove(&oldest);
@@ -250,6 +265,75 @@ pub fn parse_kitty_image_header(line: &str) -> Option<KittyImageHeader> {
         }
     }
     Some(KittyImageHeader { ids, rows })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyImagePlacement {
+    pub image_id: u32,
+    pub transmission_generation: u64,
+    pub transmission_bytes: usize,
+    pub estimated_decoded_bytes: usize,
+    pub sequence: String,
+    pub replacement_line: String,
+}
+
+const KITTY_PLACEMENT_CONTROL_KEYS: &[&str] = &[
+    "i", "p", "x", "y", "w", "h", "X", "Y", "c", "r", "C", "U", "z", "P", "Q", "H", "V",
+];
+
+/// TS `getKittyImagePlacement`.
+pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
+    let start = line.find(KITTY_IMAGE_PREFIX)?;
+    let after = &line[start + KITTY_IMAGE_PREFIX.len()..];
+    let (controls, _) = after.split_once(';')?;
+    let image_id = image_id_from_controls(controls)?;
+    let store = kitty_metadata()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let registered = store.get(&image_id)?;
+    let mut command_start = start;
+    let mut command_controls = controls.to_string();
+    let mut transmission_end;
+    loop {
+        let Some(rel) = line[command_start + KITTY_IMAGE_PREFIX.len()..].find(KITTY_IMAGE_SUFFIX)
+        else {
+            return None;
+        };
+        let terminator = command_start + KITTY_IMAGE_PREFIX.len() + rel;
+        transmission_end = terminator + KITTY_IMAGE_SUFFIX.len();
+        let is_more = command_controls.split(',').any(|part| part == "m=1");
+        if !is_more {
+            break;
+        }
+        command_start = transmission_end;
+        if !line[command_start..].starts_with(KITTY_IMAGE_PREFIX) {
+            return None;
+        }
+        let after_prefix = &line[command_start + KITTY_IMAGE_PREFIX.len()..];
+        let (next_controls, _) = after_prefix.split_once(';')?;
+        command_controls = next_controls.to_string();
+    }
+    let kept: Vec<&str> = controls
+        .split(',')
+        .filter(|control| {
+            let key = control.split('=').next().unwrap_or("");
+            KITTY_PLACEMENT_CONTROL_KEYS.contains(&key)
+        })
+        .collect();
+    let sequence = format!(
+        "{KITTY_IMAGE_PREFIX}a=p,q=2,{}{KITTY_IMAGE_SUFFIX}",
+        kept.join(",")
+    );
+    Some(KittyImagePlacement {
+        image_id,
+        transmission_generation: registered.transmission_generation,
+        transmission_bytes: transmission_end - start,
+        estimated_decoded_bytes: (registered.metadata.width_px as usize)
+            .saturating_mul(registered.metadata.height_px as usize)
+            .saturating_mul(4),
+        sequence: sequence.clone(),
+        replacement_line: format!("{}{sequence}{}", &line[..start], &line[transmission_end..]),
+    })
 }
 
 pub fn kitty_image_ids(line: &str) -> Vec<String> {

@@ -105,6 +105,39 @@ pub fn decode_kitty_printable(data: &str) -> Option<String> {
     char::from_u32(effective).map(|ch| ch.to_string())
 }
 
+/// Kitty functional key codepoints matching `KITTY_FUNCTIONAL_KEY_EQUIVALENTS`.
+pub fn kitty_functional_codepoint(name: &str) -> Option<u32> {
+    Some(match name {
+        "left" => 57417,
+        "right" => 57418,
+        "up" => 57419,
+        "down" => 57420,
+        "pageup" => 57421,
+        "pagedown" => 57422,
+        "home" => 57423,
+        "end" => 57424,
+        "insert" => 57425,
+        "delete" => 57426,
+        _ => return None,
+    })
+}
+
+/// Parse `\x1b[{code}[;{mods}[:3]]u` into (codepoint, modifier bits, release).
+pub fn parse_kitty_csi_u(data: &str) -> Option<(u32, u32, bool)> {
+    let rest = data.strip_prefix("\x1b[")?;
+    let rest = rest.strip_suffix('u')?;
+    let (code_part, mods_part) = rest.split_once(';').unwrap_or((rest, "1"));
+    let codepoint = code_part.split(':').next()?.parse().ok()?;
+    let mut mods_bits = mods_part.split(':');
+    let mod_value = mods_bits.next()?.parse::<u32>().ok().unwrap_or(1);
+    let release = mods_bits.next() == Some("3");
+    Some((codepoint, mod_value.saturating_sub(1), release))
+}
+
+pub fn key_modifier_bits(ctrl: bool, alt: bool, shift: bool) -> u32 {
+    u32::from(shift) + (u32::from(alt) * 2) + (u32::from(ctrl) * 4)
+}
+
 /// TS `isKeyRelease`.
 pub fn is_key_release(data: &str) -> bool {
     if data.contains("\x1b[200~") {

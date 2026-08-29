@@ -1319,6 +1319,51 @@ pub fn get_grapheme_cell_range(line: &str, column: usize) -> Option<GraphemeCell
     None
 }
 
+/// TS `getOsc8LinkAtColumn`.
+pub fn get_osc8_link_at_column(line: &str, column: usize) -> Option<String> {
+    let mut active_url: Option<String> = None;
+    let mut current_col = 0usize;
+    let mut i = 0usize;
+    while i < line.len() {
+        if let Some((code, len)) = extract_ansi_code(line, i) {
+            if let Some(url) = parse_osc8_url(&code) {
+                active_url = if url.is_empty() { None } else { Some(url) };
+            }
+            i += len;
+            continue;
+        }
+        let mut text_end = i;
+        while text_end < line.len() && extract_ansi_code(line, text_end).is_none() {
+            text_end += line[text_end..]
+                .chars()
+                .next()
+                .map_or(1, |ch| ch.len_utf8());
+        }
+        for segment in line[i..text_end].graphemes(true) {
+            let width = if segment == "\t" {
+                3
+            } else {
+                grapheme_width(segment)
+            };
+            if column >= current_col && column < current_col + width {
+                return active_url;
+            }
+            current_col += width;
+        }
+        i = text_end;
+    }
+    None
+}
+
+fn parse_osc8_url(code: &str) -> Option<String> {
+    let rest = code.strip_prefix("\x1b]8;")?;
+    let rest = rest
+        .strip_suffix('\x07')
+        .or_else(|| rest.strip_suffix("\x1b\\"))?;
+    let (_, url) = rest.split_once(';')?;
+    Some(url.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedSegments {
     pub before: String,

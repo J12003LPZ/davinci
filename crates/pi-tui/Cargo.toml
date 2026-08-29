@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Terminal UI matching @earendil-works/pi-tui"
 
 [dependencies]
+base64.workspace = true
 crossterm.workspace = true
 fancy-regex.workspace = true
 icu_segmenter.workspace = true

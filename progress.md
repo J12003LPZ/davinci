@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (viewport layout, TuiMainScreen/TuiAltScreen/ProcessTerminal). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (`createInteractiveTui` host + TuiAltScreen product paths). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -133,9 +133,11 @@ Closed this slice: TUI `Spacer`, TS `Text` (`TuiText` wrap + pad + tab=3 + backg
 
 Closed this slice: TUI viewport `renderLayoutFrame` (grow, fixed-basis measure skip, shrink, nested min sizes, follow-end unused delta, Kitty crop `y=0,h=34,r=1`, HStack compose, transient/always scrollbar, thumb heights 21/40/100/400, reserved-width runtime update, nested scroll geometry). `SelectList` layout options (`minPrimaryColumnWidth` / `maxPrimaryColumnWidth`, multiline description normalize). `TuiMainScreen` differential + bounded writer + `PI_DEBUG_REDRAW`. `TuiAltScreen` enter/exit 1049, implicit follow-end, page/home/end/wheel. `ProcessTerminal` Kitty query `\x1b[>7u\x1b[?u\x1b[c`, flags/DA/modifyOtherKeys, split confirmation, OSC 9;4, COLUMNS/LINES. Alt-screen search corpus + match keys.
 
+Closed this slice: `createInteractiveTui` / `switchTuiMode` / `stopInteractiveTui` / `handleCopyCommand` in `pi_coding_agent::interactive_tui`. Interactive `run_interactive` mounts `TuiMainScreen`/`TuiAltScreen` (settings or `--tui-mode`), live `ProcessTerminal`, chrome `SharedLineView`, host-consumed alt-screen search/scroll/selection, `/settings` tui-mode remount, `fullscreenExitOutput` resume-hint vs transcript, `/copy` flash vs status. `TuiAltScreen` now has character/word/line selection, scrollbar hover/drag, OSC-8 click, `Copied!` flash, offscreen Kitty placement cache (16 / 32MB tx / 64MB decoded), search overlay (`ctrl+shift+f`), prompt jump, and signed follow-end layout Y.
+
 Still not product-equivalent:
 
 - Native TUI C addons (`tui/native/darwin`, `tui/native/win32`) — optional; Shift detection uses crossterm modifiers, `PI_TUI_SHIFT` / `PI_TUI_NATIVE_MODIFIER_SHIFT`, plus the TS rewrite helpers. Darwin/Win32 `.node` binaries are not shipped.
-- TuiAltScreen mouse text selection, scrollbar drag, OSC-8 click, flash container, and offscreen Kitty placement cache are partial versus TS. InteractiveSession remains the coding-agent host; TS still mounts `TuiMainScreen`/`TuiAltScreen` through `createInteractiveTui`.
+- InteractiveMode chrome is still one `SharedLineView` blob rather than TS `documentContainer` + transcript `ScrollView` + editor/footer dock; `switchTuiMode` remounts a new view instead of the same child object references.
 - Sparse 1e9-line scroll clip (JS sparse arrays) is not ported as a non-allocating line source.
 - TypeScript under `vendor/pi` remains the behavioral spec.

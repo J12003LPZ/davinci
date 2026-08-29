@@ -1,5 +1,6 @@
 //! Terminal UI matching `@earendil-works/pi-tui`.
 
+mod alt_screen_flash;
 mod alt_screen_search;
 mod ansi;
 mod autocomplete;
@@ -49,19 +50,21 @@ mod transcript;
 mod tree;
 mod truncated_text;
 mod trust_selector;
+mod tui_alt_screen;
 mod tui_runtime;
 mod tui_text;
 mod undo_stack;
 mod word_nav;
 mod word_wrap;
 
+pub use alt_screen_flash::AltScreenFlashContainer;
 pub use alt_screen_search::{
     find_alt_screen_search_matches, get_alt_screen_search_match_key, AltScreenSearchComponent,
     AltScreenSearchMatch, AltScreenSearchSegment,
 };
 pub use ansi::{
-    extract_ansi_code, extract_segments, get_grapheme_cell_range, grapheme_width,
-    normalize_terminal_output, slice_by_column, slice_with_width,
+    extract_ansi_code, extract_segments, get_grapheme_cell_range, get_osc8_link_at_column,
+    grapheme_width, normalize_terminal_output, slice_by_column, slice_with_width,
     strip_terminal_sequences as strip_ansi_sequences, truncate_to_width as truncate_to_width_ansi,
     visible_width as visible_width_ansi, wrap_text_with_ansi, ExtractedSegments, GraphemeCellRange,
     SlicedText,
@@ -95,10 +98,10 @@ pub use footer::{
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use image::{
     crop_kitty_image_line, delete_all_kitty_images, delete_all_kitty_placements,
-    delete_kitty_image, encode_kitty, get_cell_dimensions, get_kitty_image_metadata, is_image_line,
-    iterm_image, kitty_image_chunk, kitty_image_ids, parse_kitty_image_header,
-    register_kitty_image_metadata, set_cell_dimensions, CellDimensions, KittyImageHeader,
-    KittyImageMetadata, KITTY_IMAGE_PREFIX,
+    delete_kitty_image, encode_kitty, get_cell_dimensions, get_kitty_image_metadata,
+    get_kitty_image_placement, is_image_line, iterm_image, kitty_image_chunk, kitty_image_ids,
+    parse_kitty_image_header, register_kitty_image_metadata, set_cell_dimensions, CellDimensions,
+    KittyImageHeader, KittyImageMetadata, KittyImagePlacement, KITTY_IMAGE_PREFIX,
 };
 pub use input::{Input, InputAction};
 pub use item_select_list::{
@@ -139,7 +142,7 @@ pub use osc::{
 pub use overlay::{
     composite_overlay_lines, composite_tui_line, overlay_options_from_json, resolve_anchor_col,
     resolve_anchor_row, resolve_overlay_layout, Overlay, OverlayAnchor, OverlayLayout,
-    OverlayOptions, SizeValue,
+    OverlayMargin, OverlayOptions, SizeValue,
 };
 pub use render::{
     strip_terminal_sequences, visible_width, visible_width_stripped, Component, Text,
@@ -199,9 +202,9 @@ pub use truncated_text::TruncatedText;
 pub use trust_selector::{
     TrustOption, TrustSavedDecision, TrustSelector, TrustSelectorAction, TrustUpdate,
 };
+pub use tui_alt_screen::{TuiAltScreen, TuiAltScreenOptions};
 pub use tui_runtime::{
-    TuiAltScreen, TuiAltScreenOptions, TuiMainScreen, TuiMainScreenRenderState, TuiRuntimeMode,
-    TuiStopOptions,
+    OverlayHandle, TuiMainScreen, TuiMainScreenRenderState, TuiRuntimeMode, TuiStopOptions,
 };
 pub use tui_text::{apply_background_to_line, TuiText};
 

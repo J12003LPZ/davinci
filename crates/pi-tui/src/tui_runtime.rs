@@ -3,40 +3,37 @@
 
 use std::path::PathBuf;
 
-use crate::alt_screen_search::{
-    find_alt_screen_search_matches, get_alt_screen_search_match_key, AltScreenSearchMatch,
-};
 use crate::ansi::{normalize_terminal_output, slice_by_column, visible_width};
 use crate::container::Container;
-use crate::image::{
-    delete_all_kitty_images, delete_all_kitty_placements, delete_kitty_image, is_image_line,
-    kitty_image_ids, parse_kitty_image_header,
-};
+use crate::image::{delete_kitty_image, is_image_line, kitty_image_ids, parse_kitty_image_header};
 use crate::keybindings::Keybindings;
 use crate::keys::is_key_release;
-use crate::layout::{render_layout_frame, LayoutFrame};
 use crate::osc::{
     is_osc11_background_color_response, parse_osc11_background_color,
     parse_terminal_color_scheme_report, RgbColor, COLOR_SCHEME_QUERY, OSC_11_QUERY,
 };
 use crate::overlay::{composite_tui_line, resolve_overlay_layout, OverlayOptions};
 use crate::render::Component;
-use crate::scroll::{ScrollFollow, ScrollView, ScrollViewOptions};
 use crate::terminal::TerminalIo;
 use crate::CURSOR_MARKER;
 
 const SEGMENT_RESET: &str = "\x1b[0m\x1b]8;;\x07";
 const MAX_RENDER_WRITE_CHARS: usize = 1024 * 1024;
-const ENTER_ALT_SCREEN: &str = "\x1b[?1049h";
-const EXIT_ALT_SCREEN: &str = "\x1b[?1049l";
-const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
-const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
-const ENABLE_BUTTON_MOTION_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h";
-const ENABLE_ALL_MOTION_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h";
-const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
-const BEGIN_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026h";
-const END_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026l";
-const PAGE_SCROLL_OVERLAP: usize = 4;
+pub(crate) const ENTER_ALT_SCREEN: &str = "\x1b[?1049h";
+pub(crate) const EXIT_ALT_SCREEN: &str = "\x1b[?1049l";
+pub(crate) const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
+pub(crate) const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
+pub(crate) const ENABLE_BUTTON_MOTION_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h";
+pub(crate) const ENABLE_ALL_MOTION_MOUSE: &str =
+    "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h";
+pub(crate) const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+pub(crate) const BEGIN_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026h";
+pub(crate) const END_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026l";
+pub(crate) const PAGE_SCROLL_OVERLAP: usize = 4;
+pub(crate) const FOCUS_IN: &str = "\x1b[I";
+pub(crate) const FOCUS_OUT: &str = "\x1b[O";
+pub(crate) const OSC133_ZONE_PREFIX: &str = "\x1b]133;";
+pub(crate) const OSC133_PROMPT_START: &str = "\x1b]133;A";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TuiStopOptions {
@@ -56,8 +53,9 @@ struct OverlayStackEntry {
     focus_order: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlayHandle {
-    id: usize,
+    pub id: usize,
 }
 
 struct BoundedTerminalWriter {
@@ -273,6 +271,34 @@ impl TuiBase {
             self.focused = None;
             self.request_render(false);
         }
+    }
+
+    pub fn is_overlay_focused(&self) -> bool {
+        matches!(self.focused, Some(FocusTarget::Overlay(_)))
+    }
+
+    pub fn is_overlay_handle_focused(&self, handle: &OverlayHandle) -> bool {
+        let Some(index) = self.overlay_ids.iter().position(|id| *id == handle.id) else {
+            return false;
+        };
+        self.focused == Some(FocusTarget::Overlay(index))
+    }
+
+    pub fn overlay_component_mut(&mut self, handle: &OverlayHandle) -> Option<&mut dyn Component> {
+        let index = self.overlay_ids.iter().position(|id| *id == handle.id)?;
+        Some(self.overlays[index].component.as_mut())
+    }
+
+    pub fn take_terminal(self) -> Box<dyn TerminalIo> {
+        self.terminal
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    pub fn set_stopped(&mut self, stopped: bool) {
+        self.stopped = stopped;
     }
 
     pub fn request_render(&mut self, force: bool) {
@@ -636,6 +662,10 @@ impl TuiMainScreen {
         self.hardware_cursor_row = 0;
         self.max_lines_rendered = 0;
         self.previous_viewport_top = 0;
+    }
+
+    pub fn take_terminal(self) -> Box<dyn TerminalIo> {
+        self.base.take_terminal()
     }
 
     pub fn render_now(&mut self, force: bool) {
@@ -1135,352 +1165,12 @@ pub struct TuiMainScreenRenderState {
     pub previous_viewport_top: usize,
 }
 
-pub struct TuiAltScreenOptions {
-    pub wheel_scroll_lines: usize,
-    pub mouse: bool,
-    pub copy_on_select: bool,
-}
-
-impl Default for TuiAltScreenOptions {
-    fn default() -> Self {
-        Self {
-            wheel_scroll_lines: 1,
-            mouse: true,
-            copy_on_select: true,
-        }
-    }
-}
-
-/// Alternate-screen TUI matching TS `TuiAltScreen`.
-pub struct TuiAltScreen {
-    pub base: TuiBase,
-    previous_screen: Vec<String>,
-    previous_screen_width: usize,
-    previous_screen_height: usize,
-    implicit_scroll: ScrollView,
-    alt_screen_active: bool,
-    wheel_scroll_lines: usize,
-    mouse_enabled: bool,
-    copy_on_select: bool,
-    search_matches: Vec<AltScreenSearchMatch>,
-    search_index: isize,
-    search_query: String,
-}
-
-impl TuiAltScreen {
-    pub fn new(terminal: Box<dyn TerminalIo>) -> Self {
-        Self::with_options(terminal, TuiAltScreenOptions::default())
-    }
-
-    pub fn with_options(terminal: Box<dyn TerminalIo>, options: TuiAltScreenOptions) -> Self {
-        let document = Container::new();
-        let implicit_scroll = ScrollView::new(
-            Box::new(document),
-            ScrollViewOptions {
-                follow: ScrollFollow::End,
-                primary: true,
-                ..ScrollViewOptions::default()
-            },
-        )
-        .expect("vertical scroll");
-        Self {
-            base: TuiBase::new(terminal, None, None),
-            previous_screen: Vec::new(),
-            previous_screen_width: 0,
-            previous_screen_height: 0,
-            implicit_scroll,
-            alt_screen_active: false,
-            wheel_scroll_lines: options.wheel_scroll_lines.max(1),
-            mouse_enabled: options.mouse,
-            copy_on_select: options.copy_on_select,
-            search_matches: Vec::new(),
-            search_index: -1,
-            search_query: String::new(),
-        }
-    }
-
-    pub fn mode(&self) -> TuiRuntimeMode {
-        TuiRuntimeMode::Fullscreen
-    }
-
-    pub fn add_child(&mut self, component: Box<dyn Component>) {
-        if let Some(container) = self
-            .implicit_scroll
-            .child_mut()
-            .as_any_mut()
-            .downcast_mut::<Container>()
-        {
-            container.add_child(component);
-        }
-    }
-
-    pub fn get_copy_on_select(&self) -> bool {
-        self.copy_on_select
-    }
-
-    pub fn set_copy_on_select(&mut self, enabled: bool) {
-        self.copy_on_select = enabled;
-    }
-
-    pub fn viewport_top(&self) -> usize {
-        self.implicit_scroll.scroll_top()
-    }
-
-    pub fn is_following_output(&self) -> bool {
-        self.implicit_scroll.is_following_end()
-    }
-
-    pub fn scroll_by(&mut self, lines: isize) {
-        self.implicit_scroll.scroll_by(lines);
-        self.render_now(false);
-    }
-
-    pub fn scroll_to_top(&mut self) {
-        self.implicit_scroll.scroll_to_start();
-        self.render_now(false);
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.implicit_scroll.scroll_to_end();
-        self.render_now(false);
-    }
-
-    pub fn start(&mut self) {
-        self.alt_screen_active = true;
-        let term = std::env::var("TERM")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let mouse = if !self.mouse_enabled {
-            String::new()
-        } else if std::env::var("TMUX").is_ok()
-            || std::env::var("ZELLIJ").is_ok()
-            || std::env::var("STY").is_ok()
-            || term.starts_with("tmux")
-            || term.starts_with("screen")
-        {
-            ENABLE_BUTTON_MOTION_MOUSE.to_string()
-        } else {
-            ENABLE_ALL_MOTION_MOUSE.to_string()
-        };
-        self.base.terminal.write(&format!(
-            "{ENTER_ALT_SCREEN}{DISABLE_AUTOWRAP}{mouse}\x1b[2J\x1b[H\x1b[?25l"
-        ));
-        self.base.stopped = false;
-        self.base.terminal.start();
-        self.render_now(false);
-    }
-
-    pub fn stop(&mut self, options: TuiStopOptions) {
-        if self.alt_screen_active {
-            let mouse = if self.mouse_enabled {
-                DISABLE_MOUSE
-            } else {
-                ""
-            };
-            self.base.terminal.write(&format!(
-                "{BEGIN_SYNCHRONIZED_OUTPUT}{}{mouse}{ENABLE_AUTOWRAP}{END_SYNCHRONIZED_OUTPUT}",
-                delete_all_kitty_images()
-            ));
-            if options.preserve_screen {
-                self.base.terminal.write(&format!(
-                    "{BEGIN_SYNCHRONIZED_OUTPUT}{EXIT_ALT_SCREEN}\x1b[?25h{END_SYNCHRONIZED_OUTPUT}"
-                ));
-            } else {
-                self.base.terminal.write(&format!(
-                    "{BEGIN_SYNCHRONIZED_OUTPUT}{EXIT_ALT_SCREEN}{ENABLE_AUTOWRAP}\r\n\x1b[?25h{END_SYNCHRONIZED_OUTPUT}"
-                ));
-            }
-            self.alt_screen_active = false;
-        }
-        self.base.stopped = true;
-        self.base.terminal.show_cursor();
-        self.base.terminal.stop();
-    }
-
-    pub fn handle_input(&mut self, data: &str) {
-        if self.handle_viewport_input(data) {
-            self.render_now(false);
-            return;
-        }
-        self.base.handle_terminal_input(data);
-        self.render_now(false);
-    }
-
-    fn handle_viewport_input(&mut self, data: &str) -> bool {
-        if let Some((direction, _, _)) = parse_sgr_wheel(data) {
-            self.implicit_scroll
-                .scroll_by(direction * self.wheel_scroll_lines as isize);
-            return true;
-        }
-        let kb = Keybindings::defaults();
-        if kb.matches(data, "tui.scroll.pageUp") || data == "\x1b[5~" {
-            let height = self.base.terminal.rows().max(1);
-            let delta = height.saturating_sub(PAGE_SCROLL_OVERLAP).max(1) as isize;
-            self.implicit_scroll.scroll_by(-delta);
-            return true;
-        }
-        if kb.matches(data, "tui.scroll.pageDown") || data == "\x1b[6~" {
-            let height = self.base.terminal.rows().max(1);
-            let delta = height.saturating_sub(PAGE_SCROLL_OVERLAP).max(1) as isize;
-            self.implicit_scroll.scroll_by(delta);
-            return true;
-        }
-        if kb.matches(data, "tui.scroll.top") || data == "\x1b[H" || data == "\x1b[1~" {
-            self.implicit_scroll.scroll_to_start();
-            return true;
-        }
-        if kb.matches(data, "tui.scroll.bottom") || data == "\x1b[F" || data == "\x1b[4~" {
-            self.implicit_scroll.scroll_to_end();
-            return true;
-        }
-        false
-    }
-
-    pub fn render_now(&mut self, force: bool) {
-        if self.base.stopped || !self.alt_screen_active {
-            return;
-        }
-        if force {
-            self.previous_screen.clear();
-            self.previous_screen_width = 0;
-            self.previous_screen_height = 0;
-        }
-        let width = self.base.terminal.columns().max(1);
-        let height = self.base.terminal.rows().max(1);
-        let frame = render_layout_frame(&mut self.implicit_scroll, width, height);
-        self.paint_frame(frame, width, height);
-    }
-
-    fn paint_frame(&mut self, frame: LayoutFrame, width: usize, height: usize) {
-        let mut screen = frame.lines;
-        if !self.search_query.is_empty() {
-            self.search_matches = find_alt_screen_search_matches(&screen, &self.search_query);
-            screen = apply_search_highlights(&screen, &self.search_matches, self.search_index);
-        }
-        screen = self.base.composite_overlays(&screen, width, height);
-        if screen.len() > height {
-            screen = screen[screen.len() - height..].to_vec();
-        }
-        let mut screen_for_cursor = screen.clone();
-        let cursor_pos = TuiBase::extract_cursor_position(&mut screen_for_cursor, height);
-        screen = self.base.apply_line_resets(&screen_for_cursor);
-        screen = screen
-            .into_iter()
-            .map(|line| {
-                if is_image_line(&line) || visible_width(&line) <= width {
-                    line
-                } else {
-                    slice_by_column(&line, 0, width, true)
-                }
-            })
-            .collect();
-        let full_redraw = self.previous_screen.is_empty()
-            || self.previous_screen_width != width
-            || self.previous_screen_height != height;
-        let mut buffer = BEGIN_SYNCHRONIZED_OUTPUT.to_string();
-        if full_redraw {
-            self.base.full_redraws += 1;
-            buffer.push_str(&delete_all_kitty_placements());
-            buffer.push_str("\x1b[2J");
-        }
-        for row in 0..height {
-            if !full_redraw && self.previous_screen.get(row) == screen.get(row) {
-                continue;
-            }
-            buffer.push_str(&format!(
-                "\x1b[{};1H\x1b[2K{}",
-                row + 1,
-                screen.get(row).map(String::as_str).unwrap_or("")
-            ));
-        }
-        if let Some((row, col)) = cursor_pos {
-            buffer.push_str(&format!("\x1b[{};{}H", row + 1, col.min(width) + 1));
-            buffer.push_str(if self.base.get_show_hardware_cursor() {
-                "\x1b[?25h"
-            } else {
-                "\x1b[?25l"
-            });
-        } else {
-            buffer.push_str("\x1b[?25l");
-        }
-        buffer.push_str(END_SYNCHRONIZED_OUTPUT);
-        self.base.terminal.write(&buffer);
-        self.previous_screen = screen;
-        self.previous_screen_width = width;
-        self.previous_screen_height = height;
-    }
-
-    pub fn set_search_query(&mut self, query: impl Into<String>) {
-        self.search_query = query.into();
-        self.search_index = 0;
-        self.render_now(false);
-    }
-
-    pub fn search_match_count(&self) -> usize {
-        self.search_matches.len()
-    }
-
-    pub fn search_selected_key(&self) -> Option<String> {
-        self.search_matches
-            .get(self.search_index.max(0) as usize)
-            .map(get_alt_screen_search_match_key)
-    }
-}
-
-fn apply_search_highlights(
-    screen: &[String],
-    matches: &[AltScreenSearchMatch],
-    selected: isize,
-) -> Vec<String> {
-    let mut lines = screen.to_vec();
-    for (index, found) in matches.iter().enumerate() {
-        let current = selected >= 0 && index == selected as usize;
-        for segment in &found.segments {
-            if let Some(line) = lines.get_mut(segment.row) {
-                let before = slice_by_column(line, 0, segment.start_col, true);
-                let mid = slice_by_column(
-                    line,
-                    segment.start_col,
-                    segment.end_col.saturating_sub(segment.start_col),
-                    true,
-                );
-                let after = slice_by_column(line, segment.end_col, usize::MAX / 4, true);
-                let styled = if current {
-                    format!("\x1b[1;7m{mid}\x1b[22;27m")
-                } else {
-                    format!("\x1b[4m{mid}\x1b[24m")
-                };
-                *line = format!("{before}{styled}{after}");
-            }
-        }
-    }
-    lines
-}
-
-fn parse_sgr_wheel(data: &str) -> Option<(isize, usize, usize)> {
-    let rest = data.strip_prefix("\x1b[<")?;
-    let end = rest.chars().last()?;
-    if end != 'M' && end != 'm' {
-        return None;
-    }
-    let body = &rest[..rest.len() - 1];
-    let mut parts = body.split(';');
-    let button = parts.next()?.parse::<u32>().ok()?;
-    let x = parts.next()?.parse::<usize>().ok()?;
-    let y = parts.next()?.parse::<usize>().ok()?;
-    let direction = match button & 0b1100000 {
-        64 => -1,
-        65 => 1,
-        _ => return None,
-    };
-    Some((direction, x, y))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::render::Text;
     use crate::terminal::MemoryTerminal;
+    use crate::tui_alt_screen::TuiAltScreen;
     use std::cell::RefCell;
     use std::rc::Rc;
 
