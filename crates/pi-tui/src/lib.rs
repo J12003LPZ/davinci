@@ -4,6 +4,7 @@ pub mod component;
 pub mod diff;
 pub mod editor;
 pub mod fuzzy;
+pub mod image;
 pub mod keys;
 pub mod layout;
 pub mod markdown;
@@ -19,9 +20,10 @@ pub mod word_nav;
 pub use component::{wrap_text_with_ansi, Component, Text};
 pub use diff::{
     apply_line_resets, composite_tui_line, extract_cursor_position, hardware_cursor_sequence,
-    normalize_terminal_output, visible_width, DiffScreen,
+    normalize_terminal_output, truncate_to_width, visible_width, DiffScreen,
 };
 pub use editor::Editor;
+pub use image::Image;
 pub use keys::{default_keybindings, parse_bytes, parse_key, read_key, Key, Keybinding};
 pub use layout::{ChatView, Container, Overlay};
 pub use markdown::Markdown;
@@ -33,13 +35,15 @@ pub use terminal::{
     enter_raw_mode, leave_alt_screen, leave_raw_mode, set_title, TuiMode,
 };
 pub use terminal_image::{
-    calculate_image_cell_size, crop_kitty_image_line, delete_all_kitty_images,
-    delete_all_kitty_placements, delete_kitty_image, detect_capabilities, encode_iterm2,
-    encode_kitty, get_capabilities, get_kitty_image_metadata, get_kitty_image_placement, hyperlink,
-    is_image_line, register_kitty_image_metadata, render_image, reset_capabilities_cache,
-    set_capabilities, set_capability_overrides, set_cell_dimensions, CellDimensions,
-    ImageDimensions, ImageProtocol, ImageRenderOptions, KittyImageMetadata, KittyImagePlacement,
-    RenderedImage, TerminalCapabilities, ITERM2_PREFIX, KITTY_PREFIX,
+    allocate_image_id, calculate_image_cell_size, crop_kitty_image_line, delete_all_kitty_images,
+    delete_all_kitty_placements, delete_kitty_image, detect_capabilities,
+    emit_reserved_image_block, encode_iterm2, encode_kitty, get_capabilities, get_image_dimensions,
+    get_kitty_image_metadata, get_kitty_image_placement, hyperlink, image_fallback, is_image_line,
+    kitty_image_reserved_rows, prepare_kitty_screen, register_kitty_image_metadata, render_image,
+    reset_capabilities_cache, set_capabilities, set_capability_overrides, set_cell_dimensions,
+    CachedKittyImage, CellDimensions, ImageDimensions, ImageProtocol, ImageRenderOptions,
+    KittyImageMetadata, KittyImagePlacement, RenderedImage, TerminalCapabilities, ITERM2_PREFIX,
+    KITTY_PREFIX, MAX_CACHED_OFFSCREEN_KITTY_IMAGES,
 };
 pub use themes::Theme;
 pub use widgets::{

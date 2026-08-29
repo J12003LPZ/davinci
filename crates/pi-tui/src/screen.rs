@@ -4,6 +4,10 @@ use crate::component::Component;
 use crate::diff::{composite_tui_line, visible_width, DiffScreen};
 use crate::mouse::{overlay_rect, parse_sgr_mouse, MouseEvent, Rect};
 use crate::terminal::TuiMode;
+use crate::terminal_image::{
+    get_capabilities, prepare_kitty_screen, CachedKittyImage, ImageProtocol,
+};
+use indexmap::IndexMap;
 
 #[derive(Debug, Clone)]
 pub struct OverlayOptions {
@@ -47,6 +51,8 @@ pub struct Tui {
     overlays: Vec<OverlayEntry>,
     next_id: u64,
     screen: DiffScreen,
+    image_protocol: Option<ImageProtocol>,
+    uploaded_kitty: IndexMap<u32, CachedKittyImage>,
 }
 
 impl Tui {
@@ -59,6 +65,8 @@ impl Tui {
             overlays: Vec::new(),
             next_id: 1,
             screen: DiffScreen::new(columns, rows),
+            image_protocol: get_capabilities().images,
+            uploaded_kitty: IndexMap::new(),
         }
     }
 
@@ -159,7 +167,26 @@ impl Tui {
         let mut frame = self.compose_frame();
         let cursor = crate::diff::extract_cursor_position(&mut frame, self.rows);
         crate::diff::apply_line_resets(&mut frame);
+        let mut evicted = String::new();
+        if self.image_protocol == Some(ImageProtocol::Kitty)
+            || (self.mode == TuiMode::Fullscreen
+                && frame
+                    .iter()
+                    .any(|line| crate::terminal_image::is_image_line(line)))
+        {
+            let prepared = prepare_kitty_screen(&frame, &mut self.uploaded_kitty);
+            frame = prepared.0;
+            evicted = prepared.1;
+        }
         let mut out = self.screen.render(&frame, force);
+        if !evicted.is_empty() {
+            if let Some(idx) = out.find(crate::diff::SYNC_BEGIN) {
+                let insert_at = idx + crate::diff::SYNC_BEGIN.len();
+                out.insert_str(insert_at, &evicted);
+            } else {
+                out.insert_str(0, &evicted);
+            }
+        }
         if let Some((row, col)) = cursor {
             out.push_str(&crate::diff::hardware_cursor_sequence(row, col));
         }

@@ -183,6 +183,27 @@ pub fn truncate_visible(text: &str, width: usize) -> String {
     out
 }
 
+/// TypeScript `truncateToWidth` with default ellipsis `...`.
+pub fn truncate_to_width(text: &str, max_width: usize, ellipsis: &str) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if visible_width(text) <= max_width {
+        return text.to_string();
+    }
+    let ellipsis_width = visible_width(ellipsis);
+    if ellipsis_width >= max_width {
+        return truncate_visible(ellipsis, max_width);
+    }
+    let target = max_width - ellipsis_width;
+    let prefix = truncate_visible(text, target);
+    if text.contains('\u{1b}') {
+        format!("{prefix}\u{1b}[0m{ellipsis}\u{1b}[0m")
+    } else {
+        format!("{prefix}{ellipsis}")
+    }
+}
+
 /// Composite overlay content into a terminal line at a fixed column (TS `compositeTuiLine`).
 pub fn composite_tui_line(
     base_line: &str,
@@ -266,11 +287,26 @@ impl DiffScreen {
             if force && !self.previous_lines.is_empty() {
                 out.push_str("\u{1b}[H\u{1b}[2J");
             }
-            for (i, line) in new_lines.iter().enumerate() {
+            let mut i = 0;
+            while i < new_lines.len() {
                 if i > 0 {
                     out.push_str("\r\n");
                 }
-                out.push_str(line);
+                let reserved = crate::terminal_image::kitty_image_reserved_rows(
+                    new_lines,
+                    i,
+                    Some(new_lines.len().saturating_sub(1)),
+                );
+                if reserved > 1 && reserved <= self.rows.max(1) {
+                    out.push_str(&crate::terminal_image::emit_reserved_image_block(
+                        &new_lines[i],
+                        reserved,
+                    ));
+                    i += reserved;
+                    continue;
+                }
+                out.push_str(&new_lines[i]);
+                i += 1;
             }
             out.push_str(SYNC_END);
             self.previous_lines = new_lines.to_vec();

@@ -93,6 +93,7 @@ struct ImageState {
     cell: CellDimensions,
     kitty_metadata: IndexMap<u32, RegisteredKittyImageMetadata>,
     kitty_generation: u32,
+    next_image_id: u32,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -113,6 +114,7 @@ impl Default for ImageState {
             },
             kitty_metadata: IndexMap::new(),
             kitty_generation: 0,
+            next_image_id: 1,
         }
     }
 }
@@ -629,6 +631,302 @@ pub fn hyperlink(text: &str, url: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
+pub fn allocate_image_id() -> u32 {
+    let mut state = state();
+    let id = state.next_image_id.max(1);
+    state.next_image_id = id.wrapping_add(1).max(1);
+    id
+}
+
+fn home_dir() -> Option<String> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|value| !value.is_empty()))
+}
+
+fn shorten_image_path(filename: &str) -> String {
+    let Some(home) = home_dir() else {
+        return filename.to_string();
+    };
+    if filename == home || filename.starts_with(&format!("{home}/")) || filename.starts_with(&format!("{home}\\")) {
+        format!("~{}", &filename[home.len()..])
+    } else {
+        filename.to_string()
+    }
+}
+
+fn is_absolute_path(filename: &str) -> bool {
+    filename.starts_with('/') || filename.starts_with('\\') || filename.chars().nth(1) == Some(':')
+}
+
+fn file_url(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    if unified.starts_with('/') {
+        format!("file://{unified}")
+    } else {
+        format!("file:///{unified}")
+    }
+}
+
+pub fn image_fallback(
+    mime_type: &str,
+    dimensions: Option<ImageDimensions>,
+    filename: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(filename) = filename {
+        let display = shorten_image_path(filename);
+        if get_capabilities().hyperlinks && is_absolute_path(filename) {
+            parts.push(hyperlink(&display, &file_url(filename)));
+        } else {
+            parts.push(display);
+        }
+    }
+    parts.push(format!("[{mime_type}]"));
+    if let Some(dimensions) = dimensions {
+        parts.push(format!("{}x{}", dimensions.width_px, dimensions.height_px));
+    }
+    format!("[Image: {}]", parts.join(" "))
+}
+
+fn decode_base64(data: &str) -> Option<Vec<u8>> {
+    STANDARD.decode(data.trim()).ok()
+}
+
+pub fn get_png_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = decode_base64(base64_data)?;
+    if buffer.len() < 24 || buffer[0] != 0x89 || buffer[1] != 0x50 || buffer[2] != 0x4e || buffer[3] != 0x47 {
+        return None;
+    }
+    Some(ImageDimensions {
+        width_px: u32::from_be_bytes(buffer[16..20].try_into().ok()?),
+        height_px: u32::from_be_bytes(buffer[20..24].try_into().ok()?),
+    })
+}
+
+pub fn get_jpeg_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = decode_base64(base64_data)?;
+    if buffer.len() < 2 || buffer[0] != 0xff || buffer[1] != 0xd8 {
+        return None;
+    }
+    let mut offset = 2usize;
+    while offset + 9 < buffer.len() {
+        if buffer[offset] != 0xff {
+            offset += 1;
+            continue;
+        }
+        let marker = buffer[offset + 1];
+        if (0xc0..=0xc2).contains(&marker) {
+            return Some(ImageDimensions {
+                width_px: u16::from_be_bytes(buffer[offset + 7..offset + 9].try_into().ok()?) as u32,
+                height_px: u16::from_be_bytes(buffer[offset + 5..offset + 7].try_into().ok()?) as u32,
+            });
+        }
+        if offset + 3 >= buffer.len() {
+            return None;
+        }
+        let length = u16::from_be_bytes(buffer[offset + 2..offset + 4].try_into().ok()?) as usize;
+        if length < 2 {
+            return None;
+        }
+        offset += 2 + length;
+    }
+    None
+}
+
+pub fn get_gif_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = decode_base64(base64_data)?;
+    if buffer.len() < 10 {
+        return None;
+    }
+    let sig = std::str::from_utf8(&buffer[..6]).ok()?;
+    if sig != "GIF87a" && sig != "GIF89a" {
+        return None;
+    }
+    Some(ImageDimensions {
+        width_px: u16::from_le_bytes(buffer[6..8].try_into().ok()?) as u32,
+        height_px: u16::from_le_bytes(buffer[8..10].try_into().ok()?) as u32,
+    })
+}
+
+pub fn get_webp_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = decode_base64(base64_data)?;
+    if buffer.len() < 30 {
+        return None;
+    }
+    if &buffer[..4] != b"RIFF" || &buffer[8..12] != b"WEBP" {
+        return None;
+    }
+    match &buffer[12..16] {
+        b"VP8 " => Some(ImageDimensions {
+            width_px: (u16::from_le_bytes(buffer[26..28].try_into().ok()?) & 0x3fff) as u32,
+            height_px: (u16::from_le_bytes(buffer[28..30].try_into().ok()?) & 0x3fff) as u32,
+        }),
+        b"VP8L" => {
+            if buffer.len() < 25 {
+                return None;
+            }
+            let bits = u32::from_le_bytes(buffer[21..25].try_into().ok()?);
+            Some(ImageDimensions {
+                width_px: (bits & 0x3fff) + 1,
+                height_px: ((bits >> 14) & 0x3fff) + 1,
+            })
+        }
+        b"VP8X" => Some(ImageDimensions {
+            width_px: u32::from_le_bytes([buffer[24], buffer[25], buffer[26], 0]) + 1,
+            height_px: u32::from_le_bytes([buffer[27], buffer[28], buffer[29], 0]) + 1,
+        }),
+        _ => None,
+    }
+}
+
+pub fn get_image_dimensions(base64_data: &str, mime_type: &str) -> Option<ImageDimensions> {
+    match mime_type {
+        "image/png" => get_png_dimensions(base64_data),
+        "image/jpeg" => get_jpeg_dimensions(base64_data),
+        "image/gif" => get_gif_dimensions(base64_data),
+        "image/webp" => get_webp_dimensions(base64_data),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedKittyImage {
+    pub transmission_generation: u32,
+    pub transmission_bytes: usize,
+    pub estimated_decoded_bytes: u32,
+}
+
+pub const MAX_CACHED_OFFSCREEN_KITTY_IMAGES: usize = 16;
+pub const MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES: u32 = 64 * 1024 * 1024;
+
+pub fn parse_kitty_image_header(line: &str) -> Option<(Vec<u32>, u32)> {
+    let start = line.find(KITTY_PREFIX)?;
+    let params_start = start + KITTY_PREFIX.len();
+    let params_end = line[params_start..].find(';')? + params_start;
+    let mut ids = Vec::new();
+    let mut rows = 1u32;
+    for param in line[params_start..params_end].split(',') {
+        let Some((key, value)) = param.split_once('=') else {
+            continue;
+        };
+        let Ok(number) = value.parse::<u32>() else {
+            continue;
+        };
+        if number == 0 {
+            continue;
+        }
+        if key == "i" {
+            ids.push(number);
+        } else if key == "r" {
+            rows = number;
+        }
+    }
+    Some((ids, rows))
+}
+
+pub fn kitty_image_reserved_rows(lines: &[String], index: usize, max_index: Option<usize>) -> usize {
+    let rows = parse_kitty_image_header(lines.get(index).map(String::as_str).unwrap_or(""))
+        .map(|(_, rows)| rows)
+        .unwrap_or(1) as usize;
+    if rows <= 1 {
+        return 1;
+    }
+    let last = max_index.unwrap_or(lines.len().saturating_sub(1));
+    let max_rows = rows.min(last.saturating_sub(index) + 1).min(lines.len().saturating_sub(index));
+    let mut reserved = 1usize;
+    while reserved < max_rows {
+        let line = lines.get(index + reserved).map(String::as_str).unwrap_or("");
+        if is_image_line(line) || crate::diff::visible_width(line) > 0 {
+            break;
+        }
+        reserved += 1;
+    }
+    reserved
+}
+
+pub fn emit_reserved_image_block(line: &str, reserved_rows: usize) -> String {
+    if reserved_rows <= 1 {
+        return line.to_string();
+    }
+    let offset = reserved_rows - 1;
+    format!(
+        "{}{}{}{}",
+        "\r\n".repeat(offset),
+        format!("\x1b[{offset}A"),
+        line,
+        format!("\x1b[{offset}B")
+    )
+}
+
+pub fn prepare_kitty_screen(
+    screen: &[String],
+    cache: &mut IndexMap<u32, CachedKittyImage>,
+) -> (Vec<String>, String) {
+    let mut visible = std::collections::HashSet::new();
+    let lines: Vec<String> = screen
+        .iter()
+        .map(|line| {
+            let Some(placement) = get_kitty_image_placement(line) else {
+                return line.clone();
+            };
+            visible.insert(placement.image_id);
+            let cached = cache.shift_remove(&placement.image_id);
+            cache.insert(
+                placement.image_id,
+                CachedKittyImage {
+                    transmission_generation: placement.transmission_generation,
+                    transmission_bytes: placement.transmission_bytes,
+                    estimated_decoded_bytes: placement.estimated_decoded_bytes,
+                },
+            );
+            if cached
+                .as_ref()
+                .is_some_and(|cached| cached.transmission_generation == placement.transmission_generation)
+            {
+                placement.replacement_line
+            } else {
+                line.clone()
+            }
+        })
+        .collect();
+
+    let mut offscreen_count = 0usize;
+    let mut offscreen_tx = 0usize;
+    let mut offscreen_decoded = 0u32;
+    for (image_id, cached) in cache.iter() {
+        if visible.contains(image_id) {
+            continue;
+        }
+        offscreen_count += 1;
+        offscreen_tx += cached.transmission_bytes;
+        offscreen_decoded += cached.estimated_decoded_bytes;
+    }
+
+    let mut evicted = String::new();
+    let keys: Vec<u32> = cache.keys().copied().collect();
+    for image_id in keys {
+        if offscreen_count <= MAX_CACHED_OFFSCREEN_KITTY_IMAGES
+            && offscreen_tx <= MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES
+            && offscreen_decoded <= MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES
+        {
+            break;
+        }
+        if visible.contains(&image_id) {
+            continue;
+        }
+        if let Some(cached) = cache.shift_remove(&image_id) {
+            evicted.push_str(&delete_kitty_image(image_id));
+            offscreen_count = offscreen_count.saturating_sub(1);
+            offscreen_tx = offscreen_tx.saturating_sub(cached.transmission_bytes);
+            offscreen_decoded = offscreen_decoded.saturating_sub(cached.estimated_decoded_bytes);
+        }
+    }
+    (lines, evicted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,5 +1209,113 @@ mod tests {
             height_px: 18,
         });
         reset_capabilities_cache();
+    }
+
+    #[test]
+    fn image_fallback_and_png_dimensions_match_typescript() {
+        set_capabilities(TerminalCapabilities {
+            images: None,
+            true_color: false,
+            hyperlinks: false,
+        });
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".into());
+        let abs = format!("{home}/.pi/agent/shot.png");
+        assert_eq!(
+            image_fallback(
+                "image/png",
+                Some(ImageDimensions {
+                    width_px: 1280,
+                    height_px: 720
+                }),
+                Some(&abs)
+            ),
+            "[Image: ~/.pi/agent/shot.png [image/png] 1280x720]"
+        );
+        assert_eq!(
+            image_fallback(
+                "image/png",
+                Some(ImageDimensions {
+                    width_px: 8,
+                    height_px: 6
+                }),
+                None
+            ),
+            "[Image: [image/png] 8x6]"
+        );
+        set_capabilities(TerminalCapabilities {
+            images: None,
+            true_color: false,
+            hyperlinks: true,
+        });
+        let linked = image_fallback(
+            "image/png",
+            Some(ImageDimensions {
+                width_px: 10,
+                height_px: 10,
+            }),
+            Some(&abs),
+        );
+        assert!(linked.contains("\x1b]8;;file://"));
+        assert!(linked.contains(&abs.replace('\\', "/")) || linked.contains(&abs));
+        assert!(linked.contains("~/.pi/agent/shot.png"));
+        assert_eq!(
+            image_fallback(
+                "image/png",
+                Some(ImageDimensions {
+                    width_px: 1,
+                    height_px: 1
+                }),
+                Some("clankolas.png")
+            ),
+            "[Image: clankolas.png [image/png] 1x1]"
+        );
+        let mut png = vec![0u8; 24];
+        png[0] = 0x89;
+        png[1] = b'P';
+        png[2] = b'N';
+        png[3] = b'G';
+        png[16..20].copy_from_slice(&800u32.to_be_bytes());
+        png[20..24].copy_from_slice(&600u32.to_be_bytes());
+        let encoded = STANDARD.encode(&png);
+        assert_eq!(
+            get_png_dimensions(&encoded),
+            Some(ImageDimensions {
+                width_px: 800,
+                height_px: 600
+            })
+        );
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    fn prepare_kitty_screen_reuses_generation_and_evicts() {
+        register_kitty_image_metadata(KittyImageMetadata {
+            image_id: 7,
+            columns: 2,
+            rows: 2,
+            width_px: 10,
+            height_px: 10,
+        });
+        let line = encode_kitty("AAAA", Some(2), Some(2), Some(7), Some(false));
+        let mut cache = IndexMap::new();
+        let (first, evicted) = prepare_kitty_screen(&[line.clone()], &mut cache);
+        assert!(evicted.is_empty());
+        assert_eq!(first[0], line);
+        let (second, _) = prepare_kitty_screen(&[line.clone()], &mut cache);
+        let placement = get_kitty_image_placement(&line).expect("placement");
+        assert_eq!(second[0], placement.replacement_line);
+        for id in 100..120 {
+            cache.insert(
+                id,
+                CachedKittyImage {
+                    transmission_generation: 1,
+                    transmission_bytes: 1,
+                    estimated_decoded_bytes: 1,
+                },
+            );
+        }
+        let (_, evicted) = prepare_kitty_screen(&[line], &mut cache);
+        assert!(evicted.contains("d=I,i=100"));
+        assert!(cache.len() <= MAX_CACHED_OFFSCREEN_KITTY_IMAGES + 1);
     }
 }
