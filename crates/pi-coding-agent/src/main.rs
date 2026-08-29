@@ -27,7 +27,7 @@ use args::{normalize_session_name, parse_args, print_help, Args, ListModels, Mod
 use commands::dispatch_subcommand;
 use event_bus::EventBus;
 use interactive::{run_interactive, InteractiveMode};
-use pi_agent::context::{load_context_files, render_system_prompt};
+use pi_agent::context::{load_project_context_files, render_system_prompt};
 use pi_agent::{
     discover_default_skill_dirs, load_skills, AgentMessage, FollowUpQueue, SteerQueue,
     ThinkingLevel, ToolRegistry,
@@ -188,12 +188,16 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
     }
 
     let app_mode = resolve_mode(&parsed, stdin_tty, stdout_tty);
-    let context = load_context_files(&cwd, parsed.no_context_files);
-    let system_prompt = render_system_prompt(
+    let context =
+        load_project_context_files(&cwd, Some(&commands::agent_dir()), parsed.no_context_files);
+    let (system_source, append_sources) = settings::resolve_startup_prompts(
+        &cwd,
+        &commands::agent_dir(),
+        project_trusted,
         parsed.system_prompt.as_deref(),
         &parsed.append_system_prompt,
-        &context,
     );
+    let system_prompt = render_system_prompt(system_source.as_deref(), &append_sources, &context);
     let mut skill_paths = if project_trusted {
         discover_default_skill_dirs(&cwd, &commands::agent_dir())
     } else {

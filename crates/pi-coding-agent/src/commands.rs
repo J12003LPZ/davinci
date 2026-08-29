@@ -1019,6 +1019,53 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_files_match_typescript_discovery() {
+        with_agent_dir(|| {
+            let cwd = std::env::current_dir().unwrap();
+            let agent = agent_dir();
+            std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+            std::fs::write(agent.join("SYSTEM.md"), "global system").unwrap();
+            std::fs::write(agent.join("APPEND_SYSTEM.md"), "global append").unwrap();
+            let (system, append) =
+                crate::settings::resolve_startup_prompts(&cwd, &agent, false, None, &[]);
+            assert!(system.as_deref().unwrap().ends_with("SYSTEM.md"));
+            assert_eq!(
+                pi_agent::resolve_prompt_input(system.as_deref().unwrap()),
+                "global system"
+            );
+            assert_eq!(pi_agent::resolve_prompt_input(&append[0]), "global append");
+
+            std::fs::write(cwd.join(".pi").join("SYSTEM.md"), "project system").unwrap();
+            std::fs::write(cwd.join(".pi").join("APPEND_SYSTEM.md"), "project append").unwrap();
+            let untrusted =
+                crate::settings::resolve_startup_prompts(&cwd, &agent, false, None, &[]);
+            assert_eq!(
+                pi_agent::resolve_prompt_input(untrusted.0.as_deref().unwrap()),
+                "global system"
+            );
+            let trusted = crate::settings::resolve_startup_prompts(&cwd, &agent, true, None, &[]);
+            assert_eq!(
+                pi_agent::resolve_prompt_input(trusted.0.as_deref().unwrap()),
+                "project system"
+            );
+            assert_eq!(
+                pi_agent::resolve_prompt_input(&trusted.1[0]),
+                "project append"
+            );
+
+            let cli = crate::settings::resolve_startup_prompts(
+                &cwd,
+                &agent,
+                true,
+                Some("cli system"),
+                &["cli append".into()],
+            );
+            assert_eq!(cli.0.as_deref(), Some("cli system"));
+            assert_eq!(cli.1, vec!["cli append".to_string()]);
+        });
+    }
+
+    #[test]
     fn list_prompts_project_trust_selector_like_typescript() {
         with_agent_dir(|| {
             let cwd = std::env::current_dir().unwrap();

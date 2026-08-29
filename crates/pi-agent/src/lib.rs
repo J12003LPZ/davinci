@@ -11,6 +11,9 @@ pub mod templates;
 pub mod tools;
 
 pub use compaction::compact_messages;
+pub use context::{
+    load_context_files, load_project_context_files, render_system_prompt, resolve_prompt_input,
+};
 pub use events::{AgentEvent, AgentMessage};
 pub use loop_::{run_agent, AgentConfig, AgentError};
 pub use permission::{

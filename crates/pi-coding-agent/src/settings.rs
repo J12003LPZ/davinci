@@ -427,3 +427,50 @@ pub fn set_trust(agent_dir: &Path, cwd: &Path, decision: Option<bool>) {
         ),
     );
 }
+
+pub fn discover_system_prompt_file(
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+) -> Option<PathBuf> {
+    let project = cwd.join(".pi").join("SYSTEM.md");
+    if project_trusted && project.is_file() {
+        return Some(project);
+    }
+    let global = agent_dir.join("SYSTEM.md");
+    global.is_file().then_some(global)
+}
+
+pub fn discover_append_system_prompt_file(
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+) -> Option<PathBuf> {
+    let project = cwd.join(".pi").join("APPEND_SYSTEM.md");
+    if project_trusted && project.is_file() {
+        return Some(project);
+    }
+    let global = agent_dir.join("APPEND_SYSTEM.md");
+    global.is_file().then_some(global)
+}
+
+pub fn resolve_startup_prompts(
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+    cli_system: Option<&str>,
+    cli_append: &[String],
+) -> (Option<String>, Vec<String>) {
+    let system = cli_system.map(str::to_string).or_else(|| {
+        discover_system_prompt_file(cwd, agent_dir, project_trusted)
+            .map(|path| path.to_string_lossy().into_owned())
+    });
+    let append = if cli_append.is_empty() {
+        discover_append_system_prompt_file(cwd, agent_dir, project_trusted)
+            .map(|path| vec![path.to_string_lossy().into_owned()])
+            .unwrap_or_default()
+    } else {
+        cli_append.to_vec()
+    };
+    (system, append)
+}
