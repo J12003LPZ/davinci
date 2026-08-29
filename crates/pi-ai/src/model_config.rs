@@ -183,9 +183,11 @@ pub fn apply_config_auth(
 }
 
 fn parse_models_json(value: &Value) -> Result<BTreeMap<String, ModelsJsonProvider>, String> {
-    let Some(providers) = value.get("providers").and_then(Value::as_object) else {
-        return Err("  - providers: Expected object".into());
-    };
+    validate_models_config(value)?;
+    let providers = value
+        .get("providers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "  - providers: Expected object".to_string())?;
     let mut out = BTreeMap::new();
     let mut errors = Vec::new();
     for (id, provider) in providers {
@@ -200,6 +202,233 @@ fn parse_models_json(value: &Value) -> Result<BTreeMap<String, ModelsJsonProvide
         Ok(out)
     } else {
         Err(errors.join("\n"))
+    }
+}
+
+fn validate_models_config(value: &Value) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let Some(root) = value.as_object() else {
+        return Err("  - root: Expected object".into());
+    };
+    match root.get("providers") {
+        None => errors.push("  - providers: Expected required property".into()),
+        Some(providers) => match providers.as_object() {
+            None => errors.push("  - providers: Expected object".into()),
+            Some(map) => {
+                for (id, provider) in map {
+                    validate_provider_schema(&format!("providers.{id}"), provider, &mut errors);
+                }
+            }
+        },
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn validate_provider_schema(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    expect_optional_min_string(&format!("{path}.name"), object.get("name"), errors);
+    expect_optional_min_string(&format!("{path}.baseUrl"), object.get("baseUrl"), errors);
+    expect_optional_min_string(&format!("{path}.apiKey"), object.get("apiKey"), errors);
+    expect_optional_min_string(&format!("{path}.api"), object.get("api"), errors);
+    match object.get("oauth") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(value)) if value == "radius" => {}
+        Some(_) => errors.push(format!("  - {path}.oauth: Expected const value")),
+    }
+    match object.get("authHeader") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(_)) => {}
+        Some(_) => errors.push(format!("  - {path}.authHeader: Expected boolean")),
+    }
+    validate_string_record(&format!("{path}.headers"), object.get("headers"), errors);
+    if let Some(compat) = object.get("compat") {
+        if !compat.is_null() && !compat.is_object() {
+            errors.push(format!("  - {path}.compat: Expected union value"));
+        }
+    }
+    match object.get("models") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                validate_model_definition(&format!("{path}.models.{index}"), item, errors);
+            }
+        }
+        Some(_) => errors.push(format!("  - {path}.models: Expected array")),
+    }
+    match object.get("modelOverrides") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            for (id, overlay) in map {
+                validate_model_override(&format!("{path}.modelOverrides.{id}"), overlay, errors);
+            }
+        }
+        Some(_) => errors.push(format!("  - {path}.modelOverrides: Expected object")),
+    }
+}
+
+fn validate_model_definition(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    match object.get("id") {
+        None => errors.push(format!("  - {path}.id: Expected required property")),
+        Some(Value::String(id)) if id.is_empty() => {
+            errors.push(format!(
+                "  - {path}.id: Expected string length greater or equal to 1"
+            ));
+        }
+        Some(Value::String(_)) => {}
+        Some(_) => errors.push(format!("  - {path}.id: Expected string")),
+    }
+    expect_optional_min_string(&format!("{path}.name"), object.get("name"), errors);
+    expect_optional_min_string(&format!("{path}.api"), object.get("api"), errors);
+    expect_optional_min_string(&format!("{path}.baseUrl"), object.get("baseUrl"), errors);
+    expect_optional_bool(
+        &format!("{path}.reasoning"),
+        object.get("reasoning"),
+        errors,
+    );
+    expect_optional_number(
+        &format!("{path}.contextWindow"),
+        object.get("contextWindow"),
+        errors,
+    );
+    expect_optional_number(
+        &format!("{path}.maxTokens"),
+        object.get("maxTokens"),
+        errors,
+    );
+    validate_input_array(&format!("{path}.input"), object.get("input"), errors);
+    validate_model_cost(&format!("{path}.cost"), object.get("cost"), true, errors);
+    validate_string_record(&format!("{path}.headers"), object.get("headers"), errors);
+    if let Some(compat) = object.get("compat") {
+        if !compat.is_null() && !compat.is_object() {
+            errors.push(format!("  - {path}.compat: Expected union value"));
+        }
+    }
+}
+
+fn validate_model_override(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    expect_optional_min_string(&format!("{path}.name"), object.get("name"), errors);
+    expect_optional_bool(
+        &format!("{path}.reasoning"),
+        object.get("reasoning"),
+        errors,
+    );
+    expect_optional_number(
+        &format!("{path}.contextWindow"),
+        object.get("contextWindow"),
+        errors,
+    );
+    expect_optional_number(
+        &format!("{path}.maxTokens"),
+        object.get("maxTokens"),
+        errors,
+    );
+    validate_input_array(&format!("{path}.input"), object.get("input"), errors);
+    validate_model_cost(&format!("{path}.cost"), object.get("cost"), false, errors);
+    validate_string_record(&format!("{path}.headers"), object.get("headers"), errors);
+}
+
+fn validate_model_cost(
+    path: &str,
+    value: Option<&Value>,
+    required_rates: bool,
+    errors: &mut Vec<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    for key in ["input", "output", "cacheRead", "cacheWrite"] {
+        match object.get(key) {
+            None if required_rates => {
+                errors.push(format!("  - {path}.{key}: Expected required property"));
+            }
+            None => {}
+            Some(item) if item.is_number() => {}
+            Some(_) => errors.push(format!("  - {path}.{key}: Expected number")),
+        }
+    }
+}
+
+fn validate_input_array(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Some(items) = value.as_array() else {
+        errors.push(format!("  - {path}: Expected array"));
+        return;
+    };
+    for (index, item) in items.iter().enumerate() {
+        match item.as_str() {
+            Some("text") | Some("image") => {}
+            _ => errors.push(format!("  - {path}.{index}: Expected union value")),
+        }
+    }
+}
+
+fn validate_string_record(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            for (key, item) in map {
+                if !item.is_string() {
+                    errors.push(format!("  - {path}.{key}: Expected string"));
+                }
+            }
+        }
+        Some(_) => errors.push(format!("  - {path}: Expected object")),
+    }
+}
+
+fn expect_optional_min_string(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) if text.is_empty() => {
+            errors.push(format!(
+                "  - {path}: Expected string length greater or equal to 1"
+            ));
+        }
+        Some(Value::String(_)) => {}
+        Some(_) => errors.push(format!("  - {path}: Expected string")),
+    }
+}
+
+fn expect_optional_bool(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(_)) => {}
+        Some(_) => errors.push(format!("  - {path}: Expected boolean")),
+    }
+}
+
+fn expect_optional_number(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(item) if item.is_number() => {}
+        Some(_) => errors.push(format!("  - {path}: Expected number")),
     }
 }
 
@@ -664,5 +893,90 @@ mod tests {
             NO_MODELS_AVAILABLE,
             "No models available. Check your installation or add models to models.json."
         );
+    }
+
+    #[test]
+    fn typebox_keyword_error_paths() {
+        let dir = tempdir().unwrap();
+        let write = |name: &str, raw: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, raw).unwrap();
+            ModelConfig::load(&path)
+        };
+
+        let missing = write("missing.json", r#"{}"#);
+        let missing_error = missing.error().unwrap();
+        assert!(missing_error.contains("  - providers: Expected required property"));
+
+        let array = write("array.json", r#"{"providers":[]}"#);
+        assert!(array
+            .error()
+            .unwrap()
+            .contains("  - providers: Expected object"));
+
+        let required_id = write(
+            "id.json",
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","api":"openai-completions","models":[{}]}}}"#,
+        );
+        assert!(required_id
+            .error()
+            .unwrap()
+            .contains("  - providers.local.models.0.id: Expected required property"));
+
+        let empty_name = write(
+            "name.json",
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","api":"openai-completions","models":[{"id":"demo","name":""}]}}}"#,
+        );
+        assert!(empty_name.error().unwrap().contains(
+            "  - providers.local.models.0.name: Expected string length greater or equal to 1"
+        ));
+
+        let oauth = write(
+            "oauth.json",
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","oauth":"github"}}}"#,
+        );
+        assert!(oauth
+            .error()
+            .unwrap()
+            .contains("  - providers.local.oauth: Expected const value"));
+
+        let cost = write(
+            "cost.json",
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","api":"openai-completions","models":[{"id":"demo","cost":"free"}]}}}"#,
+        );
+        assert!(cost
+            .error()
+            .unwrap()
+            .contains("  - providers.local.models.0.cost: Expected object"));
+
+        let cost_field = write(
+            "cost-field.json",
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","api":"openai-completions","models":[{"id":"demo","cost":{"input":"x","output":1,"cacheRead":0,"cacheWrite":0}}]}}}"#,
+        );
+        assert!(cost_field
+            .error()
+            .unwrap()
+            .contains("  - providers.local.models.0.cost.input: Expected number"));
+
+        let input = write(
+            "input.json",
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","api":"openai-completions","models":[{"id":"demo","input":["video"]}]}}}"#,
+        );
+        assert!(input
+            .error()
+            .unwrap()
+            .contains("  - providers.local.models.0.input.0: Expected union value"));
+
+        let collected = write(
+            "multi.json",
+            r#"{"providers":{"local":{"apiKey":"","oauth":"github","models":[{"id":""}]}}}"#,
+        );
+        let collected_error = collected.error().unwrap();
+        assert!(collected_error
+            .contains("  - providers.local.apiKey: Expected string length greater or equal to 1"));
+        assert!(collected_error.contains("  - providers.local.oauth: Expected const value"));
+        assert!(collected_error.contains(
+            "  - providers.local.models.0.id: Expected string length greater or equal to 1"
+        ));
     }
 }

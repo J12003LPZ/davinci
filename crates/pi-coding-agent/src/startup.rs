@@ -154,8 +154,10 @@ pub fn get_latest_pi_release(current_version: &str) -> Option<LatestPiRelease> {
 }
 
 pub fn check_for_package_updates(settings: &Settings) -> Vec<String> {
-    let _ = settings;
-    if std::env::var("PI_OFFLINE").is_ok() {
+    if matches!(
+        std::env::var("PI_OFFLINE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) {
         return Vec::new();
     }
     if let Ok(raw) = std::env::var("PI_PACKAGE_UPDATES_REPLY") {
@@ -166,7 +168,9 @@ pub fn check_for_package_updates(settings: &Settings) -> Vec<String> {
             .map(str::to_string)
             .collect();
     }
-    Vec::new()
+    let agent_dir = pi_session::default_agent_dir();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    crate::packages::check_for_available_updates(settings, &agent_dir, &cwd)
 }
 
 pub fn check_tmux_keyboard_setup() -> Option<String> {
@@ -295,5 +299,45 @@ mod tests {
         assert!(formatted
             .iter()
             .any(|(_, line)| line.contains("pi update --extensions")));
+    }
+
+    #[test]
+    fn live_npm_view_fixture_detects_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let npm = dir
+            .path()
+            .join("agent")
+            .join("npm")
+            .join("node_modules")
+            .join("todo");
+        std::fs::create_dir_all(&npm).unwrap();
+        std::fs::write(
+            npm.join("package.json"),
+            r#"{"name":"todo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        std::env::set_var("PI_NPM_VIEW_REPLY", "\"2.0.0\"");
+        std::env::remove_var("PI_PACKAGE_UPDATES_REPLY");
+        std::env::remove_var("PI_OFFLINE");
+        let settings = Settings {
+            packages: vec!["npm:todo".into()],
+            ..Settings::default()
+        };
+        let updates = crate::packages::check_for_available_updates(
+            &settings,
+            &dir.path().join("agent"),
+            dir.path(),
+        );
+        assert_eq!(updates, vec!["todo".to_string()]);
+        std::env::set_var("PI_NPM_VIEW_REPLY", "\"1.0.0\"");
+        let none = crate::packages::check_for_available_updates(
+            &settings,
+            &dir.path().join("agent"),
+            dir.path(),
+        );
+        assert!(none.is_empty());
+        std::env::remove_var("PI_NPM_VIEW_REPLY");
+        std::env::remove_var("PI_CODING_AGENT_DIR");
     }
 }

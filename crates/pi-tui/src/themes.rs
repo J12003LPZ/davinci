@@ -8,6 +8,17 @@ pub struct Theme {
     pub accent: String,
 }
 
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            name: "dark".into(),
+            background: "#1e1e1e".into(),
+            foreground: "#e6e6e6".into(),
+            accent: "#7aa2f7".into(),
+        }
+    }
+}
+
 impl Theme {
     pub fn fg(&self, role: &str, text: &str) -> String {
         match role {

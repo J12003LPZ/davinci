@@ -4,6 +4,7 @@ mod auth;
 mod catalog;
 mod codex;
 mod model_config;
+mod model_runtime;
 mod models_store;
 mod oauth;
 mod oauth_callback;
@@ -30,6 +31,10 @@ pub use codex::{
 pub use model_config::{
     apply_config_auth, apply_models_config, load_models_json, merge_headers, models_json_path,
     ModelConfig, ModelsJsonProvider, NO_MODELS_AVAILABLE,
+};
+pub use model_runtime::{
+    empty_catalog_error, format_no_models_available_message, snapshot_availability, AuthCheck,
+    ModelRuntimeSnapshot,
 };
 pub use models_store::{
     catalog_url, load_models_store, merge_models, models_store_path, now_ms, parse_remote_catalog,

@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (models.json ModelConfig, ModelSelector search/scope, startup version/package/tmux notices, JS overlay compositing + persistent tick host). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (live npm/git package update probe, TypeBox models.json keyword paths, ModelSelector theme roles, overlay `visible()` callback, ModelRuntime availability snapshot). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -34,6 +34,11 @@ Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 - **ModelSelectorComponent:** search via `getModelSelectorSearchText` (bare id not first), current/default/provider sort, Tab `Scope: all | scoped`, `tab scope (all/scoped)`, `Only showing models from configured providers. Use /login to add providers.`, `→ id [provider] · default ✓`, `No matching models`, `Model Name:`, `(i/n)`, `Enter to select · Ctrl+S to set as default · Esc to cancel`. Ctrl+S persists `defaultProvider`/`defaultModel`.
 - **Startup notices:** `Update Available` / `New version {v} is available. Run pi update` / `Changelog: https://pi.dev/changelog` (`PI_LATEST_VERSION_REPLY`, `PI_SKIP_VERSION_CHECK`, `PI_OFFLINE`); `Package Updates Available` / `pi update --extensions` (`PI_PACKAGE_UPDATES_REPLY`); tmux `extended-keys` / `extended-keys-format` warnings (`PI_TMUX_EXTENDED_KEYS*`); `models.json error:` and `Migrated credentials to auth.json:`.
 - **JS overlay compositing:** `compositeTuiLine` (CJK-boundary fixtures), 9-point anchors / `%` / margin / offset, `ui.custom({ overlay: true, overlayOptions })` composites onto chrome instead of replacing the editor. Persistent Node `--persistent` host keeps `setInterval` / `tick()` state across `customTick`/`customInput`.
+- **Live package update probe:** `checkForAvailableUpdates` walks project + user `packages`, skips local and exact npm pins, reads installed `package.json` / `git rev-parse HEAD`, compares `npm view … version --json` and `git ls-remote origin HEAD`. Fixtures: `PI_NPM_VIEW_REPLY`, `PI_GIT_LS_REMOTE_REPLY`, `PI_GIT_REV_PARSE_REPLY` (plus existing `PI_PACKAGE_UPDATES_REPLY`). Tests never hit the network.
+- **TypeBox models.json keyword paths:** collected errors use TS `formatValidationPath` + messages (`Expected required property`, `Expected object`/`string`/`number`/`boolean`/`array`, `Expected string length greater or equal to 1`, `Expected const value`, `Expected union value`) on providers, models, overrides, cost, input, oauth, headers.
+- **ModelSelector theme roles:** `theme.fg` warning/accent/muted/success/error/dim on hint, scope tabs, selected `→ id`, provider badge, default, check, empty/detail/scroll/footer.
+- **Overlay `visible(termWidth, termHeight)`:** JS host evaluates `overlayOptions.visible` each tick; Rust `OverlayOptions.visible` skips compositing when `false`; `nonCapturing` is parsed.
+- **ModelRuntime snapshot:** `all` / `available` / `configuredProviders` / `storedProviders` / `auth` / `getError()` (`Provider "id": …`, `Availability refresh: …`). `/model`, `--list-models`, print lookup, and catalog refresh use **available** (auth + models.json `apiKey` + env). Empty available with a nonempty catalog prints the TS login-help form.
 - **pi-parity**: six required corpora + optional `--parallel-run` / `--diff-jsonl`.
 
 Gates on this slice: `cargo test --workspace`, `cargo fmt --check`, `clippy --workspace --all-targets -- -D warnings` green on 1.83.
@@ -48,10 +53,10 @@ Closed this slice: `/llama` live SSE + progress overlay + Retry/Close, JS `Conta
 
 Closed this slice: `models.json` ModelConfig + apply/overrides/auth headers + `/model` hot reload, full ModelSelector search/scope/default chrome, startup version/package/tmux notice strings, `compositeTuiLine` + overlay anchors, persistent JS custom-UI host for live ticks.
 
+Closed this slice: live npm/git `checkForAvailableUpdates`, TypeBox models.json keyword error paths, ModelSelector `theme.fg` roles, overlay `visible(termWidth, termHeight)`, ModelRuntime availability snapshot filtering `/model` and `--list-models`.
+
 Still not product-equivalent:
 
-- Live npm `checkForAvailableUpdates` registry probe (UI + `PI_PACKAGE_UPDATES_REPLY` are wired; production does not query npm)
-- Full TypeBox `models.json` keyword error paths (structural/compose errors are locked; not every TypeBox instancePath)
-- ModelSelector ANSI theme roles (`theme.fg` accent/muted/success) — copy and key behavior match
-- Overlay `visible(termWidth, termHeight)` JS callback
-- ModelRuntime availability snapshot (configured/stored provider sets + auth map) beyond merged model lists
+- `--list-models` still prints `provider/id  name` rather than the TS column table (`provider`, `model`, `context`, `max-out`, `thinking`, `images`)
+- TypeBox `compat` nested union/const paths (`thinkingFormat`, routing, `cacheControlFormat`) are typed as object-or-union, not every nested instancePath
+- Live `getAvailable()` per-provider network auth probes (snapshot uses storage + env + models.json keys only)

@@ -65,6 +65,8 @@ pub struct OverlayOptions {
     pub row: Option<SizeValue>,
     pub col: Option<SizeValue>,
     pub margin: OverlayMargin,
+    pub visible: Option<bool>,
+    pub non_capturing: bool,
 }
 
 impl Default for OverlayOptions {
@@ -84,6 +86,8 @@ impl Default for OverlayOptions {
                 bottom: 0,
                 left: 0,
             },
+            visible: None,
+            non_capturing: false,
         }
     }
 }
@@ -175,6 +179,11 @@ pub fn overlay_options_from_json(value: &serde_json::Value) -> OverlayOptions {
         row: value.get("row").and_then(SizeValue::parse),
         col: value.get("col").and_then(SizeValue::parse),
         margin: parse_margin(value.get("margin")),
+        visible: value.get("visible").and_then(serde_json::Value::as_bool),
+        non_capturing: value
+            .get("nonCapturing")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -284,6 +293,9 @@ pub fn composite_overlay_lines(
     term_width: usize,
     term_height: usize,
 ) -> Vec<String> {
+    if options.visible == Some(false) {
+        return base.to_vec();
+    }
     let layout = resolve_overlay_layout(options, overlay.len(), term_width, term_height);
     let overlay_lines: Vec<String> = if let Some(max_height) = layout.max_height {
         overlay.iter().take(max_height).cloned().collect()
@@ -555,5 +567,23 @@ mod tests {
         let layout = resolve_overlay_layout(&options, 2, 40, 10);
         assert_eq!(layout.col, 30);
         assert_eq!(layout.row, 0);
+    }
+
+    #[test]
+    fn visible_false_skips_composite() {
+        let options = OverlayOptions {
+            visible: Some(false),
+            ..OverlayOptions::default()
+        };
+        let base = vec!["hello".into()];
+        let out = composite_overlay_lines(&base, &["OVER".into()], &options, 80, 24);
+        assert_eq!(out, base);
+        let parsed = overlay_options_from_json(&serde_json::json!({
+            "visible": false,
+            "nonCapturing": true,
+            "anchor": "top-left"
+        }));
+        assert_eq!(parsed.visible, Some(false));
+        assert!(parsed.non_capturing);
     }
 }

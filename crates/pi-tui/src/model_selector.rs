@@ -2,6 +2,7 @@
 
 use crate::fuzzy::fuzzy_match;
 use crate::render::Component;
+use crate::themes::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSelectorItem {
@@ -49,6 +50,7 @@ pub struct ModelSelector {
     pub error_message: Option<String>,
     pub refresh_status: Option<String>,
     pub refresh_status_success: bool,
+    theme: Theme,
     all_models: Vec<ModelSelectorItem>,
     scoped_models: Vec<ModelSelectorItem>,
 }
@@ -74,6 +76,7 @@ impl ModelSelector {
             error_message: None,
             refresh_status: Some("Refreshing model catalogs…".into()),
             refresh_status_success: false,
+            theme: Theme::default(),
             all_models: models,
             scoped_models,
         };
@@ -98,6 +101,11 @@ impl ModelSelector {
         }
         self.sort_models();
         self.filter_models();
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     pub fn set_refresh_status(&mut self, message: Option<String>, success: bool) {
@@ -257,13 +265,32 @@ impl Component for ModelSelector {
     fn render(&self, width: usize) -> Vec<String> {
         let mut lines = vec![String::new()];
         if self.scoped_models.is_empty() {
-            lines.push(
-                "Only showing models from configured providers. Use /login to add providers."
-                    .into(),
-            );
+            lines.push(self.theme.fg(
+                "warning",
+                "Only showing models from configured providers. Use /login to add providers.",
+            ));
         } else {
-            lines.push("Scope: all | scoped".into());
-            lines.push("tab scope (all/scoped)".into());
+            let all = if self.scope == ModelScope::All {
+                self.theme.fg("accent", "all")
+            } else {
+                self.theme.fg("muted", "all")
+            };
+            let scoped = if self.scope == ModelScope::Scoped {
+                self.theme.fg("accent", "scoped")
+            } else {
+                self.theme.fg("muted", "scoped")
+            };
+            lines.push(format!(
+                "{}{}{}{}",
+                self.theme.fg("muted", "Scope: "),
+                all,
+                self.theme.fg("muted", " | "),
+                scoped
+            ));
+            lines.push(format!(
+                "tab scope{}",
+                self.theme.fg("muted", " (all/scoped)")
+            ));
         }
         lines.push(String::new());
         lines.push(format!("> {}", self.search));
@@ -281,40 +308,66 @@ impl Component for ModelSelector {
         let end = (start + max_visible).min(filtered.len());
         for (offset, item) in filtered[start..end].iter().enumerate() {
             let index = start + offset;
-            let prefix = if index == self.selected { "→ " } else { "  " };
-            let default_badge = if self.is_default(item) {
-                " · default"
+            let selected = index == self.selected;
+            let prefix = if selected {
+                self.theme.fg("accent", "→ ")
             } else {
-                ""
+                "  ".into()
             };
-            let check = if self.is_current(item) { " ✓" } else { "" };
+            let id = if selected {
+                self.theme.fg("accent", &item.id)
+            } else {
+                item.id.clone()
+            };
+            let provider_badge = self.theme.fg("muted", &format!("[{}]", item.provider));
+            let default_badge = if self.is_default(item) {
+                self.theme.fg("muted", " · default")
+            } else {
+                String::new()
+            };
+            let check = if self.is_current(item) {
+                self.theme.fg("success", " ✓")
+            } else {
+                String::new()
+            };
             lines.push(truncate(
-                &format!(
-                    "{prefix}{} [{}]{default_badge}{check}",
-                    item.id, item.provider
-                ),
+                &format!("{prefix}{id} {provider_badge}{default_badge}{check}"),
                 width,
             ));
         }
         if start > 0 || end < filtered.len() {
-            lines.push(format!("  ({}/{})", self.selected + 1, filtered.len()));
+            lines.push(self.theme.fg(
+                "muted",
+                &format!("  ({}/{})", self.selected + 1, filtered.len()),
+            ));
         }
         if let Some(error) = &self.error_message {
             for line in error.split('\n') {
-                lines.push(line.to_string());
+                lines.push(self.theme.fg("error", line));
             }
         } else if filtered.is_empty() {
-            lines.push("  No matching models".into());
+            lines.push(self.theme.fg("muted", "  No matching models"));
         } else if let Some(selected) = filtered.get(self.selected) {
             lines.push(String::new());
-            lines.push(format!("  Model Name: {}", selected.name));
+            lines.push(
+                self.theme
+                    .fg("muted", &format!("  Model Name: {}", selected.name)),
+            );
         }
         if let Some(status) = &self.refresh_status {
             lines.push(String::new());
-            lines.push(format!("  {status}"));
+            let role = if self.refresh_status_success {
+                "success"
+            } else {
+                "muted"
+            };
+            lines.push(self.theme.fg(role, &format!("  {status}")));
         }
         lines.push(String::new());
-        lines.push("  Enter to select · Ctrl+S to set as default · Esc to cancel".into());
+        lines.push(self.theme.fg(
+            "dim",
+            "  Enter to select · Ctrl+S to set as default · Esc to cancel",
+        ));
         lines
     }
 
@@ -426,6 +479,10 @@ mod tests {
             .iter()
             .any(|line| line.contains("Enter to select · Ctrl+S to set as default")));
         assert!(lines.iter().any(|line| line.contains("Model Name:")));
+        assert!(lines.iter().any(|line| line.contains("\x1b[33m")));
+        assert!(lines.iter().any(|line| line.contains("\x1b[36m")));
+        assert!(lines.iter().any(|line| line.contains("\x1b[32m")));
+        assert!(lines.iter().any(|line| line.contains("\x1b[2m")));
     }
 
     #[test]

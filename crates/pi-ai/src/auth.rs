@@ -73,6 +73,14 @@ impl AuthStorage {
         Self::open(&default_auth_path())
     }
 
+    pub fn in_memory() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!("pi-auth-memory-{}.json", std::process::id())),
+            data: HashMap::new(),
+            runtime_overrides: HashMap::new(),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self, AuthStorageError> {
         let data = if path.exists() {
             let raw =

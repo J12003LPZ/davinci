@@ -578,6 +578,291 @@ fn install_git_live(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> Re
     Ok(())
 }
 
+pub fn check_for_available_updates(
+    settings: &Settings,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Vec<String> {
+    let mut sources = Vec::new();
+    let project = load_settings(&cwd.join(".pi"));
+    for pkg in &project.packages {
+        sources.push((pkg.clone(), true));
+    }
+    for pkg in &settings.packages {
+        sources.push((pkg.clone(), false));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut updates = Vec::new();
+    for (source, local) in sources {
+        let identity = package_identity(&source);
+        if !seen.insert(identity) {
+            continue;
+        }
+        if let Some(name) = source_has_update(&source, local, agent_dir, cwd) {
+            updates.push(name);
+        }
+    }
+    updates
+}
+
+fn package_identity(source: &str) -> String {
+    match parse_package_source(source) {
+        ParsedSource::Npm { name, .. } => format!("npm:{name}"),
+        ParsedSource::Git(url) => format!("git:{}", git_host_path(&url)),
+        ParsedSource::Local(path) => format!("local:{path}"),
+    }
+}
+
+fn git_host_path(url: &str) -> String {
+    let (url, _) = parse_git_source(url);
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("ssh://")
+        .trim_start_matches("git@")
+        .replace(':', "/")
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+fn npm_spec_version(spec: &str, name: &str) -> Option<String> {
+    let rest = spec.strip_prefix(name)?.strip_prefix('@')?;
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
+}
+
+fn is_exact_npm_version(version: &str) -> bool {
+    let trimmed = version.trim().trim_start_matches('v');
+    if trimmed.is_empty()
+        || trimmed.contains('^')
+        || trimmed.contains('~')
+        || trimmed.contains('*')
+        || trimmed.contains('x')
+        || trimmed.contains('X')
+        || trimmed.contains(' ')
+    {
+        return false;
+    }
+    let mut parts = trimmed.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let patch = parts.next().and_then(|part| {
+        part.chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()
+    });
+    major.is_some() && minor.is_some() && patch.is_some() && parts.next().is_none()
+}
+
+fn source_has_update(source: &str, local: bool, agent_dir: &Path, cwd: &Path) -> Option<String> {
+    match parse_package_source(source) {
+        ParsedSource::Local(_) => None,
+        ParsedSource::Npm { spec, name } => {
+            if npm_spec_version(&spec, &name)
+                .as_deref()
+                .is_some_and(is_exact_npm_version)
+            {
+                return None;
+            }
+            let installed = npm_install_root(agent_dir, local, cwd)
+                .join("node_modules")
+                .join(&name);
+            if !installed.exists() {
+                return None;
+            }
+            if npm_has_available_update(&spec, &name, &installed, agent_dir, cwd) {
+                Some(name)
+            } else {
+                None
+            }
+        }
+        ParsedSource::Git(url) => {
+            let installed = git_checkout_path(agent_dir, local, cwd, &url);
+            if !installed.exists() {
+                return None;
+            }
+            if git_has_available_update(&installed) {
+                Some(git_host_path(&url))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn npm_has_available_update(
+    spec: &str,
+    name: &str,
+    installed: &Path,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> bool {
+    let installed_version = installed_npm_version(installed);
+    let Some(installed_version) = installed_version else {
+        return false;
+    };
+    let view_spec = if npm_spec_version(spec, name).is_some() {
+        spec
+    } else {
+        name
+    };
+    let Some(latest) = latest_npm_version(view_spec, agent_dir, cwd) else {
+        return false;
+    };
+    is_newer_installed_version(&latest, &installed_version)
+}
+
+fn is_newer_installed_version(candidate: &str, current: &str) -> bool {
+    match (
+        parse_install_semver(candidate),
+        parse_install_semver(current),
+    ) {
+        (Some(left), Some(right)) => left > right,
+        _ => candidate.trim() != current.trim(),
+    }
+}
+
+fn parse_install_semver(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.trim().trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts
+        .next()?
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((major, minor, patch))
+}
+
+fn installed_npm_version(installed: &Path) -> Option<String> {
+    let raw = fs::read_to_string(installed.join("package.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok()?;
+    value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn latest_npm_version(spec: &str, agent_dir: &Path, cwd: &Path) -> Option<String> {
+    let raw = if let Ok(reply) = std::env::var("PI_NPM_VIEW_REPLY") {
+        let path = PathBuf::from(&reply);
+        if path.exists() {
+            fs::read_to_string(path).ok()?
+        } else {
+            reply
+        }
+    } else if cfg!(test) {
+        return None;
+    } else {
+        let command = npm_command(agent_dir).ok()?;
+        let mut args = command[1..].to_vec();
+        args.extend([
+            "view".into(),
+            spec.into(),
+            "version".into(),
+            "--json".into(),
+        ]);
+        let output = std::process::Command::new(&command[0])
+            .args(&args)
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+    parse_npm_view_version(&raw)
+}
+
+fn parse_npm_view_version(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    match value {
+        serde_json::Value::String(version) => Some(version),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .rev()
+            .find_map(|item| item.as_str().map(str::to_string)),
+        _ => None,
+    }
+}
+
+fn git_has_available_update(installed: &Path) -> bool {
+    let Some(local) = git_rev_parse(installed, "HEAD") else {
+        return false;
+    };
+    let Some(remote) = remote_git_head(installed) else {
+        return false;
+    };
+    local.trim() != remote.trim()
+}
+
+fn git_rev_parse(installed: &Path, rev: &str) -> Option<String> {
+    if let Ok(reply) = std::env::var("PI_GIT_REV_PARSE_REPLY") {
+        return Some(reply);
+    }
+    if cfg!(test) {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(installed)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn remote_git_head(installed: &Path) -> Option<String> {
+    if let Ok(reply) = std::env::var("PI_GIT_LS_REMOTE_REPLY") {
+        let path = PathBuf::from(&reply);
+        let raw = if path.exists() {
+            fs::read_to_string(path).ok()?
+        } else {
+            reply
+        };
+        return parse_ls_remote_head(&raw);
+    }
+    if cfg!(test) {
+        return None;
+    }
+    let git = std::env::var("PI_GIT_CMD").unwrap_or_else(|_| "git".into());
+    let output = std::process::Command::new(git)
+        .args(["ls-remote", "origin", "HEAD"])
+        .current_dir(installed)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ls_remote_head(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_ls_remote_head(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let dest = parts.next().unwrap_or("");
+        if dest == "HEAD" || dest.ends_with("/HEAD") {
+            return Some(hash.to_string());
+        }
+        if hash.len() == 40 && hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Some(hash.to_string());
+        }
+    }
+    None
+}
+
 fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     fs::create_dir_all(to).map_err(|err| err.to_string())?;
     for entry in fs::read_dir(from).map_err(|err| err.to_string())? {

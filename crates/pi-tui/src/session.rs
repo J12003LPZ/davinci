@@ -307,12 +307,15 @@ impl InteractiveSession {
                     .collect()
             })
             .unwrap_or_default();
-        self.chrome.model_selector = Some(ModelSelector::new(
-            items,
-            self.current_model().map(str::to_string),
-            self.default_model.clone(),
-            scoped,
-        ));
+        self.chrome.model_selector = Some(
+            ModelSelector::new(
+                items,
+                self.current_model().map(str::to_string),
+                self.default_model.clone(),
+                scoped,
+            )
+            .with_theme(self.chrome.theme.clone()),
+        );
         self.chrome.status = "Select model".into();
     }
 

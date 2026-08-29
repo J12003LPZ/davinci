@@ -419,6 +419,7 @@ impl ExtensionHost {
                 "data": data,
                 "snapshot": snapshot,
                 "width": width,
+                "height": 24,
                 "ctx": { "mode": "tui" }
             }),
         )?;
@@ -455,6 +456,7 @@ impl ExtensionHost {
                 "name": name,
                 "snapshot": snapshot,
                 "width": width,
+                "height": 24,
                 "ctx": { "mode": "tui" }
             }),
         )?;

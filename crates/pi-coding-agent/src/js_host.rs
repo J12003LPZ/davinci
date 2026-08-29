@@ -882,4 +882,57 @@ module.exports = (pi) => {
         assert_eq!(again.result.as_ref().unwrap()["lines"][0], "2");
         stop_persistent_js_extension();
     }
+
+    #[test]
+    fn overlay_visible_callback_uses_terminal_size() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerCommand("vis", {
+    description: "vis",
+    handler: async (_args, ctx) => {
+      return ctx.ui.custom((_tui, _theme, _kb, done) => {
+        return { render() { return ["OV"]; } };
+      }, {
+        overlay: true,
+        overlayOptions: {
+          visible: (width, height) => width >= 40 && height >= 10,
+        },
+      });
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let wide = run_persistent_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "vis", "width": 80, "height": 24, "ctx": { "mode": "tui" } }),
+        )
+        .unwrap();
+        assert!(wide.ok, "{:?}", wide.error);
+        assert_eq!(
+            wide.result.as_ref().unwrap()["overlayOptions"]["visible"],
+            true
+        );
+        stop_persistent_js_extension();
+        let narrow = run_persistent_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "vis", "width": 20, "height": 8, "ctx": { "mode": "tui" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            narrow.result.as_ref().unwrap()["overlayOptions"]["visible"],
+            false
+        );
+        stop_persistent_js_extension();
+    }
 }

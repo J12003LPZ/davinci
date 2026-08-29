@@ -26,10 +26,11 @@ use pi_agent::{
     AgentEvent, CustomToolExecutor,
 };
 use pi_ai::{
-    apply_config_auth, apply_models_config, content_text, find_model, fuzzy_models, live_complete,
-    load_builtin_models, models_json_path, resolve_provider_auth, AssistantMessage, AuthStorage,
-    ContentBlock, Credential, CredentialKind, ModelConfig, ResolvedAuth, StopReason, ToolSpec,
-    NO_MODELS_AVAILABLE,
+    apply_config_auth, apply_models_config, content_text, find_model,
+    format_no_models_available_message, fuzzy_models, live_complete, load_builtin_models,
+    models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
+    ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
+    StopReason, ToolSpec, NO_MODELS_AVAILABLE,
 };
 use pi_session::{
     default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir,
@@ -300,10 +301,26 @@ fn resolve_or_create_session(
 }
 
 fn available_models(parsed: &Args) -> Vec<pi_ai::Model> {
-    load_available_models(parsed).0
+    load_model_runtime(parsed).available
 }
 
 fn load_available_models(parsed: &Args) -> (Vec<pi_ai::Model>, Option<String>) {
+    let snapshot = load_model_runtime(parsed);
+    if snapshot.all.is_empty() {
+        return (
+            Vec::new(),
+            Some(
+                snapshot
+                    .get_error()
+                    .unwrap_or_else(|| NO_MODELS_AVAILABLE.into()),
+            ),
+        );
+    }
+    let error = snapshot.get_error();
+    (snapshot.available, error)
+}
+
+fn load_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
     let mut models = load_builtin_models();
     let agent_dir = default_agent_dir();
     let store = pi_ai::load_models_store(&agent_dir);
@@ -311,11 +328,18 @@ fn load_available_models(parsed: &Args) -> (Vec<pi_ai::Model>, Option<String>) {
         models = pi_ai::merge_models(&models, &entry.models);
     }
     let config = ModelConfig::load(&models_json_path(&agent_dir));
-    let error = config.error().map(str::to_string);
+    let mut composition_errors = std::collections::BTreeMap::new();
     models = match apply_models_config(&models, &config) {
         Ok(applied) => applied,
         Err(err) => {
-            return (models, Some(error.unwrap_or(err)));
+            let provider = err
+                .strip_prefix("Provider ")
+                .and_then(|rest| rest.split(':').next())
+                .unwrap_or("models.json")
+                .trim()
+                .to_string();
+            composition_errors.insert(provider, err);
+            models
         }
     };
     for provider in loaded_extension_host(parsed).registered_providers() {
@@ -323,29 +347,68 @@ fn load_available_models(parsed: &Args) -> (Vec<pi_ai::Model>, Option<String>) {
             &provider.name,
             &provider.config,
         ));
-        if let Ok(applied) = apply_models_config(&models, &config) {
-            models = applied;
+        match apply_models_config(&models, &config) {
+            Ok(applied) => models = applied,
+            Err(err) => {
+                composition_errors.insert(provider.name.clone(), err);
+            }
         }
     }
-    if models.is_empty() {
-        return (
-            models,
-            Some(error.unwrap_or_else(|| NO_MODELS_AVAILABLE.into())),
-        );
+    let auth_path = agent_dir.join("auth.json");
+    let mut storage = AuthStorage::open(&auth_path).unwrap_or_else(|_| AuthStorage::in_memory());
+    if let Some(key) = parsed.api_key.as_deref() {
+        let provider = parsed
+            .provider
+            .clone()
+            .or_else(|| {
+                parsed
+                    .model
+                    .as_deref()
+                    .and_then(|value| value.split('/').next().map(str::to_string))
+            })
+            .unwrap_or_default();
+        if !provider.is_empty() {
+            storage.set_runtime_override(&provider, key);
+        }
     }
-    (models, error)
+    let env = std::env::vars().collect();
+    snapshot_availability(models, &config, &storage, &env, composition_errors, None)
+}
+
+fn coding_agent_docs_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pi/packages/coding-agent/docs")
 }
 
 fn list_models(list: &ListModels) -> Result<i32, String> {
-    let (models, error) = load_available_models(&Args::default());
-    if models.is_empty() {
-        eprintln!("{}", error.as_deref().unwrap_or(NO_MODELS_AVAILABLE));
-        return Ok(1);
+    let snapshot = load_model_runtime(&Args::default());
+    if let Some(error) = snapshot.get_error() {
+        if snapshot.all.is_empty() {
+            eprintln!("{error}");
+            return Ok(1);
+        }
+        eprintln!("Warning: errors loading models.json:\n{error}");
+    }
+    if snapshot.available.is_empty() {
+        if snapshot.all.is_empty() {
+            eprintln!("{NO_MODELS_AVAILABLE}");
+            return Ok(1);
+        }
+        println!(
+            "{}",
+            format_no_models_available_message(&coding_agent_docs_dir())
+        );
+        return Ok(0);
     }
     let selected = match list {
-        ListModels::All => models.iter().collect(),
-        ListModels::Query(query) => fuzzy_models(&models, query),
+        ListModels::All => snapshot.available.iter().collect(),
+        ListModels::Query(query) => fuzzy_models(&snapshot.available, query),
     };
+    if selected.is_empty() {
+        if let ListModels::Query(query) = list {
+            println!("No models matching \"{query}\"");
+            return Ok(0);
+        }
+    }
     for model in selected {
         println!("{}/{}  {}", model.provider, model.id, model.name);
     }
@@ -2431,25 +2494,26 @@ fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
     let agent_dir = default_agent_dir();
     let allow_network = std::env::var("PI_OFFLINE").is_err();
     let refreshed = catalog_refresh::refresh_model_catalogs(&agent_dir, allow_network, false);
-    let mut models: Vec<String> = refreshed
-        .models
+    let snapshot = load_model_runtime(parsed);
+    let mut models: Vec<String> = snapshot
+        .available
         .iter()
         .map(|model| format!("{}/{}", model.provider, model.id))
         .collect();
-    for model in available_models(parsed) {
+    for model in &refreshed.models {
         let label = format!("{}/{}", model.provider, model.id);
-        if !models.contains(&label) {
+        if snapshot
+            .configured_providers
+            .iter()
+            .any(|provider| provider == &model.provider)
+            && !models.contains(&label)
+        {
             models.push(label);
         }
     }
-    for existing in session.models.iter() {
-        if !models.contains(existing) {
-            models.push(existing.clone());
-        }
-    }
     session.models = models;
-    session.model_items = refreshed
-        .models
+    session.model_items = snapshot
+        .available
         .iter()
         .map(|model| ModelSelectorItem {
             provider: model.provider.clone(),
@@ -2486,7 +2550,7 @@ fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
         let success = refreshed.status == catalog_refresh::refresh_status_ok()
             || refreshed.status == "Model catalogs refreshed.";
         let status = refreshed.status.clone();
-        let error = load_available_models(parsed).1;
+        let error = snapshot.get_error();
         if let Some(selector) = &mut session.chrome.model_selector {
             selector.reload(items, current, default_model, scoped);
             selector.set_refresh_status(Some(status), success);

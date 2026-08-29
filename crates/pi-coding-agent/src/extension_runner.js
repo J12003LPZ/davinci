@@ -183,12 +183,24 @@ class Editor {
 	}
 	isShowingAutocomplete() { return false; }
 }
+function serializeOverlayOptions(options, width, height) {
+	if (!options || typeof options !== "object") return options;
+	const out = Object.assign({}, options);
+	if (typeof options.visible === "function") {
+		try {
+			out.visible = Boolean(options.visible(width || 80, height || 24));
+		} catch (_error) {
+			out.visible = true;
+		}
+	}
+	return out;
+}
 class TUI {
 	constructor() {
 		this.children = [];
 		this.mode = "normal";
 		this._wantsTick = false;
-		this.terminal = { setTitle() {} };
+		this.terminal = { setTitle() {}, columns: 80, rows: 24 };
 	}
 	addChild(component) { this.children.push(component); }
 	removeChild(component) { this.children = this.children.filter((item) => item !== component); }
@@ -424,6 +436,19 @@ async function loadModule(modPath) {
 	}
 }
 
+function serializeOverlayOptions(options, width, height) {
+	if (!options || typeof options !== "object") return options;
+	const out = Object.assign({}, options);
+	if (typeof options.visible === "function") {
+		try {
+			out.visible = Boolean(options.visible(width || 80, height || 24));
+		} catch (_error) {
+			out.visible = true;
+		}
+	}
+	return out;
+}
+
 async function main() {
 	const extPath = path.resolve(process.argv[2] || "");
 	const persistentMode = process.argv.includes("--persistent");
@@ -563,6 +588,8 @@ async function main() {
 					settledCustom = value;
 				};
 				const tui = new (require("@earendil-works/pi-tui").TUI)();
+				tui.terminal.columns = payload.width || 80;
+				tui.terminal.rows = payload.height || 24;
 				const component = await factory(tui, ui.theme, { matches: matchesKeySafe }, done);
 				customComponent = component;
 				lastCustomOverlay = overlay || Boolean(tui._overlay);
@@ -584,7 +611,11 @@ async function main() {
 							: [],
 					wantsTick: Boolean(tui._wantsTick),
 					overlay: lastCustomOverlay,
-					overlayOptions: lastCustomOverlayOptions,
+					overlayOptions: serializeOverlayOptions(
+						lastCustomOverlayOptions,
+						payload.width,
+						payload.height
+					),
 				};
 				const pending = new Error("pending custom UI");
 				pending.__piPendingCustom = true;
@@ -760,7 +791,11 @@ async function main() {
 					: [],
 			wantsTick: true,
 			overlay: lastCustomOverlay,
-			overlayOptions: lastCustomOverlayOptions,
+			overlayOptions: serializeOverlayOptions(
+				lastCustomOverlayOptions,
+				payload.width,
+				payload.height
+			),
 		};
 		result = Object.assign({ pending: true }, pendingCustom);
 		return;
@@ -994,7 +1029,7 @@ main().catch((error) => {
 		JSON.stringify({
 			ok: false,
 			error: error && error.message ? error.message : String(error),
-		}),
+		}) + "\n",
 	);
 	process.exitCode = 1;
 });
