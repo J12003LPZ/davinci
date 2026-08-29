@@ -39,6 +39,12 @@ pub struct Credential {
     pub expires: Option<u64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    #[serde(
+        default,
+        rename = "availableModelIds",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub available_model_ids: Vec<String>,
 }
 
 impl Drop for Credential {
@@ -133,6 +139,7 @@ impl AuthStorage {
                 refresh: None,
                 expires: None,
                 env: HashMap::new(),
+                available_model_ids: Vec::new(),
             },
         )
     }
@@ -153,6 +160,7 @@ impl AuthStorage {
                 refresh,
                 expires,
                 env: HashMap::new(),
+                available_model_ids: copilot_available_model_ids(provider),
             },
         )
     }
@@ -259,10 +267,8 @@ pub fn default_auth_path() -> PathBuf {
 
 pub fn env_api_key(spec: &ProviderSpec, env: &HashMap<String, String>) -> Option<(String, String)> {
     for var in spec.env_vars {
-        if let Some(value) = env.get(*var).cloned().or_else(|| std::env::var(var).ok()) {
-            if !value.is_empty() {
-                return Some((value, (*var).to_string()));
-            }
+        if let Some(value) = env.get(*var).cloned().filter(|value| !value.is_empty()) {
+            return Some((value, (*var).to_string()));
         }
     }
     None
@@ -285,11 +291,39 @@ pub fn resolve_provider_auth(
         match cred.kind {
             CredentialKind::ApiKey => {
                 if let Some(key) = &cred.key {
-                    return Some(ResolvedAuth {
-                        api_key: Some(key.clone()),
-                        headers: HashMap::new(),
-                        source: "stored credential".into(),
-                    });
+                    if !key.is_empty() {
+                        return Some(ResolvedAuth {
+                            api_key: Some(key.clone()),
+                            headers: HashMap::new(),
+                            source: "stored credential".into(),
+                        });
+                    }
+                }
+                if provider == "amazon-bedrock" {
+                    if env_nonempty(cred.env.get("AWS_PROFILE")) {
+                        return Some(ResolvedAuth {
+                            api_key: None,
+                            headers: HashMap::new(),
+                            source: "stored credential".into(),
+                        });
+                    }
+                }
+                if provider == "llama.cpp" {
+                    if env_nonempty(cred.env.get("LLAMA_BASE_URL")) {
+                        return Some(ResolvedAuth {
+                            api_key: cred.key.clone(),
+                            headers: HashMap::new(),
+                            source: "stored credential".into(),
+                        });
+                    }
+                }
+                if provider == "google-vertex" {
+                    if let Some(resolved) = vertex_ambient_auth(Some(cred), env) {
+                        return Some(resolved);
+                    }
+                }
+                if let Some(resolved) = cloudflare_auth(provider, Some(cred), env) {
+                    return Some(resolved);
                 }
             }
             CredentialKind::Oauth => {
@@ -299,33 +333,262 @@ pub fn resolve_provider_auth(
                     return Some(ResolvedAuth {
                         api_key: Some(access),
                         headers,
-                        source: "oauth".into(),
+                        source: "OAuth".into(),
                     });
                 }
             }
         }
     }
     if include_env {
-        if let Some(spec) = provider_spec(provider) {
-            if let Some((key, source)) = env_api_key(spec, env) {
-                if provider == "anthropic" && source == "ANTHROPIC_AUTH_TOKEN" {
-                    let mut headers = HashMap::new();
-                    headers.insert("Authorization".into(), format!("Bearer {key}"));
-                    return Some(ResolvedAuth {
-                        api_key: None,
-                        headers,
-                        source,
-                    });
-                }
+        if provider == "amazon-bedrock" {
+            if let Some(source) = bedrock_ambient_source(env) {
                 return Some(ResolvedAuth {
-                    api_key: Some(key),
+                    api_key: None,
                     headers: HashMap::new(),
                     source,
                 });
             }
         }
+        if provider == "llama.cpp" {
+            if let Some(url) = lookup_env("LLAMA_BASE_URL", env) {
+                if !url.is_empty() {
+                    return Some(ResolvedAuth {
+                        api_key: Some(
+                            lookup_env("LLAMA_API_KEY", env).unwrap_or_else(|| "local".into()),
+                        ),
+                        headers: HashMap::new(),
+                        source: "LLAMA_BASE_URL".into(),
+                    });
+                }
+            }
+        }
+        if provider == "google-vertex" {
+            if let Some(resolved) = vertex_ambient_auth(None, env) {
+                return Some(resolved);
+            }
+        }
+        if let Some(resolved) = cloudflare_auth(provider, None, env) {
+            return Some(resolved);
+        }
+        if provider != "amazon-bedrock"
+            && provider != "llama.cpp"
+            && provider != "google-vertex"
+            && provider != "cloudflare-workers-ai"
+            && provider != "cloudflare-ai-gateway"
+        {
+            if let Some(spec) = provider_spec(provider) {
+                if let Some((key, source)) = env_api_key(spec, env) {
+                    if provider == "anthropic" && source == "ANTHROPIC_AUTH_TOKEN" {
+                        let mut headers = HashMap::new();
+                        headers.insert("Authorization".into(), format!("Bearer {key}"));
+                        return Some(ResolvedAuth {
+                            api_key: None,
+                            headers,
+                            source,
+                        });
+                    }
+                    return Some(ResolvedAuth {
+                        api_key: Some(key),
+                        headers: HashMap::new(),
+                        source,
+                    });
+                }
+            }
+        }
     }
     None
+}
+
+fn env_nonempty(value: Option<&String>) -> bool {
+    value.is_some_and(|text| !text.is_empty())
+}
+
+fn lookup_env(name: &str, env: &HashMap<String, String>) -> Option<String> {
+    env.get(name).cloned().filter(|value| !value.is_empty())
+}
+
+/// TS `google-vertex` ADC + project + location (no network).
+pub fn vertex_ambient_auth(
+    credential: Option<&Credential>,
+    env: &HashMap<String, String>,
+) -> Option<ResolvedAuth> {
+    if let Some(key) = credential
+        .and_then(|cred| cred.key.clone())
+        .filter(|key| !key.is_empty())
+    {
+        return Some(ResolvedAuth {
+            api_key: Some(key),
+            headers: HashMap::new(),
+            source: "stored credential".into(),
+        });
+    }
+    if let Some(key) = lookup_env("GOOGLE_CLOUD_API_KEY", env) {
+        return Some(ResolvedAuth {
+            api_key: Some(key),
+            headers: HashMap::new(),
+            source: "GOOGLE_CLOUD_API_KEY".into(),
+        });
+    }
+    let adc_path = credential
+        .and_then(|cred| cred.env.get("GOOGLE_APPLICATION_CREDENTIALS").cloned())
+        .or_else(|| lookup_env("GOOGLE_APPLICATION_CREDENTIALS", env))
+        .unwrap_or_else(default_vertex_adc_path);
+    if !Path::new(&expand_home(&adc_path)).is_file() {
+        return None;
+    }
+    let project = credential
+        .and_then(|cred| cred.env.get("GOOGLE_CLOUD_PROJECT").cloned())
+        .or_else(|| lookup_env("GOOGLE_CLOUD_PROJECT", env))
+        .or_else(|| lookup_env("GCLOUD_PROJECT", env));
+    let location = credential
+        .and_then(|cred| cred.env.get("GOOGLE_CLOUD_LOCATION").cloned())
+        .or_else(|| lookup_env("GOOGLE_CLOUD_LOCATION", env));
+    if project.filter(|value| !value.is_empty()).is_some()
+        && location.filter(|value| !value.is_empty()).is_some()
+    {
+        return Some(ResolvedAuth {
+            api_key: None,
+            headers: HashMap::new(),
+            source: if credential.is_some() {
+                "stored credential".into()
+            } else {
+                "gcloud application default credentials".into()
+            },
+        });
+    }
+    None
+}
+
+pub fn cloudflare_auth(
+    provider: &str,
+    credential: Option<&Credential>,
+    env: &HashMap<String, String>,
+) -> Option<ResolvedAuth> {
+    let require_gateway = match provider {
+        "cloudflare-workers-ai" => false,
+        "cloudflare-ai-gateway" => true,
+        _ => return None,
+    };
+    let api_key = credential
+        .and_then(|cred| cred.key.clone())
+        .filter(|key| !key.is_empty())
+        .or_else(|| lookup_env("CLOUDFLARE_API_KEY", env))?;
+    credential
+        .and_then(|cred| cred.env.get("CLOUDFLARE_ACCOUNT_ID").cloned())
+        .or_else(|| lookup_env("CLOUDFLARE_ACCOUNT_ID", env))
+        .filter(|value| !value.is_empty())?;
+    if require_gateway {
+        credential
+            .and_then(|cred| cred.env.get("CLOUDFLARE_GATEWAY_ID").cloned())
+            .or_else(|| lookup_env("CLOUDFLARE_GATEWAY_ID", env))
+            .filter(|value| !value.is_empty())?;
+    }
+    Some(ResolvedAuth {
+        api_key: Some(api_key),
+        headers: HashMap::new(),
+        source: if credential.is_some() {
+            "stored credential".into()
+        } else {
+            "CLOUDFLARE_API_KEY".into()
+        },
+    })
+}
+
+fn default_vertex_adc_path() -> String {
+    "~/.config/gcloud/application_default_credentials.json".into()
+}
+
+fn expand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest).display().to_string();
+        }
+    }
+    path.to_string()
+}
+
+/// TS `amazon-bedrock` ambient resolve sources (no network).
+pub fn bedrock_ambient_source(env: &HashMap<String, String>) -> Option<String> {
+    if lookup_env("AWS_BEARER_TOKEN_BEDROCK", env).is_some() {
+        return Some("AWS_BEARER_TOKEN_BEDROCK".into());
+    }
+    if lookup_env("AWS_PROFILE", env).is_some() {
+        return Some("AWS_PROFILE".into());
+    }
+    if lookup_env("AWS_ACCESS_KEY_ID", env).is_some()
+        && lookup_env("AWS_SECRET_ACCESS_KEY", env).is_some()
+    {
+        return Some("AWS access keys".into());
+    }
+    if lookup_env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", env).is_some()
+        || lookup_env("AWS_CONTAINER_CREDENTIALS_FULL_URI", env).is_some()
+    {
+        return Some("ECS task role".into());
+    }
+    if lookup_env("AWS_WEB_IDENTITY_TOKEN_FILE", env).is_some() {
+        return Some("web identity token".into());
+    }
+    None
+}
+
+/// GitHub Copilot `availableModelIds` from `PI_COPILOT_MODELS_REPLY` (file or JSON).
+/// Tests never hit the network; production login also stays fixture-only here.
+pub fn copilot_available_model_ids(provider: &str) -> Vec<String> {
+    if provider != "github-copilot" {
+        return Vec::new();
+    }
+    let Ok(reply) = std::env::var("PI_COPILOT_MODELS_REPLY") else {
+        return Vec::new();
+    };
+    let raw = if Path::new(&reply).is_file() {
+        fs::read_to_string(&reply).unwrap_or_default()
+    } else {
+        reply
+    };
+    parse_copilot_available_model_ids(&raw)
+}
+
+pub fn parse_copilot_available_model_ids(raw: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    if let Some(ids) = value.as_array().and_then(|items| {
+        items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+    }) {
+        return ids;
+    }
+    let Some(data) = value.get("data").and_then(|item| item.as_array()) else {
+        return Vec::new();
+    };
+    let mut picker = Vec::new();
+    let mut enabled = Vec::new();
+    for item in data {
+        let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let picker_enabled = item
+            .get("model_picker_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let policy_state = item
+            .get("policy")
+            .and_then(|v| v.get("state"))
+            .and_then(|v| v.as_str());
+        if picker_enabled && policy_state != Some("disabled") {
+            picker.push(id.to_string());
+        }
+        if policy_state == Some("enabled") {
+            enabled.push(id.to_string());
+        }
+    }
+    if picker.is_empty() {
+        enabled
+    } else {
+        picker
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +611,7 @@ mod tests {
                     refresh: None,
                     expires: None,
                     env: HashMap::new(),
+                    available_model_ids: Vec::new(),
                 },
             )
             .unwrap();

@@ -570,7 +570,7 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
     let mut resolved = resolve_provider_auth(&provider, &storage, &env, true);
     if let Some(auth) = resolved.as_mut() {
         let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
-        apply_config_auth(auth, &config, &provider, None);
+        apply_config_auth(auth, &config, &provider, None, &env);
     }
     match command.kind {
         AuthCommandKind::Check => {
@@ -650,7 +650,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
     if let Some(auth) = auth.as_mut() {
         let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
         let model = find_model(&models, &agent.provider, &agent.model_id);
-        apply_config_auth(auth, &config, &agent.provider, model);
+        apply_config_auth(auth, &config, &agent.provider, model, &env);
     }
     if auth.as_ref().is_some_and(|item| {
         item.api_key.is_none() && item.headers.is_empty() && item.source == "none"
@@ -1996,6 +1996,7 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
                     refresh: None,
                     expires: None,
                     env,
+                    available_model_ids: Vec::new(),
                 },
             )
             .map_err(|err| err.to_string())?;
@@ -3516,6 +3517,7 @@ fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
                 refresh: None,
                 expires: None,
                 env: Default::default(),
+                available_model_ids: Vec::new(),
             },
         )
         .map_err(|err| err.to_string())

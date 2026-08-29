@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (live npm/git package update probe, TypeBox models.json keyword paths, ModelSelector theme roles, overlay `visible()` callback, ModelRuntime availability snapshot). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (`checkAuth`/`getAvailable` TS algorithm, Copilot `availableModelIds` filter, models.json `!`/`$ENV` resolve, Bedrock/Vertex/Cloudflare ambient auth, TypeBox OpenRouter/Vercel routing). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -57,7 +57,9 @@ Closed this slice: live npm/git `checkForAvailableUpdates`, TypeBox models.json 
 
 Closed this slice: `--list-models` TS column table (`provider`/`model`/`context`/`max-out`/`thinking`/`images` + `200K`/`1M` token counts); TypeBox `compat` nested `thinkingFormat` / `cacheControlFormat` / `maxTokensField` / `sessionAffinityFormat` / `deferredToolsMode` keyword paths.
 
+Closed this slice: `checkAuth`/`getAvailable` lock TS `AuthCheck` (`type: api_key|oauth`, `source: OAuth` without OAuth refresh); GitHub Copilot `availableModelIds` filter; models.json `!command` configured without exec and `$ENV` templates; `resolveConfigValue` on `apply_config_auth`; Bedrock ambient sources (bearer/profile/access-key pair/ECS/IRSA); Vertex ADC + project + location; Cloudflare API key + account (+ gateway); xAI/Kimi OAuth flags; TypeBox `openRouterRouting` / `vercelGatewayRouting` / `chatTemplateKwargs` / remaining compat bools / `thinkingLevelMap`.
+
 Still not product-equivalent:
 
-- Live `getAvailable()` per-provider network auth probes (snapshot uses storage + env + models.json keys only)
-- TypeBox OpenRouter/Vercel routing nested records inside `compat` are not walked field-by-field
+- GitHub Copilot OAuth login does not live-fetch `/models` (fixture `PI_COPILOT_MODELS_REPLY` only)
+- models.json `!command` resolve has no 10s timeout or Windows shell fallback (Unix `sh -c`; tests never execute)

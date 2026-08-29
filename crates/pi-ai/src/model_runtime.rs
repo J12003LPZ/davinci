@@ -1,11 +1,18 @@
 //! ModelRuntime availability snapshot matching TS `model-runtime.ts`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use crate::auth::{resolve_provider_auth, AuthStorage, ResolvedAuth};
+use crate::auth::{
+    bedrock_ambient_source, cloudflare_auth, resolve_provider_auth, vertex_ambient_auth,
+    AuthStorage, Credential, CredentialKind, ResolvedAuth,
+};
 use crate::catalog::Model;
-use crate::model_config::{ModelConfig, NO_MODELS_AVAILABLE};
+use crate::model_config::{
+    config_value_env_var_names, is_command_config_value, ModelConfig, NO_MODELS_AVAILABLE,
+};
+use crate::oauth_providers::oauth_providers;
+use crate::providers::provider_spec;
 
 /// Auth check recorded for a provider, matching TS `AuthCheck`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,19 +87,16 @@ pub fn snapshot_availability(
     for id in &stored_providers {
         provider_ids.insert(id.clone());
     }
+    provider_ids.insert("llama.cpp".into());
     let mut auth = BTreeMap::new();
     let mut configured = BTreeSet::new();
     for provider in &provider_ids {
-        if let Some(check) = provider_auth_check(provider, config, storage, env) {
+        if let Some(check) = check_auth(provider, config, storage, env) {
             configured.insert(provider.clone());
             auth.insert(provider.clone(), check);
         }
     }
-    let available: Vec<Model> = all
-        .iter()
-        .filter(|model| configured.contains(&model.provider))
-        .cloned()
-        .collect();
+    let available = get_available(&all, None, config, storage, env);
     let config_error = config.error().map(str::to_string);
     ModelRuntimeSnapshot {
         all,
@@ -106,33 +110,208 @@ pub fn snapshot_availability(
     }
 }
 
-fn provider_auth_check(
+/// TS `Models.checkAuth`: OAuth stored credentials are not refreshed.
+pub fn check_auth(
     provider: &str,
     config: &ModelConfig,
     storage: &AuthStorage,
-    env: &std::collections::HashMap<String, String>,
+    env: &HashMap<String, String>,
 ) -> Option<AuthCheck> {
-    if let Some(resolved) = resolve_provider_auth(provider, storage, env, true) {
-        return Some(auth_check_from_resolved(resolved));
+    if let Some(cred) = storage.get(provider) {
+        if cred.kind == CredentialKind::Oauth {
+            return if provider_supports_oauth(provider, config) {
+                Some(AuthCheck {
+                    kind: "oauth".into(),
+                    source: "OAuth".into(),
+                })
+            } else {
+                None
+            };
+        }
+        if let Some(check) = provider_api_key_check(provider, Some(cred), config, env) {
+            return Some(check);
+        }
     }
-    if let Some(provider_config) = config.get_provider(provider) {
-        if let Some(key) = &provider_config.api_key {
-            if !key.is_empty() {
+    if let Some(check) = configured_api_key_check(config.get_provider(provider), env) {
+        return Some(check);
+    }
+    if let Some(check) = provider_api_key_check(provider, None, config, env) {
+        return Some(check);
+    }
+    resolve_provider_auth(provider, storage, env, true).map(auth_check_from_resolved)
+}
+
+/// TS `Models.getAvailable`: checkAuth then `filterModels` (GitHub Copilot).
+pub fn get_available(
+    all: &[Model],
+    provider_id: Option<&str>,
+    config: &ModelConfig,
+    storage: &AuthStorage,
+    env: &HashMap<String, String>,
+) -> Vec<Model> {
+    let mut providers: BTreeSet<String> = BTreeSet::new();
+    if let Some(id) = provider_id {
+        providers.insert(id.to_string());
+    } else {
+        for model in all {
+            providers.insert(model.provider.clone());
+        }
+        for id in config.provider_ids() {
+            providers.insert(id.to_string());
+        }
+        for id in storage.providers() {
+            providers.insert(id);
+        }
+    }
+    let authed: BTreeSet<String> = providers
+        .into_iter()
+        .filter(|provider| check_auth(provider, config, storage, env).is_some())
+        .collect();
+    all.iter()
+        .filter(|model| {
+            if let Some(id) = provider_id {
+                if model.provider != id {
+                    return false;
+                }
+            }
+            authed.contains(&model.provider)
+                && model_allowed_for_credential(model, storage.get(&model.provider))
+        })
+        .cloned()
+        .collect()
+}
+
+fn provider_supports_oauth(provider: &str, config: &ModelConfig) -> bool {
+    if oauth_providers().contains(&provider) {
+        return true;
+    }
+    if provider_spec(provider).is_some_and(|spec| spec.oauth) {
+        return true;
+    }
+    config
+        .get_provider(provider)
+        .and_then(|entry| entry.oauth.as_deref())
+        == Some("radius")
+}
+
+fn configured_api_key_check(
+    provider_config: Option<&crate::model_config::ModelsJsonProvider>,
+    env: &HashMap<String, String>,
+) -> Option<AuthCheck> {
+    let key = provider_config?.api_key.as_deref()?;
+    if key.is_empty() {
+        return None;
+    }
+    if is_command_config_value(key) {
+        return Some(configured_api_key_auth());
+    }
+    let names = config_value_env_var_names(key);
+    if !names.is_empty() {
+        if names.iter().all(|name| env_is_set(name, env)) {
+            return Some(configured_api_key_auth());
+        }
+        return None;
+    }
+    Some(configured_api_key_auth())
+}
+
+fn configured_api_key_auth() -> AuthCheck {
+    AuthCheck {
+        kind: "api_key".into(),
+        source: "configured API key".into(),
+    }
+}
+
+fn provider_api_key_check(
+    provider: &str,
+    credential: Option<&Credential>,
+    _config: &ModelConfig,
+    env: &HashMap<String, String>,
+) -> Option<AuthCheck> {
+    if provider == "llama.cpp" {
+        if let Some(cred) = credential {
+            if env_nonempty(cred.env.get("LLAMA_BASE_URL"))
+                || cred.key.as_ref().is_some_and(|k| !k.is_empty())
+            {
                 return Some(AuthCheck {
-                    kind: "api-key".into(),
-                    source: "models.json".into(),
+                    kind: "api_key".into(),
+                    source: "stored credential".into(),
                 });
             }
+        }
+        if env_is_set("LLAMA_BASE_URL", env) {
+            return Some(AuthCheck {
+                kind: "api_key".into(),
+                source: "LLAMA_BASE_URL".into(),
+            });
+        }
+        return None;
+    }
+    if provider == "google-vertex" {
+        return vertex_ambient_auth(credential, env).map(auth_check_from_resolved);
+    }
+    if matches!(provider, "cloudflare-workers-ai" | "cloudflare-ai-gateway") {
+        return cloudflare_auth(provider, credential, env).map(auth_check_from_resolved);
+    }
+    if provider == "amazon-bedrock" {
+        if let Some(cred) = credential {
+            if cred.key.as_ref().is_some_and(|k| !k.is_empty())
+                || env_nonempty(cred.env.get("AWS_PROFILE"))
+            {
+                return Some(AuthCheck {
+                    kind: "api_key".into(),
+                    source: "stored credential".into(),
+                });
+            }
+        }
+        if let Some(source) = bedrock_ambient_source(env) {
+            return Some(AuthCheck {
+                kind: "api_key".into(),
+                source,
+            });
+        }
+        return None;
+    }
+    if let Some(cred) = credential {
+        if cred.key.as_ref().is_some_and(|k| !k.is_empty()) {
+            return Some(AuthCheck {
+                kind: "api_key".into(),
+                source: "stored credential".into(),
+            });
         }
     }
     None
 }
 
+fn model_allowed_for_credential(model: &Model, credential: Option<&Credential>) -> bool {
+    if model.provider != "github-copilot" {
+        return true;
+    }
+    let Some(cred) = credential else {
+        return true;
+    };
+    if cred.kind != CredentialKind::Oauth {
+        return true;
+    }
+    if cred.available_model_ids.is_empty() {
+        return true;
+    }
+    cred.available_model_ids.iter().any(|id| id == &model.id)
+}
+
+fn env_is_set(name: &str, env: &HashMap<String, String>) -> bool {
+    env.get(name).is_some_and(|value| !value.is_empty())
+}
+
+fn env_nonempty(value: Option<&String>) -> bool {
+    value.is_some_and(|text| !text.is_empty())
+}
+
 fn auth_check_from_resolved(resolved: ResolvedAuth) -> AuthCheck {
-    let kind = if resolved.source.contains("oauth") {
+    let kind = if resolved.source == "OAuth" || resolved.source.contains("oauth") {
         "oauth"
     } else {
-        "api-key"
+        "api_key"
     };
     AuthCheck {
         kind: kind.into(),
@@ -236,7 +415,11 @@ mod tests {
         assert_eq!(snap.available.len(), 1);
         assert_eq!(
             snap.auth.get("local").map(|c| c.source.as_str()),
-            Some("models.json")
+            Some("configured API key")
+        );
+        assert_eq!(
+            snap.auth.get("local").map(|c| c.kind.as_str()),
+            Some("api_key")
         );
     }
 
@@ -264,5 +447,222 @@ mod tests {
         assert!(message.starts_with("No models available. Use /login to log into a provider"));
         assert!(message.contains("/docs/providers.md"));
         assert!(message.contains("/docs/models.md"));
+    }
+
+    #[test]
+    fn check_auth_does_not_refresh_expired_oauth() {
+        let dir = tempdir().unwrap();
+        let mut storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        storage
+            .login_oauth("anthropic", "expired", Some("refresh".into()), Some(0))
+            .unwrap();
+        let check = check_auth(
+            "anthropic",
+            &ModelConfig::empty(),
+            &storage,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(check.kind, "oauth");
+        assert_eq!(check.source, "OAuth");
+        assert_eq!(
+            storage.get("anthropic").and_then(|c| c.access.as_deref()),
+            Some("expired")
+        );
+    }
+
+    #[test]
+    fn command_api_key_is_configured_without_executing() {
+        let dir = tempdir().unwrap();
+        let counter = dir.path().join("counter");
+        std::fs::write(&counter, "0").unwrap();
+        let path = dir.path().join("models.json");
+        let command = format!("!sh -c 'echo 1 > {}'", counter.display());
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"providers":{{"local":{{"baseUrl":"http://127.0.0.1:9","api":"openai-completions","apiKey":{command},"models":[{{"id":"demo"}}]}}}}}}"#,
+                command = serde_json::to_string(&command).unwrap()
+            ),
+        )
+        .unwrap();
+        let config = ModelConfig::load(&path);
+        assert!(config.error().is_none(), "{:?}", config.error());
+        let models = config.apply(&[]).unwrap();
+        let storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        let check = check_auth("local", &config, &storage, &Default::default()).unwrap();
+        assert_eq!(check.kind, "api_key");
+        assert_eq!(check.source, "configured API key");
+        let available = get_available(&models, None, &config, &storage, &Default::default());
+        assert_eq!(available.len(), 1);
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "0");
+    }
+
+    #[test]
+    fn env_template_api_key_requires_named_vars() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","api":"openai-completions","apiKey":"$PI_TEST_LOCAL_KEY","models":[{"id":"demo"}]}}}"#,
+        )
+        .unwrap();
+        let config = ModelConfig::load(&path);
+        let models = config.apply(&[]).unwrap();
+        let storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        assert!(check_auth("local", &config, &storage, &Default::default()).is_none());
+        let mut env = HashMap::new();
+        env.insert("PI_TEST_LOCAL_KEY".into(), "sk-from-env".into());
+        let check = check_auth("local", &config, &storage, &env).unwrap();
+        assert_eq!(check.source, "configured API key");
+        assert_eq!(
+            get_available(&models, Some("local"), &config, &storage, &env).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn github_copilot_oauth_filters_available_model_ids() {
+        let dir = tempdir().unwrap();
+        let mut storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        storage
+            .set(
+                "github-copilot",
+                crate::auth::Credential {
+                    kind: crate::auth::CredentialKind::Oauth,
+                    key: None,
+                    access: Some("token".into()),
+                    refresh: None,
+                    expires: None,
+                    env: HashMap::new(),
+                    available_model_ids: vec!["gpt-4.1".into()],
+                },
+            )
+            .unwrap();
+        let all = vec![
+            demo_model("github-copilot", "gpt-4.1"),
+            demo_model("github-copilot", "claude-sonnet"),
+        ];
+        let available = get_available(
+            &all,
+            None,
+            &ModelConfig::empty(),
+            &storage,
+            &Default::default(),
+        );
+        assert_eq!(
+            available.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["gpt-4.1"]
+        );
+    }
+
+    #[test]
+    fn bedrock_ambient_sources_and_access_key_pair() {
+        let dir = tempdir().unwrap();
+        let storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        let config = ModelConfig::empty();
+        let mut only_id = HashMap::new();
+        only_id.insert("AWS_ACCESS_KEY_ID".into(), "AKIATEST".into());
+        assert!(check_auth("amazon-bedrock", &config, &storage, &only_id).is_none());
+        let mut keys = HashMap::new();
+        keys.insert("AWS_ACCESS_KEY_ID".into(), "AKIATEST".into());
+        keys.insert("AWS_SECRET_ACCESS_KEY".into(), "secret".into());
+        let check = check_auth("amazon-bedrock", &config, &storage, &keys).unwrap();
+        assert_eq!(check.kind, "api_key");
+        assert_eq!(check.source, "AWS access keys");
+        let mut ecs = HashMap::new();
+        ecs.insert(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI".into(),
+            "/creds".into(),
+        );
+        assert_eq!(
+            check_auth("amazon-bedrock", &config, &storage, &ecs)
+                .unwrap()
+                .source,
+            "ECS task role"
+        );
+        let mut web = HashMap::new();
+        web.insert("AWS_WEB_IDENTITY_TOKEN_FILE".into(), "/token".into());
+        assert_eq!(
+            check_auth("amazon-bedrock", &config, &storage, &web)
+                .unwrap()
+                .source,
+            "web identity token"
+        );
+    }
+
+    #[test]
+    fn vertex_requires_adc_project_and_location() {
+        let dir = tempdir().unwrap();
+        let storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        let config = ModelConfig::empty();
+        let mut project_only = HashMap::new();
+        project_only.insert("GOOGLE_CLOUD_PROJECT".into(), "demo".into());
+        assert!(check_auth("google-vertex", &config, &storage, &project_only).is_none());
+        let creds = dir.path().join("adc.json");
+        std::fs::write(&creds, "{}").unwrap();
+        let mut env = HashMap::new();
+        env.insert(
+            "GOOGLE_APPLICATION_CREDENTIALS".into(),
+            creds.display().to_string(),
+        );
+        env.insert("GOOGLE_CLOUD_PROJECT".into(), "demo".into());
+        env.insert("GOOGLE_CLOUD_LOCATION".into(), "us-central1".into());
+        let check = check_auth("google-vertex", &config, &storage, &env).unwrap();
+        assert_eq!(check.kind, "api_key");
+        assert_eq!(check.source, "gcloud application default credentials");
+        env.insert("GOOGLE_CLOUD_API_KEY".into(), "vertex-key".into());
+        assert_eq!(
+            check_auth("google-vertex", &config, &storage, &env)
+                .unwrap()
+                .source,
+            "GOOGLE_CLOUD_API_KEY"
+        );
+    }
+
+    #[test]
+    fn cloudflare_requires_account_and_optional_gateway() {
+        let dir = tempdir().unwrap();
+        let storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        let config = ModelConfig::empty();
+        let mut account_only = HashMap::new();
+        account_only.insert("CLOUDFLARE_ACCOUNT_ID".into(), "acct".into());
+        assert!(check_auth("cloudflare-workers-ai", &config, &storage, &account_only).is_none());
+        let mut workers = HashMap::new();
+        workers.insert("CLOUDFLARE_API_KEY".into(), "cf-key".into());
+        workers.insert("CLOUDFLARE_ACCOUNT_ID".into(), "acct".into());
+        assert_eq!(
+            check_auth("cloudflare-workers-ai", &config, &storage, &workers)
+                .unwrap()
+                .source,
+            "CLOUDFLARE_API_KEY"
+        );
+        assert!(check_auth("cloudflare-ai-gateway", &config, &storage, &workers).is_none());
+        workers.insert("CLOUDFLARE_GATEWAY_ID".into(), "gw".into());
+        assert_eq!(
+            check_auth("cloudflare-ai-gateway", &config, &storage, &workers)
+                .unwrap()
+                .kind,
+            "api_key"
+        );
+    }
+
+    #[test]
+    fn llama_base_url_configures_without_stored_key() {
+        let dir = tempdir().unwrap();
+        let storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        let mut env = HashMap::new();
+        env.insert("LLAMA_BASE_URL".into(), "http://127.0.0.1:8080".into());
+        let check = check_auth("llama.cpp", &ModelConfig::empty(), &storage, &env).unwrap();
+        assert_eq!(check.kind, "api_key");
+        assert_eq!(check.source, "LLAMA_BASE_URL");
+    }
+
+    #[test]
+    fn parse_copilot_models_fixture_uses_picker_ids() {
+        let ids = crate::parse_copilot_available_model_ids(
+            r#"{"data":[{"id":"gpt-4.1","model_picker_enabled":true,"policy":{"state":"enabled"}},{"id":"hidden","model_picker_enabled":false,"policy":{"state":"enabled"}}]}"#,
+        );
+        assert_eq!(ids, vec!["gpt-4.1".to_string()]);
     }
 }

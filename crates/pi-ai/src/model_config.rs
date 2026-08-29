@@ -1,7 +1,8 @@
 //! `models.json` ModelConfig matching TS `model-config.ts` + `provider-composer.ts`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
 
@@ -9,6 +10,181 @@ use crate::catalog::{Model, ModelCost};
 
 pub const NO_MODELS_AVAILABLE: &str =
     "No models available. Check your installation or add models to models.json.";
+
+/// TS `isCommandConfigValue`: values starting with `!` are shell commands.
+pub fn is_command_config_value(config: &str) -> bool {
+    config.starts_with('!')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplatePart {
+    Literal(String),
+    Env(String),
+}
+
+/// TS `getConfigValueEnvVarNames` for `$VAR` / `${VAR}` templates.
+pub fn config_value_env_var_names(config: &str) -> Vec<String> {
+    if is_command_config_value(config) {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for part in parse_config_value_template(config) {
+        if let TemplatePart::Env(name) = part {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// TS `resolveConfigValue`: expand `$ENV` / `${ENV}` and (outside tests) `!command`.
+pub fn resolve_config_value(config: &str, env: &HashMap<String, String>) -> Option<String> {
+    if is_command_config_value(config) {
+        return resolve_command_config_value(config);
+    }
+    resolve_template_value(&parse_config_value_template(config), env)
+}
+
+fn parse_config_value_template(config: &str) -> Vec<TemplatePart> {
+    let mut parts = Vec::new();
+    let chars: Vec<char> = config.chars().collect();
+    let mut index = 0;
+    let mut literal = String::new();
+    let flush = |literal: &mut String, parts: &mut Vec<TemplatePart>| {
+        if !literal.is_empty() {
+            parts.push(TemplatePart::Literal(std::mem::take(literal)));
+        }
+    };
+    while index < chars.len() {
+        if chars[index] != '$' {
+            literal.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let next = chars.get(index + 1).copied();
+        if next == Some('$') || next == Some('!') {
+            literal.push(next.unwrap());
+            index += 2;
+            continue;
+        }
+        if next == Some('{') {
+            if let Some(end) = chars[index + 2..].iter().position(|c| *c == '}') {
+                let name: String = chars[index + 2..index + 2 + end].iter().collect();
+                if is_env_var_name(&name) {
+                    flush(&mut literal, &mut parts);
+                    parts.push(TemplatePart::Env(name));
+                    index += 3 + end;
+                    continue;
+                }
+                literal.push_str(&chars[index..index + 3 + end].iter().collect::<String>());
+                index += 3 + end;
+                continue;
+            }
+            literal.push('$');
+            index += 1;
+            continue;
+        }
+        let rest: String = chars[index + 1..].iter().collect();
+        if let Some(name) = env_var_name_prefix(&rest) {
+            flush(&mut literal, &mut parts);
+            parts.push(TemplatePart::Env(name.clone()));
+            index += 1 + name.len();
+            continue;
+        }
+        literal.push('$');
+        index += 1;
+    }
+    flush(&mut literal, &mut parts);
+    parts
+}
+
+fn resolve_template_value(parts: &[TemplatePart], env: &HashMap<String, String>) -> Option<String> {
+    let mut resolved = String::new();
+    for part in parts {
+        match part {
+            TemplatePart::Literal(value) => resolved.push_str(value),
+            TemplatePart::Env(name) => {
+                let value = env.get(name).cloned().filter(|value| !value.is_empty())?;
+                resolved.push_str(&value);
+            }
+        }
+    }
+    Some(resolved)
+}
+
+fn resolve_command_config_value(config: &str) -> Option<String> {
+    if let Ok(reply) = std::env::var("PI_CONFIG_VALUE_REPLY") {
+        return if reply.is_empty() { None } else { Some(reply) };
+    }
+    if cfg!(test) {
+        return None;
+    }
+    let cache = command_result_cache();
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(config) {
+            return cached.clone();
+        }
+    }
+    let command = &config[1..];
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok();
+    let value = output.and_then(|result| {
+        if !result.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&result.stdout).trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    });
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(config.to_string(), value.clone());
+    }
+    value
+}
+
+fn command_result_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+fn env_var_name_prefix(rest: &str) -> Option<String> {
+    let mut name = String::new();
+    for (i, c) in rest.chars().enumerate() {
+        if i == 0 {
+            if !(c.is_ascii_alphabetic() || c == '_') {
+                return None;
+            }
+        } else if !(c.is_ascii_alphanumeric() || c == '_') {
+            break;
+        }
+        name.push(c);
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelsJsonProvider {
@@ -145,6 +321,7 @@ pub fn apply_config_auth(
     config: &ModelConfig,
     provider: &str,
     model: Option<&Model>,
+    env: &HashMap<String, String>,
 ) {
     let Some(provider_config) = config.get_provider(provider) else {
         if let Some(model) = model {
@@ -156,15 +333,19 @@ pub fn apply_config_auth(
     };
     if auth.api_key.is_none() {
         if let Some(key) = &provider_config.api_key {
-            auth.api_key = Some(key.clone());
-            auth.source = "models.json".into();
+            if let Some(resolved) = resolve_config_value(key, env) {
+                auth.api_key = Some(resolved);
+                auth.source = "configured API key".into();
+            }
         }
     }
     for (key, value) in &provider_config.headers {
         let lower = key.to_ascii_lowercase();
         auth.headers
             .retain(|existing, _| existing.to_ascii_lowercase() != lower);
-        auth.headers.insert(key.clone(), value.clone());
+        if let Some(resolved) = resolve_config_value(value, env) {
+            auth.headers.insert(key.clone(), resolved);
+        }
     }
     if let Some(model) = model {
         for (key, value) in &model.headers {
@@ -302,6 +483,11 @@ fn validate_model_definition(path: &str, value: &Value, errors: &mut Vec<String>
         object.get("maxTokens"),
         errors,
     );
+    validate_thinking_level_map(
+        &format!("{path}.thinkingLevelMap"),
+        object.get("thinkingLevelMap"),
+        errors,
+    );
     validate_input_array(&format!("{path}.input"), object.get("input"), errors);
     validate_model_cost(&format!("{path}.cost"), object.get("cost"), true, errors);
     validate_string_record(&format!("{path}.headers"), object.get("headers"), errors);
@@ -329,9 +515,15 @@ fn validate_model_override(path: &str, value: &Value, errors: &mut Vec<String>) 
         object.get("maxTokens"),
         errors,
     );
+    validate_thinking_level_map(
+        &format!("{path}.thinkingLevelMap"),
+        object.get("thinkingLevelMap"),
+        errors,
+    );
     validate_input_array(&format!("{path}.input"), object.get("input"), errors);
     validate_model_cost(&format!("{path}.cost"), object.get("cost"), false, errors);
     validate_string_record(&format!("{path}.headers"), object.get("headers"), errors);
+    validate_compat(&format!("{path}.compat"), object.get("compat"), errors);
 }
 
 fn validate_model_cost(
@@ -474,6 +666,220 @@ fn validate_compat(path: &str, value: Option<&Value>, errors: &mut Vec<String>) 
         object.get("supportsEagerToolInputStreaming"),
         errors,
     );
+    for key in [
+        "requiresToolResultName",
+        "requiresAssistantAfterToolResult",
+        "requiresThinkingAsText",
+        "requiresReasoningContentOnAssistantMessages",
+        "supportsOpenAIGrammarTools",
+        "sendSessionAffinityHeaders",
+        "supportsAdditionalTools",
+        "supportsToolSearch",
+        "supportsCacheControlOnTools",
+        "supportsTemperature",
+        "forceAdaptiveThinking",
+        "allowEmptySignature",
+        "supportsStrictTools",
+        "supportsToolReferences",
+    ] {
+        expect_optional_bool(&format!("{path}.{key}"), object.get(key), errors);
+    }
+    validate_openrouter_routing(
+        &format!("{path}.openRouterRouting"),
+        object.get("openRouterRouting"),
+        errors,
+    );
+    validate_vercel_gateway_routing(
+        &format!("{path}.vercelGatewayRouting"),
+        object.get("vercelGatewayRouting"),
+        errors,
+    );
+    validate_chat_template_record(
+        &format!("{path}.chatTemplateKwargs"),
+        object.get("chatTemplateKwargs"),
+        errors,
+    );
+    validate_chat_template_record(
+        &format!("{path}.chatTemplateArgs"),
+        object.get("chatTemplateArgs"),
+        errors,
+    );
+}
+
+fn validate_thinking_level_map(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    for key in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        match object.get(key) {
+            None | Some(Value::Null) | Some(Value::String(_)) => {}
+            Some(_) => errors.push(format!("  - {path}.{key}: Expected union value")),
+        }
+    }
+}
+
+fn validate_openrouter_routing(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    for key in [
+        "allow_fallbacks",
+        "require_parameters",
+        "zdr",
+        "enforce_distillable_text",
+    ] {
+        expect_optional_bool(&format!("{path}.{key}"), object.get(key), errors);
+    }
+    expect_optional_union(
+        &format!("{path}.data_collection"),
+        object.get("data_collection"),
+        &["deny", "allow"],
+        errors,
+    );
+    for key in ["order", "only", "ignore", "quantizations"] {
+        validate_string_array(&format!("{path}.{key}"), object.get(key), errors);
+    }
+    validate_openrouter_sort(&format!("{path}.sort"), object.get("sort"), errors);
+    validate_openrouter_max_price(
+        &format!("{path}.max_price"),
+        object.get("max_price"),
+        errors,
+    );
+    validate_number_or_percentiles(
+        &format!("{path}.preferred_min_throughput"),
+        object.get("preferred_min_throughput"),
+        errors,
+    );
+    validate_number_or_percentiles(
+        &format!("{path}.preferred_max_latency"),
+        object.get("preferred_max_latency"),
+        errors,
+    );
+}
+
+fn validate_vercel_gateway_routing(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    validate_string_array(&format!("{path}.only"), object.get("only"), errors);
+    validate_string_array(&format!("{path}.order"), object.get("order"), errors);
+}
+
+fn validate_openrouter_sort(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        Some(Value::Object(object)) => {
+            match object.get("by") {
+                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                Some(_) => errors.push(format!("  - {path}.by: Expected string")),
+            }
+            match object.get("partition") {
+                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                Some(_) => errors.push(format!("  - {path}.partition: Expected union value")),
+            }
+        }
+        Some(_) => errors.push(format!("  - {path}: Expected union value")),
+    }
+}
+
+fn validate_openrouter_max_price(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    for key in ["prompt", "completion", "image", "audio", "request"] {
+        match object.get(key) {
+            None | Some(Value::Null) => {}
+            Some(item) if item.is_number() || item.is_string() => {}
+            Some(_) => errors.push(format!("  - {path}.{key}: Expected union value")),
+        }
+    }
+}
+
+fn validate_number_or_percentiles(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(item) if item.is_number() => {}
+        Some(Value::Object(object)) => {
+            for key in ["p50", "p75", "p90", "p99"] {
+                expect_optional_number(&format!("{path}.{key}"), object.get(key), errors);
+            }
+        }
+        Some(_) => errors.push(format!("  - {path}: Expected union value")),
+    }
+}
+
+fn validate_string_array(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                if !item.is_string() {
+                    errors.push(format!("  - {path}.{index}: Expected string"));
+                }
+            }
+        }
+        Some(_) => errors.push(format!("  - {path}: Expected array")),
+    }
+}
+
+fn validate_chat_template_record(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        errors.push(format!("  - {path}: Expected object"));
+        return;
+    };
+    for (key, item) in object {
+        match item {
+            Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {}
+            Value::Object(map) => match map.get("$var") {
+                None => errors.push(format!("  - {path}.{key}.$var: Expected required property")),
+                Some(Value::String(var))
+                    if var == "thinking.enabled" || var == "thinking.effort" =>
+                {
+                    expect_optional_bool(
+                        &format!("{path}.{key}.omitWhenOff"),
+                        map.get("omitWhenOff"),
+                        errors,
+                    );
+                }
+                Some(_) => errors.push(format!("  - {path}.{key}.$var: Expected union value")),
+            },
+            _ => errors.push(format!("  - {path}.{key}: Expected union value")),
+        }
+    }
 }
 
 fn expect_optional_union(
@@ -992,8 +1398,9 @@ mod tests {
             headers: Default::default(),
             source: "none".into(),
         };
-        apply_config_auth(&mut auth, &config, "local", models.first());
+        apply_config_auth(&mut auth, &config, "local", models.first(), &HashMap::new());
         assert_eq!(auth.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(auth.source, "configured API key");
         assert_eq!(
             auth.headers.get("Authorization").map(String::as_str),
             Some("Bearer sk-test")
@@ -1101,5 +1508,62 @@ mod tests {
             .contains("  - providers.local.compat.thinkingFormat: Expected union value"));
         assert!(compat_error
             .contains("  - providers.local.compat.cacheControlFormat: Expected const value"));
+
+        let routing = write(
+            "routing.json",
+            r#"{"providers":{"local":{"baseUrl":"http://127.0.0.1:9","compat":{"openRouterRouting":{"allow_fallbacks":"yes","data_collection":"maybe","order":"anthropic","sort":1,"max_price":{"prompt":true},"preferred_min_throughput":{"p50":"x"}},"vercelGatewayRouting":{"only":1},"chatTemplateKwargs":{"thinking":{"$var":"thinking.foo"}},"requiresToolResultName":"no"}}}}"#,
+        );
+        let routing_error = routing.error().unwrap();
+        assert!(routing_error.contains(
+            "  - providers.local.compat.openRouterRouting.allow_fallbacks: Expected boolean"
+        ));
+        assert!(routing_error.contains(
+            "  - providers.local.compat.openRouterRouting.data_collection: Expected union value"
+        ));
+        assert!(routing_error
+            .contains("  - providers.local.compat.openRouterRouting.order: Expected array"));
+        assert!(routing_error
+            .contains("  - providers.local.compat.openRouterRouting.sort: Expected union value"));
+        assert!(routing_error.contains(
+            "  - providers.local.compat.openRouterRouting.max_price.prompt: Expected union value"
+        ));
+        assert!(routing_error.contains(
+            "  - providers.local.compat.openRouterRouting.preferred_min_throughput.p50: Expected number"
+        ));
+        assert!(routing_error
+            .contains("  - providers.local.compat.vercelGatewayRouting.only: Expected array"));
+        assert!(routing_error.contains(
+            "  - providers.local.compat.chatTemplateKwargs.thinking.$var: Expected union value"
+        ));
+        assert!(routing_error
+            .contains("  - providers.local.compat.requiresToolResultName: Expected boolean"));
+    }
+
+    #[test]
+    fn config_value_env_names_match_ts() {
+        assert!(is_command_config_value("!echo key"));
+        assert!(!is_command_config_value("$!echo"));
+        assert_eq!(
+            config_value_env_var_names("$FOO-${BAR}_$$BAZ"),
+            vec!["FOO".to_string(), "BAR".to_string()]
+        );
+        assert_eq!(
+            config_value_env_var_names("$FOO_${BAR}"),
+            vec!["FOO_".to_string(), "BAR".to_string()]
+        );
+        assert!(config_value_env_var_names("literal-key").is_empty());
+        assert!(config_value_env_var_names("!echo $FOO").is_empty());
+        let mut env = HashMap::new();
+        env.insert("FOO".into(), "left".into());
+        env.insert("BAR".into(), "right".into());
+        assert_eq!(
+            resolve_config_value("$FOO-${BAR}", &env).as_deref(),
+            Some("left-right")
+        );
+        assert_eq!(
+            resolve_config_value("$!literal", &env).as_deref(),
+            Some("!literal")
+        );
+        assert!(resolve_config_value("!echo should-not-run", &env).is_none());
     }
 }

@@ -13,7 +13,9 @@ mod providers;
 mod stream;
 
 pub use auth::{
-    resolve_provider_auth, AuthStorage, AuthStorageError, Credential, CredentialKind, ResolvedAuth,
+    bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
+    parse_copilot_available_model_ids, resolve_provider_auth, vertex_ambient_auth, AuthStorage,
+    AuthStorageError, Credential, CredentialKind, ResolvedAuth,
 };
 pub use catalog::{
     builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models,
@@ -29,12 +31,13 @@ pub use codex::{
     WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
 };
 pub use model_config::{
-    apply_config_auth, apply_models_config, load_models_json, merge_headers, models_json_path,
-    ModelConfig, ModelsJsonProvider, NO_MODELS_AVAILABLE,
+    apply_config_auth, apply_models_config, config_value_env_var_names, is_command_config_value,
+    load_models_json, merge_headers, models_json_path, resolve_config_value, ModelConfig,
+    ModelsJsonProvider, NO_MODELS_AVAILABLE,
 };
 pub use model_runtime::{
-    empty_catalog_error, format_no_models_available_message, snapshot_availability, AuthCheck,
-    ModelRuntimeSnapshot,
+    check_auth, empty_catalog_error, format_no_models_available_message, get_available,
+    snapshot_availability, AuthCheck, ModelRuntimeSnapshot,
 };
 pub use models_store::{
     catalog_url, load_models_store, merge_models, models_store_path, now_ms, parse_remote_catalog,
