@@ -1,6 +1,7 @@
 mod args;
 mod commands;
 mod export;
+mod extensions;
 mod rpc;
 mod settings;
 mod slash;
@@ -15,10 +16,12 @@ use args::{
 use commands::dispatch_subcommand;
 use pi_agent::context::{load_context_files, render_system_prompt};
 use pi_agent::{
-    run_agent, AgentConfig, AgentEvent, AgentMessage, FollowUpQueue, SteerQueue, ToolRegistry,
+    run_agent, AgentConfig, AgentEvent, AgentMessage, AllowAllPermissionPolicy, FollowUpQueue,
+    SteerQueue, ToolRegistry,
 };
 use pi_ai::catalog::resolve_model;
 use pi_ai::list_models;
+use pi_ai::{get_env_api_key, AuthStorage, FileAuthStorage};
 use pi_session::{
     append_session_name, clone_session, continue_latest, create_session, default_sessions_root,
     fork_session, resume_by_id_or_path,
@@ -139,6 +142,29 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         &parsed.append_system_prompt,
         &context,
     );
+    let discovered = extensions::discover_extensions(
+        &commands::agent_dir(),
+        &cwd,
+        &parsed.extensions,
+        parsed.no_extensions,
+    );
+    if parsed.verbose {
+        let settings = extensions::load_settings_value(&commands::settings_path(false));
+        let packages = extensions::settings_packages(&settings);
+        if !discovered.is_empty() || !packages.is_empty() {
+            eprintln!(
+                "extensions: {}",
+                discovered
+                    .iter()
+                    .map(|e| format!("{}={}", e.name, e.path.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !packages.is_empty() {
+                eprintln!("packages: {}", packages.join(", "));
+            }
+        }
+    }
     let tools = build_tools(&parsed);
     let model_spec = parsed.model.as_deref().unwrap_or("google/gemini-2.5-flash");
     let (model_id, thinking_from_model) = split_thinking(model_spec);
@@ -302,20 +328,7 @@ fn run_print(
         eprintln!("Error: print mode requires a prompt");
         return Ok(1);
     }
-    let config = AgentConfig {
-        cwd: cwd.to_path_buf(),
-        system_prompt: system_prompt.to_string(),
-        model_provider: provider.to_string(),
-        model_id: model_id.to_string(),
-        auto_retry: true,
-        max_retries: 2,
-        auto_compact: true,
-        context_window: 128_000,
-        fixture: std::env::var("PI_STREAM_FIXTURE")
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|raw| serde_json::from_str(&raw).ok()),
-    };
+    let config = agent_config(parsed, cwd, provider, model_id, system_prompt);
     let events =
         run_agent(&config, messages, tools, steer, follow_up).map_err(|e| e.to_string())?;
     if json {
@@ -382,49 +395,175 @@ fn run_interactive(
     for line in selector.render(80) {
         println!("{line}");
     }
-    if !initial.is_empty() {
-        let md = Markdown::new(&initial[0].content);
-        for line in md.render(80) {
-            println!("{line}");
-        }
-        let _ = tools;
-        let _ = system_prompt;
-        let _ = cwd;
+    let _ = tools;
+    let editor = Editor::default();
+    for line in editor.render(80) {
+        let _ = Text::new(line);
+    }
+    let mut messages = initial.to_vec();
+    let mut steer = SteerQueue::default();
+    let mut follow = FollowUpQueue::default();
+    if !messages.is_empty() {
+        print_agent_turn(
+            parsed,
+            cwd,
+            provider,
+            model_id,
+            system_prompt,
+            tools,
+            &messages,
+            &mut steer,
+            &mut follow,
+            session_path.as_deref(),
+        )?;
     } else {
-        let editor = Editor::default();
-        for line in editor.render(80) {
-            let _ = Text::new(line);
-        }
         println!("Type a prompt, or /help. Ctrl+C to quit.");
-        if let Some(line) = io::stdin().lock().lines().next() {
-            let line = line.map_err(|e| e.to_string())?;
-            if let Some((cmd, args)) = slash::parse_slash(&line) {
-                match cmd {
-                    "quit" => {}
-                    "clone" => {
-                        if let Some(path) = &session_path {
-                            if let Ok(info) = pi_session::read_session_info(path) {
-                                let _ = clone_session(
-                                    &default_sessions_root(),
-                                    &info,
-                                    &cwd.to_string_lossy(),
-                                );
-                            }
+    }
+    for line in io::stdin().lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some((cmd, args)) = slash::parse_slash(&line) {
+            match cmd {
+                "quit" | "exit" => break,
+                "help" => {
+                    for (name, desc) in slash::BUILTIN_SLASH_COMMANDS {
+                        println!("/{name}  {desc}");
+                    }
+                }
+                "clone" => {
+                    if let Some(path) = &session_path {
+                        if let Ok(info) = pi_session::read_session_info(path) {
+                            let _ = clone_session(
+                                &default_sessions_root(),
+                                &info,
+                                &cwd.to_string_lossy(),
+                            );
                         }
                     }
-                    "trust" => {
-                        settings::save_trust(&commands::agent_dir(), cwd);
-                        println!("Trusted {}", cwd.display());
-                    }
-                    other => println!("/{other} {args}"),
                 }
-            } else if !line.trim().is_empty() {
-                println!("{line}");
+                "trust" => {
+                    settings::save_trust(&commands::agent_dir(), cwd);
+                    println!("Trusted {}", cwd.display());
+                }
+                "login" => {
+                    if let Some(url) = pi_ai::authorize_url(args, "http://127.0.0.1:8765/cb", "pi")
+                    {
+                        println!("Open: {url}");
+                    } else {
+                        println!("Usage: /login <provider>");
+                    }
+                }
+                other => println!("/{other} {args}"),
             }
+            continue;
         }
+        messages.push(AgentMessage {
+            role: "user".into(),
+            content: line,
+            images: vec![],
+        });
+        print_agent_turn(
+            parsed,
+            cwd,
+            provider,
+            model_id,
+            system_prompt,
+            tools,
+            &messages,
+            &mut steer,
+            &mut follow,
+            session_path.as_deref(),
+        )?;
     }
     if fullscreen {
         leave_alt_screen(&mut stdout).ok();
+    }
+    Ok(0)
+}
+
+fn resolve_api_key(parsed: &Args, provider: &str) -> Option<String> {
+    if let Some(key) = &parsed.api_key {
+        return Some(key.clone());
+    }
+    if let Some(key) = get_env_api_key(provider) {
+        return Some(key);
+    }
+    FileAuthStorage::open(commands::agent_dir().join("auth.json"))
+        .ok()
+        .and_then(|store| store.read(provider))
+        .map(|cred| match cred {
+            pi_ai::Credential::ApiKey { ref key, .. } => key.clone(),
+            pi_ai::Credential::Oauth { ref access, .. } => access.clone(),
+        })
+}
+
+fn agent_config(
+    parsed: &Args,
+    cwd: &Path,
+    provider: &str,
+    model_id: &str,
+    system_prompt: &str,
+) -> AgentConfig {
+    let fixture = std::env::var("PI_STREAM_FIXTURE")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    AgentConfig {
+        cwd: cwd.to_path_buf(),
+        system_prompt: system_prompt.to_string(),
+        model_provider: provider.to_string(),
+        model_id: model_id.to_string(),
+        api_key: resolve_api_key(parsed, provider),
+        allow_network: fixture.is_none() && !parsed.offline,
+        auto_retry: true,
+        max_retries: 2,
+        auto_compact: true,
+        context_window: 128_000,
+        max_turns: 16,
+        fixture,
+        permission: Box::new(AllowAllPermissionPolicy),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_agent_turn(
+    parsed: &Args,
+    cwd: &Path,
+    provider: &str,
+    model_id: &str,
+    system_prompt: &str,
+    tools: &ToolRegistry,
+    messages: &[AgentMessage],
+    steer: &mut SteerQueue,
+    follow_up: &mut FollowUpQueue,
+    session_path: Option<&Path>,
+) -> Result<i32, String> {
+    let config = agent_config(parsed, cwd, provider, model_id, system_prompt);
+    let events =
+        run_agent(&config, messages, tools, steer, follow_up).map_err(|e| e.to_string())?;
+    for event in events {
+        match event {
+            AgentEvent::Message { message } => {
+                let md = Markdown::new(&message.content);
+                for line in md.render(80) {
+                    println!("{line}");
+                }
+                if let Some(path) = session_path {
+                    let _ = pi_session::append_entry(
+                        path,
+                        &serde_json::json!({"type":"message","role": message.role, "content": message.content}),
+                    );
+                }
+            }
+            AgentEvent::ToolStart { name, .. } => println!("▶ {name}"),
+            AgentEvent::ToolEnd { name, output, .. } => {
+                println!("■ {name}\n{output}");
+            }
+            AgentEvent::Error { message } => eprintln!("Error: {message}"),
+            _ => {}
+        }
     }
     Ok(0)
 }

@@ -4,7 +4,11 @@ pub mod auth;
 pub mod catalog;
 pub mod cost;
 pub mod events;
+pub mod http;
+pub mod oauth;
 pub mod providers;
+pub mod request;
+pub mod retry;
 pub mod stream;
 pub mod types;
 
@@ -16,6 +20,9 @@ pub use catalog::{
 };
 pub use cost::usage_cost;
 pub use events::{AssistantMessage, AssistantMessageEvent, StopReason};
+pub use oauth::{authorize_url, oauth_app, parse_token_response};
+pub use request::{build_request_body, resolve_api, RequestContext};
+pub use retry::{is_retryable_assistant_error, RetryPolicy};
 pub use stream::{complete, stream_complete, StreamEvent, StreamOptions};
 pub use types::{
     ContentBlock, KnownApi, KnownProvider, Message, Role, ThinkingLevel, ToolCall, Usage,

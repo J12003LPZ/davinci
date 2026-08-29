@@ -114,6 +114,9 @@ impl SessionSqlite {
         self.upsert_session(&info)?;
         self.conn
             .execute("DELETE FROM entries WHERE session_id = ?1", [&info.id])?;
+        let _ = self
+            .conn
+            .execute("DELETE FROM entries_fts WHERE session_id = ?1", [&info.id]);
         for (seq, line) in fs::read_to_string(path)
             .map_err(|e| SqliteError::Message(e.to_string()))?
             .lines()
@@ -133,11 +136,49 @@ impl SessionSqlite {
                 "INSERT OR REPLACE INTO entries(session_id, seq, type, body) VALUES (?1, ?2, ?3, ?4)",
                 params![info.id, (seq as i64) + 1, ty, line],
             )?;
+            let _ = self.conn.execute(
+                "INSERT INTO entries_fts(session_id, type, body) VALUES (?1, ?2, ?3)",
+                params![info.id, ty, line],
+            );
         }
         Ok(info)
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<SessionInfo>, SqliteError> {
+        if let Ok(hits) = self.search_fts(query) {
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+        self.search_like(query)
+    }
+
+    fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
+        Ok(SessionInfo {
+            id: row.get(0)?,
+            path: PathBuf::from(row.get::<_, String>(1)?),
+            cwd: row.get(2)?,
+            created_at: row.get(3)?,
+            modified_at: row.get(4)?,
+            source_format: row.get(5)?,
+            name: row.get(6)?,
+            parent_session_id: row.get(7)?,
+        })
+    }
+
+    fn search_fts(&self, query: &str) -> Result<Vec<SessionInfo>, SqliteError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT s.id, s.path, s.cwd, s.created_at, s.modified_at, s.source_format, s.name, s.parent_session_id
+             FROM sessions s
+             JOIN entries_fts f ON f.session_id = s.id
+             WHERE entries_fts MATCH ?1
+             ORDER BY s.modified_at DESC",
+        )?;
+        let rows = stmt.query_map([query], Self::map_session_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn search_like(&self, query: &str) -> Result<Vec<SessionInfo>, SqliteError> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT s.id, s.path, s.cwd, s.created_at, s.modified_at, s.source_format, s.name, s.parent_session_id
              FROM sessions s
@@ -146,18 +187,7 @@ impl SessionSqlite {
              ORDER BY s.modified_at DESC",
         )?;
         let pattern = format!("%{query}%");
-        let rows = stmt.query_map([&pattern], |row| {
-            Ok(SessionInfo {
-                id: row.get(0)?,
-                path: PathBuf::from(row.get::<_, String>(1)?),
-                cwd: row.get(2)?,
-                created_at: row.get(3)?,
-                modified_at: row.get(4)?,
-                source_format: row.get(5)?,
-                name: row.get(6)?,
-                parent_session_id: row.get(7)?,
-            })
-        })?;
+        let rows = stmt.query_map([&pattern], Self::map_session_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 

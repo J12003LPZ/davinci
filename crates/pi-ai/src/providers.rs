@@ -17,6 +17,13 @@ pub fn provider_display_name(id: &str) -> &'static str {
         "openai-codex" => "OpenAI Codex",
         "github-copilot" => "GitHub Copilot",
         "openrouter" => "OpenRouter",
+        "amazon-bedrock" => "Amazon Bedrock",
+        "mistral" => "Mistral",
+        "groq" => "Groq",
+        "deepseek" => "DeepSeek",
+        "xai" => "xAI",
+        "google-vertex" => "Google Vertex",
+        "azure-openai-responses" => "Azure OpenAI",
         other => Box::leak(other.to_string().into_boxed_str()),
     }
 }

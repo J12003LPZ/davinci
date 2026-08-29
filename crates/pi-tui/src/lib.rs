@@ -29,6 +29,26 @@ mod tests {
         assert!(!rendered.is_empty());
     }
 
+    #[test]
+    fn wrap_ansi_and_keys_match_ts_fixtures() {
+        let wrapped = crate::component::wrap("one two three four", 8);
+        assert!(wrapped.iter().all(|l| display_width(l) <= 8));
+        assert_eq!(parse_key("\u{1b}[A"), Key::Up);
+        assert_eq!(parse_key("ctrl+c"), Key::Ctrl('c'));
+        assert_eq!(parse_key("enter"), Key::Enter);
+        let mut editor = Editor::default();
+        editor.handle_key(&Key::Char('π'));
+        editor.handle_key(&Key::Left);
+        editor.handle_key(&Key::Char('x'));
+        assert_eq!(editor.buffer, "xπ");
+        let list = SelectList::new(vec!["apple".into(), "apricot".into(), "banana".into()]);
+        let mut list = list;
+        list.query = "ap".into();
+        let rendered = list.render(20);
+        assert!(rendered.iter().any(|l| l.contains("apple")));
+        assert!(!rendered.iter().any(|l| l.contains("banana")));
+    }
+
     fn display_width(s: &str) -> usize {
         unicode_width::UnicodeWidthStr::width(s)
     }

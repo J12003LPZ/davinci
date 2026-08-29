@@ -36,8 +36,16 @@ impl ToolRegistry {
                 Box::new(WriteTool),
                 Box::new(EditTool),
                 Box::new(BashTool),
+                Box::new(LsTool),
+                Box::new(GrepTool),
+                Box::new(FindTool),
             ],
         }
+    }
+
+    pub fn register(&mut self, tool: Box<dyn BuiltinTool>) {
+        self.tools.retain(|t| t.name() != tool.name());
+        self.tools.push(tool);
     }
 
     pub fn with_names(names: &[String]) -> Self {
@@ -155,6 +163,73 @@ impl BuiltinTool for EditTool {
     }
 }
 
+struct LsTool;
+impl BuiltinTool for LsTool {
+    fn name(&self) -> &'static str {
+        "ls"
+    }
+    fn description(&self) -> &'static str {
+        "List directory contents"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"number"}}})
+    }
+    fn execute(&self, input: &Value, cwd: &Path) -> Result<ToolResult, ToolError> {
+        ls(
+            cwd,
+            input.get("path").and_then(|v| v.as_str()).unwrap_or("."),
+            input.get("limit").and_then(|v| v.as_u64()).unwrap_or(500) as usize,
+        )
+    }
+}
+
+struct GrepTool;
+impl BuiltinTool for GrepTool {
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+    fn description(&self) -> &'static str {
+        "Search file contents for patterns (respects .gitignore)"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"limit":{"type":"number"}},"required":["pattern"]})
+    }
+    fn execute(&self, input: &Value, cwd: &Path) -> Result<ToolResult, ToolError> {
+        grep(
+            cwd,
+            input.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
+            input.get("path").and_then(|v| v.as_str()),
+            input.get("glob").and_then(|v| v.as_str()),
+            input
+                .get("ignoreCase")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            input.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize,
+        )
+    }
+}
+
+struct FindTool;
+impl BuiltinTool for FindTool {
+    fn name(&self) -> &'static str {
+        "find"
+    }
+    fn description(&self) -> &'static str {
+        "Find files by glob pattern (respects .gitignore)"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"number"}},"required":["pattern"]})
+    }
+    fn execute(&self, input: &Value, cwd: &Path) -> Result<ToolResult, ToolError> {
+        find_files(
+            cwd,
+            input.get("pattern").and_then(|v| v.as_str()).unwrap_or("*"),
+            input.get("path").and_then(|v| v.as_str()),
+            input.get("limit").and_then(|v| v.as_u64()).unwrap_or(1000) as usize,
+        )
+    }
+}
+
 struct BashTool;
 impl BuiltinTool for BashTool {
     fn name(&self) -> &'static str {
@@ -224,6 +299,119 @@ pub fn edit(
     })
 }
 
+pub fn ls(cwd: &Path, path: &str, limit: usize) -> Result<ToolResult, ToolError> {
+    let resolved = resolve_path(cwd, path);
+    let mut names = Vec::new();
+    let entries = fs::read_dir(&resolved).map_err(|e| ToolError::Message(e.to_string()))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let suffix = if entry.path().is_dir() { "/" } else { "" };
+        names.push(format!("{name}{suffix}"));
+        if names.len() >= limit {
+            break;
+        }
+    }
+    names.sort();
+    Ok(ToolResult {
+        output: names.join("\n"),
+        is_error: false,
+        details: json!({"path": resolved, "count": names.len()}),
+    })
+}
+
+pub fn grep(
+    cwd: &Path,
+    pattern: &str,
+    path: Option<&str>,
+    glob_pat: Option<&str>,
+    ignore_case: bool,
+    limit: usize,
+) -> Result<ToolResult, ToolError> {
+    let root = resolve_path(cwd, path.unwrap_or("."));
+    let flags = if ignore_case { "(?i)" } else { "" };
+    let re = regex::Regex::new(&format!("{flags}{pattern}"))
+        .map_err(|e| ToolError::Message(format!("Invalid regex: {e}")))?;
+    let matcher = glob_pat.map(|g| glob::Pattern::new(g).ok()).unwrap_or(None);
+    let mut hits = Vec::new();
+    if root.is_file() {
+        grep_file(&root, cwd, &re, &mut hits, limit);
+    } else {
+        for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
+            if hits.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(pat) = &matcher {
+                if !pat.matches_path(path) {
+                    continue;
+                }
+            }
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.') || n == "target")
+            {
+                continue;
+            }
+            grep_file(path, cwd, &re, &mut hits, limit);
+        }
+    }
+    Ok(ToolResult {
+        output: hits.join("\n"),
+        is_error: false,
+        details: json!({"matches": hits.len()}),
+    })
+}
+
+fn grep_file(path: &Path, cwd: &Path, re: &regex::Regex, hits: &mut Vec<String>, limit: usize) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let rel = path.strip_prefix(cwd).unwrap_or(path);
+    for (i, line) in content.lines().enumerate() {
+        if hits.len() >= limit {
+            return;
+        }
+        if re.is_match(line) {
+            hits.push(format!("{}:{}:{line}", rel.display(), i + 1));
+        }
+    }
+}
+
+pub fn find_files(
+    cwd: &Path,
+    pattern: &str,
+    path: Option<&str>,
+    limit: usize,
+) -> Result<ToolResult, ToolError> {
+    let root = resolve_path(cwd, path.unwrap_or("."));
+    let pat = glob::Pattern::new(pattern)
+        .map_err(|e| ToolError::Message(format!("Invalid glob: {e}")))?;
+    let mut hits = Vec::new();
+    for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
+        if hits.len() >= limit {
+            break;
+        }
+        let p = entry.path();
+        let rel = p.strip_prefix(&root).unwrap_or(p);
+        let rel_posix = rel.to_string_lossy().replace('\\', "/");
+        if pat.matches(&rel_posix)
+            || pat.matches(p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+        {
+            let suffix = if p.is_dir() { "/" } else { "" };
+            hits.push(format!("{rel_posix}{suffix}"));
+        }
+    }
+    Ok(ToolResult {
+        output: hits.join("\n"),
+        is_error: false,
+        details: json!({"count": hits.len()}),
+    })
+}
+
 pub fn bash(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {
     let output = Command::new("bash")
         .arg("-lc")
@@ -262,7 +450,14 @@ mod tests {
         let missing = edit(dir.path(), "a.txt", "nope", "x").unwrap();
         assert!(missing.is_error);
         assert!(missing.output.contains("oldText not found"));
-        let ls = bash(dir.path(), "printf hi").unwrap();
-        assert_eq!(ls.output, "hi");
+        let out = bash(dir.path(), "printf hi").unwrap();
+        assert_eq!(out.output, "hi");
+        write_file(dir.path(), "src/a.rs", "fn main() {}").unwrap();
+        let listed = ls(dir.path(), ".", 50).unwrap();
+        assert!(listed.output.contains("a.txt") || listed.output.contains("src/"));
+        let found = find_files(dir.path(), "*.rs", None, 50).unwrap();
+        assert!(found.output.contains("a.rs"));
+        let grepped = grep(dir.path(), "main", None, Some("*.rs"), false, 20).unwrap();
+        assert!(grepped.output.contains("main"));
     }
 }

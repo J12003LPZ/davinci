@@ -4,6 +4,7 @@ pub mod compaction;
 pub mod context;
 pub mod events;
 pub mod loop_;
+pub mod permission;
 pub mod queues;
 pub mod skills;
 pub mod templates;
@@ -12,9 +13,14 @@ pub mod tools;
 pub use compaction::compact_messages;
 pub use events::{AgentEvent, AgentMessage};
 pub use loop_::{run_agent, AgentConfig, AgentError};
+pub use permission::{
+    AllowAllPermissionPolicy, DenyAllPermissionPolicy, NamedPermissionPolicy, PermissionDecision,
+    PermissionPolicy,
+};
 pub use queues::{FollowUpQueue, SteerQueue};
 pub use tools::{
-    bash, edit, read_file, write_file, BuiltinTool, ToolError, ToolRegistry, ToolResult,
+    bash, edit, find_files, grep, ls, read_file, write_file, BuiltinTool, ToolError, ToolRegistry,
+    ToolResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

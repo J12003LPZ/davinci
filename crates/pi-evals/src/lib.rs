@@ -28,11 +28,15 @@ pub fn run_eval(case: &EvalCase) -> EvalResult {
         system_prompt: "eval".into(),
         model_provider: "faux".into(),
         model_id: "fixture".into(),
+        api_key: None,
+        allow_network: false,
         auto_retry: false,
         max_retries: 0,
         auto_compact: false,
         context_window: 128_000,
+        max_turns: 8,
         fixture: Some(case.fixture.clone()),
+        permission: Box::new(pi_agent::AllowAllPermissionPolicy),
     };
     let events = run_agent(
         &config,

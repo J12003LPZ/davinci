@@ -114,6 +114,16 @@ pub fn handle_rpc(
         }
         "set_session_name" => json!({"ok": true, "name": command.get("name")}),
         "get_session_stats" => json!({"ok": true, "messages": messages.len()}),
+        "extension_tool" => {
+            let path = command.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let name = command.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let input = command.get("input").cloned().unwrap_or(json!({}));
+            match crate::extensions::invoke_extension_tool(std::path::Path::new(path), name, &input)
+            {
+                Ok(result) => json!({"ok": true, "result": result}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
+        }
         "bash" => {
             let command_text = command
                 .get("command")
