@@ -1,5 +1,6 @@
 //! Shared AgentSession runtime used by print, JSON, RPC, and interactive.
 
+use crate::args::FlagValue;
 use crate::event_bus::EventBus;
 use crate::export;
 use crate::extension_ui::ExtensionUiHost;
@@ -17,6 +18,7 @@ use pi_session::{
     session_stats, session_tree, SessionInfo,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub struct SessionRuntime {
@@ -47,6 +49,8 @@ pub struct SessionRuntime {
     pub ui: ExtensionUiHost,
     pub extensions: Vec<Extension>,
     pub registry: ExtensionRegistry,
+    pub theme: String,
+    pub flag_values: BTreeMap<String, Value>,
 }
 
 impl SessionRuntime {
@@ -77,10 +81,95 @@ impl SessionRuntime {
 
     pub fn bind_extensions(&mut self) {
         self.registry = extensions::load_extensions(&self.extensions);
+        self.registry
+            .shortcuts
+            .retain(|shortcut| !extensions::is_reserved_shortcut(&shortcut.shortcut));
         for tool in &self.registry.tools {
             self.tools
                 .register(Box::new(ExtensionTool::from_meta(tool)));
         }
+        for flag in &self.registry.flags {
+            if !self.flag_values.contains_key(&flag.name) {
+                if let Some(default) = &flag.default {
+                    self.flag_values.insert(flag.name.clone(), default.clone());
+                }
+            }
+        }
+    }
+
+    pub fn apply_cli_flags(
+        &mut self,
+        flags: &BTreeMap<String, FlagValue>,
+    ) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        let mut unknown = Vec::new();
+        for (name, value) in flags {
+            let Some(flag) = self.registry.flags.iter().find(|f| f.name == *name) else {
+                unknown.push(name.clone());
+                continue;
+            };
+            match flag.flag_type.as_str() {
+                "string" => match value {
+                    FlagValue::String(text) => {
+                        self.flag_values.insert(name.clone(), json!(text));
+                    }
+                    FlagValue::Bool(_) => {
+                        errors.push(format!("Extension flag \"--{name}\" requires a value"));
+                    }
+                },
+                _ => {
+                    self.flag_values.insert(name.clone(), json!(true));
+                }
+            }
+        }
+        if !unknown.is_empty() {
+            errors.push(format!(
+                "Unknown option{}: {}",
+                if unknown.len() == 1 { "" } else { "s" },
+                unknown
+                    .iter()
+                    .map(|name| format!("--{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    pub fn flags_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        for (name, value) in &self.flag_values {
+            map.insert(name.clone(), value.clone());
+        }
+        Value::Object(map)
+    }
+
+    pub fn invoke_shortcut(&mut self, shortcut: &str) -> Result<Vec<Value>, String> {
+        let normalized = shortcut.to_ascii_lowercase();
+        if extensions::is_reserved_shortcut(&normalized) {
+            return Err(format!(
+                "Extension shortcut '{normalized}' from built-in conflicts with built-in shortcut. Skipping."
+            ));
+        }
+        let path = self
+            .registry
+            .shortcuts
+            .iter()
+            .find(|s| s.shortcut == normalized)
+            .ok_or_else(|| format!("shortcut not found: {normalized}"))?
+            .path
+            .clone();
+        let invoked = extensions::invoke_extension_shortcut(
+            &path,
+            &normalized,
+            &self.flags_json(),
+            &json!({}),
+        )?;
+        Ok(self.ui.apply_calls(&invoked.ui_calls))
     }
 
     pub fn config(&self) -> AgentConfig {
@@ -190,7 +279,17 @@ impl SessionRuntime {
             .ok_or_else(|| format!("Unknown command: {name}"))?
             .path
             .clone();
-        let invoked = extensions::invoke_extension_command(&path, name, args, &json!({}))?;
+        let invoked = if self.flag_values.is_empty() {
+            extensions::invoke_extension_command(&path, name, args, &json!({}))?
+        } else {
+            extensions::invoke_extension_command_with_flags(
+                &path,
+                name,
+                args,
+                &self.flags_json(),
+                &json!({}),
+            )?
+        };
         Ok(self.ui.apply_calls(&invoked.ui_calls))
     }
 
@@ -248,9 +347,14 @@ impl SessionRuntime {
 
     pub fn fire_extensions(&mut self, event: &str, data: &Value) -> Vec<Value> {
         let paths: Vec<_> = self.extensions.iter().map(|e| e.path.clone()).collect();
+        let mut payload = data.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("flags".into(), self.flags_json());
+        }
         let mut events = Vec::new();
         for path in paths {
-            if let Ok(invoked) = extensions::invoke_extension_event(&path, event, data, &json!({}))
+            if let Ok(invoked) =
+                extensions::invoke_extension_event(&path, event, &payload, &json!({}))
             {
                 events.extend(self.ui.apply_calls(&invoked.ui_calls));
             }
@@ -508,7 +612,23 @@ impl SessionRuntime {
             .session_path
             .as_ref()
             .ok_or_else(|| "no session".to_string())?;
-        export::export_from_file(&path.to_string_lossy(), output).map_err(|e| e.to_string())
+        let renderer = crate::tool_html::ToolHtmlRenderer::new(
+            self.theme.clone(),
+            self.cwd.clone(),
+            self.registry.tools.clone(),
+        );
+        let state = export::HtmlExportState {
+            system_prompt: Some(self.system_prompt.clone()),
+            tools: self.tools.schemas(),
+        };
+        export::export_from_file_with_renderer(
+            &path.to_string_lossy(),
+            output,
+            &self.theme,
+            &renderer,
+            Some(&state),
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn fork_user_messages(&self) -> Vec<Value> {
@@ -686,6 +806,8 @@ mod tests {
             ui: crate::extension_ui::ExtensionUiHost::default(),
             extensions: vec![],
             registry: ExtensionRegistry::default(),
+            theme: "dark".into(),
+            flag_values: Default::default(),
         };
         runtime.registry.providers.push(RegisteredProviderMeta {
             name: "my-proxy".into(),
@@ -733,5 +855,47 @@ mod tests {
             .extra_headers
             .iter()
             .any(|(k, v)| k == "authorization" && v == "Bearer literal-key"));
+    }
+
+    #[test]
+    fn apply_cli_flags_matches_typescript_errors() {
+        let mut runtime = runtime_with_provider();
+        runtime
+            .registry
+            .flags
+            .push(crate::extensions::RegisteredFlagMeta {
+                name: "region".into(),
+                flag_type: "string".into(),
+                default: Some(json!("us")),
+                description: Some("Region".into()),
+                path: PathBuf::from("plugin.js"),
+            });
+        runtime
+            .registry
+            .flags
+            .push(crate::extensions::RegisteredFlagMeta {
+                name: "verbose".into(),
+                flag_type: "boolean".into(),
+                default: Some(json!(false)),
+                description: None,
+                path: PathBuf::from("plugin.js"),
+            });
+        let mut flags = BTreeMap::new();
+        flags.insert("verbose".into(), FlagValue::Bool(true));
+        flags.insert("region".into(), FlagValue::String("eu".into()));
+        runtime.apply_cli_flags(&flags).unwrap();
+        assert_eq!(runtime.flag_values["verbose"], json!(true));
+        assert_eq!(runtime.flag_values["region"], json!("eu"));
+        let mut missing = BTreeMap::new();
+        missing.insert("region".into(), FlagValue::Bool(true));
+        let err = runtime.apply_cli_flags(&missing).unwrap_err();
+        assert!(err
+            .iter()
+            .any(|e| e == "Extension flag \"--region\" requires a value"));
+        let mut unknown = BTreeMap::new();
+        unknown.insert("nope".into(), FlagValue::Bool(true));
+        unknown.insert("also".into(), FlagValue::String("x".into()));
+        let err = runtime.apply_cli_flags(&unknown).unwrap_err();
+        assert!(err.iter().any(|e| e == "Unknown options: --also, --nope"));
     }
 }

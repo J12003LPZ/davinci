@@ -1,3 +1,4 @@
+mod ansi_to_html;
 mod args;
 mod changelog;
 mod clipboard;
@@ -12,6 +13,8 @@ mod session_runtime;
 mod settings;
 mod share;
 mod slash;
+mod theme;
+mod tool_html;
 
 use std::io::{self, BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -93,7 +96,11 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
     }
     if let Some(export) = &parsed.export {
         let output = parsed.messages.first().map(String::as_str);
-        match export::export_from_file(export, output) {
+        let exported = match parsed.use_theme.as_deref() {
+            Some(theme) => export::export_from_file_with_theme(export, output, theme),
+            None => export::export_from_file(export, output),
+        };
+        match exported {
             Ok(path) => {
                 println!("Exported to: {}", path.display());
                 return Ok(0);
@@ -283,8 +290,16 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         ui: crate::extension_ui::ExtensionUiHost::default(),
         extensions: discovered.clone(),
         registry: crate::extensions::ExtensionRegistry::default(),
+        theme: parsed.use_theme.clone().unwrap_or_else(|| "dark".into()),
+        flag_values: Default::default(),
     };
     runtime.bind_extensions();
+    if let Err(errors) = runtime.apply_cli_flags(&parsed.unknown_flags) {
+        for error in errors {
+            eprintln!("Error: {error}");
+        }
+        return Ok(1);
+    }
 
     match app_mode {
         AppMode::Rpc => run_rpc(&mut runtime),

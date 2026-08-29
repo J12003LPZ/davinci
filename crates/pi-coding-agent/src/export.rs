@@ -1,4 +1,6 @@
-use serde_json::Value;
+use crate::theme;
+use crate::tool_html::{self, ToolHtmlRenderer};
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -9,7 +11,41 @@ pub enum ExportError {
     Message(String),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct HtmlExportState {
+    pub system_prompt: Option<String>,
+    pub tools: Vec<Value>,
+}
+
 pub fn export_from_file(input: &str, output: Option<&str>) -> Result<PathBuf, ExportError> {
+    write_export(input, output, None, None, None)
+}
+
+pub fn export_from_file_with_theme(
+    input: &str,
+    output: Option<&str>,
+    theme: &str,
+) -> Result<PathBuf, ExportError> {
+    write_export(input, output, Some(theme), None, None)
+}
+
+pub fn export_from_file_with_renderer(
+    input: &str,
+    output: Option<&str>,
+    theme: &str,
+    renderer: &ToolHtmlRenderer,
+    state: Option<&HtmlExportState>,
+) -> Result<PathBuf, ExportError> {
+    write_export(input, output, Some(theme), Some(renderer), state)
+}
+
+fn write_export(
+    input: &str,
+    output: Option<&str>,
+    theme: Option<&str>,
+    renderer: Option<&ToolHtmlRenderer>,
+    state: Option<&HtmlExportState>,
+) -> Result<PathBuf, ExportError> {
     let input_path = expand_tilde(input);
     let raw = fs::read_to_string(&input_path)
         .map_err(|e| ExportError::Message(format!("Failed to export session: {e}")))?;
@@ -21,13 +57,20 @@ pub fn export_from_file(input: &str, output: Option<&str>) -> Result<PathBuf, Ex
             dest
         }
     };
-    let html = session_to_html(
-        &raw,
-        input_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("session"),
-    );
+    let title = input_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    let html = match (theme, renderer) {
+        (Some(theme), Some(renderer)) => {
+            session_to_html_document(&raw, title, theme, Some(renderer), state)
+        }
+        (Some(theme), None) => session_to_html_with_theme(&raw, title, theme),
+        (None, Some(renderer)) => {
+            session_to_html_document(&raw, title, "dark", Some(renderer), state)
+        }
+        (None, None) => session_to_html(&raw, title),
+    };
     fs::write(&dest, html).map_err(|e| ExportError::Message(e.to_string()))?;
     Ok(dest)
 }
@@ -95,25 +138,21 @@ const HIGHLIGHT_JS: &str = include_str!(
     "../../../vendor/pi/packages/coding-agent/src/core/export-html/vendor/highlight.min.js"
 );
 
-const DEFAULT_THEME_VARS: &str = "\
---text: #d4d4d4;
---accent: #8abeb7;
---border: #5f87ff;
---muted: #808080;
---dim: #666666;
---userMessageBg: #343541;
---userMessageText: #d4d4d4;
---toolPendingBg: #282832;
---toolSuccessBg: #283228;
---toolErrorBg: #3c2828;
---mdHeading: #f0c674;
---mdLink: #81a2be;
---mdCode: #8abeb7;
---exportPageBg: rgb(24, 24, 30);
---exportCardBg: rgb(30, 30, 36);
---exportInfoBg: rgb(60, 55, 40);";
-
 pub fn session_to_html(raw: &str, title: &str) -> String {
+    session_to_html_with_theme(raw, title, "dark")
+}
+
+pub fn session_to_html_with_theme(raw: &str, title: &str, theme: &str) -> String {
+    session_to_html_document(raw, title, theme, None, None)
+}
+
+pub fn session_to_html_document(
+    raw: &str,
+    title: &str,
+    theme: &str,
+    renderer: Option<&ToolHtmlRenderer>,
+    state: Option<&HtmlExportState>,
+) -> String {
     let title = escape_html(title);
     let _ = sanitize_markdown_url("https://pi.dev");
     let (header, entries) = parse_session_document(raw, &title);
@@ -121,20 +160,35 @@ pub fn session_to_html(raw: &str, title: &str) -> String {
         .iter()
         .rev()
         .find_map(|entry| entry.get("id").cloned());
-    let session_json = serde_json::json!({
+    let rendered_tools = renderer.and_then(|r| tool_html::pre_render_custom_tools(&entries, r));
+    let mut session_json = serde_json::json!({
         "header": header,
         "entries": entries,
         "leafId": leaf_id,
     });
+    if let Some(obj) = session_json.as_object_mut() {
+        if let Some(rendered) = rendered_tools {
+            obj.insert("renderedTools".into(), rendered);
+        }
+        if let Some(state) = state {
+            if let Some(prompt) = &state.system_prompt {
+                obj.insert("systemPrompt".into(), json!(prompt));
+            }
+            if !state.tools.is_empty() {
+                obj.insert("tools".into(), json!(state.tools));
+            }
+        }
+    }
     let session_b64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         session_json.to_string().as_bytes(),
     );
+    let (theme_vars, page_bg, card_bg, info_bg) = theme::generate_theme_vars(theme);
     let css = TEMPLATE_CSS
-        .replace("{{THEME_VARS}}", DEFAULT_THEME_VARS)
-        .replace("{{BODY_BG}}", "rgb(24, 24, 30)")
-        .replace("{{CONTAINER_BG}}", "rgb(30, 30, 36)")
-        .replace("{{INFO_BG}}", "rgb(60, 55, 40)");
+        .replace("{{THEME_VARS}}", &theme_vars)
+        .replace("{{BODY_BG}}", &page_bg)
+        .replace("{{CONTAINER_BG}}", &card_bg)
+        .replace("{{INFO_BG}}", &info_bg);
     TEMPLATE_HTML
         .replace(
             "<title>Session Export</title>",
@@ -183,16 +237,25 @@ fn normalize_entry(value: Value) -> Value {
     if value.get("type").and_then(|v| v.as_str()) != Some("message") {
         return value;
     }
+    let mut message = serde_json::Map::new();
+    for key in [
+        "role",
+        "content",
+        "timestamp",
+        "toolCallId",
+        "toolName",
+        "details",
+        "isError",
+        "name",
+        "arguments",
+    ] {
+        if let Some(v) = value.get(key) {
+            message.insert(key.to_string(), v.clone());
+        }
+    }
     let mut entry = value.clone();
     if let Some(obj) = entry.as_object_mut() {
-        obj.insert(
-            "message".into(),
-            serde_json::json!({
-                "role": value.get("role"),
-                "content": value.get("content"),
-                "timestamp": value.get("timestamp"),
-            }),
-        );
+        obj.insert("message".into(), Value::Object(message));
     }
     entry
 }
@@ -268,5 +331,28 @@ mod tests {
         assert_eq!(data["entries"][1]["id"], "child");
         assert_eq!(data["leafId"], "child");
         assert_eq!(data["entries"][0]["message"]["role"], "user");
+        assert!(html.contains("#18181e"));
+        let light = session_to_html_with_theme(raw, "s", "light");
+        assert!(light.contains("#f8f8f8"));
+        assert!(light.contains("#ffffff"));
+    }
+
+    #[test]
+    fn session_html_includes_custom_tool_pre_render() {
+        let raw = r#"{"type":"message","id":"a","role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"grep","arguments":{"pattern":"TODO"}}]}
+{"type":"message","id":"b","role":"toolResult","toolCallId":"call-1","toolName":"grep","content":[{"type":"text","text":"main.rs:1:TODO"}]}
+{"type":"message","id":"c","role":"assistant","content":[{"type":"toolCall","id":"call-2","name":"bash","arguments":{"command":"ls"}}]}"#;
+        let renderer = ToolHtmlRenderer::new("dark", PathBuf::from("."), vec![]);
+        let html = session_to_html_document(raw, "s", "dark", Some(&renderer), None);
+        let data = session_payload(&html);
+        assert!(data["renderedTools"]["call-1"]["callHtml"]
+            .as_str()
+            .unwrap()
+            .contains("ansi-line"));
+        assert!(data["renderedTools"]["call-1"]["resultHtmlExpanded"]
+            .as_str()
+            .unwrap()
+            .contains("TODO"));
+        assert!(data["renderedTools"].get("call-2").is_none());
     }
 }

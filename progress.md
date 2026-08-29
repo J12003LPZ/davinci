@@ -5,7 +5,7 @@
 TypeScript spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185` (`@earendil-works/pi-*` 0.84.4).
 Toolchain: Rust **1.83.0**, no `edition2024`, no `unsafe`. TypeScript remains in `vendor/pi` as the behavioral reference only. Rust under `crates/*` is the product.
 
-A TypeScript `pi` user can install Rust `pi` and use the same flags, `~/.pi` sessions, provider credentials, TUI, print, RPC, JS extension registration, and HTML export built from TypeScript `template.html` / `template.css` / `template.js` plus vendored marked and highlight.js.
+A TypeScript `pi` user can install Rust `pi` and use the same flags, `~/.pi` sessions, provider credentials, TUI, print, RPC, JS extension registration (including CLI flags and keyboard shortcuts), and HTML export built from TypeScript `template.html` / `template.css` / `template.js` plus vendored marked and highlight.js, with live theme colors and custom-tool TUI→ANSI→HTML pre-render.
 
 ## What landed
 
@@ -18,18 +18,16 @@ A TypeScript `pi` user can install Rust `pi` and use the same flags, `~/.pi` ses
 - **pi-protocol/client/server**: Unix+TCP+memory, handshake timeout, leases, request correlation, CBOR vectors. Server implements the full TypeScript `Command` union (list/create/attach/detach/prompt/steer/abort/set_model/set_thinking).
 - **pi-evals / pi-parity**: fixture evals + required golden corpora. Optional `--parallel-run` / `--diff-jsonl`.
 - **pi binary**: flags/subcommands from `args.ts` / `main.ts`, print/json/rpc/interactive sharing `SessionRuntime`. RPC `{type:"response",command,success}` plus streamed agent events. Prompt `streamingBehavior` queues steer/follow-up while a turn is running. Unknown command error `Unknown command: {type}`. Extension UI host implements every `RpcExtensionUIRequest` method (`select`, `confirm`, `input`, `editor`, `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) with pending-response correlation matching TypeScript. Interactive applies those requests to the TUI (title, footer statuses, widgets, selectors, editor text). JS extensions receive `pi.on` plus `ctx.ui` / `hasUI` in the Node host; `session_start` / `turn_start` / `turn_end` apply collected UI calls. Interactive raw-stdin key loop and builtin slash handlers. `/copy` uses platform clipboard tools then OSC 52 with TypeScript error strings. `/changelog` parses `CHANGELOG.md` version headers and normalizes GitHub links. `/share` tries Radius (`https://radius.pi.dev/v1/artifacts`) when a bearer token is present, then a secret gist (`gh gist create --public=false`) with `PI_SHARE_VIEWER_URL` (`https://pi.dev/session/#<id>`).
-- **JS extension API**: `pi.registerProvider` / `unregisterProvider` (name+config or native `{id}` object), `pi.registerTool` (schema + `execute(toolCallId, params, signal, onUpdate, ctx)`), `pi.registerCommand` (slash handler), `registerShortcut`, `registerFlag` / `getFlag` with TypeScript default-type error. Load-time capture; tools join `ToolRegistry`; commands appear in `/help`, RPC `get_commands` (`source: "extension"`), print/RPC prompt, and interactive slash; providers merge into model list and `AgentConfig` (`baseUrl`, `api`, interpolated `apiKey`, headers, `authHeader`). `resolveConfigValue` matches `$ENV` / `${ENV}` / `$$` / `$!` / leading `!command`. Exact errors: `Provider config is required when registering by name`, `Provider id must not be empty.`
-- **HTML export**: embeds TypeScript `template.html` / `template.css` / `template.js` plus vendored `marked.min.js` and `highlight.min.js`. Session JSONL is normalized to `{header, entries, leafId}` (message entries wrap `role`/`content` as `message` when missing). Dark theme CSS vars match the TypeScript default export palette. `escapeHtml` / `sanitizeMarkdownUrl` stay as Rust helpers locked to the TypeScript allow-list.
+- **JS extension API**: `pi.registerProvider` / `unregisterProvider` (name+config or native `{id}` object), `pi.registerTool` (schema + `execute(toolCallId, params, signal, onUpdate, ctx)` + optional `renderCall`/`renderResult`), `pi.registerCommand` (slash handler), `registerShortcut` dispatched from the interactive key loop (reserved `ctrl+c`/`ctrl+p`/`ctrl+t`/`escape`/`enter`/`ctrl+d`/`ctrl+z` cannot be overridden), `registerFlag` parsed as CLI flags with TypeScript errors (`Extension flag "--{name}" requires a value`, `Unknown option: --x` / `Unknown options: --a, --b`) and `getFlag`. Load-time capture; tools join `ToolRegistry`; commands appear in `/help`, RPC `get_commands` (`source: "extension"`), print/RPC prompt, and interactive slash; providers merge into model list and `AgentConfig` (`baseUrl`, `api`, interpolated `apiKey`, headers, `authHeader`). `resolveConfigValue` matches `$ENV` / `${ENV}` / `$$` / `$!` / leading `!command`. Exact errors: `Provider config is required when registering by name`, `Provider id must not be empty.`
+- **HTML export**: embeds TypeScript `template.html` / `template.css` / `template.js` plus vendored `marked.min.js` and `highlight.min.js`. Session JSONL is normalized to `{header, entries, leafId}` (message entries wrap `role`/`content`/`toolCallId`/`toolName`/`details`/`isError` as `message` when missing). Theme CSS vars come from `getResolvedThemeColors` / `getThemeExportColors` (builtin dark/light plus `PI_CODING_AGENT_DIR/themes/{name}.json`). `/export` and RPC `export_html` attach `systemPrompt`, tool schemas, and `renderedTools`. Custom tools (not `bash`/`read`/`write`/`edit`/`ls`) are pre-rendered via TUI→ANSI→HTML (`ansi-to-html.ts` SGR, whitespace fixture, grep/find formatters, JS `renderCall`/`renderResult`). `escapeHtml` / `sanitizeMarkdownUrl` stay as Rust helpers locked to the TypeScript allow-list.
 
 ## What remains
 
-- Theme-aware HTML export colors (`getResolvedThemeColors` / `getThemeExportColors`) still use the TypeScript dark default palette rather than the live interactive theme.
-- Custom-tool HTML pre-render (`ToolHtmlRenderer` / TUI→HTML) is not wired; builtin bash/read/write/edit/ls rendering lives in `template.js`.
-- Extension `registerShortcut` is listed in `/hotkeys` but not dispatched on keypress; `registerFlag` is stored on session state, not parsed as CLI flags.
+- Extension `registerMessageRenderer` / `registerMarkdownTransformer` / `registerEntryRenderer` are no-ops. TypeScript uses them for custom TUI and HTML entry rendering; Rust captures the rest of the extension host but does not invoke these three.
 
 ## Next crate/module
 
-Wire live theme colors and extension flag/shortcut dispatch, then re-audit the Done bar.
+Port the three custom renderer registration APIs and re-audit the Done bar (no documented product gaps, every `vendor/pi/packages/*` crate/module with TS-fixture tests, gates green, `progress.md` 100%).
 
 ## Gates
 
@@ -37,4 +35,4 @@ Wire live theme colors and extension flag/shortcut dispatch, then re-audit the D
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: green on 1.83 after JS registration APIs and TypeScript HTML template embed.
+Last run: green on 1.83 after theme-aware HTML export, extension flag/shortcut dispatch, and custom-tool HTML pre-render.

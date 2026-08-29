@@ -79,6 +79,8 @@ pub struct RegisteredToolMeta {
     pub description: String,
     pub parameters: Value,
     pub path: PathBuf,
+    pub has_render_call: bool,
+    pub has_render_result: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +286,7 @@ function jsonSafe(value) {
 const registrations = { tools: [], commands: [], providers: [], shortcuts: [], flags: [] };
 const liveTools = {};
 const liveCommands = {};
+const liveShortcuts = {};
 const handlers = {};
 const ctx = {
   ui,
@@ -317,6 +320,8 @@ function buildPi() {
         parameters: jsonSafe(tool.parameters),
         promptSnippet: tool.promptSnippet,
         promptGuidelines: tool.promptGuidelines,
+        hasRenderCall: typeof tool.renderCall === 'function',
+        hasRenderResult: typeof tool.renderResult === 'function',
       });
       liveTools[tool.name] = tool;
     },
@@ -344,10 +349,12 @@ function buildPi() {
       registrations.providers = registrations.providers.filter((p) => p.name !== providerName);
     },
     registerShortcut(shortcut, options) {
+      const key = String(shortcut || '').toLowerCase();
       registrations.shortcuts.push({
-        shortcut,
+        shortcut: key,
         description: options && options.description,
       });
+      liveShortcuts[key] = options || {};
     },
     registerFlag(flagName, options) {
       if (options && options.default !== undefined && typeof options.default !== options.type) {
@@ -416,6 +423,76 @@ async function main() {
     console.log(JSON.stringify({ ok: false, error: 'tool not found: ' + name, uiCalls, registrations }));
     return;
   }
+  if (kind === 'render_call' || kind === 'render_result') {
+    const tool = liveTools[name];
+    if (!tool) {
+      console.log(JSON.stringify({ ok: false, error: 'tool not found: ' + name, uiCalls, registrations }));
+      return;
+    }
+    const colors = payload.themeColors || {};
+    const ESC = String.fromCharCode(27);
+    const hexToRgb = (hex) => {
+      const h = String(hex || '#d4d4d4').replace('#', '');
+      return {
+        r: parseInt(h.slice(0, 2), 16) || 0,
+        g: parseInt(h.slice(2, 4), 16) || 0,
+        b: parseInt(h.slice(4, 6), 16) || 0,
+      };
+    };
+    const theme = {
+      fg(color, text) {
+        const { r, g, b } = hexToRgb(colors[color]);
+        return ESC + '[38;2;' + r + ';' + g + ';' + b + 'm' + text + ESC + '[39m';
+      },
+      bg(_color, text) { return text; },
+      bold(text) { return ESC + '[1m' + text + ESC + '[22m'; },
+      italic(text) { return ESC + '[3m' + text + ESC + '[23m'; },
+      underline(text) { return ESC + '[4m' + text + ESC + '[24m'; },
+    };
+    const context = {
+      args: payload.args,
+      toolCallId: payload.toolCallId || name,
+      invalidate() {},
+      lastComponent: undefined,
+      state: {},
+      cwd: payload.cwd || '.',
+      executionStarted: true,
+      argsComplete: true,
+      isPartial: kind === 'render_call',
+      expanded: !!(payload.options && payload.options.expanded),
+      showImages: false,
+      isError: !!payload.isError,
+    };
+    let component;
+    if (kind === 'render_call') {
+      if (typeof tool.renderCall !== 'function') {
+        console.log(JSON.stringify({ ok: true, result: { lines: null }, uiCalls, registrations }));
+        return;
+      }
+      component = tool.renderCall(payload.args, theme, context);
+    } else {
+      if (typeof tool.renderResult !== 'function') {
+        console.log(JSON.stringify({ ok: true, result: { lines: null }, uiCalls, registrations }));
+        return;
+      }
+      component = tool.renderResult(payload.result, payload.options || { expanded: false, isPartial: false }, theme, context);
+    }
+    const lines = component && typeof component.render === 'function'
+      ? component.render(payload.width || 100)
+      : null;
+    console.log(JSON.stringify({ ok: true, result: { lines }, uiCalls, registrations }));
+    return;
+  }
+  if (kind === 'shortcut') {
+    const shortcut = liveShortcuts[String(name || '').toLowerCase()];
+    if (!shortcut || typeof shortcut.handler !== 'function') {
+      console.log(JSON.stringify({ ok: false, error: 'shortcut not found: ' + name, uiCalls, registrations }));
+      return;
+    }
+    const result = await shortcut.handler(ctx);
+    console.log(JSON.stringify({ ok: true, result, uiCalls, registrations }));
+    return;
+  }
   if (kind === 'command') {
     const command = liveCommands[name];
     if (!command || typeof command.handler !== 'function') {
@@ -471,13 +548,74 @@ pub fn invoke_extension_command(
     args: &str,
     replies: &Value,
 ) -> Result<ExtensionInvoke, String> {
+    invoke_extension_command_with_flags(extension, command, args, &json!({}), replies)
+}
+
+pub fn invoke_extension_command_with_flags(
+    extension: &Path,
+    command: &str,
+    args: &str,
+    flags: &Value,
+    replies: &Value,
+) -> Result<ExtensionInvoke, String> {
     invoke_extension(
         extension,
         "command",
         command,
-        &json!({"args": args}),
+        &json!({"args": args, "flags": flags}),
         replies,
     )
+}
+
+/// TypeScript reserved editor-global shortcuts that extensions may not override.
+pub const RESERVED_SHORTCUTS: &[&str] = &[
+    "ctrl+c", "ctrl+p", "ctrl+t", "escape", "enter", "ctrl+d", "ctrl+z",
+];
+
+pub fn is_reserved_shortcut(shortcut: &str) -> bool {
+    RESERVED_SHORTCUTS.contains(&shortcut.to_ascii_lowercase().as_str())
+}
+
+pub fn invoke_extension_shortcut(
+    extension: &Path,
+    shortcut: &str,
+    flags: &Value,
+    replies: &Value,
+) -> Result<ExtensionInvoke, String> {
+    invoke_extension(
+        extension,
+        "shortcut",
+        shortcut,
+        &json!({"flags": flags}),
+        replies,
+    )
+}
+
+/// Invoke TypeScript `renderCall` / `renderResult` and return TUI lines.
+pub fn invoke_extension_render(
+    extension: &Path,
+    kind: &str,
+    tool_name: &str,
+    payload: &Value,
+) -> Result<Option<Vec<String>>, String> {
+    let invoked = invoke_extension(extension, kind, tool_name, payload, &json!({}))?;
+    if invoked.result.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return Ok(None);
+    }
+    let lines = invoked
+        .result
+        .get("result")
+        .and_then(|v| v.get("lines"))
+        .or_else(|| invoked.result.get("lines"));
+    match lines {
+        Some(Value::Array(items)) => Ok(Some(
+            items
+                .iter()
+                .map(|item| item.as_str().unwrap_or("").to_string())
+                .collect(),
+        )),
+        _ => Ok(None),
+    }
 }
 
 pub fn load_extension(path: &Path) -> Result<ExtensionRegistry, String> {
@@ -557,6 +695,14 @@ fn parse_registry(value: &Value, path: &Path) -> ExtensionRegistry {
                     .to_string(),
                 parameters: tool.get("parameters").cloned().unwrap_or(json!({})),
                 path: path.to_path_buf(),
+                has_render_call: tool
+                    .get("hasRenderCall")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                has_render_result: tool
+                    .get("hasRenderResult")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             })
         })
         .collect();
@@ -863,7 +1009,14 @@ module.exports = function (pi) {
     label: "Echo",
     description: "Echo arguments",
     parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
-    execute: async (_id, params) => ({ content: [{ type: "text", text: "echo:" + params.text }] })
+    execute: async (_id, params) => ({ content: [{ type: "text", text: "echo:" + params.text }] }),
+    renderCall(args) {
+      return { render: () => ["echo " + (args && args.text ? args.text : "")] };
+    },
+    renderResult(result) {
+      const text = result && result.content && result.content[0] ? result.content[0].text : "";
+      return { render: () => ["", text, ""] };
+    }
   });
   pi.registerCommand("echo-cmd", {
     description: "Echo a slash argument",
@@ -872,7 +1025,10 @@ module.exports = function (pi) {
       ctx.ui.notify("ran " + args, "info");
     }
   });
-  pi.registerShortcut("ctrl+l", { description: "Llama overlay" });
+  pi.registerShortcut("ctrl+l", {
+    description: "Llama overlay",
+    handler: async (ctx) => { ctx.ui.setTitle("short:" + String(pi.getFlag("verbose"))); }
+  });
   pi.registerFlag("verbose", { type: "boolean", default: false, description: "Verbose" });
 };
 "#,
@@ -886,6 +1042,33 @@ module.exports = function (pi) {
             "https://proxy.example"
         );
         assert_eq!(registry.tools[0].name, "echo_tool");
+        assert!(registry.tools[0].has_render_call);
+        assert!(registry.tools[0].has_render_result);
+        let call_lines = invoke_extension_render(
+            &path,
+            "render_call",
+            "echo_tool",
+            &json!({"args": {"text": "hi"}, "width": 100}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(call_lines, vec!["echo hi".to_string()]);
+        let result_lines = invoke_extension_render(
+            &path,
+            "render_result",
+            "echo_tool",
+            &json!({
+                "result": {"content": [{"type":"text","text":"echo:hi"}]},
+                "options": {"expanded": true, "isPartial": false},
+                "width": 100
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result_lines,
+            vec!["".to_string(), "echo:hi".into(), "".into()]
+        );
         assert_eq!(registry.commands[0].name, "echo-cmd");
         assert_eq!(registry.shortcuts[0].shortcut, "ctrl+l");
         assert_eq!(registry.flags[0].name, "verbose");
@@ -902,6 +1085,15 @@ module.exports = function (pi) {
             .ui_calls
             .iter()
             .any(|c| c["method"] == "setTitle" && c["title"] == "cmd:hello"));
+        let short =
+            invoke_extension_shortcut(&path, "ctrl+l", &json!({"verbose": true}), &json!({}))
+                .unwrap();
+        assert!(short
+            .ui_calls
+            .iter()
+            .any(|c| c["method"] == "setTitle" && c["title"] == "short:true"));
+        assert!(is_reserved_shortcut("ctrl+c"));
+        assert!(!is_reserved_shortcut("ctrl+l"));
     }
 
     #[test]

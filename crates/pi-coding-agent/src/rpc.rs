@@ -443,6 +443,8 @@ mod tests {
             ui: crate::extension_ui::ExtensionUiHost::default(),
             extensions: vec![],
             registry: crate::extensions::ExtensionRegistry::default(),
+            theme: "dark".into(),
+            flag_values: Default::default(),
         }
     }
 

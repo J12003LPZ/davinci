@@ -45,12 +45,13 @@ impl InteractiveMode {
             chat.push("session", path.display().to_string());
         }
         tui.add_child_lines(chat.render(80));
+        let theme = runtime.theme.clone();
         Self {
             runtime,
             tui,
             chat,
             editor: Editor::default(),
-            theme: "default".into(),
+            theme,
             discovered,
             auto_approve: true,
             last_json_events: Vec::new(),
@@ -573,7 +574,36 @@ impl InteractiveMode {
         Ok(false)
     }
 
+    fn try_extension_shortcut(&mut self, key: &Key) -> Result<bool, String> {
+        let id = key_id(key);
+        if crate::extensions::is_reserved_shortcut(&id) {
+            return Ok(false);
+        }
+        if self
+            .runtime
+            .registry
+            .shortcuts
+            .iter()
+            .any(|shortcut| shortcut.shortcut == id)
+        {
+            match self.runtime.invoke_shortcut(&id) {
+                Ok(events) => {
+                    for event in events {
+                        self.apply_ui_request(&event);
+                    }
+                    self.chat.push("system", format!("shortcut {id}"));
+                    return Ok(true);
+                }
+                Err(err) => self.chat.push("error", err),
+            }
+        }
+        Ok(false)
+    }
+
     pub fn handle_key(&mut self, key: &Key) -> Result<bool, String> {
+        if self.try_extension_shortcut(key)? {
+            return Ok(false);
+        }
         match key {
             Key::Ctrl('c') => return Ok(true),
             Key::Ctrl('p') => {
@@ -599,6 +629,22 @@ impl InteractiveMode {
             other => self.editor.handle_key(other),
         }
         Ok(false)
+    }
+}
+
+fn key_id(key: &Key) -> String {
+    match key {
+        Key::Ctrl(c) => format!("ctrl+{c}"),
+        Key::Char(c) => c.to_lowercase().to_string(),
+        Key::Enter => "enter".into(),
+        Key::Escape => "escape".into(),
+        Key::Tab => "tab".into(),
+        Key::Backspace => "backspace".into(),
+        Key::Left => "left".into(),
+        Key::Right => "right".into(),
+        Key::Up => "up".into(),
+        Key::Down => "down".into(),
+        Key::Unknown(raw) => raw.to_ascii_lowercase(),
     }
 }
 
