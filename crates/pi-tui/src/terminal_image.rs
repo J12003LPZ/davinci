@@ -273,9 +273,9 @@ pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
         let search = command_start + KITTY_PREFIX.len();
         let terminator = line[search..].find("\x1b\\")?;
         transmission_end = search + terminator + 2;
-        if !control_value(&command_controls, "m")
+        if control_value(&command_controls, "m")
             .as_deref()
-            .is_some_and(|m| m == "1")
+            .is_none_or(|m| m != "1")
         {
             break;
         }
@@ -326,8 +326,7 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: u32, visible_rows: u32) ->
         return line.to_string();
     }
     let source_y = metadata.height_px * hidden_rows / metadata.rows;
-    let source_end =
-        (metadata.height_px * (hidden_rows + cropped_rows) + metadata.rows - 1) / metadata.rows;
+    let source_end = (metadata.height_px * (hidden_rows + cropped_rows)).div_ceil(metadata.rows);
     let source_height = 1.max(metadata.height_px.min(source_end).saturating_sub(source_y));
     let Some(controls) = kitty_controls(line) else {
         return line.to_string();
