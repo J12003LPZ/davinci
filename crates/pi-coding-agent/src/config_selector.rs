@@ -614,7 +614,12 @@ impl ConfigSelector {
                 self.search.value.pop();
                 self.rebuild_filter();
             }
-            other if other.chars().count() == 1 && !other.starts_with('\u{1b}') && other != " " => {
+            other
+                if !other.is_empty()
+                    && !other.starts_with('\u{1b}')
+                    && other != " "
+                    && other.chars().all(|c| !c.is_control()) =>
+            {
                 self.search.value.push_str(other);
                 self.rebuild_filter();
             }
@@ -1153,12 +1158,12 @@ mod tests {
 
         let mut selector =
             ConfigSelector::from_scoped(&resolved, &resolved, WriteScope::Global, true);
-        selector.handle_input("z");
+        selector.handle_input("zzz-no-such-resource");
         assert!(selector
             .render(80)
             .iter()
             .any(|l| l.contains("No resources found")));
-        selector.handle_input("backspace");
+        selector.search.value.clear();
         selector.handle_input("index");
         assert!(selector.render(80).iter().any(|l| l.contains("index.ts")));
         selector.handle_input("pagedown");

@@ -1,4 +1,4 @@
-use crate::args::{APP_NAME, VERSION};
+use crate::args::{APP_NAME, PACKAGE_NAME, VERSION};
 use crate::package_manager::network_disabled;
 use crate::settings::{canonicalize_path, cwd_relative_path};
 use serde_json::Value;
@@ -22,8 +22,16 @@ struct LatestPiRelease {
 #[derive(Debug, Clone)]
 pub struct SelfUpdatePlan {
     pub version: String,
+    pub package_name: String,
+    pub install_spec: String,
     pub should_run: bool,
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelfUpdateCommand {
+    pub display: String,
+    pub steps: Vec<(String, Vec<String>, String)>,
 }
 
 fn package_dir() -> PathBuf {
@@ -175,22 +183,500 @@ pub fn self_update_plan(force: bool) -> Result<SelfUpdatePlan, String> {
     let package_name = latest
         .package_name
         .clone()
-        .unwrap_or_else(|| "@earendil-works/pi-coding-agent".into());
-    if force
-        || package_name != "@earendil-works/pi-coding-agent"
-        || is_newer_package_version(&latest.version, VERSION)
-    {
+        .unwrap_or_else(|| PACKAGE_NAME.into());
+    let install_spec = format!("{}@{}", package_name, latest.version);
+    if force || package_name != PACKAGE_NAME || is_newer_package_version(&latest.version, VERSION) {
         return Ok(SelfUpdatePlan {
             version: latest.version,
+            package_name,
+            install_spec,
             should_run: true,
             note: latest.note,
         });
     }
     Ok(SelfUpdatePlan {
         version: latest.version,
+        package_name,
+        install_spec,
         should_run: false,
         note: latest.note,
     })
+}
+
+pub fn detect_install_method() -> &'static str {
+    if let Ok(method) = std::env::var("PI_INSTALL_METHOD") {
+        return match method.as_str() {
+            "npm" => "npm",
+            "pnpm" => "pnpm",
+            "yarn" => "yarn",
+            "bun" => "bun",
+            "bun-binary" => "bun-binary",
+            _ => "unknown",
+        };
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+        .unwrap_or_default();
+    let package = package_dir()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let resolved = format!("{package}\0{exe}");
+    if resolved.contains("/pnpm/") || resolved.contains("/.pnpm/") {
+        "pnpm"
+    } else if resolved.contains("/yarn/") || resolved.contains("/.yarn/") {
+        "yarn"
+    } else if resolved.contains("/install/global/node_modules/") {
+        "bun"
+    } else if resolved.contains("/npm/") || resolved.contains("/node_modules/") {
+        "npm"
+    } else {
+        "unknown"
+    }
+}
+
+fn quote_arg(arg: &str) -> String {
+    if arg.chars().any(char::is_whitespace) {
+        format!("\"{arg}\"")
+    } else {
+        arg.to_string()
+    }
+}
+
+fn format_command_display(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .map(quote_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn make_step(command: &str, args: Vec<String>) -> (String, Vec<String>, String) {
+    let display = format_command_display(command, &args);
+    (command.to_string(), args, display)
+}
+
+fn split_npm_command(npm_command: Option<&[String]>) -> (String, Vec<String>) {
+    match npm_command {
+        Some(args) if !args.is_empty() => (args[0].clone(), args[1..].to_vec()),
+        _ => ("npm".into(), Vec::new()),
+    }
+}
+
+fn read_command_output(
+    command: &str,
+    args: &[String],
+    require_success: bool,
+) -> Result<Option<String>, String> {
+    match Command::new(command).args(args).output() {
+        Ok(output) => {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                return Ok((!stdout.is_empty()).then_some(stdout));
+            }
+            if !require_success {
+                return Ok(None);
+            }
+            let reason = String::from_utf8_lossy(&output.stderr);
+            let reason = reason.trim();
+            Err(format!(
+                "Failed to run {} {}: {}",
+                command,
+                args.join(" "),
+                if reason.is_empty() {
+                    format!("exit code {}", output.status.code().unwrap_or(-1))
+                } else {
+                    reason.to_string()
+                }
+            ))
+        }
+        Err(err) if require_success => Err(format!("Failed to run {command}: {err}")),
+        Err(_) => Ok(None),
+    }
+}
+
+fn inferred_npm_install(package: &Path) -> Option<(PathBuf, PathBuf)> {
+    let parent = package.parent()?;
+    let parent_name = parent.file_name()?.to_str()?;
+    let root = if parent_name.starts_with('@')
+        && parent.parent()?.file_name()?.to_str() == Some("node_modules")
+    {
+        parent.parent()?.to_path_buf()
+    } else if parent_name == "node_modules" {
+        parent.to_path_buf()
+    } else {
+        return None;
+    };
+    let prefix = root.parent().and_then(|p| {
+        if p.file_name()?.to_str() == Some("lib") {
+            p.parent().map(Path::to_path_buf)
+        } else {
+            None
+        }
+    })?;
+    Some((root, prefix))
+}
+
+fn path_candidates(path: &Path) -> Vec<PathBuf> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let mut out = vec![canonicalize_path(path)];
+    if let Ok(raw) = path.canonicalize() {
+        if !out.contains(&raw) {
+            out.push(raw);
+        }
+    }
+    out
+}
+
+fn path_is_under(child: &Path, root: &Path) -> bool {
+    if child == root {
+        return true;
+    }
+    child.starts_with(root)
+}
+
+fn dir_writable(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let probe = path.join(format!(".pi-write-probe-{}", std::process::id()));
+    match fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn self_update_path_writable() -> bool {
+    let package = package_dir();
+    let parent = package.parent().unwrap_or(&package);
+    dir_writable(&package) && dir_writable(parent)
+}
+
+fn pnpm_bin_dir_args() -> Vec<String> {
+    let package = package_dir().to_string_lossy().replace('\\', "/");
+    let re = regex::Regex::new(r"^(.*[/]global/[^/]+)/\.pnpm/").expect("pnpm path regex");
+    if let Some(caps) = re.captures(&package) {
+        let home = std::env::var("PNPM_HOME").ok().unwrap_or_else(|| {
+            PathBuf::from(&caps[1])
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        });
+        vec![format!("--config.global-bin-dir={home}")]
+    } else {
+        Vec::new()
+    }
+}
+
+fn global_package_roots(
+    method: &str,
+    npm_command: Option<&[String]>,
+) -> Result<Vec<PathBuf>, String> {
+    match method {
+        "npm" => {
+            let configured = npm_command.is_some_and(|c| !c.is_empty());
+            let (command, mut args) = split_npm_command(npm_command);
+            if configured && command == "bun" {
+                let mut roots = vec![dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".bun")
+                    .join("install")
+                    .join("global")
+                    .join("node_modules")];
+                args.extend(["pm".into(), "bin".into(), "-g".into()]);
+                if let Some(bin) = read_command_output(&command, &args, true)? {
+                    roots.push(
+                        PathBuf::from(bin)
+                            .join("install")
+                            .join("global")
+                            .join("node_modules"),
+                    );
+                }
+                return Ok(roots);
+            }
+            let mut root_args = args.clone();
+            root_args.extend(["root".into(), "-g".into()]);
+            let mut roots = Vec::new();
+            if let Some(root) = read_command_output(&command, &root_args, configured)? {
+                roots.push(PathBuf::from(root));
+            }
+            if !configured {
+                if let Some((root, _)) = inferred_npm_install(&package_dir()) {
+                    roots.push(root);
+                }
+            }
+            Ok(roots)
+        }
+        "pnpm" => {
+            let mut roots = Vec::new();
+            if let Some(root) = read_command_output("pnpm", &["root".into(), "-g".into()], false)? {
+                let root = PathBuf::from(root);
+                if let Some(parent) = root.parent() {
+                    roots.push(parent.to_path_buf());
+                }
+                roots.push(root);
+            } else {
+                let package = package_dir().to_string_lossy().replace('\\', "/");
+                let re =
+                    regex::Regex::new(r"^(.*[/]global/[^/]+)/\.pnpm/").expect("pnpm path regex");
+                if let Some(caps) = re.captures(&package) {
+                    roots.push(PathBuf::from(&caps[1]));
+                }
+            }
+            Ok(roots)
+        }
+        "yarn" => {
+            let mut roots = Vec::new();
+            if let Some(dir) = read_command_output("yarn", &["global".into(), "dir".into()], false)?
+            {
+                let dir = PathBuf::from(dir);
+                roots.push(dir.join("node_modules"));
+                roots.push(dir);
+            }
+            Ok(roots)
+        }
+        "bun" => {
+            let mut roots = vec![dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".bun")
+                .join("install")
+                .join("global")
+                .join("node_modules")];
+            if let Some(bin) =
+                read_command_output("bun", &["pm".into(), "bin".into(), "-g".into()], false)?
+            {
+                roots.push(
+                    PathBuf::from(bin)
+                        .join("install")
+                        .join("global")
+                        .join("node_modules"),
+                );
+            }
+            Ok(roots)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn managed_by_global_package_manager(
+    method: &str,
+    npm_command: Option<&[String]>,
+) -> Result<bool, String> {
+    let package_dirs = path_candidates(&package_dir());
+    let roots = global_package_roots(method, npm_command)?;
+    Ok(roots.iter().any(|root| {
+        path_candidates(root).iter().any(|normalized| {
+            package_dirs
+                .iter()
+                .any(|pkg| path_is_under(pkg, normalized))
+        })
+    }))
+}
+
+fn command_for_method(
+    method: &str,
+    installed_package_name: &str,
+    target: &SelfUpdatePlan,
+    npm_command: Option<&[String]>,
+) -> Option<SelfUpdateCommand> {
+    let install_spec = target.install_spec.clone();
+    match method {
+        "bun-binary" | "unknown" => None,
+        "pnpm" => {
+            let bin_dir_args = if read_command_output("pnpm", &["root".into(), "-g".into()], false)
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                pnpm_bin_dir_args()
+            } else {
+                Vec::new()
+            };
+            let mut install = vec![
+                "install".into(),
+                "-g".into(),
+                "--ignore-scripts".into(),
+                "--config.minimumReleaseAge=0".into(),
+            ];
+            install.extend(bin_dir_args.clone());
+            install.push(install_spec);
+            let install_step = make_step("pnpm", install);
+            let uninstall = if target.package_name != installed_package_name {
+                let mut args = vec!["remove".into(), "-g".into()];
+                args.extend(bin_dir_args);
+                args.push(installed_package_name.into());
+                Some(make_step("pnpm", args))
+            } else {
+                None
+            };
+            Some(finish_command(install_step, uninstall))
+        }
+        "yarn" => {
+            let install_step = make_step(
+                "yarn",
+                vec![
+                    "global".into(),
+                    "add".into(),
+                    "--ignore-scripts".into(),
+                    install_spec,
+                ],
+            );
+            let uninstall = if target.package_name != installed_package_name {
+                Some(make_step(
+                    "yarn",
+                    vec![
+                        "global".into(),
+                        "remove".into(),
+                        installed_package_name.into(),
+                    ],
+                ))
+            } else {
+                None
+            };
+            Some(finish_command(install_step, uninstall))
+        }
+        "bun" => {
+            let install_step = make_step(
+                "bun",
+                vec![
+                    "install".into(),
+                    "-g".into(),
+                    "--ignore-scripts".into(),
+                    "--minimum-release-age=0".into(),
+                    install_spec,
+                ],
+            );
+            let uninstall = if target.package_name != installed_package_name {
+                Some(make_step(
+                    "bun",
+                    vec![
+                        "uninstall".into(),
+                        "-g".into(),
+                        installed_package_name.into(),
+                    ],
+                ))
+            } else {
+                None
+            };
+            Some(finish_command(install_step, uninstall))
+        }
+        "npm" => {
+            let (command, npm_args) = split_npm_command(npm_command);
+            let inferred = if npm_command.is_some_and(|c| !c.is_empty()) {
+                None
+            } else {
+                inferred_npm_install(&package_dir())
+            };
+            let mut prefix_args = npm_args;
+            if let Some((_, prefix)) = inferred {
+                prefix_args.push("--prefix".into());
+                prefix_args.push(prefix.display().to_string());
+            }
+            let mut install = prefix_args.clone();
+            install.extend([
+                "install".into(),
+                "-g".into(),
+                "--ignore-scripts".into(),
+                "--min-release-age=0".into(),
+                install_spec,
+            ]);
+            let install_step = make_step(&command, install);
+            let uninstall = if target.package_name != installed_package_name {
+                let mut args = prefix_args;
+                args.extend([
+                    "uninstall".into(),
+                    "-g".into(),
+                    installed_package_name.into(),
+                ]);
+                Some(make_step(&command, args))
+            } else {
+                None
+            };
+            Some(finish_command(install_step, uninstall))
+        }
+        _ => None,
+    }
+}
+
+fn finish_command(
+    install: (String, Vec<String>, String),
+    uninstall: Option<(String, Vec<String>, String)>,
+) -> SelfUpdateCommand {
+    if let Some(uninstall) = uninstall {
+        SelfUpdateCommand {
+            display: format!("{} && {}", uninstall.2, install.2),
+            steps: vec![uninstall, install],
+        }
+    } else {
+        SelfUpdateCommand {
+            display: install.2.clone(),
+            steps: vec![install],
+        }
+    }
+}
+
+pub fn self_update_command(
+    npm_command: Option<&[String]>,
+    plan: &SelfUpdatePlan,
+) -> Result<Option<SelfUpdateCommand>, String> {
+    let method = detect_install_method();
+    let command = match command_for_method(method, PACKAGE_NAME, plan, npm_command) {
+        Some(command) => command,
+        None => return Ok(None),
+    };
+    if !managed_by_global_package_manager(method, npm_command)? || !self_update_path_writable() {
+        return Ok(None);
+    }
+    Ok(Some(command))
+}
+
+pub fn self_update_unavailable_instruction(
+    npm_command: Option<&[String]>,
+    plan: &SelfUpdatePlan,
+) -> String {
+    let method = detect_install_method();
+    if method == "bun-binary" {
+        return "Download from: https://github.com/earendil-works/pi-mono/releases/latest".into();
+    }
+    if let Some(command) = command_for_method(method, PACKAGE_NAME, plan, npm_command) {
+        if managed_by_global_package_manager(method, npm_command).unwrap_or(false)
+            && !self_update_path_writable()
+        {
+            return format!(
+                "This installation is managed by a global {method} install, but the install path is not writable. Update it yourself with: {}",
+                command.display
+            );
+        }
+        return format!(
+            "This installation is not managed by a global {method} install. Update it with the package manager, wrapper, or source checkout that provides it."
+        );
+    }
+    format!(
+        "Update {} using the package manager, wrapper, or source checkout that provides this installation.",
+        plan.install_spec
+    )
+}
+
+pub fn run_self_update_command(command: &SelfUpdateCommand) -> Result<(), String> {
+    for (program, args, display) in &command.steps {
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|err| format!("{display} exited with code unknown: {err}"))?;
+        if !output.status.success() {
+            if let Some(signal) = output.status.code() {
+                return Err(format!("{display} exited with code {signal}"));
+            }
+            return Err(format!("{display} terminated by signal"));
+        }
+    }
+    Ok(())
 }
 
 fn lock_path(managed_root: &Path) -> PathBuf {

@@ -53,6 +53,55 @@ pub fn discover_extensions(
     found
 }
 
+fn discover_project_trust_extensions() -> Vec<Extension> {
+    let agent = crate::settings::agent_dir();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut found: Vec<Extension> = Vec::new();
+    for ext in crate::package_manager::resolve_resources(&agent, &cwd, false).extensions {
+        if ext.enabled && !found.iter().any(|e| e.path == ext.path) {
+            push_extension(&ext.path, &mut found);
+        }
+    }
+    let user_dir = agent.join("extensions");
+    if user_dir.is_dir() {
+        for entry in WalkDir::new(&user_dir).max_depth(2).into_iter().flatten() {
+            let path = entry.path();
+            if is_extension_file(path) && !found.iter().any(|e| e.path == path) {
+                push_extension(path, &mut found);
+            }
+        }
+    }
+    found
+}
+
+pub fn consult_project_trust(cwd: &Path) -> Option<(bool, bool)> {
+    which_node()?;
+    let event = json!({ "type": "project_trust", "cwd": cwd.to_string_lossy() });
+    for ext in discover_project_trust_extensions() {
+        let Ok(invoked) = invoke_extension_event(&ext.path, "project_trust", &event, &json!({}))
+        else {
+            continue;
+        };
+        let decision = invoked
+            .result
+            .get("result")
+            .and_then(|v| v.get("trusted"))
+            .and_then(|v| v.as_str());
+        let remember = invoked
+            .result
+            .get("result")
+            .and_then(|v| v.get("remember"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        match decision {
+            Some("yes") => return Some((true, remember)),
+            Some("no") => return Some((false, remember)),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn is_extension_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|s| s.to_str()),

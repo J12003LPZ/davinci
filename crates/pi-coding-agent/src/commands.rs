@@ -10,8 +10,6 @@ use std::io::{self, IsTerminal, Write};
 
 pub use crate::settings::{agent_dir, settings_path};
 
-pub const PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
-
 #[derive(Debug)]
 pub struct CommandOutcome {
     pub handled: bool,
@@ -333,48 +331,6 @@ Options:
     }
 }
 
-fn detect_install_method() -> &'static str {
-    if let Ok(method) = std::env::var("PI_INSTALL_METHOD") {
-        return match method.as_str() {
-            "npm" => "npm",
-            "pnpm" => "pnpm",
-            "yarn" => "yarn",
-            "bun" => "bun",
-            "bun-binary" => "bun-binary",
-            _ => "unknown",
-        };
-    }
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
-        .unwrap_or_default();
-    if exe.contains("/pnpm/") || exe.contains("/.pnpm/") {
-        "pnpm"
-    } else if exe.contains("/yarn/") || exe.contains("/.yarn/") {
-        "yarn"
-    } else if exe.contains("/install/global/node_modules/") {
-        "bun"
-    } else if exe.contains("/npm/") || exe.contains("/node_modules/") {
-        "npm"
-    } else {
-        "unknown"
-    }
-}
-
-fn self_update_unavailable_instruction() -> String {
-    let method = detect_install_method();
-    if method == "bun-binary" {
-        return "Download from: https://github.com/earendil-works/pi-mono/releases/latest".into();
-    }
-    if method == "unknown" {
-        return format!(
-            "Update {PACKAGE_NAME} using the package manager, wrapper, or source checkout that provides this installation."
-        );
-    }
-    format!(
-        "This installation is not managed by a global {method} install. Update it with the package manager, wrapper, or source checkout that provides it."
-    )
-}
-
 fn run_self_update(force: bool) -> CommandOutcome {
     let managed = match self_update::active_managed_install_root() {
         Ok(root) => root,
@@ -418,8 +374,59 @@ fn run_self_update(force: bool) -> CommandOutcome {
             Err(err) => CommandOutcome::done(1, stdout, format!("Error: {err}\n")),
         };
     }
+    #[cfg(windows)]
+    {
+        let method = self_update::detect_install_method();
+        if method != "npm" && method != "pnpm" {
+            return CommandOutcome::done(
+                1,
+                stdout,
+                format!(
+                    "{APP_NAME} self-update on Windows is only supported for npm and pnpm installs.\nDetected install method: {method}. Update {APP_NAME} manually.\n"
+                ),
+            );
+        }
+    }
+    let npm_command = crate::settings::SettingsDocument::load(&settings_path(false)).npm_command();
+    let command = match self_update::self_update_command(npm_command.as_deref(), &plan) {
+        Ok(command) => command,
+        Err(err) => return CommandOutcome::done(1, stdout, format!("Error: {err}\n")),
+    };
+    if let Some(command) = command {
+        stdout.push_str(&format!(
+            "Updating {APP_NAME} with {}...\n",
+            command.display
+        ));
+        return match self_update::run_self_update_command(&command) {
+            Ok(()) => CommandOutcome::done(
+                0,
+                format!(
+                    "{stdout}Updated {APP_NAME} from {VERSION} to {}\n",
+                    plan.version
+                ),
+                "",
+            ),
+            Err(err) => {
+                let mut stderr = format!("Error: {err}\n");
+                if self_update::detect_install_method() == "pnpm" {
+                    stderr.push_str("If pnpm reports missing package versions, its cached registry metadata may be stale.\n");
+                    stderr.push_str(&format!(
+                        "Run `pnpm store prune` and retry `{APP_NAME} update --self`.\n"
+                    ));
+                }
+                stderr.push_str(&format!(
+                    "If this keeps failing, run this command yourself: {}\n",
+                    command.display
+                ));
+                CommandOutcome::done(1, stdout, stderr)
+            }
+        };
+    }
     let mut stderr = format!("error: {APP_NAME} cannot self-update this installation.\n");
-    stderr.push_str(&self_update_unavailable_instruction());
+    stderr.push_str(&self_update::self_update_unavailable_instruction(
+        npm_command.as_deref(),
+        &plan,
+    ));
     stderr.push('\n');
     if let Ok(exe) = std::env::current_exe() {
         stderr.push('\n');
@@ -1091,6 +1098,115 @@ mod tests {
             match previous_root {
                 Some(v) => std::env::set_var("PI_MANAGED_INSTALL_ROOT", v),
                 None => std::env::remove_var("PI_MANAGED_INSTALL_ROOT"),
+            }
+            match previous_pkg {
+                Some(v) => std::env::set_var("PI_PACKAGE_DIR", v),
+                None => std::env::remove_var("PI_PACKAGE_DIR"),
+            }
+            match previous_latest {
+                Some(v) => std::env::set_var("PI_SELF_UPDATE_FIXTURE", v),
+                None => std::env::remove_var("PI_SELF_UPDATE_FIXTURE"),
+            }
+        });
+    }
+
+    #[test]
+    fn list_consults_project_trust_extension() {
+        with_agent_dir(|| {
+            let cwd = std::env::current_dir().unwrap();
+            std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+            std::fs::write(
+                cwd.join(".pi").join("settings.json"),
+                r#"{"packages":["npm:@project/pkg"]}"#,
+            )
+            .unwrap();
+            let extensions = agent_dir().join("extensions");
+            std::fs::create_dir_all(&extensions).unwrap();
+            std::fs::write(
+                extensions.join("trust.js"),
+                r#"module.exports = function (pi) {
+  pi.on("project_trust", () => ({ trusted: "yes", remember: true }));
+};
+"#,
+            )
+            .unwrap();
+            let listed = dispatch_subcommand(&["list".into()]);
+            assert!(
+                listed.stdout.contains("Project packages:"),
+                "{}",
+                listed.stdout
+            );
+            assert!(listed.stdout.contains("npm:@project/pkg"));
+            assert!(crate::settings::is_trusted(&agent_dir(), &cwd));
+        });
+    }
+
+    #[test]
+    fn npm_global_self_update_spawns_install_command() {
+        with_agent_dir(|| {
+            let root = tempdir().unwrap();
+            let prefix = root.path().join("prefix");
+            let package = prefix
+                .join("lib")
+                .join("node_modules")
+                .join("@earendil-works")
+                .join("pi-coding-agent");
+            std::fs::create_dir_all(&package).unwrap();
+            let bin = root.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let record = root.path().join("npm-args.txt");
+            let npm = bin.join("npm");
+            std::fs::write(
+                &npm,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+                    record.display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&npm).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&npm, perms).unwrap();
+            }
+            let latest = root.path().join("latest.json");
+            std::fs::write(&latest, r#"{"version":"0.84.5"}"#).unwrap();
+            let previous_path = std::env::var("PATH").ok();
+            let previous_method = std::env::var("PI_INSTALL_METHOD").ok();
+            let previous_pkg = std::env::var("PI_PACKAGE_DIR").ok();
+            let previous_latest = std::env::var("PI_SELF_UPDATE_FIXTURE").ok();
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    previous_path.as_deref().unwrap_or("/usr/bin")
+                ),
+            );
+            std::env::set_var("PI_INSTALL_METHOD", "npm");
+            std::env::set_var("PI_PACKAGE_DIR", &package);
+            std::env::set_var("PI_SELF_UPDATE_FIXTURE", &latest);
+            let updated = dispatch_subcommand(&["update".into(), "--self".into()]);
+            assert_eq!(updated.exit_code, 0, "{}", updated.stderr);
+            assert!(updated.stdout.contains("Updating pi with npm"));
+            assert!(updated
+                .stdout
+                .contains(&format!("Updated pi from {VERSION} to 0.84.5")));
+            let recorded = std::fs::read_to_string(&record).unwrap();
+            assert!(recorded.contains("install"));
+            assert!(recorded.contains("-g"));
+            assert!(recorded.contains("--ignore-scripts"));
+            assert!(recorded.contains("--min-release-age=0"));
+            assert!(recorded.contains("@earendil-works/pi-coding-agent@0.84.5"));
+            match previous_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match previous_method {
+                Some(v) => std::env::set_var("PI_INSTALL_METHOD", v),
+                None => std::env::remove_var("PI_INSTALL_METHOD"),
             }
             match previous_pkg {
                 Some(v) => std::env::set_var("PI_PACKAGE_DIR", v),

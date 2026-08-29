@@ -4,6 +4,7 @@ use pi_ai::ThinkingLevel;
 use pi_tui::TuiMode;
 
 pub const APP_NAME: &str = "pi";
+pub const PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
 pub const CONFIG_DIR_NAME: &str = ".pi";
 pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";

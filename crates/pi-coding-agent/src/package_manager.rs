@@ -1500,6 +1500,12 @@ pub fn project_is_trusted(approve: Option<bool>, mode: ProjectTrustMode) -> bool
     if !settings::has_trust_requiring_project_resources(&cwd) {
         return true;
     }
+    if let Some((trusted, remember)) = crate::extensions::consult_project_trust(&cwd) {
+        if remember {
+            settings::set_trust(&agent, &cwd, Some(trusted));
+        }
+        return trusted;
+    }
     if let Some(decision) = settings::trust_decision(&agent, &cwd) {
         return decision;
     }
