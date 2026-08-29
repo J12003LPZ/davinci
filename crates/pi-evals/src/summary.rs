@@ -644,6 +644,7 @@ pub fn strip_vt_control_characters(input: &str) -> String {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn observation(
         harness: &str,
         test_name: &str,

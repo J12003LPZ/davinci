@@ -2,7 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 pub const EVAL_HARNESS_ITERATION_ARTIFACT: &str = "vitestEvalsHarnessIteration";
 
@@ -99,10 +98,7 @@ fn derive_input_key(input: &Value) -> Result<String, String> {
     }
     let canonical = serde_json::to_string(&canonicalize_json(input)?)
         .map_err(|_| "Eval input must be JSON-serializable.".to_string())?;
-    Ok(Sha256::digest(canonical.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(crate::artifacts::sha256_hex(&canonical))
 }
 
 pub fn derive_eval_group_key(input: &Value, repetition: i64) -> Result<String, String> {

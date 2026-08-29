@@ -1,6 +1,7 @@
 //! TS `vendor/pi/packages/evals/src/vitest-evals/artifacts.ts`.
 
 use sha2::{Digest, Sha256};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 pub const PI_SESSION_SNAPSHOT_ARTIFACT: &str = "piSessionJsonl";
@@ -59,11 +60,13 @@ pub fn record_eval_source_artifact(run_id: &str, attachment: EvalAttachment) -> 
     }
 }
 
-fn sha256_hex(input: &str) -> String {
-    Sha256::digest(input.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+pub(crate) fn sha256_hex(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 pub fn persist_eval_artifact_references(
