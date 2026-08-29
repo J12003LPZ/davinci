@@ -2,9 +2,9 @@
 
 **Integration branch: `rust-rewrite`.** TypeScript under `vendor/pi` stays as the behavioral reference.
 
-**Complete: ChatMessage extras landed; bashExecution persist, `before_agent_start` custom messages, and fd/rg find/grep still open.** Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
+**Complete: ChatMessage extras landed; bashExecution persist, `before_agent_start` custom messages, and fd/rg find/grep still open.**
 
-Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
+Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`. Merged `main` (96 product commits + ChatMessage extras) into `rust-rewrite`, keeping rust-rewrite-only vendor/LICENSE files. Overlapping crates use the `main` tree.
 
 ## What landed
 
