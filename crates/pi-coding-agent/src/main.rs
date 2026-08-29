@@ -11,6 +11,7 @@ mod extensions;
 mod interactive;
 mod package_manager;
 mod rpc;
+mod self_update;
 mod session_runtime;
 mod settings;
 mod share;

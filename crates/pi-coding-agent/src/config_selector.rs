@@ -3,10 +3,16 @@ use crate::package_manager::{
 };
 use crate::settings::{agent_dir, package_source_string, settings_path, SettingsDocument};
 use pi_tui::component::Component;
+use pi_tui::diff::visible_width;
+use pi_tui::keys::{read_key, Key};
+use pi_tui::screen::Tui;
+use pi_tui::terminal::{
+    disable_raw_input, enable_raw_input, enter_alt_screen, leave_alt_screen, TuiMode,
+};
 use pi_tui::widgets::Input;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,21 +626,15 @@ impl ConfigSelector {
     fn checkbox(&self, item: &ResourceItem) -> String {
         if self.write_scope == WriteScope::Project {
             return match project_override_state(item) {
-                OverrideState::Load => "[+]".into(),
-                OverrideState::Unload => "[-]".into(),
-                OverrideState::Inherit => {
-                    if item.enabled {
-                        "[x]".into()
-                    } else {
-                        "[ ]".into()
-                    }
-                }
+                OverrideState::Load => theme_fg("success", "[+]"),
+                OverrideState::Unload => theme_fg("warning", "[-]"),
+                OverrideState::Inherit => theme_fg("dim", if item.enabled { "[x]" } else { "[ ]" }),
             };
         }
         if item.enabled {
-            "[x]".into()
+            theme_fg("success", "[x]")
         } else {
-            "[ ]".into()
+            theme_fg("dim", "[ ]")
         }
     }
 
@@ -643,11 +643,21 @@ impl ConfigSelector {
             return String::new();
         }
         match project_override_state(item) {
-            OverrideState::Load => "  project load".into(),
-            OverrideState::Unload => "  project unload".into(),
-            OverrideState::Inherit if item.metadata.scope == "user" => "  inherited global".into(),
+            OverrideState::Load => theme_fg("muted", "  project load"),
+            OverrideState::Unload => theme_fg("muted", "  project unload"),
+            OverrideState::Inherit if item.metadata.scope == "user" => {
+                theme_fg("dim", "  inherited global")
+            }
             _ => String::new(),
         }
+    }
+
+    pub fn handle_key(&mut self, key: &Key) -> bool {
+        self.handle_input(&key_to_config_input(key))
+    }
+
+    pub fn set_terminal_rows(&mut self, rows: usize) {
+        self.max_visible = rows.saturating_sub(8).max(5);
     }
 }
 
@@ -859,37 +869,40 @@ fn next_override_state(
 
 impl Component for ConfigSelector {
     fn render(&self, width: usize) -> Vec<String> {
-        let title = if self.write_scope == WriteScope::Project {
+        let title = theme_bold(if self.write_scope == WriteScope::Project {
             "Project Local Resources"
         } else {
             "Global Resources"
-        };
+        });
+        let sep = theme_fg("muted", " · ");
         let switch = if self.project_mode_available {
-            "tab switch mode · "
+            format!("tab switch mode{sep}")
         } else {
-            ""
+            String::new()
         };
         let action = if self.write_scope == WriteScope::Project {
             "space cycle inherit/+/-"
         } else {
             "space toggle"
         };
-        let hint = format!("{switch}{action} · esc close");
-        let spacing = width.saturating_sub(title.len() + hint.len()).max(1);
+        let hint = format!("{switch}{action}{sep}esc close");
+        let spacing = width
+            .saturating_sub(visible_width(&title) + visible_width(&hint))
+            .max(1);
         let scope_hint = if self.write_scope == WriteScope::Project {
-            ".pi/settings.json · inherited global resources are dimmed"
+            theme_fg(
+                "muted",
+                ".pi/settings.json · inherited global resources are dimmed",
+            )
         } else {
-            "~/.pi/agent/settings.json"
+            theme_fg("muted", "~/.pi/agent/settings.json")
         };
-        let mut lines = vec![
-            format!("{title}{:spacing$}{hint}", ""),
-            scope_hint.to_string(),
-        ];
-        lines.extend(self.search.render(width));
-        lines.push(String::new());
+        let mut inner = vec![format!("{title}{:spacing$}{hint}", ""), scope_hint];
+        inner.extend(self.search.render(width));
+        inner.push(String::new());
         if self.filtered.is_empty() {
-            lines.push("  No resources found".into());
-            return lines;
+            inner.push(theme_fg("muted", "  No resources found"));
+            return wrap_process_terminal_chrome(inner, width);
         }
         let start = self
             .selected
@@ -905,17 +918,27 @@ impl Component for ConfigSelector {
                     } else {
                         ""
                     };
-                    lines.push(format!("  {label}{suffix}"));
+                    inner.push(theme_fg(
+                        if inherited { "dim" } else { "accent" },
+                        &format!("  {label}{suffix}"),
+                    ));
                 }
                 FlatEntry::Subgroup { label, .. } => {
-                    lines.push(format!("    {label}"));
+                    inner.push(theme_fg("muted", &format!("    {label}")));
                 }
                 FlatEntry::Item(item) => {
                     let cursor = if i == self.selected { "> " } else { "  " };
-                    lines.push(format!(
+                    let name = if self.write_scope == WriteScope::Project
+                        && item.metadata.scope == "user"
+                    {
+                        theme_fg("dim", &item.display_name)
+                    } else {
+                        item.display_name.clone()
+                    };
+                    inner.push(format!(
                         "{cursor}    {} {}{}",
                         self.checkbox(item),
-                        item.display_name,
+                        name,
                         self.item_suffix(item)
                     ));
                 }
@@ -934,10 +957,90 @@ impl Component for ConfigSelector {
                 .filter(|e| matches!(e, FlatEntry::Item(_)))
                 .count()
                 .max(1);
-            lines.push(format!("  ({current}/{item_count})"));
+            inner.push(theme_fg("dim", &format!("  ({current}/{item_count})")));
         }
-        lines
+        wrap_process_terminal_chrome(inner, width)
     }
+}
+
+fn hex_rgb(hex: &str) -> (u8, u8, u8) {
+    let h = hex.trim_start_matches('#');
+    if h.len() < 6 {
+        return (0, 0, 0);
+    }
+    (
+        u8::from_str_radix(&h[0..2], 16).unwrap_or(0),
+        u8::from_str_radix(&h[2..4], 16).unwrap_or(0),
+        u8::from_str_radix(&h[4..6], 16).unwrap_or(0),
+    )
+}
+
+fn theme_color_hex(name: &str) -> &'static str {
+    match name {
+        "accent" => "#8abeb7",
+        "border" => "#5f87ff",
+        "success" => "#b5bd68",
+        "warning" => "#ffff00",
+        "muted" => "#808080",
+        "dim" => "#666666",
+        _ => "#d4d4d4",
+    }
+}
+
+fn theme_fg(name: &str, text: &str) -> String {
+    let (r, g, b) = hex_rgb(theme_color_hex(name));
+    format!("\u{1b}[38;2;{r};{g};{b}m{text}\u{1b}[39m")
+}
+
+fn theme_bold(text: &str) -> String {
+    format!("\u{1b}[1m{text}\u{1b}[22m")
+}
+
+fn dynamic_border_line(width: usize) -> String {
+    theme_fg("border", &"─".repeat(width.max(1)))
+}
+
+fn wrap_process_terminal_chrome(inner: Vec<String>, width: usize) -> Vec<String> {
+    let border = dynamic_border_line(width);
+    let mut lines = vec![String::new(), border.clone(), String::new()];
+    lines.extend(inner);
+    lines.push(String::new());
+    lines.push(border);
+    lines
+}
+
+fn key_to_config_input(key: &Key) -> String {
+    match key {
+        Key::Up => "up".into(),
+        Key::Down => "down".into(),
+        Key::Tab => "tab".into(),
+        Key::Escape => "escape".into(),
+        Key::Enter => "enter".into(),
+        Key::Backspace => "backspace".into(),
+        Key::Ctrl('c') => "ctrl+c".into(),
+        Key::Char(c) => c.to_string(),
+        Key::Unknown(raw) if raw.contains("[5~") => "pageup".into(),
+        Key::Unknown(raw) if raw.contains("[6~") => "pagedown".into(),
+        Key::Unknown(raw) => raw.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn terminal_size() -> (usize, usize) {
+    if let Ok(out) = std::process::Command::new("stty").arg("size").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut parts = text.split_whitespace();
+            if let (Some(rows), Some(cols)) = (parts.next(), parts.next()) {
+                if let (Ok(rows), Ok(cols)) = (rows.parse::<usize>(), cols.parse::<usize>()) {
+                    if rows > 0 && cols > 0 {
+                        return (cols, rows);
+                    }
+                }
+            }
+        }
+    }
+    (80, 24)
 }
 
 pub fn render_config(write_scope: WriteScope, project_trusted: bool) -> String {
@@ -961,24 +1064,36 @@ pub fn run_interactive_config(write_scope: WriteScope, project_trusted: bool) ->
         global.clone()
     };
     let mut selector = ConfigSelector::from_scoped(&global, &project, write_scope, project_trusted);
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
     if !stdin.is_terminal() || !stdout.is_terminal() {
         return render_config(write_scope, project_trusted);
     }
-    use std::io::Write;
+    let (cols, rows) = terminal_size();
+    selector.set_terminal_rows(rows);
+    let _ = enter_alt_screen(&mut stdout);
+    let _ = enable_raw_input();
+    let mut tui = Tui::new(TuiMode::Fullscreen, cols, rows);
+    let mut raw_stdin = stdin;
     loop {
-        let frame = selector.render(80).join("\n");
-        let _ = writeln!(stdout, "{frame}");
+        tui.clear_children();
+        tui.add_child_lines(selector.render(cols));
+        let frame = tui.render_now(false);
+        let _ = write!(stdout, "{frame}");
         let _ = stdout.flush();
-        let mut buf = String::new();
-        if stdin.read_line(&mut buf).ok().unwrap_or(0) == 0 {
-            break;
-        }
-        if selector.handle_input(buf.trim_end()) {
-            break;
+        match read_key(&mut raw_stdin) {
+            Ok(Some(key)) => {
+                if selector.handle_key(&key) {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
         }
     }
+    let _ = disable_raw_input();
+    let _ = leave_alt_screen(&mut stdout);
+    let _ = stdout.flush();
     String::new()
 }
 
@@ -1052,6 +1167,9 @@ mod tests {
         let project = render_config(WriteScope::Project, true);
         assert!(project.contains("Project Local Resources"));
         assert!(project.contains("space cycle inherit/+/-"));
+        assert!(project.contains('─'));
+        assert!(project.contains("\u{1b}[38;2;"));
+        assert!(selector.handle_key(&Key::Escape));
         selector.handle_input(" ");
         let project_doc = SettingsDocument::load(&dir.path().join(".pi").join("settings.json"));
         let project_pkg = project_doc

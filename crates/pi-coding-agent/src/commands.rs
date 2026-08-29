@@ -2,8 +2,9 @@ use crate::args::{parse_args, APP_NAME, VERSION};
 use crate::config_selector::{render_config, run_interactive_config, WriteScope};
 use crate::package_manager::{
     format_package_list, install_and_persist, list_configured_packages, project_is_trusted,
-    remove_and_persist, update_configured,
+    remove_and_persist, update_configured, ProjectTrustMode,
 };
+use crate::self_update;
 use pi_ai::{get_env_api_key, AuthStorage, FileAuthStorage};
 use std::io::{self, IsTerminal, Write};
 
@@ -295,6 +296,8 @@ Options:
   --models                Refresh model catalogs only
   --all                   Update pi and installed packages
   --extension <source>    Update one package only
+  -a, --approve           Trust project-local files for this command
+  -na, --no-approve       Ignore project-local files for this command
   --force                 Reinstall pi even if the current version is latest
 ",
             package_usage("update")
@@ -304,6 +307,10 @@ Options:
   {}
 
 List installed packages from user and project settings.
+
+Options:
+  -a, --approve      Trust project-local files for this command
+  -na, --no-approve  Ignore project-local files for this command
 ",
             package_usage("list")
         ),
@@ -369,19 +376,47 @@ fn self_update_unavailable_instruction() -> String {
 }
 
 fn run_self_update(force: bool) -> CommandOutcome {
-    let _ = force;
-    if let Ok(fixture) = std::env::var("PI_SELF_UPDATE_FIXTURE") {
-        if let Ok(raw) = std::fs::read_to_string(&fixture) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
-                    return CommandOutcome::done(
-                        0,
-                        format!("Updated {APP_NAME} from {VERSION} to {version}\n"),
-                        "",
-                    );
-                }
-            }
-        }
+    let managed = match self_update::active_managed_install_root() {
+        Ok(root) => root,
+        Err(err) => return CommandOutcome::done(1, "", format!("Error: {err}\n")),
+    };
+    if managed.is_some() && force {
+        return CommandOutcome::done(
+            1,
+            "",
+            format!(
+                "Managed {APP_NAME} installations do not support --force; rerun the installer to repair this installation.\n"
+            ),
+        );
+    }
+    let plan = match self_update::self_update_plan(force) {
+        Ok(plan) => plan,
+        Err(err) => return CommandOutcome::done(1, "", format!("Error: {err}\n")),
+    };
+    if !plan.should_run {
+        return CommandOutcome::done(
+            0,
+            format!("{APP_NAME} is already up to date (v{VERSION})\n"),
+            "",
+        );
+    }
+    let mut stdout = String::new();
+    if let Some(note) = &plan.note {
+        stdout.push_str(&self_update::format_update_note(note));
+    }
+    if let Some(root) = managed {
+        stdout.push_str(&format!("Updating managed {APP_NAME} installation...\n"));
+        return match self_update::run_managed_self_update(&root, &plan.version) {
+            Ok(()) => CommandOutcome::done(
+                0,
+                format!(
+                    "{stdout}Updated {APP_NAME} from {VERSION} to {}\n",
+                    plan.version
+                ),
+                "",
+            ),
+            Err(err) => CommandOutcome::done(1, stdout, format!("Error: {err}\n")),
+        };
     }
     let mut stderr = format!("error: {APP_NAME} cannot self-update this installation.\n");
     stderr.push_str(&self_update_unavailable_instruction());
@@ -393,7 +428,7 @@ fn run_self_update(force: bool) -> CommandOutcome {
             exe.display()
         ));
     }
-    CommandOutcome::done(1, "", stderr)
+    CommandOutcome::done(1, stdout, stderr)
 }
 
 fn refresh_model_catalogs() -> Result<(), String> {
@@ -542,7 +577,12 @@ fn run_package(command: &str, args: &[String]) -> CommandOutcome {
     }
 
     let approve = parse_approve(args).unwrap_or(None);
-    let trusted = project_is_trusted(approve);
+    let trust_mode = if command == "update" {
+        ProjectTrustMode::SavedOnly
+    } else {
+        ProjectTrustMode::Full
+    };
+    let trusted = project_is_trusted(approve, trust_mode);
     if local && !trusted && (command == "install" || command == "remove" || command == "uninstall")
     {
         return CommandOutcome::done(
@@ -553,7 +593,11 @@ fn run_package(command: &str, args: &[String]) -> CommandOutcome {
     }
 
     match command {
-        "list" => CommandOutcome::done(0, format_package_list(&list_configured_packages()), ""),
+        "list" => CommandOutcome::done(
+            0,
+            format_package_list(&list_configured_packages(trusted)),
+            "",
+        ),
         "install" => {
             let Some(source) = source else {
                 return CommandOutcome::done(
@@ -598,6 +642,7 @@ fn run_package(command: &str, args: &[String]) -> CommandOutcome {
             extension_flag_source,
             force,
             conflicting,
+            trusted,
         ),
         _ => CommandOutcome::skip(),
     }
@@ -613,6 +658,7 @@ fn run_update(
     extension_flag_source: Option<String>,
     force: bool,
     mut conflicting: Option<String>,
+    include_project: bool,
 ) -> CommandOutcome {
     if all_flag && (self_flag || extensions_flag || models_flag || extension_flag_source.is_some())
     {
@@ -666,7 +712,7 @@ fn run_update(
     let (target, skipped_note) = if models_flag {
         (UpdateTarget::Models, false)
     } else if let Some(ext) = extension_flag_source.clone() {
-        return update_extensions(Some(ext));
+        return update_extensions(Some(ext), include_project);
     } else if let Some(source) = source.clone() {
         if source == "self" || source == "pi" {
             if extensions_flag {
@@ -675,7 +721,7 @@ fn run_update(
                 (UpdateTarget::SelfOnly, false)
             }
         } else {
-            return update_extensions(Some(source));
+            return update_extensions(Some(source), include_project);
         }
     } else if all_flag || (self_flag && extensions_flag) {
         (UpdateTarget::All, false)
@@ -700,7 +746,7 @@ fn run_update(
         },
         UpdateTarget::Extensions => {
             let mut out = stdout;
-            let result = update_extensions(None);
+            let result = update_extensions(None, include_project);
             out.push_str(&result.stdout);
             CommandOutcome::done(result.exit_code, out, result.stderr)
         }
@@ -709,7 +755,7 @@ fn run_update(
             CommandOutcome::done(result.exit_code, stdout + &result.stdout, result.stderr)
         }
         UpdateTarget::All => {
-            let ext = update_extensions(None);
+            let ext = update_extensions(None, include_project);
             if ext.exit_code != 0 {
                 return CommandOutcome::done(ext.exit_code, stdout + &ext.stdout, ext.stderr);
             }
@@ -724,8 +770,8 @@ fn run_update(
     }
 }
 
-fn update_extensions(source: Option<String>) -> CommandOutcome {
-    match update_configured(source.as_deref()) {
+fn update_extensions(source: Option<String>, include_project: bool) -> CommandOutcome {
+    match update_configured(source.as_deref(), include_project) {
         Ok(_) => {
             if let Some(source) = source {
                 CommandOutcome::done(0, format!("Updated {source}\n"), "")
@@ -767,7 +813,7 @@ fn run_config(args: &[String]) -> CommandOutcome {
             );
         }
     }
-    let trusted = project_is_trusted(approve);
+    let trusted = project_is_trusted(approve, ProjectTrustMode::Full);
     if local && !trusted {
         return CommandOutcome::done(
             1,
@@ -891,17 +937,168 @@ mod tests {
             assert_eq!(config.exit_code, 0);
             assert!(config.stdout.contains("Global Resources"));
             assert!(config.stdout.contains("npm:pi-cli (user)"));
+            let latest = dir.path().join("latest.json");
+            std::fs::write(&latest, r#"{"version":"0.84.5"}"#).unwrap();
+            let previous_latest = std::env::var("PI_SELF_UPDATE_FIXTURE").ok();
+            std::env::set_var("PI_SELF_UPDATE_FIXTURE", &latest);
             let update = dispatch_subcommand(&["update".into()]);
             assert!(update.stdout.contains("Extensions are skipped"));
             assert!(update
                 .stderr
                 .contains("cannot self-update this installation"));
+            match previous_latest {
+                Some(v) => std::env::set_var("PI_SELF_UPDATE_FIXTURE", v),
+                None => std::env::remove_var("PI_SELF_UPDATE_FIXTURE"),
+            }
             let unknown = dispatch_subcommand(&["list".into(), "-l".into()]);
             assert_eq!(unknown.exit_code, 1);
             assert!(unknown.stderr.contains("Unknown option -l for \"list\""));
             match previous_fixture {
                 Some(v) => std::env::set_var("PI_PACKAGE_FIXTURE", v),
                 None => std::env::remove_var("PI_PACKAGE_FIXTURE"),
+            }
+        });
+    }
+
+    fn write_pi_shim(dir: &std::path::Path, version: &str) {
+        let bin = dir.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let pi = bin.join("pi");
+        std::fs::write(&pi, format!("#!/bin/sh\nprintf '%s\\n' {version}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&pi).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&pi, perms).unwrap();
+        }
+    }
+
+    #[test]
+    fn list_respects_project_trust_like_typescript() {
+        with_agent_dir(|| {
+            let cwd = std::env::current_dir().unwrap();
+            let project = cwd.join(".pi");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("settings.json"),
+                r#"{"packages":["npm:@project/pkg"]}"#,
+            )
+            .unwrap();
+            let untrusted = dispatch_subcommand(&["list".into()]);
+            assert_eq!(untrusted.stdout, "No packages installed.\n");
+            assert!(!untrusted.stdout.contains("Project packages:"));
+
+            let approved = dispatch_subcommand(&["list".into(), "--approve".into()]);
+            assert!(approved.stdout.contains("Project packages:"));
+            assert!(approved.stdout.contains("npm:@project/pkg"));
+
+            crate::settings::save_trust(&agent_dir(), &cwd);
+            let remembered = dispatch_subcommand(&["list".into()]);
+            assert!(remembered.stdout.contains("Project packages:"));
+
+            let denied = dispatch_subcommand(&["list".into(), "--no-approve".into()]);
+            assert_eq!(denied.stdout, "No packages installed.\n");
+
+            crate::settings::set_trust(&agent_dir(), &cwd, Some(false));
+            std::fs::write(settings_path(false), r#"{"defaultProjectTrust":"always"}"#).unwrap();
+            let overridden = dispatch_subcommand(&["list".into()]);
+            assert_eq!(overridden.stdout, "No packages installed.\n");
+
+            crate::settings::set_trust(&agent_dir(), &cwd, None);
+            let always = dispatch_subcommand(&["list".into()]);
+            assert!(always.stdout.contains("Project packages:"));
+        });
+    }
+
+    #[test]
+    fn managed_install_self_update_matches_typescript() {
+        with_agent_dir(|| {
+            let root = tempdir().unwrap();
+            let managed = root.path().join("install");
+            let current_release = managed.join("releases").join(VERSION);
+            let package_dir = current_release
+                .join("node_modules")
+                .join("@earendil-works")
+                .join("pi-coding-agent");
+            std::fs::create_dir_all(&package_dir).unwrap();
+            write_pi_shim(&current_release, VERSION);
+            std::fs::write(managed.join("current-version"), format!("{VERSION}\n")).unwrap();
+            std::fs::write(
+                managed.join("managed-install.json"),
+                r#"{"kind":"pi-managed-install","schemaVersion":1,"layout":"releases-v1"}
+"#,
+            )
+            .unwrap();
+
+            let previous_root = std::env::var("PI_MANAGED_INSTALL_ROOT").ok();
+            let previous_pkg = std::env::var("PI_PACKAGE_DIR").ok();
+            let previous_latest = std::env::var("PI_SELF_UPDATE_FIXTURE").ok();
+            std::env::set_var("PI_MANAGED_INSTALL_ROOT", &managed);
+            std::env::set_var("PI_PACKAGE_DIR", &package_dir);
+
+            let force = dispatch_subcommand(&["update".into(), "--self".into(), "--force".into()]);
+            assert_eq!(force.exit_code, 1);
+            assert!(force
+                .stderr
+                .contains("Managed pi installations do not support --force"));
+
+            let current_latest = root.path().join("current.json");
+            std::fs::write(&current_latest, format!(r#"{{"version":"{VERSION}"}}"#)).unwrap();
+            std::env::set_var("PI_SELF_UPDATE_FIXTURE", &current_latest);
+            let current = dispatch_subcommand(&["update".into(), "--self".into()]);
+            assert_eq!(current.exit_code, 0, "{}", current.stderr);
+            assert!(current
+                .stdout
+                .contains(&format!("pi is already up to date (v{VERSION})")));
+
+            let next = "0.84.5";
+            let next_release = managed.join("releases").join(next);
+            write_pi_shim(&next_release, next);
+            std::fs::write(
+                root.path().join("next.json"),
+                format!(r#"{{"version":"{next}"}}"#),
+            )
+            .unwrap();
+            std::env::set_var("PI_SELF_UPDATE_FIXTURE", root.path().join("next.json"));
+            let updated = dispatch_subcommand(&["update".into(), "--self".into()]);
+            assert_eq!(updated.exit_code, 0, "{}", updated.stderr);
+            assert!(updated
+                .stdout
+                .contains(&format!("Updated pi from {VERSION} to {next}")));
+            assert_eq!(
+                std::fs::read_to_string(managed.join("current-version"))
+                    .unwrap()
+                    .trim(),
+                next
+            );
+
+            std::fs::create_dir_all(managed.join("update.lock")).unwrap();
+            let locked = dispatch_subcommand(&["update".into(), "--self".into()]);
+            assert_eq!(locked.exit_code, 1);
+            assert!(locked
+                .stderr
+                .contains("Another managed Pi update is already running."));
+            std::fs::remove_dir_all(managed.join("update.lock")).unwrap();
+
+            std::fs::write(managed.join("managed-install.json"), r#"{"kind":"nope"}"#).unwrap();
+            let invalid = dispatch_subcommand(&["update".into(), "--self".into()]);
+            assert_eq!(invalid.exit_code, 1);
+            assert!(invalid
+                .stderr
+                .contains("Managed install marker is missing or invalid"));
+
+            match previous_root {
+                Some(v) => std::env::set_var("PI_MANAGED_INSTALL_ROOT", v),
+                None => std::env::remove_var("PI_MANAGED_INSTALL_ROOT"),
+            }
+            match previous_pkg {
+                Some(v) => std::env::set_var("PI_PACKAGE_DIR", v),
+                None => std::env::remove_var("PI_PACKAGE_DIR"),
+            }
+            match previous_latest {
+                Some(v) => std::env::set_var("PI_SELF_UPDATE_FIXTURE", v),
+                None => std::env::remove_var("PI_SELF_UPDATE_FIXTURE"),
             }
         });
     }

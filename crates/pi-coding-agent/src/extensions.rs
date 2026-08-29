@@ -28,7 +28,10 @@ pub fn discover_extensions(
     if no_discover {
         return found;
     }
-    let trusted = crate::package_manager::project_is_trusted(None);
+    let trusted = crate::package_manager::project_is_trusted(
+        None,
+        crate::package_manager::ProjectTrustMode::Full,
+    );
     for ext in crate::package_manager::resolve_resources(agent_dir, cwd, trusted).extensions {
         if ext.enabled && !found.iter().any(|e| e.path == ext.path) {
             push_extension(&ext.path, &mut found);

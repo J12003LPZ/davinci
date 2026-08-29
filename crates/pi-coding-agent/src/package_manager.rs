@@ -839,9 +839,14 @@ pub fn remove_and_persist(source: &str, local: bool) -> Result<bool, String> {
     Ok(remove_source_from_settings(source, local))
 }
 
-pub fn list_configured_packages() -> Vec<ConfiguredPackage> {
+pub fn list_configured_packages(include_project: bool) -> Vec<ConfiguredPackage> {
     let mut out = Vec::new();
-    for (local, scope) in [(false, "user"), (true, "project")] {
+    let scopes = if include_project {
+        vec![(false, "user"), (true, "project")]
+    } else {
+        vec![(false, "user")]
+    };
+    for (local, scope) in scopes {
         let doc = SettingsDocument::load(&settings_path(local));
         for pkg in doc.packages() {
             let Some(source) = package_source_string(&pkg) else {
@@ -902,10 +907,13 @@ pub fn package_identity(source: &str) -> String {
     }
 }
 
-pub fn update_configured(source: Option<&str>) -> Result<Vec<String>, String> {
+pub fn update_configured(
+    source: Option<&str>,
+    include_project: bool,
+) -> Result<Vec<String>, String> {
     if let Some(source) = source {
         let identity = package_identity(source);
-        let packages = list_configured_packages();
+        let packages = list_configured_packages(include_project);
         if !packages
             .iter()
             .any(|pkg| package_identity(&pkg.source) == identity)
@@ -916,7 +924,7 @@ pub fn update_configured(source: Option<&str>) -> Result<Vec<String>, String> {
     if is_offline_mode_enabled() {
         return Ok(Vec::new());
     }
-    let packages = list_configured_packages();
+    let packages = list_configured_packages(include_project);
     let mut updated = Vec::new();
     for pkg in packages {
         if let Some(source) = source {
@@ -1474,12 +1482,28 @@ pub fn resolve_current(project_trusted: bool) -> ResolvedPaths {
     resolve_resources(&agent_dir(), &cwd(), project_trusted)
 }
 
-pub fn project_is_trusted(approve: Option<bool>) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectTrustMode {
+    Full,
+    SavedOnly,
+}
+
+pub fn project_is_trusted(approve: Option<bool>, mode: ProjectTrustMode) -> bool {
     if let Some(flag) = approve {
         return flag;
     }
-    let local = SettingsDocument::load(&settings_path(true));
-    local.trusted() || settings::is_trusted(&agent_dir(), &cwd())
+    let cwd = cwd();
+    let agent = agent_dir();
+    if mode == ProjectTrustMode::SavedOnly {
+        return settings::trust_decision(&agent, &cwd) == Some(true);
+    }
+    if !settings::has_trust_requiring_project_resources(&cwd) {
+        return true;
+    }
+    if let Some(decision) = settings::trust_decision(&agent, &cwd) {
+        return decision;
+    }
+    SettingsDocument::load(&settings_path(false)).default_project_trust() == "always"
 }
 
 #[cfg(test)]
@@ -1565,7 +1589,7 @@ mod tests {
         );
         assert!(installed.join("extensions").join("index.ts").exists());
         assert!(agent.join("npm").join("package.json").exists());
-        let listed = list_configured_packages();
+        let listed = list_configured_packages(true);
         assert_eq!(listed[0].source, "npm:pi-fixture");
         assert_eq!(listed[0].installed_path.as_ref(), Some(&installed));
         let resolved = resolve_resources(&agent, dir.path(), false);

@@ -107,13 +107,6 @@ impl SettingsDocument {
         }
     }
 
-    pub fn trusted(&self) -> bool {
-        self.value
-            .get("trusted")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    }
-
     pub fn npm_command(&self) -> Option<Vec<String>> {
         let args = self
             .value
@@ -130,28 +123,111 @@ impl SettingsDocument {
             Some(args)
         }
     }
+
+    pub fn default_project_trust(&self) -> &'static str {
+        match self
+            .value
+            .get("defaultProjectTrust")
+            .and_then(|v| v.as_str())
+        {
+            Some("always") => "always",
+            Some("never") => "never",
+            _ => "ask",
+        }
+    }
+}
+
+const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: [&str; 7] = [
+    "settings.json",
+    "extensions",
+    "skills",
+    "prompts",
+    "themes",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+];
+
+pub fn canonicalize_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+pub fn cwd_relative_path(file_path: &Path, cwd: &Path) -> Option<PathBuf> {
+    let resolved_cwd = canonicalize_path(cwd);
+    let resolved_path = canonicalize_path(file_path);
+    if resolved_path == resolved_cwd {
+        return Some(PathBuf::from("."));
+    }
+    resolved_path
+        .strip_prefix(&resolved_cwd)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
+    let current = canonicalize_path(cwd);
+    let config_dir = current.join(".pi");
+    if TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES
+        .iter()
+        .any(|entry| config_dir.join(entry).exists())
+    {
+        return true;
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let user_agents = canonicalize_path(&home.join(".agents").join("skills"));
+    let mut dir = current;
+    loop {
+        let agents = canonicalize_path(&dir.join(".agents").join("skills"));
+        if agents != user_agents && agents.exists() {
+            return true;
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => return false,
+        }
+    }
 }
 
 pub fn trust_store_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("trusted-projects.json")
+    agent_dir.join("trust.json")
+}
+
+fn read_trust_file(agent_dir: &Path) -> Value {
+    let path = trust_store_path(agent_dir);
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .filter(|value: &Value| value.is_object())
+        .unwrap_or_else(|| json!({}))
+}
+
+pub fn trust_decision(agent_dir: &Path, cwd: &Path) -> Option<bool> {
+    let data = read_trust_file(agent_dir);
+    let obj = data.as_object()?;
+    let mut dir = canonicalize_path(cwd);
+    loop {
+        let key = dir.to_string_lossy();
+        if let Some(value) = obj.get(key.as_ref()) {
+            if let Some(decision) = value.as_bool() {
+                return Some(decision);
+            }
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
 }
 
 pub fn is_trusted(agent_dir: &Path, cwd: &Path) -> bool {
-    let path = trust_store_path(agent_dir);
-    let Ok(raw) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return false;
-    };
-    value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .any(|v| v.as_str() == Some(&cwd.to_string_lossy()))
-        })
-        .unwrap_or(false)
+    trust_decision(agent_dir, cwd) == Some(true)
 }
 
 #[cfg(test)]
@@ -161,20 +237,31 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub fn save_trust(agent_dir: &Path, cwd: &Path) {
+    set_trust(agent_dir, cwd, Some(true));
+}
+
+pub fn set_trust(agent_dir: &Path, cwd: &Path, decision: Option<bool>) {
     let path = trust_store_path(agent_dir);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let mut items = fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-        .unwrap_or_default();
-    let cwd = cwd.to_string_lossy().to_string();
-    if !items.contains(&cwd) {
-        items.push(cwd);
+    let mut data = read_trust_file(agent_dir);
+    let key = canonicalize_path(cwd).to_string_lossy().into_owned();
+    if let Some(obj) = data.as_object_mut() {
+        match decision {
+            Some(value) => {
+                obj.insert(key, json!(value));
+            }
+            None => {
+                obj.remove(&key);
+            }
+        }
     }
     let _ = fs::write(
         path,
-        serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into()),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&data).unwrap_or_else(|_| "{}".into())
+        ),
     );
 }
