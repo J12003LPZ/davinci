@@ -3,6 +3,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub const LLAMA_PROVIDER_ID: &str = "llama.cpp";
 pub const DEFAULT_LLAMA_SERVER_URL: &str = "http://127.0.0.1:8080";
@@ -394,37 +398,142 @@ pub fn parse_sse_events(body: &str) -> Vec<LlamaModelEvent> {
     events
 }
 
+pub fn is_connection_error(error: &str) -> bool {
+    let message = error.to_lowercase();
+    message.contains("fetch failed")
+        || message.contains("timeout")
+        || message.contains("network")
+        || message.contains("could not connect")
+        || message.contains("connection refused")
+}
+
+pub fn connection_error_message(error: &str) -> String {
+    if is_connection_error(error) {
+        "Could not connect to the server.".into()
+    } else {
+        error.to_string()
+    }
+}
+
+pub fn connection_retry_title(server_url: &str, error: &str) -> String {
+    format!(
+        "llama.cpp unavailable\n{server_url}\n\n{}",
+        connection_error_message(error)
+    )
+}
+
+pub fn progress_bar(ratio: f64) -> String {
+    let clamped = ratio.clamp(0.0, 1.0);
+    let filled = (clamped * 40.0).round() as usize;
+    let filled = filled.min(40);
+    format!(
+        "{}{} {}%",
+        "█".repeat(filled),
+        "─".repeat(40 - filled),
+        (clamped * 100.0).round() as i32
+    )
+}
+
+/// Snapshot helper used by fixtures and tests. Live callers use [`watch_live`].
 pub fn watch_events(server_url: &str) -> Result<Vec<LlamaModelEvent>, String> {
+    let mut events = Vec::new();
+    watch_live(server_url, |event| events.push(event), None)?;
+    Ok(events)
+}
+
+/// TS `LlamaClient.watch`: persistent `GET /models/sse` with incremental frames.
+pub fn watch_live(
+    server_url: &str,
+    mut on_event: impl FnMut(LlamaModelEvent),
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
     if let Ok(raw) = std::env::var("PI_LLAMA_SSE_REPLY") {
-        return Ok(parse_sse_events(&raw));
+        for event in parse_sse_events(&raw) {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Ok(());
+            }
+            on_event(event);
+        }
+        return Ok(());
     }
     if std::env::var("PI_LLAMA_DRY_RUN").is_ok() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let url = format!("{}/models/sse", normalize_llama_server_url(server_url)?);
-    let mut request = ureq::get(&url);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_millis(200))
+        .timeout_write(Duration::from_secs(5))
+        .build();
+    let mut request = agent.get(&url);
     if let Ok(key) = std::env::var("LLAMA_API_KEY") {
         if !key.is_empty() {
             request = request.set("Authorization", &format!("Bearer {key}"));
         }
     }
     let response = request
-        .timeout(std::time::Duration::from_millis(250))
         .call()
         .map_err(|err| format!("llama.cpp SSE returned HTTP {err}"))?;
     let status = response.status();
-    let body = response.into_string().unwrap_or_default();
     if !(200..300).contains(&status) {
         return Err(format!("llama.cpp SSE returned HTTP {status}"));
     }
-    Ok(parse_sse_events(&body))
+    let mut reader = response.into_reader();
+    let mut buffer = String::new();
+    let mut chunk = [0u8; 2048];
+    loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk[..n]).replace("\r\n", "\n"));
+                while let Some(boundary) = buffer.find("\n\n") {
+                    let frame = buffer[..boundary].to_string();
+                    buffer = buffer[boundary + 2..].to_string();
+                    for event in parse_sse_events(&format!("{frame}\n\n")) {
+                        on_event(event);
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(err) => {
+                if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Ok(());
+                }
+                return Err(format!("llama.cpp SSE returned HTTP {err}"));
+            }
+        }
+    }
+    Ok(())
 }
 
-fn fixture_wait_mode() -> bool {
+pub fn fixture_wait_mode() -> bool {
     std::env::var("PI_LLAMA_SSE_REPLY").is_ok()
         || std::env::var("PI_LLAMA_MODELS_REPLY").is_ok()
         || std::env::var("PI_LLAMA_ACTION_REPLY").is_ok()
         || std::env::var("PI_LLAMA_DRY_RUN").is_ok()
+}
+
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+#[derive(Default)]
+struct LoadWatchState {
+    loaded: bool,
+    error: Option<String>,
+    progress: Option<LlamaProgress>,
+}
+
+#[derive(Default)]
+struct DownloadWatchState {
+    finished: bool,
+    failure: Option<String>,
+    saw_downloading: bool,
+    progress: Option<LlamaProgress>,
 }
 
 pub fn unload_and_wait(server_url: &str, model: &str) -> Result<(), String> {
@@ -442,144 +551,234 @@ pub fn unload_and_wait(server_url: &str, model: &str) -> Result<(), String> {
     }
 }
 
+fn apply_load_event(model: &str, event: &LlamaModelEvent, state: &mut LoadWatchState) {
+    if event.model != model {
+        return;
+    }
+    if event.event != "model_status" && event.event != "status_change" {
+        return;
+    }
+    if event
+        .data
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("loaded")
+    {
+        state.loaded = true;
+    }
+    if event
+        .data
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("unloaded")
+    {
+        state.error = Some("Model failed to load".into());
+    }
+    if let Some(progress) = event.data.as_ref().and_then(parse_load_progress) {
+        state.progress = Some(progress);
+    }
+}
+
+fn apply_download_event(model: &str, event: &LlamaModelEvent, state: &mut DownloadWatchState) {
+    if event.model != model {
+        return;
+    }
+    if event.event == "download_finished" {
+        state.finished = true;
+    }
+    if event.event == "download_failed" {
+        state.failure = Some(llama_error_message(event.data.as_ref(), "Download failed"));
+    }
+    if event.event == "download_progress" {
+        state.saw_downloading = true;
+        if let Some(progress) = event.data.as_ref().and_then(parse_download_progress) {
+            state.progress = Some(progress);
+        }
+    }
+}
+
 pub fn load_and_wait(
     server_url: &str,
     model: &str,
-    mut on_progress: impl FnMut(LlamaProgress),
+    on_progress: impl FnMut(LlamaProgress),
 ) -> Result<LlamaModelInfo, String> {
-    let events = watch_events(server_url).unwrap_or_default();
-    let mut event_loaded = false;
-    let mut event_error: Option<String> = None;
-    for event in &events {
-        if event.model != model {
-            continue;
-        }
-        if event.event != "model_status" && event.event != "status_change" {
-            continue;
-        }
-        if event
-            .data
-            .as_ref()
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str)
-            == Some("loaded")
-        {
-            event_loaded = true;
-        }
-        if event
-            .data
-            .as_ref()
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str)
-            == Some("unloaded")
-        {
-            event_error = Some("Model failed to load".into());
-        }
-        if let Some(progress) = event.data.as_ref().and_then(parse_load_progress) {
-            on_progress(progress);
-        }
-    }
-    load_model(server_url, model)?;
-    on_progress(LlamaProgress {
-        message: "Loading model".into(),
-        ratio: None,
-        detail: None,
+    load_and_wait_with_cancel(server_url, model, on_progress, None)
+}
+
+pub fn load_and_wait_with_cancel(
+    server_url: &str,
+    model: &str,
+    mut on_progress: impl FnMut(LlamaProgress),
+    cancel: Option<&AtomicBool>,
+) -> Result<LlamaModelInfo, String> {
+    let state = Arc::new(Mutex::new(LoadWatchState::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let url = server_url.to_string();
+    let watched = model.to_string();
+    let state_watch = state.clone();
+    let stop_watch = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let _ = watch_live(
+            &url,
+            |event| {
+                if let Ok(mut guard) = state_watch.lock() {
+                    apply_load_event(&watched, &event, &mut guard);
+                }
+            },
+            Some(&stop_watch),
+        );
     });
-    loop {
-        let catalog = list_models(server_url)?;
-        if let Some(entry) = catalog.iter().find(|item| item.id == model).cloned() {
-            if entry.status.value == "loaded" {
-                return Ok(entry);
+    let result = (|| {
+        load_model(server_url, model)?;
+        if cancelled(cancel) {
+            return Err("Cancelled".into());
+        }
+        on_progress(LlamaProgress {
+            message: "Loading model".into(),
+            ratio: None,
+            detail: None,
+        });
+        loop {
+            if cancelled(cancel) {
+                return Err("Cancelled".into());
             }
-            if entry.status.failed {
-                return Err(match entry.status.exit_code {
-                    Some(code) => format!("Model exited with code {code}"),
-                    None => event_error.unwrap_or_else(|| "Model failed to load".into()),
+            if let Ok(mut guard) = state.lock() {
+                if let Some(progress) = guard.progress.take() {
+                    on_progress(progress);
+                }
+            }
+            let catalog = list_models(server_url)?;
+            let event_loaded = state.lock().map(|guard| guard.loaded).unwrap_or(false);
+            let event_error = state.lock().ok().and_then(|guard| guard.error.clone());
+            if let Some(entry) = catalog.iter().find(|item| item.id == model).cloned() {
+                if entry.status.value == "loaded" {
+                    return Ok(entry);
+                }
+                if entry.status.failed {
+                    return Err(match entry.status.exit_code {
+                        Some(code) => format!("Model exited with code {code}"),
+                        None => event_error.unwrap_or_else(|| "Model failed to load".into()),
+                    });
+                }
+            } else if event_loaded {
+                return Ok(LlamaModelInfo {
+                    id: model.to_string(),
+                    status: LlamaModelStatus {
+                        value: "loaded".into(),
+                        ..LlamaModelStatus::default()
+                    },
+                    architecture: None,
+                    source: None,
+                    meta: None,
                 });
             }
-        } else if event_loaded {
-            return Ok(LlamaModelInfo {
-                id: model.to_string(),
-                status: LlamaModelStatus {
-                    value: "loaded".into(),
-                    ..LlamaModelStatus::default()
-                },
-                architecture: None,
-                source: None,
-                meta: None,
-            });
-        }
-        if fixture_wait_mode() {
-            if let Some(error) = event_error {
-                return Err(error);
+            if fixture_wait_mode() {
+                if let Some(error) = event_error {
+                    return Err(error);
+                }
+                return Err("Model failed to load".into());
             }
-            return Err("Model failed to load".into());
+            std::thread::sleep(Duration::from_millis(250));
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
+    })();
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    result
 }
 
 pub fn download_and_wait(
     server_url: &str,
     model: &str,
-    mut on_progress: impl FnMut(LlamaProgress),
+    on_progress: impl FnMut(LlamaProgress),
 ) -> Result<Vec<LlamaModelInfo>, String> {
-    let events = watch_events(server_url).unwrap_or_default();
-    let mut finished = false;
-    let mut failure: Option<String> = None;
-    let mut saw_downloading = false;
-    for event in &events {
-        if event.model != model {
-            continue;
+    download_and_wait_with_cancel(server_url, model, on_progress, None)
+}
+
+pub fn download_and_wait_with_cancel(
+    server_url: &str,
+    model: &str,
+    mut on_progress: impl FnMut(LlamaProgress),
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<LlamaModelInfo>, String> {
+    let state = Arc::new(Mutex::new(DownloadWatchState::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let url = server_url.to_string();
+    let watched = model.to_string();
+    let state_watch = state.clone();
+    let stop_watch = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let _ = watch_live(
+            &url,
+            |event| {
+                if let Ok(mut guard) = state_watch.lock() {
+                    apply_download_event(&watched, &event, &mut guard);
+                }
+            },
+            Some(&stop_watch),
+        );
+    });
+    let result = (|| {
+        download_model(server_url, model)?;
+        if cancelled(cancel) {
+            return Err("Cancelled".into());
         }
-        if event.event == "download_finished" {
-            finished = true;
-        }
-        if event.event == "download_failed" {
-            failure = Some(llama_error_message(event.data.as_ref(), "Download failed"));
-        }
-        if event.event == "download_progress" {
-            saw_downloading = true;
-            if let Some(progress) = event.data.as_ref().and_then(parse_download_progress) {
+        on_progress(LlamaProgress {
+            message: "Downloading model".into(),
+            ratio: None,
+            detail: None,
+        });
+        let mut polls = 0;
+        loop {
+            if cancelled(cancel) {
+                return Err("Cancelled".into());
+            }
+            let (failure, finished, saw_downloading, progress) = {
+                let mut guard = state.lock().map_err(|err| err.to_string())?;
+                (
+                    guard.failure.clone(),
+                    guard.finished,
+                    guard.saw_downloading,
+                    guard.progress.take(),
+                )
+            };
+            if let Some(progress) = progress {
                 on_progress(progress);
             }
-        }
-    }
-    download_model(server_url, model)?;
-    on_progress(LlamaProgress {
-        message: "Downloading model".into(),
-        ratio: None,
-        detail: None,
-    });
-    let mut polls = 0;
-    loop {
-        if let Some(error) = &failure {
-            return Err(error.clone());
-        }
-        let models = list_models(server_url)?;
-        polls += 1;
-        if let Some(entry) = models.iter().find(|item| item.id == model) {
-            if entry.status.value == "downloading" {
-                saw_downloading = true;
-                if let Some(progress) = entry
-                    .status
-                    .progress
-                    .as_ref()
-                    .and_then(parse_download_progress)
-                {
-                    on_progress(progress);
-                }
-            } else if finished || saw_downloading || polls >= 2 {
-                return list_models(server_url);
+            if let Some(error) = failure {
+                return Err(error);
             }
-        } else if finished || polls >= 2 {
-            return Ok(models);
+            let models = list_models(server_url)?;
+            polls += 1;
+            if let Some(entry) = models.iter().find(|item| item.id == model) {
+                if entry.status.value == "downloading" {
+                    if let Ok(mut guard) = state.lock() {
+                        guard.saw_downloading = true;
+                    }
+                    if let Some(progress) = entry
+                        .status
+                        .progress
+                        .as_ref()
+                        .and_then(parse_download_progress)
+                    {
+                        on_progress(progress);
+                    }
+                } else if finished || saw_downloading || polls >= 2 {
+                    return list_models_opts(server_url, true);
+                }
+            } else if finished || polls >= 2 {
+                return list_models_opts(server_url, true);
+            }
+            if fixture_wait_mode() {
+                return Ok(models);
+            }
+            std::thread::sleep(Duration::from_millis(500));
         }
-        if fixture_wait_mode() {
-            return Ok(models);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
+    })();
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    result
 }
 
 pub fn load_model(server_url: &str, model: &str) -> Result<(), String> {
@@ -613,6 +812,15 @@ pub fn download_model(server_url: &str, model: &str) -> Result<(), String> {
 }
 
 pub fn list_models(server_url: &str) -> Result<Vec<LlamaModelInfo>, String> {
+    list_models_opts(server_url, false)
+}
+
+pub fn list_models_opts(server_url: &str, reload: bool) -> Result<Vec<LlamaModelInfo>, String> {
+    if let Ok(err) = std::env::var("PI_LLAMA_MODELS_ERROR") {
+        if !err.is_empty() {
+            return Err(err);
+        }
+    }
     if let Ok(raw) = std::env::var("PI_LLAMA_MODELS_REPLY") {
         let payload: Value =
             serde_json::from_str(&raw).map_err(|err| format!("PI_LLAMA_MODELS_REPLY: {err}"))?;
@@ -621,7 +829,12 @@ pub fn list_models(server_url: &str) -> Result<Vec<LlamaModelInfo>, String> {
     if std::env::var("PI_LLAMA_DRY_RUN").is_ok() {
         return Ok(Vec::new());
     }
-    let url = format!("{}/models", normalize_llama_server_url(server_url)?);
+    let path = if reload {
+        "/models?reload=1"
+    } else {
+        "/models"
+    };
+    let url = format!("{}{path}", normalize_llama_server_url(server_url)?);
     let response = ureq::get(&url)
         .call()
         .map_err(|err| format!("Could not connect to the server. {err}"))?;
@@ -1209,6 +1422,66 @@ mod tests {
         std::env::remove_var("PI_LLAMA_ACTION_REPLY");
         std::env::remove_var("PI_LLAMA_MODELS_REPLY");
         std::env::remove_var("PI_LLAMA_SSE_REPLY");
+    }
+
+    #[test]
+    fn connection_retry_and_progress_bar_match_ts() {
+        assert!(is_connection_error("TypeError fetch failed"));
+        assert!(is_connection_error("TimeoutError: timeout"));
+        assert_eq!(
+            connection_error_message("network down"),
+            "Could not connect to the server."
+        );
+        assert_eq!(
+            connection_error_message("Model failed to load"),
+            "Model failed to load"
+        );
+        assert_eq!(
+            connection_retry_title("http://127.0.0.1:8080", "fetch failed"),
+            "llama.cpp unavailable\nhttp://127.0.0.1:8080\n\nCould not connect to the server."
+        );
+        assert!(progress_bar(0.5).contains("50%"));
+        assert_eq!(
+            progress_bar(0.5).chars().filter(|ch| *ch == '█').count(),
+            20
+        );
+        std::env::set_var("PI_LLAMA_MODELS_ERROR", "fetch failed");
+        let err = list_models("http://127.0.0.1:8080").unwrap_err();
+        std::env::remove_var("PI_LLAMA_MODELS_ERROR");
+        assert_eq!(
+            connection_error_message(&err),
+            "Could not connect to the server."
+        );
+    }
+
+    #[test]
+    fn live_sse_watch_streams_frames_incrementally() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "data: {\"model\":\"local\",\"event\":\"model_status\",\"data\":{\"status\":\"loaded\",\"progress\":{\"current\":\"text_model\",\"stages\":[\"text_model\"],\"value\":1}}}\n\n";
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        std::env::remove_var("PI_LLAMA_SSE_REPLY");
+        std::env::remove_var("PI_LLAMA_DRY_RUN");
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let mut got = Vec::new();
+        watch_live(&url, |event| got.push(event), None).unwrap();
+        assert_eq!(got[0].model, "local");
+        assert_eq!(got[0].event, "model_status");
+        let progress = parse_load_progress(got[0].data.as_ref().unwrap()).unwrap();
+        assert_eq!(progress.message, "Loading text model");
     }
 
     #[test]

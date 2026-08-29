@@ -84,6 +84,8 @@ pub struct Settings {
     pub external_editor: Option<String>,
     #[serde(default, rename = "modelThinkingLevels")]
     pub model_thinking_levels: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, rename = "npmCommand")]
+    pub npm_command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

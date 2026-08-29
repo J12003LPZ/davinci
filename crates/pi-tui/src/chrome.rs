@@ -1,8 +1,8 @@
 use crate::autocomplete::AutocompleteSuggestions;
 use crate::editor::Editor;
 use crate::extension_ui::{
-    ExtensionConfirm, ExtensionEditor, ExtensionInput, ExtensionSelector, ExtensionWidget,
-    WidgetPlacement,
+    ExtensionConfirm, ExtensionEditor, ExtensionInput, ExtensionProgress, ExtensionSelector,
+    ExtensionWidget, WidgetPlacement,
 };
 use crate::first_time::FirstTimeSetup;
 use crate::login_dialog::LoginDialog;
@@ -47,6 +47,7 @@ pub struct ChatChrome {
     pub extension_input: Option<ExtensionInput>,
     pub extension_editor: Option<ExtensionEditor>,
     pub extension_confirm: Option<ExtensionConfirm>,
+    pub extension_progress: Option<ExtensionProgress>,
     pub custom_editor_lines: Option<Vec<String>>,
     pub custom_overlay_lines: Option<Vec<String>>,
     pub custom_overlay_path: Option<String>,
@@ -84,6 +85,7 @@ impl ChatChrome {
             extension_input: None,
             extension_editor: None,
             extension_confirm: None,
+            extension_progress: None,
             custom_editor_lines: None,
             custom_overlay_lines: None,
             custom_overlay_path: None,
@@ -297,6 +299,9 @@ impl Component for ChatChrome {
         } else if let Some(confirm) = &self.extension_confirm {
             lines.push(String::new());
             lines.extend(confirm.render(width));
+        } else if let Some(progress) = &self.extension_progress {
+            lines.push(String::new());
+            lines.extend(progress.render(width));
         } else if let Some(custom) = &self.custom_overlay_lines {
             lines.push(String::new());
             lines.extend(custom.iter().cloned());
@@ -359,6 +364,8 @@ impl Component for ChatChrome {
             editor.handle_input(data);
         } else if let Some(confirm) = &mut self.extension_confirm {
             confirm.handle_input(data);
+        } else if let Some(progress) = &mut self.extension_progress {
+            progress.handle_input(data);
         } else {
             self.editor.handle_input(data);
         }

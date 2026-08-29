@@ -651,4 +651,77 @@ module.exports = (pi) => {
         assert_eq!(executed.content, "ticket:42");
         assert!(!executed.is_error);
     }
+
+    #[test]
+    fn mounts_js_virtual_tui_container_select_list_and_input() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+const { Container, SelectList, Input, TUI, Text } = require("@earendil-works/pi-tui");
+module.exports = (pi) => {
+  pi.registerCommand("tools", {
+    description: "tools",
+    handler: async (_args, ctx) => {
+      return ctx.ui.custom((tui, _theme, _kb, done) => {
+        const root = new Container();
+        const title = new Text("tools");
+        const list = new SelectList([
+          { value: "read", label: "read", description: "files" },
+          { value: "bash", label: "bash" },
+        ], 8);
+        const input = new Input();
+        input.setValue("query");
+        list.onSelect = (item) => done(item.value);
+        root.addChild(title);
+        root.addChild(list);
+        root.addChild(input);
+        tui.requestRender();
+        return {
+          extra: { selected: list.getSelectedItem() && list.getSelectedItem().value },
+          handleInput(data) { list.handleInput(data); },
+          render(width) { return root.render(width); },
+        };
+      });
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let opened = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "tools", "ctx": { "mode": "tui" } }),
+        )
+        .unwrap();
+        assert!(opened.ok, "{:?}", opened.error);
+        let lines = opened.result.as_ref().unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line.as_str())
+            .collect::<Vec<_>>();
+        assert!(lines.iter().any(|line| line.contains("tools")));
+        assert!(lines.iter().any(|line| line.contains("read")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("> query") || line.contains("query")));
+        let selected = run_js_extension(
+            &module,
+            "customInput",
+            &serde_json::json!({
+                "name": "tools",
+                "data": "\r",
+                "snapshot": opened.result.as_ref().unwrap()["snapshot"],
+                "ctx": { "mode": "tui" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(selected.result.as_ref().unwrap(), "read");
+    }
 }

@@ -430,6 +430,32 @@ impl ExtensionHost {
         Ok(result.result)
     }
 
+    pub fn invoke_custom_tick(
+        &mut self,
+        path: &str,
+        name: &str,
+        snapshot: Option<&Value>,
+        width: usize,
+    ) -> Result<Option<Value>, String> {
+        let result = run_js_extension(
+            Path::new(path),
+            "customTick",
+            &serde_json::json!({
+                "name": name,
+                "snapshot": snapshot,
+                "width": width,
+                "ctx": { "mode": "tui" }
+            }),
+        )?;
+        if !result.ok {
+            return Err(result
+                .error
+                .unwrap_or_else(|| "Command handler error".into()));
+        }
+        self.ui_calls.extend(result.ui_calls);
+        Ok(result.result)
+    }
+
     pub fn editor_input(
         &self,
         path: &str,

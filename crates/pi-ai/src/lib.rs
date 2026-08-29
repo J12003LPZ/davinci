@@ -3,6 +3,7 @@
 mod auth;
 mod catalog;
 mod codex;
+mod models_store;
 mod oauth;
 mod oauth_callback;
 mod oauth_providers;
@@ -24,6 +25,11 @@ pub use codex::{
     DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS, PREVIOUS_RESPONSE_NOT_FOUND,
     WEBSOCKET_CLOSED_BEFORE_COMPLETED, WEBSOCKET_CONNECTION_LIMIT_REACHED,
     WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
+};
+pub use models_store::{
+    catalog_url, load_models_store, merge_models, models_store_path, now_ms, parse_remote_catalog,
+    save_models_store, ModelsStore, ModelsStoreEntry, DEFAULT_CATALOG_BASE_URL,
+    REMOTE_CATALOG_REFRESH_INTERVAL_MS,
 };
 pub use oauth::{poll_oauth_device_code_flow, DeviceCodePoller, DevicePollStatus};
 pub use oauth_callback::{

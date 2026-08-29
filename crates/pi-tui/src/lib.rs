@@ -45,8 +45,8 @@ pub use custom_message::{
 };
 pub use editor::Editor;
 pub use extension_ui::{
-    ExtensionConfirm, ExtensionDialogAction, ExtensionEditor, ExtensionInput, ExtensionSelector,
-    ExtensionWidget, WidgetPlacement, MAX_WIDGET_LINES,
+    ExtensionConfirm, ExtensionDialogAction, ExtensionEditor, ExtensionInput, ExtensionProgress,
+    ExtensionSelector, ExtensionWidget, WidgetPlacement, MAX_WIDGET_LINES,
 };
 pub use first_time::{
     detect_terminal_theme, FirstTimeAction, FirstTimeSetup, FirstTimeSetupResult, SETUP_LOGO_LINES,

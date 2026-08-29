@@ -95,7 +95,7 @@ impl ExtensionSelector {
                 .cloned()
                 .map(ExtensionDialogAction::Select)
                 .unwrap_or(ExtensionDialogAction::Cancel),
-            "\x1b" => ExtensionDialogAction::Cancel,
+            "\x1b" | "\x03" => ExtensionDialogAction::Cancel,
             _ => ExtensionDialogAction::None,
         }
     }
@@ -223,6 +223,74 @@ impl Component for ExtensionEditor {
     fn invalidate(&mut self) {}
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtensionProgress {
+    pub title: String,
+    pub model: String,
+    pub message: String,
+    pub ratio: Option<f64>,
+    pub detail: Option<String>,
+}
+
+impl ExtensionProgress {
+    pub fn new(
+        title: impl Into<String>,
+        model: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            model: model.into(),
+            message: message.into(),
+            ratio: None,
+            detail: None,
+        }
+    }
+
+    pub fn progress_bar(ratio: f64) -> String {
+        let clamped = ratio.clamp(0.0, 1.0);
+        let filled = (clamped * 40.0).round() as usize;
+        let filled = filled.min(40);
+        format!(
+            "{}{} {}%",
+            "█".repeat(filled),
+            "─".repeat(40 - filled),
+            (clamped * 100.0).round() as i32
+        )
+    }
+
+    pub fn handle_key(&mut self, data: &str) -> ExtensionDialogAction {
+        match data {
+            "\x1b" | "\x03" => ExtensionDialogAction::Cancel,
+            _ => ExtensionDialogAction::None,
+        }
+    }
+}
+
+impl Component for ExtensionProgress {
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut lines = vec![
+            truncate(&self.title, width),
+            truncate(&self.model, width),
+            truncate(&self.message, width),
+        ];
+        if let Some(ratio) = self.ratio {
+            lines.push(truncate(&Self::progress_bar(ratio), width));
+        }
+        if let Some(detail) = &self.detail {
+            lines.push(truncate(detail, width));
+        }
+        lines.push("  escape stop".into());
+        lines
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        let _ = self.handle_key(data);
+    }
+
+    fn invalidate(&mut self) {}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionConfirm {
     pub title: String,
@@ -317,5 +385,17 @@ mod tests {
             confirm.handle_key("\x1b"),
             ExtensionDialogAction::Confirm(false)
         );
+
+        let mut progress = ExtensionProgress::new("Loading model", "local", "Starting…");
+        progress.ratio = Some(0.5);
+        progress.detail = Some("512 B / 1.00 KiB".into());
+        let rendered = progress.render(80).join("\n");
+        assert!(rendered.contains("Loading model"));
+        assert!(rendered.contains("Starting…"));
+        assert!(rendered.contains("50%"));
+        assert!(rendered.contains("512 B / 1.00 KiB"));
+        assert!(rendered.contains("escape stop"));
+        assert_eq!(progress.handle_key("\x1b"), ExtensionDialogAction::Cancel);
+        assert_eq!(progress.handle_key("\x03"), ExtensionDialogAction::Cancel);
     }
 }

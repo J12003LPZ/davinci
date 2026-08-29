@@ -134,21 +134,9 @@ fn handle_update(args: &[String], agent_dir: &Path) -> Result<String, String> {
     Ok(parts.join("\n"))
 }
 
-fn refresh_model_catalogs(agent_dir: &Path, target: Option<&str>) -> Result<String, String> {
-    let catalogs = agent_dir.join("models");
-    fs::create_dir_all(&catalogs).map_err(|err| err.to_string())?;
-    for provider in pi_ai::builtin_provider_ids() {
-        if let Some(json) = pi_ai::builtin_catalog_json(provider) {
-            fs::write(catalogs.join(format!("{provider}.json")), json)
-                .map_err(|err| err.to_string())?;
-        }
-    }
-    let target = target.unwrap_or("all");
-    Ok(format!(
-        "Updated {target}: wrote {} catalogs to {}",
-        pi_ai::builtin_provider_ids().len(),
-        catalogs.display()
-    ))
+fn refresh_model_catalogs(agent_dir: &Path, _target: Option<&str>) -> Result<String, String> {
+    let result = crate::catalog_refresh::refresh_model_catalogs(agent_dir, true, true);
+    crate::catalog_refresh::cli_refresh_message(&result)
 }
 
 /// TS `pi update --self`: package-manager argv when npm/pnpm/yarn/bun; copy `~/.pi/bin/pi` otherwise.
@@ -319,7 +307,8 @@ pub fn parse_package_source(source: &str) -> ParsedSource {
             name,
         };
     }
-    if source.starts_with("git@")
+    if source.starts_with("git:")
+        || source.starts_with("git@")
         || source.ends_with(".git")
         || source.contains("github.com")
         || source.starts_with("https://")
@@ -328,6 +317,66 @@ pub fn parse_package_source(source: &str) -> ParsedSource {
         return ParsedSource::Git(source.to_string());
     }
     ParsedSource::Local(source.to_string())
+}
+
+pub fn parse_git_source(source: &str) -> (String, Option<String>) {
+    let raw = source.strip_prefix("git:").unwrap_or(source);
+    if raw.starts_with("git@") {
+        if let Some(idx) = raw.rfind('@') {
+            if idx > 3 {
+                return (raw[..idx].to_string(), Some(raw[idx + 1..].to_string()));
+            }
+        }
+        return (raw.to_string(), None);
+    }
+    if let Some(idx) = raw.rfind('@') {
+        let spec = &raw[idx + 1..];
+        if !spec.contains('/') && !spec.contains(':') {
+            return (raw[..idx].to_string(), Some(spec.to_string()));
+        }
+    }
+    (raw.to_string(), None)
+}
+
+pub fn npm_install_args(manager: &str, specs: &[String], install_root: &Path) -> Vec<String> {
+    let mut args = vec!["install".into()];
+    args.extend(specs.iter().cloned());
+    match manager {
+        "pnpm" => {
+            args.push("--prefix".into());
+            args.push(install_root.display().to_string());
+            args.push("--config.auto-install-peers=false".into());
+            args.push("--config.strict-peer-dependencies=false".into());
+            args.push("--config.strict-dep-builds=false".into());
+        }
+        "bun" => {
+            args.push("--cwd".into());
+            args.push(install_root.display().to_string());
+            args.push("--omit=peer".into());
+        }
+        _ => {
+            args.push("--prefix".into());
+            args.push(install_root.display().to_string());
+            args.push("--legacy-peer-deps".into());
+        }
+    }
+    args
+}
+
+pub fn npm_install_root(agent_dir: &Path, local: bool, cwd: &Path) -> PathBuf {
+    if local {
+        cwd.join(".pi").join("npm")
+    } else {
+        agent_dir.join("npm")
+    }
+}
+
+pub fn git_install_root(agent_dir: &Path, local: bool, cwd: &Path) -> PathBuf {
+    if local {
+        cwd.join(".pi").join("git")
+    } else {
+        agent_dir.join("git")
+    }
 }
 
 fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<String, String> {
@@ -341,11 +390,11 @@ fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<St
             }
         }
         ParsedSource::Npm { name, spec } => {
-            install_remote_package(agent_dir, "npm", name, spec)?;
+            install_remote_package(agent_dir, "npm", name, spec, local)?;
         }
         ParsedSource::Git(url) => {
             let name = git_package_name(url);
-            install_remote_package(agent_dir, "git", &name, url)?;
+            install_remote_package(agent_dir, "git", &name, url, local)?;
         }
     }
     if !settings.extensions.contains(&source.to_string()) {
@@ -355,7 +404,6 @@ fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<St
         settings.packages.push(source.to_string());
     }
     save_settings(agent_dir, &settings)?;
-    let _ = local;
     Ok(source.to_string())
 }
 
@@ -385,10 +433,12 @@ fn install_remote_package(
     kind: &str,
     name: &str,
     spec: &str,
+    local: bool,
 ) -> Result<(), String> {
     if std::env::var("PI_INSTALL_DRY_RUN").is_ok() {
         return Ok(());
     }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let fixture = match kind {
         "npm" => std::env::var_os("PI_NPM_PACKAGE_DIR").map(PathBuf::from),
         _ => std::env::var_os("PI_GIT_PACKAGE_DIR").map(PathBuf::from),
@@ -397,16 +447,135 @@ fn install_remote_package(
         if !fixture.exists() {
             return Err(format!("Path does not exist: {}", fixture.display()));
         }
-        let dest = agent_dir.join("packages").join(name);
+        let dest = if kind == "npm" {
+            npm_install_root(agent_dir, local, &cwd)
+                .join("node_modules")
+                .join(name)
+        } else {
+            git_checkout_path(agent_dir, local, &cwd, spec)
+        };
         copy_dir(&fixture, &dest)?;
         return Ok(());
     }
     if cfg!(test) {
         return Ok(());
     }
-    Err(format!(
-        "Unsupported install source without fixture: {spec} (set PI_INSTALL_DRY_RUN=1)"
-    ))
+    if kind == "npm" {
+        return install_npm_live(agent_dir, local, &cwd, spec);
+    }
+    install_git_live(agent_dir, local, &cwd, spec)
+}
+
+fn git_checkout_path(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> PathBuf {
+    let (url, _) = parse_git_source(spec);
+    let host_path = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("ssh://")
+        .trim_start_matches("git@")
+        .replace(':', "/");
+    git_install_root(agent_dir, local, cwd).join(host_path.trim_end_matches(".git"))
+}
+
+fn npm_command(agent_dir: &Path) -> Result<Vec<String>, String> {
+    if let Ok(raw) = std::env::var("PI_NPM_CMD") {
+        let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
+        if parts.is_empty() || parts[0].is_empty() {
+            return Err("Invalid npmCommand: first array entry must be a non-empty command".into());
+        }
+        return Ok(parts);
+    }
+    let settings = load_settings(agent_dir);
+    if let Some(command) = settings.npm_command {
+        if command.is_empty() || command[0].is_empty() {
+            return Err("Invalid npmCommand: first array entry must be a non-empty command".into());
+        }
+        return Ok(command);
+    }
+    Ok(vec!["npm".into()])
+}
+
+fn ensure_npm_project(root: &Path) -> Result<(), String> {
+    fs::create_dir_all(root).map_err(|err| err.to_string())?;
+    let package = root.join("package.json");
+    if !package.exists() {
+        fs::write(
+            package,
+            "{\n  \"name\": \"pi-extensions\",\n  \"private\": true\n}\n",
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    let gitignore = root.join(".gitignore");
+    if !gitignore.exists() {
+        fs::write(gitignore, "*\n!.gitignore\n").map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn run_install_command(program: &str, args: &[String], cwd: Option<&Path>) -> Result<(), String> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command.output().map_err(|err| err.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!("{} {}", stderr.trim(), stdout.trim())
+        .trim()
+        .to_string())
+}
+
+fn install_npm_live(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> Result<(), String> {
+    let root = npm_install_root(agent_dir, local, cwd);
+    ensure_npm_project(&root)?;
+    let command = npm_command(agent_dir)?;
+    let manager = command.last().map(String::as_str).unwrap_or("npm");
+    let mut args = command[1..].to_vec();
+    args.extend(npm_install_args(manager, &[spec.to_string()], &root));
+    run_install_command(&command[0], &args, None)
+}
+
+fn install_git_live(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> Result<(), String> {
+    let (url, git_ref) = parse_git_source(spec);
+    let dest = git_checkout_path(agent_dir, local, cwd, spec);
+    if dest.exists() {
+        let _ = fs::remove_dir_all(&dest);
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let git = std::env::var("PI_GIT_CMD").unwrap_or_else(|_| "git".into());
+    if let Err(err) = run_install_command(
+        &git,
+        &["clone".into(), url.clone(), dest.display().to_string()],
+        None,
+    ) {
+        let _ = fs::remove_dir_all(&dest);
+        return Err(err);
+    }
+    if let Some(git_ref) = git_ref {
+        if let Err(err) = run_install_command(&git, &["checkout".into(), git_ref], Some(&dest)) {
+            let _ = fs::remove_dir_all(&dest);
+            return Err(err);
+        }
+    }
+    if dest.join("package.json").exists() {
+        let command = npm_command(agent_dir)?;
+        let mut args = command[1..].to_vec();
+        args.push("install".into());
+        if command.last().map(String::as_str) == Some("npm") && command.len() == 1 {
+            args.push("--omit=dev".into());
+        }
+        if let Err(err) = run_install_command(&command[0], &args, Some(&dest)) {
+            let _ = fs::remove_dir_all(&dest);
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
@@ -553,5 +722,21 @@ mod tests {
             .render(80)
             .iter()
             .any(|line| line.contains("Package resources")));
+        assert_eq!(
+            parse_git_source("https://github.com/acme/ext@v1"),
+            ("https://github.com/acme/ext".into(), Some("v1".into()))
+        );
+        assert_eq!(
+            npm_install_args("npm", &["demo-ext".into()], Path::new("/tmp/npm"))[1],
+            "demo-ext"
+        );
+        assert!(
+            npm_install_args("npm", &["demo-ext".into()], Path::new("/tmp/npm"))
+                .contains(&"--legacy-peer-deps".into())
+        );
+        assert!(
+            npm_install_args("bun", &["demo-ext".into()], Path::new("/tmp/npm"))
+                .contains(&"--omit=peer".into())
+        );
     }
 }

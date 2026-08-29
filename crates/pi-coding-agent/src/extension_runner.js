@@ -34,6 +34,114 @@ const virtualRoot = path.join(os.tmpdir(), "pi-virtual-modules");
 fs.mkdirSync(virtualRoot, { recursive: true });
 
 const TUI_VIRTUAL = `
+class Container {
+	constructor() { this.children = []; }
+	addChild(component) { if (component) this.children.push(component); }
+	removeChild(component) { this.children = this.children.filter((item) => item !== component); }
+	clear() { this.children = []; }
+	invalidate() { for (const child of this.children) { if (child && typeof child.invalidate === "function") child.invalidate(); } }
+	render(width) {
+		const lines = [];
+		for (const child of this.children) {
+			if (child && typeof child.render === "function") lines.push(...child.render(width));
+		}
+		return lines;
+	}
+	handleInput(data) {
+		for (const child of this.children) {
+			if (child && typeof child.handleInput === "function") child.handleInput(data);
+		}
+	}
+}
+class Text {
+	constructor(value) { this.value = value == null ? "" : String(value); }
+	setText(value) { this.value = value == null ? "" : String(value); }
+	invalidate() {}
+	render(width) {
+		const text = String(this.value);
+		if (text.length <= width) return [text];
+		const lines = [];
+		for (let i = 0; i < text.length; i += width) lines.push(text.slice(i, i + width));
+		return lines;
+	}
+}
+class Input {
+	constructor() {
+		this.value = "";
+		this.focused = true;
+		this.onSubmit = undefined;
+		this.onEscape = undefined;
+	}
+	getValue() { return this.value; }
+	setValue(value) { this.value = value == null ? "" : String(value); }
+	invalidate() {}
+	handleInput(data) {
+		if (matchesKey(data, "escape")) { if (typeof this.onEscape === "function") this.onEscape(); return; }
+		if (matchesKey(data, "enter")) { if (typeof this.onSubmit === "function") this.onSubmit(this.value); return; }
+		if (matchesKey(data, "backspace")) { this.value = this.value.slice(0, -1); return; }
+		if (typeof data === "string" && data.length > 0 && !/[\\x00-\\x1f]/.test(data)) this.value += data;
+	}
+	render(width) {
+		const line = "> " + this.value;
+		return [line.length > width ? line.slice(0, width) : line];
+	}
+}
+class SelectList {
+	constructor(items, maxVisible) {
+		this.items = Array.isArray(items) ? items.slice() : [];
+		this.maxVisible = maxVisible || 8;
+		this.selected = 0;
+		this.filter = "";
+		this.onSelect = undefined;
+		this.onCancel = undefined;
+		this.onSelectionChange = undefined;
+	}
+	setFilter(filter) { this.filter = String(filter || ""); this.selected = 0; }
+	setSelectedIndex(index) { this.selected = Math.max(0, Math.min(this.filtered().length - 1, index)); }
+	getSelectedItem() { return this.filtered()[this.selected] || null; }
+	filtered() {
+		const q = this.filter.toLowerCase();
+		return this.items.filter((item) => {
+			const label = String(item && item.label != null ? item.label : item && item.value != null ? item.value : item || "");
+			return !q || label.toLowerCase().includes(q);
+		});
+	}
+	invalidate() {}
+	handleInput(data) {
+		const items = this.filtered();
+		if (matchesKey(data, "up")) {
+			this.selected = items.length ? (this.selected + items.length - 1) % items.length : 0;
+			if (typeof this.onSelectionChange === "function") this.onSelectionChange(this.getSelectedItem());
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			this.selected = items.length ? (this.selected + 1) % items.length : 0;
+			if (typeof this.onSelectionChange === "function") this.onSelectionChange(this.getSelectedItem());
+			return;
+		}
+		if (matchesKey(data, "enter")) {
+			const item = this.getSelectedItem();
+			if (item && typeof this.onSelect === "function") this.onSelect(item);
+			return;
+		}
+		if (matchesKey(data, "escape")) {
+			if (typeof this.onCancel === "function") this.onCancel();
+		}
+	}
+	render(width) {
+		const items = this.filtered();
+		const start = Math.max(0, this.selected - this.maxVisible + 1);
+		const visible = items.slice(start, start + this.maxVisible);
+		if (visible.length === 0) return ["  No options"];
+		return visible.map((item, index) => {
+			const actual = start + index;
+			const prefix = actual === this.selected ? "> " : "  ";
+			const label = item && item.label != null ? item.label : item && item.value != null ? item.value : String(item);
+			const desc = item && item.description ? "  " + item.description : "";
+			return truncateToWidth(prefix + label + desc, width, "");
+		});
+	}
+}
 class Editor {
 	constructor() {
 		this.buffer = "";
@@ -75,6 +183,32 @@ class Editor {
 	}
 	isShowingAutocomplete() { return false; }
 }
+class TUI {
+	constructor() {
+		this.children = [];
+		this.mode = "normal";
+		this._wantsTick = false;
+		this.terminal = { setTitle() {} };
+	}
+	addChild(component) { this.children.push(component); }
+	removeChild(component) { this.children = this.children.filter((item) => item !== component); }
+	clear() { this.children = []; }
+	setFocus() {}
+	showOverlay(component) {
+		return { hide() {}, setHidden() {}, focus() {}, unfocus() {}, isFocused() { return true; }, component };
+	}
+	hideOverlay() {}
+	requestRender() { this._wantsTick = true; }
+	addInputListener() { return () => {}; }
+	invalidate() {}
+	render(width) {
+		const lines = [];
+		for (const child of this.children) {
+			if (child && typeof child.render === "function") lines.push(...child.render(width));
+		}
+		return lines;
+	}
+}
 function matchesKey(data, name) {
 	const key = String(name || "").toLowerCase();
 	if (key === "escape" || key === "esc") return data === "\\x1b";
@@ -100,7 +234,12 @@ const exported = {
 	__piVirtual: "@earendil-works/pi-tui",
 	name: "@earendil-works/pi-tui",
 	version: "0.84.4",
+	Container,
+	Text,
+	Input,
+	SelectList,
 	Editor,
+	TUI,
 	matchesKey,
 	visibleWidth,
 	truncateToWidth,
@@ -313,6 +452,17 @@ async function main() {
 			return raw;
 		}
 	}
+	function matchesKeySafe(data, name) {
+		const key = String(name || "").toLowerCase();
+		if (key === "escape" || key === "esc") return data === "\x1b";
+		if (key === "enter" || key === "return") return data === "\r" || data === "\n";
+		if (key === "backspace") return data === "\x7f" || data === "\x08";
+		if (key === "left") return data === "\x1b[D";
+		if (key === "right") return data === "\x1b[C";
+		if (key === "up") return data === "\x1b[A";
+		if (key === "down") return data === "\x1b[B";
+		return data === name;
+	}
 	function makeUi() {
 		return {
 			select(title, options) {
@@ -394,10 +544,13 @@ async function main() {
 				const done = (value) => {
 					settled = value;
 				};
-				const component = await factory({}, ui.theme, {}, done);
+				const tui = new (require("@earendil-works/pi-tui").TUI)();
+				const component = await factory(tui, ui.theme, { matches: matchesKeySafe }, done);
 				customComponent = component;
 				restoreEditor(component, payload.snapshot);
-				if ((op === "customInput" || payload.data) && component && typeof component.handleInput === "function") {
+				if (op === "customTick" && component && typeof component.tick === "function") {
+					component.tick();
+				} else if ((op === "customInput" || payload.data) && component && typeof component.handleInput === "function") {
 					component.handleInput(payload.data || "");
 				}
 				if (settled !== undefined) return settled;
@@ -407,6 +560,7 @@ async function main() {
 						component && typeof component.render === "function"
 							? component.render(payload.width || 80)
 							: [],
+					wantsTick: Boolean(tui._wantsTick),
 				};
 				const pending = new Error("pending custom UI");
 				pending.__piPendingCustom = true;
@@ -663,7 +817,7 @@ async function main() {
 			ctx.ui = ctx.ui || ui;
 			result = await handler(ctx);
 		}
-	} else if (op === "command" || op === "customInput") {
+	} else if (op === "command" || op === "customInput" || op === "customTick") {
 		const name = String(payload.name || "");
 		const handler = recorded.commandHandlers[name];
 		if (typeof handler === "function") {

@@ -1,5 +1,6 @@
 mod args;
 mod auth_cmd;
+mod catalog_refresh;
 mod changelog;
 mod experimental;
 mod export;
@@ -9,6 +10,7 @@ mod external_editor;
 mod image_convert;
 mod js_host;
 mod llama;
+mod migrations;
 mod packages;
 mod rpc;
 mod self_update;
@@ -134,6 +136,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
 
     let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let migrations = migrations::maybe_run_startup_migrations(&cwd);
     let mut agent = build_agent(&parsed, &session_dir, &cwd)?;
 
     if parsed.mode == Some(Mode::Rpc) {
@@ -144,6 +147,9 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     let stdout_tty = io::stdout().is_terminal();
     if parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty {
         return run_print(&parsed, &mut agent);
+    }
+    if !migrations.deprecation_warnings.is_empty() {
+        migrations::show_deprecation_warnings(&migrations.deprecation_warnings);
     }
     run_interactive(&parsed, &mut agent)
 }
@@ -293,6 +299,10 @@ fn resolve_or_create_session(
 
 fn available_models(parsed: &Args) -> Vec<pi_ai::Model> {
     let mut models = load_builtin_models();
+    let store = pi_ai::load_models_store(&default_agent_dir());
+    for entry in store.providers.values() {
+        models = pi_ai::merge_models(&models, &entry.models);
+    }
     for provider in loaded_extension_host(parsed).registered_providers() {
         models.extend(pi_ai::models_from_provider_config(
             &provider.name,
@@ -684,6 +694,7 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     session.slash_commands = interactive_slash_commands(agent, parsed);
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
+    refresh_interactive_models(parsed, &mut session);
     if should_run_first_time_setup(&settings_path(&default_agent_dir())) {
         session.open_first_time_setup(&detect_terminal_theme(&session.chrome.theme), APP_NAME);
     }
@@ -796,6 +807,12 @@ fn run_raw_session(
         if !crossterm::event::poll(std::time::Duration::from_millis(50))
             .map_err(|err| err.to_string())?
         {
+            let mut dirty = poll_llama_job(session);
+            dirty |= tick_custom_overlay(parsed, session);
+            if dirty {
+                print!("\x1b[H{}", session.render_frame());
+                io::stdout().flush().ok();
+            }
             continue;
         }
         match crossterm::event::read().map_err(|err| err.to_string())? {
@@ -855,7 +872,15 @@ fn apply_session_action(
     action: SessionAction,
 ) -> Result<bool, String> {
     match action {
-        SessionAction::None | SessionAction::OpenModel | SessionAction::CloseOverlay => Ok(true),
+        SessionAction::None | SessionAction::CloseOverlay => Ok(true),
+        SessionAction::OpenModel => {
+            refresh_interactive_models(parsed, session);
+            Ok(true)
+        }
+        SessionAction::ExtensionProgressCancel => {
+            handle_llama_progress_cancel(session);
+            Ok(true)
+        }
         SessionAction::SelectSession(id) => {
             let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
             let summary =
@@ -2289,6 +2314,37 @@ fn paste_clipboard(session: &mut InteractiveSession) {
     }
 }
 
+fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
+    session.chrome.status = catalog_refresh::refresh_status_refreshing().into();
+    let agent_dir = default_agent_dir();
+    let allow_network = std::env::var("PI_OFFLINE").is_err();
+    let refreshed = catalog_refresh::refresh_model_catalogs(&agent_dir, allow_network, false);
+    let mut models: Vec<String> = refreshed
+        .models
+        .iter()
+        .map(|model| format!("{}/{}", model.provider, model.id))
+        .collect();
+    for model in available_models(parsed) {
+        let label = format!("{}/{}", model.provider, model.id);
+        if !models.contains(&label) {
+            models.push(label);
+        }
+    }
+    for existing in session.models.iter() {
+        if !models.contains(existing) {
+            models.push(existing.clone());
+        }
+    }
+    session.models = models;
+    if session.chrome.selector.is_some() {
+        session.chrome.selector = Some(pi_tui::SelectList::new(session.models.clone()));
+    }
+    if let Some(scoped) = &mut session.chrome.scoped_models {
+        scoped.refresh_status = Some(refreshed.status.clone());
+    }
+    session.chrome.status = refreshed.status;
+}
+
 fn open_llama_ui(session: &mut InteractiveSession) -> Result<(), String> {
     let storage = AuthStorage::create().map_err(|err| err.to_string())?;
     let cred = storage.get(llama::LLAMA_PROVIDER_ID);
@@ -2298,27 +2354,35 @@ fn open_llama_ui(session: &mut InteractiveSession) -> Result<(), String> {
     );
     let Ok(url) = llama::normalize_llama_server_url(&url) else {
         session.chrome.status = format!(
-            "Configure llama.cpp with /login {} <url>",
+            "Configure llama.cpp with /login {}",
             llama::LLAMA_PROVIDER_ID
         );
         return Ok(());
     };
-    let catalog = match llama::list_models(&url) {
+    show_llama_catalog(session, &url)
+}
+
+fn show_llama_catalog(session: &mut InteractiveSession, url: &str) -> Result<(), String> {
+    let catalog = match llama::list_models(url) {
         Ok(catalog) => catalog,
         Err(err) => {
-            session.chrome.status = err;
+            session.extension_dialog_context = Some(format!("llama-retry:{url}"));
+            session.open_extension_selector(
+                llama::connection_retry_title(url, &err),
+                vec!["Retry".into(), "Close".into()],
+            );
             return Ok(());
         }
     };
-    let autoload = llama::router_autoload(&url, &catalog);
-    let selectable = llama::selectable_models(&catalog, &url, autoload)?;
-    let inference = llama::llama_inference_url(&url)?;
+    let autoload = llama::router_autoload(url, &catalog);
+    let selectable = llama::selectable_models(&catalog, url, autoload)?;
+    let inference = llama::llama_inference_url(url)?;
     let mut options: Vec<String> = catalog.iter().map(llama::catalog_option_label).collect();
-    options.push("Download model".into());
+    options.push("Download model…".into());
     options.push("Close".into());
     session.extension_dialog_context = Some(format!("llama:{url}"));
     session.chrome.status = format!("{} selectable via {inference}", selectable.len());
-    session.open_extension_selector(format!("llama.cpp  {url}"), options);
+    session.open_extension_selector(format!("llama.cpp models\n{url}"), options);
     if let Some(selector) = &session.chrome.extension_selector {
         println!("{}", selector.render(80).join("\n"));
     }
@@ -2338,75 +2402,91 @@ fn handle_extension_select(
     };
     if let Some(url) = context
         .as_deref()
+        .and_then(|value| value.strip_prefix("llama-retry:"))
+    {
+        if choice == "Retry" {
+            show_llama_catalog(session, url)?;
+            return Ok(true);
+        }
+        session.chrome.status = "llama closed".into();
+        return Ok(true);
+    }
+    if let Some(target) = context
+        .as_deref()
+        .and_then(|value| value.strip_prefix("llama-hf-pick:"))
+    {
+        let id = choice
+            .split_once(" · ")
+            .map(|(id, _)| id)
+            .unwrap_or(choice.as_str());
+        begin_llama_download(session, target, id);
+        return Ok(true);
+    }
+    if let Some(rest) = context
+        .as_deref()
+        .and_then(|value| value.strip_prefix("llama-hf-gated:"))
+    {
+        if let Some((model, target)) = rest.split_once('@') {
+            if choice == "Continue" {
+                continue_llama_download(session, target, model, None, true);
+            } else {
+                session.chrome.status = "llama download cancelled".into();
+                let _ = show_llama_catalog(session, target);
+            }
+        }
+        return Ok(true);
+    }
+    if let Some(rest) = context
+        .as_deref()
+        .and_then(|value| value.strip_prefix("llama-hf-quant:"))
+    {
+        if let Some((model, target)) = rest.split_once('@') {
+            let quant = choice
+                .split_once(" · ")
+                .map(|(name, _)| name)
+                .unwrap_or(choice.as_str());
+            finish_llama_download(session, target, &format!("{model}:{quant}"));
+        }
+        return Ok(true);
+    }
+    if let Some(rest) = context
+        .as_deref()
+        .and_then(|value| value.strip_prefix("llama-load:"))
+    {
+        if let Some((model, target)) = rest.split_once('@') {
+            match choice.as_str() {
+                "Cancel" => {
+                    session.chrome.status = "llama load cancelled".into();
+                    let _ = show_llama_catalog(session, target);
+                }
+                "Unload all and load" => {
+                    let catalog = llama::list_models(target).unwrap_or_default();
+                    let restore: Vec<String> = llama::loaded_models(&catalog, Some(model))
+                        .into_iter()
+                        .map(|item| item.id.clone())
+                        .collect();
+                    for id in &restore {
+                        let _ = llama::unload_and_wait(target, id);
+                    }
+                    start_llama_load(session, target, model, restore)?;
+                }
+                _ => start_llama_load(session, target, model, Vec::new())?,
+            }
+        }
+        return Ok(true);
+    }
+    if let Some(url) = context
+        .as_deref()
         .and_then(|value| value.strip_prefix("llama:"))
     {
         if choice == "Close" {
             session.chrome.status = "llama closed".into();
             return Ok(true);
         }
-        if choice == "Download model" {
+        if choice == "Download model…" || choice == "Download model" {
             session.extension_dialog_context = Some(format!("llama-download:{url}"));
-            session.open_extension_input("Hugging Face model", "search or org/model:Q4_K_M");
-            return Ok(true);
-        }
-        if let Some(target) = context
-            .as_deref()
-            .and_then(|value| value.strip_prefix("llama-hf-pick:"))
-        {
-            let id = choice
-                .split_once(" · ")
-                .map(|(id, _)| id)
-                .unwrap_or(choice.as_str());
-            begin_llama_download(session, target, id);
-            return Ok(true);
-        }
-        if let Some(rest) = context
-            .as_deref()
-            .and_then(|value| value.strip_prefix("llama-hf-gated:"))
-        {
-            if let Some((model, target)) = rest.split_once('@') {
-                if choice == "Continue" {
-                    continue_llama_download(session, target, model, None, true);
-                } else {
-                    session.chrome.status = "llama download cancelled".into();
-                }
-            }
-            return Ok(true);
-        }
-        if let Some(rest) = context
-            .as_deref()
-            .and_then(|value| value.strip_prefix("llama-hf-quant:"))
-        {
-            if let Some((model, target)) = rest.split_once('@') {
-                let quant = choice
-                    .split_once(" · ")
-                    .map(|(name, _)| name)
-                    .unwrap_or(choice.as_str());
-                finish_llama_download(session, target, &format!("{model}:{quant}"));
-            }
-            return Ok(true);
-        }
-        if let Some(rest) = context
-            .as_deref()
-            .and_then(|value| value.strip_prefix("llama-load:"))
-        {
-            if let Some((model, target)) = rest.split_once('@') {
-                match choice.as_str() {
-                    "Cancel" => session.chrome.status = "llama load cancelled".into(),
-                    "Unload all and load" => {
-                        let catalog = llama::list_models(target).unwrap_or_default();
-                        for loaded in llama::loaded_models(&catalog, Some(model)) {
-                            let _ = llama::unload_and_wait(target, &loaded.id);
-                        }
-                        session.chrome.status =
-                            load_llama_model_and_refresh(session, target, model)?;
-                    }
-                    _ => {
-                        session.chrome.status =
-                            load_llama_model_and_refresh(session, target, model)?
-                    }
-                }
-            }
+            session
+                .open_extension_input("Download model", "Model name or owner/repository[:quant]");
             return Ok(true);
         }
         let catalog = llama::list_models(url).unwrap_or_default();
@@ -2440,7 +2520,7 @@ fn handle_extension_select(
                     );
                     return Ok(true);
                 }
-                session.chrome.status = load_llama_model_and_refresh(session, url, &model.id)?;
+                start_llama_load(session, url, &model.id, Vec::new())?;
                 return Ok(true);
             }
             session.chrome.status = format!("{} is {}", model.id, model.status.value);
@@ -2451,16 +2531,6 @@ fn handle_extension_select(
     }
     session.chrome.status = format!("extension-select={choice}");
     Ok(true)
-}
-
-fn load_llama_model_and_refresh(
-    session: &mut InteractiveSession,
-    url: &str,
-    model: &str,
-) -> Result<String, String> {
-    let status = load_llama_model(url, model)?;
-    refresh_llama_models(session, url);
-    Ok(status)
 }
 
 fn refresh_llama_models(session: &mut InteractiveSession, url: &str) {
@@ -2475,16 +2545,274 @@ fn refresh_llama_models(session: &mut InteractiveSession, url: &str) {
     }
 }
 
-fn load_llama_model(url: &str, model: &str) -> Result<String, String> {
+struct LlamaJob {
+    kind: &'static str,
+    url: String,
+    model: String,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    progress: std::sync::Arc<std::sync::Mutex<llama::LlamaProgress>>,
+    result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    restore: Vec<String>,
+}
+
+fn llama_job_slot() -> &'static std::sync::Mutex<Option<LlamaJob>> {
+    static SLOT: std::sync::Mutex<Option<LlamaJob>> = std::sync::Mutex::new(None);
+    &SLOT
+}
+
+fn start_llama_load(
+    session: &mut InteractiveSession,
+    url: &str,
+    model: &str,
+    restore: Vec<String>,
+) -> Result<(), String> {
+    start_llama_op(session, "load", url, model, restore)
+}
+
+fn start_llama_download_op(
+    session: &mut InteractiveSession,
+    url: &str,
+    model: &str,
+) -> Result<(), String> {
+    start_llama_op(session, "download", url, model, Vec::new())
+}
+
+fn start_llama_op(
+    session: &mut InteractiveSession,
+    kind: &'static str,
+    url: &str,
+    model: &str,
+    restore: Vec<String>,
+) -> Result<(), String> {
+    let title = if kind == "download" {
+        "Downloading model"
+    } else {
+        "Loading model"
+    };
+    session.extension_dialog_context = Some(format!("llama-{kind}:{model}@{url}"));
+    session.open_extension_progress(title, model, "Starting…");
+    if llama::fixture_wait_mode() {
+        let _ = llama::watch_events(url);
+        let status = run_llama_op_blocking(kind, url, model, None, |progress| {
+            session.update_extension_progress(
+                progress.message.clone(),
+                progress.ratio,
+                progress.detail.clone(),
+            );
+            if let Some(ratio) = progress.ratio {
+                session.chrome.status = llama::progress_bar(ratio);
+            }
+        })?;
+        finish_llama_op(session, kind, url, model, Ok(status), restore);
+        return Ok(());
+    }
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(llama::LlamaProgress {
+        message: "Starting…".into(),
+        ratio: None,
+        detail: None,
+    }));
+    let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let url_owned = url.to_string();
+    let model_owned = model.to_string();
+    let cancel_t = cancel.clone();
+    let progress_t = progress.clone();
+    let result_t = result.clone();
+    std::thread::spawn(move || {
+        let outcome =
+            run_llama_op_blocking(kind, &url_owned, &model_owned, Some(&cancel_t), |update| {
+                if let Ok(mut guard) = progress_t.lock() {
+                    *guard = update;
+                }
+            });
+        if let Ok(mut guard) = result_t.lock() {
+            *guard = Some(outcome);
+        }
+    });
+    if let Ok(mut slot) = llama_job_slot().lock() {
+        *slot = Some(LlamaJob {
+            kind,
+            url: url.to_string(),
+            model: model.to_string(),
+            cancel,
+            progress,
+            result,
+            restore,
+        });
+    }
+    Ok(())
+}
+
+fn run_llama_op_blocking(
+    kind: &str,
+    url: &str,
+    model: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    mut on_progress: impl FnMut(llama::LlamaProgress),
+) -> Result<String, String> {
+    if kind == "download" {
+        if cancel.is_none() {
+            llama::download_and_wait(url, model, on_progress)?;
+        } else {
+            llama::download_and_wait_with_cancel(url, model, on_progress, cancel)?;
+        }
+        return Ok(format!("Downloaded {model}"));
+    }
     let mut status = format!("Load started for {model}");
-    let loaded = llama::load_and_wait(url, model, |progress| {
-        status = format!("{} {model}", progress.message);
-    })?;
+    let loaded = if cancel.is_none() {
+        llama::load_and_wait(url, model, |progress| {
+            status = format!("{} {model}", progress.message);
+            on_progress(progress);
+        })?
+    } else {
+        llama::load_and_wait_with_cancel(
+            url,
+            model,
+            |progress| {
+                status = format!("{} {model}", progress.message);
+                on_progress(progress);
+            },
+            cancel,
+        )?
+    };
     Ok(if loaded.status.value == "loaded" {
         format!("Loaded {}", loaded.id)
     } else {
         status
     })
+}
+
+fn finish_llama_op(
+    session: &mut InteractiveSession,
+    kind: &str,
+    url: &str,
+    model: &str,
+    status: Result<String, String>,
+    restore: Vec<String>,
+) {
+    session.chrome.extension_progress = None;
+    match status {
+        Ok(message) => {
+            session.chrome.status = message;
+            refresh_llama_models(session, url);
+        }
+        Err(err) if err == "Cancelled" => {
+            session.chrome.status = format!("{kind} cancelled");
+            if !restore.is_empty() {
+                session.chrome.status = "Restoring previously loaded models".into();
+                for id in restore {
+                    let _ = llama::load_and_wait(url, &id, |_| {});
+                }
+            }
+        }
+        Err(err) => {
+            if !llama::is_connection_error(&err) {
+                session.chrome.status = err;
+            } else {
+                session.chrome.status = llama::connection_error_message(&err);
+            }
+            if !restore.is_empty() {
+                for id in restore {
+                    let _ = llama::load_and_wait(url, &id, |_| {});
+                }
+            }
+        }
+    }
+    let _ = model;
+    let _ = show_llama_catalog(session, url);
+}
+
+fn poll_llama_job(session: &mut InteractiveSession) -> bool {
+    let mut finished = None;
+    if let Ok(slot) = llama_job_slot().lock() {
+        if let Some(job) = slot.as_ref() {
+            if let Ok(progress) = job.progress.lock() {
+                session.update_extension_progress(
+                    progress.message.clone(),
+                    progress.ratio,
+                    progress.detail.clone(),
+                );
+            }
+            if let Ok(result) = job.result.lock() {
+                if let Some(done) = result.clone() {
+                    finished = Some((
+                        job.kind,
+                        job.url.clone(),
+                        job.model.clone(),
+                        done,
+                        job.restore.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some((kind, url, model, status, restore)) = finished {
+        if let Ok(mut slot) = llama_job_slot().lock() {
+            *slot = None;
+        }
+        finish_llama_op(session, kind, &url, &model, status, restore);
+        return true;
+    }
+    session.chrome.extension_progress.is_some()
+}
+
+fn handle_llama_progress_cancel(session: &mut InteractiveSession) {
+    let context = session.extension_dialog_context.clone().unwrap_or_default();
+    if let Some(rest) = context.strip_prefix("llama-load:") {
+        if let Some((model, _)) = rest.split_once('@') {
+            session.extension_dialog_context = Some(format!("llama-stop-load:{rest}"));
+            session.open_extension_confirm("Stop loading?", model);
+            return;
+        }
+    }
+    if let Some(rest) = context.strip_prefix("llama-download:") {
+        if let Some((model, _)) = rest.split_once('@') {
+            session.extension_dialog_context = Some(format!("llama-stop-download:{rest}"));
+            session.open_extension_confirm("Stop download?", model);
+            return;
+        }
+    }
+    session.chrome.status = "llama cancelled".into();
+}
+
+fn cancel_llama_job(url: &str, model: &str) {
+    if let Ok(slot) = llama_job_slot().lock() {
+        if let Some(job) = slot.as_ref() {
+            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _ = llama::unload_model(url, model);
+}
+
+fn tick_custom_overlay(parsed: &Args, session: &mut InteractiveSession) -> bool {
+    let Some(path) = session.chrome.custom_overlay_path.clone() else {
+        return false;
+    };
+    let Some(command) = session.chrome.custom_overlay_command.clone() else {
+        return false;
+    };
+    let snapshot = session.chrome.custom_overlay_snapshot.clone();
+    let mut host = loaded_extension_host(parsed);
+    if let Ok(Some(result)) =
+        host.invoke_custom_tick(&path, &command, snapshot.as_ref(), session.width)
+    {
+        if let Some(lines) = result.get("lines").and_then(|value| value.as_array()) {
+            session.chrome.custom_overlay_lines = Some(
+                lines
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+        if let Some(snapshot) = result.get("snapshot") {
+            session.chrome.custom_overlay_snapshot = Some(snapshot.clone());
+        }
+        return result
+            .get("wantsTick")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+    }
+    false
 }
 
 fn begin_llama_download(session: &mut InteractiveSession, url: &str, value: &str) {
@@ -2565,20 +2893,8 @@ fn continue_llama_download(
 
 fn finish_llama_download(session: &mut InteractiveSession, url: &str, model: &str) {
     let token = llama::find_hugging_face_token();
-    match llama::download_and_wait(url, model, |_| {}) {
-        Ok(_) => {
-            session.chrome.status = format!(
-                "Downloaded {model} hf={}",
-                token.as_deref().unwrap_or("missing")
-            );
-        }
-        Err(err) => {
-            session.chrome.status = format!(
-                "download {model} via {url} hf={} {err}",
-                token.as_deref().unwrap_or("missing")
-            );
-        }
-    }
+    session.chrome.status = format!("hf={}", token.as_deref().unwrap_or("missing"));
+    let _ = start_llama_download_op(session, url, model);
 }
 
 fn handle_extension_input(session: &mut InteractiveSession, value: Option<String>) {
@@ -2601,15 +2917,49 @@ fn handle_extension_confirm(session: &mut InteractiveSession, confirmed: bool) {
     let context = session.extension_dialog_context.take();
     if let Some(rest) = context
         .as_deref()
+        .and_then(|item| item.strip_prefix("llama-stop-load:"))
+    {
+        if let Some((model, url)) = rest.split_once('@') {
+            if confirmed {
+                cancel_llama_job(url, model);
+                session.chrome.status = "llama load cancelled".into();
+            } else {
+                session.extension_dialog_context = Some(format!("llama-load:{model}@{url}"));
+                session.chrome.status = "Loading model".into();
+            }
+        }
+        return;
+    }
+    if let Some(rest) = context
+        .as_deref()
+        .and_then(|item| item.strip_prefix("llama-stop-download:"))
+    {
+        if let Some((model, url)) = rest.split_once('@') {
+            if confirmed {
+                cancel_llama_job(url, model);
+                session.chrome.status = "llama download cancelled".into();
+            } else {
+                session.extension_dialog_context = Some(format!("llama-download:{model}@{url}"));
+                session.chrome.status = "Downloading model".into();
+            }
+        }
+        return;
+    }
+    if let Some(rest) = context
+        .as_deref()
         .and_then(|item| item.strip_prefix("llama-unload:"))
     {
         if confirmed {
             if let Some((model, url)) = rest.split_once('@') {
                 let _ = llama::unload_and_wait(url, model);
                 session.chrome.status = format!("Unloaded {model}");
+                let _ = show_llama_catalog(session, url);
             } else {
                 session.chrome.status = format!("Unloaded {rest}");
             }
+        } else if let Some((_, url)) = rest.split_once('@') {
+            session.chrome.status = "llama unload cancelled".into();
+            let _ = show_llama_catalog(session, url);
         } else {
             session.chrome.status = "llama unload cancelled".into();
         }
@@ -2748,7 +3098,14 @@ fn open_session_tree(agent: &Agent, session: &mut InteractiveSession) {
 }
 
 fn open_scoped_models(session: &mut InteractiveSession) {
-    let models = load_builtin_models()
+    session.chrome.status = catalog_refresh::refresh_status_refreshing().into();
+    let refreshed = catalog_refresh::refresh_model_catalogs(
+        &default_agent_dir(),
+        std::env::var("PI_OFFLINE").is_err(),
+        false,
+    );
+    let models = refreshed
+        .models
         .into_iter()
         .map(|model| ScopedModel {
             provider: model.provider,
@@ -2757,9 +3114,11 @@ fn open_scoped_models(session: &mut InteractiveSession) {
         })
         .collect();
     session.open_scoped_models(models);
-    if let Some(scoped) = &session.chrome.scoped_models {
+    if let Some(scoped) = &mut session.chrome.scoped_models {
+        scoped.refresh_status = Some(refreshed.status.clone());
         println!("{}", scoped.render(80).join("\n"));
     }
+    session.chrome.status = refreshed.status;
 }
 
 fn start_login(

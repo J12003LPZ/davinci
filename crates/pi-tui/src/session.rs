@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use crate::autocomplete::{apply_completion, suggestions, SlashCommandSpec};
 use crate::chrome::ChatChrome;
 use crate::extension_ui::{
-    ExtensionConfirm, ExtensionDialogAction, ExtensionEditor, ExtensionInput, ExtensionSelector,
+    ExtensionConfirm, ExtensionDialogAction, ExtensionEditor, ExtensionInput, ExtensionProgress,
+    ExtensionSelector,
 };
 use crate::first_time::{FirstTimeAction, FirstTimeSetup};
 use crate::image::{delete_all_kitty_images, delete_kitty_image, encode_kitty};
@@ -109,6 +110,7 @@ pub enum SessionAction {
     ExtensionInput(Option<String>),
     ExtensionEditor(Option<String>),
     ExtensionConfirm(bool),
+    ExtensionProgressCancel,
     CustomEditorInput(String),
     CustomOverlayInput(String),
 }
@@ -194,6 +196,7 @@ pub enum OverlayKind {
     ExtensionInput,
     ExtensionEditor,
     ExtensionConfirm,
+    ExtensionProgress,
 }
 
 impl InteractiveSession {
@@ -373,6 +376,7 @@ impl InteractiveSession {
         self.chrome.extension_input = None;
         self.chrome.extension_editor = None;
         self.chrome.extension_confirm = None;
+        self.chrome.extension_progress = None;
         self.chrome.custom_overlay_lines = None;
         self.chrome.custom_overlay_path = None;
         self.chrome.custom_overlay_command = None;
@@ -394,6 +398,7 @@ impl InteractiveSession {
             || self.chrome.extension_input.is_some()
             || self.chrome.extension_editor.is_some()
             || self.chrome.extension_confirm.is_some()
+            || self.chrome.extension_progress.is_some()
             || self.chrome.custom_overlay_path.is_some()
             || self.chrome.custom_overlay_lines.is_some()
     }
@@ -448,10 +453,37 @@ impl InteractiveSession {
     }
 
     pub fn open_extension_confirm(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let keep_progress = self.chrome.extension_progress.clone();
         self.close_overlays();
+        self.chrome.extension_progress = keep_progress;
         self.overlay_kind = OverlayKind::ExtensionConfirm;
         self.chrome.extension_confirm = Some(ExtensionConfirm::new(title, message));
         self.chrome.status = "Extension confirm".into();
+    }
+
+    pub fn open_extension_progress(
+        &mut self,
+        title: impl Into<String>,
+        model: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionProgress;
+        self.chrome.extension_progress = Some(ExtensionProgress::new(title, model, message));
+        self.chrome.status = "Extension progress".into();
+    }
+
+    pub fn update_extension_progress(
+        &mut self,
+        message: impl Into<String>,
+        ratio: Option<f64>,
+        detail: Option<String>,
+    ) {
+        if let Some(progress) = &mut self.chrome.extension_progress {
+            progress.message = message.into();
+            progress.ratio = ratio;
+            progress.detail = detail;
+        }
     }
 
     pub fn begin_osc_query(&mut self, timeout_ms: u64) -> String {
@@ -892,13 +924,29 @@ impl InteractiveSession {
             return Some(match confirm.handle_key(data) {
                 ExtensionDialogAction::None => SessionAction::None,
                 ExtensionDialogAction::Confirm(value) => {
-                    self.close_overlays();
+                    self.chrome.extension_confirm = None;
+                    if self.chrome.extension_progress.is_none() {
+                        self.close_overlays();
+                    } else {
+                        self.overlay_kind = OverlayKind::ExtensionProgress;
+                    }
                     SessionAction::ExtensionConfirm(value)
                 }
                 ExtensionDialogAction::Cancel => {
-                    self.close_overlays();
+                    self.chrome.extension_confirm = None;
+                    if self.chrome.extension_progress.is_none() {
+                        self.close_overlays();
+                    } else {
+                        self.overlay_kind = OverlayKind::ExtensionProgress;
+                    }
                     SessionAction::ExtensionConfirm(false)
                 }
+                _ => SessionAction::None,
+            });
+        }
+        if let Some(progress) = &mut self.chrome.extension_progress {
+            return Some(match progress.handle_key(data) {
+                ExtensionDialogAction::Cancel => SessionAction::ExtensionProgressCancel,
                 _ => SessionAction::None,
             });
         }
@@ -1175,7 +1223,8 @@ impl InteractiveSession {
                     | OverlayKind::ExtensionSelect
                     | OverlayKind::ExtensionInput
                     | OverlayKind::ExtensionEditor
-                    | OverlayKind::ExtensionConfirm => SessionAction::CloseOverlay,
+                    | OverlayKind::ExtensionConfirm
+                    | OverlayKind::ExtensionProgress => SessionAction::CloseOverlay,
                 };
             }
             self.chrome.selector = None;
@@ -1612,6 +1661,21 @@ mod tests {
         assert_eq!(
             session.handle_bytes("y"),
             SessionAction::ExtensionConfirm(true)
+        );
+
+        session.open_extension_progress("Loading model", "local", "Starting…");
+        session.update_extension_progress("Loading text model", Some(0.5), None);
+        assert!(session
+            .chrome
+            .extension_progress
+            .as_ref()
+            .unwrap()
+            .render(80)
+            .join("\n")
+            .contains("50%"));
+        assert_eq!(
+            session.handle_bytes("\x1b"),
+            SessionAction::ExtensionProgressCancel
         );
     }
 
