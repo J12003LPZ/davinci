@@ -648,9 +648,10 @@ fn apply_resolved_models(parsed: &Args, agent: &mut Agent) -> Result<(), String>
     if !scoped.scoped_models.is_empty() && !session_was_restored(parsed) {
         let settings = load_settings(&default_agent_dir());
         let saved = match (&settings.default_provider, &settings.default_model) {
-            (Some(provider), Some(id)) => scoped.scoped_models.iter().find(|item| {
-                item.model.provider == *provider && item.model.id == *id
-            }),
+            (Some(provider), Some(id)) => scoped
+                .scoped_models
+                .iter()
+                .find(|item| item.model.provider == *provider && item.model.id == *id),
             _ => None,
         };
         let chosen = saved.unwrap_or(&scoped.scoped_models[0]);
@@ -1673,9 +1674,8 @@ fn rpc_emit_and_wait_ui(
         .unwrap_or_default()
         .to_string();
     let timeout_ms = call.get("timeout").and_then(|value| value.as_u64());
-    let deadline = timeout_ms.map(|ms| {
-        std::time::Instant::now() + std::time::Duration::from_millis(ms)
-    });
+    let deadline =
+        timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     let mut parked = std::collections::VecDeque::new();
     loop {
         if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
@@ -1838,8 +1838,7 @@ fn run_interactive(
     session.enabled_model_ids = stored.enabled_models.clone();
     if !parsed.models.is_empty() {
         let snapshot = load_model_runtime(parsed);
-        let scoped =
-            model_resolver::resolve_model_scope_from_models(&parsed.models, &snapshot.all);
+        let scoped = model_resolver::resolve_model_scope_from_models(&parsed.models, &snapshot.all);
         for diagnostic in &scoped.diagnostics {
             eprintln!("Warning: {}", diagnostic.message);
         }
@@ -6676,8 +6675,11 @@ mod tests {
 
     #[test]
     fn apply_resolved_models_fuzzy_and_thinking_suffix() {
-        let mut parsed = Args::default();
-        parsed.model = Some("sonnet:high".into());
+        let parsed = Args {
+            provider: Some("anthropic".into()),
+            model: Some("sonnet:high".into()),
+            ..Args::default()
+        };
         let mut agent = Agent::new(default_system_prompt());
         apply_resolved_models(&parsed, &mut agent).expect("resolve");
         assert!(agent.model_id.to_ascii_lowercase().contains("sonnet"));
@@ -6687,8 +6689,10 @@ mod tests {
 
     #[test]
     fn apply_resolved_models_unknown_is_error() {
-        let mut parsed = Args::default();
-        parsed.model = Some("definitely-not-a-real-model-xyz".into());
+        let parsed = Args {
+            model: Some("definitely-not-a-real-model-xyz".into()),
+            ..Args::default()
+        };
         let mut agent = Agent::new(default_system_prompt());
         let err = apply_resolved_models(&parsed, &mut agent).unwrap_err();
         assert!(err.contains("not found"));

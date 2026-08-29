@@ -39,7 +39,10 @@ pub const DEFAULT_MODEL_PER_PROVIDER: &[(&str, &str)] = &[
     ("opencode-go", "kimi-k2.6"),
     ("kimi-coding", "kimi-for-coding"),
     ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
-    ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6"),
+    (
+        "cloudflare-ai-gateway",
+        "workers-ai/@cf/moonshotai/kimi-k2.6",
+    ),
     ("qwen-token-plan", "qwen3.7-max"),
     ("qwen-token-plan-cn", "qwen3.7-max"),
     ("qwen-token-plan-individual", "qwen3.8-max"),
@@ -189,7 +192,11 @@ fn try_match_model(model_pattern: &str, available_models: &[Model]) -> Option<Mo
     dated.first().map(|model| (*model).clone())
 }
 
-fn build_fallback_model(provider: &str, model_id: &str, available_models: &[Model]) -> Option<Model> {
+fn build_fallback_model(
+    provider: &str,
+    model_id: &str,
+    available_models: &[Model],
+) -> Option<Model> {
     let provider_models: Vec<&Model> = available_models
         .iter()
         .filter(|model| model.provider == provider)
@@ -232,7 +239,11 @@ pub fn parse_model_pattern(
     let prefix = &pattern[..last_colon];
     let suffix = &pattern[last_colon + 1..];
     if let Some(level) = is_valid_thinking_level(suffix) {
-        let result = parse_model_pattern(prefix, available_models, allow_invalid_thinking_level_fallback);
+        let result = parse_model_pattern(
+            prefix,
+            available_models,
+            allow_invalid_thinking_level_fallback,
+        );
         if result.model.is_some() {
             return ParsedModelResult {
                 thinking_level: if result.warning.is_some() {
@@ -253,7 +264,11 @@ pub fn parse_model_pattern(
             warning: None,
         };
     }
-    let result = parse_model_pattern(prefix, available_models, allow_invalid_thinking_level_fallback);
+    let result = parse_model_pattern(
+        prefix,
+        available_models,
+        allow_invalid_thinking_level_fallback,
+    );
     if result.model.is_some() {
         return ParsedModelResult {
             model: result.model,
@@ -323,12 +338,15 @@ fn glob_match_inner(pat: &[u8], val: &[u8]) -> bool {
 }
 
 fn match_class(pat: &[u8], value: Option<u8>) -> Option<usize> {
-    let Some(end) = pat.iter().skip(1).position(|ch| *ch == b']').map(|pos| pos + 1) else {
+    let Some(end) = pat
+        .iter()
+        .skip(1)
+        .position(|ch| *ch == b']')
+        .map(|pos| pos + 1)
+    else {
         return (value == Some(b'[')).then_some(1);
     };
-    let Some(ch) = value else {
-        return None;
-    };
+    let ch = value?;
     let mut inner = &pat[1..end];
     let negate = matches!(inner.first(), Some(b'!' | b'^'));
     if negate {
@@ -401,7 +419,7 @@ pub fn resolve_model_scope_from_models(
                 .iter()
                 .filter(|model| {
                     let full = format!("{}/{}", model.provider, model.id);
-                    glob_match(glob_pattern, &full) || glob_match(glob_pattern, &model.id)
+                    model_pattern_matches(glob_pattern, &full, &model.id)
                 })
                 .collect();
             if matching.is_empty() {
@@ -479,8 +497,7 @@ pub fn resolve_cli_model(
             thinking_level: None,
             warning: None,
             error: Some(
-                "No models available. Check your installation or add models to models.json."
-                    .into(),
+                "No models available. Check your installation or add models to models.json.".into(),
             ),
         };
     }
@@ -490,7 +507,8 @@ pub fn resolve_cli_model(
         provider_map.insert(model.provider.to_ascii_lowercase(), model.provider.clone());
     }
 
-    let mut provider = cli_provider.and_then(|name| provider_map.get(&name.to_ascii_lowercase()).cloned());
+    let mut provider =
+        cli_provider.and_then(|name| provider_map.get(&name.to_ascii_lowercase()).cloned());
     if cli_provider.is_some() && provider.is_none() {
         return ResolveCliModelResult {
             model: None,
@@ -569,12 +587,14 @@ pub fn resolve_cli_model(
         }
     }
 
-    if let (Some(cli_provider), Some(provider)) = (cli_provider, provider.as_deref()) {
+    if let (Some(_cli_provider), Some(provider)) = (cli_provider, provider.as_deref()) {
         let prefix = format!("{provider}/");
-        if cli_model.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()) {
+        if cli_model
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+        {
             pattern = cli_model[prefix.len()..].to_string();
         }
-        let _ = cli_provider;
     }
 
     let candidates: Vec<Model> = if let Some(provider) = provider.as_deref() {
@@ -697,10 +717,7 @@ pub fn thinking_level_for_model_switch(
     default_level: Option<ThinkingLevel>,
     current: ThinkingLevel,
 ) -> ThinkingLevel {
-    explicit
-        .or(per_model)
-        .or(default_level)
-        .unwrap_or(current)
+    explicit.or(per_model).or(default_level).unwrap_or(current)
 }
 
 #[cfg(test)]
@@ -776,7 +793,10 @@ mod tests {
             .contains("Invalid thinking level"));
 
         let colon_id = parse_model_pattern("qwen/qwen3-coder:exacto:high", &models, true);
-        assert_eq!(colon_id.model.as_ref().unwrap().id, "qwen/qwen3-coder:exacto");
+        assert_eq!(
+            colon_id.model.as_ref().unwrap().id,
+            "qwen/qwen3-coder:exacto"
+        );
         assert_eq!(colon_id.thinking_level, Some(ThinkingLevel::High));
     }
 
@@ -794,15 +814,15 @@ mod tests {
         assert_eq!(thinking.model.as_ref().unwrap().id, "claude-sonnet-4-5");
         assert_eq!(thinking.thinking_level, Some(ThinkingLevel::High));
 
-        let openrouter = resolve_cli_model(
-            None,
-            Some("openai/gpt-4o:extended"),
-            None,
-            &models,
-            |_| false,
-        );
+        let openrouter =
+            resolve_cli_model(None, Some("openai/gpt-4o:extended"), None, &models, |_| {
+                false
+            });
         assert_eq!(openrouter.model.as_ref().unwrap().provider, "openrouter");
-        assert_eq!(openrouter.model.as_ref().unwrap().id, "openai/gpt-4o:extended");
+        assert_eq!(
+            openrouter.model.as_ref().unwrap().id,
+            "openai/gpt-4o:extended"
+        );
 
         let strict = resolve_cli_model(
             Some("openai"),
@@ -813,7 +833,11 @@ mod tests {
         );
         assert_eq!(strict.model.as_ref().unwrap().provider, "openai");
         assert_eq!(strict.model.as_ref().unwrap().id, "gpt-4o:extended");
-        assert!(strict.warning.as_deref().unwrap().contains("custom model id"));
+        assert!(strict
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("custom model id"));
 
         let empty = resolve_cli_model(Some("openai"), Some("gpt-4o"), None, &[], |_| false);
         assert!(empty
@@ -826,7 +850,12 @@ mod tests {
     #[test]
     fn resolve_cli_model_ambiguous_prefers_authenticated() {
         let models = vec![
-            mock_model("azure-openai-responses", "gpt-5.6-sol", "GPT 5.6 Sol", false),
+            mock_model(
+                "azure-openai-responses",
+                "gpt-5.6-sol",
+                "GPT 5.6 Sol",
+                false,
+            ),
             mock_model("openai-codex", "gpt-5.6-sol", "GPT 5.6 Sol", false),
         ];
         let resolved = resolve_cli_model(None, Some("gpt-5.6-sol"), None, &models, |provider| {
@@ -868,8 +897,16 @@ mod tests {
 
         let provider_glob = resolve_model_scope_from_models(&["openai/*".into()], &models);
         assert_eq!(provider_glob.scoped_models[0].model.id, "gpt-4o");
-        assert!(model_pattern_matches("*sonnet*", "anthropic/claude-sonnet-4-5", "claude-sonnet-4-5"));
-        assert!(!model_pattern_matches("openai/*", "anthropic/claude-sonnet-4-5", "claude-sonnet-4-5"));
+        assert!(model_pattern_matches(
+            "*sonnet*",
+            "anthropic/claude-sonnet-4-5",
+            "claude-sonnet-4-5"
+        ));
+        assert!(!model_pattern_matches(
+            "openai/*",
+            "anthropic/claude-sonnet-4-5",
+            "claude-sonnet-4-5"
+        ));
     }
 
     #[test]

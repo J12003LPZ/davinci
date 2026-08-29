@@ -194,11 +194,6 @@ impl RpcRuntime {
 
     pub fn set_scoped_models(&mut self, patterns: &[String]) {
         let resolved = resolve_model_scope_from_models(patterns, &self.models);
-        self.scoped_models = resolved
-            .scoped_models
-            .iter()
-            .map(|item| item.model.clone())
-            .collect();
         self.scoped_thinking = resolved
             .scoped_models
             .iter()
@@ -207,6 +202,7 @@ impl RpcRuntime {
                     .map(|level| (format!("{}/{}", item.model.provider, item.model.id), level))
             })
             .collect();
+        self.scoped_models = resolve_scoped_models(&self.models, patterns);
     }
 
     fn apply_thinking_for_switch(&mut self, provider: &str, model_id: &str) {
@@ -1049,14 +1045,11 @@ mod tests {
         runtime.agent.provider = runtime.models[0].provider.clone();
         runtime.agent.model_id = runtime.models[0].id.clone();
         runtime.agent.thinking_level = ThinkingLevel::Off;
-        let scoped_ids = resolve_scoped_models(
-            &runtime.models,
-            &[format!(
-                "{}:high",
-                runtime.models[1].id
-            )],
-        );
-        assert!(scoped_ids.iter().any(|model| model.id == runtime.models[1].id));
+        let scoped_ids =
+            resolve_scoped_models(&runtime.models, &[format!("{}:high", runtime.models[1].id)]);
+        assert!(scoped_ids
+            .iter()
+            .any(|model| model.id == runtime.models[1].id));
         runtime.scoped_models = vec![runtime.models[0].clone(), runtime.models[1].clone()];
         runtime.scoped_thinking.insert(
             format!("{}/{}", runtime.models[1].provider, runtime.models[1].id),

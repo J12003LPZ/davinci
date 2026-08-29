@@ -256,8 +256,10 @@ impl Drop for PersistentJsSession {
 static PERSISTENT_JS: Mutex<Option<PersistentJsSession>> = Mutex::new(None);
 static NODE_LOCK: Mutex<()> = Mutex::new(());
 
+type UiWaiter = Box<dyn FnMut(&Value) -> Value>;
+
 thread_local! {
-    static UI_WAITER: RefCell<Option<Box<dyn FnMut(&Value) -> Value>>> = const { RefCell::new(None) };
+    static UI_WAITER: RefCell<Option<UiWaiter>> = const { RefCell::new(None) };
 }
 
 pub fn install_ui_waiter(waiter: Box<dyn FnMut(&Value) -> Value>) {
@@ -385,9 +387,8 @@ pub fn run_js_extension(
             let _ = pipe.read_to_string(&mut stderr);
         }
         let _ = std::fs::remove_dir_all(dir);
-        return serde_json::from_str(&stdout).map_err(|err| {
-            format!("extension runner: {err}: {} {stderr}", stdout.trim())
-        });
+        return serde_json::from_str(&stdout)
+            .map_err(|err| format!("extension runner: {err}: {} {stderr}", stdout.trim()));
     }
     let output = child.wait_with_output().map_err(|err| err.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout);
