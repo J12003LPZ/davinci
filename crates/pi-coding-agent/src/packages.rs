@@ -271,8 +271,16 @@ fn refresh_model_catalogs(agent_dir: &Path, _target: Option<&str>) -> Result<Str
     crate::catalog_refresh::cli_refresh_message(&result)
 }
 
-/// TS `pi update --self`: package-manager argv when npm/pnpm/yarn/bun; copy `~/.pi/bin/pi` otherwise.
+/// TS `pi update --self`: managed-install, package-manager argv, or copy `~/.pi/bin/pi`.
 pub fn self_update_binary(agent_dir: &Path, _force: bool) -> Result<String, String> {
+    if let Some(root) = crate::self_update::get_active_managed_install_root()? {
+        let version = std::env::var("PI_MANAGED_UPDATE_VERSION")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| VERSION.to_string());
+        crate::self_update::run_managed_self_update(&root, &version)?;
+        return Ok(format!("Updated {APP_NAME} from {VERSION} to {version}"));
+    }
     let method = current_install_method();
     let target = PackageTarget::new(PACKAGE_NAME, None);
     let package_dir = package_dir_from_env();

@@ -99,8 +99,8 @@ pub use shell::{
 };
 pub use stream::{
     assistant_to_chat, complete_from_events, complete_simple, events_from_complete,
-    fixture_complete, live_complete, live_complete_with, live_stream, parse_sse_block,
-    replay_sse_events, request_body, request_body_with, request_url,
+    fixture_complete, live_complete, live_complete_streaming_with, live_complete_with, live_stream,
+    parse_sse_block, replay_sse_events, request_body, request_body_with, request_url,
     resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
     StopReason, StreamEvent, StreamOptions,
 };

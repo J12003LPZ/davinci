@@ -12,17 +12,19 @@ use crate::ToolExecutionMode;
 
 impl Agent {
     /// Start a loop after user prompts have already been appended.
-    pub fn run_loop<F>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
+    pub fn run_loop<F, T>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
     where
-        F: FnMut(&Agent) -> Result<AssistantMessage, String>,
+        F: FnMut(&Agent) -> Result<T, String>,
+        T: Into<crate::CompleteOutput>,
     {
         self.run_loop_inner(true, complete)
     }
 
     /// Continue from an existing user or toolResult tail (TS `agentLoopContinue`).
-    pub fn continue_loop<F>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
+    pub fn continue_loop<F, T>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
     where
-        F: FnMut(&Agent) -> Result<AssistantMessage, String>,
+        F: FnMut(&Agent) -> Result<T, String>,
+        T: Into<crate::CompleteOutput>,
     {
         if self.messages.is_empty() {
             return Err("Cannot continue: no messages in context".into());
@@ -33,13 +35,14 @@ impl Agent {
         self.run_loop_inner(false, complete)
     }
 
-    fn run_loop_inner<F>(
+    fn run_loop_inner<F, T>(
         &mut self,
         emit_prompt_messages: bool,
         mut complete: F,
     ) -> Result<Vec<AgentEvent>, String>
     where
-        F: FnMut(&Agent) -> Result<AssistantMessage, String>,
+        F: FnMut(&Agent) -> Result<T, String>,
+        T: Into<crate::CompleteOutput>,
     {
         self.is_streaming = true;
         self.retry_aborted = false;
@@ -79,13 +82,14 @@ impl Agent {
                 }
             }
 
-            let assistant = match self.complete_with_retry(&mut complete, &mut events) {
-                Ok(message) => message,
-                Err(err) => {
-                    self.is_streaming = false;
-                    return Err(err);
-                }
-            };
+            let (assistant, stream_events) =
+                match self.complete_with_retry(&mut complete, &mut events) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        self.is_streaming = false;
+                        return Err(err);
+                    }
+                };
             let chat = assistant_to_chat(&assistant);
             self.messages.push(chat.clone());
             self.persist_assistant(&assistant, &chat);
@@ -93,7 +97,8 @@ impl Agent {
             events.push(AgentEvent::MessageStart {
                 message: chat.clone(),
             });
-            for assistant_message_event in pi_ai::events_from_complete(&assistant) {
+            let updates = stream_events.unwrap_or_else(|| pi_ai::events_from_complete(&assistant));
+            for assistant_message_event in updates {
                 events.push(AgentEvent::MessageUpdate {
                     message: chat.clone(),
                     assistant_message_event,
@@ -271,13 +276,14 @@ impl Agent {
         }
     }
 
-    fn complete_with_retry<F>(
+    fn complete_with_retry<F, T>(
         &mut self,
         complete: &mut F,
         events: &mut Vec<AgentEvent>,
-    ) -> Result<AssistantMessage, String>
+    ) -> Result<(AssistantMessage, Option<Vec<pi_ai::AssistantMessageEvent>>), String>
     where
-        F: FnMut(&Agent) -> Result<AssistantMessage, String>,
+        F: FnMut(&Agent) -> Result<T, String>,
+        T: Into<crate::CompleteOutput>,
     {
         let max_retries = if self.auto_retry {
             self.retry_attempts
@@ -296,18 +302,23 @@ impl Agent {
                         final_error: Some("Retry cancelled".into()),
                     });
                 }
-                return Ok(AssistantMessage {
-                    id: crate::new_message_id(),
-                    role: "assistant".into(),
-                    content: Vec::new(),
-                    model: String::new(),
-                    usage: None,
-                    stop_reason: Some(StopReason::Aborted),
-                    error_message: Some("aborted".into()),
-                });
+                return Ok((
+                    AssistantMessage {
+                        id: crate::new_message_id(),
+                        role: "assistant".into(),
+                        content: Vec::new(),
+                        model: String::new(),
+                        usage: None,
+                        stop_reason: Some(StopReason::Aborted),
+                        error_message: Some("aborted".into()),
+                    },
+                    None,
+                ));
             }
             match complete(self) {
-                Ok(message) => {
+                Ok(output) => {
+                    let output = output.into();
+                    let message = output.message;
                     if message.stop_reason == Some(StopReason::Error)
                         && pi_ai::is_retryable_assistant_error(&message)
                         && attempt + 1 < attempts
@@ -338,7 +349,7 @@ impl Agent {
                             },
                         });
                     }
-                    return Ok(message);
+                    return Ok((message, output.stream_events));
                 }
                 Err(err) => {
                     last_error = Some(err.clone());

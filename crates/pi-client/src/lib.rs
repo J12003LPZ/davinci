@@ -1,8 +1,13 @@
 //! Protocol client matching `@earendil-works/pi-client`.
 
+mod connection;
 mod session;
 mod state;
 
+pub use connection::{
+    loopback_factory, ByteTransport, ByteTransportHandlers, Connection, ConnectionState,
+    ConnectionStateChange, LoopbackTransport, TransportFactory, MAX_UINT32,
+};
 pub use session::{SessionClient, SessionHandle, SessionLeaseMode};
 pub use state::{ClientState, Unsubscribe};
 
@@ -19,7 +24,7 @@ use pi_protocol::{
 use thiserror::Error;
 use uuid::Uuid;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ClientError {
     #[error("{0}")]
     Io(String),

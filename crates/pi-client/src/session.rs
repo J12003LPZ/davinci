@@ -5,12 +5,16 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use pi_protocol::{
-    ClientMessage, Command, CommandResult, ModelRef, ProtocolError, ServerEvent, ServerMessage,
-    ServerSnapshot, SessionSnapshot, ThinkingLevel, PROTOCOL_VERSION,
+    encode_client_message, ClientMessage, Command, CommandResult, FrameDecoderOptions, ModelRef,
+    ProtocolError, ServerEvent, ServerMessage, ServerSnapshot, SessionSnapshot, ThinkingLevel,
+    PROTOCOL_VERSION,
 };
 
+use crate::connection::{loopback_factory, Connection, ConnectionState, TransportFactory};
 use crate::state::{ClientState, Unsubscribe};
 use crate::ClientError;
+
+type DispatchFn = Box<dyn FnMut(ClientMessage) -> (ServerMessage, Vec<ServerEvent>)>;
 
 const DISCONNECTED: &str = "Pi client is disconnected";
 const DISPOSED: &str = "Pi client is disposed";
@@ -23,7 +27,10 @@ pub struct SessionClient {
 }
 
 struct SessionClientInner {
-    dispatch: Box<dyn FnMut(ClientMessage) -> (ServerMessage, Vec<ServerEvent>)>,
+    dispatch: DispatchFn,
+    factory: Option<TransportFactory>,
+    connection: Option<Connection>,
+    last_response: Option<ServerMessage>,
     state: ClientState,
     connected: bool,
     disposed: bool,
@@ -40,6 +47,9 @@ impl SessionClient {
         Self {
             inner: Rc::new(RefCell::new(SessionClientInner {
                 dispatch: Box::new(dispatch),
+                factory: None,
+                connection: None,
+                last_response: None,
                 state: ClientState::new(),
                 connected: false,
                 disposed: false,
@@ -51,9 +61,66 @@ impl SessionClient {
         }
     }
 
+    /// TS `new PiClient({ transportFactory })` — framed hello/handshake over `ByteTransport`.
+    pub fn with_factory(factory: TransportFactory) -> Result<Self, ClientError> {
+        Ok(Self {
+            inner: Rc::new(RefCell::new(SessionClientInner {
+                dispatch: Box::new(|_| {
+                    (
+                        ServerMessage::HelloError {
+                            error: ProtocolError {
+                                code: pi_protocol::ProtocolErrorCode::InternalError,
+                                message:
+                                    "SessionClient dispatch is unused with a transport factory"
+                                        .into(),
+                                details: None,
+                            },
+                        },
+                        Vec::new(),
+                    )
+                }),
+                factory: Some(factory),
+                connection: Some(Connection::new(None)?),
+                last_response: None,
+                state: ClientState::new(),
+                connected: false,
+                disposed: false,
+                request_seq: 0,
+                lease_counts: HashMap::new(),
+                exclusive: HashSet::new(),
+                generations: HashMap::new(),
+            })),
+        })
+    }
+
+    /// Convenience: wrap in-process dispatch in a framed loopback `ByteTransport`.
+    pub fn with_loopback(
+        dispatch: impl FnMut(ClientMessage) -> (ServerMessage, Vec<ServerEvent>) + 'static,
+    ) -> Result<Self, ClientError> {
+        Self::with_factory(loopback_factory(dispatch))
+    }
+
+    pub fn connection_state(&self) -> ConnectionState {
+        let inner = self.inner.borrow();
+        if let Some(connection) = &inner.connection {
+            return connection.state();
+        }
+        if inner.connected && !inner.disposed {
+            ConnectionState::Connected
+        } else {
+            ConnectionState::Disconnected
+        }
+    }
+
     pub fn connected(&self) -> bool {
         let inner = self.inner.borrow();
-        inner.connected && !inner.disposed
+        if inner.disposed {
+            return false;
+        }
+        if let Some(connection) = &inner.connection {
+            return connection.state() == ConnectionState::Connected;
+        }
+        inner.connected
     }
 
     pub fn disposed(&self) -> bool {
@@ -65,10 +132,13 @@ impl SessionClient {
     }
 
     pub fn connect(&self) -> Result<ServerSnapshot, ClientError> {
-        let mut inner = self.inner.borrow_mut();
-        if inner.disposed {
+        if self.inner.borrow().disposed {
             return Err(ClientError::Protocol(DISPOSED.into()));
         }
+        if self.inner.borrow().factory.is_some() {
+            return self.connect_framed();
+        }
+        let mut inner = self.inner.borrow_mut();
         if !inner.connected {
             inner.state.reset();
         }
@@ -91,30 +161,103 @@ impl SessionClient {
         }
     }
 
+    fn connect_framed(&self) -> Result<ServerSnapshot, ClientError> {
+        let (connection, mut factory) = {
+            let mut inner = self.inner.borrow_mut();
+            if inner
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.state() == ConnectionState::Disconnected)
+            {
+                inner.state.reset();
+            }
+            let connection = inner
+                .connection
+                .clone()
+                .ok_or_else(|| ClientError::Protocol("Pi client is disconnected".into()))?;
+            let factory = inner
+                .factory
+                .take()
+                .ok_or_else(|| ClientError::Protocol("Pi client is disconnected".into()))?;
+            (connection, factory)
+        };
+        let client = self.clone();
+        connection.on_handshake(move |snapshot| {
+            client
+                .inner
+                .borrow_mut()
+                .state
+                .apply_server_snapshot(snapshot.clone());
+            Ok(())
+        });
+        let client = self.clone();
+        connection.on_message(move |message| match message {
+            ServerMessage::Event { event } => {
+                let mut inner = client.inner.borrow_mut();
+                if let ServerEvent::SessionRemoved { session_id } = event {
+                    invalidate_one(&mut inner, session_id);
+                }
+                inner.state.apply_event(event);
+            }
+            ServerMessage::Response { .. } => {
+                client.inner.borrow_mut().last_response = Some(message.clone());
+            }
+            _ => {}
+        });
+        let result = connection.connect(&mut factory);
+        self.inner.borrow_mut().factory = Some(factory);
+        match result {
+            Ok(snapshot) => {
+                self.inner.borrow_mut().connected = true;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                self.inner.borrow_mut().connected = false;
+                Err(error)
+            }
+        }
+    }
+
     pub fn reconnect(&self) -> Result<ServerSnapshot, ClientError> {
-        {
+        let connection = {
             let mut inner = self.inner.borrow_mut();
             inner.connected = false;
             inner.state.reset();
             inner.state.clear_attachments();
             invalidate_all(&mut inner);
+            inner.connection.clone()
+        };
+        if let Some(connection) = connection {
+            connection.disconnect("Client disconnected");
         }
         self.connect()
     }
 
     pub fn disconnect(&self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.connected = false;
-        inner.state.clear_attachments();
-        invalidate_all(&mut inner);
+        let connection = {
+            let mut inner = self.inner.borrow_mut();
+            inner.connected = false;
+            inner.state.clear_attachments();
+            invalidate_all(&mut inner);
+            inner.connection.clone()
+        };
+        if let Some(connection) = connection {
+            connection.disconnect("Client disconnected");
+        }
     }
 
     pub fn dispose(&self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.disposed = true;
-        inner.connected = false;
-        inner.state.dispose();
-        invalidate_all(&mut inner);
+        let connection = {
+            let mut inner = self.inner.borrow_mut();
+            inner.disposed = true;
+            inner.connected = false;
+            inner.state.dispose();
+            invalidate_all(&mut inner);
+            inner.connection.clone()
+        };
+        if let Some(connection) = connection {
+            connection.disconnect("Pi client is disposed");
+        }
     }
 
     pub fn subscribe(&self, listener: impl Fn(&ServerSnapshot) + 'static) -> Unsubscribe {
@@ -174,13 +317,16 @@ impl SessionClient {
     }
 
     fn request(&self, command: Command) -> Result<CommandResult, ClientError> {
-        let mut inner = self.inner.borrow_mut();
-        if inner.disposed {
+        if self.inner.borrow().disposed {
             return Err(ClientError::Protocol(DISPOSED.into()));
         }
-        if !inner.connected {
+        if !self.connected() {
             return Err(ClientError::Protocol(DISCONNECTED.into()));
         }
+        if self.inner.borrow().factory.is_some() {
+            return self.request_framed(command);
+        }
+        let mut inner = self.inner.borrow_mut();
         inner.request_seq += 1;
         let id = format!("request-{}", inner.request_seq);
         let expected = command.name().to_string();
@@ -194,28 +340,46 @@ impl SessionClient {
             }
             inner.state.apply_event(&event);
         }
-        match message {
-            ServerMessage::Response {
-                ok: true,
-                result: Some(result),
-                ..
-            } => {
-                if result.command_name() != expected {
-                    return Err(ClientError::Protocol(format!(
-                        "Response command {} does not match {expected}",
-                        result.command_name()
-                    )));
-                }
-                inner.state.apply_result(&result);
-                Ok(result)
-            }
-            ServerMessage::Response {
-                error: Some(error), ..
-            } => Err(protocol_error(&error)),
-            other => Err(ClientError::Protocol(format!(
-                "Unexpected response: {other:?}"
-            ))),
-        }
+        apply_response(&mut inner, expected, message)
+    }
+
+    fn request_framed(&self, command: Command) -> Result<CommandResult, ClientError> {
+        let (expected, frame, connection) = {
+            let mut inner = self.inner.borrow_mut();
+            inner.request_seq += 1;
+            let id = format!("request-{}", inner.request_seq);
+            let expected = command.name().to_string();
+            let max_frame_length = inner
+                .connection
+                .as_ref()
+                .map(Connection::max_frame_length)
+                .unwrap_or(pi_protocol::DEFAULT_MAX_FRAME_LENGTH);
+            let frame = encode_client_message(
+                &ClientMessage::Request {
+                    id,
+                    request: command,
+                },
+                Some(FrameDecoderOptions {
+                    max_frame_length: Some(max_frame_length),
+                }),
+            )
+            .map_err(|err| ClientError::Protocol(err.to_string()))?;
+            inner.last_response = None;
+            let connection = inner
+                .connection
+                .clone()
+                .ok_or_else(|| ClientError::Protocol(DISCONNECTED.into()))?;
+            (expected, frame, connection)
+        };
+        connection.send(&frame)?;
+        let message = self
+            .inner
+            .borrow_mut()
+            .last_response
+            .take()
+            .ok_or_else(|| ClientError::Protocol("Unexpected response: missing".into()))?;
+        let mut inner = self.inner.borrow_mut();
+        apply_response(&mut inner, expected, message)
     }
 
     fn reserve_lease(&self, session_id: &str, mode: SessionLeaseMode) -> Result<(), ClientError> {
@@ -454,6 +618,35 @@ fn protocol_error(error: &ProtocolError) -> ClientError {
     ClientError::Protocol(error.message.clone())
 }
 
+fn apply_response(
+    inner: &mut SessionClientInner,
+    expected: String,
+    message: ServerMessage,
+) -> Result<CommandResult, ClientError> {
+    match message {
+        ServerMessage::Response {
+            ok: true,
+            result: Some(result),
+            ..
+        } => {
+            if result.command_name() != expected {
+                return Err(ClientError::Protocol(format!(
+                    "Response command {} does not match {expected}",
+                    result.command_name()
+                )));
+            }
+            inner.state.apply_result(&result);
+            Ok(result)
+        }
+        ServerMessage::Response {
+            error: Some(error), ..
+        } => Err(protocol_error(&error)),
+        other => Err(ClientError::Protocol(format!(
+            "Unexpected response: {other:?}"
+        ))),
+    }
+}
+
 trait CommandName {
     fn command_name(&self) -> &'static str;
 }
@@ -640,6 +833,56 @@ mod tests {
             Ok(_) => panic!("expected disposed"),
         };
         assert!(disposed.contains(DISPOSED));
+    }
+
+    #[test]
+    fn framed_loopback_connects_and_lists() {
+        let server = Rc::new(RefCell::new(FakeServer::default()));
+        let client = SessionClient::with_loopback({
+            let server = server.clone();
+            move |message| match message {
+                ClientMessage::Hello { version } => (
+                    ServerMessage::Hello {
+                        version,
+                        connection_id: "c1".into(),
+                        snapshot: ServerSnapshot {
+                            server_id: "s".into(),
+                            protocol_version: PROTOCOL_VERSION,
+                            revision: server.borrow().revision,
+                            sessions: Vec::new(),
+                            models: Vec::new(),
+                        },
+                    },
+                    Vec::new(),
+                ),
+                ClientMessage::Request { id, request } => {
+                    let result = match request {
+                        Command::List => CommandResult::List {
+                            sessions: Vec::new(),
+                        },
+                        _ => CommandResult::List {
+                            sessions: Vec::new(),
+                        },
+                    };
+                    (
+                        ServerMessage::Response {
+                            id,
+                            ok: true,
+                            result: Some(result),
+                            error: None,
+                        },
+                        Vec::new(),
+                    )
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!(client.connection_state(), ConnectionState::Disconnected);
+        client.connect().unwrap();
+        assert_eq!(client.connection_state(), ConnectionState::Connected);
+        assert!(client.list_sessions().unwrap().is_empty());
+        client.reconnect().unwrap();
+        assert_eq!(client.connection_state(), ConnectionState::Connected);
     }
 
     #[test]

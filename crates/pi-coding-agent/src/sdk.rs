@@ -6,7 +6,10 @@ use pi_agent::{
     default_system_prompt, discover_prompt_templates, discover_skills, expand_user_text,
     load_context_files, Agent, CompactionResult, BUILTIN_TOOLS,
 };
-use pi_ai::{find_model, load_builtin_models};
+use pi_ai::{
+    find_model, load_builtin_models, snapshot_availability, AuthStorage, ModelConfig,
+    ModelRuntimeSnapshot,
+};
 use pi_session::{default_agent_dir, latest_session, JsonlSession};
 
 use crate::settings::load_merged_settings;
@@ -36,12 +39,32 @@ pub struct CreateAgentSessionOptions {
     pub custom_tools: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExtensionLoadError {
+    pub path: String,
+    pub error: String,
+}
+
+/// TS `LoadExtensionsResult` (runtime is owned by the JS host; embed exposes loaded manifests).
+#[derive(Debug, Clone, Default)]
+pub struct LoadExtensionsResult {
+    pub extensions: Vec<ExtensionManifest>,
+    pub errors: Vec<ExtensionLoadError>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExtensionManifest {
+    pub name: String,
+    pub path: Option<String>,
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub cwd: PathBuf,
     pub agent_dir: PathBuf,
     pub scoped_models: Vec<String>,
     pub custom_tools: Vec<String>,
+    pub model_runtime: ModelRuntimeSnapshot,
     listeners: Vec<AgentEventListener>,
 }
 
@@ -111,6 +134,7 @@ impl AgentSession {
 
 pub struct CreateAgentSessionResult {
     pub session: AgentSession,
+    pub extensions_result: LoadExtensionsResult,
     pub model_fallback_message: Option<String>,
 }
 
@@ -206,6 +230,9 @@ pub fn create_agent_session(
         agent.apply_extension_tools(&custom_tools);
     }
 
+    let model_runtime = embed_model_runtime(&agent_dir);
+    let extensions_result = load_extensions_result(&agent_dir, &cwd, &settings.extensions);
+
     Ok(CreateAgentSessionResult {
         session: AgentSession {
             agent,
@@ -213,10 +240,95 @@ pub fn create_agent_session(
             agent_dir,
             scoped_models,
             custom_tools,
+            model_runtime,
             listeners: Vec::new(),
         },
+        extensions_result,
         model_fallback_message,
     })
+}
+
+fn embed_model_runtime(agent_dir: &std::path::Path) -> ModelRuntimeSnapshot {
+    let models = load_builtin_models();
+    let config = ModelConfig::load(&agent_dir.join("models.json"));
+    let storage = AuthStorage::open(&agent_dir.join("auth.json"))
+        .unwrap_or_else(|_| AuthStorage::in_memory());
+    let env = std::env::vars().collect();
+    snapshot_availability(models, &config, &storage, &env, Default::default(), None)
+}
+
+fn load_extensions_result(
+    agent_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    configured: &[String],
+) -> LoadExtensionsResult {
+    let mut names = configured.to_vec();
+    for root in [
+        agent_dir.join("extensions"),
+        cwd.join(".pi").join("extensions"),
+    ] {
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    if !names.iter().any(|existing| existing == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut extensions = Vec::new();
+    let mut errors = Vec::new();
+    for name in names {
+        let candidates = [
+            agent_dir.join("extensions").join(&name),
+            cwd.join(".pi").join("extensions").join(&name),
+        ];
+        let dir = candidates.iter().find(|path| path.is_dir());
+        let Some(dir) = dir else {
+            errors.push(ExtensionLoadError {
+                path: name.clone(),
+                error: format!("Extension not found: {name}"),
+            });
+            continue;
+        };
+        let manifest_path = if dir.join("pi.extension.json").exists() {
+            dir.join("pi.extension.json")
+        } else {
+            dir.join("package.json")
+        };
+        if manifest_path.exists() {
+            match std::fs::read_to_string(&manifest_path) {
+                Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(value) => extensions.push(ExtensionManifest {
+                        name: value
+                            .get("name")
+                            .and_then(|item| item.as_str())
+                            .unwrap_or(&name)
+                            .to_string(),
+                        path: Some(dir.display().to_string()),
+                    }),
+                    Err(error) => errors.push(ExtensionLoadError {
+                        path: manifest_path.display().to_string(),
+                        error: error.to_string(),
+                    }),
+                },
+                Err(error) => errors.push(ExtensionLoadError {
+                    path: manifest_path.display().to_string(),
+                    error: error.to_string(),
+                }),
+            }
+        } else {
+            extensions.push(ExtensionManifest {
+                name: name.clone(),
+                path: Some(dir.display().to_string()),
+            });
+        }
+    }
+    LoadExtensionsResult { extensions, errors }
 }
 
 fn initial_tools(
@@ -271,6 +383,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result.session.agent.tools, vec!["read".to_string()]);
+        assert!(!result.session.model_runtime.all.is_empty());
+        assert!(result.extensions_result.errors.is_empty());
         assert_eq!(
             result.session.agent.thinking_level,
             pi_protocol::ThinkingLevel::High
@@ -402,5 +516,29 @@ mod tests {
         assert!(kinds.contains(&"agent_start".to_string()));
         assert!(kinds.contains(&"message_update".to_string()));
         assert!(kinds.contains(&"agent_end".to_string()));
+    }
+
+    #[test]
+    fn extensions_result_loads_project_manifest() {
+        let dir = tempdir().unwrap();
+        let ext = dir.path().join(".pi").join("extensions").join("demo");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(
+            ext.join("pi.extension.json"),
+            r#"{"name":"demo","tools":[{"name":"ticket"}]}"#,
+        )
+        .unwrap();
+        let result = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap();
+        assert_eq!(result.extensions_result.extensions[0].name, "demo");
+        assert!(
+            result.session.model_runtime.get_error().is_none()
+                || result.session.model_runtime.availability_error.is_none()
+        );
     }
 }

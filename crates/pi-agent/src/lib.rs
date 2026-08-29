@@ -45,7 +45,7 @@ pub use templates::{
 pub use tools::{execute_tool, tool_specs, AgentTool, ToolError, ToolResult, BUILTIN_TOOLS};
 pub use turn::retry_delay_ms;
 
-use pi_ai::{content_text, ChatMessage, ThinkingBudgets};
+use pi_ai::{content_text, AssistantMessage, AssistantMessageEvent, ChatMessage, ThinkingBudgets};
 use pi_protocol::ThinkingLevel;
 use pi_session::{JsonlSession, SessionEntry};
 use serde::{Deserialize, Serialize};
@@ -542,6 +542,22 @@ fn first_kept_entry_id(
         .unwrap_or_default()
 }
 
+/// Provider complete callback output. `From<AssistantMessage>` keeps existing closures working.
+#[derive(Debug, Clone)]
+pub struct CompleteOutput {
+    pub message: AssistantMessage,
+    pub stream_events: Option<Vec<AssistantMessageEvent>>,
+}
+
+impl From<AssistantMessage> for CompleteOutput {
+    fn from(message: AssistantMessage) -> Self {
+        Self {
+            message,
+            stream_events: None,
+        }
+    }
+}
+
 pub fn default_system_prompt() -> String {
     "You are pi, a coding assistant with read, bash, edit, and write tools. Be concise and make precise edits.".into()
 }
@@ -682,12 +698,16 @@ mod tests {
     fn continue_loop_matches_ts_errors() {
         let mut agent = Agent::new("x");
         assert_eq!(
-            agent.continue_loop(|_| unreachable!()).unwrap_err(),
+            agent
+                .continue_loop::<_, AssistantMessage>(|_| unreachable!())
+                .unwrap_err(),
             "Cannot continue: no messages in context"
         );
         agent.record_assistant("hi");
         assert_eq!(
-            agent.continue_loop(|_| unreachable!()).unwrap_err(),
+            agent
+                .continue_loop::<_, AssistantMessage>(|_| unreachable!())
+                .unwrap_err(),
             "Cannot continue from message role: assistant"
         );
     }

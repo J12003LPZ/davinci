@@ -147,6 +147,25 @@ pub enum AssistantMessageEvent {
     },
 }
 
+impl AssistantMessageEvent {
+    pub fn message(&self) -> &AssistantMessage {
+        match self {
+            Self::Start { partial }
+            | Self::TextStart { partial, .. }
+            | Self::TextDelta { partial, .. }
+            | Self::TextEnd { partial, .. }
+            | Self::ThinkingStart { partial, .. }
+            | Self::ThinkingDelta { partial, .. }
+            | Self::ThinkingEnd { partial, .. }
+            | Self::ToolcallStart { partial, .. }
+            | Self::ToolcallDelta { partial, .. }
+            | Self::ToolcallEnd { partial, .. } => partial,
+            Self::Done { message, .. } => message,
+            Self::Error { error, .. } => error,
+        }
+    }
+}
+
 pub type StreamEvent = AssistantMessageEvent;
 
 pub fn parse_sse_block(block: &str) -> Option<Value> {
@@ -357,6 +376,70 @@ pub fn live_complete_with(
     )
     .map_err(|err| err.message)?;
     Ok(parse_provider_response(model, &text))
+}
+
+/// Streaming complete: prefer live SSE events over synthesizing `events_from_complete`.
+pub fn live_complete_streaming_with(
+    model: &Model,
+    messages: &[ChatMessage],
+    auth: &ResolvedAuth,
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+) -> Result<(AssistantMessage, Vec<AssistantMessageEvent>), String> {
+    let mut body = request_body_with(model, messages, system, tools, options);
+    if let Value::Object(map) = &mut body {
+        map.insert("stream".into(), Value::Bool(true));
+    }
+    if model.api == "openai-codex-responses" {
+        if let Some(token) = auth.api_key.as_deref() {
+            match crate::codex::try_codex_websocket_transport(
+                model,
+                &body,
+                token,
+                options.transport.as_deref(),
+                options.session_id.as_deref(),
+                options.cache_retention.as_deref(),
+                options.websocket_connect_timeout_ms,
+                options.timeout_ms,
+            ) {
+                Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => {
+                    let events = events_from_complete(&message);
+                    return Ok((*message, events));
+                }
+                Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let url = request_url(model, auth);
+    let headers = crate::merge_provider_attribution_headers(
+        model,
+        options.session_id.as_deref(),
+        options.install_telemetry,
+        &collect_request_headers(model, auth, options.session_id.as_deref()),
+    );
+    let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
+    let compress_zstd = model.api == "openai-codex-responses";
+    let text = crate::provider_retry::retry_provider_request(
+        || send_provider_body(&url, &headers, &body, timeout_ms, compress_zstd),
+        crate::provider_retry::ProviderRetryOptions {
+            max_retries: options.max_retries.unwrap_or(0),
+            max_retry_delay_ms: options.max_retry_delay_ms,
+        },
+    )
+    .map_err(|err| err.message)?;
+    if text.contains("data:") {
+        let events = replay_sse_events(model, &text);
+        let message = complete_from_events(&events)
+            .or_else(|| events.last().map(|event| event.message().clone()))
+            .ok_or_else(|| "Empty provider stream".to_string())?;
+        Ok((message, events))
+    } else {
+        let message = parse_provider_response(model, &text);
+        let events = events_from_complete(&message);
+        Ok((message, events))
+    }
 }
 
 fn collect_request_headers(

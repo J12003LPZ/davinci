@@ -6,4 +6,5 @@ pub mod trust;
 
 pub use sdk::{
     create_agent_session, AgentSession, CreateAgentSessionOptions, CreateAgentSessionResult,
+    ExtensionLoadError, ExtensionManifest, LoadExtensionsResult,
 };

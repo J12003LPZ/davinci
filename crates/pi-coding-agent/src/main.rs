@@ -27,15 +27,15 @@ use std::sync::{Arc, Mutex};
 
 use pi_agent::{
     default_system_prompt, discover_prompt_templates, discover_skills, env_summarizer,
-    load_context_files, Agent, AgentEvent, CustomToolExecutor, SummarizeRequest, SummarizeResponse,
-    Summarizer,
+    load_context_files, Agent, AgentEvent, CompleteOutput, CustomToolExecutor, SummarizeRequest,
+    SummarizeResponse, Summarizer,
 };
 use pi_ai::{
     apply_config_auth_with_shell, apply_models_config, complete_simple, content_text, find_model,
-    format_no_models_available_message, fuzzy_models, live_complete_with, load_builtin_models,
-    models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
-    ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
-    StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE,
+    format_no_models_available_message, fuzzy_models, live_complete_streaming_with,
+    load_builtin_models, models_json_path, resolve_provider_auth, snapshot_availability,
+    AssistantMessage, AuthStorage, ContentBlock, Credential, CredentialKind, ModelConfig,
+    ModelRuntimeSnapshot, ResolvedAuth, StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE,
 };
 use pi_session::{
     default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir_from,
@@ -1001,8 +1001,9 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                         &current.messages_for_provider(),
                         &current.system_prompt,
                     )
+                    .map(CompleteOutput::from)
                 }
-                (false, Some(model), Some(auth), None) => live_complete_with(
+                (false, Some(model), Some(auth), None) => live_complete_streaming_with(
                     model,
                     &current.messages_for_provider(),
                     auth,
@@ -1025,8 +1026,12 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                         cache_retention: None,
                         install_telemetry: Some(current.install_telemetry),
                     },
-                ),
-                _ => Ok(AssistantMessage {
+                )
+                .map(|(message, stream_events)| CompleteOutput {
+                    message,
+                    stream_events: Some(stream_events),
+                }),
+                _ => Ok(CompleteOutput::from(AssistantMessage {
                     id: pi_agent::new_message_id(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -1036,7 +1041,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                     usage: None,
                     stop_reason: Some(StopReason::Stop),
                     error_message: None,
-                }),
+                })),
             }
         })
         .unwrap_or_else(|err| {
