@@ -4,7 +4,9 @@ use crate::first_time::FirstTimeSetup;
 use crate::login_dialog::LoginDialog;
 use crate::render::Component;
 use crate::scoped_models::ScopedModelsSelector;
+use crate::session_selector::SessionSelector;
 use crate::settings::SettingsList;
+use crate::settings_submenu::SettingsSubmenu;
 use crate::themes::Theme;
 use crate::tool_card::ToolCard;
 use crate::transcript::Transcript;
@@ -18,6 +20,8 @@ pub struct ChatChrome {
     pub editor: Editor,
     pub selector: Option<SelectList>,
     pub settings_list: Option<SettingsList>,
+    pub settings_submenu: Option<SettingsSubmenu>,
+    pub session_selector: Option<SessionSelector>,
     pub first_time: Option<FirstTimeSetup>,
     pub login_dialog: Option<LoginDialog>,
     pub tree: Option<TreeSelector>,
@@ -37,6 +41,8 @@ impl ChatChrome {
             editor: Editor::new(),
             selector: None,
             settings_list: None,
+            settings_submenu: None,
+            session_selector: None,
             first_time: None,
             login_dialog: None,
             tree: None,
@@ -83,6 +89,12 @@ impl Component for ChatChrome {
         } else if let Some(scoped) = &self.scoped_models {
             lines.push(String::new());
             lines.extend(scoped.render(width));
+        } else if let Some(submenu) = &self.settings_submenu {
+            lines.push(String::new());
+            lines.extend(submenu.render(width));
+        } else if let Some(sessions) = &self.session_selector {
+            lines.push(String::new());
+            lines.extend(sessions.render(width));
         } else if let Some(settings) = &self.settings_list {
             lines.push(String::new());
             lines.extend(settings.render(width));
@@ -119,6 +131,10 @@ impl Component for ChatChrome {
             tree.handle_input(data);
         } else if let Some(scoped) = &mut self.scoped_models {
             scoped.handle_input(data);
+        } else if let Some(submenu) = &mut self.settings_submenu {
+            submenu.handle_input(data);
+        } else if let Some(sessions) = &mut self.session_selector {
+            sessions.handle_input(data);
         } else if let Some(settings) = &mut self.settings_list {
             settings.handle_input(data);
         } else if let Some(selector) = &mut self.selector {

@@ -78,6 +78,10 @@ pub struct Settings {
     pub show_terminal_progress: Option<bool>,
     #[serde(default)]
     pub warnings: WarningSettings,
+    #[serde(default, rename = "externalEditor")]
+    pub external_editor: Option<String>,
+    #[serde(default, rename = "modelThinkingLevels")]
+    pub model_thinking_levels: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -210,6 +214,11 @@ pub fn to_interactive_config(
         output_padding: settings.output_pad.unwrap_or(1),
         clear_on_shrink: settings.clear_on_shrink.unwrap_or(false),
         terminal_progress: settings.show_terminal_progress.unwrap_or(true),
+        warnings_anthropic_extra_usage: settings.warnings.anthropic_extra_usage.unwrap_or(true),
+        model_thinking_summary: match &settings.model_thinking_levels {
+            Some(levels) if !levels.is_empty() => format!("{} overrides", levels.len()),
+            _ => "none".into(),
+        },
     }
 }
 
@@ -280,5 +289,8 @@ mod tests {
         assert!(ids.contains(&"hide-thinking"));
         assert!(ids.contains(&"cache-miss-notices"));
         assert!(ids.contains(&"steering-mode"));
+        assert!(ids.contains(&"warnings"));
+        assert!(ids.contains(&"model-thinking"));
+        assert!(ids.contains(&"theme"));
     }
 }

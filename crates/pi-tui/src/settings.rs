@@ -134,6 +134,8 @@ pub struct InteractiveSettingsConfig {
     pub output_padding: u32,
     pub clear_on_shrink: bool,
     pub terminal_progress: bool,
+    pub warnings_anthropic_extra_usage: bool,
+    pub model_thinking_summary: String,
 }
 
 impl Default for InteractiveSettingsConfig {
@@ -170,6 +172,8 @@ impl Default for InteractiveSettingsConfig {
             output_padding: 1,
             clear_on_shrink: false,
             terminal_progress: true,
+            warnings_anthropic_extra_usage: true,
+            model_thinking_summary: "none".into(),
         }
     }
 }
@@ -449,6 +453,24 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 description: Some("Color theme for the interface".into()),
                 current_value: config.theme.clone(),
                 values: vec!["dark".into(), "light".into(), "pi".into()],
+            },
+            SettingItem {
+                id: "warnings".into(),
+                label: "Warnings".into(),
+                description: Some("Configure warning prompts".into()),
+                current_value: if config.warnings_anthropic_extra_usage {
+                    "configure".into()
+                } else {
+                    "off".into()
+                },
+                values: Vec::new(),
+            },
+            SettingItem {
+                id: "model-thinking".into(),
+                label: "Per-model thinking".into(),
+                description: Some("Override thinking level per model".into()),
+                current_value: config.model_thinking_summary.clone(),
+                values: Vec::new(),
             },
             bool_item(
                 "enable-analytics",

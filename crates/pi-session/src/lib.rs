@@ -204,8 +204,16 @@ impl JsonlSession {
             Some(serde_json::Value::Object(map)) => map.clone(),
             _ => serde_json::Map::new(),
         };
-        map.insert("name".into(), serde_json::Value::String(name.to_string()));
-        self.header.metadata = Some(serde_json::Value::Object(map));
+        if name.is_empty() {
+            map.remove("name");
+        } else {
+            map.insert("name".into(), serde_json::Value::String(name.to_string()));
+        }
+        self.header.metadata = if map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(map))
+        };
         self.rewrite_header()
     }
 

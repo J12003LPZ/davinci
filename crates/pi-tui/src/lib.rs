@@ -8,6 +8,7 @@ mod editor;
 mod first_time;
 mod fuzzy;
 mod image;
+mod keybindings;
 mod keys;
 mod latex;
 mod login_dialog;
@@ -21,7 +22,9 @@ mod render;
 mod scoped_models;
 mod scroll;
 mod session;
+mod session_selector;
 mod settings;
+mod settings_submenu;
 mod themes;
 mod tool_card;
 mod transcript;
@@ -44,6 +47,7 @@ pub use image::{
     delete_all_kitty_images, delete_kitty_image, encode_kitty, iterm_image, kitty_image_chunk,
     kitty_image_ids, parse_kitty_image_header, KittyImageHeader, KITTY_IMAGE_PREFIX,
 };
+pub use keybindings::{key_to_bytes, Keybindings};
 pub use keys::{decode_kitty_printable, parse_key, Key};
 pub use latex::render_latex;
 pub use login_dialog::{AuthInfoLink, DeviceCodeInfo, LoginDialog, LoginDialogAction};
@@ -66,11 +70,16 @@ pub use scroll::ScrollView;
 pub use session::{
     DoubleEscapeAction, InteractiveSession, OverlayKind, SessionAction, BRACKETED_PASTE_DISABLE,
     BRACKETED_PASTE_ENABLE, DISABLE_AUTOWRAP, DOUBLE_ESCAPE_MS, ENABLE_AUTOWRAP,
-    KITTY_KEYBOARD_DISABLE, KITTY_KEYBOARD_QUERY,
+    KITTY_KEYBOARD_DISABLE, KITTY_KEYBOARD_QUERY, OSC_QUERY_TIMEOUT_MS,
 };
+pub use session_selector::{SessionItem, SessionSelector, SessionSelectorAction, SortMode};
 pub use settings::{
     default_interactive_settings, format_http_idle_timeout, interactive_settings_list,
     parse_http_idle_timeout, InteractiveSettingsConfig, SettingItem, SettingsList,
+};
+pub use settings_submenu::{
+    parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
+    SettingsSubmenuKind, AUTOMATIC_THEME_VALUE,
 };
 pub use themes::{builtin_themes, Theme};
 pub use tool_card::{ToolCard, ToolCardState, FALLBACK_PREVIEW_LINES};

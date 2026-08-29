@@ -3,24 +3,33 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeMap;
+
 use crate::autocomplete::{apply_completion, suggestions, SlashCommandSpec};
 use crate::chrome::ChatChrome;
 use crate::first_time::{FirstTimeAction, FirstTimeSetup};
 use crate::image::{delete_all_kitty_images, delete_kitty_image, encode_kitty};
+use crate::keybindings::Keybindings;
 use crate::keys::decode_kitty_printable;
 use crate::login_dialog::{LoginDialog, LoginDialogAction};
 use crate::mermaid::MermaidMode;
 use crate::mouse::{parse_mouse_sgr, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
+use crate::osc::ThemeDetection;
 use crate::overlay::Overlay;
 use crate::render::Component;
 use crate::scoped_models::{EnabledIds, ScopedModel, ScopedModelsAction, ScopedModelsSelector};
+use crate::session_selector::{SessionItem, SessionSelector, SessionSelectorAction};
 use crate::settings::{SettingItem, SettingsList};
+use crate::settings_submenu::{
+    parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
+};
 use crate::themes::Theme;
 use crate::tool_card::ToolCard;
 use crate::tree::{FilterMode, SessionTreeNode, TreeAction, TreeSelector};
 use crate::{SelectList, ALT_BUFFER_ENTER, ALT_BUFFER_LEAVE};
 
 pub const DOUBLE_ESCAPE_MS: u64 = 500;
+pub const OSC_QUERY_TIMEOUT_MS: u64 = 100;
 
 pub const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
 pub const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
@@ -67,6 +76,19 @@ pub enum SessionAction {
         id: String,
         label: Option<String>,
     },
+    OpenSettingsSubmenu,
+    ApplySetting {
+        id: String,
+        value: String,
+    },
+    FollowUp(String),
+    Dequeue,
+    ExternalEditor,
+    PasteClipboard,
+    RenameSession {
+        id: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -87,9 +109,23 @@ pub struct InteractiveSession {
     pub tree_filter_mode: FilterMode,
     pub mermaid_mode: MermaidMode,
     pub enabled_model_ids: EnabledIds,
+    pub keybindings: Keybindings,
+    pub follow_up_queue: Vec<String>,
+    pub model_thinking_levels: BTreeMap<String, String>,
+    pub warnings_anthropic_extra_usage: bool,
+    osc_query: Option<OscQuery>,
     last_escape: Option<Instant>,
     next_image_id: u32,
     paste_buf: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OscQuery {
+    started: Instant,
+    timeout: Duration,
+    osc11: Option<String>,
+    scheme: Option<String>,
+    finished: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +159,7 @@ pub enum OverlayKind {
     Model,
     Session,
     Settings,
+    SettingsSubmenu,
     Tree,
     ScopedModels,
     Login,
@@ -154,6 +191,11 @@ impl InteractiveSession {
             tree_filter_mode: FilterMode::Default,
             mermaid_mode: MermaidMode::Streaming,
             enabled_model_ids: None,
+            keybindings: Keybindings::defaults(),
+            follow_up_queue: Vec::new(),
+            model_thinking_levels: BTreeMap::new(),
+            warnings_anthropic_extra_usage: true,
+            osc_query: None,
             last_escape: None,
             next_image_id: 1,
             paste_buf: None,
@@ -206,6 +248,14 @@ impl InteractiveSession {
     pub fn open_session_overlay(&mut self, sessions: Vec<String>) {
         self.overlay_kind = OverlayKind::Session;
         self.chrome.selector = Some(SelectList::new(sessions));
+        self.chrome.session_selector = None;
+        self.chrome.status = "Select session".into();
+    }
+
+    pub fn open_session_selector(&mut self, items: Vec<SessionItem>) {
+        self.overlay_kind = OverlayKind::Session;
+        self.chrome.session_selector = Some(SessionSelector::new(items));
+        self.chrome.selector = None;
         self.chrome.status = "Select session".into();
     }
 
@@ -228,7 +278,14 @@ impl InteractiveSession {
     pub fn open_settings_list(&mut self, list: SettingsList) {
         self.overlay_kind = OverlayKind::Settings;
         self.chrome.settings_list = Some(list);
+        self.chrome.settings_submenu = None;
         self.chrome.selector = None;
+        self.chrome.status = "Settings".into();
+    }
+
+    pub fn open_settings_submenu(&mut self, submenu: SettingsSubmenu) {
+        self.overlay_kind = OverlayKind::SettingsSubmenu;
+        self.chrome.settings_submenu = Some(submenu);
         self.chrome.status = "Settings".into();
     }
 
@@ -272,6 +329,8 @@ impl InteractiveSession {
     pub fn close_overlays(&mut self) {
         self.chrome.selector = None;
         self.chrome.settings_list = None;
+        self.chrome.settings_submenu = None;
+        self.chrome.session_selector = None;
         self.chrome.first_time = None;
         self.chrome.login_dialog = None;
         self.chrome.tree = None;
@@ -287,6 +346,54 @@ impl InteractiveSession {
             || self.chrome.scoped_models.is_some()
             || self.chrome.selector.is_some()
             || self.chrome.settings_list.is_some()
+            || self.chrome.settings_submenu.is_some()
+            || self.chrome.session_selector.is_some()
+    }
+
+    pub fn begin_osc_query(&mut self, timeout_ms: u64) -> String {
+        self.osc_query = Some(OscQuery {
+            started: Instant::now(),
+            timeout: Duration::from_millis(timeout_ms),
+            osc11: None,
+            scheme: None,
+            finished: false,
+        });
+        format!(
+            "{}{}",
+            crate::osc::OSC_11_QUERY,
+            crate::osc::COLOR_SCHEME_QUERY
+        )
+    }
+
+    pub fn finish_osc_query(&mut self, now: Instant) -> Option<ThemeDetection> {
+        let query = self.osc_query.as_mut()?;
+        if query.finished {
+            return None;
+        }
+        let has_reply = query.scheme.is_some() || query.osc11.is_some();
+        let expired = now.saturating_duration_since(query.started) >= query.timeout;
+        if !has_reply && !expired {
+            return None;
+        }
+        query.finished = true;
+        Some(crate::osc::detect_terminal_theme_for_auto(
+            query.scheme.as_deref(),
+            query.osc11.as_deref(),
+            std::env::var("COLORFGBG").ok().as_deref(),
+        ))
+    }
+
+    fn ingest_osc_reply(&mut self, data: &str) {
+        if let Some(query) = &mut self.osc_query {
+            if crate::osc::parse_terminal_color_scheme_report(data).is_some() {
+                query.scheme = Some(data.to_string());
+            }
+            if crate::osc::parse_osc11_background_color(data).is_some()
+                || crate::osc::is_osc11_background_color_response(data)
+            {
+                query.osc11 = Some(data.to_string());
+            }
+        }
     }
 
     pub fn push_tool_card(&mut self, card: ToolCard) {
@@ -425,6 +532,7 @@ impl InteractiveSession {
         if crate::osc::is_osc11_background_color_response(data)
             || crate::osc::parse_terminal_color_scheme_report(data).is_some()
         {
+            self.ingest_osc_reply(data);
             if let Some(setup) = &mut self.chrome.first_time {
                 let scheme = crate::osc::parse_terminal_color_scheme_report(data);
                 let osc11 = crate::osc::parse_osc11_background_color(data).map(|_| data);
@@ -486,6 +594,29 @@ impl InteractiveSession {
         }
         if let Some(action) = self.handle_special_overlay(data) {
             return action;
+        }
+        if !self.overlay_open() {
+            if self.keybindings.matches(data, "app.editor.external") {
+                return SessionAction::ExternalEditor;
+            }
+            if self.keybindings.matches(data, "app.clipboard.pasteImage") {
+                return SessionAction::PasteClipboard;
+            }
+            if self.keybindings.matches(data, "app.message.followUp") {
+                let text = self.chrome.editor.submit();
+                if text.is_empty() {
+                    return SessionAction::None;
+                }
+                self.follow_up_queue.push(text.clone());
+                return SessionAction::FollowUp(text);
+            }
+            if self.keybindings.matches(data, "app.message.dequeue") {
+                if let Some(text) = self.follow_up_queue.pop() {
+                    self.chrome.editor.buffer = text;
+                    self.chrome.editor.cursor = self.chrome.editor.buffer.len();
+                }
+                return SessionAction::Dequeue;
+            }
         }
         match data {
             "\x03" => SessionAction::Quit,
@@ -622,7 +753,65 @@ impl InteractiveSession {
                 }
             });
         }
+        if let Some(menu) = &mut self.chrome.settings_submenu {
+            return Some(match menu.handle_key(data) {
+                SettingsSubmenuAction::None => SessionAction::None,
+                SettingsSubmenuAction::Cancel => {
+                    self.chrome.settings_submenu = None;
+                    self.overlay_kind = OverlayKind::Settings;
+                    SessionAction::None
+                }
+                SettingsSubmenuAction::Preview(value) => {
+                    self.preview_theme_setting(&value);
+                    SessionAction::None
+                }
+                SettingsSubmenuAction::Apply { id, value } => {
+                    self.chrome.settings_submenu = None;
+                    self.overlay_kind = OverlayKind::Settings;
+                    SessionAction::ApplySetting { id, value }
+                }
+            });
+        }
+        if let Some(selector) = &mut self.chrome.session_selector {
+            return Some(match selector.handle_key(data) {
+                SessionSelectorAction::None => SessionAction::None,
+                SessionSelectorAction::Select(id) => {
+                    self.close_overlays();
+                    SessionAction::SelectSession(id)
+                }
+                SessionSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+                SessionSelectorAction::Rename { id, name } => {
+                    SessionAction::RenameSession { id, name }
+                }
+            });
+        }
         None
+    }
+
+    fn preview_theme_setting(&mut self, value: &str) {
+        let resolved = if let Some((light, dark)) = parse_auto_theme(value) {
+            let detected = crate::osc::detect_terminal_theme_for_auto(
+                std::env::var("PI_COLOR_SCHEME_REPLY").ok().as_deref(),
+                std::env::var("PI_OSC11_REPLY").ok().as_deref(),
+                std::env::var("COLORFGBG").ok().as_deref(),
+            );
+            if detected.theme == "light" {
+                light
+            } else {
+                dark
+            }
+        } else {
+            value.to_string()
+        };
+        if let Some(found) = crate::builtin_themes()
+            .into_iter()
+            .find(|item| item.name == resolved)
+        {
+            self.chrome.theme = found;
+        }
     }
 
     fn move_overlay(&mut self, delta: isize) {
@@ -635,6 +824,12 @@ impl InteractiveSession {
         } else if let Some(scoped) = &mut self.chrome.scoped_models {
             let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
             let _ = scoped.handle_key(key);
+        } else if let Some(submenu) = &mut self.chrome.settings_submenu {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = submenu.handle_key(key);
+        } else if let Some(sessions) = &mut self.chrome.session_selector {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = sessions.handle_key(key);
         } else if let Some(settings) = &mut self.chrome.settings_list {
             settings.move_by(delta);
         } else if let Some(selector) = &mut self.chrome.selector {
@@ -682,8 +877,45 @@ impl InteractiveSession {
         if self.accept_autocomplete() {
             return SessionAction::None;
         }
+        if self.chrome.settings_submenu.is_some() {
+            return self
+                .handle_special_overlay("\r")
+                .unwrap_or(SessionAction::None);
+        }
+        if self.chrome.session_selector.is_some() {
+            return self
+                .handle_special_overlay("\r")
+                .unwrap_or(SessionAction::None);
+        }
         if let Some(settings) = &self.chrome.settings_list {
             if let Some(item) = settings.selected_item() {
+                if SettingsSubmenu::is_submenu_setting(&item.id) {
+                    let submenu = match item.id.as_str() {
+                        "theme" => SettingsSubmenu::theme(
+                            &item.current_value,
+                            crate::builtin_themes()
+                                .into_iter()
+                                .map(|theme| theme.name)
+                                .collect(),
+                        ),
+                        "warnings" => {
+                            SettingsSubmenu::warnings(self.warnings_anthropic_extra_usage)
+                        }
+                        "model-thinking" => SettingsSubmenu::model_thinking(
+                            self.models
+                                .iter()
+                                .map(|key| ModelThinkingItem {
+                                    key: key.clone(),
+                                    label: key.clone(),
+                                    level: self.model_thinking_levels.get(key).cloned(),
+                                })
+                                .collect(),
+                        ),
+                        _ => return SessionAction::None,
+                    };
+                    self.open_settings_submenu(submenu);
+                    return SessionAction::OpenSettingsSubmenu;
+                }
                 let value = format!("{}={}", item.id, item.current_value);
                 self.chrome.settings_list = None;
                 self.overlay_kind = OverlayKind::None;
@@ -711,9 +943,10 @@ impl InteractiveSession {
                         SessionAction::SelectModel(item)
                     }
                     OverlayKind::Tree => SessionAction::SelectTreeEntry(item),
-                    OverlayKind::ScopedModels | OverlayKind::Login | OverlayKind::FirstTime => {
-                        SessionAction::CloseOverlay
-                    }
+                    OverlayKind::ScopedModels
+                    | OverlayKind::Login
+                    | OverlayKind::FirstTime
+                    | OverlayKind::SettingsSubmenu => SessionAction::CloseOverlay,
                 };
             }
             self.chrome.selector = None;
@@ -958,5 +1191,100 @@ mod tests {
         }]);
         assert!(session.render_frame().contains("Model Configuration"));
         assert_eq!(session.handle_bytes("\x1b"), SessionAction::CloseOverlay);
+    }
+
+    #[test]
+    fn settings_submenus_session_selector_and_osc_query() {
+        let theme = builtin_themes().into_iter().next().expect("theme");
+        let mut session = InteractiveSession::new(theme, "pi", vec!["openai/gpt".into()]);
+        session.open_settings_list(crate::interactive_settings_list(
+            &crate::InteractiveSettingsConfig {
+                theme: "dark".into(),
+                ..crate::InteractiveSettingsConfig::default()
+            },
+        ));
+        if let Some(list) = &mut session.chrome.settings_list {
+            if let Some(index) = list.items.iter().position(|item| item.id == "theme") {
+                list.selected = index;
+            }
+        }
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::OpenSettingsSubmenu
+        );
+        assert!(session.render_frame().contains("Automatic"));
+        assert_eq!(session.handle_bytes("\r"), SessionAction::None);
+        assert!(session.render_frame().contains("Automatic Theme"));
+        session.chrome.settings_submenu = None;
+        session.open_settings_list(crate::interactive_settings_list(
+            &crate::InteractiveSettingsConfig::default(),
+        ));
+        if let Some(list) = &mut session.chrome.settings_list {
+            if let Some(index) = list.items.iter().position(|item| item.id == "warnings") {
+                list.selected = index;
+            }
+        }
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::OpenSettingsSubmenu
+        );
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::ApplySetting {
+                id: "warnings.anthropic-extra-usage".into(),
+                value: "false".into(),
+            }
+        );
+
+        session.open_session_selector(vec![crate::SessionItem {
+            id: "aaa".into(),
+            name: Some("alpha".into()),
+            path: "/tmp/aaa.jsonl".into(),
+            cwd: "/work".into(),
+            modified_at: 1,
+            parent_id: None,
+        }]);
+        assert!(session.render_frame().contains("ctrl+p path"));
+        assert_eq!(session.handle_bytes("\x10"), SessionAction::None);
+        assert!(session
+            .chrome
+            .session_selector
+            .as_ref()
+            .is_some_and(|selector| selector.show_path));
+        assert_eq!(session.current_model(), Some("openai/gpt"));
+        assert_eq!(session.handle_bytes("\x12"), SessionAction::None);
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::RenameSession {
+                id: "aaa".into(),
+                name: "alpha".into(),
+            }
+        );
+
+        session.close_overlays();
+        session.chrome.editor.handle_input("later");
+        assert_eq!(
+            session.handle_bytes("\x1b\r"),
+            SessionAction::FollowUp("later".into())
+        );
+        assert!(session.chrome.editor.buffer.is_empty());
+        assert_eq!(session.handle_bytes("\x1b[1;3A"), SessionAction::Dequeue);
+        assert_eq!(session.chrome.editor.buffer, "later");
+        assert_eq!(session.handle_bytes("\x07"), SessionAction::ExternalEditor);
+        assert_eq!(session.handle_bytes("\x16"), SessionAction::PasteClipboard);
+
+        let _ = session.begin_osc_query(0);
+        let timeout = session
+            .finish_osc_query(Instant::now())
+            .expect("timeout fallback");
+        assert!(timeout.source == "fallback" || timeout.source == "COLORFGBG");
+        let _ = session.begin_osc_query(1_000);
+        assert_eq!(
+            session.handle_bytes("\x1b]11;#ffffff\x07"),
+            SessionAction::None
+        );
+        let detected = session.finish_osc_query(Instant::now()).expect("osc reply");
+        assert_eq!(detected.theme, "light");
+        assert_eq!(detected.source, "terminal background");
     }
 }

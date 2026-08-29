@@ -3,6 +3,7 @@ mod auth_cmd;
 mod export;
 mod extension_host;
 mod extensions;
+mod external_editor;
 mod js_host;
 mod packages;
 mod rpc;
@@ -27,10 +28,11 @@ use pi_session::{
     resolve_session_ref, JsonlSession, SessionEntry,
 };
 use pi_tui::{
-    builtin_themes, copy_text, detect_terminal_theme, encode_kitty, interactive_settings_list,
-    parse_http_idle_timeout, ChatChrome, Component, CustomMessage, DoubleEscapeAction, FilterMode,
-    InteractiveSession, MermaidMode, ScopedModel, SessionAction, SessionTreeEntry,
-    SlashCommandSpec, ToolCard, TuiMode, FALLBACK_PREVIEW_LINES,
+    builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto, encode_kitty,
+    interactive_settings_list, parse_auto_theme, parse_http_idle_timeout, ChatChrome, Component,
+    CustomMessage, DoubleEscapeAction, FilterMode, InteractiveSession, Keybindings, MermaidMode,
+    ScopedModel, SessionAction, SessionItem, SessionTreeEntry, SlashCommandSpec, ThemeDetection,
+    ToolCard, TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -39,6 +41,7 @@ use auth_cmd::{
     AuthCommandKind,
 };
 use extension_host::{ExtensionEvent, ExtensionHost};
+use external_editor::{clipboard_image_png, clipboard_text, ExternalEditor};
 use packages::handle_package_command;
 use rpc::{handle_rpc, RpcCommand, RpcRuntime};
 use settings::{
@@ -612,6 +615,12 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     session.chrome.transcript.mermaid_mode = session.mermaid_mode;
     session.chrome.transcript.hide_thinking_block = stored.hide_thinking_block.unwrap_or(false);
     session.enabled_model_ids = stored.enabled_models.clone();
+    session.keybindings = Keybindings::load(&default_agent_dir());
+    session.warnings_anthropic_extra_usage = stored.warnings.anthropic_extra_usage.unwrap_or(true);
+    if let Some(levels) = stored.model_thinking_levels.clone() {
+        session.model_thinking_levels = levels;
+    }
+    let _ = session.begin_osc_query(OSC_QUERY_TIMEOUT_MS);
     let host = loaded_extension_host(parsed);
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
@@ -656,7 +665,11 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') | KeyCode::Char('C') => "\x03".into(),
+            KeyCode::Char('e') | KeyCode::Char('E') => "\x05".into(),
+            KeyCode::Char('g') | KeyCode::Char('G') => "\x07".into(),
             KeyCode::Char('p') | KeyCode::Char('P') => "\x10".into(),
+            KeyCode::Char('q') | KeyCode::Char('Q') => "\x11".into(),
+            KeyCode::Char('r') | KeyCode::Char('R') => "\x12".into(),
             KeyCode::Char('t') | KeyCode::Char('T') => "\x14".into(),
             KeyCode::Char('l') | KeyCode::Char('L') => "\x0c".into(),
             KeyCode::Char('d') | KeyCode::Char('D') => "\x04".into(),
@@ -664,6 +677,7 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
             KeyCode::Char('a') | KeyCode::Char('A') => "\x01".into(),
             KeyCode::Char('o') | KeyCode::Char('O') => "\x0f".into(),
             KeyCode::Char('s') | KeyCode::Char('S') => "\x13".into(),
+            KeyCode::Char('v') | KeyCode::Char('V') => "\x16".into(),
             KeyCode::Char('x') | KeyCode::Char('X') => "\x18".into(),
             KeyCode::Left => "\x1b[1;5D".into(),
             KeyCode::Right => "\x1b[1;5C".into(),
@@ -672,10 +686,14 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
     }
     if key.modifiers.contains(KeyModifiers::ALT) {
         return match key.code {
+            KeyCode::Enter => "\x1b\r".into(),
             KeyCode::Up => "\x1b[1;3A".into(),
             KeyCode::Down => "\x1b[1;3B".into(),
             KeyCode::Left => "\x1b[1;3D".into(),
             KeyCode::Right => "\x1b[1;3C".into(),
+            KeyCode::Char('v') | KeyCode::Char('V') => "\x1bv".into(),
+            KeyCode::Char('q') | KeyCode::Char('Q') => "\x1bq".into(),
+            KeyCode::Char(ch) => format!("\x1b{ch}"),
             _ => String::new(),
         };
     }
@@ -703,7 +721,10 @@ fn run_raw_session(
 ) -> Result<i32, String> {
     let _raw = RawModeGuard::enter()?;
     loop {
-        if !crossterm::event::poll(std::time::Duration::from_millis(250))
+        if let Some(detection) = session.finish_osc_query(std::time::Instant::now()) {
+            apply_osc_theme(session, &detection);
+        }
+        if !crossterm::event::poll(std::time::Duration::from_millis(50))
             .map_err(|err| err.to_string())?
         {
             continue;
@@ -785,6 +806,35 @@ fn apply_session_action(
         }
         SessionAction::SelectSetting(value) => {
             apply_interactive_setting(session, &value)?;
+            Ok(true)
+        }
+        SessionAction::OpenSettingsSubmenu => Ok(true),
+        SessionAction::ApplySetting { id, value } => {
+            apply_interactive_setting(session, &format!("{id}={value}"))?;
+            Ok(true)
+        }
+        SessionAction::FollowUp(_) => {
+            session.chrome.status = format!("queued follow-up ({})", session.follow_up_queue.len());
+            Ok(true)
+        }
+        SessionAction::Dequeue => {
+            session.chrome.status = if session.chrome.editor.buffer.is_empty() {
+                "follow-up queue empty".into()
+            } else {
+                "dequeued follow-up".into()
+            };
+            Ok(true)
+        }
+        SessionAction::ExternalEditor => {
+            launch_external_editor(session)?;
+            Ok(true)
+        }
+        SessionAction::PasteClipboard => {
+            paste_clipboard(session);
+            Ok(true)
+        }
+        SessionAction::RenameSession { id, name } => {
+            rename_discovered_session(parsed, agent, session, &id, &name)?;
             Ok(true)
         }
         SessionAction::CycleSetting => {
@@ -923,6 +973,14 @@ fn apply_session_action(
                 start_login(session, &provider, key.as_deref())?;
                 Ok(true)
             }
+            SlashAction::Settings => {
+                open_settings_overlay(session);
+                Ok(true)
+            }
+            SlashAction::Resume => {
+                open_session_selector(parsed, agent, session)?;
+                Ok(true)
+            }
             _ => handle_user_line(parsed, agent, &mut session.chrome, &text),
         },
     }
@@ -968,6 +1026,7 @@ fn handle_user_line(
             let list =
                 interactive_settings_list(&to_interactive_config(&stored, &chrome.theme.name));
             chrome.settings_list = Some(list);
+            chrome.settings_submenu = None;
             chrome.status = "Settings".into();
             if let Some(settings) = &chrome.settings_list {
                 println!("{}", settings.render(80).join("\n"));
@@ -1082,19 +1141,16 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Resume => {
-            let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
-            let sessions = discover_sessions(&session_dir, Some(&agent.cwd.to_string_lossy()))
-                .map_err(|e| e.to_string())?;
-            let items: Vec<String> = sessions
-                .iter()
-                .map(|summary| format!("{}  {}", summary.id, summary.path.display()))
-                .collect();
-            chrome.selector = Some(pi_tui::SelectList::new(
-                sessions.iter().map(|summary| summary.id.clone()).collect(),
-            ));
+            let items = discover_session_items(parsed, agent)?;
+            chrome.session_selector = Some(pi_tui::SessionSelector::new(items.clone()));
+            chrome.selector = None;
             chrome.status = "Select session".into();
             for item in items {
-                println!("{item}");
+                println!(
+                    "{}  {}",
+                    item.name.as_deref().unwrap_or(&item.id),
+                    item.path
+                );
             }
             Ok(true)
         }
@@ -1202,12 +1258,19 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
                 session.autocomplete_max_visible = n.clamp(3, 20) as usize;
             }
         }
-        "theme" => {
-            if let Some(theme) = builtin_themes()
-                .into_iter()
-                .find(|theme| theme.name == value)
-            {
-                session.chrome.theme = theme;
+        "theme" => apply_theme_value(session, value),
+        "warnings.anthropic-extra-usage" => {
+            session.warnings_anthropic_extra_usage = value == "true";
+        }
+        "model-thinking" => {
+            if let Some((key, level)) = value.rsplit_once('=') {
+                if level == "__clear__" {
+                    session.model_thinking_levels.remove(key);
+                } else {
+                    session
+                        .model_thinking_levels
+                        .insert(key.to_string(), level.to_string());
+                }
             }
         }
         "tree-filter-mode" => {
@@ -1230,6 +1293,20 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
             stored.autocomplete_max_visible = value.parse().ok();
         }
         "theme" => stored.theme = Some(value.to_string()),
+        "warnings.anthropic-extra-usage" => {
+            stored.warnings.anthropic_extra_usage = Some(value == "true");
+        }
+        "model-thinking" => {
+            if let Some((key, level)) = value.rsplit_once('=') {
+                let mut map = stored.model_thinking_levels.take().unwrap_or_default();
+                if level == "__clear__" {
+                    map.remove(key);
+                } else {
+                    map.insert(key.to_string(), level.to_string());
+                }
+                stored.model_thinking_levels = Some(map);
+            }
+        }
         "quiet-startup" => stored.quiet_startup = value == "true",
         "tree-filter-mode" => stored.tree_filter_mode = Some(value.to_string()),
         "mermaid-rendering" => stored.markdown.mermaid = Some(value.to_string()),
@@ -1490,6 +1567,148 @@ fn tree_entry_from_session(entry: &pi_session::SessionEntry) -> SessionTreeEntry
             .and_then(|value| value.as_str())
             .map(str::to_string),
     }
+}
+
+fn apply_theme_value(session: &mut InteractiveSession, value: &str) {
+    let resolved = resolve_theme_name(value);
+    if let Some(theme) = builtin_themes()
+        .into_iter()
+        .find(|theme| theme.name == resolved)
+    {
+        session.chrome.theme = theme;
+    }
+}
+
+fn resolve_theme_name(value: &str) -> String {
+    if let Some((light, dark)) = parse_auto_theme(value) {
+        let detected = detect_terminal_theme_for_auto(
+            std::env::var("PI_COLOR_SCHEME_REPLY").ok().as_deref(),
+            std::env::var("PI_OSC11_REPLY").ok().as_deref(),
+            std::env::var("COLORFGBG").ok().as_deref(),
+        );
+        if detected.theme == "light" {
+            light
+        } else {
+            dark
+        }
+    } else {
+        value.to_string()
+    }
+}
+
+fn apply_osc_theme(session: &mut InteractiveSession, detection: &ThemeDetection) {
+    let stored = load_settings(&default_agent_dir());
+    if let Some(setting) = stored.theme.as_deref() {
+        if let Some((light, dark)) = parse_auto_theme(setting) {
+            let name = if detection.theme == "light" {
+                light
+            } else {
+                dark
+            };
+            apply_theme_value(session, &name);
+            session.chrome.status = format!("theme={} ({})", name, detection.source);
+        }
+    }
+}
+
+fn launch_external_editor(session: &mut InteractiveSession) -> Result<(), String> {
+    let stored = load_settings(&default_agent_dir());
+    let editor = ExternalEditor::new(
+        stored.external_editor.as_deref(),
+        &session.chrome.editor.buffer,
+    )?;
+    session.chrome.status = editor.launch_message();
+    println!("{}", session.chrome.status);
+    let text = editor.edit()?;
+    session.chrome.editor.buffer = text;
+    session.chrome.editor.cursor = session.chrome.editor.buffer.len();
+    Ok(())
+}
+
+fn paste_clipboard(session: &mut InteractiveSession) {
+    if let Some(png) = clipboard_image_png() {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png);
+        session.place_kitty_image(&b64, Some(1));
+        session.chrome.status = "pasted image".into();
+    } else if let Some(text) = clipboard_text() {
+        session.chrome.editor.handle_input(&text);
+        session.chrome.status = "pasted clipboard".into();
+    } else {
+        session.chrome.status = "clipboard empty".into();
+    }
+}
+
+fn discover_session_items(parsed: &Args, agent: &Agent) -> Result<Vec<SessionItem>, String> {
+    let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+    let sessions = discover_sessions(&session_dir, Some(&agent.cwd.to_string_lossy()))
+        .map_err(|err| err.to_string())?;
+    Ok(sessions
+        .into_iter()
+        .map(|summary| SessionItem {
+            id: summary.id,
+            name: summary.name,
+            path: summary.path.display().to_string(),
+            cwd: summary.cwd,
+            modified_at: summary.modified_at,
+            parent_id: summary.parent_session_id,
+        })
+        .collect())
+}
+
+fn open_session_selector(
+    parsed: &Args,
+    agent: &Agent,
+    session: &mut InteractiveSession,
+) -> Result<(), String> {
+    let items = discover_session_items(parsed, agent)?;
+    session.open_session_selector(items);
+    if let Some(selector) = &session.chrome.session_selector {
+        println!("{}", selector.render(80).join("\n"));
+    }
+    Ok(())
+}
+
+fn open_settings_overlay(session: &mut InteractiveSession) {
+    let stored = load_settings(&default_agent_dir());
+    session.open_settings_list(interactive_settings_list(&to_interactive_config(
+        &stored,
+        &session.chrome.theme.name,
+    )));
+    if let Some(settings) = &session.chrome.settings_list {
+        println!("{}", settings.render(80).join("\n"));
+    }
+}
+
+fn rename_discovered_session(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+    let summary = resolve_session_ref(&session_dir, Some(&agent.cwd.to_string_lossy()), id)
+        .map_err(|err| err.to_string())?;
+    let mut store = JsonlSession::open(&summary.path).map_err(|err| err.to_string())?;
+    store.set_name(name).map_err(|err| err.to_string())?;
+    if agent
+        .session
+        .as_ref()
+        .is_some_and(|current| current.header.id == id)
+    {
+        if let Some(current) = agent.session.as_mut() {
+            current.set_name(name).map_err(|err| err.to_string())?;
+        }
+    }
+    if let Some(selector) = &mut session.chrome.session_selector {
+        selector.apply_rename(id, name);
+    }
+    session.chrome.status = if name.is_empty() {
+        format!("session {id} name cleared")
+    } else {
+        format!("session {id} renamed to {name}")
+    };
+    Ok(())
 }
 
 fn open_session_tree(agent: &Agent, session: &mut InteractiveSession) {
