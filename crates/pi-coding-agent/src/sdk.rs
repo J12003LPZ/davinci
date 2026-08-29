@@ -12,6 +12,7 @@ use pi_session::{default_agent_dir, latest_session, JsonlSession};
 use crate::settings::load_merged_settings;
 
 const DEFAULT_ACTIVE_TOOLS: &[&str] = &["read", "bash", "edit", "write"];
+type AgentEventListener = Box<dyn Fn(&pi_agent::AgentEvent)>;
 
 #[derive(Debug, Clone, Default)]
 pub struct CreateAgentSessionOptions {
@@ -41,7 +42,7 @@ pub struct AgentSession {
     pub agent_dir: PathBuf,
     pub scoped_models: Vec<String>,
     pub custom_tools: Vec<String>,
-    listeners: Vec<Box<dyn Fn(&pi_agent::AgentEvent)>>,
+    listeners: Vec<AgentEventListener>,
 }
 
 impl AgentSession {
