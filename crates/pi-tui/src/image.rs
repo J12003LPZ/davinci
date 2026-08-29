@@ -22,22 +22,12 @@ pub struct Image {
     cached_lines: RefCell<Option<(usize, Vec<String>)>>,
 }
 
+#[derive(Default)]
 pub struct ImageOptions {
     pub max_width_cells: Option<u32>,
     pub max_height_cells: Option<u32>,
     pub filename: Option<String>,
     pub image_id: Option<u32>,
-}
-
-impl Default for ImageOptions {
-    fn default() -> Self {
-        Self {
-            max_width_cells: None,
-            max_height_cells: None,
-            filename: None,
-            image_id: None,
-        }
-    }
 }
 
 impl Image {

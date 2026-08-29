@@ -1,10 +1,14 @@
 //! Terminal UI matching `@earendil-works/pi-tui`.
 
+pub mod alt_screen;
+pub mod ansi_text;
 pub mod component;
+pub mod constrained_layout;
 pub mod diff;
 pub mod editor;
 pub mod fuzzy;
 pub mod image;
+pub mod keybindings;
 pub mod keys;
 pub mod layout;
 pub mod markdown;
@@ -14,16 +18,22 @@ pub mod selectors;
 pub mod terminal;
 pub mod terminal_image;
 pub mod themes;
+pub mod viewport;
 pub mod widgets;
 pub mod word_nav;
 
+pub use alt_screen::{
+    find_alt_screen_search_matches, layout_transcript_and_dock, TuiAltScreen, TuiAltScreenOptions,
+};
 pub use component::{wrap_text_with_ansi, Component, Text};
+pub use constrained_layout::{LayoutHStack, LayoutVStack, Node, StackEntry};
 pub use diff::{
     apply_line_resets, composite_tui_line, extract_cursor_position, hardware_cursor_sequence,
     normalize_terminal_output, truncate_to_width, visible_width, DiffScreen,
 };
 pub use editor::Editor;
 pub use image::{Image, ImageOptions};
+pub use keybindings::{matches_key, reset_alt_screen_bindings, set_alt_screen_bindings};
 pub use keys::{default_keybindings, parse_bytes, parse_key, read_key, Key, Keybinding};
 pub use layout::{ChatView, Container, Overlay};
 pub use markdown::Markdown;
@@ -46,6 +56,7 @@ pub use terminal_image::{
     KITTY_PREFIX, MAX_CACHED_OFFSCREEN_KITTY_IMAGES,
 };
 pub use themes::Theme;
+pub use viewport::{Overscroll, ScrollbarMode, ViewportScroll, ViewportScrollOptions};
 pub use widgets::{
     BoxWidget, HStack, Input, InputAction, ScrollView, SettingsList, VStack, CURSOR_MARKER,
 };

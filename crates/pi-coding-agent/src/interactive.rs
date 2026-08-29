@@ -13,8 +13,9 @@ use pi_session::{default_sessions_root, discover_sessions};
 use pi_tui::component::Component;
 use pi_tui::{
     default_keybindings, disable_mouse, disable_raw_input, enable_mouse, enable_raw_input,
-    enter_alt_screen, leave_alt_screen, set_title, ChatView, Editor, Key, Markdown, Overlay,
-    OverlayOptions, SelectList, SettingsList, Tui, TuiMode,
+    enter_alt_screen, layout_transcript_and_dock, leave_alt_screen, set_title, ChatView, Editor,
+    Key, Markdown, Node, Overlay, OverlayOptions, SelectList, SettingsList, Tui, TuiAltScreen,
+    TuiAltScreenOptions, TuiMode, ViewportScroll, ViewportScrollOptions,
 };
 use serde_json::json;
 use std::io::{self, BufRead, Read, Write};
@@ -30,6 +31,9 @@ pub struct InteractiveMode {
     pub last_json_events: Vec<serde_json::Value>,
     trust_selector: Option<TrustSelector>,
     login_dialog: Option<LoginDialog>,
+    pub alt: Option<TuiAltScreen>,
+    transcript: Option<Node>,
+    dock: Option<Node>,
 }
 
 impl InteractiveMode {
@@ -50,6 +54,24 @@ impl InteractiveMode {
         }
         tui.add_child_lines(chat.render(80));
         let theme = runtime.theme.clone();
+        let (alt, transcript, dock) = if mode == TuiMode::Fullscreen {
+            chat.semantic_zones = true;
+            let transcript = Node::text(chat.render(80).into_iter().collect::<Vec<_>>().join("\n"));
+            let scroll = ViewportScroll::new(
+                transcript.clone(),
+                ViewportScrollOptions {
+                    follow_end: true,
+                    primary: true,
+                    ..ViewportScrollOptions::default()
+                },
+            );
+            let dock = Node::text("editor");
+            let mut alt = TuiAltScreen::new(80, 24, TuiAltScreenOptions::default());
+            alt.set_layout_root(layout_transcript_and_dock(scroll, dock.clone()));
+            (Some(alt), Some(transcript), Some(dock))
+        } else {
+            (None, None, None)
+        };
         Self {
             runtime,
             tui,
@@ -61,6 +83,9 @@ impl InteractiveMode {
             last_json_events: Vec::new(),
             trust_selector: None,
             login_dialog: None,
+            alt,
+            transcript,
+            dock,
         }
     }
 
@@ -160,6 +185,31 @@ impl InteractiveMode {
     }
 
     pub fn redraw(&mut self, force: bool) -> String {
+        if self.alt.is_some() {
+            let width = self.alt.as_ref().map(|alt| alt.columns).unwrap_or(80);
+            if let Some(transcript) = &self.transcript {
+                transcript.set_text(self.chat.render(width).join("\n"));
+            }
+            if let Some(dock) = &self.dock {
+                let mut dock_lines = self.footer_lines();
+                dock_lines.extend(
+                    self.runtime
+                        .ui
+                        .widget_lines("aboveEditor")
+                        .into_iter()
+                        .map(|line| format!(" {line}")),
+                );
+                if let Some(dialog) = &self.login_dialog {
+                    dock_lines.extend(dialog.render().lines().map(str::to_string));
+                } else {
+                    dock_lines.extend(self.editor.render(width));
+                }
+                dock.set_text(dock_lines.join("\n"));
+            }
+            let alt = self.alt.as_mut().expect("fullscreen alt");
+            alt.request_render();
+            return alt.writes.last().cloned().unwrap_or_default();
+        }
         self.tui.clear_children();
         let mut lines = self.chat.render(self.tui.columns);
         lines.extend(
@@ -588,6 +638,11 @@ impl InteractiveMode {
     }
 
     pub fn handle_line(&mut self, line: &str) -> Result<bool, String> {
+        if let Some(alt) = &mut self.alt {
+            if alt.handle_input(line) {
+                return Ok(false);
+            }
+        }
         if self.login_dialog.is_some() {
             if line == "\u{1b}" || line.eq_ignore_ascii_case("escape") {
                 let _ = self.apply_login_dialog_key(&Key::Escape);
@@ -835,7 +890,11 @@ fn decode_raw_key(bytes: &[u8]) -> Option<Key> {
 
 pub fn run_interactive(mut mode: InteractiveMode, fullscreen: bool) -> Result<i32, String> {
     let mut stdout = io::stdout();
-    if fullscreen {
+    if let Some(alt) = mode.alt.as_mut() {
+        alt.start();
+        write!(stdout, "{}", alt.writes.last().cloned().unwrap_or_default()).ok();
+        enable_raw_input().ok();
+    } else if fullscreen {
         enter_alt_screen(&mut stdout).ok();
         enable_mouse(&mut stdout).ok();
         enable_raw_input().ok();
@@ -893,7 +952,11 @@ pub fn run_interactive(mut mode: InteractiveMode, fullscreen: bool) -> Result<i3
             let _ = stdout.flush();
         }
     }
-    if fullscreen {
+    if let Some(alt) = mode.alt.as_mut() {
+        alt.stop();
+        write!(stdout, "{}", alt.writes.last().cloned().unwrap_or_default()).ok();
+        disable_raw_input().ok();
+    } else if fullscreen {
         disable_raw_input().ok();
         disable_mouse(&mut stdout).ok();
         leave_alt_screen(&mut stdout).ok();

@@ -63,9 +63,14 @@ impl Component for Overlay {
     }
 }
 
+const OSC133_ZONE_START: &str = "\u{1b}]133;A\u{07}";
+const OSC133_ZONE_END: &str = "\u{1b}]133;B\u{07}";
+const OSC133_ZONE_FINAL: &str = "\u{1b}]133;C\u{07}";
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatView {
     pub lines: Vec<(String, String)>,
+    pub semantic_zones: bool,
 }
 
 impl ChatView {
@@ -78,9 +83,15 @@ impl Component for ChatView {
     fn render(&self, width: usize) -> Vec<String> {
         let mut out = Vec::new();
         for (role, text) in &self.lines {
-            out.push(format!("{role}:"));
-            out.extend(wrap(text, width));
-            out.push(String::new());
+            let mut block = vec![format!("{role}:")];
+            block.extend(wrap(text, width));
+            block.push(String::new());
+            if self.semantic_zones && !block.is_empty() {
+                let last = block.len() - 1;
+                block[0] = format!("{OSC133_ZONE_START}{}", block[0]);
+                block[last] = format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}{}", block[last]);
+            }
+            out.extend(block);
         }
         out
     }
