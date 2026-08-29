@@ -228,6 +228,64 @@ pub struct TuiAltScreenOptions {
     pub open_url: Option<fn(&str)>,
     pub on_right_click_paste: Option<fn()>,
     pub platform_windows: bool,
+    pub term_program_vscode: bool,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct OverlayShowOptions {
+    pub non_capturing: bool,
+}
+
+#[derive(Clone)]
+pub struct InputOverlay {
+    inner: Rc<RefCell<InputOverlayState>>,
+}
+
+#[derive(Default)]
+struct InputOverlayState {
+    focused: bool,
+    inputs: Vec<String>,
+}
+
+impl InputOverlay {
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(InputOverlayState::default())),
+        }
+    }
+
+    pub fn focused(&self) -> bool {
+        self.inner.borrow().focused
+    }
+
+    pub fn inputs(&self) -> Vec<String> {
+        self.inner.borrow().inputs.clone()
+    }
+
+    fn set_focused(&self, focused: bool) {
+        self.inner.borrow_mut().focused = focused;
+    }
+
+    fn push_input(&self, data: &str) {
+        self.inner.borrow_mut().inputs.push(data.to_string());
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+pub struct OverlayHandle {
+    id: u64,
+}
+
+struct OverlayEntry {
+    id: u64,
+    overlay: InputOverlay,
+    hidden: bool,
+    non_capturing: bool,
+    pre_focus: Option<InputOverlay>,
+    focus_order: u64,
 }
 
 impl Default for TuiAltScreenOptions {
@@ -242,6 +300,7 @@ impl Default for TuiAltScreenOptions {
             open_url: None,
             on_right_click_paste: None,
             platform_windows: false,
+            term_program_vscode: false,
         }
     }
 }
@@ -272,15 +331,23 @@ pub struct TuiAltScreen {
     selection_press_active: bool,
     selection_dragged: bool,
     selection_auto_dir: i8,
+    selection_drag_pointer: Option<(usize, usize)>,
+    last_auto_scroll_ms: u64,
     scrollbar_drag: Option<(usize, isize)>,
     scrollbar_hover: Option<ViewportScroll>,
     search: Option<ActiveSearch>,
     pressed_url: Option<String>,
     focus_inputs: Rc<RefCell<Vec<String>>>,
-    overlay_focused: bool,
+    focused: Option<InputOverlay>,
+    overlays: Vec<OverlayEntry>,
+    next_overlay_id: u64,
+    focus_order_counter: u64,
     copy_on_select: bool,
     opened_urls: Vec<String>,
     right_click_pastes: usize,
+    copy_log: Rc<RefCell<Vec<String>>>,
+    use_copy_handler: bool,
+    copy_ok: bool,
 }
 
 struct ActiveSearch {
@@ -331,15 +398,23 @@ impl TuiAltScreen {
             selection_press_active: false,
             selection_dragged: false,
             selection_auto_dir: 0,
+            selection_drag_pointer: None,
+            last_auto_scroll_ms: 0,
             scrollbar_drag: None,
             scrollbar_hover: None,
             search: None,
             pressed_url: None,
             focus_inputs: Rc::new(RefCell::new(Vec::new())),
-            overlay_focused: false,
+            focused: None,
+            overlays: Vec::new(),
+            next_overlay_id: 1,
+            focus_order_counter: 0,
             copy_on_select,
             opened_urls: Vec::new(),
             right_click_pastes: 0,
+            copy_log: Rc::new(RefCell::new(Vec::new())),
+            use_copy_handler: false,
+            copy_ok: true,
         }
     }
 
@@ -348,7 +423,158 @@ impl TuiAltScreen {
     }
 
     pub fn set_focus_editor(&mut self) {
-        self.overlay_focused = false;
+        self.blur_focus();
+    }
+
+    pub fn set_focus(&mut self, overlay: &InputOverlay) {
+        self.blur_focus();
+        overlay.set_focused(true);
+        self.focused = Some(overlay.clone());
+    }
+
+    pub fn set_copy_handler(&mut self, ok: bool) -> Rc<RefCell<Vec<String>>> {
+        self.use_copy_handler = true;
+        self.copy_ok = ok;
+        self.copy_log.borrow_mut().clear();
+        Rc::clone(&self.copy_log)
+    }
+
+    pub fn show_overlay(
+        &mut self,
+        overlay: InputOverlay,
+        options: OverlayShowOptions,
+    ) -> OverlayHandle {
+        self.focus_order_counter += 1;
+        let id = self.next_overlay_id;
+        self.next_overlay_id += 1;
+        let pre_focus = self.focused.clone();
+        self.overlays.push(OverlayEntry {
+            id,
+            overlay: overlay.clone(),
+            hidden: false,
+            non_capturing: options.non_capturing,
+            pre_focus,
+            focus_order: self.focus_order_counter,
+        });
+        if !options.non_capturing {
+            self.set_focus(&overlay);
+        }
+        OverlayHandle { id }
+    }
+
+    pub fn hide_overlay(&mut self, handle: &OverlayHandle) {
+        let Some(index) = self.overlays.iter().position(|entry| entry.id == handle.id) else {
+            return;
+        };
+        let entry = self.overlays.remove(index);
+        entry.overlay.set_focused(false);
+        if self
+            .focused
+            .as_ref()
+            .is_some_and(|focused| focused.ptr_eq(&entry.overlay))
+        {
+            let next = self
+                .topmost_visible_overlay()
+                .map(|entry| entry.overlay.clone())
+                .or(entry.pre_focus);
+            self.blur_focus();
+            if let Some(next) = next {
+                next.set_focused(true);
+                self.focused = Some(next);
+            }
+        }
+    }
+
+    pub fn set_overlay_hidden(&mut self, handle: &OverlayHandle, hidden: bool) {
+        let Some(index) = self.overlays.iter().position(|entry| entry.id == handle.id) else {
+            return;
+        };
+        if self.overlays[index].hidden == hidden {
+            return;
+        }
+        self.overlays[index].hidden = hidden;
+        let overlay = self.overlays[index].overlay.clone();
+        let non_capturing = self.overlays[index].non_capturing;
+        let pre_focus = self.overlays[index].pre_focus.clone();
+        if hidden {
+            overlay.set_focused(false);
+            if self
+                .focused
+                .as_ref()
+                .is_some_and(|focused| focused.ptr_eq(&overlay))
+            {
+                let next = self
+                    .topmost_visible_overlay()
+                    .map(|entry| entry.overlay.clone())
+                    .or(pre_focus);
+                self.blur_focus();
+                if let Some(next) = next {
+                    next.set_focused(true);
+                    self.focused = Some(next);
+                }
+            }
+        } else if !non_capturing {
+            self.focus_order_counter += 1;
+            self.overlays[index].focus_order = self.focus_order_counter;
+            self.set_focus(&overlay);
+        }
+    }
+
+    pub fn unfocus_overlay(&mut self, handle: &OverlayHandle) {
+        let Some(entry) = self.overlays.iter().find(|entry| entry.id == handle.id) else {
+            return;
+        };
+        let overlay = entry.overlay.clone();
+        let pre_focus = entry.pre_focus.clone();
+        let is_focused = self
+            .focused
+            .as_ref()
+            .is_some_and(|focused| focused.ptr_eq(&overlay));
+        if !is_focused {
+            return;
+        }
+        overlay.set_focused(false);
+        let next = self
+            .topmost_visible_overlay()
+            .filter(|top| !top.overlay.ptr_eq(&overlay))
+            .map(|top| top.overlay.clone())
+            .or(pre_focus);
+        self.blur_focus();
+        if let Some(next) = next {
+            next.set_focused(true);
+            self.focused = Some(next);
+        }
+    }
+
+    fn blur_focus(&mut self) {
+        if let Some(previous) = self.focused.take() {
+            previous.set_focused(false);
+        }
+    }
+
+    fn topmost_visible_overlay(&self) -> Option<&OverlayEntry> {
+        self.overlays
+            .iter()
+            .filter(|entry| !entry.hidden && !entry.non_capturing)
+            .max_by_key(|entry| entry.focus_order)
+    }
+
+    fn deliver_overlay_input(&self, data: &str) -> bool {
+        if let Some(focused) = &self.focused {
+            if self
+                .overlays
+                .iter()
+                .any(|entry| !entry.hidden && entry.overlay.ptr_eq(focused))
+            {
+                focused.push_input(data);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn has_visible_overlay(&self) -> bool {
+        self.search.is_some() || self.overlays.iter().any(|entry| !entry.hidden)
     }
 
     pub fn add_child(&mut self, node: Node) {
@@ -494,6 +720,7 @@ impl TuiAltScreen {
     }
 
     pub fn advance_ms(&mut self, delta: u64) {
+        let previous = self.now_ms;
         self.now_ms = self.now_ms.saturating_add(delta);
         let now = self.now_ms;
         self.flashes.retain(|entry| entry.expire_at > now);
@@ -502,9 +729,19 @@ impl TuiAltScreen {
         if let Some(hover) = &self.scrollbar_hover {
             dirty |= hover.tick(now);
         }
-        if self.selection_auto_dir != 0 {
-            self.auto_scroll_selection();
-            dirty = true;
+        if self.selection_auto_dir != 0 && self.selection_press_active {
+            let mut tick_at = self.last_auto_scroll_ms.saturating_add(50);
+            while tick_at <= now {
+                if tick_at > previous {
+                    self.auto_scroll_selection();
+                    dirty = true;
+                }
+                self.last_auto_scroll_ms = tick_at;
+                tick_at = tick_at.saturating_add(50);
+                if self.selection_auto_dir == 0 {
+                    break;
+                }
+            }
         }
         let _ = dirty;
         self.render_now();
@@ -544,6 +781,7 @@ impl TuiAltScreen {
             let nonempty = had && self.selection_bounds().is_some();
             self.selection_press_active = false;
             self.selection_auto_dir = 0;
+            self.selection_drag_pointer = None;
             self.stop_scrollbar_hover();
             self.scrollbar_drag = None;
             self.pressed_url = None;
@@ -563,7 +801,8 @@ impl TuiAltScreen {
         }
         if let Some(wheel) = parse_wheel(data) {
             if self.should_defer_overlay() {
-                return false;
+                self.deliver_overlay_input(data);
+                return true;
             }
             self.route_wheel(wheel.0, wheel.1, wheel.2);
             return true;
@@ -634,7 +873,8 @@ impl TuiAltScreen {
             return true;
         }
         if self.should_defer_overlay() {
-            return false;
+            self.deliver_overlay_input(data);
+            return true;
         }
 
         let scroll = self.primary_scroll();
@@ -692,7 +932,12 @@ impl TuiAltScreen {
     }
 
     fn should_defer_overlay(&self) -> bool {
-        self.overlay_focused && self.search.is_none()
+        self.search.is_none()
+            && self.focused.as_ref().is_some_and(|focused| {
+                self.overlays.iter().any(|entry| {
+                    !entry.hidden && !entry.non_capturing && entry.overlay.ptr_eq(focused)
+                })
+            })
     }
 
     fn open_search(&mut self) {
@@ -779,6 +1024,7 @@ impl TuiAltScreen {
     fn handle_right_click(&mut self, event: (u16, usize, usize, bool)) -> bool {
         if self.options.on_right_click_paste.is_none()
             || !self.options.platform_windows
+            || self.options.term_program_vscode
             || std::env::var("TERM_PROGRAM")
                 .map(|v| v.eq_ignore_ascii_case("vscode"))
                 .unwrap_or(false)
@@ -907,6 +1153,7 @@ impl TuiAltScreen {
             }
             self.selection_press_active = false;
             self.selection_auto_dir = 0;
+            self.selection_drag_pointer = None;
             if self.selection_anchor.is_none() {
                 return;
             }
@@ -948,12 +1195,17 @@ impl TuiAltScreen {
             return;
         }
         self.selection_auto_dir = 0;
+        self.selection_drag_pointer = None;
         self.selection_press_active = true;
-        let scroll = self.current_layout.as_ref().and_then(|layout| {
-            get_scroll_views_at(layout, event.1, event.2)
-                .into_iter()
-                .next()
-        });
+        let scroll = if self.has_visible_overlay() {
+            None
+        } else {
+            self.current_layout.as_ref().and_then(|layout| {
+                get_scroll_views_at(layout, event.1, event.2)
+                    .into_iter()
+                    .next()
+            })
+        };
         let anchor = self.selection_point(event.1, event.2, scroll.as_ref().map(Self::scroll_id));
         let word = self.word_selection(anchor);
         let count = self.click_count(anchor, word.as_ref());
@@ -1051,22 +1303,7 @@ impl TuiAltScreen {
 
     fn word_selection(&self, point: SelectionPoint) -> Option<(SelectionPoint, SelectionPoint)> {
         let line = strip_terminal_sequences(&self.source_line(point));
-        let mut segments = Vec::new();
-        let mut start = 0usize;
-        let mut rest = line.as_str();
-        while !rest.is_empty() {
-            let Some((segment, next)) = crate::ansi_text::next_grapheme(rest) else {
-                break;
-            };
-            let end = start + crate::ansi_text::grapheme_width(segment);
-            let joiner = segment.chars().count() == 1
-                && WORD_JOINERS.contains(&segment.chars().next().unwrap());
-            let selectable =
-                joiner || segment.chars().any(|ch| ch.is_alphanumeric()) || is_cjk(segment);
-            segments.push((start, end, selectable, joiner));
-            start = end;
-            rest = next;
-        }
+        let segments = word_segments(&line);
         let index = segments
             .iter()
             .position(|(s, e, _, _)| point.col >= *s && point.col < *e)?;
@@ -1171,21 +1408,25 @@ impl TuiAltScreen {
         count
     }
 
-    fn update_selection_auto_scroll(&mut self, _x: usize, y: usize) {
+    fn update_selection_auto_scroll(&mut self, x: usize, y: usize) {
         let Some(id) = self.selection_anchor.and_then(|p| p.scroll) else {
             self.selection_auto_dir = 0;
+            self.selection_drag_pointer = None;
             return;
         };
         let Some(scroll) = self.scroll_by_id(id) else {
             self.selection_auto_dir = 0;
+            self.selection_drag_pointer = None;
             return;
         };
         let Some(layout) = &self.current_layout else {
             self.selection_auto_dir = 0;
+            self.selection_drag_pointer = None;
             return;
         };
         let Some(box_) = get_scroll_view_box(layout, &scroll) else {
             self.selection_auto_dir = 0;
+            self.selection_drag_pointer = None;
             return;
         };
         let visible_top = as_pos(box_.rect.y.max(box_.clip.y));
@@ -1194,13 +1435,23 @@ impl TuiAltScreen {
                 .min(box_.rect.y + box_.rect.height.saturating_sub(1) as i32)
                 .min(box_.clip.y + box_.clip.height.saturating_sub(1) as i32),
         );
-        self.selection_auto_dir = if y <= visible_top {
+        self.selection_drag_pointer = Some((x, y));
+        let dir = if y <= visible_top {
             -1
         } else if y >= visible_bottom {
             1
         } else {
             0
         };
+        if dir == 0 {
+            self.selection_auto_dir = 0;
+            self.selection_drag_pointer = None;
+            return;
+        }
+        if self.selection_auto_dir == 0 {
+            self.last_auto_scroll_ms = self.now_ms;
+        }
+        self.selection_auto_dir = dir;
     }
 
     fn auto_scroll_selection(&mut self) {
@@ -1218,6 +1469,11 @@ impl TuiAltScreen {
         let remaining = scroll.scroll_by(dir, self.now_ms);
         if remaining == dir {
             self.selection_auto_dir = 0;
+            return;
+        }
+        if let Some((x, y)) = self.selection_drag_pointer {
+            let point = self.selection_point(x, y, Some(id));
+            self.update_selection_focus(point);
         }
     }
 
@@ -1301,6 +1557,18 @@ impl TuiAltScreen {
     }
 
     fn copy_text(&mut self, text: &str) -> bool {
+        if self.use_copy_handler {
+            self.copy_log.borrow_mut().push(text.to_string());
+            self.flash(
+                if self.copy_ok {
+                    "Copied!"
+                } else {
+                    "Copy failed"
+                },
+                1000,
+            );
+            return self.copy_ok;
+        }
         if let Some(handler) = self.options.copy_selection {
             let ok = handler(text);
             self.flash(if ok { "Copied!" } else { "Copy failed" }, 1000);
@@ -1627,6 +1895,10 @@ impl TuiAltScreen {
     }
 
     pub fn render_now(&mut self) {
+        self.render_now_forced(false);
+    }
+
+    pub fn render_now_forced(&mut self, force: bool) {
         self.sync_document();
         let root = self
             .layout_root
@@ -1665,7 +1937,7 @@ impl TuiAltScreen {
         while screen.len() < self.rows {
             screen.push(String::new());
         }
-        let full = self.previous_screen.is_empty();
+        let full = force || self.previous_screen.is_empty();
         let images_need = screen.iter().enumerate().any(|(row, line)| {
             line != self
                 .previous_screen
@@ -1788,13 +2060,82 @@ fn apply_selection_highlight(text: &str) -> String {
     result
 }
 
-fn is_cjk(segment: &str) -> bool {
-    segment.chars().any(|ch| {
-        matches!(
-            ch,
-            '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}'
-        )
-    })
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}'
+    )
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || is_cjk_char(ch)
+}
+
+fn is_mid_word(ch: char) -> bool {
+    matches!(ch, '.' | '\'' | '\u{2019}' | '\u{00B7}' | '-')
+}
+
+fn word_segments(line: &str) -> Vec<(usize, usize, bool, bool)> {
+    let mut graphemes = Vec::new();
+    let mut col = 0usize;
+    let mut rest = line;
+    while !rest.is_empty() {
+        let Some((segment, next)) = crate::ansi_text::next_grapheme(rest) else {
+            break;
+        };
+        let width = crate::ansi_text::grapheme_width(segment);
+        graphemes.push((segment, col, col + width));
+        col += width;
+        rest = next;
+    }
+    let mut segments = Vec::new();
+    let mut index = 0usize;
+    while index < graphemes.len() {
+        let (segment, start, _) = graphemes[index];
+        if segment.chars().all(char::is_whitespace) {
+            let mut end = graphemes[index].2;
+            index += 1;
+            while index < graphemes.len() && graphemes[index].0.chars().all(char::is_whitespace) {
+                end = graphemes[index].2;
+                index += 1;
+            }
+            segments.push((start, end, false, false));
+            continue;
+        }
+        if segment.chars().any(is_word_char) {
+            let mut end = graphemes[index].2;
+            index += 1;
+            while index < graphemes.len() {
+                let current = graphemes[index].0;
+                if current.chars().any(is_word_char) {
+                    end = graphemes[index].2;
+                    index += 1;
+                    continue;
+                }
+                let mid =
+                    current.chars().count() == 1 && current.chars().next().is_some_and(is_mid_word);
+                if mid
+                    && index + 1 < graphemes.len()
+                    && graphemes[index + 1].0.chars().any(is_word_char)
+                {
+                    end = graphemes[index + 1].2;
+                    index += 2;
+                    continue;
+                }
+                break;
+            }
+            segments.push((start, end, true, false));
+            continue;
+        }
+        let joiner = segment.chars().count() == 1
+            && segment
+                .chars()
+                .next()
+                .is_some_and(|ch| WORD_JOINERS.contains(&ch));
+        segments.push((graphemes[index].1, graphemes[index].2, joiner, joiner));
+        index += 1;
+    }
+    segments
 }
 
 fn parse_wheel(data: &str) -> Option<(i8, usize, usize)> {
@@ -2308,6 +2649,348 @@ mod tests {
         assert!(tui.has_active_selection());
         assert!(tui.writes.iter().all(|w| !w.contains("\u{1b}]52;c;")));
         tui.stop();
+    }
+
+    #[test]
+    fn copy_handler_flashes_success_and_skips_osc52_on_failure() {
+        let mut tui = TuiAltScreen::new(20, 4, TuiAltScreenOptions::default());
+        let copied = tui.set_copy_handler(true);
+        tui.add_child(Node::text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        tui.handle_input("\u{1b}[<0;1;1M");
+        tui.handle_input("\u{1b}[<32;4;2M");
+        tui.handle_input("\u{1b}[<0;4;2m");
+        assert_eq!(copied.borrow().as_slice(), &["alpha\nbeta".to_string()]);
+        assert!(tui.has_active_selection());
+        copied.borrow_mut().clear();
+        assert!(tui.copy_active_selection());
+        assert_eq!(copied.borrow().as_slice(), &["alpha\nbeta".to_string()]);
+        assert!(tui.viewport().iter().any(|line| line.contains("Copied!")));
+        tui.stop();
+
+        let mut tui = TuiAltScreen::new(20, 4, TuiAltScreenOptions::default());
+        tui.set_copy_handler(false);
+        tui.add_child(Node::text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        tui.handle_input("\u{1b}[<0;1;1M");
+        tui.handle_input("\u{1b}[<32;4;2M");
+        tui.handle_input("\u{1b}[<0;4;2m");
+        assert!(tui
+            .viewport()
+            .iter()
+            .any(|line| line.contains("Copy failed")));
+        assert!(tui.writes.iter().all(|w| !w.contains("\u{1b}]52;c;")));
+        tui.stop();
+    }
+
+    #[test]
+    fn double_click_word_selection_skips_trailing_whitespace() {
+        let mut tui = TuiAltScreen::new(20, 1, TuiAltScreenOptions::default());
+        tui.add_child(Node::text("foo  bar"));
+        tui.start();
+        tui.handle_input("\u{1b}[<0;1;1M");
+        tui.handle_input("\u{1b}[<0;1;1m");
+        tui.handle_input("\u{1b}[<0;3;1M");
+        assert!(tui.writes.iter().any(|w| w.contains("foo\u{1b}[27m")));
+        tui.stop();
+    }
+
+    #[test]
+    fn double_click_joins_slash_and_hyphen_paths() {
+        for (line, needle) in [
+            ("extensions/starline/fixed-editor/compositor.ts", "starline"),
+            ("earendil-works/pi-tui", "works"),
+        ] {
+            let mut tui = TuiAltScreen::new(80, 1, TuiAltScreenOptions::default());
+            let copied = tui.set_copy_handler(true);
+            tui.add_child(Node::text(line));
+            tui.start();
+            let col = line.find(needle).unwrap() + 1;
+            let press = format!("\u{1b}[<0;{col};1M");
+            let release = format!("\u{1b}[<0;{col};1m");
+            tui.handle_input(&press);
+            tui.handle_input(&release);
+            tui.handle_input(&press);
+            tui.handle_input(&release);
+            assert_eq!(copied.borrow().as_slice(), &[line.to_string()]);
+            tui.stop();
+        }
+    }
+
+    #[test]
+    fn word_drag_highlights_full_whitespace_segment() {
+        let mut tui = TuiAltScreen::new(20, 1, TuiAltScreenOptions::default());
+        tui.add_child(Node::text("foo  bar"));
+        tui.start();
+        tui.handle_input("\u{1b}[<0;1;1M");
+        tui.handle_input("\u{1b}[<0;1;1m");
+        tui.handle_input("\u{1b}[<0;2;1M");
+        tui.handle_input("\u{1b}[<32;4;1M");
+        assert!(tui.writes.iter().any(|w| w.contains("foo  \u{1b}[27m")));
+        tui.stop();
+    }
+
+    #[test]
+    fn double_click_word_drag_and_triple_click_line() {
+        let mut tui = TuiAltScreen::new(20, 2, TuiAltScreenOptions::default());
+        tui.add_child(Node::text("zero alpha beta\ngamma delta"));
+        tui.start();
+        tui.handle_input("\u{1b}[<0;6;1M");
+        tui.handle_input("\u{1b}[<0;6;1m");
+        tui.handle_input("\u{1b}[<0;10;1M");
+        tui.handle_input("\u{1b}[<0;10;1m");
+        assert!(tui.writes.iter().any(|w| w.contains(&osc52("alpha"))));
+
+        tui.handle_input("\u{1b}[<0;12;1M");
+        tui.handle_input("\u{1b}[<0;12;1m");
+        tui.handle_input("\u{1b}[<0;14;1M");
+        tui.handle_input("\u{1b}[<32;3;2M");
+        tui.handle_input("\u{1b}[<0;3;2m");
+        assert!(tui.writes.iter().any(|w| w.contains(&osc52("beta\ngamma"))));
+
+        tui.handle_input("\u{1b}[<0;7;2M");
+        tui.handle_input("\u{1b}[<0;7;2m");
+        tui.handle_input("\u{1b}[<0;9;2M");
+        tui.handle_input("\u{1b}[<0;9;2m");
+        tui.handle_input("\u{1b}[<0;11;2M");
+        tui.handle_input("\u{1b}[<0;11;2m");
+        assert!(tui.writes.iter().any(|w| w.contains(&osc52("gamma delta"))));
+        tui.stop();
+    }
+
+    #[test]
+    fn focus_loss_idle_zero_width_and_completed_selection() {
+        let mut tui = TuiAltScreen::new(20, 4, TuiAltScreenOptions::default());
+        tui.add_child(Node::text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        let idle_writes = tui.writes.len();
+        tui.handle_input("\u{1b}[O");
+        tui.handle_input("\u{1b}[I");
+        assert_eq!(tui.writes.len(), idle_writes);
+
+        tui.handle_input("\u{1b}[<0;1;1M");
+        tui.handle_input("\u{1b}[<0;1;1m");
+        tui.handle_input("\u{1b}[<32;4;2M");
+        tui.handle_input("\u{1b}[<0;4;2m");
+        assert!(tui.writes.iter().all(|w| !w.contains("\u{1b}]52;c;")));
+
+        tui.handle_input("\u{1b}[<0;1;3M");
+        let pressed_writes = tui.writes.len();
+        tui.handle_input("\u{1b}[O");
+        tui.handle_input("\u{1b}[I");
+        assert_eq!(tui.writes.len(), pressed_writes);
+        tui.handle_input("\u{1b}[<32;4;2M");
+        tui.handle_input("\u{1b}[<0;4;2m");
+        assert!(tui.writes.iter().all(|w| !w.contains("\u{1b}]52;c;")));
+        assert!(tui.writes.iter().any(|w| w.contains("\u{1b}[?1004h")));
+        tui.stop();
+        assert!(tui.writes.iter().any(|w| w.contains("\u{1b}[?1004l")));
+
+        let mut tui = TuiAltScreen::new(20, 4, TuiAltScreenOptions::default());
+        tui.add_child(Node::text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        tui.handle_input("\u{1b}[<0;1;1M");
+        tui.handle_input("\u{1b}[<32;4;2M");
+        let before_focus = tui.writes.len();
+        tui.handle_input("\u{1b}[O");
+        tui.handle_input("\u{1b}[I");
+        let focus_writes = tui.writes[before_focus..].join("");
+        assert!(focus_writes.contains("alpha"));
+        assert!(focus_writes.contains("beta"));
+        assert!(!focus_writes.contains("\u{1b}[7m"));
+        tui.handle_input("\u{1b}[<32;4;2M");
+        tui.handle_input("\u{1b}[<0;4;2m");
+        assert!(tui.writes.iter().all(|w| !w.contains("\u{1b}]52;c;")));
+        tui.stop();
+
+        let mut tui = TuiAltScreen::new(20, 4, TuiAltScreenOptions::default());
+        tui.add_child(Node::text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        tui.handle_input("\u{1b}[<0;1;1M");
+        tui.handle_input("\u{1b}[<32;4;2M");
+        tui.handle_input("\u{1b}[<0;4;2m");
+        let completed = tui.writes.len();
+        tui.handle_input("\u{1b}[O");
+        tui.handle_input("\u{1b}[I");
+        assert_eq!(tui.writes.len(), completed);
+        tui.render_now_forced(true);
+        let redraw = tui.writes.last().cloned().unwrap_or_default();
+        assert!(redraw.contains("alpha"));
+        assert!(redraw.contains("beta"));
+        assert!(redraw.contains("\u{1b}[7m"));
+        tui.stop();
+    }
+
+    #[test]
+    fn auto_scroll_extends_drag_at_viewport_edge() {
+        let mut tui = TuiAltScreen::new(20, 4, TuiAltScreenOptions::default());
+        tui.add_child(lines(10));
+        tui.start();
+        assert_eq!(tui.viewport_top(), 6);
+        tui.handle_input("\u{1b}[<0;1;3M");
+        tui.handle_input("\u{1b}[<32;1;1M");
+        tui.advance_ms(130);
+        let selection_top = tui.viewport_top();
+        assert!(
+            selection_top < 6,
+            "expected auto-scroll above row 6, got {selection_top}"
+        );
+        tui.handle_input("\u{1b}[<0;1;1m");
+        let mut selected: Vec<String> = (0..8usize.saturating_sub(selection_top))
+            .map(|index| format!("line {}", selection_top + index + 1))
+            .collect();
+        selected.push("l".into());
+        assert!(tui
+            .writes
+            .iter()
+            .any(|w| w.contains(&osc52(&selected.join("\n")))));
+        tui.stop();
+    }
+
+    #[test]
+    fn cjk_emoji_and_combining_grapheme_selection() {
+        let mut tui = TuiAltScreen::new(20, 2, TuiAltScreenOptions::default());
+        tui.add_child(Node::text("A界🙂éZ"));
+        tui.start();
+        let wide = osc52("界🙂");
+        tui.handle_input("\u{1b}[<0;3;1M");
+        tui.handle_input("\u{1b}[<32;4;1M");
+        tui.handle_input("\u{1b}[<0;4;1m");
+        assert_eq!(tui.writes.iter().filter(|w| w.contains(&wide)).count(), 1);
+        tui.handle_input("\u{1b}[<0;5;1M");
+        tui.handle_input("\u{1b}[<32;2;1M");
+        tui.handle_input("\u{1b}[<0;2;1m");
+        assert_eq!(tui.writes.iter().filter(|w| w.contains(&wide)).count(), 2);
+        tui.handle_input("\u{1b}[<0;6;1M");
+        tui.handle_input("\u{1b}[<32;7;1M");
+        tui.handle_input("\u{1b}[<0;7;1m");
+        assert!(tui.writes.iter().any(|w| w.contains(&osc52("éZ"))));
+        tui.stop();
+    }
+
+    #[test]
+    fn ignores_horizontal_trackpad_wheel() {
+        let mut tui = TuiAltScreen::new(20, 4, TuiAltScreenOptions::default());
+        tui.add_child(lines(8));
+        tui.start();
+        tui.handle_input("\u{1b}[<66;1;1M");
+        tui.handle_input("\u{1b}[<67;1;1M");
+        assert_eq!(tui.viewport_top(), 4);
+        assert_eq!(
+            trim_view(&tui),
+            vec!["line 5", "line 6", "line 7", "line 8"]
+        );
+        tui.stop();
+    }
+
+    #[test]
+    fn focused_overlay_receives_wheel_and_viewport_keys() {
+        let mut tui = TuiAltScreen::new(20, 6, TuiAltScreenOptions::default());
+        tui.add_child(lines(12));
+        let overlay = InputOverlay::new();
+        tui.start();
+        let top_before = tui.viewport_top();
+        let handle = tui.show_overlay(overlay.clone(), OverlayShowOptions::default());
+        assert!(overlay.focused());
+        let keys = [
+            "\u{1b}[5~",
+            "\u{1b}[6~",
+            "\u{1b}OH",
+            "\u{1b}OF",
+            "\u{1b}[<64;10;3M",
+        ];
+        for key in keys {
+            tui.handle_input(key);
+        }
+        assert_eq!(overlay.inputs(), keys);
+        assert_eq!(tui.viewport_top(), top_before);
+        tui.hide_overlay(&handle);
+        tui.handle_input("\u{1b}[5~");
+        assert!(tui.viewport_top() < top_before);
+        tui.stop();
+    }
+
+    #[test]
+    fn unfocused_overlays_keep_viewport_scrolling() {
+        let mut tui = TuiAltScreen::new(20, 6, TuiAltScreenOptions::default());
+        let editor = InputOverlay::new();
+        tui.add_child(lines(12));
+        tui.set_focus(&editor);
+        tui.start();
+        let top_before = tui.viewport_top();
+        let hidden = tui.show_overlay(InputOverlay::new(), OverlayShowOptions::default());
+        tui.set_overlay_hidden(&hidden, true);
+        let non_capturing = InputOverlay::new();
+        tui.show_overlay(
+            non_capturing.clone(),
+            OverlayShowOptions {
+                non_capturing: true,
+            },
+        );
+        let unfocused = InputOverlay::new();
+        let unfocused_handle = tui.show_overlay(unfocused.clone(), OverlayShowOptions::default());
+        tui.unfocus_overlay(&unfocused_handle);
+        assert!(!non_capturing.focused());
+        assert!(!unfocused.focused());
+        tui.handle_input("\u{1b}[5~");
+        tui.handle_input("\u{1b}[<64;10;3M");
+        assert!(tui.viewport_top() < top_before);
+        assert!(non_capturing.inputs().is_empty());
+        assert!(unfocused.inputs().is_empty());
+        tui.stop();
+    }
+
+    #[test]
+    fn search_focus_keeps_viewport_scrolling() {
+        let mut tui = TuiAltScreen::new(20, 6, TuiAltScreenOptions::default());
+        tui.add_child(lines(12));
+        tui.start();
+        let top_before = tui.viewport_top();
+        tui.handle_input("\u{1b}[102;6u");
+        assert!(tui
+            .viewport()
+            .iter()
+            .any(|line| line.contains("Find transcript")));
+        tui.handle_input("\u{1b}[5~");
+        tui.handle_input("\u{1b}[<64;1;4M");
+        assert!(tui.viewport_top() < top_before);
+        assert!(tui
+            .viewport()
+            .iter()
+            .any(|line| line.contains("Find transcript")));
+        tui.stop();
+    }
+
+    #[test]
+    fn right_click_paste_windows_only_outside_vscode() {
+        let mut tui = TuiAltScreen::new(
+            20,
+            4,
+            TuiAltScreenOptions {
+                platform_windows: true,
+                on_right_click_paste: Some(|| {}),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        tui.start();
+        tui.handle_input("\u{1b}[<2;1;1M");
+        tui.handle_input("\u{1b}[<2;1;1m");
+        assert_eq!(tui.right_click_pastes(), 1);
+        tui.options.term_program_vscode = true;
+        tui.handle_input("\u{1b}[<2;1;1M");
+        assert_eq!(tui.right_click_pastes(), 1);
+        tui.options.term_program_vscode = false;
+        tui.options.platform_windows = false;
+        tui.handle_input("\u{1b}[<2;1;1M");
+        assert_eq!(tui.right_click_pastes(), 1);
+        tui.stop();
+    }
+
+    fn osc52(text: &str) -> String {
+        format!(
+            "\u{1b}]52;c;{}\u{07}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes())
+        )
     }
 
     fn trim_view(tui: &TuiAltScreen) -> Vec<String> {

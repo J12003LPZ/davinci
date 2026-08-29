@@ -212,47 +212,32 @@ pub fn composite_tui_line(
     overlay_width: usize,
     total_width: usize,
 ) -> String {
-    let before = pad_to_width("", start_col.min(total_width));
-    let overlay = pad_to_width(
-        overlay_line,
-        overlay_width.min(total_width.saturating_sub(start_col)),
+    if is_image_line(base_line) {
+        return base_line.to_string();
+    }
+    let after_start = start_col.saturating_add(overlay_width);
+    let after_len = total_width.saturating_sub(after_start);
+    let before = crate::ansi_text::slice_by_column(base_line, 0, start_col, true);
+    let overlay = crate::ansi_text::slice_by_column(overlay_line, 0, overlay_width, true);
+    let before_width = visible_width(&before);
+    let overlay_drawn = visible_width(&overlay);
+    let before_pad = start_col.saturating_sub(before_width);
+    let overlay_pad = overlay_width.saturating_sub(overlay_drawn);
+    let actual_before = start_col.max(before_width);
+    let actual_overlay = overlay_width.max(overlay_drawn);
+    let after_target = total_width.saturating_sub(actual_before.saturating_add(actual_overlay));
+    let after = crate::ansi_text::slice_by_column(base_line, after_start, after_len, true);
+    let after_pad = after_target.saturating_sub(visible_width(&after));
+    let result = format!(
+        "{before}{}{SEGMENT_RESET}{overlay}{}{SEGMENT_RESET}{after}{}",
+        pad_to_width("", before_pad),
+        pad_to_width("", overlay_pad),
+        pad_to_width("", after_pad)
     );
-    let used = visible_width(&before) + visible_width(&overlay);
-    let after_width = total_width.saturating_sub(used);
-    let after = if after_width == 0 {
-        String::new()
-    } else {
-        let base_tail = {
-            let mut skipped = 0;
-            let mut rest = String::new();
-            let mut chars = base_line.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if ch == '\u{1b}' {
-                    if chars.peek() == Some(&'[') {
-                        chars.next();
-                        for next in chars.by_ref() {
-                            if next.is_ascii_alphabetic() {
-                                break;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                if skipped >= start_col + overlay_width {
-                    rest.push(ch);
-                }
-                skipped += w;
-            }
-            rest
-        };
-        pad_to_width(&base_tail, after_width)
-    };
-    let result = format!("{before}{SEGMENT_RESET}{overlay}{SEGMENT_RESET}{after}");
     if visible_width(&result) <= total_width {
         result
     } else {
-        truncate_visible(&result, total_width)
+        crate::ansi_text::slice_by_column(&result, 0, total_width, true)
     }
 }
 
@@ -357,6 +342,19 @@ mod tests {
         let line = composite_tui_line("", &"X".repeat(100), 0, 20, 80);
         assert!(visible_width(&line) <= 80);
         assert!(visible_width(&line) >= 20);
+    }
+
+    #[test]
+    fn composite_keeps_base_text_before_overlay() {
+        let line = composite_tui_line(
+            "\u{1b}[7malpha\u{1b}[27m",
+            "\u{1b}[7m Copied! \u{1b}[27m",
+            11,
+            9,
+            20,
+        );
+        assert!(line.contains("alpha"), "{line:?}");
+        assert!(line.contains("Copied!"), "{line:?}");
     }
 
     #[test]
