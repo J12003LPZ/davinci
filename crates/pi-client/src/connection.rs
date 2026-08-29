@@ -356,10 +356,10 @@ impl Connection {
             Some(transport) => transport.send(frame),
             None => Err(ClientError::Protocol("Pi client is disconnected".into())),
         };
-        let still_current = self.state() != ConnectionState::Disconnected;
-        let mut inner = self.inner.borrow_mut();
-        if still_current && inner.transport.is_none() {
-            inner.transport = transport;
+        let restore = self.state() != ConnectionState::Disconnected
+            && self.inner.borrow().transport.is_none();
+        if restore {
+            self.inner.borrow_mut().transport = transport;
         } else if let Some(mut leftover) = transport {
             leftover.close();
         }
@@ -662,7 +662,8 @@ mod tests {
             None,
         )
         .unwrap();
-        connection.handle_data(connection.inner.borrow().current_id, &frame);
+        let id = connection.inner.borrow().current_id;
+        connection.handle_data(id, &frame);
         assert_eq!(connection.state(), ConnectionState::Disconnected);
     }
 
