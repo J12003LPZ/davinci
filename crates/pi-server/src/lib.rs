@@ -180,16 +180,9 @@ impl MemoryService {
     }
 }
 
+#[derive(Default)]
 pub struct PiServer {
     pub service: MemoryService,
-}
-
-impl Default for PiServer {
-    fn default() -> Self {
-        Self {
-            service: MemoryService::new(),
-        }
-    }
 }
 
 impl PiServer {
