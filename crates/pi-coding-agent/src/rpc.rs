@@ -203,6 +203,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
         "set_auto_compaction" => {
             if let Some(enabled) = command.enabled {
                 runtime.agent.auto_compaction = enabled;
+                runtime.agent.compaction.enabled = enabled;
             }
             ok(id, &kind, None)
         }

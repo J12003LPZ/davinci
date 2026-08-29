@@ -56,9 +56,24 @@ pub fn default_session_dir() -> PathBuf {
 }
 
 pub fn resolve_session_dir(explicit: Option<&str>) -> PathBuf {
-    explicit
-        .map(expand_tilde)
-        .unwrap_or_else(default_session_dir)
+    resolve_session_dir_from(explicit, None)
+}
+
+/// TS session dir order: `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, `settings.sessionDir`, default.
+pub fn resolve_session_dir_from(explicit: Option<&str>, settings_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = explicit.map(str::trim).filter(|dir| !dir.is_empty()) {
+        return expand_tilde(dir);
+    }
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return expand_tilde(trimmed);
+        }
+    }
+    if let Some(dir) = settings_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        return expand_tilde(dir);
+    }
+    default_agent_dir().join("sessions")
 }
 
 pub fn encode_cwd_component(cwd: &str) -> String {
@@ -282,5 +297,29 @@ mod tests {
             .find(|session| session.id == first.header.id)
             .unwrap();
         assert_eq!(found.all_messages_text, "a");
+    }
+
+    #[test]
+    fn session_dir_resolution_matches_ts_order() {
+        let previous = std::env::var_os("PI_CODING_AGENT_SESSION_DIR");
+        std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+        assert_eq!(
+            resolve_session_dir_from(Some("~/sessions"), Some("/settings/sessions")),
+            expand_tilde("~/sessions")
+        );
+        assert_eq!(
+            resolve_session_dir_from(None, Some("~/from-settings")),
+            expand_tilde("~/from-settings")
+        );
+        std::env::set_var("PI_CODING_AGENT_SESSION_DIR", "/env/sessions");
+        assert_eq!(
+            resolve_session_dir_from(None, Some("/settings/sessions")),
+            PathBuf::from("/env/sessions")
+        );
+        std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
+        }
     }
 }

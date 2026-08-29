@@ -12,8 +12,8 @@ pub use codec::{
 };
 pub use discovery::{
     cwd_encoded_dir, default_agent_dir, default_session_dir, discover_sessions,
-    encode_cwd_component, expand_tilde, latest_session, resolve_session_dir, resolve_session_ref,
-    SessionSummary,
+    encode_cwd_component, expand_tilde, latest_session, resolve_session_dir,
+    resolve_session_dir_from, resolve_session_ref, SessionSummary,
 };
 pub use errors::{JsonlDecodeError, SessionError};
 pub use tree::{

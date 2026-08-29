@@ -84,14 +84,35 @@ fn parse_version_header(rest: &str) -> Option<(u32, u32, u32)> {
 }
 
 pub fn format_changelog(entries: &[ChangelogEntry]) -> String {
-    if entries.is_empty() {
+    format_changelog_since(entries, None)
+}
+
+pub fn format_changelog_since(entries: &[ChangelogEntry], since: Option<&str>) -> String {
+    let filtered: Vec<&ChangelogEntry> = match since.and_then(parse_version_string) {
+        Some((major, minor, patch)) => entries
+            .iter()
+            .filter(|entry| (entry.major, entry.minor, entry.patch) > (major, minor, patch))
+            .collect(),
+        None => entries.iter().collect(),
+    };
+    if filtered.is_empty() {
         return "No changelog entries found.".into();
     }
-    entries
+    filtered
         .iter()
         .map(|entry| entry.content.clone())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn parse_version_string(value: &str) -> Option<(u32, u32, u32)> {
+    let trimmed = value.trim().trim_start_matches('v');
+    let mut parts = trimmed.split('.');
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ))
 }
 
 #[cfg(test)]
@@ -113,5 +134,9 @@ mod tests {
             (entries[1].major, entries[1].minor, entries[1].patch),
             (0, 83, 0)
         );
+        assert!(format_changelog(&entries).contains("- older"));
+        let newer = format_changelog_since(&entries, Some("0.83.0"));
+        assert!(newer.contains("- first"));
+        assert!(!newer.contains("- older"));
     }
 }

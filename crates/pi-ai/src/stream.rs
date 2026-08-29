@@ -5,8 +5,21 @@ use uuid::Uuid;
 use crate::auth::ResolvedAuth;
 use crate::catalog::Model;
 use crate::content_text;
+use crate::thinking::{
+    clamp_thinking_budget_to_answer_room, google_thinking_budget, thinking_budget_for_level,
+    ThinkingBudgets,
+};
 use crate::{ChatMessage, MessageContent, ToolSpec};
-use pi_protocol::Usage;
+use pi_protocol::{ThinkingLevel, Usage};
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamOptions {
+    pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_budgets: Option<ThinkingBudgets>,
+    pub timeout_ms: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub max_retry_delay_ms: Option<u64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -283,9 +296,31 @@ pub fn live_complete(
     system: Option<&str>,
     tools: &[ToolSpec],
 ) -> Result<AssistantMessage, String> {
-    let body = request_body(model, messages, system, tools);
+    live_complete_with(
+        model,
+        messages,
+        auth,
+        system,
+        tools,
+        &StreamOptions::default(),
+    )
+}
+
+pub fn live_complete_with(
+    model: &Model,
+    messages: &[ChatMessage],
+    auth: &ResolvedAuth,
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+) -> Result<AssistantMessage, String> {
+    let body = request_body_with(model, messages, system, tools, options);
     let url = request_url(model, auth);
     let mut request = ureq::post(&url);
+    if let Some(timeout_ms) = options.timeout_ms.filter(|ms| *ms > 0) {
+        request = request.timeout(std::time::Duration::from_millis(timeout_ms));
+    }
+    let _ = (options.max_retries, options.max_retry_delay_ms);
     for (key, value) in &auth.headers {
         request = request.set(key, value);
     }
@@ -319,12 +354,26 @@ pub fn request_body(
     system: Option<&str>,
     tools: &[ToolSpec],
 ) -> Value {
+    request_body_with(model, messages, system, tools, &StreamOptions::default())
+}
+
+pub fn request_body_with(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+) -> Value {
     match model.api.as_str() {
-        "anthropic-messages" | "pi-messages" => anthropic_body(model, messages, system, tools),
-        "google-generative-ai" | "google-vertex" => google_body(model, messages, system, tools),
+        "anthropic-messages" | "pi-messages" => {
+            anthropic_body(model, messages, system, tools, options)
+        }
+        "google-generative-ai" | "google-vertex" => {
+            google_body(model, messages, system, tools, options)
+        }
         "bedrock-converse-stream" => bedrock_body(model, messages, system, tools),
         "mistral-conversations" => mistral_body(model, messages, system, tools),
-        _ => openai_body(model, messages, system, tools),
+        _ => openai_body(model, messages, system, tools, options),
     }
 }
 
@@ -473,7 +522,7 @@ fn mistral_body(
     system: Option<&str>,
     tools: &[ToolSpec],
 ) -> Value {
-    let mut body = openai_body(model, messages, system, tools);
+    let mut body = openai_body(model, messages, system, tools, &StreamOptions::default());
     body["stream"] = Value::Bool(false);
     body
 }
@@ -508,6 +557,7 @@ fn openai_body(
     messages: &[ChatMessage],
     system: Option<&str>,
     tools: &[ToolSpec],
+    options: &StreamOptions,
 ) -> Value {
     let mut out = Vec::new();
     if let Some(system) = system {
@@ -578,7 +628,44 @@ fn openai_body(
                 .collect(),
         );
     }
+    apply_openai_thinking(&mut body, model, options);
     body
+}
+
+fn apply_openai_thinking(body: &mut Value, model: &Model, options: &StreamOptions) {
+    let Some(level) = options
+        .thinking_level
+        .filter(|level| *level != ThinkingLevel::Off)
+    else {
+        return;
+    };
+    let field = model
+        .compat
+        .get("thinkingTokenBudgetField")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            model
+                .compat
+                .get("supportsThinkingTokenBudget")
+                .and_then(Value::as_bool)
+                .filter(|enabled| *enabled)
+                .map(|_| "thinking_token_budget")
+        });
+    let Some(field) = field else {
+        return;
+    };
+    let ceiling = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| body.get("max_completion_tokens").and_then(Value::as_u64))
+        .unwrap_or(model.max_tokens) as u32;
+    let budget = clamp_thinking_budget_to_answer_room(
+        thinking_budget_for_level(level, options.thinking_budgets.as_ref()),
+        ceiling,
+    );
+    if budget > 0 {
+        body[field] = Value::from(budget);
+    }
 }
 
 fn anthropic_body(
@@ -586,6 +673,7 @@ fn anthropic_body(
     messages: &[ChatMessage],
     system: Option<&str>,
     tools: &[ToolSpec],
+    options: &StreamOptions,
 ) -> Value {
     let converted: Vec<Value> = messages
         .iter()
@@ -657,6 +745,23 @@ fn anthropic_body(
                 .collect(),
         );
     }
+    if let Some(level) = options
+        .thinking_level
+        .filter(|level| *level != ThinkingLevel::Off)
+    {
+        let budget = thinking_budget_for_level(level, options.thinking_budgets.as_ref());
+        let max_tokens = body
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(model.max_tokens) as u32;
+        let budget = clamp_thinking_budget_to_answer_room(budget, max_tokens);
+        if budget > 0 {
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
+    }
     body
 }
 
@@ -665,6 +770,7 @@ fn google_body(
     messages: &[ChatMessage],
     system: Option<&str>,
     tools: &[ToolSpec],
+    options: &StreamOptions,
 ) -> Value {
     let contents: Vec<Value> = messages
         .iter()
@@ -688,7 +794,15 @@ fn google_body(
             })).collect::<Vec<_>>()
         }]);
     }
-    let _ = model;
+    if let Some(level) = options
+        .thinking_level
+        .filter(|level| *level != ThinkingLevel::Off)
+    {
+        let budget = google_thinking_budget(&model.id, level, options.thinking_budgets.as_ref());
+        body["generationConfig"] = serde_json::json!({
+            "thinkingConfig": { "thinkingBudget": budget }
+        });
+    }
     body
 }
 
@@ -932,5 +1046,44 @@ mod tests {
             .content
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolCall { .. })));
+    }
+
+    #[test]
+    fn request_body_applies_thinking_budgets() {
+        let mut anthropic = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("anthropic");
+        anthropic.max_tokens = 8192;
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::Medium),
+            thinking_budgets: Some(ThinkingBudgets {
+                medium: Some(4096),
+                ..ThinkingBudgets::default()
+            }),
+            ..StreamOptions::default()
+        };
+        let body = request_body_with(&anthropic, &[], None, &[], &options);
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
+
+        let mut google = load_builtin_models()
+            .into_iter()
+            .find(|m| m.id.contains("2.5-pro") && m.api.starts_with("google"))
+            .expect("gemini 2.5 pro");
+        google.max_tokens = 8192;
+        let google_body = request_body_with(&google, &[], None, &[], &options);
+        assert_eq!(
+            google_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            4096
+        );
+
+        let mut openai = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api.contains("openai"))
+            .expect("openai");
+        openai.compat = serde_json::json!({"thinkingTokenBudgetField": "thinking_budget"});
+        openai.max_tokens = 8192;
+        let openai_body = request_body_with(&openai, &[], None, &[], &options);
+        assert_eq!(openai_body["thinking_budget"], 4096);
     }
 }

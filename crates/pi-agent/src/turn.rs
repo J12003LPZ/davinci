@@ -69,8 +69,13 @@ impl Agent {
 
             self.inject_queued(&mut events, &mut new_messages, true);
 
-            if self.auto_compaction && self.messages.len() > 24 {
-                let _ = self.compact(None);
+            if self.auto_compaction {
+                let tokens = crate::estimate_context_tokens(&self.messages);
+                let mut settings = self.compaction;
+                settings.enabled = true;
+                if crate::should_compact(tokens, self.context_window, &settings) {
+                    let _ = self.compact(None);
+                }
             }
 
             let assistant = match self.complete_with_retry(&mut complete) {
@@ -269,7 +274,7 @@ impl Agent {
             1
         };
         let mut last_error = None;
-        for _ in 0..attempts {
+        for attempt in 0..attempts {
             if self.aborted {
                 return Ok(AssistantMessage {
                     id: crate::new_message_id(),
@@ -283,7 +288,12 @@ impl Agent {
             }
             match complete(self) {
                 Ok(message) => return Ok(message),
-                Err(err) => last_error = Some(err),
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt + 1 < attempts {
+                        sleep_retry_delay(retry_delay_ms(self.retry_base_delay_ms, attempt));
+                    }
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| "Provider request failed".into()))
@@ -341,4 +351,17 @@ impl Agent {
             let _ = session.append_entry(pi_session::SessionEntry::message(&message.role, content));
         }
     }
+}
+
+/// TS `baseDelayMs * 2 ** (attempt - 1)` with attempt starting at 1.
+pub fn retry_delay_ms(base_delay_ms: u64, zero_based_attempt: u32) -> u64 {
+    let shift = zero_based_attempt.min(20);
+    base_delay_ms.saturating_mul(1_u64 << shift)
+}
+
+fn sleep_retry_delay(delay_ms: u64) {
+    if delay_ms == 0 || cfg!(test) {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 }

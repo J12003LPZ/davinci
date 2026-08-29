@@ -27,13 +27,13 @@ use pi_agent::{
 };
 use pi_ai::{
     apply_config_auth_with_shell, apply_models_config, content_text, find_model,
-    format_no_models_available_message, fuzzy_models, live_complete, load_builtin_models,
+    format_no_models_available_message, fuzzy_models, live_complete_with, load_builtin_models,
     models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
     ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
-    StopReason, ToolSpec, NO_MODELS_AVAILABLE,
+    StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE,
 };
 use pi_session::{
-    default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir,
+    default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir_from,
     resolve_session_ref, JsonlSession, SessionEntry,
 };
 use pi_tui::{
@@ -55,8 +55,9 @@ use external_editor::{clipboard_image_png, clipboard_text, ExternalEditor};
 use packages::handle_package_command;
 use rpc::{handle_rpc, RpcCommand, RpcRuntime};
 use settings::{
-    default_project_trust_value, is_trusted, load_settings, save_settings, set_enable_analytics,
-    settings_path, should_run_first_time_setup, to_interactive_config,
+    apply_http_proxy_settings, default_project_trust_value, is_trusted, load_merged_settings,
+    load_settings, save_settings, set_enable_analytics, settings_path, should_run_first_time_setup,
+    to_interactive_config,
 };
 use slash::SlashAction;
 
@@ -72,6 +73,12 @@ fn main() {
 }
 
 fn run(raw: Vec<String>) -> Result<i32, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    apply_http_proxy_settings(
+        load_merged_settings(&default_agent_dir(), &cwd)
+            .http_proxy
+            .as_deref(),
+    );
     if experimental::is_experimental_command(raw.first().map(String::as_str)) {
         let command = raw[0].as_str();
         if raw.iter().any(|a| a == "--help" || a == "-h") {
@@ -137,8 +144,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         return export_session(&parsed, export);
     }
 
-    let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
     let mut agent = build_agent(&parsed, &session_dir, &cwd)?;
 
@@ -155,6 +161,14 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         migrations::show_deprecation_warnings(&migrations.deprecation_warnings);
     }
     run_interactive(&parsed, &mut agent, &migrations.migrated_auth_providers)
+}
+
+fn resolved_session_dir(parsed: &Args, cwd: &Path) -> PathBuf {
+    let settings = load_merged_settings(&default_agent_dir(), cwd);
+    resolve_session_dir_from(
+        parsed.session_dir.as_deref(),
+        settings.session_dir_normalized().as_deref(),
+    )
 }
 
 fn is_package_command(command: Option<&str>) -> bool {
@@ -179,11 +193,23 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         prompt.push_str(&text);
     }
     let mut agent = Agent::new(prompt);
+    let settings = load_merged_settings(&default_agent_dir(), cwd);
+    apply_http_proxy_settings(settings.http_proxy.as_deref());
     if let Some(level) = parsed.thinking {
+        agent.thinking_level = level;
+    } else if let Some(level) = settings
+        .default_thinking_level
+        .as_deref()
+        .and_then(pi_protocol::ThinkingLevel::parse)
+    {
         agent.thinking_level = level;
     }
     if parsed.no_tools || parsed.no_builtin_tools {
         agent.tools.clear();
+    } else if parsed.tools.is_empty() {
+        if let Some(tools) = &settings.default_tools {
+            agent.tools = tools.clone();
+        }
     }
     if !parsed.tools.is_empty() {
         agent.tools = parsed.tools.clone();
@@ -194,18 +220,35 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if !parsed.no_skills {
         let mut roots: Vec<PathBuf> = parsed.skills.iter().map(PathBuf::from).collect();
         roots.push(cwd.join(".pi").join("skills"));
+        if let Some(extra) = &settings.skills {
+            roots.extend(extra.iter().map(PathBuf::from));
+        }
         agent.skills = discover_skills(&roots);
     }
     if !parsed.no_prompt_templates {
         let mut roots: Vec<PathBuf> = parsed.prompt_templates.iter().map(PathBuf::from).collect();
         roots.push(cwd.join(".pi").join("prompts"));
+        if let Some(extra) = &settings.prompts {
+            roots.extend(extra.iter().map(PathBuf::from));
+        }
         agent.templates = discover_prompt_templates(&roots);
     }
     agent.context_files = load_context_files(cwd, !parsed.no_context_files);
     if !parsed.no_session {
         agent.session = Some(resolve_or_create_session(parsed, session_dir, cwd)?);
     }
-    let settings = load_settings(&default_agent_dir());
+    agent.auto_compaction = settings.compaction_enabled();
+    agent.compaction = settings.compaction_settings();
+    agent.auto_retry = settings.retry_enabled();
+    agent.retry_attempts = settings.retry_max_retries();
+    agent.retry_base_delay_ms = settings.retry_base_delay_ms();
+    agent.provider_timeout_ms = settings.provider_timeout_ms();
+    agent.provider_max_retries = settings.provider_max_retries();
+    agent.provider_max_retry_delay_ms = settings.provider_max_retry_delay_ms();
+    agent.thinking_budgets = settings.thinking_budgets.clone();
+    if let Some(ms) = settings.websocket_connect_timeout_ms {
+        std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", ms.to_string());
+    }
     if let Some(path) = settings.shell_path.as_deref() {
         std::env::set_var("PI_SHELL", path);
     }
@@ -235,6 +278,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     );
     agent.provider = provider;
     agent.model_id = model_id;
+    if let Some(model) = find_model(&available_models(parsed), &agent.provider, &agent.model_id) {
+        agent.context_window = model.context_window;
+    }
     if let Some(key) = &parsed.api_key {
         if let Ok(mut storage) = AuthStorage::create() {
             storage.set_runtime_override(&agent.provider, key);
@@ -535,8 +581,8 @@ fn list_models(list: &ListModels) -> Result<i32, String> {
 }
 
 fn export_session(parsed: &Args, export: &str) -> Result<i32, String> {
-    let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let session_dir = resolved_session_dir(parsed, &cwd);
     let session = if Path::new(export).exists() {
         JsonlSession::open(Path::new(export)).map_err(|err| err.to_string())?
     } else {
@@ -693,12 +739,19 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                 .map(|m| content_text(&m.content).len())
                 .unwrap_or(0);
             match (offline, model.as_ref(), auth.as_ref()) {
-                (false, Some(model), Some(auth)) => live_complete(
+                (false, Some(model), Some(auth)) => live_complete_with(
                     model,
                     &current.messages,
                     auth,
                     Some(&current.system_prompt),
                     &tools,
+                    &StreamOptions {
+                        thinking_level: Some(current.thinking_level),
+                        thinking_budgets: current.thinking_budgets.clone(),
+                        timeout_ms: current.provider_timeout_ms,
+                        max_retries: current.provider_max_retries,
+                        max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
+                    },
                 ),
                 _ => Ok(AssistantMessage {
                     id: pi_agent::new_message_id(),
@@ -924,7 +977,7 @@ fn run_interactive(
         .map(|name| (*name).to_string())
         .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
         .collect();
-    let stored = load_settings(&default_agent_dir());
+    let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     session.double_escape_action =
         DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
     session.autocomplete_max_visible =
@@ -943,6 +996,9 @@ fn run_interactive(
     };
     session.keybindings = Keybindings::load(&default_agent_dir());
     session.warnings_anthropic_extra_usage = stored.warnings.anthropic_extra_usage.unwrap_or(true);
+    session.branch_summary_skip_prompt = stored.branch_summary_skip_prompt();
+    session.branch_summary_reserve_tokens = stored.branch_summary_reserve_tokens();
+    let _indent = stored.code_block_indent();
     if let Some(levels) = stored.model_thinking_levels.clone() {
         session.model_thinking_levels = levels;
     }
@@ -1146,7 +1202,7 @@ fn apply_session_action(
             Ok(true)
         }
         SessionAction::SelectSession(id) => {
-            let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+            let session_dir = resolved_session_dir(parsed, &agent.cwd);
             let summary =
                 resolve_session_ref(&session_dir, Some(&agent.cwd.to_string_lossy()), &id)
                     .map_err(|err| err.to_string())?;
@@ -1221,8 +1277,7 @@ fn apply_session_action(
             Ok(true)
         }
         SessionAction::ExtensionEditor(value) => {
-            session.chrome.status = format!("extension-editor={}", value.unwrap_or_default());
-            session.extension_dialog_context = None;
+            handle_branch_summary_editor(agent, session, value);
             Ok(true)
         }
         SessionAction::ExtensionConfirm(value) => {
@@ -1256,10 +1311,7 @@ fn apply_session_action(
             Ok(true)
         }
         SessionAction::OpenLogin => Ok(true),
-        SessionAction::SelectTreeEntry(id) => {
-            session.chrome.status = format!("tree={id}");
-            Ok(true)
-        }
+        SessionAction::SelectTreeEntry(id) => select_tree_entry(agent, session, id),
         SessionAction::FirstTimeSubmit {
             theme,
             share_analytics,
@@ -1503,7 +1555,7 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::NewSession => {
-            let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+            let session_dir = resolved_session_dir(parsed, &agent.cwd);
             let session = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
             agent.messages.clear();
@@ -1568,7 +1620,7 @@ fn handle_user_line(
         }
         SlashAction::Fork => {
             if let Some(session) = &agent.session {
-                let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+                let session_dir = resolved_session_dir(parsed, &agent.cwd);
                 let next = session
                     .fork(
                         session.leaf_id.as_deref().unwrap_or(&session.header.id),
@@ -1582,7 +1634,7 @@ fn handle_user_line(
         }
         SlashAction::Clone => {
             if let Some(session) = &agent.session {
-                let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+                let session_dir = resolved_session_dir(parsed, &agent.cwd);
                 let next = session
                     .clone_session(&session_dir)
                     .map_err(|e| e.to_string())?;
@@ -1671,7 +1723,11 @@ fn handle_user_line(
         }
         SlashAction::Changelog => {
             let entries = changelog::parse_changelog(&changelog::changelog_path());
-            let text = changelog::format_changelog(&entries);
+            let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
+            let text = match stored.last_changelog_version.as_deref() {
+                Some(since) => changelog::format_changelog_since(&entries, Some(since)),
+                None => changelog::format_changelog(&entries),
+            };
             chrome.transcript.push("changelog", &text);
             chrome.status = "changelog".into();
             println!("{text}");
@@ -1705,7 +1761,14 @@ fn reload_interactive_resources(
 }
 
 fn available_themes() -> Vec<Theme> {
-    load_themes_from_dir(&default_agent_dir().join("themes"))
+    let mut themes = load_themes_from_dir(&default_agent_dir().join("themes"));
+    let settings = load_settings(&default_agent_dir());
+    if let Some(paths) = &settings.themes {
+        for path in paths {
+            themes.extend(load_themes_from_dir(Path::new(path)));
+        }
+    }
+    themes
 }
 
 fn share_current_session(agent: &Agent) -> Result<String, String> {
@@ -2739,12 +2802,18 @@ fn show_llama_catalog(session: &mut InteractiveSession, url: &str) -> Result<(),
 }
 
 fn handle_extension_select(
-    _parsed: &Args,
-    _agent: &mut Agent,
+    parsed: &Args,
+    agent: &mut Agent,
     session: &mut InteractiveSession,
     choice: Option<String>,
 ) -> Result<bool, String> {
     let context = session.extension_dialog_context.take();
+    if let Some(id) = context
+        .as_deref()
+        .and_then(|value| value.strip_prefix("branch-summary:"))
+    {
+        return handle_branch_summary_choice(parsed, agent, session, id, choice);
+    }
     let Some(choice) = choice else {
         session.chrome.status = "extension-select cancelled".into();
         return Ok(true);
@@ -3317,8 +3386,8 @@ fn handle_extension_confirm(session: &mut InteractiveSession, confirmed: bool) {
     session.chrome.status = format!("extension-confirm={confirmed}");
 }
 
-fn discover_session_items(parsed: &Args, _agent: &Agent) -> Result<Vec<SessionItem>, String> {
-    let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+fn discover_session_items(parsed: &Args, agent: &Agent) -> Result<Vec<SessionItem>, String> {
+    let session_dir = resolved_session_dir(parsed, &agent.cwd);
     let sessions = discover_sessions(&session_dir, None).map_err(|err| err.to_string())?;
     Ok(sessions
         .into_iter()
@@ -3368,7 +3437,7 @@ fn rename_discovered_session(
     id: &str,
     name: &str,
 ) -> Result<(), String> {
-    let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+    let session_dir = resolved_session_dir(parsed, &agent.cwd);
     let summary = resolve_session_ref(&session_dir, Some(&agent.cwd.to_string_lossy()), id)
         .map_err(|err| err.to_string())?;
     let mut store = JsonlSession::open(&summary.path).map_err(|err| err.to_string())?;
@@ -3425,6 +3494,96 @@ fn delete_discovered_session(
         selector.remove(id);
     }
     Ok(())
+}
+
+fn handle_branch_summary_choice(
+    _parsed: &Args,
+    agent: &Agent,
+    session: &mut InteractiveSession,
+    id: &str,
+    choice: Option<String>,
+) -> Result<bool, String> {
+    match choice.as_deref() {
+        None => {
+            open_session_tree(agent, session);
+            Ok(true)
+        }
+        Some("No summary") => {
+            session.chrome.status = format!("tree={id} summary=none");
+            Ok(true)
+        }
+        Some("Summarize") => {
+            session.chrome.status = format!(
+                "tree={id} summary=summarize reserve={}",
+                session.branch_summary_reserve_tokens
+            );
+            Ok(true)
+        }
+        Some("Summarize with custom prompt") => {
+            session.extension_dialog_context = Some(format!("branch-summary-custom:{id}"));
+            session.open_extension_editor("Custom summarization instructions", "");
+            Ok(true)
+        }
+        Some(other) => {
+            session.chrome.status = format!("tree={id} summary={other}");
+            Ok(true)
+        }
+    }
+}
+
+fn handle_branch_summary_editor(
+    _agent: &Agent,
+    session: &mut InteractiveSession,
+    value: Option<String>,
+) {
+    let context = session.extension_dialog_context.take();
+    if let Some(id) = context
+        .as_deref()
+        .and_then(|value| value.strip_prefix("branch-summary-custom:"))
+    {
+        match value {
+            None => {
+                session.extension_dialog_context = Some(format!("branch-summary:{id}"));
+                session.open_extension_selector(
+                    "Summarize branch?",
+                    vec![
+                        "No summary".into(),
+                        "Summarize".into(),
+                        "Summarize with custom prompt".into(),
+                    ],
+                );
+            }
+            Some(instructions) => {
+                session.chrome.status = format!("tree={id} summary=custom");
+                let _ = instructions;
+            }
+        }
+        return;
+    }
+    session.chrome.status = format!("extension-editor={}", value.unwrap_or_default());
+}
+
+fn select_tree_entry(
+    agent: &Agent,
+    session: &mut InteractiveSession,
+    id: String,
+) -> Result<bool, String> {
+    if session.branch_summary_skip_prompt {
+        session.chrome.status = format!("tree={id} summary=none");
+        return Ok(true);
+    }
+    session.extension_dialog_context = Some(format!("branch-summary:{id}"));
+    session.open_extension_selector(
+        "Summarize branch?",
+        vec![
+            "No summary".into(),
+            "Summarize".into(),
+            "Summarize with custom prompt".into(),
+        ],
+    );
+    let _ = session.branch_summary_reserve_tokens;
+    let _ = agent.compaction.reserve_tokens;
+    Ok(true)
 }
 
 fn open_session_tree(agent: &Agent, session: &mut InteractiveSession) {

@@ -9,15 +9,20 @@ mod templates;
 mod tools;
 mod turn;
 
-pub use compaction::{compact_messages, CompactionResult};
+pub use compaction::{
+    calculate_context_tokens, compact_messages, compact_messages_with, estimate_context_tokens,
+    estimate_tokens, find_cut_point, should_compact, CompactionResult, CompactionSettings,
+    CutPointResult, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
+};
 pub use context::{load_context_files, ContextFile};
 pub use events::AgentEvent;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
 pub use skills::{discover_skills, Skill};
 pub use templates::{discover_prompt_templates, PromptTemplate};
 pub use tools::{execute_tool, tool_specs, AgentTool, ToolError, ToolResult, BUILTIN_TOOLS};
+pub use turn::retry_delay_ms;
 
-use pi_ai::{content_text, ChatMessage};
+use pi_ai::{content_text, ChatMessage, ThinkingBudgets};
 use pi_protocol::ThinkingLevel;
 use pi_session::{JsonlSession, SessionEntry};
 use serde::{Deserialize, Serialize};
@@ -66,8 +71,15 @@ pub struct Agent {
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
     pub auto_compaction: bool,
+    pub compaction: CompactionSettings,
     pub auto_retry: bool,
     pub retry_attempts: u32,
+    pub retry_base_delay_ms: u64,
+    pub provider_timeout_ms: Option<u64>,
+    pub provider_max_retries: Option<u32>,
+    pub provider_max_retry_delay_ms: u64,
+    pub thinking_budgets: Option<ThinkingBudgets>,
+    pub context_window: u64,
     pub queues: SteerFollowUpQueues,
     pub tools: Vec<String>,
     pub skills: Vec<Skill>,
@@ -91,8 +103,15 @@ impl Agent {
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             auto_compaction: true,
+            compaction: CompactionSettings::default(),
             auto_retry: true,
             retry_attempts: 3,
+            retry_base_delay_ms: 2_000,
+            provider_timeout_ms: None,
+            provider_max_retries: None,
+            provider_max_retry_delay_ms: 60_000,
+            thinking_budgets: None,
+            context_window: 200_000,
             queues: SteerFollowUpQueues::default(),
             tools: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             skills: Vec::new(),
@@ -153,7 +172,11 @@ impl Agent {
 
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
         self.is_compacting = true;
-        let result = compact_messages(&self.messages, custom_instructions);
+        let result = compact_messages_with(
+            &self.messages,
+            custom_instructions,
+            self.compaction.keep_recent_tokens,
+        );
         self.messages = result.messages.clone();
         self.is_compacting = false;
         result
@@ -345,5 +368,13 @@ mod tests {
             .iter()
             .any(|event| event.kind() == "tool_execution_end"));
         assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn retry_delay_matches_ts_exponential_backoff() {
+        assert_eq!(retry_delay_ms(2000, 0), 2000);
+        assert_eq!(retry_delay_ms(2000, 1), 4000);
+        assert_eq!(retry_delay_ms(2000, 2), 8000);
+        assert_eq!(retry_delay_ms(1, 3), 8);
     }
 }

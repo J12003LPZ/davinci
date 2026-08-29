@@ -12,6 +12,7 @@ mod oauth_providers;
 mod providers;
 mod shell;
 mod stream;
+mod thinking;
 
 pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
@@ -65,8 +66,13 @@ pub use shell::{
 };
 pub use stream::{
     assistant_to_chat, complete_from_events, events_from_complete, fixture_complete, live_complete,
-    live_stream, parse_sse_block, replay_sse_events, request_body, request_url, AssistantMessage,
-    AssistantMessageEvent, ContentBlock, StopReason, StreamEvent,
+    live_complete_with, live_stream, parse_sse_block, replay_sse_events, request_body,
+    request_body_with, request_url, AssistantMessage, AssistantMessageEvent, ContentBlock,
+    StopReason, StreamEvent, StreamOptions,
+};
+pub use thinking::{
+    clamp_reasoning, clamp_thinking_budget_to_answer_room, google_thinking_budget,
+    thinking_budget_for_level, ThinkingBudgets, DEFAULT_THINKING_BUDGETS, MIN_ANSWER_TOKENS,
 };
 
 use pi_protocol::Usage;
