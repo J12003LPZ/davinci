@@ -19,6 +19,9 @@ use crate::login_dialog::{LoginDialog, LoginDialogAction};
 use crate::mermaid::MermaidMode;
 use crate::model_selector::{ModelSelector, ModelSelectorAction, ModelSelectorItem};
 use crate::mouse::{parse_mouse_sgr, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
+use crate::oauth_selector::{
+    AuthSelectorMode, AuthSelectorProvider, OAuthSelector, OAuthSelectorAction,
+};
 use crate::osc::ThemeDetection;
 use crate::overlay::Overlay;
 use crate::render::Component;
@@ -78,6 +81,10 @@ pub enum SessionAction {
     OpenFork,
     OpenScopedModels,
     OpenLogin,
+    SelectAuthProvider {
+        provider: String,
+        auth_type: String,
+    },
     SelectTreeEntry(String),
     RunBash(String),
     CloseOverlay,
@@ -148,6 +155,10 @@ pub struct InteractiveSession {
     pub last_autocomplete_debounce_ms: u64,
     pub cwd: PathBuf,
     pub login_providers: Vec<String>,
+    pub login_auth_options: Vec<AuthSelectorProvider>,
+    pub login_auth_type_labels: Option<(String, String)>,
+    pub auth_selector_logout: bool,
+    pub supports_thinking: bool,
     pub autocomplete_max_visible: usize,
     pub tree_filter_mode: FilterMode,
     pub mermaid_mode: MermaidMode,
@@ -218,6 +229,7 @@ pub enum OverlayKind {
     Tree,
     ScopedModels,
     Login,
+    AuthSelector,
     FirstTime,
     ExtensionSelect,
     ExtensionInput,
@@ -257,6 +269,10 @@ impl InteractiveSession {
             last_autocomplete_debounce_ms: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             login_providers: Vec::new(),
+            login_auth_options: Vec::new(),
+            login_auth_type_labels: None,
+            auth_selector_logout: false,
+            supports_thinking: true,
             autocomplete_max_visible: 8,
             tree_filter_mode: FilterMode::Default,
             mermaid_mode: MermaidMode::Streaming,
@@ -448,8 +464,42 @@ impl InteractiveSession {
         title: Option<&str>,
     ) {
         self.overlay_kind = OverlayKind::Login;
+        self.chrome.oauth_selector = None;
         self.chrome.login_dialog = Some(LoginDialog::new(provider_id, provider_name, title));
         self.chrome.status = format!("Login to {provider_id}");
+    }
+
+    pub fn open_oauth_selector(
+        &mut self,
+        mode: AuthSelectorMode,
+        providers: Vec<AuthSelectorProvider>,
+        initial_search: Option<&str>,
+    ) {
+        self.login_auth_options = providers.clone();
+        self.auth_selector_logout = mode == AuthSelectorMode::Logout;
+        self.overlay_kind = OverlayKind::AuthSelector;
+        self.chrome.oauth_selector = Some(
+            OAuthSelector::new(mode, providers, initial_search)
+                .with_theme(self.chrome.theme.clone()),
+        );
+        self.chrome.status = match mode {
+            AuthSelectorMode::Login => "Select provider to configure".into(),
+            AuthSelectorMode::Logout => "Select provider to logout".into(),
+        };
+    }
+
+    pub fn set_supported_thinking_levels(&mut self, reasoning: bool, levels: Vec<String>) {
+        self.supports_thinking = reasoning;
+        if levels.is_empty() {
+            return;
+        }
+        let current = self.current_thinking().to_string();
+        self.thinking_levels = levels;
+        self.thinking_index = self
+            .thinking_levels
+            .iter()
+            .position(|level| level == &current)
+            .unwrap_or(0);
     }
 
     pub fn open_tree_overlay(&mut self, roots: Vec<SessionTreeNode>, leaf_id: Option<String>) {
@@ -482,6 +532,7 @@ impl InteractiveSession {
         self.chrome.session_selector = None;
         self.chrome.first_time = None;
         self.chrome.login_dialog = None;
+        self.chrome.oauth_selector = None;
         self.chrome.tree = None;
         self.chrome.scoped_models = None;
         self.chrome.extension_selector = None;
@@ -502,6 +553,7 @@ impl InteractiveSession {
     fn overlay_open(&self) -> bool {
         self.chrome.first_time.is_some()
             || self.chrome.login_dialog.is_some()
+            || self.chrome.oauth_selector.is_some()
             || self.chrome.tree.is_some()
             || self.chrome.scoped_models.is_some()
             || self.chrome.selector.is_some()
@@ -1231,6 +1283,25 @@ impl InteractiveSession {
                 }
             });
         }
+        if let Some(selector) = &mut self.chrome.oauth_selector {
+            return Some(match selector.handle_key(data) {
+                OAuthSelectorAction::None => SessionAction::None,
+                OAuthSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+                OAuthSelectorAction::Select {
+                    provider_id,
+                    auth_type,
+                } => {
+                    self.close_overlays();
+                    SessionAction::SelectAuthProvider {
+                        provider: provider_id,
+                        auth_type,
+                    }
+                }
+            });
+        }
         if let Some(login) = &mut self.chrome.login_dialog {
             return Some(match login.handle_key(data) {
                 LoginDialogAction::None => SessionAction::None,
@@ -1487,6 +1558,7 @@ impl InteractiveSession {
                     OverlayKind::Tree => SessionAction::SelectTreeEntry(item),
                     OverlayKind::ScopedModels
                     | OverlayKind::Login
+                    | OverlayKind::AuthSelector
                     | OverlayKind::FirstTime
                     | OverlayKind::SettingsSubmenu
                     | OverlayKind::ExtensionSelect
@@ -1721,6 +1793,9 @@ impl InteractiveSession {
     }
 
     fn cycle_thinking(&mut self) {
+        if !self.supports_thinking || self.thinking_levels.is_empty() {
+            return;
+        }
         self.thinking_index = (self.thinking_index + 1) % self.thinking_levels.len();
         self.chrome.status = format!("thinking={}", self.current_thinking());
     }
@@ -2331,5 +2406,20 @@ mod tests {
             session.escape_timeout_ms,
             crate::resolve_escape_timeout_ms_from_env()
         );
+
+        session.set_supported_thinking_levels(false, vec!["off".into()]);
+        session.thinking_index = 0;
+        session.cycle_thinking();
+        assert_eq!(session.current_thinking(), "off");
+        session.open_thinking_selector(None);
+        let thinking_levels = session
+            .chrome
+            .thinking_selector
+            .as_ref()
+            .unwrap()
+            .render(80)
+            .join("\n");
+        assert!(thinking_levels.contains("off"));
+        assert!(!thinking_levels.contains("xhigh"));
     }
 }

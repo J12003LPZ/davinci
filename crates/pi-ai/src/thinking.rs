@@ -1,3 +1,4 @@
+use crate::catalog::Model;
 use pi_protocol::ThinkingLevel;
 use serde::{Deserialize, Serialize};
 
@@ -114,6 +115,49 @@ fn merge_budgets(custom: Option<&ThinkingBudgets>) -> ThinkingBudgets {
     budgets
 }
 
+/// TS `getSupportedThinkingLevels`.
+pub fn get_supported_thinking_levels(model: &Model) -> Vec<ThinkingLevel> {
+    if !model.reasoning {
+        return vec![ThinkingLevel::Off];
+    }
+    ThinkingLevel::all()
+        .iter()
+        .copied()
+        .filter(|level| match model.thinking_level_map.get(level.as_str()) {
+            Some(None) => false,
+            Some(Some(_)) => true,
+            None => !matches!(*level, ThinkingLevel::Xhigh | ThinkingLevel::Max),
+        })
+        .collect()
+}
+
+/// TS `AgentSession.getAvailableThinkingLevels`.
+pub fn available_thinking_levels(model: Option<&Model>) -> Vec<ThinkingLevel> {
+    match model {
+        Some(model) => get_supported_thinking_levels(model),
+        None => ThinkingLevel::all().to_vec(),
+    }
+}
+
+/// TS `AgentSession.cycleThinkingLevel` (`undefined` when the model does not reason).
+pub fn cycle_thinking_level(
+    model: Option<&Model>,
+    current: ThinkingLevel,
+) -> Option<ThinkingLevel> {
+    if model.is_some_and(|model| !model.reasoning) {
+        return None;
+    }
+    let levels = available_thinking_levels(model);
+    if levels.is_empty() {
+        return None;
+    }
+    let index = levels
+        .iter()
+        .position(|level| *level == current)
+        .unwrap_or(0);
+    Some(levels[(index + 1) % levels.len()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +193,88 @@ mod tests {
             ),
             1111
         );
+    }
+
+    #[test]
+    fn supported_thinking_levels_lock_ts() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("off".into(), None);
+        map.insert("xhigh".into(), Some("xhigh".into()));
+        map.insert("max".into(), Some("max".into()));
+        let reasoning = Model {
+            id: "claude-fable-5".into(),
+            name: "Fable".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: None,
+            reasoning: true,
+            input: vec!["text".into()],
+            cost: crate::catalog::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1,
+            max_tokens: 1,
+            compat: serde_json::Value::Null,
+            headers: Default::default(),
+            thinking_level_map: map,
+        };
+        assert_eq!(
+            get_supported_thinking_levels(&reasoning),
+            vec![
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::Xhigh,
+                ThinkingLevel::Max,
+            ]
+        );
+        let mute = Model {
+            reasoning: false,
+            thinking_level_map: Default::default(),
+            ..reasoning.clone()
+        };
+        assert_eq!(
+            get_supported_thinking_levels(&mute),
+            vec![ThinkingLevel::Off]
+        );
+        assert_eq!(cycle_thinking_level(Some(&mute), ThinkingLevel::Off), None);
+        assert_eq!(
+            cycle_thinking_level(Some(&reasoning), ThinkingLevel::High),
+            Some(ThinkingLevel::Xhigh)
+        );
+    }
+
+    #[test]
+    fn catalog_fable_5_thinking_map_matches_ts() {
+        let models = crate::load_builtin_models();
+        let fable = models
+            .iter()
+            .find(|model| model.provider == "anthropic" && model.id == "claude-fable-5")
+            .expect("claude-fable-5");
+        assert_eq!(fable.thinking_level_map.get("off"), Some(&None));
+        assert_eq!(
+            get_supported_thinking_levels(fable),
+            vec![
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::Xhigh,
+                ThinkingLevel::Max,
+            ]
+        );
+        let mute = models
+            .iter()
+            .find(|model| !model.reasoning)
+            .expect("non-reasoning model");
+        assert_eq!(
+            get_supported_thinking_levels(mute),
+            vec![ThinkingLevel::Off]
+        );
+        assert_eq!(cycle_thinking_level(Some(mute), ThinkingLevel::Off), None);
     }
 }

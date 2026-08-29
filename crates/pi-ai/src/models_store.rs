@@ -145,6 +145,7 @@ mod tests {
                 max_tokens: 1,
                 compat: serde_json::Value::Null,
                 headers: Default::default(),
+                thinking_level_map: Default::default(),
             }],
             &parsed,
         );

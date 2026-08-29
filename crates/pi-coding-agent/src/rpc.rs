@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use pi_agent::{Agent, QueueMode};
-use pi_ai::{find_model, load_builtin_models, Model};
+use pi_ai::{
+    available_thinking_levels, cycle_thinking_level, find_model, load_builtin_models, Model,
+};
 use pi_protocol::ThinkingLevel;
 use pi_session::JsonlSession;
 use serde::{Deserialize, Serialize};
@@ -456,11 +458,16 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 Err(err) => fail(id, &kind, err.to_string()),
             }
         }
-        "get_available_thinking_levels" => ok(
-            id,
-            &kind,
-            Some(serde_json::json!({ "levels": ThinkingLevel::all() })),
-        ),
+        "get_available_thinking_levels" => {
+            let model = runtime.current_model();
+            ok(
+                id,
+                &kind,
+                Some(serde_json::json!({
+                    "levels": available_thinking_levels(model)
+                })),
+            )
+        }
         "set_model" => {
             let provider = command
                 .provider
@@ -509,14 +516,13 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             Some(serde_json::json!({ "models": runtime.models })),
         ),
         "cycle_thinking_level" => {
-            let levels = ThinkingLevel::all();
-            let current = levels
-                .iter()
-                .position(|level| *level == runtime.agent.thinking_level)
-                .unwrap_or(0);
-            let next = levels[(current + 1) % levels.len()];
-            runtime.agent.thinking_level = next;
-            ok(id, &kind, Some(serde_json::json!({ "level": next })))
+            match cycle_thinking_level(runtime.current_model(), runtime.agent.thinking_level) {
+                Some(next) => {
+                    runtime.agent.thinking_level = next;
+                    ok(id, &kind, Some(serde_json::json!({ "level": next })))
+                }
+                None => ok(id, &kind, Some(Value::Null)),
+            }
         }
         "new_session" => match create_session(runtime, command.parent_session.as_deref()) {
             Ok(cancelled) => ok(
@@ -615,6 +621,15 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
     }
 }
 
+fn with_optional_timeout(mut extra: Value, call: &Value) -> Value {
+    if let Some(timeout) = call.get("timeout") {
+        if let Some(object) = extra.as_object_mut() {
+            object.insert("timeout".into(), timeout.clone());
+        }
+    }
+    extra
+}
+
 pub fn extension_ui_request(id: &str, method: &str, extra: Value) -> Value {
     let mut object = extra.as_object().cloned().unwrap_or_default();
     object.insert("type".into(), Value::String("extension_ui_request".into()));
@@ -633,26 +648,35 @@ pub fn extension_ui_requests_from_calls(calls: &[Value]) -> Vec<Value> {
                 "select" => extension_ui_request(
                     &id,
                     "select",
-                    serde_json::json!({
-                        "title": call.get("title"),
-                        "options": call.get("options"),
-                    }),
+                    with_optional_timeout(
+                        serde_json::json!({
+                            "title": call.get("title"),
+                            "options": call.get("options"),
+                        }),
+                        call,
+                    ),
                 ),
                 "confirm" => extension_ui_request(
                     &id,
                     "confirm",
-                    serde_json::json!({
-                        "title": call.get("title"),
-                        "message": call.get("message"),
-                    }),
+                    with_optional_timeout(
+                        serde_json::json!({
+                            "title": call.get("title"),
+                            "message": call.get("message"),
+                        }),
+                        call,
+                    ),
                 ),
                 "input" => extension_ui_request(
                     &id,
                     "input",
-                    serde_json::json!({
-                        "title": call.get("title"),
-                        "placeholder": call.get("placeholder"),
-                    }),
+                    with_optional_timeout(
+                        serde_json::json!({
+                            "title": call.get("title"),
+                            "placeholder": call.get("placeholder"),
+                        }),
+                        call,
+                    ),
                 ),
                 "editor" => extension_ui_request(
                     &id,
@@ -894,6 +918,13 @@ mod tests {
         let emitted = extension_ui_requests_from_calls(&calls);
         assert_eq!(emitted[0]["method"], "notify");
         assert_eq!(emitted[0]["notifyType"], "info");
+        let timed = extension_ui_requests_from_calls(&[serde_json::json!({
+            "op": "select",
+            "title": "Pick",
+            "options": ["a"],
+            "timeout": 1500
+        })]);
+        assert_eq!(timed[0]["timeout"], 1500);
         let mut runtime = RpcRuntime::new(
             pi_agent::Agent::new(default_system_prompt()),
             PathBuf::from("/tmp"),
@@ -1029,6 +1060,71 @@ mod tests {
             },
         );
         assert_eq!(single.data, Some(Value::Null));
+    }
+
+    #[test]
+    fn thinking_levels_are_model_scoped() {
+        let mut runtime = RpcRuntime::new(
+            pi_agent::Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        let mute = runtime
+            .models
+            .iter()
+            .find(|model| !model.reasoning)
+            .cloned()
+            .expect("non-reasoning model");
+        runtime.agent.provider = mute.provider.clone();
+        runtime.agent.model_id = mute.id.clone();
+        let levels = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_available_thinking_levels".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert_eq!(
+            levels.data.as_ref().unwrap()["levels"],
+            serde_json::json!(["off"])
+        );
+        let cycled = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "cycle_thinking_level".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert_eq!(cycled.data, Some(Value::Null));
+
+        let fable = runtime
+            .models
+            .iter()
+            .find(|model| model.provider == "anthropic" && model.id == "claude-fable-5")
+            .cloned()
+            .expect("claude-fable-5");
+        runtime.agent.provider = fable.provider.clone();
+        runtime.agent.model_id = fable.id.clone();
+        runtime.agent.thinking_level = ThinkingLevel::High;
+        let available = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_available_thinking_levels".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert_eq!(
+            available.data.as_ref().unwrap()["levels"],
+            serde_json::json!(available_thinking_levels(Some(&fable)))
+        );
+        let next = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "cycle_thinking_level".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert_eq!(next.data.as_ref().unwrap()["level"], "xhigh");
     }
 
     #[test]

@@ -105,7 +105,8 @@ pub use stream::{
     StopReason, StreamEvent, StreamOptions,
 };
 pub use thinking::{
-    clamp_reasoning, clamp_thinking_budget_to_answer_room, google_thinking_budget,
+    available_thinking_levels, clamp_reasoning, clamp_thinking_budget_to_answer_room,
+    cycle_thinking_level, get_supported_thinking_levels, google_thinking_budget,
     thinking_budget_for_level, ThinkingBudgets, DEFAULT_THINKING_BUDGETS, MIN_ANSWER_TOKENS,
 };
 
@@ -303,6 +304,7 @@ mod tests {
                 max_tokens: 1,
                 compat: serde_json::Value::Null,
                 headers: Default::default(),
+                thinking_level_map: Default::default(),
             };
             let url = request_url(&model, &auth);
             assert!(url.starts_with("https://example.test"), "{api} -> {url}");

@@ -80,6 +80,8 @@ pub struct Model {
     pub compat: serde_json::Value,
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "thinkingLevelMap", default)]
+    pub thinking_level_map: std::collections::BTreeMap<String, Option<String>>,
 }
 
 pub fn flatten_catalog(provider: &str, groups: &serde_json::Value) -> Vec<Model> {
@@ -191,6 +193,7 @@ pub fn openrouter_image_models() -> Vec<Model> {
         max_tokens: 8192,
         compat: serde_json::Value::Null,
         headers: Default::default(),
+        thinking_level_map: Default::default(),
     }]
 }
 

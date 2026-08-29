@@ -865,6 +865,7 @@ module.exports = (pi) => {
             max_tokens: 100,
             compat: serde_json::json!(null),
             headers: Default::default(),
+            thinking_level_map: Default::default(),
         };
         let message = run_js_stream_simple(
             &module,

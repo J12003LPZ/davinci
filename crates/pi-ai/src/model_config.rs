@@ -710,6 +710,25 @@ fn validate_compat(path: &str, value: Option<&Value>, errors: &mut Vec<String>) 
     );
 }
 
+fn parse_thinking_level_map(
+    value: Option<&Value>,
+) -> std::collections::BTreeMap<String, Option<String>> {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return Default::default();
+    };
+    object
+        .iter()
+        .filter_map(|(key, item)| {
+            if item.is_null() {
+                Some((key.clone(), None))
+            } else {
+                item.as_str()
+                    .map(|mapped| (key.clone(), Some(mapped.to_string())))
+            }
+        })
+        .collect()
+}
+
 fn validate_thinking_level_map(path: &str, value: Option<&Value>, errors: &mut Vec<String>) {
     let Some(value) = value else {
         return;
@@ -1185,6 +1204,7 @@ fn model_from_json(
             definition.get("compat").unwrap_or(&Value::Null),
         ),
         headers: merge_headers(&provider_config.headers, &headers),
+        thinking_level_map: parse_thinking_level_map(definition.get("thinkingLevelMap")),
     })
 }
 
@@ -1194,6 +1214,9 @@ fn apply_override(model: &mut Model, override_value: &Value) {
     }
     if let Some(reasoning) = override_value.get("reasoning").and_then(Value::as_bool) {
         model.reasoning = reasoning;
+    }
+    if override_value.get("thinkingLevelMap").is_some() {
+        model.thinking_level_map = parse_thinking_level_map(override_value.get("thinkingLevelMap"));
     }
     if let Some(input) = override_value.get("input").and_then(Value::as_array) {
         model.input = input

@@ -31,11 +31,12 @@ use pi_agent::{
     SummarizeResponse, Summarizer,
 };
 use pi_ai::{
-    apply_config_auth_with_shell, apply_models_config, complete_simple, content_text, find_model,
-    format_no_models_available_message, fuzzy_models, live_complete_streaming_with,
-    load_builtin_models, models_json_path, resolve_provider_auth, snapshot_availability,
-    AssistantMessage, AuthStorage, ContentBlock, Credential, CredentialKind, ModelConfig,
-    ModelRuntimeSnapshot, ResolvedAuth, StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE,
+    apply_config_auth_with_shell, apply_models_config, check_auth, complete_simple, content_text,
+    find_model, format_no_models_available_message, fuzzy_models, get_supported_thinking_levels,
+    live_complete_streaming_with, load_builtin_models, models_json_path, resolve_provider_auth,
+    snapshot_availability, AssistantMessage, AuthStorage, ContentBlock, Credential, CredentialKind,
+    ModelConfig, ModelRuntimeSnapshot, ResolvedAuth, StopReason, StreamOptions, ToolSpec,
+    NO_MODELS_AVAILABLE, PROVIDER_SPECS,
 };
 use pi_coding_agent::interactive_tui::{
     create_interactive_tui, handle_copy_command, remount_chrome_panes, stop_interactive_tui,
@@ -48,12 +49,12 @@ use pi_session::{
 use pi_tui::{
     builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto,
     drain_osc_tty, encode_kitty, interactive_settings_list, load_themes_from_dir, parse_auto_theme,
-    parse_http_idle_timeout, resolve_git_branch, AutocompleteItem, ChatChrome, Component,
-    CustomMessage, DoubleEscapeAction, ExtraAutocompleteProvider, FilterMode, InteractiveSession,
-    Keybindings, LiveAutocompleteQuery, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction,
-    SessionItem, SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TrustOption,
-    TrustSavedDecision, TrustSelector, TrustUpdate, TuiMode, FALLBACK_PREVIEW_LINES,
-    OSC_QUERY_TIMEOUT_MS,
+    parse_http_idle_timeout, resolve_git_branch, AuthSelectorMode, AuthSelectorProvider,
+    AutocompleteItem, ChatChrome, Component, CustomMessage, DoubleEscapeAction,
+    ExtraAutocompleteProvider, FilterMode, InteractiveSession, Keybindings, LiveAutocompleteQuery,
+    MermaidMode, ModelSelectorItem, ScopedModel, SessionAction, SessionItem, SessionTreeEntry,
+    SlashCommandSpec, Theme, ThemeDetection, ToolCard, TrustOption, TrustSavedDecision,
+    TrustSelector, TrustUpdate, TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -1479,6 +1480,7 @@ fn run_interactive(
     if let Some(levels) = stored.model_thinking_levels.clone() {
         session.model_thinking_levels = levels;
     }
+    sync_session_thinking(&mut session, agent);
     let _ = session.begin_osc_query(OSC_QUERY_TIMEOUT_MS);
     let mut host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
@@ -1913,7 +1915,22 @@ fn apply_session_action(
             open_scoped_models(session);
             Ok(true)
         }
-        SessionAction::OpenLogin => Ok(true),
+        SessionAction::OpenLogin => {
+            show_login_auth_type_selector(session, None);
+            Ok(true)
+        }
+        SessionAction::SelectAuthProvider {
+            provider,
+            auth_type,
+        } => {
+            if session.auth_selector_logout {
+                session.auth_selector_logout = false;
+                handle_logout_command(session, Some(&provider))
+            } else {
+                start_provider_login(session, &provider, &auth_type, None)?;
+                Ok(true)
+            }
+        }
         SessionAction::SelectTreeEntry(id) => select_tree_entry(agent, session, id),
         SessionAction::FirstTimeSubmit {
             theme,
@@ -2014,12 +2031,16 @@ fn apply_session_action(
             Ok(true)
         }
         SessionAction::CycleThinking => {
-            if let Some(level) = pi_protocol::ThinkingLevel::parse(session.current_thinking()) {
-                agent.thinking_level = level;
+            sync_session_thinking(session, agent);
+            if session.supports_thinking {
+                if let Some(level) = pi_protocol::ThinkingLevel::parse(session.current_thinking()) {
+                    agent.thinking_level = level;
+                }
             }
             Ok(true)
         }
         SessionAction::OpenThinking => {
+            sync_session_thinking(session, agent);
             session.open_thinking_selector(
                 load_settings(&default_agent_dir())
                     .default_thinking_level
@@ -2082,7 +2103,7 @@ fn apply_session_action(
                 Ok(true)
             }
             SlashAction::Login { provider, key } => {
-                start_login(session, &provider, key.as_deref())?;
+                handle_login_command(session, &provider, key.as_deref())?;
                 Ok(true)
             }
             SlashAction::Settings => {
@@ -2275,6 +2296,7 @@ fn handle_user_line(
         SlashAction::Quit => Ok(false),
         SlashAction::Prompt(prompt) => submit_user_message(parsed, agent, session, &prompt, &[]),
         SlashAction::OpenThinking => {
+            sync_session_thinking(session, agent);
             session.open_thinking_selector(
                 load_settings(&default_agent_dir())
                     .default_thinking_level
@@ -2397,17 +2419,10 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Login { provider, key } => {
-            login_provider(&provider, key.as_deref())?;
+            handle_login_command(session, &provider, key.as_deref())?;
             Ok(true)
         }
-        SlashAction::Logout { provider } => {
-            let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
-            if let Some(provider) = provider {
-                storage.remove(&provider).map_err(|e| e.to_string())?;
-                println!("removed {provider}");
-            }
-            Ok(true)
-        }
+        SlashAction::Logout { provider } => handle_logout_command(session, provider.as_deref()),
         SlashAction::Name(name) => {
             if let Some(session) = agent.session.as_mut() {
                 session.set_name(&name).map_err(|e| e.to_string())?;
@@ -4515,9 +4530,18 @@ fn handle_extension_select(
         return handle_branch_summary_choice(parsed, agent, session, id, choice);
     }
     let Some(choice) = choice else {
+        if context.as_deref() == Some("auth-type") {
+            session.login_auth_type_labels = None;
+            session.chrome.status.clear();
+            return Ok(true);
+        }
         session.chrome.status = "extension-select cancelled".into();
         return Ok(true);
     };
+    if context.as_deref() == Some("auth-type") {
+        handle_auth_type_choice(session, &choice);
+        return Ok(true);
+    }
     if let Some(url) = context
         .as_deref()
         .and_then(|value| value.strip_prefix("llama-retry:"))
@@ -5360,12 +5384,287 @@ fn open_scoped_models(session: &mut InteractiveSession) {
     session.chrome.status = refreshed.status;
 }
 
+fn current_runtime_model(agent: &Agent) -> Option<pi_ai::Model> {
+    let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
+    let models = apply_models_config(&load_builtin_models(), &config)
+        .unwrap_or_else(|_| load_builtin_models());
+    find_model(&models, &agent.provider, &agent.model_id).cloned()
+}
+
+fn sync_session_thinking(session: &mut InteractiveSession, agent: &Agent) {
+    if let Some(model) = current_runtime_model(agent) {
+        let levels = get_supported_thinking_levels(&model);
+        session.set_supported_thinking_levels(
+            model.reasoning,
+            levels
+                .iter()
+                .map(|level| level.as_str().to_string())
+                .collect(),
+        );
+    }
+}
+
+fn login_provider_options(auth_type: Option<&str>) -> Vec<AuthSelectorProvider> {
+    let storage = AuthStorage::create().unwrap_or_else(|_| AuthStorage::in_memory());
+    let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let mut options = Vec::new();
+    for spec in PROVIDER_SPECS {
+        let check = check_auth(spec.id, &config, &storage, &env);
+        let status_type = check.as_ref().map(|item| item.kind.clone());
+        let status_source = check.as_ref().map(|item| item.source.clone());
+        if auth_type != Some("api_key") && spec.oauth {
+            options.push(AuthSelectorProvider {
+                id: spec.id.into(),
+                name: spec.name.into(),
+                auth_type: "oauth".into(),
+                method_name: spec.oauth_name.map(str::to_string),
+                status_type: status_type.clone(),
+                status_source: status_source.clone(),
+            });
+        }
+        if auth_type != Some("oauth") && !spec.env_vars.is_empty() {
+            options.push(AuthSelectorProvider {
+                id: spec.id.into(),
+                name: spec.name.into(),
+                auth_type: "api_key".into(),
+                method_name: None,
+                status_type,
+                status_source,
+            });
+        }
+    }
+    options.sort_by(|left, right| left.name.cmp(&right.name));
+    options
+}
+
+fn logout_provider_options() -> Result<Vec<AuthSelectorProvider>, String> {
+    let storage = AuthStorage::create().map_err(|err| err.to_string())?;
+    let mut options = Vec::new();
+    for id in storage.providers() {
+        let Some(credential) = storage.get(&id) else {
+            continue;
+        };
+        let spec = PROVIDER_SPECS.iter().find(|item| item.id == id);
+        options.push(AuthSelectorProvider {
+            id: id.clone(),
+            name: spec.map(|item| item.name.to_string()).unwrap_or(id),
+            auth_type: match credential.kind {
+                CredentialKind::Oauth => "oauth".into(),
+                CredentialKind::ApiKey => "api_key".into(),
+            },
+            method_name: spec.and_then(|item| item.oauth_name.map(str::to_string)),
+            status_type: Some(match credential.kind {
+                CredentialKind::Oauth => "oauth".into(),
+                CredentialKind::ApiKey => "api_key".into(),
+            }),
+            status_source: Some("stored credential".into()),
+        });
+    }
+    options.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(options)
+}
+
+fn find_login_provider_options(provider_ref: &str) -> Vec<AuthSelectorProvider> {
+    let needle = provider_ref.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    login_provider_options(None)
+        .into_iter()
+        .filter(|provider| {
+            provider.id.to_ascii_lowercase() == needle
+                || provider.name.to_ascii_lowercase() == needle
+        })
+        .collect()
+}
+
+fn provider_has_interactive_login(provider_id: &str, auth_type: &str) -> bool {
+    PROVIDER_SPECS.iter().any(|spec| {
+        spec.id == provider_id
+            && if auth_type == "oauth" {
+                spec.oauth
+            } else {
+                !spec.env_vars.is_empty()
+            }
+    })
+}
+
+fn show_login_auth_type_selector(
+    session: &mut InteractiveSession,
+    provider_options: Option<Vec<AuthSelectorProvider>>,
+) {
+    let oauth = provider_options
+        .as_ref()
+        .and_then(|options| options.iter().find(|item| item.auth_type == "oauth"));
+    let subscription_label = oauth
+        .and_then(|item| item.method_name.clone())
+        .unwrap_or_else(|| "Sign in with an account".into());
+    let api_key_label = "Sign in with an API key".to_string();
+    let available: std::collections::BTreeSet<&str> = provider_options
+        .as_ref()
+        .map(|options| options.iter().map(|item| item.auth_type.as_str()).collect())
+        .unwrap_or_else(|| ["oauth", "api_key"].into_iter().collect());
+    let mut options = Vec::new();
+    if available.contains("oauth") {
+        options.push(subscription_label.clone());
+    }
+    if available.contains("api_key") {
+        options.push(api_key_label.clone());
+    }
+    if options.is_empty() {
+        session.chrome.status = "No login methods available.".into();
+        println!("{}", session.chrome.status);
+        return;
+    }
+    if let Some(providers) = &provider_options {
+        if options.len() == 1 {
+            if let Some(provider) = providers.first() {
+                let _ = start_provider_login(session, &provider.id, &provider.auth_type, None);
+            }
+            return;
+        }
+        session.login_auth_options = providers.clone();
+    } else {
+        session.login_auth_options.clear();
+    }
+    session.login_auth_type_labels = Some((subscription_label, api_key_label));
+    let title = provider_options
+        .as_ref()
+        .and_then(|options| options.first())
+        .map(|provider| format!("Select authentication method for {}:", provider.name))
+        .unwrap_or_else(|| "Select authentication method:".into());
+    session.extension_dialog_context = Some("auth-type".into());
+    session.open_extension_selector(title, options);
+}
+
+fn handle_auth_type_choice(session: &mut InteractiveSession, choice: &str) {
+    let labels = session.login_auth_type_labels.take();
+    let auth_type = match labels {
+        Some((subscription, _)) if choice == subscription => "oauth",
+        _ => "api_key",
+    };
+    let scoped = session.login_auth_options.clone();
+    if !scoped.is_empty() {
+        if let Some(provider) = scoped.iter().find(|item| item.auth_type == auth_type) {
+            let _ = start_provider_login(session, &provider.id, &provider.auth_type, None);
+        }
+        return;
+    }
+    show_login_provider_selector(session, Some(auth_type), None);
+}
+
+fn show_login_provider_selector(
+    session: &mut InteractiveSession,
+    auth_type: Option<&str>,
+    initial_search: Option<&str>,
+) {
+    let options = login_provider_options(auth_type);
+    if options.is_empty() {
+        session.chrome.status = match auth_type {
+            Some("oauth") => "No subscription providers available.".into(),
+            Some("api_key") => "No API key providers available.".into(),
+            _ => "No login providers available.".into(),
+        };
+        println!("{}", session.chrome.status);
+        return;
+    }
+    session.open_oauth_selector(AuthSelectorMode::Login, options, initial_search);
+}
+
+fn handle_login_command(
+    session: &mut InteractiveSession,
+    provider: &str,
+    key: Option<&str>,
+) -> Result<(), String> {
+    if provider.is_empty() {
+        show_login_auth_type_selector(session, None);
+        return Ok(());
+    }
+    let options = find_login_provider_options(provider);
+    if options.len() == 1 {
+        return start_provider_login(session, &options[0].id, &options[0].auth_type, key);
+    }
+    if options.len() > 1 {
+        let ids: std::collections::BTreeSet<&str> =
+            options.iter().map(|item| item.id.as_str()).collect();
+        if ids.len() == 1 {
+            show_login_auth_type_selector(session, Some(options));
+            return Ok(());
+        }
+    }
+    show_login_provider_selector(session, None, Some(provider));
+    Ok(())
+}
+
+fn handle_logout_command(
+    session: &mut InteractiveSession,
+    provider: Option<&str>,
+) -> Result<bool, String> {
+    if let Some(provider) = provider {
+        let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+        storage.remove(provider).map_err(|err| err.to_string())?;
+        session.chrome.status = format!("removed {provider}");
+        println!("removed {provider}");
+        return Ok(true);
+    }
+    match logout_provider_options() {
+        Ok(options) if options.is_empty() => {
+            session.chrome.status = "No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.".into();
+            println!("{}", session.chrome.status);
+        }
+        Ok(options) => {
+            session.open_oauth_selector(AuthSelectorMode::Logout, options, None);
+        }
+        Err(error) => {
+            session.chrome.status = format!("Could not read stored credentials: {error}");
+            eprintln!("{}", session.chrome.status);
+        }
+    }
+    Ok(true)
+}
+
+fn start_provider_login(
+    session: &mut InteractiveSession,
+    provider: &str,
+    auth_type: &str,
+    key: Option<&str>,
+) -> Result<(), String> {
+    if auth_type == "api_key"
+        && key.is_none()
+        && !provider_has_interactive_login(provider, auth_type)
+    {
+        let name = PROVIDER_SPECS
+            .iter()
+            .find(|spec| spec.id == provider)
+            .map(|spec| spec.name)
+            .unwrap_or(provider);
+        session.open_login_dialog(provider, Some(name), Some(&format!("{name} setup")));
+        if let Some(dialog) = &mut session.chrome.login_dialog {
+            dialog.show_info(
+                &format!("Authentication is configured outside {APP_NAME}."),
+                &[],
+                true,
+            );
+        }
+        if let Some(dialog) = &session.chrome.login_dialog {
+            println!("{}", dialog.render(80).join("\n"));
+        }
+        return Ok(());
+    }
+    start_login(session, provider, key)
+}
+
 fn start_login(
     session: &mut InteractiveSession,
     provider: &str,
     key: Option<&str>,
 ) -> Result<(), String> {
-    session.open_login_dialog(provider, None, None);
+    let name = PROVIDER_SPECS
+        .iter()
+        .find(|spec| spec.id == provider)
+        .map(|spec| spec.name);
+    session.open_login_dialog(provider, name, None);
     if let Some(key) = key {
         login_provider(provider, Some(key))?;
         if let Some(dialog) = &mut session.chrome.login_dialog {
@@ -5382,8 +5681,14 @@ fn start_login(
         println!("{}", request.url);
         println!("{}", request.instructions);
     } else if let Some(dialog) = &mut session.chrome.login_dialog {
+        if provider == "amazon-bedrock" {
+            dialog.show_details(&[
+                "You can also use an AWS profile, IAM keys, or role-based credentials.".into(),
+                "See:".into(),
+                format!("  {}/docs/providers.md", default_agent_dir().display()),
+            ]);
+        }
         dialog.show_manual_input("Enter API key");
-        println!("Usage: /login <provider> <api-key>");
     }
     if let Some(dialog) = &session.chrome.login_dialog {
         println!("{}", dialog.render(80).join("\n"));
@@ -5587,6 +5892,7 @@ mod tests {
             max_tokens: 16_384,
             compat: serde_json::json!(null),
             headers: Default::default(),
+            thinking_level_map: Default::default(),
         };
         let table = render_models_table(&[&model]);
         let header = table.lines().next().unwrap();
@@ -5661,5 +5967,102 @@ mod tests {
             pi_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db")).unwrap();
         let listed = store.list_sessions(None).unwrap();
         assert!(listed.iter().any(|item| item.id == session.header.id));
+    }
+
+    fn test_session() -> (Args, Agent, InteractiveSession) {
+        let theme = builtin_themes().into_iter().next().expect("theme");
+        (
+            Args::default(),
+            Agent::new("sys"),
+            InteractiveSession::new(theme, "pi", vec!["anthropic/claude-fable-5".into()]),
+        )
+    }
+
+    #[test]
+    fn bare_login_opens_auth_type_selector() {
+        let (parsed, mut agent, mut session) = test_session();
+        handle_user_line(&parsed, &mut agent, &mut session, "/login", None).unwrap();
+        let selector = session
+            .chrome
+            .extension_selector
+            .as_ref()
+            .expect("auth-type selector");
+        assert_eq!(selector.title, "Select authentication method:");
+        assert!(selector
+            .options
+            .iter()
+            .any(|item| item == "Sign in with an account"));
+        assert!(selector
+            .options
+            .iter()
+            .any(|item| item == "Sign in with an API key"));
+    }
+
+    #[test]
+    fn login_anthropic_opens_auth_type_when_both_methods_exist() {
+        let (parsed, mut agent, mut session) = test_session();
+        handle_user_line(&parsed, &mut agent, &mut session, "/login anthropic", None).unwrap();
+        let selector = session
+            .chrome
+            .extension_selector
+            .as_ref()
+            .expect("provider auth-type");
+        assert_eq!(
+            selector.title,
+            "Select authentication method for Anthropic:"
+        );
+        assert_eq!(session.login_auth_options.len(), 2);
+        assert!(session.login_auth_type_labels.is_some());
+    }
+
+    #[test]
+    fn login_bedrock_opens_api_key_dialog() {
+        let (parsed, mut agent, mut session) = test_session();
+        handle_user_line(
+            &parsed,
+            &mut agent,
+            &mut session,
+            "/login amazon-bedrock",
+            None,
+        )
+        .unwrap();
+        assert!(session.chrome.login_dialog.is_some());
+        assert!(session.chrome.extension_selector.is_none());
+        let rendered = session
+            .chrome
+            .login_dialog
+            .as_ref()
+            .unwrap()
+            .render(80)
+            .join("\n");
+        assert!(rendered.contains("AWS profile") || rendered.contains("Enter API key"));
+    }
+
+    #[test]
+    fn ambient_login_shows_configured_outside_dialog() {
+        let theme = builtin_themes().into_iter().next().expect("theme");
+        let mut session = InteractiveSession::new(theme, "pi", vec!["google/gemini".into()]);
+        start_provider_login(&mut session, "custom-ambient", "api_key", None).unwrap();
+        let dialog = session
+            .chrome
+            .login_dialog
+            .as_ref()
+            .expect("ambient dialog");
+        let rendered = dialog.render(80).join("\n");
+        assert!(rendered.contains(&format!("Authentication is configured outside {APP_NAME}.")));
+    }
+
+    #[test]
+    fn bare_logout_without_stored_credentials_matches_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        let (parsed, mut agent, mut session) = test_session();
+        handle_user_line(&parsed, &mut agent, &mut session, "/logout", None).unwrap();
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        assert!(session.chrome.oauth_selector.is_none());
+        assert!(session
+            .chrome
+            .status
+            .contains("No stored credentials to remove"));
     }
 }

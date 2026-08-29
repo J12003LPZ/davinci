@@ -29,6 +29,7 @@ mod mermaid;
 mod model_selector;
 mod mouse;
 mod native;
+mod oauth_selector;
 mod open_browser;
 mod osc;
 mod overlay;
@@ -131,6 +132,10 @@ pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISAB
 pub use native::{
     enable_virtual_terminal_input, get_native_module_candidates, is_native_modifier_pressed,
     native_helper_path, ModifierKey, NativeModuleCandidateOptions, TUI_PACKAGE_NAME,
+};
+pub use oauth_selector::{
+    format_auth_selector_provider_type, AuthSelectorMode, AuthSelectorProvider, OAuthSelector,
+    OAuthSelectorAction,
 };
 pub use open_browser::{copy_text, open_browser, open_browser_argv, open_browser_dry_run};
 pub use osc::{

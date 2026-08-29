@@ -188,7 +188,9 @@ where
     let mut response = None;
     for step in steps {
         match step {
-            HarnessStep::Reload => {}
+            HarnessStep::Reload => {
+                agent.reload();
+            }
             HarnessStep::Prompt(text) => {
                 let previous = agent.messages.len();
                 agent.prompt(text);
@@ -276,5 +278,13 @@ mod tests {
             .events
             .iter()
             .any(|event| event["type"] == "message" && event["role"] == "assistant"));
+        let mut agent = Agent::new("eval");
+        run_harness(
+            &mut agent,
+            &[HarnessStep::Reload, HarnessStep::Prompt("hi".into())],
+            |_| Ok(fixture_complete("done")),
+        )
+        .unwrap();
+        assert_eq!(agent.reload_count, 1);
     }
 }

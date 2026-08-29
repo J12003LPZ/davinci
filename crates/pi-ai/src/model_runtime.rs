@@ -357,6 +357,7 @@ mod tests {
             max_tokens: 16_384,
             compat: json!(null),
             headers: Default::default(),
+            thinking_level_map: Default::default(),
         }
     }
 

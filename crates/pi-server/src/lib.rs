@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use pi_agent::{default_system_prompt, Agent, AgentEvent};
-use pi_ai::{content_text, AssistantMessage, ContentBlock, StopReason};
+use pi_ai::{
+    content_text, get_supported_thinking_levels, AssistantMessage, ContentBlock, StopReason,
+};
 use pi_protocol::{
     encode_server_message, AssistantContent, ClientMessage, ClientMessageDecoder, Command,
     CommandResult, ModelCost, ModelMetadata, ModelRef, ProtocolError, ProtocolErrorCode,
@@ -747,27 +749,26 @@ fn assistant_content(content: &Value) -> Vec<AssistantContent> {
 fn builtin_models() -> Vec<ModelMetadata> {
     pi_ai::load_builtin_models()
         .into_iter()
-        .map(|model| ModelMetadata {
-            provider: model.provider,
-            id: model.id,
-            name: model.name,
-            api: model.api,
-            reasoning: model.reasoning,
-            input: model.input,
-            context_window: model.context_window,
-            max_tokens: model.max_tokens,
-            cost: ModelCost {
-                input: model.cost.input,
-                output: model.cost.output,
-                cache_read: model.cost.cache_read,
-                cache_write: model.cost.cache_write,
-            },
-            supported_thinking_levels: if model.reasoning {
-                ThinkingLevel::all().to_vec()
-            } else {
-                vec![ThinkingLevel::Off]
-            },
-            authenticated: false,
+        .map(|model| {
+            let supported_thinking_levels = get_supported_thinking_levels(&model);
+            ModelMetadata {
+                provider: model.provider,
+                id: model.id,
+                name: model.name,
+                api: model.api,
+                reasoning: model.reasoning,
+                input: model.input,
+                context_window: model.context_window,
+                max_tokens: model.max_tokens,
+                cost: ModelCost {
+                    input: model.cost.input,
+                    output: model.cost.output,
+                    cache_read: model.cost.cache_read,
+                    cache_write: model.cost.cache_write,
+                },
+                supported_thinking_levels,
+                authenticated: false,
+            }
         })
         .collect()
 }

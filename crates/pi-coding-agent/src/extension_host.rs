@@ -1182,6 +1182,7 @@ mod tests {
                 max_tokens: 128,
                 compat: serde_json::Value::Null,
                 headers: Default::default(),
+                thinking_level_map: Default::default(),
             },
             pi_ai::Model {
                 id: "gpt".into(),
@@ -1201,6 +1202,7 @@ mod tests {
                 max_tokens: 128,
                 compat: serde_json::Value::Null,
                 headers: Default::default(),
+                thinking_level_map: Default::default(),
             },
         ];
         host.filter_models(&mut models);

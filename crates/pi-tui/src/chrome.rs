@@ -8,6 +8,7 @@ use crate::first_time::FirstTimeSetup;
 use crate::footer::{format_pwd_line, truncate_to_width};
 use crate::login_dialog::LoginDialog;
 use crate::model_selector::ModelSelector;
+use crate::oauth_selector::OAuthSelector;
 use crate::overlay::{composite_overlay_lines, OverlayOptions};
 use crate::render::Component;
 use crate::scoped_models::ScopedModelsSelector;
@@ -36,6 +37,7 @@ pub struct ChatChrome {
     pub session_selector: Option<SessionSelector>,
     pub first_time: Option<FirstTimeSetup>,
     pub login_dialog: Option<LoginDialog>,
+    pub oauth_selector: Option<OAuthSelector>,
     pub tree: Option<TreeSelector>,
     pub scoped_models: Option<ScopedModelsSelector>,
     pub tool_cards: Vec<ToolCard>,
@@ -91,6 +93,7 @@ impl ChatChrome {
             session_selector: None,
             first_time: None,
             login_dialog: None,
+            oauth_selector: None,
             tree: None,
             scoped_models: None,
             tool_cards: Vec::new(),
@@ -425,6 +428,9 @@ impl ChatChrome {
         } else if let Some(login) = &self.login_dialog {
             lines.push(String::new());
             lines.extend(login.render(width));
+        } else if let Some(selector) = &self.oauth_selector {
+            lines.push(String::new());
+            lines.extend(selector.render(width));
         } else if let Some(tree) = &self.tree {
             lines.push(String::new());
             lines.extend(tree.render(width));
@@ -549,6 +555,8 @@ impl Component for ChatChrome {
             setup.handle_input(data);
         } else if let Some(login) = &mut self.login_dialog {
             login.handle_input(data);
+        } else if let Some(selector) = &mut self.oauth_selector {
+            let _ = selector.handle_key(data);
         } else if let Some(tree) = &mut self.tree {
             tree.handle_input(data);
         } else if let Some(scoped) = &mut self.scoped_models {

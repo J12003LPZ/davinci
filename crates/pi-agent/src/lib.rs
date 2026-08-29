@@ -138,6 +138,7 @@ pub struct Agent {
     pub retry_aborted: bool,
     pub transport: Option<String>,
     pub install_telemetry: bool,
+    pub reload_count: u32,
 }
 
 impl Agent {
@@ -178,7 +179,14 @@ impl Agent {
             retry_aborted: false,
             transport: None,
             install_telemetry: true,
+            reload_count: 0,
         }
+    }
+
+    /// TS `evalSession.reload()` — isolated evals have no extensions; count the step.
+    pub fn reload(&mut self) {
+        self.reload_count = self.reload_count.saturating_add(1);
+        self.aborted = false;
     }
 
     pub fn prompt(&mut self, text: &str) -> ChatMessage {

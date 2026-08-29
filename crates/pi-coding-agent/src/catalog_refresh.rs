@@ -336,6 +336,7 @@ mod tests {
                 max_tokens: 64,
                 compat: serde_json::json!(null),
                 headers: Default::default(),
+                thinking_level_map: Default::default(),
             }],
         );
         assert!(merged.models.iter().any(|model| model.id == "live"));
