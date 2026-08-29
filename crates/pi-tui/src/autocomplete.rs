@@ -126,16 +126,18 @@ pub fn suggestions(query: SuggestionQuery<'_>) -> Option<AutocompleteSuggestions
     }
     if let Some(rest) = query.text.strip_prefix('/') {
         if let Some((name, args)) = rest.split_once(' ') {
-            return argument_suggestions(
+            if let Some(found) = argument_suggestions(
                 name,
                 args,
                 query.commands,
                 query.models,
                 query.thinking_levels,
                 query.login_providers,
-            );
-        }
-        if !query.force_path {
+            ) {
+                return Some(found);
+            }
+        } else {
+            // TS Editor Tab uses force:false for slash names (`handleSlashCommandCompletion`).
             let filtered = fuzzy_filter(
                 rest,
                 &query
@@ -904,6 +906,12 @@ mod tests {
             apply_completion("/mo", 3, "/mo", &slash.items[0]),
             "/model "
         );
+        let forced = suggestions(SuggestionQuery {
+            force_path: true,
+            ..query("/mo", &commands, &models, Path::new("."))
+        })
+        .unwrap();
+        assert_eq!(forced.items[0].value, "model");
     }
 
     #[test]

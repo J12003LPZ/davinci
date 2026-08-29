@@ -1752,6 +1752,8 @@ mod tests {
                 .map(|item| item.value.as_str()),
             Some("#42")
         );
+        session.chrome.autocomplete = None;
+        session.extra_autocomplete.clear();
         session.chrome.editor.buffer = "/mo".into();
         session.chrome.editor.cursor = 3;
         assert_eq!(session.handle_bytes("\t"), SessionAction::None);
