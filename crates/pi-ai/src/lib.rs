@@ -5,6 +5,7 @@ mod auth;
 mod catalog;
 mod codex;
 mod codex_ws;
+mod http_proxy;
 mod model_config;
 mod model_runtime;
 mod models_store;
@@ -32,19 +33,24 @@ pub use catalog::{
 };
 pub use codex::{
     build_cached_websocket_request_body, build_sse_headers, build_websocket_headers,
-    close_openai_codex_websocket_sessions, connect_codex_websocket, extract_account_id,
-    get_openai_codex_websocket_debug_stats, is_previous_response_not_found,
-    is_websocket_connection_limit_reached, map_codex_event_type, normalize_codex_terminal_event,
-    pi_user_agent, replay_codex_events, reset_openai_codex_websocket_debug_stats,
-    resolve_codex_url, resolve_codex_websocket_url, resolve_websocket_connect_timeout_ms,
-    should_fallback_to_sse, should_retry_missing_previous_response,
-    should_retry_websocket_connection_limit, try_codex_websocket_transport,
-    websocket_connect_timeout_error, websocket_idle_timeout_error, CachedWebSocketContinuation,
-    CodexWebsocketOutcome, OpenAICodexWebSocketDebugStats, DEFAULT_CODEX_BASE_URL,
-    DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS, OPENAI_BETA_RESPONSES_EXPERIMENTAL,
-    OPENAI_BETA_RESPONSES_WEBSOCKETS, PREVIOUS_RESPONSE_NOT_FOUND, SESSION_WEBSOCKET_CACHE_TTL_MS,
+    close_openai_codex_websocket_sessions, compress_request_body_zstd, connect_codex_websocket,
+    encode_codex_sse_body, extract_account_id, get_openai_codex_websocket_debug_stats,
+    is_previous_response_not_found, is_websocket_connection_limit_reached, map_codex_event_type,
+    normalize_codex_terminal_event, pi_user_agent, replay_codex_events,
+    reset_openai_codex_websocket_debug_stats, resolve_codex_url, resolve_codex_websocket_url,
+    resolve_websocket_connect_timeout_ms, should_fallback_to_sse,
+    should_retry_missing_previous_response, should_retry_websocket_connection_limit,
+    try_codex_websocket_transport, websocket_connect_timeout_error, websocket_idle_timeout_error,
+    CachedWebSocketContinuation, CodexWebsocketOutcome, OpenAICodexWebSocketDebugStats,
+    DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
+    OPENAI_BETA_RESPONSES_EXPERIMENTAL, OPENAI_BETA_RESPONSES_WEBSOCKETS,
+    PREVIOUS_RESPONSE_NOT_FOUND, REQUEST_COMPRESSION_ZSTD_LEVEL, SESSION_WEBSOCKET_CACHE_TTL_MS,
     SESSION_WEBSOCKET_MAX_AGE_MS, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
     WEBSOCKET_CONNECTION_LIMIT_REACHED, WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
+};
+pub use http_proxy::{
+    resolve_http_proxy_url_for_target, tcp_connect_via_http_proxy,
+    UNSUPPORTED_PROXY_PROTOCOL_MESSAGE,
 };
 pub use model_config::{
     apply_config_auth, apply_config_auth_with_shell, apply_models_config,

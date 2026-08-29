@@ -1,11 +1,19 @@
 use crate::kill_ring::KillRing;
 use crate::render::{visible_width, Component};
+use crate::undo_stack::UndoStack;
 use crate::CURSOR_MARKER;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LastAction {
     Kill,
     Yank,
+    TypeWord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorState {
+    buffer: String,
+    cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +30,7 @@ pub struct Editor {
     kill_ring: KillRing,
     last_action: Option<LastAction>,
     jump_mode: Option<JumpMode>,
+    undo_stack: UndoStack<EditorState>,
 }
 
 impl Editor {
@@ -33,7 +42,24 @@ impl Editor {
             kill_ring: KillRing::new(),
             last_action: None,
             jump_mode: None,
+            undo_stack: UndoStack::new(),
         }
+    }
+
+    fn push_undo(&mut self) {
+        self.undo_stack.push(EditorState {
+            buffer: self.buffer.clone(),
+            cursor: self.cursor,
+        });
+    }
+
+    pub fn undo(&mut self) {
+        let Some(snapshot) = self.undo_stack.pop() else {
+            return;
+        };
+        self.buffer = snapshot.buffer;
+        self.cursor = snapshot.cursor;
+        self.last_action = None;
     }
 
     pub fn jump_mode(&self) -> Option<bool> {
@@ -53,15 +79,19 @@ impl Editor {
     }
 
     pub fn insert_str(&mut self, text: &str) {
+        self.push_undo();
         self.buffer.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.clear_last_action();
     }
 
     pub fn insert(&mut self, ch: char) {
+        if ch.is_whitespace() || self.last_action != Some(LastAction::TypeWord) {
+            self.push_undo();
+        }
+        self.last_action = Some(LastAction::TypeWord);
         self.buffer.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
-        self.clear_last_action();
     }
 
     pub fn backspace(&mut self) {
@@ -69,6 +99,7 @@ impl Editor {
         if self.cursor == 0 {
             return;
         }
+        self.push_undo();
         let prev = self.buffer[..self.cursor]
             .chars()
             .next_back()
@@ -83,6 +114,7 @@ impl Editor {
         if self.cursor >= self.buffer.len() {
             return;
         }
+        self.push_undo();
         let next = self.buffer[self.cursor..]
             .chars()
             .next()
@@ -144,6 +176,7 @@ impl Editor {
     }
 
     pub fn delete_word_backwards(&mut self) {
+        self.push_undo();
         let start = crate::word_nav::find_word_backward_default(&self.buffer, self.cursor);
         let deleted = self.buffer[start..self.cursor].to_string();
         self.buffer.drain(start..self.cursor);
@@ -154,6 +187,7 @@ impl Editor {
     }
 
     pub fn delete_word_forwards(&mut self) {
+        self.push_undo();
         let end = crate::word_nav::find_word_forward_default(&self.buffer, self.cursor);
         let deleted = self.buffer[self.cursor..end].to_string();
         self.buffer.drain(self.cursor..end);
@@ -163,6 +197,7 @@ impl Editor {
     }
 
     pub fn delete_to_line_start(&mut self) {
+        self.push_undo();
         let start = self.buffer[..self.cursor]
             .rfind('\n')
             .map(|index| index + 1)
@@ -176,6 +211,7 @@ impl Editor {
     }
 
     pub fn delete_to_line_end(&mut self) {
+        self.push_undo();
         let end = self.buffer[self.cursor..]
             .find('\n')
             .map(|index| self.cursor + index)
@@ -191,6 +227,7 @@ impl Editor {
         let Some(text) = self.kill_ring.peek().map(str::to_string) else {
             return;
         };
+        self.push_undo();
         self.buffer.insert_str(self.cursor, &text);
         self.cursor += text.len();
         self.last_action = Some(LastAction::Yank);
@@ -200,6 +237,7 @@ impl Editor {
         if self.last_action != Some(LastAction::Yank) || self.kill_ring.len() <= 1 {
             return;
         }
+        self.push_undo();
         let prev = self.kill_ring.peek().unwrap_or("").to_string();
         let start = self.cursor.saturating_sub(prev.len());
         if self.buffer.get(start..self.cursor) == Some(prev.as_str()) {
@@ -262,6 +300,8 @@ impl Editor {
     pub fn submit(&mut self) -> String {
         let value = std::mem::take(&mut self.buffer);
         self.cursor = 0;
+        self.undo_stack.clear();
+        self.last_action = None;
         if !value.is_empty() {
             self.history.push(value.clone());
         }
@@ -387,6 +427,16 @@ mod tests {
         assert_eq!(editor.cursor, 5);
         editor.jump_to_char('j', false);
         assert_eq!(editor.cursor, 0);
+
+        let mut editor = Editor::new();
+        for ch in "hello world".chars() {
+            editor.insert(ch);
+        }
+        assert_eq!(editor.buffer, "hello world");
+        editor.undo();
+        assert_eq!(editor.buffer, "hello");
+        editor.undo();
+        assert_eq!(editor.buffer, "");
         editor.begin_jump_forward();
         assert_eq!(editor.jump_mode(), Some(true));
         editor.cancel_jump();

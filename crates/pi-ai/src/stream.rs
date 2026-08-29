@@ -347,8 +347,9 @@ pub fn live_complete_with(
         &collect_request_headers(model, auth, options.session_id.as_deref()),
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
+    let compress_zstd = model.api == "openai-codex-responses";
     let text = crate::provider_retry::retry_provider_request(
-        || send_provider_body(&url, &headers, &body, timeout_ms),
+        || send_provider_body(&url, &headers, &body, timeout_ms, compress_zstd),
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -406,6 +407,7 @@ fn send_provider_body(
     headers: &[(String, String)],
     body: &Value,
     timeout_ms: Option<u64>,
+    compress_zstd: bool,
 ) -> Result<String, crate::provider_retry::ProviderError> {
     let mut request = ureq::post(url);
     if let Some(timeout_ms) = timeout_ms {
@@ -414,9 +416,19 @@ fn send_provider_body(
     for (key, value) in headers {
         request = request.set(key, value);
     }
-    let response = request
-        .send_string(&body.to_string())
-        .map_err(crate::provider_retry::provider_error_from_ureq)?;
+    let response = if compress_zstd {
+        let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
+        if compressed {
+            request = request.set("content-encoding", "zstd");
+        }
+        request
+            .send_bytes(&bytes)
+            .map_err(crate::provider_retry::provider_error_from_ureq)?
+    } else {
+        request
+            .send_string(&body.to_string())
+            .map_err(crate::provider_retry::provider_error_from_ureq)?
+    };
     response.into_string().map_err(|err| {
         crate::provider_retry::ProviderError::new(
             None,
@@ -523,9 +535,19 @@ pub fn live_stream(
         }
     }
     request = request.set("content-type", "application/json");
-    let response = request
-        .send_string(&body.to_string())
-        .map_err(|err| format!("Provider request failed: {err}"))?;
+    let response = if model.api == "openai-codex-responses" {
+        let (bytes, compressed) = crate::codex::encode_codex_sse_body(&body);
+        if compressed {
+            request = request.set("content-encoding", "zstd");
+        }
+        request
+            .send_bytes(&bytes)
+            .map_err(|err| format!("Provider request failed: {err}"))?
+    } else {
+        request
+            .send_string(&body.to_string())
+            .map_err(|err| format!("Provider request failed: {err}"))?
+    };
     let text = response
         .into_string()
         .map_err(|err| format!("Unable to read provider response: {err}"))?;

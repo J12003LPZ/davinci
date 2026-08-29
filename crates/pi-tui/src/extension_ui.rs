@@ -123,51 +123,47 @@ impl Component for ExtensionSelector {
     fn invalidate(&mut self) {}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExtensionInput {
     pub title: String,
     pub placeholder: String,
-    pub value: String,
+    input: crate::input::Input,
 }
 
 impl ExtensionInput {
     pub fn new(title: impl Into<String>, placeholder: impl Into<String>) -> Self {
+        let mut input = crate::input::Input::new();
+        input.focused = true;
         Self {
             title: title.into(),
             placeholder: placeholder.into(),
-            value: String::new(),
+            input,
         }
     }
 
+    pub fn value(&self) -> &str {
+        self.input.get_value()
+    }
+
     pub fn handle_key(&mut self, data: &str) -> ExtensionDialogAction {
-        match data {
-            "\r" | "\n" => ExtensionDialogAction::Submit(self.value.clone()),
-            "\x1b" => ExtensionDialogAction::Cancel,
-            "\x7f" | "\x08" => {
-                self.value.pop();
-                ExtensionDialogAction::None
-            }
-            other if !other.chars().any(char::is_control) => {
-                self.value.push_str(other);
-                ExtensionDialogAction::None
-            }
-            _ => ExtensionDialogAction::None,
+        match self.input.handle_key(data) {
+            crate::input::InputAction::Submit(value) => ExtensionDialogAction::Submit(value),
+            crate::input::InputAction::Cancel => ExtensionDialogAction::Cancel,
+            crate::input::InputAction::None => ExtensionDialogAction::None,
         }
     }
 }
 
 impl Component for ExtensionInput {
     fn render(&self, width: usize) -> Vec<String> {
-        let shown = if self.value.is_empty() {
-            format!("  {}", self.placeholder)
+        let mut lines = vec![truncate(&self.title, width)];
+        if self.input.get_value().is_empty() && !self.placeholder.is_empty() {
+            lines.push(truncate(&format!("  {}", self.placeholder), width));
         } else {
-            format!("  {}", self.value)
-        };
-        vec![
-            truncate(&self.title, width),
-            truncate(&shown, width),
-            "  enter submit  escape cancel".into(),
-        ]
+            lines.extend(self.input.render(width));
+        }
+        lines.push("  enter submit  escape cancel".into());
+        lines
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -369,6 +365,13 @@ mod tests {
             input.handle_key("\r"),
             ExtensionDialogAction::Submit("ab".into())
         );
+        let mut cjk = ExtensionInput::new("Name", "");
+        for ch in "你好世界。你好，世界".chars() {
+            cjk.handle_key(&ch.to_string());
+        }
+        cjk.handle_key("\x05");
+        cjk.handle_key("\x17");
+        assert_eq!(cjk.value(), "你好世界。你好，");
 
         let mut editor = ExtensionEditor::new("Edit", "hello");
         assert_eq!(

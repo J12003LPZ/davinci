@@ -1,12 +1,12 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (ICU4X CJK dictionary word-nav). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (TS Input widget, Codex SSE zstd, HTTP CONNECT for WSS). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
 ## What landed
 
-- Workspace on rustc **1.83.0**, edition 2021, pinned clap/uuid/tempfile/thiserror/ureq/url/rustls/webpki/zeroize (+ sha2 for PKCE, fancy-regex 0.14.0, image 0.25.6, icu_segmenter 1.5.0 compiled_data).
+- Workspace on rustc **1.83.0**, edition 2021, pinned clap/uuid/tempfile/thiserror/ureq/url/rustls/webpki/zeroize (+ sha2 for PKCE, fancy-regex 0.14.0, image 0.25.6, icu_segmenter 1.5.0 compiled_data, zstd 0.13.2, jobserver 0.1.32 for rustc 1.83).
 - `vendor/pi` kept as the TypeScript behavioral spec (not deleted).
 - **pi-protocol**: TS CBOR subset, 4-byte framing, hello/request/response, error strings locked to TS tests.
 - **pi-session / pi-session-sqlite**: JSONL v4, v3→v4 migrate, cwd-encoded discovery (`~/.pi`, `--session-dir`), continue/resume/fork/clone, FTS, writer leases, `001_initial.sql`. Entry types include TS `label`, `session_info`, and `custom_message`. `set_name` clears metadata when the name is empty.
@@ -88,6 +88,8 @@ Closed this slice: JSONL-on-disk `SessionRepo` (`vendor/pi/packages/agent/src/ha
 Closed this slice: Codex websocket protocol from `openai-codex-responses.ts` — `resolveCodexUrl` / `resolveCodexWebSocketUrl` (`/codex/responses`, https→wss), JWT `chatgpt_account_id`, SSE headers (`OpenAI-Beta: responses=experimental`, `originator: pi`, `chatgpt-account-id`) and WS headers (`OpenAI-Beta: responses_websockets=2026-02-06`, stripped from handshake like TS), session cache + continuation input deltas + debug stats, connection-limit / missing-`previous_response_id` retries, SSE fallback before first event, idle/connect timeout strings, RFC 6455 client (loopback tests + rustls `wss` for live ChatGPT). Compaction `complete_simple` sends `cacheRetention: none`. Tests use `PI_CODEX_WS_REPLY` / localhost only.
 
 Closed this slice: TUI CJK word segmentation uses ICU4X `WordSegmenter::new_dictionary` on CJK runs (real dictionary, not pair-grouping). Locks TS `你好|世界`, `你好，世界`, mixed `hello你好，world世界`, and Input Ctrl+W `你好世界。你好，世界`. ASCII word-nav fixtures are unchanged (TS punctuation splitter). Editor word-move/delete uses the same path.
+
+Closed this slice: TUI `Input` matches TS `components/input.ts` — grapheme cursor, kill-ring/yank/yank-pop, undo coalescing (`ctrl+-` / Kitty `\x1b[45;5u`), bracketed paste, horizontal CJK scroll, word-nav. `ExtensionInput` and InteractiveSession `/` dialogs use it. Editor undo is wired on the same keybinding. Codex SSE bodies use zstd level 3 + `content-encoding: zstd` (TS `compressRequestBodyZstd`). WSS honors TS `resolveHttpProxyUrlForTarget` (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, SOCKS/PAC reject string) and HTTP CONNECT (Basic proxy auth, 200). Tests: `vendor/pi/packages/tui/test/input.test.ts`, `openai-codex-stream` zstd, `node-http-proxy.test.ts`; CONNECT is loopback only.
 
 Still not product-equivalent:
 

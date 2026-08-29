@@ -253,25 +253,30 @@ fn open_codex_websocket(
         Some(query) => format!("{path}?{query}"),
         None => path.to_string(),
     };
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|err| format!("WebSocket address: {err}"))?;
     let timeout = Duration::from_millis(timeout_ms.max(1));
-    let mut last_error = "WebSocket connect failed".to_string();
-    let mut tcp = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                tcp = Some(stream);
-                break;
+    let proxy = crate::http_proxy::resolve_http_proxy_url_for_target(url, None)?;
+    let tcp = if let Some(proxy) = proxy {
+        crate::http_proxy::tcp_connect_via_http_proxy(&proxy, host, port, timeout)?
+    } else {
+        let addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(|err| format!("WebSocket address: {err}"))?;
+        let mut last_error = "WebSocket connect failed".to_string();
+        let mut tcp = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(stream) => {
+                    tcp = Some(stream);
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(websocket_connect_timeout_error(timeout_ms));
+                }
+                Err(err) => last_error = format!("WebSocket connect failed: {err}"),
             }
-            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(websocket_connect_timeout_error(timeout_ms));
-            }
-            Err(err) => last_error = format!("WebSocket connect failed: {err}"),
         }
-    }
-    let tcp = tcp.ok_or(last_error)?;
+        tcp.ok_or(last_error)?
+    };
     tcp.set_nodelay(true)
         .map_err(|err| format!("WebSocket connect failed: {err}"))?;
     tcp.set_read_timeout(Some(timeout))

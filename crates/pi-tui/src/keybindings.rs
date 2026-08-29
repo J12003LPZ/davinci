@@ -164,6 +164,7 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("tui.editor.deleteToLineEnd", &["ctrl+k"]),
         ("tui.editor.yank", &["ctrl+y"]),
         ("tui.editor.yankPop", &["alt+y"]),
+        ("tui.editor.undo", &["ctrl+-", "\x1b[45;5u"]),
         ("tui.editor.jumpForward", &["ctrl+]"]),
         ("tui.editor.jumpBackward", &["ctrl+alt+]"]),
     ]
@@ -193,6 +194,7 @@ pub fn key_to_bytes(key: &str) -> String {
         "ctrl+x" => "\x18".into(),
         "ctrl+y" => "\x19".into(),
         "ctrl+z" => "\x1a".into(),
+        "ctrl+-" => "\x1f".into(),
         "ctrl+]" => "\x1d".into(),
         "ctrl+alt+]" => "\x1b\x1d".into(),
         "ctrl+backspace" => "\x1b[3;5~".into(),
@@ -262,6 +264,8 @@ mod tests {
         assert!(Keybindings::defaults().matches("\x0b", "tui.editor.deleteToLineEnd"));
         assert!(Keybindings::defaults().matches("\x1d", "tui.editor.jumpForward"));
         assert!(Keybindings::defaults().matches("\x1b\x1d", "tui.editor.jumpBackward"));
+        assert!(Keybindings::defaults().matches("\x1f", "tui.editor.undo"));
+        assert!(Keybindings::defaults().matches("\x1b[45;5u", "tui.editor.undo"));
         let migrated = Keybindings::from_json(r#"{"clear":"ctrl+u"}"#);
         assert!(migrated.matches("\x15", "app.clear"));
     }

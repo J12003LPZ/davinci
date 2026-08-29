@@ -272,6 +272,22 @@ where
     headers
 }
 
+/// TS `REQUEST_COMPRESSION_ZSTD_LEVEL = 3`. The Codex SSE backend accepts
+/// uncompressed JSON when compression is unavailable.
+pub const REQUEST_COMPRESSION_ZSTD_LEVEL: i32 = 3;
+
+pub fn compress_request_body_zstd(body_json: &str) -> Option<Vec<u8>> {
+    zstd::bulk::compress(body_json.as_bytes(), REQUEST_COMPRESSION_ZSTD_LEVEL).ok()
+}
+
+pub fn encode_codex_sse_body(body: &Value) -> (Vec<u8>, bool) {
+    let json = body.to_string();
+    match compress_request_body_zstd(&json) {
+        Some(bytes) => (bytes, true),
+        None => (json.into_bytes(), false),
+    }
+}
+
 pub fn build_websocket_headers<'a, I>(
     model_headers: I,
     additional: &[(String, String)],
@@ -1114,6 +1130,31 @@ data: {"type":"response.completed","response":{"status":"completed"}}
             Some(OPENAI_BETA_RESPONSES_EXPERIMENTAL)
         );
         assert_eq!(sse_get("accept"), Some("text/event-stream"));
+    }
+
+    #[test]
+    fn zstd_compresses_sse_request_bodies() {
+        let large_text = "compress me ".repeat(400);
+        let body = serde_json::json!({
+            "input": [{"content": [{"text": large_text}]}]
+        });
+        let (bytes, compressed) = encode_codex_sse_body(&body);
+        assert!(compressed);
+        assert_ne!(bytes, body.to_string().as_bytes());
+        let decoded = zstd::decode_all(bytes.as_slice()).expect("zstd");
+        let parsed: Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(
+            parsed["input"][0]["content"][0]["text"].as_str(),
+            Some(large_text.as_str())
+        );
+        let (small, small_compressed) = encode_codex_sse_body(&serde_json::json!({
+            "input": [{"content": [{"text": "hi"}]}]
+        }));
+        assert!(small_compressed);
+        assert!(!small.is_empty());
+        assert_eq!(REQUEST_COMPRESSION_ZSTD_LEVEL, 3);
+        let compressed = compress_request_body_zstd(&body.to_string()).expect("compress");
+        assert_eq!(compressed, bytes);
     }
 
     #[test]

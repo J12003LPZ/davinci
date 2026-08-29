@@ -1448,6 +1448,10 @@ impl InteractiveSession {
             editor.yank_pop();
             return true;
         }
+        if self.keybindings.matches(data, "tui.editor.undo") {
+            editor.undo();
+            return true;
+        }
         if self.keybindings.matches(data, "tui.editor.jumpForward") {
             editor.begin_jump_forward();
             return true;

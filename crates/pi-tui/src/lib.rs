@@ -11,6 +11,7 @@ mod first_time;
 mod footer;
 mod fuzzy;
 mod image;
+mod input;
 mod keybindings;
 mod keys;
 mod kill_ring;
@@ -34,6 +35,7 @@ mod themes;
 mod tool_card;
 mod transcript;
 mod tree;
+mod undo_stack;
 mod word_nav;
 
 pub use autocomplete::{
@@ -64,6 +66,7 @@ pub use image::{
     delete_all_kitty_images, delete_kitty_image, encode_kitty, iterm_image, kitty_image_chunk,
     kitty_image_ids, parse_kitty_image_header, KittyImageHeader, KITTY_IMAGE_PREFIX,
 };
+pub use input::{Input, InputAction};
 pub use keybindings::{key_to_bytes, Keybindings};
 pub use keys::{decode_kitty_printable, parse_key, Key};
 pub use latex::render_latex;
