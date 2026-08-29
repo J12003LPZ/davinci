@@ -2,7 +2,7 @@
 
 use std::fs::{self, Permissions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -117,12 +117,14 @@ pub fn owned_bind_path(path: &str) -> PathBuf {
 }
 
 pub struct BoundUnixListener {
-    pub listener: UnixListener,
+    listener: Option<UnixListener>,
     pub path: PathBuf,
     pub owned_bind_path: PathBuf,
     pub mode: u32,
     pub max_pending_bytes: u64,
     pub graceful_close_timeout_ms: u64,
+    socket_identity: Option<(u64, u64)>,
+    closed: bool,
 }
 
 pub fn bind_unix(path: &str) -> Result<BoundUnixListener, ServerError> {
@@ -143,26 +145,97 @@ pub fn bind_unix_with(options: UnixListenerOptions) -> Result<BoundUnixListener,
     remove_stale_socket(&public_path)?;
     remove_stale_socket(&owned)?;
     let listener = UnixListener::bind(&owned).map_err(|err| ServerError::Io(err.to_string()))?;
+    let stats = fs::symlink_metadata(&owned).map_err(|err| ServerError::Io(err.to_string()))?;
+    if !stats.file_type().is_socket() {
+        return Err(ServerError::Io(format!(
+            "Unix listener path is not a socket after binding: {}",
+            owned.display()
+        )));
+    }
+    let socket_identity = Some((stats.dev(), stats.ino()));
     if owned.exists() {
         fs::hard_link(&owned, &public_path).map_err(|err| ServerError::Io(err.to_string()))?;
         let _ = fs::set_permissions(&public_path, Permissions::from_mode(options.mode));
     }
     Ok(BoundUnixListener {
-        listener,
+        listener: Some(listener),
         path: public_path,
         owned_bind_path: owned,
         mode: options.mode,
         max_pending_bytes: options.max_pending_bytes,
         graceful_close_timeout_ms: options.graceful_close_timeout_ms,
+        socket_identity,
+        closed: false,
     })
 }
 
 impl BoundUnixListener {
     pub fn accept(&self) -> Result<UnixStream, ServerError> {
-        self.listener
+        let listener = self
+            .listener
+            .as_ref()
+            .ok_or_else(|| ServerError::Io("Unix listener is closing or closed".into()))?;
+        listener
             .accept()
             .map(|(stream, _)| stream)
             .map_err(|err| ServerError::Io(err.to_string()))
+    }
+
+    pub fn close(&mut self) -> Result<(), ServerError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.listener.take();
+        let cleanup = self.cleanup_owned_socket();
+        let owned = remove_path(&self.owned_bind_path);
+        cleanup.and(owned)
+    }
+
+    fn cleanup_owned_socket(&mut self) -> Result<(), ServerError> {
+        let Some(identity) = self.socket_identity.take() else {
+            return Ok(());
+        };
+        let current = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(ServerError::Io(err.to_string())),
+        };
+        if !current.file_type().is_socket()
+            || current.dev() != identity.0
+            || current.ino() != identity.1
+        {
+            return Ok(());
+        }
+        let preserved = sibling_temp_path(&self.path, ".c-");
+        match fs::rename(&self.path, &preserved) {
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(ServerError::Io(err.to_string())),
+            Ok(()) => {}
+        }
+        let moved =
+            fs::symlink_metadata(&preserved).map_err(|err| ServerError::Io(err.to_string()))?;
+        if moved.file_type().is_socket() && moved.dev() == identity.0 && moved.ino() == identity.1 {
+            return remove_path(&preserved);
+        }
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                fs::rename(&preserved, &self.path)
+                    .map_err(|err| ServerError::Io(err.to_string()))?;
+            }
+            Err(err) => return Err(ServerError::Io(err.to_string())),
+        }
+        Err(ServerError::Io(format!(
+            "Unix listener path changed during cleanup; preserved replacement at {}",
+            preserved.display()
+        )))
+    }
+}
+
+impl Drop for BoundUnixListener {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -174,13 +247,30 @@ fn hex8(bytes: &[u8]) -> String {
     })
 }
 
+fn sibling_temp_path(path: &Path, prefix: &str) -> PathBuf {
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let name = format!("{prefix}{}", &suffix[..6]);
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+fn remove_path(path: &Path) -> Result<(), ServerError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ServerError::Io(err.to_string())),
+    }
+}
+
 fn remove_stale_socket(path: &Path) -> Result<(), ServerError> {
-    let metadata = match fs::symlink_metadata(path) {
+    let original = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(ServerError::Io(err.to_string())),
     };
-    if !metadata.file_type().is_socket() {
+    if !original.file_type().is_socket() {
         return Err(ServerError::Io(format!(
             "Refusing to remove non-socket Unix listener path: {}",
             path.display()
@@ -192,13 +282,32 @@ fn remove_stale_socket(path: &Path) -> Result<(), ServerError> {
             path.display()
         )));
     }
-    fs::remove_file(path).or_else(|err| {
-        if err.kind() == ErrorKind::NotFound {
-            Ok(())
-        } else {
-            Err(ServerError::Io(err.to_string()))
+    let identity = (original.dev(), original.ino());
+    let preserved = sibling_temp_path(path, ".s-");
+    match fs::rename(path, &preserved) {
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(ServerError::Io(err.to_string())),
+        Ok(()) => {}
+    }
+    let current =
+        fs::symlink_metadata(&preserved).map_err(|err| ServerError::Io(err.to_string()))?;
+    if !current.file_type().is_socket()
+        || current.dev() != identity.0
+        || current.ino() != identity.1
+    {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                fs::rename(&preserved, path).map_err(|err| ServerError::Io(err.to_string()))?;
+            }
+            Err(err) => return Err(ServerError::Io(err.to_string())),
         }
-    })
+        return Err(ServerError::Io(format!(
+            "Unix listener path changed while checking for a stale socket: {}",
+            path.display()
+        )));
+    }
+    remove_path(&preserved)
 }
 
 fn is_socket_live(path: &Path) -> bool {
@@ -206,7 +315,10 @@ fn is_socket_live(path: &Path) -> bool {
         Ok(_) => true,
         Err(err) => !matches!(
             err.kind(),
-            ErrorKind::ConnectionRefused | ErrorKind::NotFound | ErrorKind::BrokenPipe
+            ErrorKind::ConnectionRefused
+                | ErrorKind::NotFound
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
         ),
     }
 }
@@ -324,5 +436,85 @@ mod tests {
             Err(err) => assert_eq!(err.to_string(), "Unix connection is closed"),
             Ok(()) => panic!("expected closed"),
         }
+    }
+
+    fn socket_identity(path: &Path) -> (u64, u64) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[test]
+    fn rejects_a_live_listener_without_unlinking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let path_str = path.to_string_lossy().into_owned();
+        let first = bind_unix(&path_str).unwrap();
+        let first_identity = socket_identity(&path);
+        match bind_unix(&path_str) {
+            Err(err) => assert!(err.to_string().contains("already running")),
+            Ok(_) => panic!("expected already-running Unix listener"),
+        }
+        assert!(path.metadata().unwrap().file_type().is_socket());
+        assert_eq!(socket_identity(&path), first_identity);
+        drop(first);
+    }
+
+    #[test]
+    fn never_unlinks_a_regular_file_at_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        fs::write(&path, "do not remove").unwrap();
+        match bind_unix(&path.to_string_lossy()) {
+            Err(err) => assert!(err.to_string().contains("non-socket")),
+            Ok(_) => panic!("expected non-socket refusal"),
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "do not remove");
+    }
+
+    #[test]
+    fn creates_nested_parents_restricts_permissions_and_removes_its_own_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p").join("n").join("server.sock");
+        let path_str = path.to_string_lossy().into_owned();
+        let mut bound = bind_unix(&path_str).unwrap();
+        let stats = fs::symlink_metadata(&path).unwrap();
+        assert!(stats.file_type().is_socket());
+        assert_eq!(stats.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        bound.close().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn does_not_remove_a_replacement_inode_during_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let path_str = path.to_string_lossy().into_owned();
+        let mut bound = bind_unix(&path_str).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "replacement").unwrap();
+        bound.close().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+    }
+
+    #[test]
+    fn removes_a_genuinely_stale_socket_before_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        {
+            let _dead = UnixListener::bind(&path).unwrap();
+        }
+        assert!(path.exists());
+        let mut bound = bind_unix(&path.to_string_lossy()).unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        bound.close().unwrap();
+        assert!(!path.exists());
     }
 }

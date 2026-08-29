@@ -170,6 +170,7 @@ pub struct InteractiveSession {
     pub quiet_startup: bool,
     progress_active: bool,
     pub escape_timeout_ms: u64,
+    stdin_buffer: Option<crate::stdin_buffer::StdinBuffer>,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +279,7 @@ impl InteractiveSession {
             quiet_startup: false,
             progress_active: false,
             escape_timeout_ms: resolve_escape_timeout_ms_from_env(),
+            stdin_buffer: None,
         }
     }
 
@@ -797,6 +799,44 @@ impl InteractiveSession {
         } else {
             SessionAction::Submit(submitted)
         }
+    }
+
+    /// Feed raw stdin through [`StdinBuffer`] then [`handle_bytes`].
+    /// Default [`handle_bytes`] stays immediate so existing tests keep ESC-as-Abort.
+    pub fn process_stdin(&mut self, data: &str) -> SessionAction {
+        if self.stdin_buffer.is_none() {
+            self.stdin_buffer = Some(crate::stdin_buffer::StdinBuffer::with_options(
+                crate::stdin_buffer::StdinBufferOptions {
+                    timeout: 50,
+                    escape_timeout: self.escape_timeout_ms,
+                },
+            ));
+        }
+        let events = self
+            .stdin_buffer
+            .as_mut()
+            .expect("stdin buffer")
+            .process(data);
+        let mut last = SessionAction::None;
+        for paste in events.paste {
+            last = self.handle_bytes(&format!("\x1b[200~{paste}\x1b[201~"));
+        }
+        for sequence in events.data {
+            last = self.handle_bytes(&sequence);
+        }
+        last
+    }
+
+    pub fn tick_stdin(&mut self, ms: u64) -> SessionAction {
+        let Some(buffer) = self.stdin_buffer.as_mut() else {
+            return SessionAction::None;
+        };
+        let events = buffer.tick(ms);
+        let mut last = SessionAction::None;
+        for sequence in events.data {
+            last = self.handle_bytes(&sequence);
+        }
+        last
     }
 
     pub fn handle_bytes(&mut self, data: &str) -> SessionAction {

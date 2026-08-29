@@ -3,8 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::render::visible_width;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitPaths {
     pub repo_dir: PathBuf,
@@ -109,29 +107,7 @@ pub fn format_pwd_line(
 }
 
 pub fn truncate_to_width(text: &str, width: usize, ellipsis: &str) -> String {
-    if visible_width(text) <= width {
-        return text.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let ellipsis_width = visible_width(ellipsis);
-    if ellipsis_width >= width {
-        return ellipsis.chars().take(width).collect();
-    }
-    let keep = width.saturating_sub(ellipsis_width);
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let next = visible_width(&ch.to_string());
-        if used + next > keep {
-            break;
-        }
-        out.push(ch);
-        used += next;
-    }
-    out.push_str(ellipsis);
-    out
+    crate::ansi::truncate_to_width(text, width, ellipsis, false)
 }
 
 #[cfg(test)]

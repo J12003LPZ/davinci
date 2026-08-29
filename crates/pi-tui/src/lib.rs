@@ -1,5 +1,6 @@
 //! Terminal UI matching `@earendil-works/pi-tui`.
 
+mod ansi;
 mod autocomplete;
 mod box_comp;
 mod chrome;
@@ -31,6 +32,7 @@ mod session;
 mod session_selector;
 mod settings;
 mod settings_submenu;
+mod stdin_buffer;
 mod terminal;
 mod themes;
 mod thinking_selector;
@@ -42,6 +44,11 @@ mod undo_stack;
 mod word_nav;
 mod word_wrap;
 
+pub use ansi::{
+    extract_ansi_code, grapheme_width, normalize_terminal_output,
+    strip_terminal_sequences as strip_ansi_sequences, truncate_to_width as truncate_to_width_ansi,
+    visible_width as visible_width_ansi, wrap_text_with_ansi,
+};
 pub use autocomplete::{
     apply_completion, autocomplete_debounce_ms, suggestions, AutocompleteItem,
     AutocompleteSuggestions, ExtraAutocompleteProvider, LiveAutocompleteQuery, SlashCommandSpec,
@@ -122,6 +129,7 @@ pub use settings_submenu::{
     parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
     SettingsSubmenuKind, AUTOMATIC_THEME_VALUE,
 };
+pub use stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvents};
 pub use terminal::{
     is_apple_terminal_session, is_keyboard_protocol_negotiation_sequence_prefix,
     normalize_apple_terminal_input, normalize_native_shift_enter_input,

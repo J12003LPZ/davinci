@@ -91,21 +91,6 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
             .http_proxy
             .as_deref(),
     );
-    if experimental::is_experimental_command(raw.first().map(String::as_str)) {
-        let command = raw[0].as_str();
-        if raw.iter().any(|a| a == "--help" || a == "-h") {
-            println!("{}", print_help());
-            return Ok(0);
-        }
-        let message = match command {
-            "server" => experimental::run_server(experimental::parse_server_command(&raw[1..])?)?,
-            "client" => experimental::run_client(experimental::parse_client_command(&raw[1..])?)?,
-            _ => return Err(format!("Unknown command {command}")),
-        };
-        println!("{message}");
-        return Ok(0);
-    }
-
     if is_package_command(raw.first().map(String::as_str)) {
         let command = raw[0].as_str();
         if raw.iter().any(|a| a == "--help" || a == "-h") {
@@ -129,7 +114,38 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         return run_auth(command);
     }
 
-    let parsed = parse_args(&raw);
+    let parsed = if experimental::is_experimental_command(raw.first().map(String::as_str))
+        || experimental::experimental_features_enabled()
+    {
+        match experimental::parse_experimental_cli(&raw).map_err(|errors| errors.join("\n"))? {
+            experimental::ExperimentalCli::Server { listen, auth } => {
+                let message = experimental::run_server(experimental::ServerCommand {
+                    listen,
+                    auth_token: experimental::resolve_experimental_auth(auth)?,
+                })?;
+                println!("{message}");
+                return Ok(0);
+            }
+            experimental::ExperimentalCli::Client { connect, auth } => {
+                let message = experimental::run_client(experimental::ClientCommand {
+                    connect,
+                    auth_token: experimental::resolve_experimental_auth(auth)?,
+                })?;
+                println!("{message}");
+                return Ok(0);
+            }
+            experimental::ExperimentalCli::Pi {
+                listen, options, ..
+            } => {
+                if !listen.is_empty() {
+                    let _ = experimental::bind_listen_addresses(&listen)?;
+                }
+                options
+            }
+        }
+    } else {
+        parse_args(&raw)
+    };
     for diagnostic in &parsed.diagnostics {
         let prefix = if diagnostic.kind == "error" {
             "Error"
