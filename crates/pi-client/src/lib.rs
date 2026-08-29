@@ -1,7 +1,9 @@
 //! Protocol client matching `@earendil-works/pi-client`.
 
+mod session;
 mod state;
 
+pub use session::{SessionClient, SessionHandle, SessionLeaseMode};
 pub use state::{ClientState, Unsubscribe};
 
 use std::collections::HashMap;

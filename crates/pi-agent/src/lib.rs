@@ -655,6 +655,25 @@ mod tests {
         assert_eq!(kinds.first().copied(), Some("agent_start"));
         assert!(kinds.contains(&"tool_execution_start"));
         assert!(kinds.contains(&"tool_execution_end"));
+        assert!(kinds.contains(&"message_update"));
+        let update_types: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageUpdate {
+                    assistant_message_event,
+                    ..
+                } => Some(match assistant_message_event {
+                    pi_ai::AssistantMessageEvent::TextDelta { .. } => "text_delta",
+                    pi_ai::AssistantMessageEvent::ThinkingDelta { .. } => "thinking_delta",
+                    pi_ai::AssistantMessageEvent::ToolcallStart { .. } => "toolcall_start",
+                    pi_ai::AssistantMessageEvent::ToolcallEnd { .. } => "toolcall_end",
+                    _ => "other",
+                }),
+                _ => None,
+            })
+            .collect();
+        assert!(update_types.contains(&"toolcall_start"));
+        assert!(update_types.contains(&"text_delta"));
         assert_eq!(kinds.last().copied(), Some("agent_end"));
         assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
     }

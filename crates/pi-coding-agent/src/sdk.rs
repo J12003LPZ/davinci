@@ -29,12 +29,50 @@ pub struct CreateAgentSessionOptions {
     /// Resume the latest JSONL session for `cwd` (TS sessionManager restore).
     pub continue_session: bool,
     pub session_path: Option<PathBuf>,
+    /// Models available for cycling (TS `scopedModels`).
+    pub scoped_models: Option<Vec<String>>,
+    /// Extra tool names to register (TS `customTools`).
+    pub custom_tools: Option<Vec<String>>,
 }
 
 pub struct AgentSession {
     pub agent: Agent,
     pub cwd: PathBuf,
     pub agent_dir: PathBuf,
+    pub scoped_models: Vec<String>,
+    pub custom_tools: Vec<String>,
+    listeners: Vec<Box<dyn Fn(&pi_agent::AgentEvent)>>,
+}
+
+impl AgentSession {
+    pub fn subscribe(&mut self, listener: impl Fn(&pi_agent::AgentEvent) + 'static) {
+        self.listeners.push(Box::new(listener));
+    }
+
+    pub fn run<F>(&mut self, complete: F) -> Result<Vec<pi_agent::AgentEvent>, String>
+    where
+        F: FnMut(&Agent) -> Result<pi_ai::AssistantMessage, String>,
+    {
+        let events = self.agent.run_loop(complete)?;
+        for event in &events {
+            for listener in &self.listeners {
+                listener(event);
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn prompt_and_run<F>(
+        &mut self,
+        text: &str,
+        complete: F,
+    ) -> Result<Vec<pi_agent::AgentEvent>, String>
+    where
+        F: FnMut(&Agent) -> Result<pi_ai::AssistantMessage, String>,
+    {
+        self.prompt(text);
+        self.run(complete)
+    }
 }
 
 impl AgentSession {
@@ -161,11 +199,20 @@ pub fn create_agent_session(
         );
     }
 
+    let scoped_models = options.scoped_models.clone().unwrap_or_default();
+    let custom_tools = options.custom_tools.clone().unwrap_or_default();
+    if !custom_tools.is_empty() {
+        agent.apply_extension_tools(&custom_tools);
+    }
+
     Ok(CreateAgentSessionResult {
         session: AgentSession {
             agent,
             cwd,
             agent_dir,
+            scoped_models,
+            custom_tools,
+            listeners: Vec::new(),
         },
         model_fallback_message,
     })
@@ -311,5 +358,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result.session.agent.tools, vec!["read".to_string()]);
+    }
+
+    #[test]
+    fn subscribe_and_custom_tools_match_embed_api() {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempdir().unwrap();
+        let result = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            scoped_models: Some(vec!["google/gemini-3-flash".into()]),
+            custom_tools: Some(vec!["ticket".into()]),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap();
+        let mut session = result.session;
+        assert_eq!(session.scoped_models, vec!["google/gemini-3-flash"]);
+        assert!(session.agent.tools.contains(&"ticket".to_string()));
+        let kinds = Rc::new(RefCell::new(Vec::new()));
+        let kinds_clone = kinds.clone();
+        session.subscribe(move |event| {
+            kinds_clone.borrow_mut().push(event.kind().to_string());
+        });
+        session
+            .prompt_and_run("hi", |_| {
+                Ok(AssistantMessage {
+                    id: "a1".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+        let kinds = kinds.borrow().clone();
+        assert!(kinds.contains(&"agent_start".to_string()));
+        assert!(kinds.contains(&"message_update".to_string()));
+        assert!(kinds.contains(&"agent_end".to_string()));
     }
 }

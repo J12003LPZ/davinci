@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (project `trust.json` + TrustSelector `/trust`, `--help` Examples/Environment Variables, `ClientState` subscribe, server snapshot events). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (SessionHandle + reconnecting SessionClient, `fetchDeferred`/`cancelDeferred` fixtures, agent `message_update` replay, server `session_progress`, embed subscribe/scopedModels/customTools). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 

@@ -93,6 +93,12 @@ impl Agent {
             events.push(AgentEvent::MessageStart {
                 message: chat.clone(),
             });
+            for assistant_message_event in pi_ai::events_from_complete(&assistant) {
+                events.push(AgentEvent::MessageUpdate {
+                    message: chat.clone(),
+                    assistant_message_event,
+                });
+            }
             events.push(AgentEvent::MessageEnd {
                 message: chat.clone(),
             });

@@ -11,7 +11,7 @@ use pi_protocol::{
     encode_server_message, AssistantContent, ClientMessage, ClientMessageDecoder, Command,
     CommandResult, ModelCost, ModelMetadata, ModelRef, ProtocolError, ProtocolErrorCode,
     ServerEvent, ServerMessage, ServerSnapshot, SessionPhase, SessionSnapshot, TextOrImage,
-    ThinkingLevel, TranscriptItem, PROTOCOL_VERSION,
+    ThinkingLevel, TranscriptItem, TranscriptProgress, PROTOCOL_VERSION,
 };
 use pi_session::{discover_sessions, JsonlSession};
 use serde_json::Value;
@@ -73,6 +73,49 @@ impl PiServer {
         self.pending_events.push(ServerEvent::ServerSnapshot {
             snapshot: self.snapshot(),
         });
+    }
+
+    fn emit_prompt_progress(&mut self, session_id: &str, snapshot: &SessionSnapshot) {
+        if let Some(item) = snapshot
+            .transcript
+            .iter()
+            .rev()
+            .find(|item| matches!(item, TranscriptItem::User { .. }))
+        {
+            self.pending_events.push(ServerEvent::SessionProgress {
+                session_id: session_id.into(),
+                progress: TranscriptProgress::ItemStarted { item: item.clone() },
+            });
+            self.pending_events.push(ServerEvent::SessionProgress {
+                session_id: session_id.into(),
+                progress: TranscriptProgress::ItemFinished { item: item.clone() },
+            });
+        }
+        if let Some(TranscriptItem::Assistant { id, content, .. }) = snapshot
+            .transcript
+            .iter()
+            .rev()
+            .find(|item| matches!(item, TranscriptItem::Assistant { .. }))
+        {
+            let delta = content
+                .iter()
+                .find_map(|part| match part {
+                    AssistantContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if !delta.is_empty() {
+                self.pending_events.push(ServerEvent::SessionProgress {
+                    session_id: session_id.into(),
+                    progress: TranscriptProgress::AssistantDelta {
+                        message_id: id.clone(),
+                        content_index: 0,
+                        kind: "text".into(),
+                        delta,
+                    },
+                });
+            }
+        }
     }
 
     fn queue_result_events(&mut self, result: &CommandResult) {
@@ -238,9 +281,9 @@ impl PiServer {
                         live.phase = SessionPhase::Idle;
                     }
                 }
-                Ok(CommandResult::Prompt {
-                    session: self.live_snapshot(&session_id)?,
-                })
+                let session = self.live_snapshot(&session_id)?;
+                self.emit_prompt_progress(&session_id, &session);
+                Ok(CommandResult::Prompt { session })
             }
             Command::Steer { session_id, text } => {
                 self.ensure_live(&session_id)?;
@@ -765,6 +808,42 @@ mod tests {
         assert!(attach_events.iter().any(|event| matches!(
             event,
             ServerEvent::SessionSnapshot { snapshot } if snapshot.id == created.id && snapshot.attached
+        )));
+    }
+
+    #[test]
+    fn prompt_emits_session_progress() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let created = create_session(&mut server);
+        let _ = server.take_events();
+        std::env::set_var("PI_SERVER_PROMPT_REPLY", "delta-text");
+        let _ = memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "p1".into(),
+                request: Command::Prompt {
+                    session_id: created.id.clone(),
+                    text: "hi".into(),
+                },
+            },
+        );
+        std::env::remove_var("PI_SERVER_PROMPT_REPLY");
+        let events = server.take_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::SessionProgress {
+                session_id,
+                progress: TranscriptProgress::ItemStarted { .. },
+            } if session_id == &created.id
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::SessionProgress {
+                progress: TranscriptProgress::AssistantDelta { kind, delta, .. },
+                ..
+            } if kind == "text" && delta == "delta-text"
         )));
     }
 }

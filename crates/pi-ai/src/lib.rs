@@ -5,6 +5,7 @@ mod auth;
 mod catalog;
 mod codex;
 mod codex_ws;
+mod deferred;
 mod http_proxy;
 mod images;
 mod model_config;
@@ -48,6 +49,9 @@ pub use codex::{
     PREVIOUS_RESPONSE_NOT_FOUND, REQUEST_COMPRESSION_ZSTD_LEVEL, SESSION_WEBSOCKET_CACHE_TTL_MS,
     SESSION_WEBSOCKET_MAX_AGE_MS, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
     WEBSOCKET_CONNECTION_LIMIT_REACHED, WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
+};
+pub use deferred::{
+    cancel_deferred, fetch_deferred, DeferredFetchOptions, DeferredFetchResult, DeferredHandle,
 };
 pub use http_proxy::{
     resolve_http_proxy_url_for_target, tcp_connect_via_http_proxy,
