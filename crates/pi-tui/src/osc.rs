@@ -277,6 +277,9 @@ pub fn detect_terminal_theme_for_auto(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_osc11_matches_ts() {
@@ -361,6 +364,7 @@ mod tests {
 
     #[test]
     fn drain_osc_tty_reads_path_with_timeout() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("osc");
         std::fs::write(&path, "\x1b]11;#ffffff\x07").expect("write");
@@ -388,6 +392,7 @@ mod tests {
 
     #[test]
     fn drain_osc_tty_times_out_when_path_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("PI_OSC_DRAIN_REPLY");
         std::env::set_var("PI_OSC_TTY", "/no/such/pi-osc-tty");
         assert!(drain_osc_tty(15).is_none());
