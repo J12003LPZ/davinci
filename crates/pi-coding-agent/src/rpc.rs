@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::export;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RpcCommand {
     #[serde(default)]
     pub id: Option<String>,
@@ -49,6 +49,20 @@ pub struct RpcCommand {
     pub streaming_behavior: Option<String>,
     #[serde(rename = "excludeFromContext", default)]
     pub exclude_from_context: Option<bool>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
+    #[serde(default)]
+    pub confirmed: Option<bool>,
+    #[serde(default)]
+    pub cancelled: Option<bool>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(rename = "notifyType", default)]
+    pub notify_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +86,7 @@ pub struct RpcRuntime {
     pub models: Vec<Model>,
     pub bash_aborted: bool,
     pub invocable_commands: Vec<Value>,
+    pub pending_ui: std::collections::HashMap<String, RpcCommand>,
 }
 
 impl RpcRuntime {
@@ -84,6 +99,7 @@ impl RpcRuntime {
             models,
             bash_aborted: false,
             invocable_commands: Vec::new(),
+            pending_ui: std::collections::HashMap::new(),
         }
     }
 
@@ -387,8 +403,102 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             runtime.bash_aborted = true;
             ok(id, &kind, None)
         }
+        "extension_ui_response" => {
+            if let Some(response_id) = id.clone() {
+                runtime.pending_ui.insert(response_id, command);
+            }
+            ok(id, &kind, None)
+        }
         other => fail(id, other, format!("Unknown RPC command: {other}")),
     }
+}
+
+pub fn extension_ui_request(id: &str, method: &str, extra: Value) -> Value {
+    let mut object = extra.as_object().cloned().unwrap_or_default();
+    object.insert("type".into(), Value::String("extension_ui_request".into()));
+    object.insert("id".into(), Value::String(id.to_string()));
+    object.insert("method".into(), Value::String(method.to_string()));
+    Value::Object(object)
+}
+
+pub fn extension_ui_requests_from_calls(calls: &[Value]) -> Vec<Value> {
+    calls
+        .iter()
+        .filter_map(|call| {
+            let op = call.get("op").and_then(Value::as_str)?;
+            let id = uuid::Uuid::new_v4().to_string();
+            Some(match op {
+                "select" => extension_ui_request(
+                    &id,
+                    "select",
+                    serde_json::json!({
+                        "title": call.get("title"),
+                        "options": call.get("options"),
+                    }),
+                ),
+                "confirm" => extension_ui_request(
+                    &id,
+                    "confirm",
+                    serde_json::json!({
+                        "title": call.get("title"),
+                        "message": call.get("message"),
+                    }),
+                ),
+                "input" => extension_ui_request(
+                    &id,
+                    "input",
+                    serde_json::json!({
+                        "title": call.get("title"),
+                        "placeholder": call.get("placeholder"),
+                    }),
+                ),
+                "editor" => extension_ui_request(
+                    &id,
+                    "editor",
+                    serde_json::json!({
+                        "title": call.get("title"),
+                        "prefill": call.get("prefill"),
+                    }),
+                ),
+                "notify" => extension_ui_request(
+                    &id,
+                    "notify",
+                    serde_json::json!({
+                        "message": call.get("message"),
+                        "notifyType": call.get("type"),
+                    }),
+                ),
+                "setStatus" => extension_ui_request(
+                    &id,
+                    "setStatus",
+                    serde_json::json!({
+                        "statusKey": call.get("key"),
+                        "statusText": call.get("text"),
+                    }),
+                ),
+                "setWidget" => extension_ui_request(
+                    &id,
+                    "setWidget",
+                    serde_json::json!({
+                        "widgetKey": call.get("key"),
+                        "widgetLines": call.get("lines"),
+                        "widgetPlacement": call.get("placement"),
+                    }),
+                ),
+                "setTitle" => extension_ui_request(
+                    &id,
+                    "setTitle",
+                    serde_json::json!({ "title": call.get("title") }),
+                ),
+                "setEditorText" | "pasteToEditor" => extension_ui_request(
+                    &id,
+                    "set_editor_text",
+                    serde_json::json!({ "text": call.get("text") }),
+                ),
+                _ => return None,
+            })
+        })
+        .collect()
 }
 
 fn create_session(runtime: &mut RpcRuntime, parent: Option<&str>) -> Result<bool, String> {
@@ -558,5 +668,50 @@ fn fail(id: Option<String>, command: &str, error: String) -> RpcResponse {
         success: false,
         data: None,
         error: Some(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi_agent::default_system_prompt;
+
+    #[test]
+    fn extension_ui_protocol_matches_ts_shapes() {
+        let request = extension_ui_request(
+            "ui-1",
+            "select",
+            serde_json::json!({ "title": "Pick", "options": ["a", "b"] }),
+        );
+        assert_eq!(request["type"], "extension_ui_request");
+        assert_eq!(request["id"], "ui-1");
+        assert_eq!(request["method"], "select");
+        assert_eq!(request["options"][0], "a");
+        let calls = vec![serde_json::json!({"op":"notify","message":"ready","type":"info"})];
+        let emitted = extension_ui_requests_from_calls(&calls);
+        assert_eq!(emitted[0]["method"], "notify");
+        assert_eq!(emitted[0]["notifyType"], "info");
+        let mut runtime = RpcRuntime::new(
+            pi_agent::Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        let response = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                id: Some("ui-1".into()),
+                kind: "extension_ui_response".into(),
+                value: Some("a".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(response.success);
+        assert_eq!(
+            runtime
+                .pending_ui
+                .get("ui-1")
+                .and_then(|item| item.value.clone()),
+            Some("a".into())
+        );
     }
 }

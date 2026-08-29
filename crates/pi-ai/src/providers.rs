@@ -409,6 +409,7 @@ pub const KNOWN_APIS: &[&str] = &[
     "google-generative-ai",
     "google-vertex",
     "pi-messages",
+    "openrouter-images",
 ];
 
 pub fn builtin_providers() -> Vec<Provider> {

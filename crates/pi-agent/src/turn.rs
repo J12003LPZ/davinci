@@ -307,6 +307,16 @@ impl Agent {
         } else {
             match execute_tool(cwd, name, args) {
                 Ok(result) => (result.content, result.is_error),
+                Err(crate::tools::ToolError::Unknown(_)) => {
+                    if let Some(executor) = &self.custom_tool_executor {
+                        match executor.execute(cwd, name, args) {
+                            Ok(result) => (result.content, result.is_error),
+                            Err(err) => (err.to_string(), true),
+                        }
+                    } else {
+                        (format!("Unknown tool: {name}"), true)
+                    }
+                }
                 Err(err) => (err.to_string(), true),
             }
         };

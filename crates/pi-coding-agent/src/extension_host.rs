@@ -4,8 +4,8 @@ use std::path::Path;
 
 use crate::extensions::{discover_extensions, ExtensionManifest};
 use crate::js_host::{
-    execute_command_tool, node_available, resolve_extension_module, run_js_extension,
-    JsExtensionResult,
+    execute_command_tool, execute_js_tool, node_available, resolve_extension_module,
+    run_js_extension, JsExtensionResult, JsRegisteredProvider,
 };
 use pi_tui::Keybindings;
 
@@ -55,9 +55,10 @@ pub struct LoadedJsExtension {
     pub markdown_transformers: u32,
     pub shortcuts: Vec<String>,
     pub has_editor: bool,
+    pub providers: Vec<JsRegisteredProvider>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ExtensionHost {
     pub events: Vec<ExtensionEvent>,
     pub manifests: Vec<ExtensionManifest>,
@@ -126,6 +127,7 @@ impl ExtensionHost {
                             markdown_transformers: loaded.markdown_transformers,
                             shortcuts: loaded.shortcuts,
                             has_editor,
+                            providers: loaded.providers,
                         });
                     }
                 }
@@ -270,6 +272,20 @@ impl ExtensionHost {
     }
 
     pub fn execute_named_tool(&self, name: &str, cwd: &Path) -> Option<Result<String, String>> {
+        for ext in &self.js {
+            if ext.tools.iter().any(|tool| tool == name) {
+                return Some(
+                    execute_js_tool(
+                        Path::new(&ext.path),
+                        name,
+                        &Value::Object(Default::default()),
+                        cwd,
+                    )
+                    .map(|result| result.content)
+                    .map_err(|err| err.to_string()),
+                );
+            }
+        }
         for manifest in &self.manifests {
             for tool in &manifest.tools {
                 if tool.name == name {
@@ -280,6 +296,42 @@ impl ExtensionHost {
             }
         }
         None
+    }
+
+    pub fn execute_js_or_manifest_tool(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+    ) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+        for ext in &self.js {
+            if ext.tools.iter().any(|tool| tool == name) {
+                return execute_js_tool(Path::new(&ext.path), name, args, cwd);
+            }
+        }
+        for manifest in &self.manifests {
+            for tool in &manifest.tools {
+                if tool.name == name {
+                    if let Some(command) = &tool.command {
+                        return execute_command_tool(command, cwd)
+                            .map(|content| pi_agent::ToolResult {
+                                content,
+                                is_error: false,
+                                details: None,
+                            })
+                            .map_err(pi_agent::ToolError::Failed);
+                    }
+                }
+            }
+        }
+        Err(pi_agent::ToolError::Unknown(name.to_string()))
+    }
+
+    pub fn registered_providers(&self) -> Vec<JsRegisteredProvider> {
+        self.js
+            .iter()
+            .flat_map(|ext| ext.providers.clone())
+            .collect()
     }
 
     pub fn kinds(&self) -> Vec<&'static str> {

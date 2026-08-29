@@ -21,8 +21,37 @@ use pi_ai::{content_text, ChatMessage};
 use pi_protocol::ThinkingLevel;
 use pi_session::{JsonlSession, SessionEntry};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
+
+type CustomToolFn = dyn Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync;
+
+/// Injected tool runner for JS/manifest tools so `pi-agent` stays independent of the coding-agent host.
+#[derive(Clone)]
+pub struct CustomToolExecutor {
+    inner: Arc<CustomToolFn>,
+}
+
+impl std::fmt::Debug for CustomToolExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CustomToolExecutor")
+    }
+}
+
+impl CustomToolExecutor {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync + 'static,
+    {
+        Self { inner: Arc::new(f) }
+    }
+
+    pub fn execute(&self, cwd: &Path, name: &str, args: &Value) -> Result<ToolResult, ToolError> {
+        (self.inner)(cwd, name, args)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,6 +81,7 @@ pub struct Agent {
     pub provider: String,
     pub model_id: String,
     pub tool_execution_mode: ToolExecutionMode,
+    pub custom_tool_executor: Option<CustomToolExecutor>,
 }
 
 impl Agent {
@@ -76,6 +106,7 @@ impl Agent {
             provider: "google".into(),
             model_id: String::new(),
             tool_execution_mode: ToolExecutionMode::Sequential,
+            custom_tool_executor: None,
         }
     }
 
@@ -264,5 +295,55 @@ mod tests {
             agent.continue_loop(|_| unreachable!()).unwrap_err(),
             "Cannot continue from message role: assistant"
         );
+    }
+
+    #[test]
+    fn custom_tool_executor_runs_unknown_builtin_names() {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+
+        let mut agent = Agent::new(default_system_prompt());
+        agent.tools.push("ticket".into());
+        agent.custom_tool_executor = Some(CustomToolExecutor::new(|_cwd, name, args| {
+            Ok(ToolResult {
+                content: format!("{name}:{}", args["id"].as_str().unwrap_or("")),
+                is_error: false,
+                details: None,
+            })
+        }));
+        agent.prompt("lookup");
+        let events = agent
+            .run_loop(|current| {
+                if current.messages.iter().any(|m| m.role == "toolResult") {
+                    return Ok(AssistantMessage {
+                        id: "a2".into(),
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        model: "fixture".into(),
+                        usage: None,
+                        stop_reason: Some(StopReason::Stop),
+                        error_message: None,
+                    });
+                }
+                Ok(AssistantMessage {
+                    id: "a1".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolCall {
+                        id: "call_1".into(),
+                        name: "ticket".into(),
+                        arguments: serde_json::json!({"id": "42"}),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::ToolUse),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind() == "tool_execution_end"));
+        assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
     }
 }

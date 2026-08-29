@@ -3,6 +3,7 @@
 mod autocomplete;
 mod box_comp;
 mod chrome;
+mod config_selector;
 mod custom_message;
 mod editor;
 mod extension_ui;
@@ -36,6 +37,9 @@ pub use autocomplete::{
 };
 pub use box_comp::TuiBox;
 pub use chrome::ChatChrome;
+pub use config_selector::{
+    ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector, ConfigSelectorAction,
+};
 pub use custom_message::{
     CustomMessage, MessageRenderOptions, MessageRenderer, MessageRendererRegistry,
 };

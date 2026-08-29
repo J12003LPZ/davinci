@@ -1,6 +1,7 @@
 mod args;
 mod auth_cmd;
 mod changelog;
+mod experimental;
 mod export;
 mod extension_host;
 mod extensions;
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use pi_agent::{
     default_system_prompt, discover_prompt_templates, discover_skills, load_context_files, Agent,
-    AgentEvent,
+    AgentEvent, CustomToolExecutor,
 };
 use pi_ai::{
     content_text, find_model, fuzzy_models, live_complete, load_builtin_models,
@@ -66,6 +67,21 @@ fn main() {
 }
 
 fn run(raw: Vec<String>) -> Result<i32, String> {
+    if experimental::is_experimental_command(raw.first().map(String::as_str)) {
+        let command = raw[0].as_str();
+        if raw.iter().any(|a| a == "--help" || a == "-h") {
+            println!("{}", print_help());
+            return Ok(0);
+        }
+        let message = match command {
+            "server" => experimental::run_server(experimental::parse_server_command(&raw[1..])?)?,
+            "client" => experimental::run_client(experimental::parse_client_command(&raw[1..])?)?,
+            _ => return Err(format!("Unknown command {command}")),
+        };
+        println!("{message}");
+        return Ok(0);
+    }
+
     if is_package_command(raw.first().map(String::as_str)) {
         let command = raw[0].as_str();
         if raw.iter().any(|a| a == "--help" || a == "-h") {
@@ -194,6 +210,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             let _ = ext.handlers.as_slice();
         }
         agent.apply_extension_tools(&names);
+        attach_tool_executor(&mut agent, &host);
         let _ = host.describe_js();
     }
     agent.cwd = cwd.to_path_buf();
@@ -274,8 +291,19 @@ fn resolve_or_create_session(
     .map_err(|err| err.to_string())
 }
 
+fn available_models(parsed: &Args) -> Vec<pi_ai::Model> {
+    let mut models = load_builtin_models();
+    for provider in loaded_extension_host(parsed).registered_providers() {
+        models.extend(pi_ai::models_from_provider_config(
+            &provider.name,
+            &provider.config,
+        ));
+    }
+    models
+}
+
 fn list_models(list: &ListModels) -> Result<i32, String> {
-    let models = load_builtin_models();
+    let models = available_models(&Args::default());
     let selected = match list {
         ListModels::All => models.iter().collect(),
         ListModels::Query(query) => fuzzy_models(&models, query),
@@ -537,6 +565,12 @@ fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
         cwd,
     );
     let host = loaded_extension_host(&Args::default());
+    for provider in host.registered_providers() {
+        runtime.models.extend(pi_ai::models_from_provider_config(
+            &provider.name,
+            &provider.config,
+        ));
+    }
     runtime.invocable_commands = slash::invocable_commands(
         &host
             .js
@@ -563,6 +597,12 @@ fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
             "{}",
             serde_json::to_string(&response).map_err(|err| err.to_string())?
         );
+        for request in rpc::extension_ui_requests_from_calls(&host.ui_calls) {
+            println!(
+                "{}",
+                serde_json::to_string(&request).map_err(|err| err.to_string())?
+            );
+        }
         if is_prompt {
             let parsed = Args {
                 offline: matches!(
@@ -572,6 +612,12 @@ fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
                 ..Args::default()
             };
             let (_reply, events) = complete_prompt(&parsed, &mut runtime.agent);
+            for request in rpc::extension_ui_requests_from_calls(&host.ui_calls) {
+                println!(
+                    "{}",
+                    serde_json::to_string(&request).map_err(|err| err.to_string())?
+                );
+            }
             for event in events {
                 println!(
                     "{}",
@@ -596,7 +642,7 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         .find(|theme| parsed.use_theme.as_deref() == Some(theme.name.as_str()))
         .or_else(|| builtin_themes().into_iter().next())
         .expect("theme");
-    let models: Vec<String> = load_builtin_models()
+    let models: Vec<String> = available_models(parsed)
         .into_iter()
         .map(|model| format!("{}/{}", model.provider, model.id))
         .collect();
@@ -2008,6 +2054,13 @@ fn handle_custom_overlay_input(parsed: &Args, session: &mut InteractiveSession, 
     }
 }
 
+fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
+    let host = host.clone();
+    agent.custom_tool_executor = Some(CustomToolExecutor::new(move |cwd, name, args| {
+        host.execute_js_or_manifest_tool(cwd, name, args)
+    }));
+}
+
 fn loaded_extension_host(parsed: &Args) -> ExtensionHost {
     let stored = load_settings(&default_agent_dir());
     let mut extensions = stored.extensions.clone();
@@ -2345,9 +2398,13 @@ fn handle_extension_select(
                         for loaded in llama::loaded_models(&catalog, Some(model)) {
                             let _ = llama::unload_and_wait(target, &loaded.id);
                         }
-                        session.chrome.status = load_llama_model(target, model)?;
+                        session.chrome.status =
+                            load_llama_model_and_refresh(session, target, model)?;
                     }
-                    _ => session.chrome.status = load_llama_model(target, model)?,
+                    _ => {
+                        session.chrome.status =
+                            load_llama_model_and_refresh(session, target, model)?
+                    }
                 }
             }
             return Ok(true);
@@ -2383,7 +2440,7 @@ fn handle_extension_select(
                     );
                     return Ok(true);
                 }
-                session.chrome.status = load_llama_model(url, &model.id)?;
+                session.chrome.status = load_llama_model_and_refresh(session, url, &model.id)?;
                 return Ok(true);
             }
             session.chrome.status = format!("{} is {}", model.id, model.status.value);
@@ -2394,6 +2451,28 @@ fn handle_extension_select(
     }
     session.chrome.status = format!("extension-select={choice}");
     Ok(true)
+}
+
+fn load_llama_model_and_refresh(
+    session: &mut InteractiveSession,
+    url: &str,
+    model: &str,
+) -> Result<String, String> {
+    let status = load_llama_model(url, model)?;
+    refresh_llama_models(session, url);
+    Ok(status)
+}
+
+fn refresh_llama_models(session: &mut InteractiveSession, url: &str) {
+    let catalog = llama::list_models(url).unwrap_or_default();
+    if let Ok(models) = llama::selectable_models(&catalog, url, true) {
+        for model in models {
+            let label = format!("{}/{}", model.provider, model.id);
+            if !session.models.contains(&label) {
+                session.models.push(label);
+            }
+        }
+    }
 }
 
 fn load_llama_model(url: &str, model: &str) -> Result<String, String> {
@@ -2771,7 +2850,8 @@ mod tests {
     fn help_lists_product_commands() {
         let help = print_help();
         for needle in [
-            "install", "remove", "update", "list", "config", "auth", "--print", "--resume",
+            "install", "remove", "update", "list", "config", "auth", "server", "client", "--print",
+            "--resume",
         ] {
             assert!(help.contains(needle), "missing {needle}");
         }

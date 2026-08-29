@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: 100% of the previously documented editor/SSE gaps; remaining product deltas listed below.**
+**Complete: remaining product gaps reduced this slice (JS tools/providers, tool fidelity, RPC UI, install/config, experimental CLIs, radius/llama/openrouter-images). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -21,6 +21,11 @@ Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 - **pi-client / pi-server**: Unix + TCP + memory, handshake timeout, request correlation, leases.
 - **pi-telemetry / pi-evals**: TS contracts + fixture harness.
 - **pi-coding-agent `pi`**: flags/subcommands, slash (including `/login` dialog, `/model`, `/settings` cycling the full TS settings-selector item list plus the three submenus, `/tree` filters/label/copy/fold, `/scoped-models`, `/resume` selector, **`/import` JSONL**, **`/share`** Radius-first then gist: `PI_RADIUS_TOKEN` / auth.json plus `PI_RADIUS_ARTIFACT_URL` / `PI_RADIUS_ARTIFACT_REPLY` fixtures, else `https://radius.pi.dev/v1/artifacts`, else gist/`PI_SHARE_*`, **`/changelog`** TS `## [x.y.z]` parser, **`/llama`** llama.cpp router catalog + login `LLAMA_BASE_URL`), RPC (`prompt`/`steer`/`follow_up`/`clear_queue` and the rest of the TS command set), settings/trust (`treeFilterMode`, `markdown.mermaid`, `enableAnalytics`/`trackingId`, `enabledModels`, `httpIdleTimeoutMs`, `hideThinkingBlock`, `showCacheMissNotices`, transport/steering/follow-up, TUI/fullscreen, images, padding, `externalEditor`, `modelThinkingLevels`, warnings), HTML export using TS templates, JS/TS extension runner with virtual `@earendil-works/*` packages, `registerMessageRenderer` / `registerEntryRenderer` / `registerMarkdownTransformer`, and **`registerShortcut`** (reserved built-ins skipped, last extension wins, dispatched when no overlay), **`ctx.ui`** (`setWidget` above/below editor, `setStatus`/`setHeader`/`setFooter`/`notify`/`setTitle`/`setEditorText`/`pasteToEditor`, select/input/editor/confirm dialogs, **`setEditorComponent` / `ui.custom()` Node hosts**, `PI_EXTENSION_UI_REPLY` fixtures), `pi update --self` native copy or npm/pnpm/yarn/bun argv, `pi update --models` catalogs. First-time setup gate matches TS (`PI_EXPERIMENTAL=1`, no `PI_CODING_AGENT_DIR`, missing `settings.json`). Tree labels persist as JSONL `label` entries. Copy uses `pbcopy`/`clip`/`xclip` (dry-run in tests). `/reload` reloads keybindings, **JS extension host**, skills, prompts, **theme files** from `<agent-dir>/themes`, context files, and **extension shortcuts**. Built-in **llama.cpp** provider (`llama.cpp`) matches TS URL normalize, selectable loaded/sleeping models, context/image metadata, progress parsers, Hugging Face id/token lookup, **HF search/details/quantization/gated** (`PI_HF_SEARCH_REPLY` / `PI_HF_DETAILS_REPLY`), **`/models/sse` parse + load/unload/download wait loops** (`PI_LLAMA_SSE_REPLY`), and `PI_LLAMA_MODELS_REPLY` / `PI_LLAMA_PROPS_REPLY` / `PI_LLAMA_ACTION_REPLY` fixtures. JS **`setEditorComponent`** instantiates a Node `Editor` / `CustomEditor` subclass (`session_start` factory, snapshot/restore, key routing, submit/abort). **`ui.custom()`** keeps a pending overlay until `done()`. `/llama` load asks unload-all vs keep when other models are loaded.
+- **JS `registerTool` execute** stores handlers and runs them from the agent loop via `CustomToolExecutor` (no `pi-agent` → coding-agent dependency). **`pi.registerProvider()`** merges models into `/model` and `--list-models`.
+- **Tools:** Windows `powershell` (UTF-8 prefix, `PI_POWERSHELL_REPLY` fixture), gitignore-aware `grep`/`find`/`ls` with TS empty/limit/path error strings, image `read` (`Read image file [mime]` + attachment details).
+- **`pi install`** resolves local/npm/git sources (`Path does not exist`, `PI_INSTALL_DRY_RUN` / `PI_NPM_PACKAGE_DIR` / `PI_GIT_PACKAGE_DIR`). **`pi config`** renders the Tab-scoped package resource TUI.
+- **Experimental `pi server` / `pi client`** with TS `unix:///` transport errors. RPC emits `extension_ui_request` from JS `ui.*` calls and accepts `extension_ui_response`.
+- **Radius** `/v1/config` catalog (`PI_RADIUS_CONFIG_REPLY` / `PI_RADIUS_CONFIG_JSON`), **`openrouter-images`** KnownApi + models, llama selectable models refresh into `/model` after load.
 - **pi-parity**: six required corpora + optional `--parallel-run` / `--diff-jsonl`.
 
 Gates on this slice: `cargo test --workspace`, `cargo fmt --check`, `clippy --workspace --all-targets -- -D warnings` green on 1.83.
@@ -29,13 +34,11 @@ Gates on this slice: `cargo test --workspace`, `cargo fmt --check`, `clippy --wo
 
 Closed this slice: `/export` `.jsonl` (TS branch rewrite), `/session` + `get_session_stats` token/cost shape, RPC `get_tree`/`get_entries`/`get_fork_messages`/`get_state` streaming flags, `get_commands` + slash autocomplete for extension/prompt/skill commands, `read` offset/limit + 2000-line/50KB truncation, RPC `images`/`streamingBehavior`/`excludeFromContext` fields.
 
+Closed this slice: JS `registerTool()` execute via `CustomToolExecutor`, `pi.registerProvider()` catalog merge, Windows `powershell` + gitignore-aware `grep`/`find`/`ls` + image `read`, RPC `extension_ui_request`/`extension_ui_response`, `pi install` path/npm/git resolve (fixtures/dry-run), `pi config` TUI selector (Tab scope), experimental `pi server`/`pi client`, Radius `/v1/config` catalog + `openrouter-images` API + llama models refreshed into `/model`.
+
 Still not product-equivalent:
 
-- **`pi config` TUI** and **`pi install` package resolve/fetch** (text-only / persist-only today)
-- **Experimental `pi server` / `pi client` CLIs**
-- **RPC extension UI protocol** (`extension_ui_request` / `extension_ui_response`)
-- **Tool fidelity:** Windows `powershell`, ripgrep/fd-quality `grep`/`find`/`ls`, JS `registerTool()` execute, image `read`
-- **Dynamic providers:** Radius live catalog, `pi.registerProvider()`, `openrouter-images`, llama catalog refresh into `/model`
 - **`/llama` UX:** live SSE stream (not 250ms snapshot), progress overlay, connection retry UI
 - **JS virtual TUI:** Editor + custom overlay host works; full TS component tree (`Container`/`SelectList`/`Input`) is not mounted
 - Startup deprecation warnings and live interactive model-catalog refresh
+- Live `npm`/`git` package fetch (fixtures and `PI_INSTALL_DRY_RUN` cover tests; no unattended registry install)

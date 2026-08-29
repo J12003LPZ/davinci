@@ -13,8 +13,9 @@ pub use auth::{
     resolve_provider_auth, AuthStorage, AuthStorageError, Credential, CredentialKind, ResolvedAuth,
 };
 pub use catalog::{
-    builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models, Model,
-    ModelCost, KNOWN_PROVIDERS,
+    builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models,
+    load_radius_models, models_from_provider_config, openrouter_image_models,
+    radius_models_from_config, Model, ModelCost, KNOWN_PROVIDERS,
 };
 pub use codex::{
     is_previous_response_not_found, is_websocket_connection_limit_reached, map_codex_event_type,

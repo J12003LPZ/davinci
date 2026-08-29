@@ -18,6 +18,8 @@ pub struct JsExtensionResult {
     #[serde(default)]
     pub tools: Vec<JsRegisteredTool>,
     #[serde(default)]
+    pub providers: Vec<JsRegisteredProvider>,
+    #[serde(default)]
     pub commands: Vec<JsRegisteredCommand>,
     #[serde(default)]
     pub flags: Vec<String>,
@@ -46,6 +48,15 @@ pub struct JsRegisteredTool {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub parameters: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JsRegisteredProvider {
+    pub name: String,
+    #[serde(default)]
+    pub config: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -149,6 +160,45 @@ pub fn run_js_extension(
             stdout.trim(),
             String::from_utf8_lossy(&output.stderr)
         )
+    })
+}
+
+pub fn execute_js_tool(
+    module: &Path,
+    name: &str,
+    args: &Value,
+    cwd: &Path,
+) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+    let result = run_js_extension(
+        module,
+        "tool",
+        &serde_json::json!({
+            "name": name,
+            "args": args,
+            "cwd": cwd,
+            "toolCallId": "call",
+        }),
+    )
+    .map_err(pi_agent::ToolError::Failed)?;
+    if !result.ok {
+        return Err(pi_agent::ToolError::Failed(
+            result
+                .error
+                .unwrap_or_else(|| format!("JS tool {name} failed")),
+        ));
+    }
+    let value = result.result.unwrap_or(Value::Null);
+    Ok(pi_agent::ToolResult {
+        content: value
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        is_error: value
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        details: value.get("details").cloned(),
     })
 }
 
@@ -558,5 +608,47 @@ module.exports = (pi) => {
         )
         .unwrap();
         assert_eq!(closed.result.as_ref().unwrap(), "closed");
+    }
+
+    #[test]
+    fn executes_registered_js_tool_and_records_provider() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerProvider("my-proxy", {
+    baseUrl: "https://proxy.example.com",
+    api: "anthropic-messages",
+    models: [{ id: "demo", name: "Demo", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 128 }],
+  });
+  pi.registerTool({
+    name: "ticket",
+    description: "lookup",
+    execute(_id, args) {
+      return { content: [{ type: "text", text: "ticket:" + args.id }], isError: false };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        assert_eq!(loaded.tools[0].name, "ticket");
+        assert_eq!(loaded.providers[0].name, "my-proxy");
+        let executed = execute_js_tool(
+            &module,
+            "ticket",
+            &serde_json::json!({"id":"42"}),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(executed.content, "ticket:42");
+        assert!(!executed.is_error);
     }
 }

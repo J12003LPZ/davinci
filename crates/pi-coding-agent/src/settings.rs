@@ -9,6 +9,8 @@ pub struct Settings {
     #[serde(default)]
     pub extensions: Vec<String>,
     #[serde(default)]
+    pub packages: Vec<String>,
+    #[serde(default)]
     pub theme: Option<String>,
     #[serde(default)]
     pub quiet_startup: bool,

@@ -11,7 +11,9 @@ Commands:
   pi list                      List installed extensions from settings
   pi config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
   pi auth <command>            Print credentials or check provider readiness
-  pi <command> --help          Show help for install/remove/uninstall/update/list/config/auth
+  pi server --listen unix:///path   Experimental protocol server
+  pi client --connect unix:///path  Experimental protocol client
+  pi <command> --help          Show help for install/remove/uninstall/update/list/config/auth/server/client
 
 Options:
   --provider <name>              Provider name (default: google)

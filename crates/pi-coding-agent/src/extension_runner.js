@@ -288,6 +288,7 @@ async function main() {
 	const recorded = {
 		handlers: {},
 		tools: [],
+		toolHandlers: {},
 		commands: [],
 		commandHandlers: {},
 		flags: [],
@@ -297,6 +298,7 @@ async function main() {
 		markdownTransformers: [],
 		entryRenderers: {},
 		uiCalls: [],
+		providers: [],
 	};
 	let editorFactory;
 	let customComponent;
@@ -433,7 +435,16 @@ async function main() {
 			recorded.handlers[event].push(handler);
 		},
 		registerTool(tool) {
-			recorded.tools.push({ name: tool.name, description: tool.description || "" });
+			recorded.tools.push({
+				name: tool.name,
+				description: tool.description || "",
+				parameters: tool.parameters || null,
+			});
+			if (typeof tool.execute === "function") {
+				recorded.toolHandlers[tool.name] = tool.execute;
+			} else if (typeof tool.handler === "function") {
+				recorded.toolHandlers[tool.name] = tool.handler;
+			}
 		},
 		registerCommand(name, options) {
 			recorded.commands.push({ name, description: (options && options.description) || "" });
@@ -441,7 +452,16 @@ async function main() {
 				recorded.commandHandlers[name] = options.handler;
 			}
 		},
-		registerProvider() {},
+		registerProvider(nameOrProvider, config) {
+			if (typeof nameOrProvider === "string") {
+				recorded.providers.push({ name: nameOrProvider, config: config || {} });
+			} else if (nameOrProvider && typeof nameOrProvider === "object") {
+				recorded.providers.push({
+					name: nameOrProvider.id || nameOrProvider.name || "custom",
+					config: nameOrProvider,
+				});
+			}
+		},
 		ui,
 		registerFlag(name) {
 			recorded.flags.push(name);
@@ -489,7 +509,9 @@ async function main() {
 			return "off";
 		},
 		setThinkingLevel() {},
-		unregisterProvider() {},
+		unregisterProvider(name) {
+			recorded.providers = recorded.providers.filter((provider) => provider.name !== name);
+		},
 		getFlag() {
 			return undefined;
 		},
@@ -657,6 +679,34 @@ async function main() {
 				}
 			}
 		}
+	} else if (op === "tool") {
+		const handler = recorded.toolHandlers[payload.name];
+		if (typeof handler === "function") {
+			const out = await handler(
+				payload.toolCallId || "call",
+				payload.args || {},
+				undefined,
+				undefined,
+				payload.ctx || { cwd: payload.cwd },
+			);
+			if (typeof out === "string") {
+				result = { content: out, isError: false };
+			} else if (out && Array.isArray(out.content)) {
+				result = {
+					content: out.content.map((block) => block.text || "").join("\n"),
+					isError: Boolean(out.isError),
+					details: out.details,
+				};
+			} else if (out && typeof out.content === "string") {
+				result = {
+					content: out.content,
+					isError: Boolean(out.isError),
+					details: out.details,
+				};
+			} else {
+				result = out;
+			}
+		}
 	} else if (op === "editorInput" || op === "editorRender") {
 		const editor = await activateEditor();
 		if (!editor) {
@@ -707,6 +757,7 @@ async function main() {
 			uiCalls: recorded.uiCalls,
 			hasEditor: typeof editorFactory === "function",
 			hasCustom: Boolean(customComponent),
+			providers: recorded.providers,
 			result,
 		}),
 	);

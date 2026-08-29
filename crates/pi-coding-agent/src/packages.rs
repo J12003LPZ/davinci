@@ -8,6 +8,7 @@ use crate::self_update::{
     InstallMethod, PackageTarget, PACKAGE_NAME,
 };
 use crate::settings::{load_settings, save_settings, Settings};
+use pi_tui::{Component, ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector};
 
 const CANNOT_SELF_UPDATE: &str = "error: pi cannot self-update this installation.";
 const ALL_CONFLICT: &str =
@@ -41,21 +42,19 @@ pub fn handle_package_command(
     match command {
         "install" => {
             let source = source.ok_or("install <source> [-l]")?;
-            if !settings.extensions.contains(&source) {
-                settings.extensions.push(source.clone());
-            }
-            save_settings(agent_dir, &settings)?;
-            Ok(format!("Installed {source}{}", scope(local)))
+            let installed = install_and_persist(&source, local, agent_dir)?;
+            Ok(format!("Installed {installed}{}", scope(local)))
         }
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
             settings.extensions.retain(|item| item != &source);
+            settings.packages.retain(|item| item != &source);
             save_settings(agent_dir, &settings)?;
             Ok(format!("Removed {source}{}", scope(local)))
         }
         "update" => handle_update(args, agent_dir),
         "list" => Ok(render_list(&settings)),
-        "config" => Ok(render_config(&settings, local)),
+        "config" => render_config_command(&settings, local, agent_dir),
         _ => Err(format!("Unknown command {command}")),
     }
 }
@@ -291,13 +290,195 @@ fn render_list(settings: &Settings) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedSource {
+    Local(String),
+    Npm { spec: String, name: String },
+    Git(String),
+}
+
+pub fn parse_package_source(source: &str) -> ParsedSource {
+    if let Some(spec) = source.strip_prefix("npm:") {
+        let spec = spec.trim();
+        let name = spec
+            .split_once('@')
+            .filter(|(head, _)| !head.is_empty() || spec.starts_with('@'))
+            .map(|(head, _)| {
+                if spec.starts_with('@') {
+                    let rest = spec.trim_start_matches('@');
+                    rest.split_once('@')
+                        .map(|(pkg, _)| format!("@{pkg}"))
+                        .unwrap_or_else(|| spec.to_string())
+                } else {
+                    head.to_string()
+                }
+            })
+            .unwrap_or_else(|| spec.to_string());
+        return ParsedSource::Npm {
+            spec: spec.to_string(),
+            name,
+        };
+    }
+    if source.starts_with("git@")
+        || source.ends_with(".git")
+        || source.contains("github.com")
+        || source.starts_with("https://")
+        || source.starts_with("ssh://")
+    {
+        return ParsedSource::Git(source.to_string());
+    }
+    ParsedSource::Local(source.to_string())
+}
+
+fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<String, String> {
+    let mut settings = load_settings(agent_dir);
+    let parsed = parse_package_source(source);
+    match &parsed {
+        ParsedSource::Local(path) => {
+            let resolved = resolve_local_path(path);
+            if !resolved.exists() {
+                return Err(format!("Path does not exist: {}", resolved.display()));
+            }
+        }
+        ParsedSource::Npm { name, spec } => {
+            install_remote_package(agent_dir, "npm", name, spec)?;
+        }
+        ParsedSource::Git(url) => {
+            let name = git_package_name(url);
+            install_remote_package(agent_dir, "git", &name, url)?;
+        }
+    }
+    if !settings.extensions.contains(&source.to_string()) {
+        settings.extensions.push(source.to_string());
+    }
+    if !settings.packages.contains(&source.to_string()) {
+        settings.packages.push(source.to_string());
+    }
+    save_settings(agent_dir, &settings)?;
+    let _ = local;
+    Ok(source.to_string())
+}
+
+fn resolve_local_path(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs_home() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn git_package_name(url: &str) -> String {
+    url.rsplit('/')
+        .next()
+        .unwrap_or("package")
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+fn install_remote_package(
+    agent_dir: &Path,
+    kind: &str,
+    name: &str,
+    spec: &str,
+) -> Result<(), String> {
+    if std::env::var("PI_INSTALL_DRY_RUN").is_ok() {
+        return Ok(());
+    }
+    let fixture = match kind {
+        "npm" => std::env::var_os("PI_NPM_PACKAGE_DIR").map(PathBuf::from),
+        _ => std::env::var_os("PI_GIT_PACKAGE_DIR").map(PathBuf::from),
+    };
+    if let Some(fixture) = fixture {
+        if !fixture.exists() {
+            return Err(format!("Path does not exist: {}", fixture.display()));
+        }
+        let dest = agent_dir.join("packages").join(name);
+        copy_dir(&fixture, &dest)?;
+        return Ok(());
+    }
+    if cfg!(test) {
+        return Ok(());
+    }
+    Err(format!(
+        "Unsupported install source without fixture: {spec} (set PI_INSTALL_DRY_RUN=1)"
+    ))
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|err| err.to_string())?;
+    for entry in fs::read_dir(from).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let dest = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &dest)?;
+        } else {
+            fs::copy(entry.path(), dest).map_err(|err| err.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn render_config(settings: &Settings, local: bool) -> String {
     format!(
-        "scope: {}\nextensions: {}\ntheme: {}\n",
+        "scope: {}\nextensions: {}\npackages: {}\ntheme: {}\n",
         if local { "local" } else { "user" },
         settings.extensions.join(", "),
+        settings.packages.join(", "),
         settings.theme.clone().unwrap_or_else(|| "dark".into())
     )
+}
+
+fn render_config_command(
+    settings: &Settings,
+    local: bool,
+    agent_dir: &Path,
+) -> Result<String, String> {
+    let selector = config_selector_from_settings(settings, local, agent_dir);
+    let rendered = selector.render(80).join("\n");
+    if std::env::var("PI_CONFIG_TEXT").is_ok() {
+        return Ok(format!("{}\n{rendered}", render_config(settings, local)));
+    }
+    Ok(rendered)
+}
+
+pub fn config_selector_from_settings(
+    settings: &Settings,
+    local: bool,
+    _agent_dir: &Path,
+) -> ConfigSelector {
+    let scope = if local {
+        ConfigScope::Project
+    } else {
+        ConfigScope::User
+    };
+    let mut items = Vec::new();
+    for source in settings.extensions.iter().chain(settings.packages.iter()) {
+        let name = Path::new(source)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.clone());
+        if items
+            .iter()
+            .any(|item: &ConfigResource| item.source == *source && item.scope == scope)
+        {
+            continue;
+        }
+        items.push(ConfigResource {
+            kind: ConfigResourceKind::Extensions,
+            name,
+            source: source.clone(),
+            enabled: true,
+            scope,
+        });
+    }
+    let mut selector = ConfigSelector::new(items);
+    selector.scope = scope;
+    selector
 }
 
 pub fn ensure_agent_dir(path: &Path) -> Result<(), String> {
@@ -334,5 +515,43 @@ mod tests {
         let message = self_update_binary(&agent, true).unwrap();
         assert!(message.starts_with("Updated pi from "));
         assert!(managed_bin_dir(&agent).join("pi").exists());
+    }
+
+    #[test]
+    fn install_resolves_local_path_and_rejects_missing() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let ext = dir.path().join("ext");
+        fs::create_dir_all(&ext).unwrap();
+        fs::write(ext.join("index.js"), "module.exports = () => {}").unwrap();
+        let installed =
+            handle_package_command("install", &[ext.display().to_string()], &agent).unwrap();
+        assert!(installed.starts_with("Installed "));
+        let settings = load_settings(&agent);
+        assert!(settings.packages.iter().any(|item| item.contains("ext")));
+        let err = handle_package_command(
+            "install",
+            &[dir.path().join("missing").display().to_string()],
+            &agent,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("Path does not exist:"));
+        std::env::set_var("PI_INSTALL_DRY_RUN", "1");
+        let npm = handle_package_command("install", &["npm:demo-ext".into()], &agent).unwrap();
+        std::env::remove_var("PI_INSTALL_DRY_RUN");
+        assert!(npm.contains("npm:demo-ext"));
+        assert_eq!(
+            parse_package_source("npm:demo-ext"),
+            ParsedSource::Npm {
+                spec: "demo-ext".into(),
+                name: "demo-ext".into(),
+            }
+        );
+        let selector = config_selector_from_settings(&load_settings(&agent), false, &agent);
+        assert!(selector
+            .render(80)
+            .iter()
+            .any(|line| line.contains("Package resources")));
     }
 }
