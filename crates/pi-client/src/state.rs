@@ -7,6 +7,11 @@ use std::rc::Rc;
 use pi_protocol::{CommandResult, ServerEvent, ServerSnapshot, SessionSnapshot};
 
 pub type Unsubscribe = Box<dyn FnOnce()>;
+type SnapshotListener = Rc<dyn Fn(&ServerSnapshot)>;
+type EventListener = Rc<dyn Fn(&ServerEvent)>;
+type SessionListener = Rc<dyn Fn(&SessionSnapshot)>;
+type IdListeners<T> = HashMap<u64, T>;
+type SessionListeners<T> = HashMap<String, IdListeners<T>>;
 
 #[derive(Clone, Default)]
 pub struct ClientState {
@@ -18,10 +23,10 @@ struct Inner {
     snapshot: Option<ServerSnapshot>,
     session_snapshots: HashMap<String, SessionSnapshot>,
     attached_session_ids: HashSet<String>,
-    snapshot_listeners: HashMap<u64, Rc<dyn Fn(&ServerSnapshot)>>,
-    event_listeners: HashMap<u64, Rc<dyn Fn(&ServerEvent)>>,
-    session_snapshot_listeners: HashMap<String, HashMap<u64, Rc<dyn Fn(&SessionSnapshot)>>>,
-    session_event_listeners: HashMap<String, HashMap<u64, Rc<dyn Fn(&ServerEvent)>>>,
+    snapshot_listeners: IdListeners<SnapshotListener>,
+    event_listeners: IdListeners<EventListener>,
+    session_snapshot_listeners: SessionListeners<SessionListener>,
+    session_event_listeners: SessionListeners<EventListener>,
     next_id: u64,
 }
 
@@ -211,7 +216,7 @@ impl ClientState {
             }
             ServerEvent::SessionProgress { .. } => {}
         }
-        let listeners: Vec<Rc<dyn Fn(&ServerEvent)>> = {
+        let listeners: Vec<EventListener> = {
             let inner = self.inner.borrow();
             inner.event_listeners.values().cloned().collect()
         };
@@ -219,7 +224,7 @@ impl ClientState {
             listener(event);
         }
         if let Some(session_id) = event_session_id(event) {
-            let listeners: Vec<Rc<dyn Fn(&ServerEvent)>> = {
+            let listeners: Vec<EventListener> = {
                 let inner = self.inner.borrow();
                 inner
                     .session_event_listeners
@@ -275,11 +280,7 @@ impl ClientState {
             inner
                 .session_snapshot_listeners
                 .get(&id)
-                .map(|set| {
-                    set.values()
-                        .cloned()
-                        .collect::<Vec<Rc<dyn Fn(&SessionSnapshot)>>>()
-                })
+                .map(|set| set.values().cloned().collect::<Vec<SessionListener>>())
                 .unwrap_or_default()
         };
         for listener in listeners {

@@ -119,10 +119,7 @@ pub fn resolve_project_trusted(
     {
         return true;
     }
-    match default_project_trust.unwrap_or("ask") {
-        "always" => true,
-        _ => false,
-    }
+    matches!(default_project_trust.unwrap_or("ask"), "always")
 }
 
 pub fn canonicalize_trust_path(path: &Path) -> String {
@@ -297,9 +294,7 @@ fn find_nearest_trust_entry(
                 decision: *decision,
             });
         }
-        let Some(parent) = current.parent() else {
-            return None;
-        };
+        let parent = current.parent()?;
         if parent == current {
             return None;
         }
