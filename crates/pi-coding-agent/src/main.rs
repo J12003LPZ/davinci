@@ -247,7 +247,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         cwd,
         parsed.project_trust_override,
     );
-    let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     apply_http_proxy_settings(settings.http_proxy.as_deref());
     if let Some(level) = parsed.thinking {
         agent.thinking_level = level;
@@ -271,27 +270,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent
         .tools
         .retain(|tool| !parsed.exclude_tools.contains(tool));
-    if !parsed.no_skills {
-        let mut roots: Vec<PathBuf> = parsed.skills.iter().map(PathBuf::from).collect();
-        if trusted {
-            roots.push(cwd.join(".pi").join("skills"));
-        }
-        if let Some(extra) = &settings.skills {
-            roots.extend(extra.iter().map(PathBuf::from));
-        }
-        agent.skills = discover_skills(&roots);
-    }
-    if !parsed.no_prompt_templates {
-        let mut roots: Vec<PathBuf> = parsed.prompt_templates.iter().map(PathBuf::from).collect();
-        if trusted {
-            roots.push(cwd.join(".pi").join("prompts"));
-        }
-        if let Some(extra) = &settings.prompts {
-            roots.extend(extra.iter().map(PathBuf::from));
-        }
-        agent.templates = discover_prompt_templates(&roots);
-    }
-    agent.context_files = load_context_files(cwd, !parsed.no_context_files);
+    agent.cwd = cwd.to_path_buf();
+    apply_discovered_resources(parsed, &mut agent);
     if !parsed.no_session {
         agent.session = Some(resolve_or_create_session(parsed, session_dir, cwd)?);
     }
@@ -340,18 +320,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
                 extensions.push(path.to_string_lossy().into_owned());
             }
         }
-        if !parsed.no_skills {
-            agent
-                .skills
-                .extend(discover_skills(&settings::collect_package_resources(
-                    pkg, "skills",
-                )));
-        }
-        if !parsed.no_prompt_templates {
-            agent.templates.extend(discover_prompt_templates(
-                &settings::collect_package_resources(pkg, "prompts"),
-            ));
-        }
     }
     if !extensions.is_empty() {
         let host = ExtensionHost::load(&default_agent_dir(), &extensions);
@@ -366,7 +334,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         attach_tool_executor(&mut agent, &host);
         let _ = host.describe_js();
     }
-    agent.cwd = cwd.to_path_buf();
     apply_resolved_models(parsed, &mut agent)?;
     if let Some(key) = &parsed.api_key {
         if let Ok(mut storage) = AuthStorage::create() {
@@ -3030,8 +2997,13 @@ fn reload_interactive_resources(
     show_loaded_resources(session, agent, &host, parsed);
 }
 
-fn available_themes() -> Vec<Theme> {
+fn available_themes_with(parsed: Option<&Args>) -> Vec<Theme> {
     let mut themes = load_themes_from_dir(&default_agent_dir().join("themes"));
+    if let Some(parsed) = parsed {
+        for path in &parsed.themes {
+            themes.extend(load_themes_from_dir(Path::new(path)));
+        }
+    }
     let settings = load_settings(&default_agent_dir());
     if let Some(paths) = &settings.themes {
         for path in paths {
@@ -3048,6 +3020,10 @@ fn available_themes() -> Vec<Theme> {
         }
     }
     themes
+}
+
+fn available_themes() -> Vec<Theme> {
+    available_themes_with(None)
 }
 
 fn share_current_session(agent: &Agent) -> Result<String, String> {
@@ -4007,12 +3983,18 @@ fn handle_custom_overlay_input(
 }
 
 fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
-    let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+    let settings = load_merged_settings_with_override(
+        &default_agent_dir(),
+        &agent.cwd,
+        parsed.project_trust_override,
+    );
+    let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
     if !parsed.no_skills {
-        let mut roots = vec![
-            default_agent_dir().join("skills"),
-            agent.cwd.join(".pi").join("skills"),
-        ];
+        let mut roots: Vec<PathBuf> = parsed.skills.iter().map(PathBuf::from).collect();
+        roots.push(default_agent_dir().join("skills"));
+        if trusted {
+            roots.push(agent.cwd.join(".pi").join("skills"));
+        }
         if let Some(extra) = &settings.skills {
             roots.extend(extra.iter().map(PathBuf::from));
         }
@@ -4022,10 +4004,11 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         agent.skills = discover_skills(&roots);
     }
     if !parsed.no_prompt_templates {
-        let mut roots = vec![
-            default_agent_dir().join("prompts"),
-            agent.cwd.join(".pi").join("prompts"),
-        ];
+        let mut roots: Vec<PathBuf> = parsed.prompt_templates.iter().map(PathBuf::from).collect();
+        roots.push(default_agent_dir().join("prompts"));
+        if trusted {
+            roots.push(agent.cwd.join(".pi").join("prompts"));
+        }
         if let Some(extra) = &settings.prompts {
             roots.extend(extra.iter().map(PathBuf::from));
         }
@@ -4149,7 +4132,7 @@ fn show_loaded_resources(
             });
         }
         loaded.add_named_section(&theme, "Extensions", &extensions, expanded);
-        let themes: Vec<LoadedResourceItem> = collect_custom_theme_files()
+        let themes: Vec<LoadedResourceItem> = collect_custom_theme_files(parsed)
             .into_iter()
             .map(|(name, path)| {
                 let path = path.display().to_string();
@@ -4228,8 +4211,11 @@ fn compact_extension_label(path: &str) -> String {
     segments.last().copied().unwrap_or(path).to_string()
 }
 
-fn collect_custom_theme_files() -> Vec<(String, PathBuf)> {
+fn collect_custom_theme_files(parsed: &Args) -> Vec<(String, PathBuf)> {
     let mut files = theme_files_from_dir(&default_agent_dir().join("themes"));
+    for path in &parsed.themes {
+        files.extend(theme_files_from_dir(Path::new(path)));
+    }
     let settings = load_settings(&default_agent_dir());
     if let Some(paths) = &settings.themes {
         for path in paths {
@@ -6736,7 +6722,10 @@ mod tests {
         .unwrap();
         let mut agent = Agent::new("x");
         agent.cwd = dir.path().to_path_buf();
-        let parsed = Args::default();
+        let parsed = Args {
+            project_trust_override: Some(true),
+            ..Args::default()
+        };
         let mut host = ExtensionHost::default();
         rebind_print_extensions(&parsed, &mut agent, &mut host);
         match previous {
@@ -6773,18 +6762,17 @@ mod tests {
         std::fs::write(dir.path().join("AGENTS.md"), "# agents\n").unwrap();
         let mut agent = Agent::new("x");
         agent.cwd = dir.path().to_path_buf();
-        apply_discovered_resources(&Args::default(), &mut agent);
+        let parsed = Args {
+            project_trust_override: Some(true),
+            ..Args::default()
+        };
+        apply_discovered_resources(&parsed, &mut agent);
         let mut session = InteractiveSession::new(
             builtin_themes()[0].clone(),
             "pi",
             vec!["google/gemini".into()],
         );
-        show_loaded_resources(
-            &mut session,
-            &agent,
-            &ExtensionHost::default(),
-            &Args::default(),
-        );
+        show_loaded_resources(&mut session, &agent, &ExtensionHost::default(), &parsed);
         let collapsed = session.chrome.render_document(80).join("\n");
         assert!(collapsed.contains("[Skills]"), "{collapsed}");
         assert!(collapsed.contains("demo"), "{collapsed}");
@@ -6797,14 +6785,43 @@ mod tests {
             "{expanded}"
         );
         session.quiet_startup = true;
-        show_loaded_resources(
-            &mut session,
-            &agent,
-            &ExtensionHost::default(),
-            &Args::default(),
-        );
+        show_loaded_resources(&mut session, &agent, &ExtensionHost::default(), &parsed);
         let quiet = session.chrome.render_document(80).join("\n");
         assert!(!quiet.contains("[Skills]"), "{quiet}");
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    #[test]
+    fn apply_discovered_resources_keeps_cli_skill_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let extra = dir.path().join("extra-skill.md");
+        std::fs::write(
+            &extra,
+            "---\nname: cli-skill\ndescription: from --skill\n---\n# Extra\n",
+        )
+        .unwrap();
+        let mut agent = Agent::new("x");
+        agent.cwd = dir.path().to_path_buf();
+        let parsed = Args {
+            skills: vec![extra.display().to_string()],
+            project_trust_override: Some(false),
+            ..Args::default()
+        };
+        apply_discovered_resources(&parsed, &mut agent);
+        assert!(
+            agent.skills.iter().any(|skill| skill.name == "cli-skill"),
+            "CLI --skill paths must survive reload/rebind: {:?}",
+            agent
+                .skills
+                .iter()
+                .map(|skill| &skill.name)
+                .collect::<Vec<_>>()
+        );
         match previous {
             Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
