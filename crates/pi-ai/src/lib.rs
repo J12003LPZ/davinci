@@ -38,8 +38,11 @@ pub use oauth::{
     authorize_url, oauth_app, oauth_needs_refresh, parse_token_response, refresh_oauth_token,
 };
 pub use oauth_flow::{
-    anthropic_authorize_url, generate_pkce, login_anthropic_oauth, oauth_error_html,
-    oauth_success_html, parse_authorization_input, wait_for_oauth_callback,
+    anthropic_authorize_url, callback_options_for, exchange_openrouter_code, generate_pkce,
+    login_anthropic_oauth, oauth_error_html, oauth_success_html, openai_codex_authorize_url,
+    openrouter_authorize_url, parse_authorization_input, parse_openrouter_authorization_input,
+    parse_openrouter_key_response, radius_authorize_url, wait_for_oauth_callback,
+    wait_for_oauth_callback_with,
 };
 pub use request::{build_request_body, resolve_api, RequestContext};
 pub use retry::{is_retryable_assistant_error, RetryPolicy};

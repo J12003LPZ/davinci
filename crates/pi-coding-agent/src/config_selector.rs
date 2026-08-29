@@ -370,11 +370,7 @@ impl ConfigSelector {
             groups,
             global_groups,
             project_groups,
-            search: Input {
-                value: String::new(),
-                placeholder: "Search resources".into(),
-                ..Input::default()
-            },
+            search: Input::new("Search resources"),
             filtered: Vec::new(),
             selected: 0,
             max_visible: 16,

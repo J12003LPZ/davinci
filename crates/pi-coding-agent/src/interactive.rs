@@ -464,7 +464,7 @@ impl InteractiveMode {
                 Ok(LoginStart::Message(message)) => self.chat.push("system", message),
                 Ok(LoginStart::Dialog(dialog)) => {
                     self.chat.push("system", dialog.render());
-                    self.login_dialog = Some(dialog);
+                    self.login_dialog = Some(*dialog);
                 }
                 Err(err) => self.chat.push("error", err),
             },
@@ -591,6 +591,33 @@ impl InteractiveMode {
         if self.login_dialog.is_some() {
             if line == "\u{1b}" || line.eq_ignore_ascii_case("escape") {
                 let _ = self.apply_login_dialog_key(&Key::Escape);
+                return Ok(false);
+            }
+            if line.contains("\x1b[200~") {
+                if let Some(dialog) = self.login_dialog.as_mut() {
+                    dialog.set_focused(true);
+                    match dialog.handle_input(line) {
+                        LoginDialogAction::Submitted(value) => {
+                            let dialog = self.login_dialog.take().expect("login dialog");
+                            match login::complete_login_dialog(
+                                &commands::agent_dir(),
+                                &dialog,
+                                &value,
+                            ) {
+                                Ok(message) => self.chat.push("system", message),
+                                Err(err) => self.chat.push("error", err),
+                            }
+                        }
+                        LoginDialogAction::Cancelled => {
+                            self.login_dialog = None;
+                            self.chat.push("system", login::login_cancelled_message());
+                        }
+                        LoginDialogAction::Continue => {
+                            let rendered = self.login_dialog.as_ref().unwrap().render();
+                            self.chat.push("system", rendered);
+                        }
+                    }
+                }
                 return Ok(false);
             }
             if let Some(dialog) = self.login_dialog.as_mut() {

@@ -34,10 +34,7 @@ pub struct LoginDialog {
 
 impl LoginDialog {
     pub fn new(provider_id: &str, provider_name: &str, kind: LoginDialogKind) -> Self {
-        let mut input = Input {
-            focused: true,
-            ..Input::default()
-        };
+        let mut input = Input::new("");
         input.focused = true;
         Self {
             title: format!("Login to {provider_name}"),
@@ -174,6 +171,25 @@ impl LoginDialog {
         lines.join("\n") + "\n"
     }
 
+    pub fn handle_input(&mut self, data: &str) -> LoginDialogAction {
+        if data == "\x1b" || data.eq_ignore_ascii_case("escape") {
+            return LoginDialogAction::Cancelled;
+        }
+        if !self.input_visible {
+            return LoginDialogAction::Continue;
+        }
+        match self.input.handle_input(data) {
+            InputAction::Submit => {
+                let value = self.input.get_value().to_string();
+                self.submitted_value = Some(value.clone());
+                self.input_visible = false;
+                LoginDialogAction::Submitted(value)
+            }
+            InputAction::Escape => LoginDialogAction::Cancelled,
+            InputAction::Continue => LoginDialogAction::Continue,
+        }
+    }
+
     pub fn handle_key(&mut self, key: &Key) -> LoginDialogAction {
         if matches!(key, Key::Escape) {
             return LoginDialogAction::Cancelled;
@@ -271,5 +287,12 @@ mod tests {
             dialog.handle_key(&Key::Escape),
             LoginDialogAction::Cancelled
         );
+        let mut dialog = LoginDialog::new("openrouter", "OpenRouter", LoginDialogKind::OauthPaste);
+        dialog.show_manual_input("paste");
+        assert_eq!(
+            dialog.handle_input("\x1b[200~http://localhost/cb?code=abc\x1b[201~"),
+            LoginDialogAction::Continue
+        );
+        assert!(dialog.input_value().contains("code=abc"));
     }
 }

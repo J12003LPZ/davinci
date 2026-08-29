@@ -82,15 +82,33 @@ pub enum InputAction {
     Escape,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputLastAction {
+    Kill,
+    Yank,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Input {
     pub value: String,
     pub placeholder: String,
     pub cursor: usize,
     pub focused: bool,
+    paste_buffer: String,
+    is_in_paste: bool,
+    kill_ring: Vec<String>,
+    last_action: Option<InputLastAction>,
+    undo_stack: Vec<(String, usize)>,
 }
 
 impl Input {
+    pub fn new(placeholder: impl Into<String>) -> Self {
+        Self {
+            placeholder: placeholder.into(),
+            ..Self::default()
+        }
+    }
+
     pub fn get_value(&self) -> &str {
         &self.value
     }
@@ -129,11 +147,21 @@ impl Input {
                 InputAction::Continue
             }
             Key::Ctrl('u') => {
+                self.push_undo();
+                let deleted = self.value[..self.cursor].to_string();
+                if !deleted.is_empty() {
+                    self.push_kill(deleted, true);
+                }
                 self.value.replace_range(..self.cursor, "");
                 self.cursor = 0;
                 InputAction::Continue
             }
             Key::Ctrl('k') => {
+                self.push_undo();
+                let deleted = self.value[self.cursor..].to_string();
+                if !deleted.is_empty() {
+                    self.push_kill(deleted, false);
+                }
                 self.value.truncate(self.cursor);
                 InputAction::Continue
             }
@@ -141,18 +169,84 @@ impl Input {
                 self.delete_word_backward();
                 InputAction::Continue
             }
+            Key::Ctrl('y') => {
+                self.yank();
+                InputAction::Continue
+            }
             _ => InputAction::Continue,
         }
     }
 
     pub fn handle_input(&mut self, data: &str) -> InputAction {
+        let mut data = data.to_string();
+        if data.contains("\x1b[200~") {
+            self.is_in_paste = true;
+            self.paste_buffer.clear();
+            data = data.replace("\x1b[200~", "");
+        }
+        if self.is_in_paste {
+            self.paste_buffer.push_str(&data);
+            if let Some(end) = self.paste_buffer.find("\x1b[201~") {
+                let pasted = self.paste_buffer[..end].to_string();
+                self.is_in_paste = false;
+                self.paste_buffer.clear();
+                self.push_undo();
+                self.insert_str(&pasted);
+                self.last_action = None;
+            }
+            return InputAction::Continue;
+        }
         if data == "\x1b" || data == "escape" {
             return InputAction::Escape;
         }
         if data == "\r" || data == "\n" || data == "enter" {
             return InputAction::Submit;
         }
-        self.handle_key(&crate::keys::parse_key(data))
+        if data == "\x19" {
+            self.yank();
+            return InputAction::Continue;
+        }
+        if data == "\x1b[45;5u" {
+            self.undo();
+            return InputAction::Continue;
+        }
+        self.handle_key(&crate::keys::parse_key(&data))
+    }
+
+    fn push_undo(&mut self) {
+        self.undo_stack.push((self.value.clone(), self.cursor));
+    }
+
+    fn undo(&mut self) {
+        if let Some((value, cursor)) = self.undo_stack.pop() {
+            self.value = value;
+            self.cursor = cursor;
+            self.last_action = None;
+        }
+    }
+
+    fn push_kill(&mut self, text: String, prepend: bool) {
+        if self.last_action == Some(InputLastAction::Kill) {
+            if let Some(last) = self.kill_ring.last_mut() {
+                if prepend {
+                    *last = format!("{text}{last}");
+                } else {
+                    last.push_str(&text);
+                }
+                return;
+            }
+        }
+        self.kill_ring.push(text);
+        self.last_action = Some(InputLastAction::Kill);
+    }
+
+    fn yank(&mut self) {
+        let Some(text) = self.kill_ring.last().cloned() else {
+            return;
+        };
+        self.push_undo();
+        self.insert_str(&text);
+        self.last_action = Some(InputLastAction::Yank);
     }
 
     fn insert_str(&mut self, text: &str) {
@@ -195,6 +289,7 @@ impl Input {
         if self.cursor == 0 {
             return;
         }
+        self.push_undo();
         let before = &self.value[..self.cursor];
         let trimmed = before.trim_end_matches(|c: char| c.is_whitespace());
         let word_end = trimmed
@@ -207,6 +302,10 @@ impl Input {
                     .unwrap_or(0)
             })
             .unwrap_or(0);
+        let deleted = self.value[word_end..self.cursor].to_string();
+        if !deleted.is_empty() {
+            self.push_kill(deleted, true);
+        }
         self.value.replace_range(word_end..self.cursor, "");
         self.cursor = word_end;
     }
@@ -291,5 +390,17 @@ mod tests {
         let rendered = input.render(20);
         assert!(rendered.iter().any(|line| line.contains(CURSOR_MARKER)));
         assert!(rendered.iter().any(|line| line.contains("\x1b[7m")));
+        let mut paste = Input::default();
+        assert_eq!(
+            paste.handle_input("\x1b[200~beep boop\x1b[201~"),
+            InputAction::Continue
+        );
+        assert_eq!(paste.get_value(), "beep boop");
+        paste.handle_key(&Key::Ctrl('w'));
+        assert_eq!(paste.get_value(), "beep ");
+        paste.handle_key(&Key::Ctrl('y'));
+        assert_eq!(paste.get_value(), "beep boop");
+        paste.handle_input("\x1b[45;5u");
+        assert_eq!(paste.get_value(), "beep ");
     }
 }

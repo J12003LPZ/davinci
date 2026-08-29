@@ -52,6 +52,7 @@ pub fn oauth_login_label(provider: &str) -> Option<&'static str> {
     match provider {
         "xai" => Some("Sign in with SuperGrok or X Premium"),
         "kimi-coding" => Some("Sign in with Kimi Code"),
+        "openrouter" => Some("Sign in with OpenRouter"),
         _ => None,
     }
 }

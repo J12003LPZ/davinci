@@ -3,9 +3,7 @@
 use crate::login_dialog::{LoginDialog, LoginDialogKind};
 use pi_ai::auth::{AuthStorage, Credential, FileAuthStorage};
 use pi_ai::oauth::oauth_app;
-use pi_ai::oauth_flow::{
-    anthropic_authorize_url, anthropic_redirect_uri, fixture_authorization_input, generate_pkce,
-};
+use pi_ai::oauth_flow::{anthropic_authorize_url, fixture_authorization_input, generate_pkce};
 use pi_ai::providers::{all_providers, provider_display_name};
 use pi_ai::{login_device_oauth, oauth_login_label, prefers_device_login, DeviceCodeInfo};
 use std::path::{Path, PathBuf};
@@ -234,6 +232,21 @@ pub fn login_oauth(agent_dir: &Path, provider: &str) -> Result<String, String> {
     }
     let name = provider_display_name(provider);
     let pkce = generate_pkce();
+    if provider == "openrouter" {
+        let options = pi_ai::callback_options_for(provider, &pkce.verifier);
+        let callback_url = format!("http://{}:0{}", options.host, options.callback_path);
+        let url = pi_ai::openrouter_authorize_url(&pkce, &callback_url);
+        open_browser(&url);
+        let callback = pi_ai::wait_for_oauth_callback_with(&pkce.verifier, &options)?;
+        let credential = pi_ai::exchange_openrouter_code(&callback.code, &pkce.verifier)
+            .map_err(|err| err.to_string())?;
+        let path = store_credential(agent_dir, provider, credential)?;
+        return Ok(format!(
+            "Logged in to {name}. Credentials saved to {}\nListening for OpenRouter OAuth callback on {callback_url}",
+            path.display()
+        ));
+    }
+    let options = pi_ai::callback_options_for(provider, &pkce.verifier);
     let (url, token_url, client_id, extra) = if provider == "anthropic" {
         (
             anthropic_authorize_url(&pkce),
@@ -241,28 +254,34 @@ pub fn login_oauth(agent_dir: &Path, provider: &str) -> Result<String, String> {
             pi_ai::oauth_flow::ANTHROPIC_CLIENT_ID.to_string(),
             Some(pkce.verifier.clone()),
         )
+    } else if matches!(provider, "openai-codex" | "openai") {
+        (
+            pi_ai::openai_codex_authorize_url(&pkce, &pkce.verifier),
+            pi_ai::oauth_flow::OPENAI_CODEX_TOKEN_URL.to_string(),
+            pi_ai::oauth_flow::OPENAI_CODEX_CLIENT_ID.to_string(),
+            None,
+        )
+    } else if provider == "radius" {
+        let app = oauth_app(provider).ok_or_else(|| "No login methods available.".to_string())?;
+        (
+            pi_ai::radius_authorize_url(&app.authorize_url, &pkce, &pkce.verifier),
+            app.token_url,
+            app.client_id,
+            None,
+        )
     } else {
         let app = oauth_app(provider).ok_or_else(|| "No login methods available.".to_string())?;
-        let redirect = anthropic_redirect_uri();
-        let authorize = pi_ai::authorize_url(provider, &redirect, &pkce.verifier)
+        let authorize = pi_ai::authorize_url(provider, &options.redirect_uri, &pkce.verifier)
             .unwrap_or_else(|| anthropic_authorize_url(&pkce));
         (authorize, app.token_url, app.client_id, None)
     };
     open_browser(&url);
-    let callback = pi_ai::oauth_flow::wait_for_oauth_callback(
-        &pkce.verifier,
-        &pi_ai::oauth_flow::callback_host(),
-        std::env::var("PI_OAUTH_CALLBACK_PORT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(pi_ai::oauth_flow::ANTHROPIC_CALLBACK_PORT),
-        pi_ai::oauth_flow::ANTHROPIC_CALLBACK_PATH,
-    )?;
+    let callback = pi_ai::wait_for_oauth_callback_with(&pkce.verifier, &options)?;
     let mut body = serde_json::json!({
         "grant_type": "authorization_code",
         "client_id": client_id,
         "code": callback.code,
-        "redirect_uri": anthropic_redirect_uri(),
+        "redirect_uri": options.redirect_uri,
         "code_verifier": pkce.verifier,
     });
     if extra.is_some() {
@@ -274,7 +293,7 @@ pub fn login_oauth(agent_dir: &Path, provider: &str) -> Result<String, String> {
     Ok(format!(
         "Logged in to {name}. Credentials saved to {}\nListening for OAuth callback on {}",
         path.display(),
-        url
+        options.redirect_uri
     ))
 }
 
@@ -383,7 +402,7 @@ pub fn handle_login_command(agent_dir: &Path, args: &str) -> Result<String, Stri
 #[derive(Debug)]
 pub enum LoginStart {
     Message(String),
-    Dialog(LoginDialog),
+    Dialog(Box<LoginDialog>),
 }
 
 pub fn begin_interactive_login(agent_dir: &Path, args: &str) -> Result<LoginStart, String> {
@@ -446,7 +465,7 @@ pub fn begin_interactive_login(agent_dir: &Path, args: &str) -> Result<LoginStar
                 dialog.show_info("Authentication can also use the environment.", &[], false);
             }
             dialog.show_prompt("Enter API key", None);
-            Ok(LoginStart::Dialog(dialog))
+            Ok(LoginStart::Dialog(Box::new(dialog)))
         }
         LoginAuthType::Oauth => {
             if prefers_device_login(&provider, Some(rest).filter(|value| !value.is_empty()))
@@ -466,7 +485,7 @@ pub fn begin_interactive_login(agent_dir: &Path, args: &str) -> Result<LoginStar
                             LoginDialog::new(&provider, &name, LoginDialogKind::Device);
                         dialog.show_device_code(&info);
                         dialog.show_waiting("Waiting for authentication...");
-                        return Ok(LoginStart::Dialog(dialog));
+                        return Ok(LoginStart::Dialog(Box::new(dialog)));
                     }
                     Err(_) if enterprise.is_none() && provider == "github-copilot" => {
                         let mut dialog =
@@ -475,7 +494,7 @@ pub fn begin_interactive_login(agent_dir: &Path, args: &str) -> Result<LoginStar
                             "GitHub Enterprise URL/domain (blank for github.com)",
                             Some("company.ghe.com"),
                         );
-                        return Ok(LoginStart::Dialog(dialog));
+                        return Ok(LoginStart::Dialog(Box::new(dialog)));
                     }
                     Err(err) => return Err(format!("Failed to login to {name}: {err}")),
                 }
@@ -488,14 +507,34 @@ pub fn begin_interactive_login(agent_dir: &Path, args: &str) -> Result<LoginStar
             let mut dialog = LoginDialog::new(&provider, &name, LoginDialogKind::OauthPaste);
             let pkce = generate_pkce();
             dialog.oauth_state = Some(pkce.verifier.clone());
+            let options = pi_ai::callback_options_for(&provider, &pkce.verifier);
             let url = if provider == "anthropic" {
                 anthropic_authorize_url(&pkce)
+            } else if provider == "openrouter" {
+                pi_ai::openrouter_authorize_url(
+                    &pkce,
+                    &format!("http://{}:0{}", options.host, options.callback_path),
+                )
+            } else if matches!(provider.as_str(), "openai-codex" | "openai") {
+                pi_ai::openai_codex_authorize_url(&pkce, &pkce.verifier)
+            } else if provider == "radius" {
+                let app =
+                    oauth_app("radius").ok_or_else(|| "No login methods available.".to_string())?;
+                pi_ai::radius_authorize_url(&app.authorize_url, &pkce, &pkce.verifier)
             } else {
-                pi_ai::authorize_url(&provider, &anthropic_redirect_uri(), &pkce.verifier)
+                pi_ai::authorize_url(&provider, &options.redirect_uri, &pkce.verifier)
                     .unwrap_or_else(|| anthropic_authorize_url(&pkce))
             };
             open_browser(&url);
-            dialog.show_progress("Listening for OAuth callback on http://localhost:53692/callback");
+            let listen = if provider == "openrouter" {
+                format!(
+                    "Listening for OpenRouter OAuth callback on http://{}:0{}",
+                    options.host, options.callback_path
+                )
+            } else {
+                format!("Listening for OAuth callback on {}", options.redirect_uri)
+            };
+            dialog.show_progress(&listen);
             dialog.show_auth(
                 &url,
                 Some("Complete login in your browser. If the browser is on another machine, paste the final redirect URL here."),
@@ -503,7 +542,7 @@ pub fn begin_interactive_login(agent_dir: &Path, args: &str) -> Result<LoginStar
             dialog.show_manual_input(
                 "Complete login in your browser, or paste the authorization code / redirect URL here:",
             );
-            Ok(LoginStart::Dialog(dialog))
+            Ok(LoginStart::Dialog(Box::new(dialog)))
         }
     }
 }
@@ -517,12 +556,24 @@ pub fn login_oauth_with_input(
     let name = provider_display_name(provider);
     let pkce = generate_pkce();
     let state = expected_state.unwrap_or(&pkce.verifier);
+    if provider == "openrouter" {
+        let code = pi_ai::parse_openrouter_authorization_input(input)
+            .ok_or_else(|| "Missing authorization code".to_string())?;
+        let credential =
+            pi_ai::exchange_openrouter_code(&code, state).map_err(|err| err.to_string())?;
+        let path = store_credential(agent_dir, provider, credential)?;
+        return Ok(format!(
+            "Logged in to {name}. Credentials saved to {}",
+            path.display()
+        ));
+    }
     let (code, submitted_state) = pi_ai::parse_authorization_input(input);
     let code = code.ok_or_else(|| "Missing authorization code".to_string())?;
     let submitted_state = submitted_state.unwrap_or_else(|| state.to_string());
     if submitted_state != state {
         return Err("OAuth state mismatch".into());
     }
+    let options = pi_ai::callback_options_for(provider, state);
     let (token_url, client_id, include_state) = if provider == "anthropic" {
         (
             pi_ai::oauth_flow::ANTHROPIC_TOKEN_URL.to_string(),
@@ -537,7 +588,7 @@ pub fn login_oauth_with_input(
         "grant_type": "authorization_code",
         "client_id": client_id,
         "code": code,
-        "redirect_uri": anthropic_redirect_uri(),
+        "redirect_uri": options.redirect_uri,
         "code_verifier": state,
     });
     if include_state {
@@ -661,6 +712,26 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_oauth_exchanges_key_fixture() {
+        let _lock = settings::test_env_lock();
+        let dir = tempdir().unwrap();
+        let token = dir.path().join("or.json");
+        std::fs::write(&token, r#"{"key":"or-key"}"#).unwrap();
+        std::env::set_var("PI_OAUTH_TOKEN_FIXTURE", &token);
+        std::env::set_var(
+            "PI_OAUTH_CALLBACK_URL",
+            "http://127.0.0.1/oauth/callback?code=abc",
+        );
+        let saved = login_oauth(dir.path(), "openrouter").unwrap();
+        assert!(saved.contains("Logged in to OpenRouter"));
+        assert!(saved.contains("Listening for OpenRouter OAuth callback"));
+        let raw = std::fs::read_to_string(auth_path(dir.path())).unwrap();
+        assert!(raw.contains("or-key"));
+        std::env::remove_var("PI_OAUTH_CALLBACK_URL");
+        std::env::remove_var("PI_OAUTH_TOKEN_FIXTURE");
+    }
+
+    #[test]
     fn device_code_login_uses_fixtures() {
         let _lock = settings::test_env_lock();
         let dir = tempdir().unwrap();
@@ -696,7 +767,8 @@ mod tests {
         std::env::remove_var("PI_LOGIN_API_KEY");
         let dir = tempdir().unwrap();
         match begin_interactive_login(dir.path(), "anthropic api_key").unwrap() {
-            LoginStart::Dialog(mut dialog) => {
+            LoginStart::Dialog(dialog) => {
+                let mut dialog = *dialog;
                 let rendered = dialog.render();
                 assert!(rendered.contains("Login to Anthropic"));
                 assert!(rendered.contains("Enter API key"));
