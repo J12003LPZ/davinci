@@ -2,18 +2,16 @@
 name = "pi-session"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
-description = "JSONL session store compatible with ~/.pi and TypeScript pi"
+rust-version.workspace = true
+description = "JSONL session store matching pi-agent-core session harness"
 
 [dependencies]
+pi-protocol = { path = "../pi-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-walkdir.workspace = true
-indexmap.workspace = true
-dirs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

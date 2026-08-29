@@ -2,16 +2,21 @@
 name = "pi-server"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
-description = "Experimental server for remote pi sessions"
+rust-version.workspace = true
+description = "Protocol server matching @earendil-works/pi-server"
 
 [dependencies]
-pi-protocol.workspace = true
-pi-agent.workspace = true
-pi-session.workspace = true
-pi-ai.workspace = true
+pi-agent = { path = "../pi-agent" }
+pi-ai = { path = "../pi-ai" }
+pi-client = { path = "../pi-client" }
+pi-protocol = { path = "../pi-protocol" }
+pi-session = { path = "../pi-session" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

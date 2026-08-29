@@ -2,30 +2,28 @@
 name = "pi-ai"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Unified multi-provider LLM API matching @earendil-works/pi-ai"
 
 [dependencies]
-pi-telemetry.workspace = true
+pi-protocol = { path = "../pi-protocol" }
+pi-telemetry = { path = "../pi-telemetry" }
+base64.workspace = true
+regex.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
 url.workspace = true
-zeroize.workspace = true
-rustls.workspace = true
-rustls-pki-types.workspace = true
-webpki-roots.workspace = true
-indexmap.workspace = true
-base64.workspace = true
-dirs.workspace = true
 uuid.workspace = true
-regex.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
+sha1 = { workspace = true }
 sha2.workspace = true
-hmac.workspace = true
-hex.workspace = true
-chrono.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

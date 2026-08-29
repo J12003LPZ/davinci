@@ -1,273 +1,362 @@
-//! TypeScript `packages/tui/src/components/image.ts`.
+//! Kitty / iTerm image protocol helpers matching `vendor/pi/packages/tui/src/terminal-image.ts`.
 
-use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
-use crate::component::Component;
-use crate::diff::truncate_to_width;
-use crate::terminal_image::{
-    allocate_image_id, get_capabilities, get_cell_dimensions, get_image_dimensions, image_fallback,
-    parse_kitty_image_header, render_image, ImageDimensions, ImageProtocol, ImageRenderOptions,
-};
+pub const KITTY_IMAGE_PREFIX: &str = "\x1b_G";
+pub const KITTY_IMAGE_SUFFIX: &str = "\x1b\\";
+pub const ITERM2_IMAGE_PREFIX: &str = "\x1b]1337;File=";
 
-#[derive(Debug, Clone)]
-pub struct Image {
-    base64_data: String,
-    mime_type: String,
-    dimensions: ImageDimensions,
-    fallback_color: fn(&str) -> String,
-    max_width_cells: Option<u32>,
-    max_height_cells: Option<u32>,
-    filename: Option<String>,
-    image_id: RefCell<Option<u32>>,
-    cached_lines: RefCell<Option<(usize, Vec<String>)>>,
+/// TS `isImageLine`.
+pub fn is_image_line(line: &str) -> bool {
+    line.starts_with(KITTY_IMAGE_PREFIX)
+        || line.starts_with(ITERM2_IMAGE_PREFIX)
+        || line.contains(KITTY_IMAGE_PREFIX)
+        || line.contains(ITERM2_IMAGE_PREFIX)
 }
 
-#[derive(Default)]
-pub struct ImageOptions {
-    pub max_width_cells: Option<u32>,
-    pub max_height_cells: Option<u32>,
-    pub filename: Option<String>,
-    pub image_id: Option<u32>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KittyImageMetadata {
+    pub image_id: u32,
+    pub columns: u32,
+    pub rows: u32,
+    pub width_px: u32,
+    pub height_px: u32,
 }
 
-impl Image {
-    pub fn new(
-        base64_data: impl Into<String>,
-        mime_type: impl Into<String>,
-        fallback_color: fn(&str) -> String,
-        options: ImageOptions,
-        dimensions: Option<ImageDimensions>,
-    ) -> Self {
-        let ImageOptions {
-            max_width_cells,
-            max_height_cells,
-            filename,
-            image_id,
-        } = options;
-        let base64_data = base64_data.into();
-        let mime_type = mime_type.into();
-        let dimensions = dimensions
-            .or_else(|| get_image_dimensions(&base64_data, &mime_type))
-            .unwrap_or(ImageDimensions {
-                width_px: 800,
-                height_px: 600,
-            });
-        Self {
-            base64_data,
-            mime_type,
-            dimensions,
-            fallback_color,
-            max_width_cells,
-            max_height_cells,
-            filename,
-            image_id: RefCell::new(image_id),
-            cached_lines: RefCell::new(None),
+struct RegisteredKittyImage {
+    metadata: KittyImageMetadata,
+    transmission_generation: u64,
+}
+
+fn next_kitty_generation() -> u64 {
+    static GENERATION: OnceLock<Mutex<u64>> = OnceLock::new();
+    let cell = GENERATION.get_or_init(|| Mutex::new(0));
+    let mut value = cell.lock().unwrap_or_else(|err| err.into_inner());
+    *value += 1;
+    *value
+}
+
+fn kitty_metadata() -> &'static Mutex<HashMap<u32, RegisteredKittyImage>> {
+    static STORE: OnceLock<Mutex<HashMap<u32, RegisteredKittyImage>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// TS `registerKittyImageMetadata`.
+pub fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
+    let mut store = kitty_metadata()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    store.remove(&metadata.image_id);
+    store.insert(
+        metadata.image_id,
+        RegisteredKittyImage {
+            metadata,
+            transmission_generation: next_kitty_generation(),
+        },
+    );
+    if store.len() > 1000 {
+        if let Some(oldest) = store.keys().next().copied() {
+            store.remove(&oldest);
         }
     }
-
-    pub fn image_id(&self) -> Option<u32> {
-        *self.image_id.borrow()
-    }
-
-    pub fn invalidate(&self) {
-        self.cached_lines.replace(None);
-    }
 }
 
-impl Component for Image {
-    fn render(&self, width: usize) -> Vec<String> {
-        if let Some((cached_width, lines)) = self.cached_lines.borrow().as_ref() {
-            if *cached_width == width {
-                return lines.clone();
-            }
-        }
-        let max_width =
-            1.max((width.saturating_sub(2) as u32).min(self.max_width_cells.unwrap_or(60)));
-        let cell = get_cell_dimensions();
-        let default_max_height = 1.max((max_width * cell.width_px).div_ceil(cell.height_px));
-        let max_height = self.max_height_cells.unwrap_or(default_max_height);
-        let caps = get_capabilities();
-        let mut image_id = *self.image_id.borrow();
-        let lines = if let Some(protocol) = caps.images {
-            if protocol == ImageProtocol::Kitty && image_id.is_none() {
-                image_id = Some(allocate_image_id());
-            }
-            match render_image(
-                &self.base64_data,
-                self.dimensions,
-                ImageRenderOptions {
-                    max_width_cells: Some(max_width),
-                    max_height_cells: Some(max_height),
-                    image_id,
-                    move_cursor: Some(false),
-                    ..ImageRenderOptions::default()
-                },
-            ) {
-                Some(result) => {
-                    if result.image_id.is_some() {
-                        image_id = result.image_id;
-                    }
-                    if protocol == ImageProtocol::Kitty {
-                        let mut lines = vec![result.sequence];
-                        for _ in 0..result.rows.saturating_sub(1) {
-                            lines.push(String::new());
-                        }
-                        lines
-                    } else {
-                        let mut lines = Vec::new();
-                        for _ in 0..result.rows.saturating_sub(1) {
-                            lines.push(String::new());
-                        }
-                        let row_offset = result.rows.saturating_sub(1);
-                        let move_up = if row_offset > 0 {
-                            format!("\x1b[{row_offset}A")
-                        } else {
-                            String::new()
-                        };
-                        lines.push(format!("{}{}", move_up, result.sequence));
-                        lines
-                    }
-                }
-                None => self.fallback_lines(width),
-            }
-        } else {
-            self.fallback_lines(width)
-        };
-        if image_id.is_none() {
-            if let Some(line) = lines.first() {
-                if let Some((ids, _)) = parse_kitty_image_header(line) {
-                    image_id = ids.first().copied();
-                }
-            }
-        }
-        *self.image_id.borrow_mut() = image_id;
-        self.cached_lines.replace(Some((width, lines.clone())));
-        lines
-    }
+fn kitty_controls(line: &str) -> Option<&str> {
+    let start = line.find(KITTY_IMAGE_PREFIX)?;
+    let after = &line[start + KITTY_IMAGE_PREFIX.len()..];
+    after.split_once(';').map(|(controls, _)| controls)
 }
 
-impl Image {
-    fn fallback_lines(&self, width: usize) -> Vec<String> {
-        let fallback = image_fallback(
-            &self.mime_type,
-            Some(self.dimensions),
-            self.filename.as_deref(),
+fn image_id_from_controls(controls: &str) -> Option<u32> {
+    for part in controls.split(',') {
+        if let Some(value) = part.strip_prefix("i=") {
+            return value.parse().ok();
+        }
+    }
+    None
+}
+
+/// TS `getKittyImageMetadata`.
+pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
+    let controls = kitty_controls(line)?;
+    let image_id = image_id_from_controls(controls)?;
+    let store = kitty_metadata()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    store.get(&image_id).map(|item| item.metadata)
+}
+
+/// TS `cropKittyImageLine`.
+pub fn crop_kitty_image_line(line: &str, hidden_rows: u32, visible_rows: u32) -> String {
+    let Some(metadata) = get_kitty_image_metadata(line) else {
+        return line.to_string();
+    };
+    let Some(match_start) = line.find(KITTY_IMAGE_PREFIX) else {
+        return line.to_string();
+    };
+    let Some(controls) = kitty_controls(line) else {
+        return line.to_string();
+    };
+    if hidden_rows >= metadata.rows || visible_rows == 0 {
+        return line.to_string();
+    }
+    let cropped_rows = visible_rows.min(metadata.rows - hidden_rows);
+    if hidden_rows == 0 && cropped_rows == metadata.rows {
+        return line.to_string();
+    }
+    let source_y = (metadata.height_px * hidden_rows) / metadata.rows;
+    let source_end = {
+        let num = metadata.height_px * (hidden_rows + cropped_rows);
+        num.div_ceil(metadata.rows)
+    };
+    let source_height = 1.max(metadata.height_px.min(source_end).saturating_sub(source_y));
+    let mut kept: Vec<String> = controls
+        .split(',')
+        .filter(|control| {
+            !control.starts_with("y=") && !control.starts_with("h=") && !control.starts_with("r=")
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    kept.push(format!("y={source_y}"));
+    kept.push(format!("h={source_height}"));
+    kept.push(format!("r={cropped_rows}"));
+    let rest_start = match_start + KITTY_IMAGE_PREFIX.len() + controls.len() + 1;
+    format!(
+        "{}{KITTY_IMAGE_PREFIX}{};{}",
+        &line[..match_start],
+        kept.join(","),
+        &line[rest_start..]
+    )
+}
+
+pub fn kitty_image_chunk(payload_b64: &str, last: bool) -> String {
+    let more = if last { 0 } else { 1 };
+    format!("{KITTY_IMAGE_PREFIX}a=T,f=100,m={more};{payload_b64}{KITTY_IMAGE_SUFFIX}")
+}
+
+/// TS `encodeKitty` from `terminal-image.ts`: `a=T,f=100,q=2` plus optional placement.
+pub fn encode_kitty(
+    base64_data: &str,
+    columns: Option<u32>,
+    rows: Option<u32>,
+    image_id: Option<u32>,
+    move_cursor: bool,
+) -> String {
+    const CHUNK_SIZE: usize = 4096;
+    let mut params = vec!["a=T".into(), "f=100".into(), "q=2".into()];
+    if !move_cursor {
+        params.push("C=1".into());
+    }
+    if let Some(columns) = columns {
+        params.push(format!("c={columns}"));
+    }
+    if let Some(rows) = rows {
+        params.push(format!("r={rows}"));
+    }
+    if let Some(image_id) = image_id {
+        params.push(format!("i={image_id}"));
+    }
+    if base64_data.len() <= CHUNK_SIZE {
+        return format!(
+            "{KITTY_IMAGE_PREFIX}{};{base64_data}{KITTY_IMAGE_SUFFIX}",
+            params.join(",")
         );
-        vec![truncate_to_width(
-            &(self.fallback_color)(&fallback),
-            width,
-            "...",
-        )]
     }
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    let mut first = true;
+    while offset < base64_data.len() {
+        let end = (offset + CHUNK_SIZE).min(base64_data.len());
+        let chunk = &base64_data[offset..end];
+        let last = end == base64_data.len();
+        if first {
+            chunks.push(format!(
+                "{KITTY_IMAGE_PREFIX}{},m=1;{chunk}{KITTY_IMAGE_SUFFIX}",
+                params.join(",")
+            ));
+            first = false;
+        } else if last {
+            chunks.push(format!(
+                "{KITTY_IMAGE_PREFIX}m=0;{chunk}{KITTY_IMAGE_SUFFIX}"
+            ));
+        } else {
+            chunks.push(format!(
+                "{KITTY_IMAGE_PREFIX}m=1;{chunk}{KITTY_IMAGE_SUFFIX}"
+            ));
+        }
+        offset = end;
+    }
+    chunks.join("")
+}
+
+/// TS `deleteKittyImage`.
+pub fn delete_kitty_image(image_id: u32) -> String {
+    format!("{KITTY_IMAGE_PREFIX}a=d,d=I,i={image_id},q=2{KITTY_IMAGE_SUFFIX}")
+}
+
+/// TS `deleteAllKittyImages`.
+pub fn delete_all_kitty_images() -> String {
+    format!("{KITTY_IMAGE_PREFIX}a=d,d=A,q=2{KITTY_IMAGE_SUFFIX}")
+}
+
+/// TS `deleteAllKittyPlacements`.
+pub fn delete_all_kitty_placements() -> String {
+    format!("{KITTY_IMAGE_PREFIX}a=d,d=a,q=2{KITTY_IMAGE_SUFFIX}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellDimensions {
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
+fn cell_dimensions() -> &'static Mutex<CellDimensions> {
+    static STORE: OnceLock<Mutex<CellDimensions>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        Mutex::new(CellDimensions {
+            width_px: 9,
+            height_px: 18,
+        })
+    })
+}
+
+/// TS `getCellDimensions`.
+pub fn get_cell_dimensions() -> CellDimensions {
+    *cell_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+/// TS `setCellDimensions`.
+pub fn set_cell_dimensions(width_px: u32, height_px: u32) {
+    *cell_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = CellDimensions {
+        width_px,
+        height_px,
+    };
+}
+
+pub fn iterm_image(payload_b64: &str) -> String {
+    format!("\x1b]1337;File=inline=1:{payload_b64}\u{7}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyImageHeader {
+    pub ids: Vec<String>,
+    pub rows: u32,
+}
+
+/// Parse a Kitty graphics protocol header line matching
+/// `parseKittyImageHeader` in `vendor/pi/packages/tui/src/tui-main-screen.ts`.
+pub fn parse_kitty_image_header(line: &str) -> Option<KittyImageHeader> {
+    let rest = line.strip_prefix(KITTY_IMAGE_PREFIX)?;
+    let (params, _) = rest.split_once(';').unwrap_or((rest, ""));
+    let mut ids = Vec::new();
+    let mut rows = 1_u32;
+    for part in params.split(',') {
+        if let Some(value) = part.strip_prefix("i=") {
+            ids.push(value.to_string());
+        } else if let Some(value) = part.strip_prefix("I=") {
+            ids.push(value.to_string());
+        } else if let Some(value) = part.strip_prefix("r=") {
+            rows = value.parse().unwrap_or(1);
+        }
+    }
+    Some(KittyImageHeader { ids, rows })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyImagePlacement {
+    pub image_id: u32,
+    pub transmission_generation: u64,
+    pub transmission_bytes: usize,
+    pub estimated_decoded_bytes: usize,
+    pub sequence: String,
+    pub replacement_line: String,
+}
+
+const KITTY_PLACEMENT_CONTROL_KEYS: &[&str] = &[
+    "i", "p", "x", "y", "w", "h", "X", "Y", "c", "r", "C", "U", "z", "P", "Q", "H", "V",
+];
+
+/// TS `getKittyImagePlacement`.
+pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
+    let start = line.find(KITTY_IMAGE_PREFIX)?;
+    let after = &line[start + KITTY_IMAGE_PREFIX.len()..];
+    let (controls, _) = after.split_once(';')?;
+    let image_id = image_id_from_controls(controls)?;
+    let store = kitty_metadata()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let registered = store.get(&image_id)?;
+    let mut command_start = start;
+    let mut command_controls = controls.to_string();
+    let mut transmission_end;
+    loop {
+        let rel = line[command_start + KITTY_IMAGE_PREFIX.len()..].find(KITTY_IMAGE_SUFFIX)?;
+        let terminator = command_start + KITTY_IMAGE_PREFIX.len() + rel;
+        transmission_end = terminator + KITTY_IMAGE_SUFFIX.len();
+        let is_more = command_controls.split(',').any(|part| part == "m=1");
+        if !is_more {
+            break;
+        }
+        command_start = transmission_end;
+        if !line[command_start..].starts_with(KITTY_IMAGE_PREFIX) {
+            return None;
+        }
+        let after_prefix = &line[command_start + KITTY_IMAGE_PREFIX.len()..];
+        let (next_controls, _) = after_prefix.split_once(';')?;
+        command_controls = next_controls.to_string();
+    }
+    let kept: Vec<&str> = controls
+        .split(',')
+        .filter(|control| {
+            let key = control.split('=').next().unwrap_or("");
+            KITTY_PLACEMENT_CONTROL_KEYS.contains(&key)
+        })
+        .collect();
+    let sequence = format!(
+        "{KITTY_IMAGE_PREFIX}a=p,q=2,{}{KITTY_IMAGE_SUFFIX}",
+        kept.join(",")
+    );
+    Some(KittyImagePlacement {
+        image_id,
+        transmission_generation: registered.transmission_generation,
+        transmission_bytes: transmission_end - start,
+        estimated_decoded_bytes: (registered.metadata.width_px as usize)
+            .saturating_mul(registered.metadata.height_px as usize)
+            .saturating_mul(4),
+        sequence: sequence.clone(),
+        replacement_line: format!("{}{sequence}{}", &line[..start], &line[transmission_end..]),
+    })
+}
+
+pub fn kitty_image_ids(line: &str) -> Vec<String> {
+    parse_kitty_image_header(line)
+        .map(|header| header.ids)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::visible_width;
-    use crate::terminal_image::{
-        reset_capabilities_cache, set_capabilities, set_cell_dimensions, CellDimensions,
-        TerminalCapabilities,
-    };
-
-    fn identity(value: &str) -> String {
-        value.to_string()
-    }
-
-    fn yellow(value: &str) -> String {
-        format!("\x1b[33m{value}\x1b[0m")
-    }
 
     #[test]
-    fn image_square_box_and_padding_match_typescript() {
-        let _lock = crate::terminal_image::capabilities_lock();
-        set_capabilities(TerminalCapabilities {
-            images: Some(ImageProtocol::Kitty),
-            true_color: true,
-            hyperlinks: true,
-        });
-        set_cell_dimensions(CellDimensions {
-            width_px: 10,
-            height_px: 20,
-        });
-        let image = Image::new(
-            "AAAA",
-            "image/png",
-            identity,
-            ImageOptions {
-                max_width_cells: Some(10),
-                ..ImageOptions::default()
-            },
-            Some(ImageDimensions {
-                width_px: 10,
-                height_px: 100,
-            }),
-        );
-        let lines = image.render(12);
-        assert_eq!(lines.len(), 5);
-        assert!(lines[0].contains(",c=1,r=5"));
-        set_cell_dimensions(CellDimensions {
-            width_px: 10,
-            height_px: 10,
-        });
-        let padded = Image::new(
-            "AAAA",
-            "image/png",
-            identity,
-            ImageOptions {
-                max_width_cells: Some(2),
-                ..ImageOptions::default()
-            },
-            Some(ImageDimensions {
-                width_px: 20,
-                height_px: 20,
-            }),
-        );
-        let lines = padded.render(4);
-        let image_id = padded.image_id().expect("id");
-        assert!(lines[0].starts_with("\x1b_G"));
-        assert!(lines[0].contains(",C=1,"));
-        assert!(lines[0].contains(&format!(",i={image_id}")));
-        assert!(lines[0].ends_with("\x1b\\"));
-        assert_eq!(lines[1..], [""]);
-        reset_capabilities_cache();
-        set_cell_dimensions(CellDimensions {
-            width_px: 9,
-            height_px: 18,
-        });
-    }
-
-    #[test]
-    fn image_fallback_truncates_and_shortens_home() {
-        let _lock = crate::terminal_image::capabilities_lock();
-        set_capabilities(TerminalCapabilities {
-            images: None,
-            true_color: false,
-            hyperlinks: false,
-        });
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".into());
-        let long_path = format!(
-            "{home}/images/{}.png",
-            "generated-image-with-a-very-long-absolute-path".repeat(4)
-        );
-        let image = Image::new(
-            "AAAA",
-            "image/png",
-            yellow,
-            ImageOptions {
-                filename: Some(long_path),
-                ..ImageOptions::default()
-            },
-            Some(ImageDimensions {
-                width_px: 1280,
-                height_px: 720,
-            }),
-        );
-        let lines = image.render(40);
-        assert_eq!(lines.len(), 1);
-        assert!(visible_width(&lines[0]) <= 40);
-        assert!(lines[0].contains("..."));
-        assert!(lines[0].contains('~'));
-        reset_capabilities_cache();
+    fn kitty_and_iterm_wrappers() {
+        let chunk = kitty_image_chunk("QQ==", true);
+        assert!(chunk.starts_with(KITTY_IMAGE_PREFIX));
+        assert!(chunk.ends_with(KITTY_IMAGE_SUFFIX));
+        assert!(iterm_image("QQ==").contains("1337"));
+        let header = parse_kitty_image_header("\x1b_Gi=7,r=2;QQ==\x1b\\").unwrap();
+        assert_eq!(header.ids, ["7"]);
+        assert_eq!(header.rows, 2);
+        let encoded = encode_kitty("QQ==", Some(2), Some(3), Some(42), false);
+        assert!(encoded.contains("a=T,f=100,q=2,C=1,c=2,r=3,i=42"));
+        assert_eq!(delete_kitty_image(42), "\x1b_Ga=d,d=I,i=42,q=2\x1b\\");
+        let big = encode_kitty(&"A".repeat(5000), None, None, None, true);
+        assert!(big.contains(",m=1;"));
+        assert!(big.contains("m=0;"));
     }
 }

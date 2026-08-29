@@ -1,147 +1,276 @@
 //! Unified multi-provider LLM API matching `@earendil-works/pi-ai`.
 
-pub mod auth;
-pub mod catalog;
-pub mod cost;
-pub mod device_code;
-pub mod device_oauth;
-pub mod events;
-pub mod http;
-pub mod oauth;
-pub mod oauth_flow;
-pub mod providers;
-pub mod request;
-pub mod retry;
-pub mod sigv4;
-pub mod stream;
-pub mod transport;
-pub mod types;
-pub mod vertex;
+mod attribution;
+mod auth;
+mod catalog;
+mod codex;
+mod codex_ws;
+mod deferred;
+mod http_proxy;
+mod images;
+mod model_config;
+mod model_runtime;
+mod models_store;
+mod oauth;
+mod oauth_callback;
+mod oauth_providers;
+mod provider_retry;
+mod providers;
+mod retry;
+mod shell;
+mod stream;
+mod thinking;
 
+pub use attribution::{is_install_telemetry_enabled, merge_provider_attribution_headers};
 pub use auth::{
-    AuthResult, AuthStorage, Credential, CredentialKind, FileAuthStorage, InMemoryCredentialStore,
+    bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
+    copilot_base_url_from_token, fetch_github_copilot_available_model_ids,
+    parse_copilot_available_model_ids, resolve_provider_auth, vertex_ambient_auth, AuthStorage,
+    AuthStorageError, Credential, CredentialKind, ResolvedAuth,
 };
 pub use catalog::{
-    builtin_providers, flatten_catalog, get_builtin_model, list_models, Model, ModelCost,
+    builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models,
+    load_radius_models, models_from_provider_config, openrouter_image_models,
+    radius_models_from_config, Model, ModelCost, KNOWN_PROVIDERS,
 };
-pub use cost::usage_cost;
-pub use device_code::{
-    poll_oauth_device_code_flow, DevicePollOptions, DevicePollResult, CANCEL_MESSAGE,
-    SLOW_DOWN_TIMEOUT_MESSAGE, TIMEOUT_MESSAGE,
+pub use codex::{
+    build_cached_websocket_request_body, build_sse_headers, build_websocket_headers,
+    close_openai_codex_websocket_sessions, compress_request_body_zstd, connect_codex_websocket,
+    encode_codex_sse_body, extract_account_id, get_openai_codex_websocket_debug_stats,
+    is_previous_response_not_found, is_websocket_connection_limit_reached, map_codex_event_type,
+    normalize_codex_terminal_event, pi_user_agent, replay_codex_events,
+    reset_openai_codex_websocket_debug_stats, resolve_codex_url, resolve_codex_websocket_url,
+    resolve_websocket_connect_timeout_ms, should_fallback_to_sse,
+    should_retry_missing_previous_response, should_retry_websocket_connection_limit,
+    try_codex_websocket_transport, websocket_connect_timeout_error, websocket_idle_timeout_error,
+    CachedWebSocketContinuation, CodexWebsocketOutcome, OpenAICodexWebSocketDebugStats,
+    DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
+    OPENAI_BETA_RESPONSES_EXPERIMENTAL, OPENAI_BETA_RESPONSES_WEBSOCKETS,
+    PREVIOUS_RESPONSE_NOT_FOUND, REQUEST_COMPRESSION_ZSTD_LEVEL, SESSION_WEBSOCKET_CACHE_TTL_MS,
+    SESSION_WEBSOCKET_MAX_AGE_MS, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
+    WEBSOCKET_CONNECTION_LIMIT_REACHED, WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
 };
-pub use device_oauth::{
-    device_info_from_json, is_device_oauth_provider, login_device_oauth, oauth_login_label,
-    prefers_device_login, start_device_authorization, supports_device_oauth, DeviceCodeInfo,
+pub use deferred::{
+    cancel_deferred, fetch_deferred, DeferredFetchOptions, DeferredFetchResult, DeferredHandle,
 };
-pub use events::{AssistantMessage, AssistantMessageEvent, StopReason};
-pub use oauth::{
-    authorize_url, oauth_app, oauth_needs_refresh, parse_token_response, refresh_oauth_token,
+pub use http_proxy::{
+    resolve_http_proxy_url_for_target, tcp_connect_via_http_proxy,
+    UNSUPPORTED_PROXY_PROTOCOL_MESSAGE,
 };
-pub use oauth_flow::{
-    anthropic_authorize_url, callback_options_for, exchange_openrouter_code, generate_pkce,
-    load_radius_oauth_discovery, login_anthropic_oauth, oauth_error_html, oauth_success_html,
-    openai_codex_authorize_url, openrouter_authorize_url, parse_authorization_input,
-    parse_openrouter_authorization_input, parse_openrouter_key_response,
-    parse_radius_oauth_discovery, radius_authorize_url, radius_browser_authorize_url,
-    radius_oauth_discovery_http_error, wait_for_oauth_callback, wait_for_oauth_callback_with,
+pub use images::{
+    generate_images, image_content, images_request_body, AssistantImages, GenerateImagesOptions,
+    ImagesContext,
 };
-pub use request::{build_request_body, resolve_api, RequestContext};
-pub use retry::{is_retryable_assistant_error, RetryPolicy};
-pub use sigv4::{sign_bedrock_post, AwsCredentials};
-pub use stream::{complete, stream_complete, StreamEvent, StreamOptions};
-pub use transport::{CodexWebsocketCache, Transport, TransportDecision};
-pub use types::{
-    ContentBlock, KnownApi, KnownProvider, Message, Role, ThinkingLevel, ToolCall, Usage,
+pub use model_config::{
+    apply_config_auth, apply_config_auth_with_shell, apply_models_config,
+    config_value_env_var_names, is_command_config_value, load_models_json, merge_headers,
+    models_json_path, resolve_config_value, resolve_config_value_with_shell, ModelConfig,
+    ModelsJsonProvider, NO_MODELS_AVAILABLE,
 };
-pub use vertex::{resolve_vertex_auth, VertexAuth, GCP_VERTEX_CREDENTIALS_MARKER};
+pub use model_runtime::{
+    check_auth, empty_catalog_error, format_no_api_key_found_message,
+    format_no_model_selected_message, format_no_models_available_message,
+    format_oauth_auth_failed_message, get_available, snapshot_availability, AuthCheck,
+    ModelRuntimeSnapshot,
+};
+pub use models_store::{
+    catalog_url, load_models_store, merge_models, models_store_path, now_ms, parse_remote_catalog,
+    save_models_store, ModelsStore, ModelsStoreEntry, DEFAULT_CATALOG_BASE_URL,
+    REMOTE_CATALOG_REFRESH_INTERVAL_MS,
+};
+pub use oauth::{poll_oauth_device_code_flow, DeviceCodePoller, DevicePollStatus};
+pub use oauth_callback::{
+    callback_host, handle_callback_request, oauth_error_html, oauth_success_html, CallbackProvider,
+    CallbackResponse, CallbackServer, ERR_CALLBACK_ROUTE_NOT_FOUND, ERR_INTERNAL_HTML,
+    ERR_MISSING_CODE_OR_STATE, ERR_STATE_MISMATCH, TITLE_FAILED, TITLE_SUCCESS,
+};
+pub use oauth_providers::{
+    authorize_request, device_status_from_error, exchange_authorization_code, generate_pkce,
+    oauth_providers, parse_authorization_input, token_exchange_request, AuthorizeRequest, Pkce,
+    TokenExchangeRequest,
+};
+pub use provider_retry::{
+    is_retryable_provider_error, provider_error_from_ureq, retry_delay_from_headers,
+    retry_provider_request, ProviderError, ProviderRetryOptions,
+};
+pub use providers::{builtin_providers, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS};
+pub use retry::{is_retryable_assistant_error, is_retryable_error_text};
+pub use shell::{
+    command_timeout_from_env, execute_config_command, is_legacy_wsl_bash_path,
+    resolve_shell_config, CommandTransport, ResolveCommandOptions, ShellConfig,
+};
+pub use stream::{
+    assistant_to_chat, complete_from_events, complete_simple, events_from_complete,
+    fixture_complete, live_complete, live_complete_streaming_with, live_complete_with, live_stream,
+    parse_sse_block, replay_sse_events, request_body, request_body_with, request_url,
+    resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
+    StopReason, StreamEvent, StreamOptions,
+};
+pub use thinking::{
+    available_thinking_levels, clamp_reasoning, clamp_thinking_budget_to_answer_room,
+    cycle_thinking_level, get_supported_thinking_levels, google_thinking_budget,
+    thinking_budget_for_level, ThinkingBudgets, DEFAULT_THINKING_BUDGETS, MIN_ANSWER_TOKENS,
+};
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// TypeScript `DEFAULT_RADIUS_GATEWAY` from `providers/radius-config.ts`.
-pub const DEFAULT_RADIUS_GATEWAY: &str = "https://radius.pi.dev";
+use pi_protocol::Usage;
+use serde::{Deserialize, Serialize};
 
-pub fn normalize_radius_gateway_url(value: &str) -> String {
-    let with_scheme = if value.starts_with("http://") || value.starts_with("https://") {
-        value.to_string()
-    } else {
-        format!("https://{value}")
-    };
-    with_scheme.trim_end_matches('/').to_string()
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageContent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub data: String,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
 }
 
-pub fn env_api_key_vars(provider: &str) -> Option<&'static [&'static str]> {
-    Some(match provider {
-        "anthropic" => &[
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        ],
-        "ant-ling" => &["ANT_LING_API_KEY"],
-        "qwen-token-plan" | "qwen-token-plan-individual" => &["QWEN_TOKEN_PLAN_API_KEY"],
-        "qwen-token-plan-cn" => &["QWEN_TOKEN_PLAN_CN_API_KEY"],
-        "openai" => &["OPENAI_API_KEY"],
-        "azure-openai-responses" => &["AZURE_OPENAI_API_KEY"],
-        "nvidia" => &["NVIDIA_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "google" => &["GEMINI_API_KEY"],
-        "google-vertex" => &["GOOGLE_CLOUD_API_KEY"],
-        "groq" => &["GROQ_API_KEY"],
-        "cerebras" => &["CEREBRAS_API_KEY"],
-        "xai" => &["XAI_API_KEY"],
-        "radius" => &["RADIUS_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
-        "vercel-ai-gateway" => &["AI_GATEWAY_API_KEY"],
-        "zai" => &["ZAI_API_KEY"],
-        "zai-coding-cn" => &["ZAI_CODING_CN_API_KEY"],
-        "mistral" => &["MISTRAL_API_KEY"],
-        "minimax" => &["MINIMAX_API_KEY"],
-        "minimax-cn" => &["MINIMAX_CN_API_KEY"],
-        "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"],
-        "huggingface" => &["HF_TOKEN"],
-        "fireworks" => &["FIREWORKS_API_KEY"],
-        "together" => &["TOGETHER_API_KEY"],
-        "baseten" => &["BASETEN_API_KEY"],
-        "opencode" | "opencode-go" => &["OPENCODE_API_KEY"],
-        "kimi-coding" => &["KIMI_API_KEY"],
-        "cloudflare-workers-ai" | "cloudflare-ai-gateway" => &["CLOUDFLARE_API_KEY"],
-        "xiaomi" => &["XIAOMI_API_KEY"],
-        "xiaomi-token-plan-cn" => &["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
-        "xiaomi-token-plan-ams" => &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
-        "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
-        "github-copilot" => &["COPILOT_GITHUB_TOKEN"],
-        _ => return None,
-    })
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum MessageContent {
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        redacted: Option<bool>,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    #[serde(rename = "toolCall")]
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
 }
 
-pub fn get_env_api_key(provider: &str) -> Option<String> {
-    if let Some(vars) = env_api_key_vars(provider) {
-        for var in vars {
-            if provider == "anthropic" && *var == "ANTHROPIC_AUTH_TOKEN" {
-                continue;
-            }
-            if let Ok(value) = std::env::var(var) {
-                if !value.is_empty() {
-                    return Some(value);
-                }
-            }
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: Vec<MessageContent>,
+    #[serde(rename = "toolCallId", skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(rename = "toolName", skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+    /// TS custom fields (`command`, `output`, `excludeFromContext`, `customType`, …).
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ChatMessage {
+    pub fn text(role: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: vec![MessageContent::Text { text: text.into() }],
+            ..Self::default()
         }
     }
-    if provider == "google-vertex" {
-        let has_project = std::env::var("GOOGLE_CLOUD_PROJECT").is_ok()
-            || std::env::var("GCLOUD_PROJECT").is_ok();
-        let has_location = std::env::var("GOOGLE_CLOUD_LOCATION").is_ok();
-        if has_project && has_location {
-            return Some("<authenticated>".into());
+
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            role: "toolResult".into(),
+            content: vec![MessageContent::Text {
+                text: content.into(),
+            }],
+            tool_call_id: Some(tool_call_id.into()),
+            tool_name: Some(tool_name.into()),
+            is_error: Some(is_error),
+            ..Self::default()
         }
     }
-    if provider == "amazon-bedrock"
-        && (std::env::var("AWS_PROFILE").is_ok()
-            || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-                && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok())
-            || std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok())
-    {
-        return Some("<authenticated>".into());
+
+    pub fn extra_bool(&self, key: &str) -> bool {
+        self.extra
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
-    None
+
+    pub fn extra_str(&self, key: &str) -> Option<&str> {
+        self.extra.get(key).and_then(serde_json::Value::as_str)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+    #[serde(
+        rename = "constrainedSampling",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub constrained_sampling: Option<serde_json::Value>,
+}
+
+pub fn content_text(content: &[MessageContent]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            MessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+pub fn calculate_usage(
+    model: &Model,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> Usage {
+    Usage::from_tokens(
+        input,
+        output,
+        cache_read,
+        cache_write,
+        &pi_protocol::ModelCost {
+            input: model.cost.input,
+            output: model.cost.output,
+            cache_read: model.cost.cache_read,
+            cache_write: model.cost.cache_write,
+        },
+    )
+}
+
+pub fn find_model<'a>(models: &'a [Model], provider: &str, id: &str) -> Option<&'a Model> {
+    models
+        .iter()
+        .find(|model| model.provider == provider && model.id == id)
+}
+
+pub fn rustls_root_count() -> usize {
+    let _ = rustls::version::TLS13;
+    let _ = rustls_pki_types::CertificateDer::from(Vec::<u8>::new());
+    webpki_roots::TLS_SERVER_ROOTS.len()
+}
+
+pub fn fuzzy_models<'a>(models: &'a [Model], query: &str) -> Vec<&'a Model> {
+    let query = query.to_ascii_lowercase();
+    models
+        .iter()
+        .filter(|model| {
+            model.id.to_ascii_lowercase().contains(&query)
+                || model.name.to_ascii_lowercase().contains(&query)
+                || format!("{}/{}", model.provider, model.id)
+                    .to_ascii_lowercase()
+                    .contains(&query)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -149,34 +278,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogs_include_core_providers() {
-        for provider in ["anthropic", "openai", "google"] {
+    fn loads_openai_anthropic_google_catalogs() {
+        let models = load_builtin_models();
+        assert!(models
+            .iter()
+            .any(|m| m.provider == "openai" && m.id == "gpt-4"));
+        assert!(models.iter().any(|m| m.provider == "anthropic"));
+        assert!(models.iter().any(|m| m.provider == "google"));
+        assert!(rustls_root_count() > 0);
+        for spec in PROVIDER_SPECS {
+            if spec.id == "radius" {
+                continue;
+            }
             assert!(
-                list_models(Some(provider))
-                    .iter()
-                    .any(|m| m.provider == provider),
-                "missing {provider}"
+                builtin_provider_ids().contains(&spec.id),
+                "missing catalog for {}",
+                spec.id
             );
         }
-        assert!(list_models(None).len() >= 50);
-        assert_eq!(DEFAULT_RADIUS_GATEWAY, "https://radius.pi.dev");
-        assert_eq!(
-            normalize_radius_gateway_url("radius.pi.dev/"),
-            "https://radius.pi.dev"
-        );
-    }
-
-    #[test]
-    fn env_key_map_matches_typescript() {
-        assert_eq!(env_api_key_vars("openai"), Some(&["OPENAI_API_KEY"][..]));
-        assert_eq!(env_api_key_vars("google"), Some(&["GEMINI_API_KEY"][..]));
-        assert!(env_api_key_vars("anthropic")
-            .unwrap()
-            .contains(&"ANTHROPIC_API_KEY"));
-        assert_eq!(DEFAULT_RADIUS_GATEWAY, "https://radius.pi.dev");
-        assert_eq!(
-            normalize_radius_gateway_url("radius.pi.dev/"),
-            "https://radius.pi.dev"
-        );
+        let auth = ResolvedAuth {
+            api_key: Some("k".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        for api in KNOWN_APIS {
+            let model = Model {
+                id: "m".into(),
+                name: "m".into(),
+                api: (*api).into(),
+                provider: "openai".into(),
+                base_url: Some("https://example.test".into()),
+                reasoning: false,
+                input: vec!["text".into()],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 1,
+                max_tokens: 1,
+                compat: serde_json::Value::Null,
+                headers: Default::default(),
+                thinking_level_map: Default::default(),
+            };
+            let url = request_url(&model, &auth);
+            assert!(url.starts_with("https://example.test"), "{api} -> {url}");
+        }
     }
 }

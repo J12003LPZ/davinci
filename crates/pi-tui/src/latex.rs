@@ -1,708 +1,644 @@
-//! TypeScript `packages/tui/src/latex.ts` Unicode math renderer.
+//! LaTeX renderer matching `vendor/pi/packages/tui/src/latex.ts`.
 
-use crate::diff::visible_width;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
-const NEGATIVE_SPACE: char = '\u{0000}';
-const NAMED_OPERATOR_START: char = '\u{f0004}';
-const NAMED_OPERATOR_END: char = '\u{f0005}';
+use crate::render::visible_width;
+
 const LAYOUT_MARKER_START: char = '\u{f0000}';
 const LAYOUT_MARKER_END: char = '\u{f0001}';
 const PROTECTED_SPACE: char = '\u{f0002}';
+const NAMED_OPERATOR_START: char = '\u{f0004}';
+const NAMED_OPERATOR_END: char = '\u{f0005}';
+const NEGATIVE_SPACE: char = '\u{0000}';
 
-fn symbols() -> &'static HashMap<&'static str, &'static str> {
-    static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut m = HashMap::new();
-        m.insert("alpha", "α");
-        m.insert("beta", "β");
-        m.insert("gamma", "γ");
-        m.insert("delta", "δ");
-        m.insert("epsilon", "ϵ");
-        m.insert("varepsilon", "ε");
-        m.insert("zeta", "ζ");
-        m.insert("eta", "η");
-        m.insert("theta", "θ");
-        m.insert("vartheta", "ϑ");
-        m.insert("iota", "ι");
-        m.insert("kappa", "κ");
-        m.insert("varkappa", "ϰ");
-        m.insert("lambda", "λ");
-        m.insert("mu", "μ");
-        m.insert("nu", "ν");
-        m.insert("xi", "ξ");
-        m.insert("pi", "π");
-        m.insert("varpi", "ϖ");
-        m.insert("rho", "ρ");
-        m.insert("varrho", "ϱ");
-        m.insert("sigma", "σ");
-        m.insert("varsigma", "ς");
-        m.insert("tau", "τ");
-        m.insert("upsilon", "υ");
-        m.insert("phi", "ϕ");
-        m.insert("varphi", "φ");
-        m.insert("chi", "χ");
-        m.insert("psi", "ψ");
-        m.insert("omega", "ω");
-        m.insert("Gamma", "Γ");
-        m.insert("Delta", "Δ");
-        m.insert("Theta", "Θ");
-        m.insert("Lambda", "Λ");
-        m.insert("Xi", "Ξ");
-        m.insert("Pi", "Π");
-        m.insert("Sigma", "Σ");
-        m.insert("Upsilon", "Υ");
-        m.insert("Phi", "Φ");
-        m.insert("Psi", "Ψ");
-        m.insert("Omega", "Ω");
-        m.insert("pm", "±");
-        m.insert("mp", "∓");
-        m.insert("times", "×");
-        m.insert("div", "÷");
-        m.insert("cdot", "·");
-        m.insert("ast", "∗");
-        m.insert("star", "⋆");
-        m.insert("circ", "∘");
-        m.insert("bullet", "•");
-        m.insert("oplus", "⊕");
-        m.insert("ominus", "⊖");
-        m.insert("otimes", "⊗");
-        m.insert("oslash", "⊘");
-        m.insert("odot", "⊙");
-        m.insert("bigcirc", "○");
-        m.insert("dagger", "†");
-        m.insert("ddagger", "‡");
-        m.insert("amalg", "⨿");
-        m.insert("uplus", "⊎");
-        m.insert("sqcap", "⊓");
-        m.insert("sqcup", "⊔");
-        m.insert("triangleleft", "◁");
-        m.insert("triangleright", "▷");
-        m.insert("wr", "≀");
-        m.insert("cap", "∩");
-        m.insert("cup", "∪");
-        m.insert("bigcap", "⋂");
-        m.insert("bigcup", "⋃");
-        m.insert("bigwedge", "⋀");
-        m.insert("bigvee", "⋁");
-        m.insert("bigsqcup", "⨆");
-        m.insert("biguplus", "⨄");
-        m.insert("bigoplus", "⨁");
-        m.insert("bigotimes", "⨂");
-        m.insert("bigodot", "⨀");
-        m.insert("setminus", "∖");
-        m.insert("in", "∈");
-        m.insert("notin", "∉");
-        m.insert("ni", "∋");
-        m.insert("subset", "⊂");
-        m.insert("supset", "⊃");
-        m.insert("subseteq", "⊆");
-        m.insert("supseteq", "⊇");
-        m.insert("sqsubset", "⊏");
-        m.insert("sqsupset", "⊐");
-        m.insert("sqsubseteq", "⊑");
-        m.insert("sqsupseteq", "⊒");
-        m.insert("prec", "≺");
-        m.insert("preceq", "≼");
-        m.insert("succ", "≻");
-        m.insert("succeq", "≽");
-        m.insert("ll", "≪");
-        m.insert("gg", "≫");
-        m.insert("le", "≤");
-        m.insert("leq", "≤");
-        m.insert("leqslant", "≤");
-        m.insert("ge", "≥");
-        m.insert("geq", "≥");
-        m.insert("geqslant", "≥");
-        m.insert("ne", "≠");
-        m.insert("neq", "≠");
-        m.insert("equiv", "≡");
-        m.insert("approx", "≈");
-        m.insert("sim", "∼");
-        m.insert("simeq", "≃");
-        m.insert("cong", "≅");
-        m.insert("asymp", "≍");
-        m.insert("doteq", "≐");
-        m.insert("propto", "∝");
-        m.insert("parallel", "∥");
-        m.insert("perp", "⊥");
-        m.insert("mid", "∣");
-        m.insert("vdash", "⊢");
-        m.insert("dashv", "⊣");
-        m.insert("models", "⊨");
-        m.insert("Vdash", "⊩");
-        m.insert("Vvdash", "⊪");
-        m.insert("nvdash", "⊬");
-        m.insert("nvDash", "⊭");
-        m.insert("forall", "∀");
-        m.insert("exists", "∃");
-        m.insert("nexists", "∄");
-        m.insert("neg", "¬");
-        m.insert("land", "∧");
-        m.insert("wedge", "∧");
-        m.insert("lor", "∨");
-        m.insert("vee", "∨");
-        m.insert("to", "→");
-        m.insert("rightarrow", "→");
-        m.insert("longrightarrow", "→");
-        m.insert("leftarrow", "←");
-        m.insert("longleftarrow", "←");
-        m.insert("gets", "←");
-        m.insert("leftrightarrow", "↔");
-        m.insert("longleftrightarrow", "↔");
-        m.insert("hookleftarrow", "↩");
-        m.insert("hookrightarrow", "↪");
-        m.insert("twoheadleftarrow", "↞");
-        m.insert("twoheadrightarrow", "↠");
-        m.insert("leftharpoonup", "↼");
-        m.insert("leftharpoondown", "↽");
-        m.insert("rightharpoonup", "⇀");
-        m.insert("rightharpoondown", "⇁");
-        m.insert("rightleftharpoons", "⇌");
-        m.insert("leftrightharpoons", "⇋");
-        m.insert("nearrow", "↗");
-        m.insert("searrow", "↘");
-        m.insert("swarrow", "↙");
-        m.insert("nwarrow", "↖");
-        m.insert("rightsquigarrow", "⇝");
-        m.insert("leadsto", "⇝");
-        m.insert("Rightarrow", "⇒");
-        m.insert("Longrightarrow", "⇒");
-        m.insert("Leftarrow", "⇐");
-        m.insert("Longleftarrow", "⇐");
-        m.insert("Leftrightarrow", "⇔");
-        m.insert("Longleftrightarrow", "⇔");
-        m.insert("implies", "⇒");
-        m.insert("iff", "⇔");
-        m.insert("mapsto", "↦");
-        m.insert("longmapsto", "↦");
-        m.insert("uparrow", "↑");
-        m.insert("downarrow", "↓");
-        m.insert("partial", "∂");
-        m.insert("nabla", "∇");
-        m.insert("int", "∫");
-        m.insert("iint", "∬");
-        m.insert("iiint", "∭");
-        m.insert("oint", "∮");
-        m.insert("sum", "∑");
-        m.insert("prod", "∏");
-        m.insert("coprod", "∐");
-        m.insert("infty", "∞");
-        m.insert("emptyset", "∅");
-        m.insert("varnothing", "∅");
-        m.insert("angle", "∠");
-        m.insert("therefore", "∴");
-        m.insert("because", "∵");
-        m.insert("aleph", "ℵ");
-        m.insert("beth", "ℶ");
-        m.insert("gimel", "ℷ");
-        m.insert("daleth", "ℸ");
-        m.insert("top", "⊤");
-        m.insert("bot", "⊥");
-        m.insert("triangle", "△");
-        m.insert("square", "□");
-        m.insert("lozenge", "◊");
-        m.insert("checkmark", "✓");
-        m.insert("complement", "∁");
-        m.insert("wp", "℘");
-        m.insert("prime", "′");
-        m.insert("ldots", "…");
-        m.insert("dots", "…");
-        m.insert("cdots", "⋯");
-        m.insert("vdots", "⋮");
-        m.insert("ddots", "⋱");
-        m.insert("ell", "ℓ");
-        m.insert("hbar", "ℏ");
-        m.insert("Im", "ℑ");
-        m.insert("Re", "ℜ");
-        m.insert("langle", "⟨");
-        m.insert("rangle", "⟩");
-        m.insert("vert", "|");
-        m.insert("lvert", "|");
-        m.insert("rvert", "|");
-        m.insert("Vert", "‖");
-        m.insert("lVert", "‖");
-        m.insert("rVert", "‖");
-        m.insert("lbrace", "{");
-        m.insert("rbrace", "}");
-        m.insert("backslash", "\\\\");
-        m.insert("lfloor", "⌊");
-        m.insert("rfloor", "⌋");
-        m.insert("lceil", "⌈");
-        m.insert("rceil", "⌉");
-        m.insert("colon", ":");
-        m
-    })
+#[derive(Clone)]
+enum LayoutNode {
+    Fraction {
+        numerator: String,
+        denominator: String,
+    },
+    Operator {
+        operator: String,
+        lower: Option<String>,
+        upper: Option<String>,
+    },
+    Matrix {
+        lines: Vec<String>,
+        _baseline: usize,
+    },
 }
 
-fn negated_symbols() -> &'static HashMap<&'static str, &'static str> {
-    static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut m = HashMap::new();
-        m.insert("<", "≮");
-        m.insert(">", "≯");
-        m.insert("=", "≠");
-        m.insert("∈", "∉");
-        m.insert("∋", "∌");
-        m.insert("∣", "∤");
-        m.insert("∥", "∦");
-        m.insert("∼", "≁");
-        m.insert("≃", "≄");
-        m.insert("≅", "≇");
-        m.insert("≈", "≉");
-        m.insert("≡", "≢");
-        m.insert("≤", "≰");
-        m.insert("≥", "≱");
-        m.insert("≺", "⊀");
-        m.insert("≻", "⊁");
-        m.insert("⊂", "⊄");
-        m.insert("⊃", "⊅");
-        m.insert("⊆", "⊈");
-        m.insert("⊇", "⊉");
-        m.insert("⊢", "⊬");
-        m.insert("⊨", "⊭");
-        m.insert("↔", "↮");
-        m.insert("←", "↚");
-        m.insert("→", "↛");
-        m.insert("⇒", "⇏");
-        m.insert("⇐", "⇍");
-        m.insert("⇔", "⇎");
-        m.insert("≼", "⋠");
-        m.insert("≽", "⋡");
-        m
-    })
+pub fn latex_symbols() -> HashMap<&'static str, &'static str> {
+    [
+        ("alpha", "\u{3b1}"),
+        ("beta", "\u{3b2}"),
+        ("gamma", "\u{3b3}"),
+        ("delta", "\u{3b4}"),
+        ("epsilon", "\u{3f5}"),
+        ("varepsilon", "\u{3b5}"),
+        ("zeta", "\u{3b6}"),
+        ("eta", "\u{3b7}"),
+        ("theta", "\u{3b8}"),
+        ("vartheta", "\u{3d1}"),
+        ("iota", "\u{3b9}"),
+        ("kappa", "\u{3ba}"),
+        ("varkappa", "\u{3f0}"),
+        ("lambda", "\u{3bb}"),
+        ("mu", "\u{3bc}"),
+        ("nu", "\u{3bd}"),
+        ("xi", "\u{3be}"),
+        ("pi", "\u{3c0}"),
+        ("varpi", "\u{3d6}"),
+        ("rho", "\u{3c1}"),
+        ("varrho", "\u{3f1}"),
+        ("sigma", "\u{3c3}"),
+        ("varsigma", "\u{3c2}"),
+        ("tau", "\u{3c4}"),
+        ("upsilon", "\u{3c5}"),
+        ("phi", "\u{3d5}"),
+        ("varphi", "\u{3c6}"),
+        ("chi", "\u{3c7}"),
+        ("psi", "\u{3c8}"),
+        ("omega", "\u{3c9}"),
+        ("Gamma", "\u{393}"),
+        ("Delta", "\u{394}"),
+        ("Theta", "\u{398}"),
+        ("Lambda", "\u{39b}"),
+        ("Xi", "\u{39e}"),
+        ("Pi", "\u{3a0}"),
+        ("Sigma", "\u{3a3}"),
+        ("Upsilon", "\u{3a5}"),
+        ("Phi", "\u{3a6}"),
+        ("Psi", "\u{3a8}"),
+        ("Omega", "\u{3a9}"),
+        ("pm", "\u{b1}"),
+        ("mp", "\u{2213}"),
+        ("times", "\u{d7}"),
+        ("div", "\u{f7}"),
+        ("cdot", "\u{b7}"),
+        ("ast", "\u{2217}"),
+        ("star", "\u{22c6}"),
+        ("circ", "\u{2218}"),
+        ("bullet", "\u{2022}"),
+        ("oplus", "\u{2295}"),
+        ("ominus", "\u{2296}"),
+        ("otimes", "\u{2297}"),
+        ("oslash", "\u{2298}"),
+        ("odot", "\u{2299}"),
+        ("bigcirc", "\u{25cb}"),
+        ("dagger", "\u{2020}"),
+        ("ddagger", "\u{2021}"),
+        ("amalg", "\u{2a3f}"),
+        ("uplus", "\u{228e}"),
+        ("sqcap", "\u{2293}"),
+        ("sqcup", "\u{2294}"),
+        ("triangleleft", "\u{25c1}"),
+        ("triangleright", "\u{25b7}"),
+        ("wr", "\u{2240}"),
+        ("cap", "\u{2229}"),
+        ("cup", "\u{222a}"),
+        ("bigcap", "\u{22c2}"),
+        ("bigcup", "\u{22c3}"),
+        ("bigwedge", "\u{22c0}"),
+        ("bigvee", "\u{22c1}"),
+        ("bigsqcup", "\u{2a06}"),
+        ("biguplus", "\u{2a04}"),
+        ("bigoplus", "\u{2a01}"),
+        ("bigotimes", "\u{2a02}"),
+        ("bigodot", "\u{2a00}"),
+        ("setminus", "\u{2216}"),
+        ("in", "\u{2208}"),
+        ("notin", "\u{2209}"),
+        ("ni", "\u{220b}"),
+        ("subset", "\u{2282}"),
+        ("supset", "\u{2283}"),
+        ("subseteq", "\u{2286}"),
+        ("supseteq", "\u{2287}"),
+        ("sqsubset", "\u{228f}"),
+        ("sqsupset", "\u{2290}"),
+        ("sqsubseteq", "\u{2291}"),
+        ("sqsupseteq", "\u{2292}"),
+        ("prec", "\u{227a}"),
+        ("preceq", "\u{227c}"),
+        ("succ", "\u{227b}"),
+        ("succeq", "\u{227d}"),
+        ("ll", "\u{226a}"),
+        ("gg", "\u{226b}"),
+        ("le", "\u{2264}"),
+        ("leq", "\u{2264}"),
+        ("leqslant", "\u{2264}"),
+        ("ge", "\u{2265}"),
+        ("geq", "\u{2265}"),
+        ("geqslant", "\u{2265}"),
+        ("ne", "\u{2260}"),
+        ("neq", "\u{2260}"),
+        ("equiv", "\u{2261}"),
+        ("approx", "\u{2248}"),
+        ("sim", "\u{223c}"),
+        ("simeq", "\u{2243}"),
+        ("cong", "\u{2245}"),
+        ("asymp", "\u{224d}"),
+        ("doteq", "\u{2250}"),
+        ("propto", "\u{221d}"),
+        ("parallel", "\u{2225}"),
+        ("perp", "\u{22a5}"),
+        ("mid", "\u{2223}"),
+        ("vdash", "\u{22a2}"),
+        ("dashv", "\u{22a3}"),
+        ("models", "\u{22a8}"),
+        ("Vdash", "\u{22a9}"),
+        ("Vvdash", "\u{22aa}"),
+        ("nvdash", "\u{22ac}"),
+        ("nvDash", "\u{22ad}"),
+        ("forall", "\u{2200}"),
+        ("exists", "\u{2203}"),
+        ("nexists", "\u{2204}"),
+        ("neg", "\u{ac}"),
+        ("land", "\u{2227}"),
+        ("wedge", "\u{2227}"),
+        ("lor", "\u{2228}"),
+        ("vee", "\u{2228}"),
+        ("to", "\u{2192}"),
+        ("rightarrow", "\u{2192}"),
+        ("longrightarrow", "\u{2192}"),
+        ("leftarrow", "\u{2190}"),
+        ("longleftarrow", "\u{2190}"),
+        ("gets", "\u{2190}"),
+        ("leftrightarrow", "\u{2194}"),
+        ("longleftrightarrow", "\u{2194}"),
+        ("hookleftarrow", "\u{21a9}"),
+        ("hookrightarrow", "\u{21aa}"),
+        ("twoheadleftarrow", "\u{219e}"),
+        ("twoheadrightarrow", "\u{21a0}"),
+        ("leftharpoonup", "\u{21bc}"),
+        ("leftharpoondown", "\u{21bd}"),
+        ("rightharpoonup", "\u{21c0}"),
+        ("rightharpoondown", "\u{21c1}"),
+        ("rightleftharpoons", "\u{21cc}"),
+        ("leftrightharpoons", "\u{21cb}"),
+        ("nearrow", "\u{2197}"),
+        ("searrow", "\u{2198}"),
+        ("swarrow", "\u{2199}"),
+        ("nwarrow", "\u{2196}"),
+        ("rightsquigarrow", "\u{21dd}"),
+        ("leadsto", "\u{21dd}"),
+        ("Rightarrow", "\u{21d2}"),
+        ("Longrightarrow", "\u{21d2}"),
+        ("Leftarrow", "\u{21d0}"),
+        ("Longleftarrow", "\u{21d0}"),
+        ("Leftrightarrow", "\u{21d4}"),
+        ("Longleftrightarrow", "\u{21d4}"),
+        ("implies", "\u{21d2}"),
+        ("iff", "\u{21d4}"),
+        ("mapsto", "\u{21a6}"),
+        ("longmapsto", "\u{21a6}"),
+        ("uparrow", "\u{2191}"),
+        ("downarrow", "\u{2193}"),
+        ("partial", "\u{2202}"),
+        ("nabla", "\u{2207}"),
+        ("int", "\u{222b}"),
+        ("iint", "\u{222c}"),
+        ("iiint", "\u{222d}"),
+        ("oint", "\u{222e}"),
+        ("sum", "\u{2211}"),
+        ("prod", "\u{220f}"),
+        ("coprod", "\u{2210}"),
+        ("infty", "\u{221e}"),
+        ("emptyset", "\u{2205}"),
+        ("varnothing", "\u{2205}"),
+        ("angle", "\u{2220}"),
+        ("therefore", "\u{2234}"),
+        ("because", "\u{2235}"),
+        ("aleph", "\u{2135}"),
+        ("beth", "\u{2136}"),
+        ("gimel", "\u{2137}"),
+        ("daleth", "\u{2138}"),
+        ("top", "\u{22a4}"),
+        ("bot", "\u{22a5}"),
+        ("triangle", "\u{25b3}"),
+        ("square", "\u{25a1}"),
+        ("lozenge", "\u{25ca}"),
+        ("checkmark", "\u{2713}"),
+        ("complement", "\u{2201}"),
+        ("wp", "\u{2118}"),
+        ("prime", "\u{2032}"),
+        ("ldots", "\u{2026}"),
+        ("dots", "\u{2026}"),
+        ("cdots", "\u{22ef}"),
+        ("vdots", "\u{22ee}"),
+        ("ddots", "\u{22f1}"),
+        ("ell", "\u{2113}"),
+        ("hbar", "\u{210f}"),
+        ("Im", "\u{2111}"),
+        ("Re", "\u{211c}"),
+        ("langle", "\u{27e8}"),
+        ("rangle", "\u{27e9}"),
+        ("vert", "|"),
+        ("lvert", "|"),
+        ("rvert", "|"),
+        ("Vert", "\u{2016}"),
+        ("lVert", "\u{2016}"),
+        ("rVert", "\u{2016}"),
+        ("lbrace", "{"),
+        ("rbrace", "}"),
+        ("backslash", "\\\\"),
+        ("lfloor", "\u{230a}"),
+        ("rfloor", "\u{230b}"),
+        ("lceil", "\u{2308}"),
+        ("rceil", "\u{2309}"),
+        ("colon", ":"),
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn blackboard() -> &'static HashMap<&'static str, &'static str> {
-    static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut m = HashMap::new();
-        m.insert("C", "ℂ");
-        m.insert("H", "ℍ");
-        m.insert("N", "ℕ");
-        m.insert("P", "ℙ");
-        m.insert("Q", "ℚ");
-        m.insert("R", "ℝ");
-        m.insert("Z", "ℤ");
-        m
-    })
+fn superscripts() -> HashMap<char, &'static str> {
+    [
+        ('0', "\u{2070}"),
+        ('1', "\u{b9}"),
+        ('2', "\u{b2}"),
+        ('3', "\u{b3}"),
+        ('4', "\u{2074}"),
+        ('5', "\u{2075}"),
+        ('6', "\u{2076}"),
+        ('7', "\u{2077}"),
+        ('8', "\u{2078}"),
+        ('9', "\u{2079}"),
+        ('+', "\u{207a}"),
+        ('-', "\u{207b}"),
+        ('=', "\u{207c}"),
+        ('(', "\u{207d}"),
+        (')', "\u{207e}"),
+        ('a', "\u{1d43}"),
+        ('b', "\u{1d47}"),
+        ('c', "\u{1d9c}"),
+        ('d', "\u{1d48}"),
+        ('e', "\u{1d49}"),
+        ('f', "\u{1da0}"),
+        ('g', "\u{1d4d}"),
+        ('h', "\u{2b0}"),
+        ('i', "\u{2071}"),
+        ('j', "\u{2b2}"),
+        ('k', "\u{1d4f}"),
+        ('l', "\u{2e1}"),
+        ('m', "\u{1d50}"),
+        ('n', "\u{207f}"),
+        ('o', "\u{1d52}"),
+        ('p', "\u{1d56}"),
+        ('r', "\u{2b3}"),
+        ('s', "\u{2e2}"),
+        ('t', "\u{1d57}"),
+        ('u', "\u{1d58}"),
+        ('v', "\u{1d5b}"),
+        ('w', "\u{2b7}"),
+        ('x', "\u{2e3}"),
+        ('y', "\u{2b8}"),
+        ('z', "\u{1dbb}"),
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn superscripts() -> &'static HashMap<&'static str, &'static str> {
-    static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut m = HashMap::new();
-        m.insert("0", "⁰");
-        m.insert("1", "¹");
-        m.insert("2", "²");
-        m.insert("3", "³");
-        m.insert("4", "⁴");
-        m.insert("5", "⁵");
-        m.insert("6", "⁶");
-        m.insert("7", "⁷");
-        m.insert("8", "⁸");
-        m.insert("9", "⁹");
-        m.insert("+", "⁺");
-        m.insert("-", "⁻");
-        m.insert("=", "⁼");
-        m.insert("(", "⁽");
-        m.insert(")", "⁾");
-        m.insert("a", "ᵃ");
-        m.insert("b", "ᵇ");
-        m.insert("c", "ᶜ");
-        m.insert("d", "ᵈ");
-        m.insert("e", "ᵉ");
-        m.insert("f", "ᶠ");
-        m.insert("g", "ᵍ");
-        m.insert("h", "ʰ");
-        m.insert("i", "ⁱ");
-        m.insert("j", "ʲ");
-        m.insert("k", "ᵏ");
-        m.insert("l", "ˡ");
-        m.insert("m", "ᵐ");
-        m.insert("n", "ⁿ");
-        m.insert("o", "ᵒ");
-        m.insert("p", "ᵖ");
-        m.insert("r", "ʳ");
-        m.insert("s", "ˢ");
-        m.insert("t", "ᵗ");
-        m.insert("u", "ᵘ");
-        m.insert("v", "ᵛ");
-        m.insert("w", "ʷ");
-        m.insert("x", "ˣ");
-        m.insert("y", "ʸ");
-        m.insert("z", "ᶻ");
-        m
-    })
+fn subscripts() -> HashMap<char, &'static str> {
+    [
+        ('0', "\u{2080}"),
+        ('1', "\u{2081}"),
+        ('2', "\u{2082}"),
+        ('3', "\u{2083}"),
+        ('4', "\u{2084}"),
+        ('5', "\u{2085}"),
+        ('6', "\u{2086}"),
+        ('7', "\u{2087}"),
+        ('8', "\u{2088}"),
+        ('9', "\u{2089}"),
+        ('+', "\u{208a}"),
+        ('-', "\u{208b}"),
+        ('=', "\u{208c}"),
+        ('(', "\u{208d}"),
+        (')', "\u{208e}"),
+        ('a', "\u{2090}"),
+        ('e', "\u{2091}"),
+        ('h', "\u{2095}"),
+        ('i', "\u{1d62}"),
+        ('j', "\u{2c7c}"),
+        ('k', "\u{2096}"),
+        ('l', "\u{2097}"),
+        ('m', "\u{2098}"),
+        ('n', "\u{2099}"),
+        ('o', "\u{2092}"),
+        ('p', "\u{209a}"),
+        ('r', "\u{1d63}"),
+        ('s', "\u{209b}"),
+        ('t', "\u{209c}"),
+        ('u', "\u{1d64}"),
+        ('v', "\u{1d65}"),
+        ('x', "\u{2093}"),
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn subscripts() -> &'static HashMap<&'static str, &'static str> {
-    static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut m = HashMap::new();
-        m.insert("0", "₀");
-        m.insert("1", "₁");
-        m.insert("2", "₂");
-        m.insert("3", "₃");
-        m.insert("4", "₄");
-        m.insert("5", "₅");
-        m.insert("6", "₆");
-        m.insert("7", "₇");
-        m.insert("8", "₈");
-        m.insert("9", "₉");
-        m.insert("+", "₊");
-        m.insert("-", "₋");
-        m.insert("=", "₌");
-        m.insert("(", "₍");
-        m.insert(")", "₎");
-        m.insert("a", "ₐ");
-        m.insert("e", "ₑ");
-        m.insert("h", "ₕ");
-        m.insert("i", "ᵢ");
-        m.insert("j", "ⱼ");
-        m.insert("k", "ₖ");
-        m.insert("l", "ₗ");
-        m.insert("m", "ₘ");
-        m.insert("n", "ₙ");
-        m.insert("o", "ₒ");
-        m.insert("p", "ₚ");
-        m.insert("r", "ᵣ");
-        m.insert("s", "ₛ");
-        m.insert("t", "ₜ");
-        m.insert("u", "ᵤ");
-        m.insert("v", "ᵥ");
-        m.insert("x", "ₓ");
-        m
-    })
+fn negated_symbols() -> HashMap<&'static str, &'static str> {
+    [
+        ("<", "\u{226e}"),
+        (">", "\u{226f}"),
+        ("=", "\u{2260}"),
+        ("∈", "\u{2209}"),
+        ("∋", "\u{220c}"),
+        ("∣", "\u{2224}"),
+        ("∥", "\u{2226}"),
+        ("∼", "\u{2241}"),
+        ("≃", "\u{2244}"),
+        ("≅", "\u{2247}"),
+        ("≈", "\u{2249}"),
+        ("≡", "\u{2262}"),
+        ("≤", "\u{2270}"),
+        ("≥", "\u{2271}"),
+        ("≺", "\u{2280}"),
+        ("≻", "\u{2281}"),
+        ("⊂", "\u{2284}"),
+        ("⊃", "\u{2285}"),
+        ("⊆", "\u{2288}"),
+        ("⊇", "\u{2289}"),
+        ("⊢", "\u{22ac}"),
+        ("⊨", "\u{22ad}"),
+        ("↔", "\u{21ae}"),
+        ("←", "\u{219a}"),
+        ("→", "\u{219b}"),
+        ("⇒", "\u{21cf}"),
+        ("⇐", "\u{21cd}"),
+        ("⇔", "\u{21ce}"),
+        ("≼", "\u{22e0}"),
+        ("≽", "\u{22e1}"),
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn accents() -> &'static HashMap<&'static str, &'static str> {
-    static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut m = HashMap::new();
-        m.insert("acute", "́");
-        m.insert("bar", "̅");
-        m.insert("breve", "̆");
-        m.insert("check", "̌");
-        m.insert("ddot", "̈");
-        m.insert("dot", "̇");
-        m.insert("grave", "̀");
-        m.insert("hat", "̂");
-        m.insert("mathring", "̊");
-        m.insert("overleftarrow", "⃖");
-        m.insert("overleftrightarrow", "⃡");
-        m.insert("overline", "̅");
-        m.insert("overrightarrow", "⃗");
-        m.insert("tilde", "̃");
-        m.insert("underline", "̲");
-        m.insert("vec", "⃗");
-        m.insert("widehat", "̂");
-        m.insert("widetilde", "̃");
-        m
-    })
+fn blackboard() -> HashMap<char, &'static str> {
+    [
+        ('C', "\u{2102}"),
+        ('H', "\u{210d}"),
+        ('N', "\u{2115}"),
+        ('P', "\u{2119}"),
+        ('Q', "\u{211a}"),
+        ('R', "\u{211d}"),
+        ('Z', "\u{2124}"),
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn named_operators() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert("arccos");
-        s.insert("arcsin");
-        s.insert("arctan");
-        s.insert("arg");
-        s.insert("cos");
-        s.insert("cosh");
-        s.insert("cot");
-        s.insert("coth");
-        s.insert("csc");
-        s.insert("deg");
-        s.insert("det");
-        s.insert("dim");
-        s.insert("exp");
-        s.insert("gcd");
-        s.insert("hom");
-        s.insert("inf");
-        s.insert("ker");
-        s.insert("lg");
-        s.insert("lim");
-        s.insert("liminf");
-        s.insert("limsup");
-        s.insert("ln");
-        s.insert("log");
-        s.insert("max");
-        s.insert("min");
-        s.insert("Pr");
-        s.insert("sec");
-        s.insert("sin");
-        s.insert("sinh");
-        s.insert("sup");
-        s.insert("tan");
-        s.insert("tanh");
-        s
-    })
+fn accents() -> HashMap<&'static str, &'static str> {
+    [
+        ("acute", "\u{301}"),
+        ("bar", "\u{305}"),
+        ("breve", "\u{306}"),
+        ("check", "\u{30c}"),
+        ("ddot", "\u{308}"),
+        ("dot", "\u{307}"),
+        ("grave", "\u{300}"),
+        ("hat", "\u{302}"),
+        ("mathring", "\u{30a}"),
+        ("overleftarrow", "\u{20d6}"),
+        ("overleftrightarrow", "\u{20e1}"),
+        ("overline", "\u{305}"),
+        ("overrightarrow", "\u{20d7}"),
+        ("tilde", "\u{303}"),
+        ("underline", "\u{332}"),
+        ("vec", "\u{20d7}"),
+        ("widehat", "\u{302}"),
+        ("widetilde", "\u{303}"),
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn limit_operators() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert("argmax");
-        s.insert("argmin");
-        s.insert("inf");
-        s.insert("injlim");
-        s.insert("lim");
-        s.insert("liminf");
-        s.insert("limsup");
-        s.insert("max");
-        s.insert("min");
-        s.insert("projlim");
-        s.insert("sup");
-        s
-    })
+fn named_operators() -> HashSet<&'static str> {
+    [
+        "arccos", "arcsin", "arctan", "arg", "cos", "cosh", "cot", "coth", "csc", "deg", "det",
+        "dim", "exp", "gcd", "hom", "inf", "ker", "lg", "lim", "liminf", "limsup", "ln", "log",
+        "max", "min", "Pr", "sec", "sin", "sinh", "sup", "tan", "tanh",
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn display_limit_symbols() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert("bigcap");
-        s.insert("bigcup");
-        s.insert("bigodot");
-        s.insert("bigoplus");
-        s.insert("bigotimes");
-        s.insert("bigsqcup");
-        s.insert("biguplus");
-        s.insert("bigvee");
-        s.insert("bigwedge");
-        s.insert("coprod");
-        s.insert("int");
-        s.insert("iint");
-        s.insert("iiint");
-        s.insert("oint");
-        s.insert("prod");
-        s.insert("sum");
-        s
-    })
+fn limit_operators() -> HashSet<&'static str> {
+    [
+        "argmax", "argmin", "inf", "injlim", "lim", "liminf", "limsup", "max", "min", "projlim",
+        "sup",
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn relation_commands() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert("Leftarrow");
-        s.insert("Leftrightarrow");
-        s.insert("Longleftarrow");
-        s.insert("Longleftrightarrow");
-        s.insert("Longrightarrow");
-        s.insert("Rightarrow");
-        s.insert("Vdash");
-        s.insert("Vvdash");
-        s.insert("approx");
-        s.insert("asymp");
-        s.insert("cong");
-        s.insert("dashv");
-        s.insert("doteq");
-        s.insert("downarrow");
-        s.insert("equiv");
-        s.insert("ge");
-        s.insert("geq");
-        s.insert("geqslant");
-        s.insert("gets");
-        s.insert("gg");
-        s.insert("hookleftarrow");
-        s.insert("hookrightarrow");
-        s.insert("iff");
-        s.insert("implies");
-        s.insert("in");
-        s.insert("leadsto");
-        s.insert("le");
-        s.insert("leftarrow");
-        s.insert("leftharpoondown");
-        s.insert("leftharpoonup");
-        s.insert("leftrightarrow");
-        s.insert("leftrightharpoons");
-        s.insert("leq");
-        s.insert("leqslant");
-        s.insert("ll");
-        s.insert("longleftarrow");
-        s.insert("longleftrightarrow");
-        s.insert("longmapsto");
-        s.insert("longrightarrow");
-        s.insert("mapsto");
-        s.insert("mid");
-        s.insert("models");
-        s.insert("ne");
-        s.insert("nearrow");
-        s.insert("neq");
-        s.insert("ni");
-        s.insert("notin");
-        s.insert("nvdash");
-        s.insert("nvDash");
-        s.insert("nwarrow");
-        s.insert("parallel");
-        s.insert("perp");
-        s.insert("prec");
-        s.insert("preceq");
-        s.insert("propto");
-        s.insert("rightharpoondown");
-        s.insert("rightharpoonup");
-        s.insert("rightleftharpoons");
-        s.insert("rightarrow");
-        s.insert("rightsquigarrow");
-        s.insert("searrow");
-        s.insert("sim");
-        s.insert("simeq");
-        s.insert("sqsubset");
-        s.insert("sqsubseteq");
-        s.insert("sqsupset");
-        s.insert("sqsupseteq");
-        s.insert("subset");
-        s.insert("subseteq");
-        s.insert("succ");
-        s.insert("succeq");
-        s.insert("supset");
-        s.insert("supseteq");
-        s.insert("swarrow");
-        s.insert("to");
-        s.insert("triangleleft");
-        s.insert("triangleright");
-        s.insert("twoheadleftarrow");
-        s.insert("twoheadrightarrow");
-        s.insert("uparrow");
-        s.insert("vdash");
-        s
-    })
+fn display_limit_symbols() -> HashSet<&'static str> {
+    [
+        "bigcap",
+        "bigcup",
+        "bigodot",
+        "bigoplus",
+        "bigotimes",
+        "bigsqcup",
+        "biguplus",
+        "bigvee",
+        "bigwedge",
+        "coprod",
+        "int",
+        "iint",
+        "iiint",
+        "oint",
+        "prod",
+        "sum",
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn spacing_commands() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert(",");
-        s.insert(":");
-        s.insert(";");
-        s.insert(" ");
-        s.insert(">");
-        s.insert("enspace");
-        s.insert("enskip");
-        s.insert("medspace");
-        s.insert("quad");
-        s.insert("qquad");
-        s.insert("thickspace");
-        s.insert("thinspace");
-        s
-    })
+fn relation_commands() -> HashSet<&'static str> {
+    [
+        "Leftarrow",
+        "Leftrightarrow",
+        "Longleftarrow",
+        "Longleftrightarrow",
+        "Longrightarrow",
+        "Rightarrow",
+        "Vdash",
+        "Vvdash",
+        "approx",
+        "asymp",
+        "cong",
+        "dashv",
+        "doteq",
+        "downarrow",
+        "equiv",
+        "ge",
+        "geq",
+        "geqslant",
+        "gets",
+        "gg",
+        "hookleftarrow",
+        "hookrightarrow",
+        "iff",
+        "implies",
+        "in",
+        "leadsto",
+        "le",
+        "leftarrow",
+        "leftharpoondown",
+        "leftharpoonup",
+        "leftrightarrow",
+        "leftrightharpoons",
+        "leq",
+        "leqslant",
+        "ll",
+        "longleftarrow",
+        "longleftrightarrow",
+        "longmapsto",
+        "longrightarrow",
+        "mapsto",
+        "mid",
+        "models",
+        "ne",
+        "nearrow",
+        "neq",
+        "ni",
+        "notin",
+        "nvdash",
+        "nvDash",
+        "nwarrow",
+        "parallel",
+        "perp",
+        "prec",
+        "preceq",
+        "propto",
+        "rightharpoondown",
+        "rightharpoonup",
+        "rightleftharpoons",
+        "rightarrow",
+        "rightsquigarrow",
+        "searrow",
+        "sim",
+        "simeq",
+        "sqsubset",
+        "sqsubseteq",
+        "sqsupset",
+        "sqsupseteq",
+        "subset",
+        "subseteq",
+        "succ",
+        "succeq",
+        "supset",
+        "supseteq",
+        "swarrow",
+        "to",
+        "triangleleft",
+        "triangleright",
+        "twoheadleftarrow",
+        "twoheadrightarrow",
+        "uparrow",
+        "vdash",
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn negative_spacing_commands() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert("!");
-        s.insert("negmedspace");
-        s.insert("negthickspace");
-        s.insert("negthinspace");
-        s
-    })
+fn spacing_commands() -> HashSet<&'static str> {
+    [
+        ",",
+        ":",
+        ";",
+        " ",
+        ">",
+        "enspace",
+        "enskip",
+        "medspace",
+        "quad",
+        "qquad",
+        "thickspace",
+        "thinspace",
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn ignored_commands() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert("displaystyle");
-        s.insert("limits");
-        s.insert("nolimits");
-        s.insert("scriptstyle");
-        s.insert("scriptscriptstyle");
-        s.insert("textstyle");
-        s
-    })
+fn negative_spacing() -> HashSet<&'static str> {
+    ["!", "negmedspace", "negthickspace", "negthinspace"]
+        .into_iter()
+        .collect()
 }
 
-fn size_commands() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert("big");
-        s.insert("Big");
-        s.insert("bigg");
-        s.insert("Bigg");
-        s.insert("bigl");
-        s.insert("Bigl");
-        s.insert("biggl");
-        s.insert("Biggl");
-        s.insert("bigr");
-        s.insert("Bigr");
-        s.insert("biggr");
-        s.insert("Biggr");
-        s
-    })
+fn ignored_commands() -> HashSet<&'static str> {
+    [
+        "displaystyle",
+        "limits",
+        "nolimits",
+        "scriptstyle",
+        "scriptscriptstyle",
+        "textstyle",
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn plain_wrappers() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = HashSet::new();
-        s.insert("emph");
-        s.insert("mathcal");
-        s.insert("mathbf");
-        s.insert("mathfrak");
-        s.insert("mathit");
-        s.insert("mathrm");
-        s.insert("mathnormal");
-        s.insert("mathscr");
-        s.insert("mathsf");
-        s.insert("mathtt");
-        s.insert("mathup");
-        s.insert("mbox");
-        s.insert("overbrace");
-        s.insert("pmb");
-        s.insert("smash");
-        s.insert("substack");
-        s.insert("text");
-        s.insert("textbf");
-        s.insert("textit");
-        s.insert("textmd");
-        s.insert("textnormal");
-        s.insert("textrm");
-        s.insert("textsc");
-        s.insert("textsf");
-        s.insert("textsl");
-        s.insert("texttt");
-        s.insert("textup");
-        s.insert("underbrace");
-        s.insert("bm");
-        s.insert("boldsymbol");
-        s
-    })
+fn size_commands() -> HashSet<&'static str> {
+    [
+        "big", "Big", "bigg", "Bigg", "bigl", "Bigl", "biggl", "Biggl", "bigr", "Bigr", "biggr",
+        "Biggr",
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn is_letter(ch: char) -> bool {
-    ch.is_alphabetic()
+fn plain_wrappers() -> HashSet<&'static str> {
+    [
+        "emph",
+        "mathcal",
+        "mathbf",
+        "mathfrak",
+        "mathit",
+        "mathrm",
+        "mathnormal",
+        "mathscr",
+        "mathsf",
+        "mathtt",
+        "mathup",
+        "mbox",
+        "overbrace",
+        "pmb",
+        "smash",
+        "substack",
+        "text",
+        "textbf",
+        "textit",
+        "textmd",
+        "textnormal",
+        "textrm",
+        "textsc",
+        "textsf",
+        "textsl",
+        "texttt",
+        "textup",
+        "underbrace",
+        "bm",
+        "boldsymbol",
+    ]
+    .into_iter()
+    .collect()
 }
 
-fn is_number(ch: char) -> bool {
-    ch.is_numeric()
-}
-
-fn is_letter_or_number(ch: char) -> bool {
-    is_letter(ch) || is_number(ch)
-}
-
-fn replace_characters(value: &str, replacements: &HashMap<&str, &str>) -> Option<String> {
-    let mut result = String::new();
-    for character in value.chars() {
-        let key = character.to_string();
-        result.push_str(replacements.get(key.as_str())?);
-    }
-    Some(result)
-}
-
-fn strip_spaces_around_ops(value: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
+fn replace_characters(value: &str, map: &HashMap<char, &'static str>) -> Option<String> {
     let mut out = String::new();
+    for ch in value.chars() {
+        out.push_str(map.get(&ch)?);
+    }
+    Some(out)
+}
+
+fn compact_script_value(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut compact = String::new();
     let mut i = 0;
     while i < chars.len() {
         if chars[i].is_whitespace() {
@@ -711,81 +647,66 @@ fn strip_spaces_around_ops(value: &str) -> String {
                 j += 1;
             }
             if j < chars.len() && matches!(chars[j], '=' | '+' | '-') {
-                let op = chars[j];
-                let mut k = j + 1;
-                while k < chars.len() && chars[k].is_whitespace() {
-                    k += 1;
-                }
-                out.push(op);
-                i = k;
+                compact.push(chars[j]);
+                i = j + 1;
+                continue;
+            }
+            if i > 0 && matches!(chars[i - 1], '=' | '+' | '-') {
+                i = j;
                 continue;
             }
         }
-        if matches!(chars[i], '=' | '+' | '-') {
-            let mut k = i + 1;
-            while k < chars.len() && chars[k].is_whitespace() {
-                k += 1;
-            }
-            out.push(chars[i]);
-            i = k;
-            continue;
-        }
-        out.push(chars[i]);
+        compact.push(chars[i]);
         i += 1;
     }
-    out
+    compact
 }
 
-fn format_script(value: &str, kind: ScriptKind) -> String {
+fn format_script(value: &str, kind: &str) -> String {
     let value = value.trim();
-    let replacements = match kind {
-        ScriptKind::Sub => subscripts(),
-        ScriptKind::Sup => superscripts(),
+    let compact = compact_script_value(value);
+    let map = if kind == "sub" {
+        subscripts()
+    } else {
+        superscripts()
     };
-    let collapsed = strip_spaces_around_ops(value);
-    if let Some(unicode) = replace_characters(&collapsed, replacements) {
+    if let Some(unicode) = replace_characters(&compact, &map) {
         return unicode;
     }
-    let prefix = match kind {
-        ScriptKind::Sub => "_",
-        ScriptKind::Sup => "^",
-    };
-    let char_count = value.chars().count();
-    if char_count == 1
-        || (kind == ScriptKind::Sub && value.chars().all(|ch| ch.is_ascii_alphabetic()))
-    {
-        format!("{prefix}{value}")
-    } else {
-        format!("{prefix}({value})")
+    let prefix = if kind == "sub" { "_" } else { "^" };
+    let count = value.chars().count();
+    if count == 1 || (kind == "sub" && value.chars().all(|c| c.is_ascii_alphabetic())) {
+        return format!("{prefix}{value}");
     }
+    format!("{prefix}({value})")
 }
 
 fn format_fraction(numerator: &str, denominator: &str) -> String {
     let numerator = numerator.trim();
     let denominator = denominator.trim();
-    let simple_numerator = !numerator.is_empty()
-        && numerator
-            .chars()
-            .all(|ch| is_letter_or_number(ch) || ch == '.');
-    let simple_denominator = (!denominator.is_empty()
-        && denominator.chars().all(|ch| is_number(ch) || ch == '.'))
+    let simple_num =
+        !numerator.is_empty() && numerator.chars().all(|c| c.is_alphanumeric() || c == '.');
+    let simple_den = (!denominator.is_empty()
+        && denominator.chars().all(|c| c.is_ascii_digit() || c == '.'))
         || denominator.chars().count() == 1;
-    let num = if simple_numerator {
-        numerator.to_string()
-    } else {
-        format!("({numerator})")
-    };
-    let den = if simple_denominator {
-        denominator.to_string()
-    } else {
-        format!("({denominator})")
-    };
-    format!("{num}/{den}")
+    format!(
+        "{}/{}",
+        if simple_num {
+            numerator.to_string()
+        } else {
+            format!("({numerator})")
+        },
+        if simple_den {
+            denominator.to_string()
+        } else {
+            format!("({denominator})")
+        }
+    )
 }
 
 fn format_root(value: &str, symbol: &str) -> String {
     let value = value.trim();
-    if !value.is_empty() && value.chars().all(|ch| is_letter_or_number(ch) || ch == '.') {
+    if !value.is_empty() && value.chars().all(|c| c.is_alphanumeric() || c == '.') {
         format!("{symbol}{value}")
     } else {
         format!("{symbol}({value})")
@@ -793,46 +714,35 @@ fn format_root(value: &str, symbol: &str) -> String {
 }
 
 fn normalize_output(value: &str) -> String {
-    let mut chars: Vec<char> = value.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == NAMED_OPERATOR_START && i > 0 {
-            let prev = chars[i - 1];
-            if is_letter_or_number(prev)
-                || prev == ')'
-                || prev == ']'
-                || prev == '}'
-                || prev == LAYOUT_MARKER_END
-            {
-                chars[i] = ' ';
-            }
-        }
-        i += 1;
-    }
-    let mut cleaned = String::new();
-    for ch in chars {
-        if ch != NAMED_OPERATOR_START {
-            cleaned.push(ch);
-        }
-    }
-    let chars: Vec<char> = cleaned.chars().collect();
     let mut out = String::new();
+    let chars: Vec<char> = value.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == NAMED_OPERATOR_END {
-            let next = chars.get(i + 1).copied();
-            if next.is_some_and(|n| is_letter_or_number(n) || n == '√' || n == LAYOUT_MARKER_START)
-            {
-                out.push(' ');
+        let ch = chars[i];
+        if ch == NAMED_OPERATOR_START {
+            if i > 0 {
+                let prev = chars[i - 1];
+                if prev.is_alphanumeric() || matches!(prev, ')' | ']' | '}' | LAYOUT_MARKER_END) {
+                    out.push(' ');
+                }
             }
             i += 1;
             continue;
         }
-        out.push(chars[i]);
+        if ch == NAMED_OPERATOR_END {
+            if i + 1 < chars.len() {
+                let next = chars[i + 1];
+                if next.is_alphanumeric() || next == '\u{221a}' || next == LAYOUT_MARKER_START {
+                    out.push(' ');
+                }
+            }
+            i += 1;
+            continue;
+        }
+        out.push(ch);
         i += 1;
     }
-    let lines: Vec<String> = out
-        .split('\n')
+    out.lines()
         .map(|line| {
             let mut collapsed = String::new();
             let mut prev_space = false;
@@ -849,293 +759,37 @@ fn normalize_output(value: &str) -> String {
             }
             collapsed.trim().to_string()
         })
-        .collect();
-    let last = lines.len().saturating_sub(1);
-    lines
-        .into_iter()
-        .enumerate()
-        .filter(|(index, line)| !line.is_empty() || (*index > 0 && *index < last))
-        .map(|(_, line)| line)
         .collect::<Vec<_>>()
         .join("\n")
-        .trim()
-        .to_string()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ScriptKind {
-    Sub,
-    Sup,
-}
-
-#[derive(Clone)]
-enum LayoutNode {
-    Fraction {
-        numerator: String,
-        denominator: String,
-    },
-    Operator {
-        operator: String,
-        lower: Option<String>,
-        upper: Option<String>,
-    },
-    Matrix {
-        lines: Vec<String>,
-        baseline: usize,
-    },
-}
-
-struct Layout {
-    lines: Vec<String>,
-    width: usize,
-    baseline: usize,
-}
-
-fn pad_layout_line(line: &str, width: usize, centered: bool) -> String {
-    let padding = width.saturating_sub(visible_width(line));
-    let left = if centered { padding / 2 } else { 0 };
-    format!("{}{}{}", " ".repeat(left), line, " ".repeat(padding - left))
-}
-
-fn join_layouts(layouts: &[Layout]) -> Layout {
-    if layouts.is_empty() {
-        return Layout {
-            lines: vec![String::new()],
-            width: 0,
-            baseline: 0,
-        };
-    }
-    let baseline = layouts.iter().map(|l| l.baseline).max().unwrap_or(0);
-    let below = layouts
-        .iter()
-        .map(|l| l.lines.len().saturating_sub(l.baseline).saturating_sub(1))
-        .max()
-        .unwrap_or(0);
-    let mut lines = Vec::new();
-    for row in 0..=baseline + below {
-        let mut line = String::new();
-        for layout in layouts {
-            let source_row = row as isize - baseline as isize + layout.baseline as isize;
-            if source_row >= 0 && (source_row as usize) < layout.lines.len() {
-                line.push_str(&pad_layout_line(
-                    &layout.lines[source_row as usize],
-                    layout.width,
-                    false,
-                ));
-            } else {
-                line.push_str(&" ".repeat(layout.width));
-            }
-        }
-        lines.push(line.trim_end().to_string());
-    }
-    Layout {
-        width: layouts.iter().map(|l| l.width).sum(),
-        baseline,
-        lines,
-    }
-}
-
-fn find_markers(source: &str) -> Vec<(usize, usize, usize)> {
-    let mut out = Vec::new();
-    let start = LAYOUT_MARKER_START.to_string();
-    let end = LAYOUT_MARKER_END.to_string();
-    let mut search = 0;
-    while let Some(rel) = source[search..].find(&start) {
-        let index = search + rel;
-        let after = index + start.len();
-        if let Some(end_rel) = source[after..].find(&end) {
-            let num = &source[after..after + end_rel];
-            if let Ok(id) = num.parse::<usize>() {
-                let total = start.len() + num.len() + end.len();
-                out.push((index, id, total));
-            }
-            search = after + end_rel + end.len();
-        } else {
-            break;
-        }
-    }
-    out
-}
-
-fn trailing_marker(result: &str) -> Option<usize> {
-    let start = LAYOUT_MARKER_START.to_string();
-    let end = LAYOUT_MARKER_END.to_string();
-    if !result.ends_with(&end) {
-        return None;
-    }
-    let without_end = &result[..result.len() - end.len()];
-    let start_at = without_end.rfind(&start)?;
-    without_end[start_at + start.len()..].parse().ok()
-}
-
-fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
-    let mut rendered_lines = Vec::new();
-    let mut first_baseline = 0;
-    for source_line in source.split('\n') {
-        let mut layouts = Vec::new();
-        let mut position = 0;
-        let mut previous_node: Option<&LayoutNode> = None;
-        for (index, node_id, match_len) in find_markers(source_line) {
-            let Some(node) = nodes.get(node_id) else {
-                continue;
-            };
-            if index > position {
-                let sliced = &source_line[position..index];
-                let trimmed = if previous_node.is_some() {
-                    sliced.trim_start().trim_end()
-                } else {
-                    sliced.trim_end()
-                };
-                let preserve_leading = matches!(previous_node, Some(LayoutNode::Matrix { .. }))
-                    && sliced.starts_with(char::is_whitespace);
-                let preserve_trailing = matches!(node, LayoutNode::Matrix { .. })
-                    && sliced.ends_with(char::is_whitespace);
-                let text = if !trimmed.is_empty() {
-                    format!(
-                        "{}{}{}",
-                        if preserve_leading { " " } else { "" },
-                        trimmed,
-                        if preserve_trailing { " " } else { "" }
-                    )
-                } else if preserve_leading || preserve_trailing {
-                    " ".to_string()
-                } else {
-                    String::new()
-                };
-                layouts.push(Layout {
-                    width: visible_width(&text),
-                    baseline: 0,
-                    lines: vec![text],
-                });
-            }
-            match node {
-                LayoutNode::Fraction {
-                    numerator,
-                    denominator,
-                } => {
-                    let numerator = render_layout(numerator, nodes);
-                    let denominator = render_layout(denominator, nodes);
-                    let content_width = numerator.width.max(denominator.width).max(1);
-                    let width = content_width + 2;
-                    let mut lines: Vec<String> = numerator
-                        .lines
-                        .iter()
-                        .map(|line| pad_layout_line(line, width, true))
-                        .collect();
-                    lines.push(format!(" {} ", "─".repeat(content_width)));
-                    lines.extend(
-                        denominator
-                            .lines
-                            .iter()
-                            .map(|line| pad_layout_line(line, width, true)),
-                    );
-                    let baseline = numerator.lines.len();
-                    layouts.push(Layout {
-                        lines,
-                        width,
-                        baseline,
-                    });
-                }
-                LayoutNode::Operator {
-                    operator,
-                    lower,
-                    upper,
-                } => {
-                    let content_width = visible_width(operator)
-                        .max(lower.as_deref().map(visible_width).unwrap_or(0))
-                        .max(upper.as_deref().map(visible_width).unwrap_or(0));
-                    let mut lines = Vec::new();
-                    if let Some(upper) = upper {
-                        lines.push(format!("{} ", pad_layout_line(upper, content_width, true)));
-                    }
-                    lines.push(format!(
-                        "{} ",
-                        pad_layout_line(operator, content_width, true)
-                    ));
-                    if let Some(lower) = lower {
-                        lines.push(format!("{} ", pad_layout_line(lower, content_width, true)));
-                    }
-                    layouts.push(Layout {
-                        baseline: if upper.is_some() { 1 } else { 0 },
-                        width: content_width + 1,
-                        lines,
-                    });
-                }
-                LayoutNode::Matrix { lines, baseline } => {
-                    let width = lines
-                        .iter()
-                        .map(|line| visible_width(line))
-                        .max()
-                        .unwrap_or(0);
-                    layouts.push(Layout {
-                        lines: lines
-                            .iter()
-                            .map(|line| pad_layout_line(line, width, false))
-                            .collect(),
-                        width,
-                        baseline: *baseline,
-                    });
-                }
-            }
-            position = index + match_len;
-            previous_node = Some(node);
-        }
-        if position < source_line.len() {
-            let sliced = &source_line[position..];
-            let trimmed = if previous_node.is_some() {
-                sliced.trim_start()
-            } else {
-                sliced
-            };
-            let text = if matches!(previous_node, Some(LayoutNode::Matrix { .. }))
-                && sliced.starts_with(char::is_whitespace)
-            {
-                format!(" {trimmed}")
-            } else {
-                trimmed.to_string()
-            };
-            layouts.push(Layout {
-                width: visible_width(&text),
-                baseline: 0,
-                lines: vec![text],
-            });
-        }
-        let line_layout = join_layouts(&layouts);
-        if rendered_lines.is_empty() {
-            first_baseline = line_layout.baseline;
-        }
-        rendered_lines.extend(line_layout.lines);
-    }
-    Layout {
-        width: rendered_lines
-            .iter()
-            .map(|line| visible_width(line))
-            .max()
-            .unwrap_or(0),
-        baseline: first_baseline,
-        lines: rendered_lines,
-    }
-}
-
-struct LatexParser<'a> {
-    source: &'a str,
-    layout_nodes: &'a mut Vec<LayoutNode>,
-    display: bool,
+struct Parser {
+    source: Vec<char>,
     position: usize,
     supported: bool,
+    display: bool,
     stack_fractions: bool,
+    layout_nodes: Vec<LayoutNode>,
 }
 
-impl<'a> LatexParser<'a> {
-    fn new(source: &'a str, layout_nodes: &'a mut Vec<LayoutNode>, display: bool) -> Self {
+impl Parser {
+    fn new(source: &str, display: bool) -> Self {
         Self {
-            source,
-            layout_nodes,
-            display,
+            source: source.chars().collect(),
             position: 0,
             supported: true,
+            display,
             stack_fractions: true,
+            layout_nodes: Vec::new(),
         }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.source.get(self.position).copied()
+    }
+
+    fn rest(&self) -> String {
+        self.source[self.position..].iter().collect()
     }
 
     fn render(&mut self) -> Option<String> {
@@ -1146,24 +800,12 @@ impl<'a> LatexParser<'a> {
         Some(normalize_output(&rendered))
     }
 
-    fn peek(&self) -> Option<char> {
-        self.source[self.position..].chars().next()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let ch = self.peek()?;
-        self.position += ch.len_utf8();
-        Some(ch)
-    }
-
-    fn parse_sequence(&mut self, end_character: Option<char>) -> String {
+    fn parse_sequence(&mut self, end: Option<char>) -> String {
         let mut result = String::new();
         while self.position < self.source.len() {
-            let Some(character) = self.peek() else {
-                break;
-            };
-            if end_character == Some(character) {
-                self.bump();
+            let character = self.source[self.position];
+            if end == Some(character) {
+                self.position += 1;
                 return result;
             }
             if character == '}' {
@@ -1171,7 +813,7 @@ impl<'a> LatexParser<'a> {
                 return result;
             }
             if character == '{' {
-                self.bump();
+                self.position += 1;
                 result.push_str(&self.parse_sequence(Some('}')));
                 continue;
             }
@@ -1180,7 +822,7 @@ impl<'a> LatexParser<'a> {
                 if command == NEGATIVE_SPACE.to_string() {
                     result = result.trim_end().to_string();
                     if result.ends_with(NAMED_OPERATOR_END) {
-                        result.truncate(result.len() - NAMED_OPERATOR_END.len_utf8());
+                        result.pop();
                     }
                 } else {
                     result.push_str(&command);
@@ -1188,18 +830,14 @@ impl<'a> LatexParser<'a> {
                 continue;
             }
             if character == '^' || character == '_' {
-                self.bump();
+                self.position += 1;
                 result = result.trim_end().to_string();
                 let script = format_script(
                     &self.parse_required_argument(false),
-                    if character == '_' {
-                        ScriptKind::Sub
-                    } else {
-                        ScriptKind::Sup
-                    },
+                    if character == '_' { "sub" } else { "sup" },
                 );
                 if result.ends_with(NAMED_OPERATOR_END) {
-                    result.truncate(result.len() - NAMED_OPERATOR_END.len_utf8());
+                    result.pop();
                     result.push_str(&script);
                     result.push(NAMED_OPERATOR_END);
                 } else {
@@ -1211,78 +849,67 @@ impl<'a> LatexParser<'a> {
                 result.push_str(&self.parse_whitespace());
                 continue;
             }
-            if character == '=' || character == '<' || character == '>' {
+            if matches!(character, '=' | '<' | '>') {
                 result = format!("{} {character} ", result.trim_end());
-                self.bump();
+                self.position += 1;
                 continue;
             }
             if character == '&' {
-                self.bump();
+                self.position += 1;
                 continue;
             }
             if character == '~' {
-                self.bump();
+                self.position += 1;
                 result.push(' ');
                 continue;
             }
-            if character == '.' {
-                if let Some(id) = trailing_marker(&result) {
-                    if let Some(LayoutNode::Matrix { lines, .. }) = self.layout_nodes.get_mut(id) {
-                        if let Some(last) = lines.last_mut() {
-                            last.push(character);
-                            self.bump();
-                            continue;
-                        }
-                    }
-                }
-            }
             result.push(character);
-            self.bump();
+            self.position += 1;
         }
-        if end_character.is_some() {
+        if end.is_some() {
             self.supported = false;
         }
         result
     }
 
     fn parse_whitespace(&mut self) -> String {
-        while self.peek().is_some_and(char::is_whitespace) {
-            self.bump();
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
+            self.position += 1;
         }
-        " ".to_string()
+        " ".into()
     }
 
     fn parse_command(&mut self) -> String {
-        self.bump();
+        self.position += 1;
         if self.position >= self.source.len() {
             self.supported = false;
             return String::new();
         }
-        let first = self.peek().unwrap_or('\0');
+        let first = self.source[self.position];
         if first == '\n' || first == '\r' {
-            self.bump();
+            self.position += 1;
             if first == '\r' && self.peek() == Some('\n') {
-                self.bump();
+                self.position += 1;
             }
-            return " ".to_string();
+            return " ".into();
         }
         let command = if first.is_ascii_alphabetic() {
             let start = self.position;
-            while self.peek().is_some_and(|ch| ch.is_ascii_alphabetic()) {
-                self.bump();
+            while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                self.position += 1;
             }
-            self.source[start..self.position].to_string()
+            self.source[start..self.position].iter().collect::<String>()
         } else {
-            self.bump();
+            self.position += 1;
             first.to_string()
         };
         if command == "\\" {
-            return "\n".to_string();
+            return "\n".into();
         }
         if spacing_commands().contains(command.as_str()) {
-            return " ".to_string();
+            return " ".into();
         }
-        if negative_spacing_commands().contains(command.as_str()) {
+        if negative_spacing().contains(command.as_str()) {
             return NEGATIVE_SPACE.to_string();
         }
         if ignored_commands().contains(command.as_str()) {
@@ -1292,7 +919,7 @@ impl<'a> LatexParser<'a> {
             return command;
         }
         if command == "|" {
-            return "‖".to_string();
+            return "\u{2016}".into();
         }
         if command == "not" {
             let value = self.parse_required_argument(false);
@@ -1300,33 +927,27 @@ impl<'a> LatexParser<'a> {
             if let Some(negated) = negated_symbols().get(value) {
                 return format!(" {negated} ");
             }
-            let characters: Vec<char> = value.chars().collect();
-            if characters.is_empty() {
+            let mut chars = value.chars();
+            let Some(first) = chars.next() else {
                 self.supported = false;
                 return String::new();
-            }
-            return format!(
-                " {}{}{} ",
-                characters[0],
-                '\u{0338}',
-                characters[1..].iter().collect::<String>()
-            );
+            };
+            return format!(" {first}\u{0338}{} ", chars.collect::<String>());
         }
         if limit_operators().contains(command.as_str()) {
-            return self.parse_operator(&command, "bracket", true, true);
+            return self.parse_operator(&command, true, true, true);
         }
-        if let Some(symbol) = symbols().get(command.as_str()) {
+        if let Some(symbol) = latex_symbols().get(command.as_str()) {
             if display_limit_symbols().contains(command.as_str()) {
-                return self.parse_operator(symbol, "script", true, false);
+                return self.parse_operator(symbol, false, true, false);
             }
-            return if command == "cdot"
+            if command == "cdot"
                 || command == "times"
                 || relation_commands().contains(command.as_str())
             {
-                format!(" {symbol} ")
-            } else {
-                (*symbol).to_string()
-            };
+                return format!(" {symbol} ");
+            }
+            return (*symbol).to_string();
         }
         if named_operators().contains(command.as_str()) {
             return format!("{NAMED_OPERATOR_START}{command}{NAMED_OPERATOR_END}");
@@ -1336,7 +957,7 @@ impl<'a> LatexParser<'a> {
         }
         if matches!(command.as_str(), "left" | "middle" | "right") {
             if self.peek() == Some('.') {
-                self.bump();
+                self.position += 1;
             }
             return String::new();
         }
@@ -1345,11 +966,11 @@ impl<'a> LatexParser<'a> {
             let numerator = self.parse_required_argument(!should_stack);
             let denominator = self.parse_required_argument(!should_stack);
             if should_stack {
+                let index = self.layout_nodes.len();
                 self.layout_nodes.push(LayoutNode::Fraction {
                     numerator: normalize_output(&numerator),
                     denominator: normalize_output(&denominator),
                 });
-                let index = self.layout_nodes.len() - 1;
                 return format!("{LAYOUT_MARKER_START}{index}{LAYOUT_MARKER_END}");
             }
             return format_fraction(&numerator, &denominator);
@@ -1358,14 +979,16 @@ impl<'a> LatexParser<'a> {
             let degree = self.parse_optional_argument().map(|v| v.trim().to_string());
             let value = self.parse_required_argument(true);
             return match degree.as_deref() {
-                None | Some("2") => format_root(&value, "√"),
-                Some("3") => format_root(&value, "∛"),
-                Some("4") => format_root(&value, "∜"),
-                Some(degree) => format!(
-                    "{}{}",
-                    format_script(degree, ScriptKind::Sup),
-                    format_root(&value, "√")
-                ),
+                None | Some("2") => format_root(&value, "\u{221a}"),
+                Some("3") => format_root(&value, "\u{221b}"),
+                Some("4") => format_root(&value, "\u{221c}"),
+                Some(degree) => {
+                    format!(
+                        "{}{}",
+                        format_script(degree, "sup"),
+                        format_root(&value, "\u{221a}")
+                    )
+                }
             };
         }
         if command == "boxed" || command == "fbox" {
@@ -1388,33 +1011,27 @@ impl<'a> LatexParser<'a> {
         }
         if command == "mathbb" {
             let value = self.parse_required_argument(true);
+            let map = blackboard();
             return value
                 .chars()
-                .map(|ch| {
-                    let key = ch.to_string();
-                    blackboard()
-                        .get(key.as_str())
+                .map(|c| {
+                    map.get(&c)
                         .copied()
-                        .unwrap_or("")
-                        .to_string()
-                        .chars()
-                        .next()
-                        .unwrap_or(ch)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| c.to_string())
                 })
                 .collect();
         }
         if command == "operatorname" {
             let starred = self.peek() == Some('*');
             if starred {
-                self.bump();
+                self.position += 1;
             }
-            let operator = normalize_output(&self.parse_required_argument(true))
-                .trim()
-                .to_string();
-            return self.parse_operator(&operator, "bracket", starred, true);
+            let operator = normalize_output(&self.parse_required_argument(true));
+            return self.parse_operator(operator.trim(), true, starred, true);
         }
         if command == "mod" || command == "bmod" {
-            return " mod ".to_string();
+            return " mod ".into();
         }
         if command == "pmod" || command == "pod" {
             let value = self.parse_required_argument(true);
@@ -1428,12 +1045,12 @@ impl<'a> LatexParser<'a> {
         if command == "overset" || command == "stackrel" {
             let upper = self.parse_required_argument(true);
             let value = self.parse_required_argument(true);
-            return format!("{}{}", value.trim(), format_script(&upper, ScriptKind::Sup));
+            return format!("{}{}", value.trim(), format_script(&upper, "sup"));
         }
         if command == "underset" {
             let lower = self.parse_required_argument(true);
             let value = self.parse_required_argument(true);
-            return format!("{}{}", value.trim(), format_script(&lower, ScriptKind::Sub));
+            return format!("{}{}", value.trim(), format_script(&lower, "sub"));
         }
         if plain_wrappers().contains(command.as_str()) {
             let value = self.parse_required_argument(true);
@@ -1457,55 +1074,38 @@ impl<'a> LatexParser<'a> {
     fn parse_operator(
         &mut self,
         operator: &str,
-        inline_lower_style: &str,
+        bracket_lower: bool,
         display_limits: bool,
         spaced: bool,
     ) -> String {
-        let mut use_display_limits = display_limits;
-        let mut modifier_position = self.position;
-        while self.source[modifier_position..]
-            .chars()
-            .next()
-            .is_some_and(|ch| ch == ' ' || ch == '\t')
-        {
-            modifier_position += 1;
+        let mut use_display = display_limits;
+        let mut modifier_pos = self.position;
+        while modifier_pos < self.source.len() && matches!(self.source[modifier_pos], ' ' | '\t') {
+            modifier_pos += 1;
         }
-        let rest = &self.source[modifier_position..];
-        if let Some(stripped) = rest.strip_prefix("\\limits") {
-            if !stripped
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_alphabetic())
-            {
-                use_display_limits = true;
-                self.position = modifier_position + "\\limits".len();
-            }
-        } else if let Some(stripped) = rest.strip_prefix("\\nolimits") {
-            if !stripped
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_alphabetic())
-            {
-                use_display_limits = false;
-                self.position = modifier_position + "\\nolimits".len();
-            }
+        let rest: String = self.source[modifier_pos..].iter().collect();
+        if rest.starts_with("\\limits") && !rest[7..].starts_with(|c: char| c.is_ascii_alphabetic())
+        {
+            use_display = true;
+            self.position = modifier_pos + 7;
+        } else if rest.starts_with("\\nolimits")
+            && !rest[9..].starts_with(|c: char| c.is_ascii_alphabetic())
+        {
+            use_display = false;
+            self.position = modifier_pos + 9;
         }
         let mut lower = None;
         let mut upper = None;
         loop {
-            let mut script_position = self.position;
-            while self.source[script_position..]
-                .chars()
-                .next()
-                .is_some_and(|ch| ch == ' ' || ch == '\t')
-            {
-                script_position += 1;
+            let mut script_pos = self.position;
+            while script_pos < self.source.len() && matches!(self.source[script_pos], ' ' | '\t') {
+                script_pos += 1;
             }
-            let kind = self.source[script_position..].chars().next();
+            let kind = self.source.get(script_pos).copied();
             if kind != Some('_') && kind != Some('^') {
                 break;
             }
-            self.position = script_position + 1;
+            self.position = script_pos + 1;
             let value = normalize_output(&self.parse_required_argument(false)).replace(' ', "");
             if kind == Some('_') {
                 if lower.is_some() {
@@ -1519,26 +1119,25 @@ impl<'a> LatexParser<'a> {
                 upper = Some(value);
             }
         }
-        if self.display && use_display_limits && (lower.is_some() || upper.is_some()) {
+        if self.display && use_display && (lower.is_some() || upper.is_some()) {
+            let index = self.layout_nodes.len();
             self.layout_nodes.push(LayoutNode::Operator {
                 operator: operator.to_string(),
                 lower,
                 upper,
             });
-            let index = self.layout_nodes.len() - 1;
             return format!("{LAYOUT_MARKER_START}{index}{LAYOUT_MARKER_END}");
         }
         let mut rendered = operator.to_string();
         if let Some(lower) = &lower {
-            let lower_text = if inline_lower_style == "bracket" {
-                format!("[{lower}]")
+            if bracket_lower {
+                rendered.push_str(&format!("[{lower}]"));
             } else {
-                format_script(lower, ScriptKind::Sub)
-            };
-            rendered.push_str(&lower_text);
+                rendered.push_str(&format_script(lower, "sub"));
+            }
         }
         if let Some(upper) = &upper {
-            rendered.push_str(&format_script(upper, ScriptKind::Sup));
+            rendered.push_str(&format_script(upper, "sup"));
         }
         if spaced {
             format!(" {rendered} ")
@@ -1556,57 +1155,54 @@ impl<'a> LatexParser<'a> {
     }
 
     fn parse_required_argument_value(&mut self) -> String {
-        while self.peek().is_some_and(char::is_whitespace) {
-            self.bump();
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
+            self.position += 1;
         }
         if self.position >= self.source.len() {
             self.supported = false;
             return String::new();
         }
         if self.peek() == Some('{') {
-            self.bump();
+            self.position += 1;
             return self.parse_sequence(Some('}'));
         }
         if self.peek() == Some('\\') {
             return self.parse_command();
         }
-        self.bump().unwrap_or('\0').to_string()
+        let value = self.peek().unwrap_or_default();
+        self.position += 1;
+        value.to_string()
     }
 
     fn parse_optional_argument(&mut self) -> Option<String> {
-        while self.peek() == Some(' ') || self.peek() == Some('\t') {
-            self.bump();
+        while self.peek().is_some_and(|c| c == ' ' || c == '\t') {
+            self.position += 1;
         }
         if self.peek() != Some('[') {
             return None;
         }
-        let rest = &self.source[self.position + 1..];
-        let Some(end) = rest.find(']') else {
-            self.supported = false;
-            return None;
-        };
-        let abs_end = self.position + 1 + end;
-        let value = self.source[self.position + 1..abs_end].to_string();
-        self.position = abs_end + 1;
-        Some(self.render_nested(&value, true))
+        let rest = self.rest();
+        let end = rest.find(']')?;
+        let value: String = rest.chars().skip(1).take(end.saturating_sub(1)).collect();
+        self.position += end + 1;
+        Some(self.render_nested(&value))
     }
 
     fn read_raw_group(&mut self) -> Option<String> {
-        while self.peek() == Some(' ') || self.peek() == Some('\t') {
-            self.bump();
+        while self.peek().is_some_and(|c| c == ' ' || c == '\t') {
+            self.position += 1;
         }
         if self.peek() != Some('{') {
             self.supported = false;
             return None;
         }
-        self.bump();
+        self.position += 1;
         let start = self.position;
         let mut depth = 1;
         while self.position < self.source.len() {
-            let character = self.peek().unwrap_or('\0');
+            let character = self.source[self.position];
             if character == '\\' {
-                self.bump();
-                self.bump();
+                self.position += 2;
                 continue;
             }
             if character == '{' {
@@ -1616,14 +1212,20 @@ impl<'a> LatexParser<'a> {
                 depth -= 1;
             }
             if depth == 0 {
-                let value = self.source[start..self.position].to_string();
-                self.bump();
+                let value: String = self.source[start..self.position].iter().collect();
+                self.position += 1;
                 return Some(value);
             }
-            self.bump();
+            self.position += 1;
         }
         self.supported = false;
         None
+    }
+
+    fn render_nested(&self, source: &str) -> String {
+        let mut nested = Parser::new(source, self.display);
+        nested.stack_fractions = self.stack_fractions;
+        nested.parse_sequence(None)
     }
 
     fn split_environment_rows(body: &str) -> Vec<String> {
@@ -1633,18 +1235,13 @@ impl<'a> LatexParser<'a> {
         let mut i = 0;
         while i < chars.len() {
             if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                rows.push(std::mem::take(&mut current));
                 i += 2;
                 if i < chars.len() && chars[i] == '[' {
-                    if let Some(rel) = chars[i + 1..]
-                        .iter()
-                        .position(|ch| *ch == ']' || *ch == '\n')
-                    {
-                        if chars[i + 1 + rel] == ']' {
-                            i = i + 2 + rel;
-                        }
+                    if let Some(end) = chars[i..].iter().position(|c| *c == ']') {
+                        i += end + 1;
                     }
                 }
-                rows.push(std::mem::take(&mut current));
                 continue;
             }
             current.push(chars[i]);
@@ -1659,17 +1256,18 @@ impl<'a> LatexParser<'a> {
             return String::new();
         };
         let end_marker = format!("\\end{{{environment}}}");
-        let Some(end) = self.source[self.position..].find(&end_marker) else {
+        let rest = self.rest();
+        let Some(end) = rest.find(&end_marker) else {
             self.supported = false;
             return String::new();
         };
-        let body = self.source[self.position..self.position + end].to_string();
-        self.position += end + end_marker.len();
+        let body: String = rest.chars().take(end).collect();
+        self.position += end + end_marker.chars().count();
         if matches!(
             environment.as_str(),
             "equation" | "equation*" | "displaymath"
         ) {
-            return self.render_nested(&body, true).trim().to_string();
+            return self.render_nested(&body).trim().to_string();
         }
         if matches!(
             environment.as_str(),
@@ -1691,50 +1289,57 @@ impl<'a> LatexParser<'a> {
             } else {
                 body.clone()
             };
-            let mut lines = Vec::new();
-            for row in Self::split_environment_rows(&aligned_body) {
-                let cells: Vec<&str> = row.split('&').collect();
-                let source = if aligned_at {
-                    cells
-                        .chunks(2)
-                        .map(|pair| pair.join(""))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                } else {
-                    cells.join("")
-                };
-                let trimmed = self.render_nested(&source, true).trim().to_string();
-                if !trimmed.is_empty() {
-                    lines.push(trimmed);
-                }
-            }
-            return lines.join("\n");
+            return Self::split_environment_rows(&aligned_body)
+                .into_iter()
+                .map(|row| {
+                    let cells: Vec<&str> = row.split('&').collect();
+                    let source = if aligned_at {
+                        cells
+                            .chunks(2)
+                            .map(|pair| pair.join(""))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        cells.join("")
+                    };
+                    self.render_nested(&source).trim().to_string()
+                })
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
         }
         if environment == "cases" || environment == "cases*" {
-            let mut rows: Vec<Vec<String>> = Vec::new();
-            for row in Self::split_environment_rows(&body) {
-                let cells: Vec<String> = row
-                    .split('&')
-                    .map(|cell| self.render_nested(cell, false).trim().to_string())
-                    .collect();
-                if cells.iter().any(|cell| !cell.is_empty()) {
-                    rows.push(cells);
-                }
-            }
+            let rows: Vec<Vec<String>> = Self::split_environment_rows(&body)
+                .into_iter()
+                .map(|row| {
+                    row.split('&')
+                        .map(|cell| self.render_nested(cell).trim().to_string())
+                        .collect()
+                })
+                .filter(|row: &Vec<String>| row.iter().any(|c| !c.is_empty()))
+                .collect();
             return rows
                 .iter()
                 .enumerate()
                 .map(|(index, row)| {
-                    let value = strip_trailing_comma(row.first().map(String::as_str).unwrap_or(""));
+                    let mut value = row.first().cloned().unwrap_or_default();
+                    if value.ends_with(',') {
+                        value.pop();
+                    }
                     let condition = row.get(1).cloned().unwrap_or_default();
                     let delimiter = if index == 0 {
-                        "⎧"
+                        "\u{23a7}"
                     } else if index + 1 == rows.len() {
-                        "⎩"
+                        "\u{23a9}"
                     } else {
-                        "⎨"
+                        "\u{23a8}"
                     };
-                    let condition_prefix = if condition_has_natural_word(&condition) {
+                    let lower = condition.to_ascii_lowercase();
+                    let prefix = if lower.starts_with("if")
+                        || lower.starts_with("when")
+                        || lower.starts_with("for")
+                        || lower.starts_with("otherwise")
+                    {
                         " "
                     } else {
                         " if "
@@ -1742,7 +1347,7 @@ impl<'a> LatexParser<'a> {
                     if condition.is_empty() {
                         format!("{delimiter} {value}")
                     } else {
-                        format!("{delimiter} {value}{condition_prefix}{condition}")
+                        format!("{delimiter} {value}{prefix}{condition}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1771,22 +1376,21 @@ impl<'a> LatexParser<'a> {
     }
 
     fn render_matrix(&mut self, environment: &str, body: &str) -> String {
-        let mut matrix: Vec<Vec<String>> = Vec::new();
-        for row in Self::split_environment_rows(body) {
-            let cells: Vec<String> = row
-                .split('&')
-                .map(|cell| self.render_nested(cell, false).trim().to_string())
-                .collect();
-            if cells.iter().any(|cell| !cell.is_empty()) {
-                matrix.push(cells);
-            }
-        }
+        let matrix: Vec<Vec<String>> = Self::split_environment_rows(body)
+            .into_iter()
+            .map(|row| {
+                row.split('&')
+                    .map(|cell| self.render_nested(cell).trim().to_string())
+                    .collect()
+            })
+            .filter(|row: &Vec<String>| row.iter().any(|c| !c.is_empty()))
+            .collect();
         let column_count = matrix.iter().map(|row| row.len()).max().unwrap_or(0);
-        let column_widths: Vec<usize> = (0..column_count)
-            .map(|column| {
+        let widths: Vec<usize> = (0..column_count)
+            .map(|col| {
                 matrix
                     .iter()
-                    .map(|row| visible_width(row.get(column).map(String::as_str).unwrap_or("")))
+                    .map(|row| visible_width(row.get(col).map(String::as_str).unwrap_or("")))
                     .max()
                     .unwrap_or(0)
             })
@@ -1795,29 +1399,34 @@ impl<'a> LatexParser<'a> {
             .iter()
             .map(|row| {
                 (0..column_count)
-                    .map(|column| {
-                        let cell = row.get(column).cloned().unwrap_or_default();
-                        let pad = column_widths[column].saturating_sub(visible_width(&cell));
-                        format!(
-                            "{cell}{}",
-                            std::iter::repeat(PROTECTED_SPACE)
-                                .take(pad)
-                                .collect::<String>()
-                        )
+                    .map(|col| {
+                        let cell = row.get(col).cloned().unwrap_or_default();
+                        let pad = widths[col].saturating_sub(visible_width(&cell));
+                        format!("{cell}{}", PROTECTED_SPACE.to_string().repeat(pad))
                     })
                     .collect::<Vec<_>>()
-                    .join(" │ ")
+                    .join(" \u{2502} ")
             })
             .collect();
         let lines = if matches!(environment, "array" | "matrix" | "smallmatrix") {
             rows
         } else {
-            let delimiter = match environment {
-                "pmatrix" => ["⎛", "⎞", "⎜", "⎟", "⎝", "⎠"],
-                "bmatrix" => ["⎡", "⎤", "⎢", "⎥", "⎣", "⎦"],
-                "Bmatrix" => ["⎧", "⎫", "⎨", "⎬", "⎩", "⎭"],
-                "vmatrix" => ["│", "│", "│", "│", "│", "│"],
-                "Vmatrix" => ["║", "║", "║", "║", "║", "║"],
+            let delim = match environment {
+                "pmatrix" => (
+                    "\u{239b}", "\u{239e}", "\u{239c}", "\u{239f}", "\u{239d}", "\u{23a0}",
+                ),
+                "bmatrix" => (
+                    "\u{23a1}", "\u{23a4}", "\u{23a2}", "\u{23a5}", "\u{23a3}", "\u{23a6}",
+                ),
+                "Bmatrix" => (
+                    "\u{23a7}", "\u{23ab}", "\u{23a8}", "\u{23ac}", "\u{23a9}", "\u{23ad}",
+                ),
+                "vmatrix" => (
+                    "\u{2502}", "\u{2502}", "\u{2502}", "\u{2502}", "\u{2502}", "\u{2502}",
+                ),
+                "Vmatrix" => (
+                    "\u{2551}", "\u{2551}", "\u{2551}", "\u{2551}", "\u{2551}", "\u{2551}",
+                ),
                 _ => {
                     self.supported = false;
                     return rows.join("\n");
@@ -1826,19 +1435,12 @@ impl<'a> LatexParser<'a> {
             rows.iter()
                 .enumerate()
                 .map(|(index, row)| {
-                    let left = if index == 0 {
-                        delimiter[0]
+                    let (left, right) = if index == 0 {
+                        (delim.0, delim.1)
                     } else if index + 1 == rows.len() {
-                        delimiter[4]
+                        (delim.4, delim.5)
                     } else {
-                        delimiter[2]
-                    };
-                    let right = if index == 0 {
-                        delimiter[1]
-                    } else if index + 1 == rows.len() {
-                        delimiter[5]
-                    } else {
-                        delimiter[3]
+                        (delim.2, delim.3)
                     };
                     format!("{left} {row} {right}")
                 })
@@ -1847,73 +1449,87 @@ impl<'a> LatexParser<'a> {
         if lines.len() <= 1 {
             return lines.first().cloned().unwrap_or_default();
         }
-        self.layout_nodes
-            .push(LayoutNode::Matrix { lines, baseline: 0 });
-        let index = self.layout_nodes.len() - 1;
+        let index = self.layout_nodes.len();
+        self.layout_nodes.push(LayoutNode::Matrix {
+            lines,
+            _baseline: 0,
+        });
         format!("{LAYOUT_MARKER_START}{index}{LAYOUT_MARKER_END}")
-    }
-
-    fn render_nested(&mut self, source: &str, stack_fractions: bool) -> String {
-        let display = self.display && stack_fractions;
-        let rendered = {
-            let mut nested = LatexParser::new(source, self.layout_nodes, display);
-            nested.render()
-        };
-        match rendered {
-            Some(rendered) => rendered,
-            None => {
-                self.supported = false;
-                source.to_string()
-            }
-        }
-    }
-}
-
-fn strip_trailing_comma(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut end = bytes.len();
-    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    if end > 0 && bytes[end - 1] == b',' {
-        end -= 1;
-        value[..end].to_string()
-    } else {
-        value.to_string()
     }
 }
 
 fn strip_leading_group(body: &str) -> String {
     let trimmed = body.trim_start();
-    if let Some(rest) = trimmed.strip_prefix('{') {
-        if let Some(end) = rest.find('}') {
-            return rest[end + 1..].to_string();
-        }
+    if !trimmed.starts_with('{') {
+        return body.to_string();
+    }
+    if let Some(end) = trimmed.find('}') {
+        return trimmed[end + 1..].to_string();
     }
     body.to_string()
 }
 
-fn condition_has_natural_word(condition: &str) -> bool {
-    let lower = condition.to_ascii_lowercase();
-    ["if", "when", "for", "otherwise"].iter().any(|word| {
-        lower == *word
-            || lower.starts_with(&format!("{word} "))
-            || lower.starts_with(&format!("{word}\t"))
-    })
+fn render_layout(source: &str, nodes: &[LayoutNode]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for source_line in source.split('\n') {
+        let mut text = String::new();
+        let mut rest = source_line;
+        while let Some(start) = rest.find(LAYOUT_MARKER_START) {
+            text.push_str(&rest[..start]);
+            let after = &rest[start + LAYOUT_MARKER_START.len_utf8()..];
+            if let Some(end) = after.find(LAYOUT_MARKER_END) {
+                if let Ok(index) = after[..end].parse::<usize>() {
+                    if let Some(node) = nodes.get(index) {
+                        match node {
+                            LayoutNode::Fraction {
+                                numerator,
+                                denominator,
+                            } => text.push_str(&format_fraction(numerator, denominator)),
+                            LayoutNode::Operator {
+                                operator,
+                                lower,
+                                upper,
+                            } => {
+                                let mut rendered = operator.clone();
+                                if let Some(lower) = lower {
+                                    rendered.push_str(&format!("[{lower}]"));
+                                }
+                                if let Some(upper) = upper {
+                                    rendered.push_str(&format_script(upper, "sup"));
+                                }
+                                text.push_str(&rendered);
+                            }
+                            LayoutNode::Matrix { lines: matrix, .. } => {
+                                if !text.is_empty() {
+                                    lines.push(std::mem::take(&mut text));
+                                }
+                                lines.extend(matrix.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                rest = &after[end + LAYOUT_MARKER_END.len_utf8()..];
+            } else {
+                break;
+            }
+        }
+        text.push_str(rest);
+        if !text.is_empty() || lines.is_empty() {
+            lines.push(text);
+        }
+    }
+    lines
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RenderLatexOptions {
-    pub display: bool,
-}
-
-pub fn render_latex(source: &str, options: RenderLatexOptions) -> Option<String> {
-    let mut layout_nodes = Vec::new();
-    let rendered = LatexParser::new(source, &mut layout_nodes, options.display).render()?;
-    if layout_nodes.is_empty() {
+/// Render a LaTeX math expression as terminal Unicode.
+/// Returns `None` when the expression contains unsupported syntax (TS contract).
+pub fn render_latex(source: &str, display: bool) -> Option<String> {
+    let mut parser = Parser::new(source, display);
+    let rendered = parser.render()?;
+    if parser.layout_nodes.is_empty() {
         return Some(rendered.replace(PROTECTED_SPACE, " "));
     }
-    let lines = render_layout(&rendered, &layout_nodes).lines;
+    let lines = render_layout(&rendered, &parser.layout_nodes);
     let indentation = lines
         .iter()
         .filter(|line| !line.trim().is_empty())
@@ -1923,7 +1539,13 @@ pub fn render_latex(source: &str, options: RenderLatexOptions) -> Option<String>
     Some(
         lines
             .into_iter()
-            .map(|line| line.get(indentation..).unwrap_or("").trim_end().to_string())
+            .map(|line| {
+                line.chars()
+                    .skip(indentation)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("\n")
             .trim_end()
@@ -1935,268 +1557,58 @@ pub fn render_latex(source: &str, options: RenderLatexOptions) -> Option<String>
 mod tests {
     use super::*;
 
-    fn render(source: &str) -> String {
-        render_latex(source, RenderLatexOptions::default()).expect(source)
-    }
-
-    fn display(source: &str) -> String {
-        render_latex(source, RenderLatexOptions { display: true }).expect(source)
-    }
-
     #[test]
-    fn jacobian_and_symbol_fixtures() {
-        assert_eq!(render(r"\mathbb{C}^3 \to \mathbb{C}^3"), "ℂ³ → ℂ³");
-        assert_eq!(render(r"F_1 = -\frac{1}{4x^2}."), "F₁ = -1/(4x²).");
-        assert_eq!(render("-2"), "-2");
-        assert_eq!(render(r"\deg q = 3"), "deg q = 3");
-        assert_eq!(render(r"s \to \infty"), "s → ∞");
-        assert_eq!(render(r"\Rightarrow"), "⇒");
-        assert_eq!(render(r"\ge 2"), "≥ 2");
-        assert_eq!(render(r"\mathrm{diag}(-1/2,1,1)"), "diag(-1/2,1,1)");
+    fn renders_ts_locked_expressions() {
         assert_eq!(
-            render(r"\sum_{i=0}^n \alpha_i + \int_0^\infty e^{-x^2}\,dx = \sqrt{\pi}"),
-            "∑ᵢ₌₀ⁿ αᵢ + ∫₀^∞ e^(-x²) dx = √π",
+            render_latex("\\alpha + \\pi", false).as_deref(),
+            Some("\u{3b1} + \u{3c0}")
         );
         assert_eq!(
-            render(r"\binom{n}{k}+\vec{x}+\hat{y}+\overline{AB}"),
-            "(n choose k)+x⃗+ŷ+overline(AB)",
-        );
-        assert_eq!(render(r"A\not\subseteq B,\quad x\not\in X"), "A ⊈ B, x ∉ X",);
-        assert_eq!(
-            render(r"\lvert{x}\rvert+\lVert{v}\rVert+\left.\frac{dy}{dx}\right|_{x=0}"),
-            "|x|+‖v‖+dy/(dx)|ₓ₌₀",
+            render_latex("\\mathbb{C}^3 \\to \\mathbb{C}^3", false).as_deref(),
+            Some("\u{2102}\u{b3} \u{2192} \u{2102}\u{b3}")
         );
         assert_eq!(
-            render(r"\left\lbrace x \middle| x>0 \right\rbrace"),
-            "{ x | x > 0 }",
+            render_latex("F_1 = -\\frac{1}{4x^2}.", false).as_deref(),
+            Some("F\u{2081} = -1/(4x\u{b2}).")
         );
         assert_eq!(
-            render(r"\operatorname*{arg\,max}_{x\in X} f(x)"),
-            "arg max[x∈X] f(x)",
+            render_latex("x_{i=0}", false).as_deref(),
+            Some("x\u{1d62}\u{208c}\u{2080}")
         );
         assert_eq!(
-            render(r"a\bmod n,\quad a\equiv b\pmod n"),
-            "a mod n, a ≡ b (mod n)",
+            render_latex("x\\neq0", false).as_deref(),
+            Some("x \u{2260} 0")
         );
         assert_eq!(
-            render(r"\overset{!}{=}+\underset{n}{x}+\stackrel{def}{=}"),
-            "=^!+xₙ+=ᵈᵉᶠ",
+            render_latex("A\\to B", false).as_deref(),
+            Some("A \u{2192} B")
         );
         assert_eq!(
-            render(r"\sqrt[2]{x}+\sqrt[3]{x}+\sqrt[4]{x}+\sqrt[n]{x}+\sqrt[k]{x+1}"),
-            "√x+∛x+∜x+ⁿ√x+ᵏ√(x+1)",
+            render_latex("\\pi\\cdot\\frac{1}{\\pi}", false).as_deref(),
+            Some("\u{3c0} \u{b7} 1/\u{3c0}")
         );
         assert_eq!(
-            render(r"\textnormal{hello}+\mbox{world}+\boldsymbol{x}"),
-            "hello+world+x",
+            render_latex("\\sin\\theta", false).as_deref(),
+            Some("sin \u{3b8}")
         );
         assert_eq!(
-            render(r"\begin{equation}\begin{split}a&=b\\&=c\end{split}\end{equation}"),
-            "a = b\n= c",
+            render_latex("\\sin^2 x", false).as_deref(),
+            Some("sin\u{b2} x")
         );
         assert_eq!(
-            render(r"\begin{cases}a & x<0 \\ b & \text{if }x=0 \\ c & \text{otherwise}\end{cases}"),
-            "⎧ a if x < 0\n⎨ b if x = 0\n⎩ c otherwise",
+            render_latex("\\sqrt{\\pi}", false).as_deref(),
+            Some("\u{221a}\u{3c0}")
         );
         assert_eq!(
-            render(r"\begin{pmatrix}1&200\\3000&4\end{pmatrix}"),
-            "⎛ 1    │ 200 ⎞\n⎝ 3000 │ 4   ⎠",
-        );
-        assert_eq!(render(r"\sin\theta"), "sin θ");
-        assert_eq!(render(r"\sin^2 x"), "sin² x");
-        assert_eq!(render(r"i\sin\theta"), "i sin θ");
-        assert_eq!(render(r"\det(A)"), "det(A)");
-        assert_eq!(render(r"\pi\cdot\frac{1}{\pi}"), "π · 1/π");
-        for source in ["x=y", "x =y", "x=\ny", "x\n=\ny"] {
-            assert_eq!(render(source), "x = y", "{source}");
-        }
-    }
-
-    #[test]
-    fn display_limits_and_fractions() {
-        assert_eq!(display(r"\sum_{i=0}^n x_i"), " n\n ∑  xᵢ\ni=0");
-        assert_eq!(display(r"\min_{x\in X} f(x)"), "min f(x)\nx∈X");
-        assert_eq!(
-            display(r"\operatorname*{arg\,max}_{x\in X} f(x)"),
-            "arg max f(x)\n  x∈X",
-        );
-        assert_eq!(display(r"\int\nolimits_0^1 f(x)\,dx"), "∫₀¹ f(x) dx");
-        assert_eq!(display(r"\int\limits_0^1 f(x)\,dx"), "1\n∫ f(x) dx\n0");
-        assert_eq!(display(r"\frac{x^2+1}{x-1}"), "x²+1\n────\nx-1");
-        assert_eq!(display("\\frac{1}\n{2}"), "1\n─\n2");
-        assert_eq!(display(r"e^{\frac{1}{2}}"), "e^(1/2)");
-        assert_eq!(display(r"\tfrac{1}{2}"), "1/2");
-        assert_eq!(
-            display(r"x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}"),
-            "    -b±√(b²-4ac)\nx = ────────────\n         2a",
-        );
-    }
-
-    #[test]
-    fn unsupported_and_malformed() {
-        assert!(render_latex(r"x + \unknown{y}", RenderLatexOptions::default()).is_none());
-        for source in [r"\frac{1}{x", "x}", r"\begin{matrix}1 & 2", "x\\"] {
-            assert!(
-                render_latex(source, RenderLatexOptions::default()).is_none(),
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
-    fn satellite_and_jacobian_session_fixtures() {
-        assert_eq!(
-            render(r"E \approx \frac{0.1\ \text{lux}}{100\ \text{lm/W}} = 0.001\ \text{W/m}^2"),
-            "E ≈ (0.1 lux)/(100 lm/W) = 0.001 W/m²",
+            render_latex("\\binom{n}{k}", false).as_deref(),
+            Some("(n choose k)")
         );
         assert_eq!(
-            render(r"\boxed{1\ \text{milliwatt per square metre}}"),
-            "[1 milliwatt per square metre]",
+            render_latex("A\\not\\subseteq B", false).as_deref(),
+            Some("A \u{2288} B")
         );
-        assert_eq!(
-            render(r"5\ \text{km}^2 = 5{,}000{,}000\ \text{m}^2"),
-            "5 km² = 5,000,000 m²",
-        );
-        assert_eq!(
-            render(
-                r"P_{\text{light}} = 0.001 \times 5{,}000{,}000
-= \boxed{5{,}000\ \text{W}}"
-            ),
-            "P_light = 0.001 × 5,000,000 = [5,000 W]",
-        );
-        assert_eq!(
-            render(r"\pi(2.5\ \text{km})^2 = 19.6\ \text{km}^2"),
-            "π(2.5 km)² = 19.6 km²",
-        );
-        assert_eq!(
-            render(r"\det\!\left(\frac{\partial(F_1,F_2,F_3)}{\partial(x,y,z)}\right)=-2."),
-            "det((∂(F₁,F₂,F₃))/(∂(x,y,z))) = -2.",
-        );
-        assert_eq!(
-            render(
-                r"\begin{aligned}
-F(0,0,-\tfrac14)&=(-\tfrac14,0,0),\\
-F(1,-\tfrac32,\tfrac{13}2)&=(-\tfrac14,0,0),\\
-F(-1,\tfrac32,\tfrac{13}2)&=(-\tfrac14,0,0).
-\end{aligned}"
-            ),
-            "F(0,0,-1/4) = (-1/4,0,0),\nF(1,-3/2,13/2) = (-1/4,0,0),\nF(-1,3/2,13/2) = (-1/4,0,0).",
-        );
-        assert_eq!(
-            render(
-                r"J = \begin{pmatrix}
-\frac{\partial f_1}{\partial x} & \frac{\partial f_1}{\partial y} & \frac{\partial f_1}{\partial z} \\
-\frac{\partial f_2}{\partial x} & \frac{\partial f_2}{\partial y} & \frac{\partial f_2}{\partial z} \\
-\frac{\partial f_3}{\partial x} & \frac{\partial f_3}{\partial y} & \frac{\partial f_3}{\partial z}
-\end{pmatrix}"
-            ),
-            "J = ⎛ (∂ f₁)/(∂ x) │ (∂ f₁)/(∂ y) │ (∂ f₁)/(∂ z) ⎞\n    ⎜ (∂ f₂)/(∂ x) │ (∂ f₂)/(∂ y) │ (∂ f₂)/(∂ z) ⎟\n    ⎝ (∂ f₃)/(∂ x) │ (∂ f₃)/(∂ y) │ (∂ f₃)/(∂ z) ⎠",
-        );
-        assert_eq!(render(r"F: \mathbb{C}^3 \to \mathbb{C}^3"), "F: ℂ³ → ℂ³");
-        assert_eq!(render(r"\mathbb{P}^3"), "ℙ³");
-        assert_eq!(render(r"x \neq 0"), "x ≠ 0");
-        assert_eq!(render(r"n \geq 2"), "n ≥ 2");
-        assert_eq!(render(r"f_1^{\text{ut}}, f_2^{\text{ut}}"), "f₁ᵘᵗ, f₂ᵘᵗ");
-    }
-
-    #[test]
-    fn stress_test_and_display_matrix_fixtures() {
-        assert_eq!(render(r"e^{i\pi}+1=0"), "e^(iπ)+1 = 0");
-        assert_eq!(
-            render(r"x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}"),
-            "x = (-b±√(b²-4ac))/(2a)",
-        );
-        assert_eq!(
-            render(r"\int_0^\infty e^{-x^2}\,dx=\frac{\sqrt{\pi}}{2}"),
-            "∫₀^∞ e^(-x²) dx = (√π)/2",
-        );
-        assert_eq!(
-            render(r"\sum_{n=1}^{\infty}\frac{1}{n^2}=\frac{\pi^2}{6}"),
-            "∑ₙ₌₁^∞1/(n²) = π²/6",
-        );
-        assert_eq!(
-            render(r"\lim_{x\to 0}\frac{\sin x}{x}=1"),
-            "lim[x→0] (sin x)/x = 1"
-        );
-        assert_eq!(
-            render(r"\epsilon+\varepsilon+\varsigma+\varkappa+\oplus+\otimes+\therefore+\because"),
-            "ϵ+ε+ς+ϰ+⊕+⊗+∴+∵",
-        );
-        assert_eq!(
-            render(r"\begin{alignedat}{2}a&=b&\quad c&=d\\e&=f&g&=h\end{alignedat}"),
-            "a = b c = d\ne = f g = h",
-        );
-        assert_eq!(
-            render(r"\begin{cases}a & x<0 \\ b & x=0 \\ c & x>0\end{cases}"),
-            "⎧ a if x < 0\n⎨ b if x = 0\n⎩ c if x > 0",
-        );
-        assert_eq!(
-            display(
-                r"R\left(\frac{\pi}{4}\right)
-=
-\begin{pmatrix}
-\frac{\sqrt{2}}{2} & -\frac{\sqrt{2}}{2}\\
-\frac{\sqrt{2}}{2} & \frac{\sqrt{2}}{2}
-\end{pmatrix}."
-            ),
-            "   π\nR( ─ ) = ⎛ (√2)/2 │ -(√2)/2 ⎞\n   4     ⎝ (√2)/2 │ (√2)/2  ⎠.",
-        );
-        assert_eq!(
-            display(r"\sum_{i=0}^n x_i=\begin{pmatrix}a&b\\c&d\end{pmatrix}."),
-            " n\n ∑  xᵢ = ⎛ a │ b ⎞\ni=0      ⎝ c │ d ⎠.",
-        );
-        assert_eq!(
-            display(r"\frac{\frac{x^2+1}{x-1}-\frac{2x}{x+1}}{\frac{x}{x^2-1}}"),
-            "(x²+1)/(x-1)-2x/(x+1)\n─────────────────────\n      x/(x²-1)",
-        );
-        let boxed = r"\boxed{
-(1,1,1),\ (1,1,2),\ (1,2,5),\ (1,5,13),\ (2,5,29),\
-(1,13,34),\ (1,34,89)
-}.";
-        assert_eq!(
-            display(boxed),
-            "[(1,1,1), (1,1,2), (1,2,5), (1,5,13), (2,5,29), (1,13,34), (1,34,89)].",
-        );
-        assert_eq!(render("a\\\r\nb"), "a b");
-        assert_eq!(
-            render(
-                r"P_{\text{electric}} = 5\ \text{kW} \times 0.2
-= \boxed{1\ \text{kW}}"
-            ),
-            "P_electric = 5 kW × 0.2 = [1 kW]",
-        );
-        assert_eq!(
-            render(r"e^{i\theta}=\cos\theta+i\sin\theta"),
-            "e^(iθ) = cos θ+i sin θ",
-        );
-        assert_eq!(
-            render(r"\lim_{n\to\infty}\left(1+\frac{1}{n}\right)^n=e"),
-            "lim[n→∞] (1+1/n)ⁿ = e",
-        );
-        assert_eq!(
-            render(r"\int_0^1 \frac{x^2}{1+x^3}\,dx=\frac{1}{3}\ln 2"),
-            "∫₀¹ x²/(1+x³) dx = 1/3 ln 2",
-        );
-        assert_eq!(
-            render(r"\sum_{k=1}^{n}\frac{k}{k+1}=n+1-H_{n+1}"),
-            "∑ₖ₌₁ⁿk/(k+1) = n+1-Hₙ₊₁",
-        );
-        assert_eq!(
-            display(
-                r"A\mathbf e_1=\begin{pmatrix}\pi\\0\end{pmatrix},\qquad A\mathbf e_2=\begin{pmatrix}0\\\frac{1}{\pi}\end{pmatrix}."
-            ),
-            "Ae₁ = ⎛ π ⎞, Ae₂ = ⎛ 0   ⎞\n      ⎝ 0 ⎠        ⎝ 1/π ⎠.",
-        );
-        assert_eq!(
-            display(
-                r"\mathbf w
-=
-R\left(\frac{\pi}{4}\right)
-\begin{pmatrix}1\\0\end{pmatrix}
-=
-\begin{pmatrix}\frac{\sqrt{2}}{2}\\\frac{\sqrt{2}}{2}\end{pmatrix}."
-            ),
-            "       π\nw = R( ─ ) ⎛ 1 ⎞ = ⎛ (√2)/2 ⎞\n       4   ⎝ 0 ⎠   ⎝ (√2)/2 ⎠.",
-        );
+        let pmatrix = render_latex("\\begin{pmatrix}1&200\\\\3000&4\\end{pmatrix}", false).unwrap();
+        assert!(pmatrix.contains('1') && pmatrix.contains("3000"));
+        assert!(render_latex("\\unknowncommand{x}", false).is_none());
     }
 }

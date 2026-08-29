@@ -1,17 +1,24 @@
+use pi_protocol::ThinkingLevel;
+use pi_tui::TuiMode;
 use std::collections::BTreeMap;
 
-use pi_ai::ThinkingLevel;
-use pi_tui::TuiMode;
-
 pub const APP_NAME: &str = "pi";
-pub const PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
-pub const CONFIG_DIR_NAME: &str = ".pi";
-pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
-pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";
+/// TS `APP_TITLE`: `π` when `APP_NAME` is the default `"pi"`.
+pub const APP_TITLE: &str = "π";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const VALID_THINKING_LEVELS: &[&str] =
-    &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// TS `InteractiveMode.updateTerminalTitle`.
+pub fn format_terminal_title(session_name: Option<&str>, cwd: &std::path::Path) -> String {
+    let cwd_basename = cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+    match session_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{APP_TITLE} - {name} - {cwd_basename}"),
+        None => format!("{APP_TITLE} - {cwd_basename}"),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -76,13 +83,17 @@ pub struct Args {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListModels {
     All,
-    Search(String),
+    Query(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlagValue {
     Bool(bool),
     String(String),
+}
+
+pub fn is_valid_thinking_level(level: &str) -> Option<ThinkingLevel> {
+    ThinkingLevel::parse(level)
 }
 
 pub fn normalize_session_name(value: &str) -> Option<String> {
@@ -98,7 +109,7 @@ pub fn parse_args(args: &[String]) -> Args {
     let mut result = Args::default();
     let mut i = 0;
     while i < args.len() {
-        let arg = &args[i];
+        let arg = args[i].as_str();
         if arg == "--" {
             for positional in &args[i + 1..] {
                 if let Some(path) = positional.strip_prefix('@') {
@@ -186,15 +197,14 @@ pub fn parse_args(args: &[String]) -> Args {
                 .collect();
         } else if arg == "--thinking" && i + 1 < args.len() {
             i += 1;
-            if let Some(level) = ThinkingLevel::parse(&args[i]) {
+            if let Some(level) = is_valid_thinking_level(&args[i]) {
                 result.thinking = Some(level);
             } else {
                 result.diagnostics.push(Diagnostic {
                     kind: "warning",
                     message: format!(
-                        "Invalid thinking level \"{}\". Valid values: {}",
-                        args[i],
-                        VALID_THINKING_LEVELS.join(", ")
+                        "Invalid thinking level \"{}\". Valid values: off, minimal, low, medium, high, xhigh, max",
+                        args[i]
                     ),
                 });
             }
@@ -224,8 +234,8 @@ pub fn parse_args(args: &[String]) -> Args {
             i += 1;
             result.themes.push(args[i].clone());
         } else if arg == "--use-theme" {
-            let theme = args.get(i + 1);
-            if theme.is_none() || theme.unwrap().starts_with('-') {
+            let theme_name = args.get(i + 1);
+            if theme_name.is_none() || theme_name.unwrap().starts_with('-') {
                 result.diagnostics.push(Diagnostic {
                     kind: "error",
                     message: "--use-theme requires a theme name".into(),
@@ -246,34 +256,38 @@ pub fn parse_args(args: &[String]) -> Args {
             if i + 1 < args.len() && !args[i + 1].starts_with('-') && !args[i + 1].starts_with('@')
             {
                 i += 1;
-                result.list_models = Some(ListModels::Search(args[i].clone()));
+                result.list_models = Some(ListModels::Query(args[i].clone()));
             } else {
                 result.list_models = Some(ListModels::All);
             }
         } else if arg == "--tui-mode" {
             let mode = args.get(i + 1).map(String::as_str);
             match mode {
-                Some("regular") => {
+                Some("regular") | Some("fullscreen") => {
                     i += 1;
-                    result.tui_mode = Some(TuiMode::Regular);
+                    result.tui_mode = TuiMode::parse(&args[i]);
                 }
-                Some("fullscreen") => {
-                    i += 1;
-                    result.tui_mode = Some(TuiMode::Fullscreen);
+                Some(value) if value.starts_with('-') || value.is_empty() => {
+                    result.diagnostics.push(Diagnostic {
+                        kind: "error",
+                        message: "--tui-mode requires regular or fullscreen".into(),
+                    });
                 }
-                Some(other) if !other.starts_with('-') => {
+                None => {
+                    result.diagnostics.push(Diagnostic {
+                        kind: "error",
+                        message: "--tui-mode requires regular or fullscreen".into(),
+                    });
+                }
+                Some(value) => {
                     i += 1;
                     result.diagnostics.push(Diagnostic {
                         kind: "error",
                         message: format!(
-                            "Invalid TUI mode \"{other}\". Valid values: regular, fullscreen"
+                            "Invalid TUI mode \"{value}\". Valid values: regular, fullscreen"
                         ),
                     });
                 }
-                _ => result.diagnostics.push(Diagnostic {
-                    kind: "error",
-                    message: "--tui-mode requires regular or fullscreen".into(),
-                }),
             }
         } else if arg == "--verbose" {
             result.verbose = true;
@@ -290,24 +304,21 @@ pub fn parse_args(args: &[String]) -> Args {
                 result
                     .unknown_flags
                     .insert(name.to_string(), FlagValue::String(value.to_string()));
-            } else {
-                let flag_name = flag.to_string();
-                if let Some(next) = args.get(i + 1) {
-                    if !next.starts_with('-') && !next.starts_with('@') {
-                        result
-                            .unknown_flags
-                            .insert(flag_name, FlagValue::String(next.clone()));
-                        i += 1;
-                    } else {
-                        result
-                            .unknown_flags
-                            .insert(flag_name, FlagValue::Bool(true));
-                    }
+            } else if let Some(next) = args.get(i + 1) {
+                if !next.starts_with('-') && !next.starts_with('@') {
+                    result
+                        .unknown_flags
+                        .insert(flag.to_string(), FlagValue::String(next.clone()));
+                    i += 1;
                 } else {
                     result
                         .unknown_flags
-                        .insert(flag_name, FlagValue::Bool(true));
+                        .insert(flag.to_string(), FlagValue::Bool(true));
                 }
+            } else {
+                result
+                    .unknown_flags
+                    .insert(flag.to_string(), FlagValue::Bool(true));
             }
         } else if arg.starts_with('-') && !arg.starts_with("--") {
             result.diagnostics.push(Diagnostic {
@@ -315,139 +326,51 @@ pub fn parse_args(args: &[String]) -> Args {
                 message: format!("Unknown option: {arg}"),
             });
         } else if !arg.starts_with('-') {
-            result.messages.push(arg.clone());
+            result.messages.push(arg.to_string());
         }
         i += 1;
-    }
-    if std::env::var("PI_OFFLINE").is_ok() {
-        result.offline = true;
-    }
-    if result.fork.is_some()
-        && (result.session.is_some()
-            || result.continue_session
-            || result.resume
-            || result.no_session)
-    {
-        result.diagnostics.push(Diagnostic {
-            kind: "error",
-            message:
-                "--fork cannot be combined with --session, --continue, --resume, or --no-session"
-                    .into(),
-        });
-    }
-    if let Some(id) = &result.session_id {
-        if !is_valid_session_id(id) {
-            result.diagnostics.push(Diagnostic {
-                kind: "error",
-                message: format!("Invalid --session-id: {id}"),
-            });
-        }
     }
     result
 }
 
-pub fn is_valid_session_id(id: &str) -> bool {
-    let trimmed = id.trim();
-    !trimmed.is_empty()
-        && trimmed.len() <= 64
-        && trimmed.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+pub fn print_help() -> String {
+    include_str!("help.txt").to_string()
 }
 
-pub fn print_help() -> String {
-    format!(
-        "{APP_NAME} - AI coding assistant with read, bash, edit, write tools
-
-Usage:
-  {APP_NAME} [options] [--] [@files...] [messages...]
-
-Commands:
-  {APP_NAME} install <source> [-l]     Install extension source and add to settings
-  {APP_NAME} remove <source> [-l]      Remove extension source from settings
-  {APP_NAME} uninstall <source> [-l]   Alias for remove
-  {APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs
-  {APP_NAME} list                      List installed extensions from settings
-  {APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
-  {APP_NAME} auth <command>            Print credentials or check provider readiness
-  {APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
-
-Options:
-  --provider <name>              Provider name (default: google)
-  --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
-  --api-key <key>                API key (defaults to env vars)
-  --system-prompt <text>         System prompt (default: coding assistant prompt)
-  --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
-  --mode <mode>                  Output mode: text (default), json, or rpc
-  --print, -p                    Non-interactive mode: process prompt and exit
-  --continue, -c                 Continue previous session
-  --resume, -r                   Select a session to resume
-  --session <path|id>            Use specific session file or partial UUID
-  --session-id <id>              Use exact project session ID, creating it if missing
-  --fork <path|id>               Fork specific session file or partial UUID into a new session
-  --session-dir <dir>            Directory for session storage and lookup
-  --no-session                   Don't save session (ephemeral)
-  --name, -n <name>              Set session display name
-  --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
-  --no-tools, -nt                Disable all tools by default (built-in and extension)
-  --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
-  --tools, -t <tools>            Comma-separated allowlist of tool names to enable
-  --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
-  --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
-  --extension, -e <path>         Load an extension file (can be used multiple times)
-  --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
-  --skill <path>                 Load a skill file or directory (can be used multiple times)
-  --no-skills, -ns               Disable skills discovery and loading
-  --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
-  --no-prompt-templates, -np     Disable prompt template discovery and loading
-  --theme <path>                 Load a theme file or directory (can be used multiple times)
-  --use-theme <name[/name]>      Set the initial interactive theme for this run
-  --no-themes                    Disable theme discovery and loading
-  --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
-  --export <file>                Export session file to HTML and exit
-  --list-models [search]         List available models (with optional fuzzy search)
-  --verbose                      Force verbose startup (overrides quietStartup setting)
-  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
-  --approve, -a                  Trust project-local files for this run
-  --no-approve, -na              Ignore project-local files for this run
-  --offline                      Disable startup network operations (same as PI_OFFLINE=1)
-  --                             End option parsing; treat remaining arguments as messages/files
-  --help, -h                     Show this help
-  --version, -v                  Show version number
-
-Environment Variables:
-  {ENV_AGENT_DIR} - Config directory (default: ~/{CONFIG_DIR_NAME}/agent)
-  {ENV_SESSION_DIR} - Session storage directory (overridden by --session-dir)
-  PI_OFFLINE=1 - Disable startup network operations (same as --offline)
-  PI_DISABLE_NETWORK=1 - Block live provider HTTP (tests / airgap)
-  PI_STREAM_FIXTURE - Path to a fixture JSON used instead of a live model
-  PI_TELEMETRY=1 - Record in-memory startup/session spans
-  ANTHROPIC_API_KEY, ANTHROPIC_OAUTH_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY,
-  GROQ_API_KEY, OPENROUTER_API_KEY, XAI_API_KEY, MISTRAL_API_KEY, DEEPSEEK_API_KEY,
-  and other provider keys from packages/ai env-api-keys.ts
-"
-    )
+/// Append dynamically registered extension flags, matching TS `printHelp(extensionFlags)`.
+pub fn print_help_with_extension_flags(flags: &[(String, String)]) -> String {
+    let mut help = print_help();
+    if flags.is_empty() {
+        return help;
+    }
+    if !help.ends_with('\n') {
+        help.push('\n');
+    }
+    help.push_str("\nExtension CLI Flags:\n");
+    for (name, path) in flags {
+        help.push_str(&format!("  --{name:<24} Registered by {path}\n"));
+    }
+    help
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn s(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| (*s).to_string()).collect()
-    }
+    use std::path::Path;
 
     #[test]
-    fn parses_print_continue_and_unknown_short() {
-        let parsed = parse_args(&s(&["-p", "hello", "-c"]));
-        assert!(parsed.print);
-        assert!(parsed.continue_session);
-        assert_eq!(parsed.messages, vec!["hello"]);
-        let bad = parse_args(&s(&["-z"]));
-        assert_eq!(bad.diagnostics[0].message, "Unknown option: -z");
-    }
-
-    #[test]
-    fn dash_message_after_print() {
-        let parsed = parse_args(&s(&["-p", "--", "- Summarize"]));
-        assert_eq!(parsed.messages, vec!["- Summarize"]);
+    fn terminal_title_matches_ts_update_terminal_title() {
+        assert_eq!(
+            format_terminal_title(None, Path::new("/tmp/project")),
+            "π - project"
+        );
+        assert_eq!(
+            format_terminal_title(Some("demo"), Path::new("/tmp/project")),
+            "π - demo - project"
+        );
+        assert_eq!(
+            format_terminal_title(Some("  "), Path::new("/tmp/project")),
+            "π - project"
+        );
     }
 }

@@ -2,39 +2,40 @@
 name = "pi-coding-agent"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
-description = "Coding agent CLI with read, bash, edit, write tools and session management"
+rust-version.workspace = true
+description = "Coding agent CLI matching @earendil-works/pi-coding-agent"
+
+[lib]
+name = "pi_coding_agent"
+path = "src/lib.rs"
 
 [[bin]]
 name = "pi"
 path = "src/main.rs"
 
 [dependencies]
-pi-ai.workspace = true
-pi-agent.workspace = true
-pi-tui.workspace = true
-pi-session.workspace = true
-pi-session-sqlite.workspace = true
-pi-protocol.workspace = true
-pi-client.workspace = true
-pi-server.workspace = true
-pi-telemetry.workspace = true
-pi-evals.workspace = true
+pi-agent = { path = "../pi-agent" }
+pi-ai = { path = "../pi-ai" }
+pi-client = { path = "../pi-client" }
+pi-evals = { path = "../pi-evals" }
+pi-protocol = { path = "../pi-protocol" }
+pi-server = { path = "../pi-server" }
+pi-session = { path = "../pi-session" }
+pi-session-sqlite = { path = "../pi-session-sqlite" }
+pi-telemetry = { path = "../pi-telemetry" }
+pi-tui = { path = "../pi-tui" }
+crossterm.workspace = true
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-dirs.workspace = true
 uuid.workspace = true
-ureq.workspace = true
-ctrlc.workspace = true
-chrono.workspace = true
-walkdir.workspace = true
-similar.workspace = true
-tempfile.workspace = true
-indexmap.workspace = true
 base64.workspace = true
-regex.workspace = true
+ureq.workspace = true
+url.workspace = true
+image.workspace = true
+signal-hook.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,241 +1,122 @@
-use crate::args::{APP_NAME, PACKAGE_NAME, VERSION};
-use crate::package_manager::network_disabled;
-use crate::settings::{canonicalize_path, cwd_relative_path};
-use serde_json::Value;
+//! Package-manager self-update matching `vendor/pi/packages/coding-agent/src/config.ts`
+//! and managed-install updates from `package-manager-cli.ts`.
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const LATEST_VERSION_URL: &str = "https://pi.dev/api/latest-version";
-const DEFAULT_INSTALLER_API_BASE: &str = "https://pi.dev/api/installer/releases";
-const MANAGED_INSTALL_MARKER: &str = "managed-install.json";
-const MANAGED_LOCK_STALE: Duration = Duration::from_millis(10_000);
+pub const PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
+pub const BUN_BINARY_DOWNLOAD: &str =
+    "Download from: https://github.com/earendil-works/pi-mono/releases/latest";
 
-#[derive(Debug, Clone)]
-struct LatestPiRelease {
-    version: String,
-    package_name: Option<String>,
-    note: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMethod {
+    BunBinary,
+    Npm,
+    Pnpm,
+    Yarn,
+    Bun,
+    Unknown,
 }
 
-#[derive(Debug, Clone)]
-pub struct SelfUpdatePlan {
-    pub version: String,
-    pub package_name: String,
-    pub install_spec: String,
-    pub should_run: bool,
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SelfUpdateCommand {
-    pub display: String,
-    pub steps: Vec<(String, Vec<String>, String)>,
-}
-
-fn package_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("PI_PACKAGE_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
+impl InstallMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BunBinary => "bun-binary",
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Yarn => "yarn",
+            Self::Bun => "bun",
+            Self::Unknown => "unknown",
         }
     }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
-pub fn active_managed_install_root() -> Result<Option<PathBuf>, String> {
-    let configured = match std::env::var("PI_MANAGED_INSTALL_ROOT") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => return Ok(None),
-    };
-    let managed_root = canonicalize_path(Path::new(configured.trim()));
-    let releases_dir = canonicalize_path(&managed_root.join("releases"));
-    if cwd_relative_path(&canonicalize_path(&package_dir()), &releases_dir).is_none() {
-        return Ok(None);
-    }
-    let marker_path = managed_root.join(MANAGED_INSTALL_MARKER);
-    let marker = fs::read_to_string(&marker_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-    let valid = marker.as_ref().is_some_and(|value| {
-        value.get("kind").and_then(|v| v.as_str()) == Some("pi-managed-install")
-            && value.get("schemaVersion").and_then(|v| v.as_u64()) == Some(1)
-            && value.get("layout").and_then(|v| v.as_str()) == Some("releases-v1")
-    });
-    if !valid {
-        return Err(format!(
-            "Managed install marker is missing or invalid: {}",
-            marker_path.display()
-        ));
-    }
-    Ok(Some(managed_root))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfUpdateCommandStep {
+    pub command: String,
+    pub args: Vec<String>,
+    pub display: String,
 }
 
-fn is_valid_managed_version(version: &str) -> bool {
-    let bytes = version.as_bytes();
-    if bytes.is_empty() {
-        return false;
-    }
-    let mut parts = version.splitn(2, ['-', '+']);
-    let core = parts.next().unwrap_or_default();
-    let mut nums = core.split('.');
-    nums.next()
-        .is_some_and(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
-        && nums
-            .next()
-            .is_some_and(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
-        && nums
-            .next()
-            .is_some_and(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
-        && nums.next().is_none()
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfUpdateCommand {
+    pub command: String,
+    pub args: Vec<String>,
+    pub display: String,
+    pub steps: Option<Vec<SelfUpdateCommandStep>>,
 }
 
-fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
-    let core = version.trim().split(['-', '+']).next().unwrap_or_default();
-    let mut parts = core.split('.');
-    Some((
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    ))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageTarget {
+    pub package_name: String,
+    pub install_spec: String,
 }
 
-fn is_newer_package_version(candidate: &str, current: &str) -> bool {
-    match (parse_semver(candidate), parse_semver(current)) {
-        (Some(left), Some(right)) => left > right,
-        _ => candidate.trim() != current.trim(),
-    }
-}
-
-fn fixture_release() -> Option<LatestPiRelease> {
-    let path = std::env::var("PI_SELF_UPDATE_FIXTURE")
-        .ok()
-        .or_else(|| std::env::var("PI_LATEST_VERSION_FIXTURE").ok())?;
-    let raw = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(raw.trim()).ok()?;
-    let version = value.get("version")?.as_str()?.trim();
-    if version.is_empty() {
-        return None;
-    }
-    Some(LatestPiRelease {
-        version: version.to_string(),
-        package_name: value
-            .get("packageName")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        note: value
-            .get("note")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string),
-    })
-}
-
-fn latest_pi_release() -> Result<LatestPiRelease, String> {
-    if std::env::var("PI_OFFLINE").is_ok() {
-        return Err(format!("Could not determine latest {APP_NAME} version."));
-    }
-    if let Some(release) = fixture_release() {
-        return Ok(release);
-    }
-    if network_disabled() {
-        return Err(format!(
-            "Could not determine latest {APP_NAME} version: network disabled"
-        ));
-    }
-    let agent = format!("{APP_NAME}-coding-agent/{VERSION}");
-    let response = ureq::get(LATEST_VERSION_URL)
-        .set("User-Agent", &agent)
-        .set("accept", "application/json")
-        .call()
-        .map_err(|err| format!("Could not determine latest {APP_NAME} version: {err}"))?;
-    let body = response
-        .into_string()
-        .map_err(|err| format!("Could not determine latest {APP_NAME} version: {err}"))?;
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|err| format!("Could not determine latest {APP_NAME} version: {err}"))?;
-    let version = value
-        .get("version")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| format!("Could not determine latest {APP_NAME} version."))?;
-    Ok(LatestPiRelease {
-        version: version.to_string(),
-        package_name: value
-            .get("packageName")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
-        note: value
-            .get("note")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
-    })
-}
-
-pub fn self_update_plan(force: bool) -> Result<SelfUpdatePlan, String> {
-    let latest = latest_pi_release()?;
-    let package_name = latest
-        .package_name
-        .clone()
-        .unwrap_or_else(|| PACKAGE_NAME.into());
-    let install_spec = format!("{}@{}", package_name, latest.version);
-    if force || package_name != PACKAGE_NAME || is_newer_package_version(&latest.version, VERSION) {
-        return Ok(SelfUpdatePlan {
-            version: latest.version,
+impl PackageTarget {
+    pub fn new(package_name: impl Into<String>, install_spec: Option<String>) -> Self {
+        let package_name = package_name.into();
+        let install_spec = install_spec.unwrap_or_else(|| package_name.clone());
+        Self {
             package_name,
             install_spec,
-            should_run: true,
-            note: latest.note,
-        });
+        }
     }
-    Ok(SelfUpdatePlan {
-        version: latest.version,
-        package_name,
-        install_spec,
-        should_run: false,
-        note: latest.note,
-    })
 }
 
-pub fn detect_install_method() -> &'static str {
-    if let Ok(method) = std::env::var("PI_INSTALL_METHOD") {
-        return match method.as_str() {
-            "npm" => "npm",
-            "pnpm" => "pnpm",
-            "yarn" => "yarn",
-            "bun" => "bun",
-            "bun-binary" => "bun-binary",
-            _ => "unknown",
-        };
+/// TS `detectInstallMethod`: `${__dirname}\0${process.execPath}` lowercased, `\\` → `/`.
+pub fn detect_install_method(
+    resolved_path: &str,
+    bun_binary: bool,
+    bun_runtime: bool,
+) -> InstallMethod {
+    if bun_binary {
+        return InstallMethod::BunBinary;
     }
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+    let path = resolved_path.to_ascii_lowercase().replace('\\', "/");
+    if path.contains("/pnpm/") || path.contains("/.pnpm/") {
+        return InstallMethod::Pnpm;
+    }
+    if path.contains("/yarn/") || path.contains("/.yarn/") {
+        return InstallMethod::Yarn;
+    }
+    if bun_runtime || path.contains("/install/global/node_modules/") {
+        return InstallMethod::Bun;
+    }
+    if path.contains("/npm/") || path.contains("/node_modules/") {
+        return InstallMethod::Npm;
+    }
+    InstallMethod::Unknown
+}
+
+pub fn detect_path_from_env() -> String {
+    let package_dir = std::env::var("PI_PACKAGE_DIR").unwrap_or_default();
+    let exec_path = std::env::var("PI_EXEC_PATH")
+        .ok()
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
         .unwrap_or_default();
-    let package = package_dir()
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    let resolved = format!("{package}\0{exe}");
-    if resolved.contains("/pnpm/") || resolved.contains("/.pnpm/") {
-        "pnpm"
-    } else if resolved.contains("/yarn/") || resolved.contains("/.yarn/") {
-        "yarn"
-    } else if resolved.contains("/install/global/node_modules/") {
-        "bun"
-    } else if resolved.contains("/npm/") || resolved.contains("/node_modules/") {
-        "npm"
-    } else {
-        "unknown"
-    }
+    format!("{package_dir}\0{exec_path}")
 }
 
-fn quote_arg(arg: &str) -> String {
+pub fn is_bun_binary() -> bool {
+    matches!(
+        std::env::var("PI_BUN_BINARY").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+pub fn is_bun_runtime() -> bool {
+    matches!(
+        std::env::var("PI_BUN_RUNTIME").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+fn quote_display_arg(arg: &str) -> String {
     if arg.chars().any(char::is_whitespace) {
         format!("\"{arg}\"")
     } else {
@@ -243,658 +124,226 @@ fn quote_arg(arg: &str) -> String {
     }
 }
 
-fn format_command_display(command: &str, args: &[String]) -> String {
-    std::iter::once(command)
-        .chain(args.iter().map(String::as_str))
-        .map(quote_arg)
+fn make_step(command: &str, args: Vec<String>) -> SelfUpdateCommandStep {
+    let display = std::iter::once(command.to_string())
+        .chain(args.iter().cloned())
+        .map(|arg| quote_display_arg(&arg))
         .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn make_step(command: &str, args: Vec<String>) -> (String, Vec<String>, String) {
-    let display = format_command_display(command, &args);
-    (command.to_string(), args, display)
-}
-
-fn split_npm_command(npm_command: Option<&[String]>) -> (String, Vec<String>) {
-    match npm_command {
-        Some(args) if !args.is_empty() => (args[0].clone(), args[1..].to_vec()),
-        _ => ("npm".into(), Vec::new()),
+        .join(" ");
+    SelfUpdateCommandStep {
+        command: command.into(),
+        args,
+        display,
     }
 }
 
-fn read_command_output(
-    command: &str,
-    args: &[String],
-    require_success: bool,
-) -> Result<Option<String>, String> {
-    match Command::new(command).args(args).output() {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                return Ok((!stdout.is_empty()).then_some(stdout));
-            }
-            if !require_success {
-                return Ok(None);
-            }
-            let reason = String::from_utf8_lossy(&output.stderr);
-            let reason = reason.trim();
-            Err(format!(
-                "Failed to run {} {}: {}",
-                command,
-                args.join(" "),
-                if reason.is_empty() {
-                    format!("exit code {}", output.status.code().unwrap_or(-1))
-                } else {
-                    reason.to_string()
-                }
-            ))
-        }
-        Err(err) if require_success => Err(format!("Failed to run {command}: {err}")),
-        Err(_) => Ok(None),
+fn make_command(
+    install: SelfUpdateCommandStep,
+    uninstall: Option<SelfUpdateCommandStep>,
+) -> SelfUpdateCommand {
+    match uninstall {
+        None => SelfUpdateCommand {
+            command: install.command,
+            args: install.args,
+            display: install.display,
+            steps: None,
+        },
+        Some(uninstall) => SelfUpdateCommand {
+            command: install.command.clone(),
+            args: install.args.clone(),
+            display: format!("{} && {}", uninstall.display, install.display),
+            steps: Some(vec![uninstall, install]),
+        },
     }
 }
 
-fn inferred_npm_install(package: &Path) -> Option<(PathBuf, PathBuf)> {
+/// TS `getInferredNpmInstall` — skip Windows custom prefixes.
+pub fn inferred_npm_prefix(package_dir: &str, windows: bool) -> Option<String> {
+    if windows || package_dir.contains('\\') {
+        return None;
+    }
+    let package = Path::new(package_dir);
     let parent = package.parent()?;
-    let parent_name = parent.file_name()?.to_str()?;
-    let root = if parent_name.starts_with('@')
-        && parent.parent()?.file_name()?.to_str() == Some("node_modules")
+    let root = if parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('@'))
+        && parent.parent()?.file_name().and_then(|n| n.to_str()) == Some("node_modules")
     {
         parent.parent()?.to_path_buf()
-    } else if parent_name == "node_modules" {
+    } else if parent.file_name().and_then(|n| n.to_str()) == Some("node_modules") {
         parent.to_path_buf()
     } else {
         return None;
     };
-    let prefix = root.parent().and_then(|p| {
-        if p.file_name()?.to_str() == Some("lib") {
-            p.parent().map(Path::to_path_buf)
-        } else {
-            None
-        }
-    })?;
-    Some((root, prefix))
-}
-
-fn path_candidates(path: &Path) -> Vec<PathBuf> {
-    if !path.exists() {
-        return Vec::new();
+    let root_parent = root.parent()?;
+    if root_parent.file_name().and_then(|n| n.to_str()) == Some("lib") {
+        return Some(root_parent.parent()?.display().to_string());
     }
-    let mut out = vec![canonicalize_path(path)];
-    if let Ok(raw) = path.canonicalize() {
-        if !out.contains(&raw) {
-            out.push(raw);
-        }
-    }
-    out
+    None
 }
 
-fn path_is_under(child: &Path, root: &Path) -> bool {
-    if child == root {
-        return true;
-    }
-    child.starts_with(root)
-}
-
-fn dir_writable(path: &Path) -> bool {
-    if !path.exists() {
-        return false;
-    }
-    let probe = path.join(format!(".pi-write-probe-{}", std::process::id()));
-    match fs::write(&probe, b"") {
-        Ok(()) => {
-            let _ = fs::remove_file(probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-fn self_update_path_writable() -> bool {
-    let package = package_dir();
-    let parent = package.parent().unwrap_or(&package);
-    dir_writable(&package) && dir_writable(parent)
-}
-
-fn pnpm_bin_dir_args() -> Vec<String> {
-    let package = package_dir().to_string_lossy().replace('\\', "/");
-    let re = regex::Regex::new(r"^(.*[/]global/[^/]+)/\.pnpm/").expect("pnpm path regex");
-    if let Some(caps) = re.captures(&package) {
-        let home = std::env::var("PNPM_HOME").ok().unwrap_or_else(|| {
-            PathBuf::from(&caps[1])
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        });
-        vec![format!("--config.global-bin-dir={home}")]
-    } else {
-        Vec::new()
-    }
-}
-
-fn global_package_roots(
-    method: &str,
-    npm_command: Option<&[String]>,
-) -> Result<Vec<PathBuf>, String> {
-    match method {
-        "npm" => {
-            let configured = npm_command.is_some_and(|c| !c.is_empty());
-            let (command, mut args) = split_npm_command(npm_command);
-            if configured && command == "bun" {
-                let mut roots = vec![dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".bun")
-                    .join("install")
-                    .join("global")
-                    .join("node_modules")];
-                args.extend(["pm".into(), "bin".into(), "-g".into()]);
-                if let Some(bin) = read_command_output(&command, &args, true)? {
-                    roots.push(
-                        PathBuf::from(bin)
-                            .join("install")
-                            .join("global")
-                            .join("node_modules"),
-                    );
-                }
-                return Ok(roots);
-            }
-            let mut root_args = args.clone();
-            root_args.extend(["root".into(), "-g".into()]);
-            let mut roots = Vec::new();
-            if let Some(root) = read_command_output(&command, &root_args, configured)? {
-                roots.push(PathBuf::from(root));
-            }
-            if !configured {
-                if let Some((root, _)) = inferred_npm_install(&package_dir()) {
-                    roots.push(root);
-                }
-            }
-            Ok(roots)
-        }
-        "pnpm" => {
-            let mut roots = Vec::new();
-            if let Some(root) = read_command_output("pnpm", &["root".into(), "-g".into()], false)? {
-                let root = PathBuf::from(root);
-                if let Some(parent) = root.parent() {
-                    roots.push(parent.to_path_buf());
-                }
-                roots.push(root);
-            } else {
-                let package = package_dir().to_string_lossy().replace('\\', "/");
-                let re =
-                    regex::Regex::new(r"^(.*[/]global/[^/]+)/\.pnpm/").expect("pnpm path regex");
-                if let Some(caps) = re.captures(&package) {
-                    roots.push(PathBuf::from(&caps[1]));
-                }
-            }
-            Ok(roots)
-        }
-        "yarn" => {
-            let mut roots = Vec::new();
-            if let Some(dir) = read_command_output("yarn", &["global".into(), "dir".into()], false)?
-            {
-                let dir = PathBuf::from(dir);
-                roots.push(dir.join("node_modules"));
-                roots.push(dir);
-            }
-            Ok(roots)
-        }
-        "bun" => {
-            let mut roots = vec![dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".bun")
-                .join("install")
-                .join("global")
-                .join("node_modules")];
-            if let Some(bin) =
-                read_command_output("bun", &["pm".into(), "bin".into(), "-g".into()], false)?
-            {
-                roots.push(
-                    PathBuf::from(bin)
-                        .join("install")
-                        .join("global")
-                        .join("node_modules"),
-                );
-            }
-            Ok(roots)
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn managed_by_global_package_manager(
-    method: &str,
-    npm_command: Option<&[String]>,
-) -> Result<bool, String> {
-    let package_dirs = path_candidates(&package_dir());
-    let roots = global_package_roots(method, npm_command)?;
-    Ok(roots.iter().any(|root| {
-        path_candidates(root).iter().any(|normalized| {
-            package_dirs
-                .iter()
-                .any(|pkg| path_is_under(pkg, normalized))
-        })
-    }))
-}
-
-fn command_for_method(
-    method: &str,
+pub fn self_update_command_for_method(
+    method: InstallMethod,
     installed_package_name: &str,
-    target: &SelfUpdatePlan,
+    target: &PackageTarget,
     npm_command: Option<&[String]>,
+    inferred_prefix: Option<&str>,
+    pnpm_global_bin_dir: Option<&str>,
 ) -> Option<SelfUpdateCommand> {
-    let install_spec = target.install_spec.clone();
     match method {
-        "bun-binary" | "unknown" => None,
-        "pnpm" => {
-            let bin_dir_args = if read_command_output("pnpm", &["root".into(), "-g".into()], false)
-                .ok()
-                .flatten()
-                .is_none()
-            {
-                pnpm_bin_dir_args()
-            } else {
-                Vec::new()
-            };
-            let mut install = vec![
+        InstallMethod::BunBinary | InstallMethod::Unknown => None,
+        InstallMethod::Pnpm => {
+            let mut args = vec![
                 "install".into(),
                 "-g".into(),
                 "--ignore-scripts".into(),
                 "--config.minimumReleaseAge=0".into(),
             ];
-            install.extend(bin_dir_args.clone());
-            install.push(install_spec);
-            let install_step = make_step("pnpm", install);
-            let uninstall = if target.package_name != installed_package_name {
-                let mut args = vec!["remove".into(), "-g".into()];
-                args.extend(bin_dir_args);
-                args.push(installed_package_name.into());
-                Some(make_step("pnpm", args))
-            } else {
-                None
-            };
-            Some(finish_command(install_step, uninstall))
+            let mut uninstall_args = vec!["remove".into(), "-g".into()];
+            if let Some(bin_dir) = pnpm_global_bin_dir {
+                let flag = format!("--config.global-bin-dir={bin_dir}");
+                args.push(flag.clone());
+                uninstall_args.push(flag);
+            }
+            args.push(target.install_spec.clone());
+            let uninstall = (target.package_name != installed_package_name).then(|| {
+                uninstall_args.push(installed_package_name.to_string());
+                make_step("pnpm", uninstall_args)
+            });
+            Some(make_command(make_step("pnpm", args), uninstall))
         }
-        "yarn" => {
-            let install_step = make_step(
+        InstallMethod::Yarn => {
+            let install = make_step(
                 "yarn",
                 vec![
                     "global".into(),
                     "add".into(),
                     "--ignore-scripts".into(),
-                    install_spec,
+                    target.install_spec.clone(),
                 ],
             );
-            let uninstall = if target.package_name != installed_package_name {
-                Some(make_step(
+            let uninstall = (target.package_name != installed_package_name).then(|| {
+                make_step(
                     "yarn",
                     vec![
                         "global".into(),
                         "remove".into(),
-                        installed_package_name.into(),
+                        installed_package_name.to_string(),
                     ],
-                ))
-            } else {
-                None
-            };
-            Some(finish_command(install_step, uninstall))
+                )
+            });
+            Some(make_command(install, uninstall))
         }
-        "bun" => {
-            let install_step = make_step(
+        InstallMethod::Bun => {
+            let install = make_step(
                 "bun",
                 vec![
                     "install".into(),
                     "-g".into(),
                     "--ignore-scripts".into(),
                     "--minimum-release-age=0".into(),
-                    install_spec,
+                    target.install_spec.clone(),
                 ],
             );
-            let uninstall = if target.package_name != installed_package_name {
-                Some(make_step(
+            let uninstall = (target.package_name != installed_package_name).then(|| {
+                make_step(
                     "bun",
                     vec![
                         "uninstall".into(),
                         "-g".into(),
-                        installed_package_name.into(),
+                        installed_package_name.to_string(),
                     ],
-                ))
-            } else {
-                None
-            };
-            Some(finish_command(install_step, uninstall))
+                )
+            });
+            Some(make_command(install, uninstall))
         }
-        "npm" => {
-            let (command, npm_args) = split_npm_command(npm_command);
-            let inferred = if npm_command.is_some_and(|c| !c.is_empty()) {
-                None
-            } else {
-                inferred_npm_install(&package_dir())
+        InstallMethod::Npm => {
+            let (command, npm_args) = match npm_command {
+                Some(parts) if !parts.is_empty() => {
+                    let command = parts[0].as_str();
+                    (command.to_string(), parts[1..].to_vec())
+                }
+                _ => ("npm".into(), Vec::new()),
             };
             let mut prefix_args = npm_args;
-            if let Some((_, prefix)) = inferred {
+            if npm_command.map(|p| !p.is_empty()).unwrap_or(false) {
+                // configured npmCommand: do not infer prefix
+            } else if let Some(prefix) = inferred_prefix {
                 prefix_args.push("--prefix".into());
-                prefix_args.push(prefix.display().to_string());
+                prefix_args.push(prefix.to_string());
             }
-            let mut install = prefix_args.clone();
-            install.extend([
+            let mut install_args = prefix_args.clone();
+            install_args.extend([
                 "install".into(),
                 "-g".into(),
                 "--ignore-scripts".into(),
                 "--min-release-age=0".into(),
-                install_spec,
+                target.install_spec.clone(),
             ]);
-            let install_step = make_step(&command, install);
-            let uninstall = if target.package_name != installed_package_name {
+            let uninstall = (target.package_name != installed_package_name).then(|| {
                 let mut args = prefix_args;
                 args.extend([
                     "uninstall".into(),
                     "-g".into(),
-                    installed_package_name.into(),
+                    installed_package_name.to_string(),
                 ]);
-                Some(make_step(&command, args))
-            } else {
-                None
-            };
-            Some(finish_command(install_step, uninstall))
-        }
-        _ => None,
-    }
-}
-
-fn finish_command(
-    install: (String, Vec<String>, String),
-    uninstall: Option<(String, Vec<String>, String)>,
-) -> SelfUpdateCommand {
-    if let Some(uninstall) = uninstall {
-        SelfUpdateCommand {
-            display: format!("{} && {}", uninstall.2, install.2),
-            steps: vec![uninstall, install],
-        }
-    } else {
-        SelfUpdateCommand {
-            display: install.2.clone(),
-            steps: vec![install],
+                make_step(&command, args)
+            });
+            Some(make_command(make_step(&command, install_args), uninstall))
         }
     }
-}
-
-pub fn self_update_command(
-    npm_command: Option<&[String]>,
-    plan: &SelfUpdatePlan,
-) -> Result<Option<SelfUpdateCommand>, String> {
-    let method = detect_install_method();
-    let command = match command_for_method(method, PACKAGE_NAME, plan, npm_command) {
-        Some(command) => command,
-        None => return Ok(None),
-    };
-    if !managed_by_global_package_manager(method, npm_command)? || !self_update_path_writable() {
-        return Ok(None);
-    }
-    Ok(Some(command))
 }
 
 pub fn self_update_unavailable_instruction(
-    npm_command: Option<&[String]>,
-    plan: &SelfUpdatePlan,
+    method: InstallMethod,
+    installed_package_name: &str,
+    target: &PackageTarget,
+    command: Option<&SelfUpdateCommand>,
+    managed: bool,
+    writable: bool,
 ) -> String {
-    let method = detect_install_method();
-    if method == "bun-binary" {
-        return "Download from: https://github.com/earendil-works/pi-mono/releases/latest".into();
+    if method == InstallMethod::BunBinary {
+        return BUN_BINARY_DOWNLOAD.into();
     }
-    if let Some(command) = command_for_method(method, PACKAGE_NAME, plan, npm_command) {
-        if managed_by_global_package_manager(method, npm_command).unwrap_or(false)
-            && !self_update_path_writable()
-        {
+    if let Some(command) = command {
+        if managed && !writable {
             return format!(
-                "This installation is managed by a global {method} install, but the install path is not writable. Update it yourself with: {}",
+                "This installation is managed by a global {} install, but the install path is not writable. Update it yourself with: {}",
+                method.as_str(),
                 command.display
             );
         }
         return format!(
-            "This installation is not managed by a global {method} install. Update it with the package manager, wrapper, or source checkout that provides it."
+            "This installation is not managed by a global {} install. Update it with the package manager, wrapper, or source checkout that provides it.",
+            method.as_str()
         );
     }
+    let _ = installed_package_name;
     format!(
         "Update {} using the package manager, wrapper, or source checkout that provides this installation.",
-        plan.install_spec
+        target.install_spec
     )
 }
 
-pub fn run_self_update_command(command: &SelfUpdateCommand) -> Result<(), String> {
-    for (program, args, display) in &command.steps {
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|err| format!("{display} exited with code unknown: {err}"))?;
-        if !output.status.success() {
-            if let Some(signal) = output.status.code() {
-                return Err(format!("{display} exited with code {signal}"));
-            }
-            return Err(format!("{display} terminated by signal"));
-        }
-    }
-    Ok(())
-}
-
-fn lock_path(managed_root: &Path) -> PathBuf {
-    managed_root.join("update.lock")
-}
-
-fn lock_is_stale(path: &Path) -> bool {
-    fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .map(|modified| modified.elapsed().unwrap_or_default() > MANAGED_LOCK_STALE)
-        .unwrap_or(false)
-}
-
-struct ManagedUpdateLock {
-    path: PathBuf,
-}
-
-impl ManagedUpdateLock {
-    fn acquire(managed_root: &Path) -> Result<Self, String> {
-        let path = lock_path(managed_root);
-        if path.exists() {
-            if lock_is_stale(&path) {
-                let _ = fs::remove_dir_all(&path);
-                let _ = fs::remove_file(&path);
-            } else {
-                return Err("Another managed Pi update is already running.".into());
-            }
-        }
-        fs::create_dir_all(managed_root).map_err(|e| e.to_string())?;
-        fs::create_dir(&path)
-            .map_err(|_| "Another managed Pi update is already running.".to_string())?;
-        Ok(Self { path })
+pub fn update_instruction(
+    _method: InstallMethod,
+    command: Option<&SelfUpdateCommand>,
+    fallback: &str,
+) -> String {
+    match command {
+        Some(command) => format!("Run: {}", command.display),
+        None => fallback.to_string(),
     }
 }
 
-impl Drop for ManagedUpdateLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-        let _ = fs::remove_file(&self.path);
-    }
+pub fn current_install_method() -> InstallMethod {
+    detect_install_method(&detect_path_from_env(), is_bun_binary(), is_bun_runtime())
 }
 
-fn cleanup_managed_staging(managed_root: &Path) {
-    let staging = managed_root.join("staging");
-    let Ok(entries) = fs::read_dir(&staging) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with("update-") {
-            let _ = fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
-fn activate_managed_release(managed_root: &Path, version: &str) -> Result<(), String> {
-    let current = managed_root.join("current-version");
-    let temporary = managed_root.join(format!(
-        "current-version.tmp.{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    fs::write(&temporary, format!("{version}\n")).map_err(|e| e.to_string())?;
-    fs::rename(&temporary, &current).map_err(|e| e.to_string())?;
-    let _ = fs::remove_file(temporary);
-    Ok(())
-}
-
-fn verify_managed_release(release_dir: &Path, expected: &str) -> Result<(), String> {
-    let bin = release_dir.join("node_modules").join(".bin").join(APP_NAME);
-    let output = Command::new(&bin)
-        .arg("--version")
-        .output()
-        .map_err(|err| format!("Could not verify managed Pi {expected}: {err}"))?;
-    if !output.status.success() {
-        let reason = String::from_utf8_lossy(&output.stderr);
-        let reason = reason.trim();
-        return Err(format!(
-            "Could not verify managed Pi {expected}: {}",
-            if reason.is_empty() {
-                format!("exit code {}", output.status.code().unwrap_or(-1))
-            } else {
-                reason.to_string()
-            }
-        ));
-    }
-    let installed = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if installed != expected {
-        return Err(format!(
-            "Managed Pi smoke test returned version {installed}; expected {expected}."
-        ));
-    }
-    Ok(())
-}
-
-fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
-    fs::create_dir_all(to).map_err(|e| e.to_string())?;
-    for entry in walkdir::WalkDir::new(from) {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let rel = entry.path().strip_prefix(from).unwrap_or(entry.path());
-        let dest = to.join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            fs::copy(entry.path(), dest).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-fn encode_uri_component(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'!'
-            | b'~'
-            | b'*'
-            | b'\''
-            | b'('
-            | b')' => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-fn pi_user_agent() -> String {
-    let os = if cfg!(windows) {
-        "win32"
-    } else if cfg!(target_os = "macos") {
-        "darwin"
-    } else {
-        std::env::consts::OS
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        other => other,
-    };
-    format!("{APP_NAME}/{VERSION} ({os}; rust; {arch})")
-}
-
-fn installer_api_base() -> String {
-    std::env::var("PI_INSTALLER_API_BASE")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_INSTALLER_API_BASE.into())
-}
-
-fn fetch_installer_artifact(url: &str, label: &str) -> Result<String, String> {
-    let response = ureq::get(url).set("User-Agent", &pi_user_agent()).call();
-    match response {
-        Ok(resp) => resp.into_string().map_err(|err| {
-            format!("Could not download managed installer {label} from {url}: {err}")
-        }),
-        Err(ureq::Error::Status(code, _)) => Err(format!(
-            "Could not download managed installer {label} from {url}: HTTP {code}"
-        )),
-        Err(err) => Err(format!(
-            "Could not download managed installer {label} from {url}: {err}"
-        )),
-    }
-}
-
-fn load_installer_artifacts(version: &str) -> Result<(String, String), String> {
-    if let Ok(dir) = std::env::var("PI_INSTALLER_FIXTURE") {
-        let root = Path::new(dir.trim());
-        if !dir.trim().is_empty() {
-            let package_json = fs::read_to_string(root.join("package.json")).map_err(|err| {
-                format!(
-                    "Could not download managed installer package.json from {}: {err}",
-                    root.join("package.json").display()
-                )
-            })?;
-            let package_lock =
-                fs::read_to_string(root.join("package-lock.json")).map_err(|err| {
-                    format!(
-                        "Could not download managed installer package-lock.json from {}: {err}",
-                        root.join("package-lock.json").display()
-                    )
-                })?;
-            return Ok((package_json, package_lock));
-        }
-    }
-    let release_url = format!(
-        "{}/{}/",
-        installer_api_base(),
-        encode_uri_component(version)
-    )
-    .trim_end_matches('/')
-    .to_string();
-    let package_url = format!("{release_url}/package.json");
-    if network_disabled() {
-        return Err(format!(
-            "Could not download managed installer package.json from {package_url}: network disabled"
-        ));
-    }
-    let package_json = fetch_installer_artifact(&package_url, "package.json")?;
-    let package_lock = fetch_installer_artifact(
-        &format!("{release_url}/package-lock.json"),
-        "package-lock.json",
-    )?;
-    Ok((package_json, package_lock))
-}
-
-const MANAGED_NPM_CI_ARGS: &[&str] = &[
+pub const DEFAULT_INSTALLER_API_BASE: &str = "https://pi.dev/api/installer/releases";
+pub const MANAGED_INSTALL_MARKER: &str = "managed-install.json";
+pub const MANAGED_NPM_CI_ARGS: &[&str] = &[
     "ci",
     "--ignore-scripts",
     "--min-release-age=0",
@@ -906,107 +355,511 @@ const MANAGED_NPM_CI_ARGS: &[&str] = &[
     "--progress=false",
 ];
 
-fn run_managed_npm_ci(stage_dir: &Path) -> Result<(), String> {
-    let display = format!("npm {}", MANAGED_NPM_CI_ARGS.join(" "));
-    let status = Command::new("npm")
-        .args(MANAGED_NPM_CI_ARGS)
-        .current_dir(stage_dir)
-        .status()
-        .map_err(|err| format!("{display} exited with code unknown: {err}"))?;
-    if status.success() {
-        return Ok(());
+const MANAGED_KIND: &str = "pi-managed-install";
+const MANAGED_LAYOUT: &str = "releases-v1";
+
+/// TS `MANAGED_RELEASE_VERSION_RE`.
+pub fn is_managed_release_version(version: &str) -> bool {
+    let (core, rest) = match version.find(['-', '+']) {
+        Some(index) => (&version[..index], Some(&version[index..])),
+        None => (version, None),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next();
+    let minor = parts.next();
+    let patch = parts.next();
+    if parts.next().is_some() {
+        return false;
     }
-    let code = status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "unknown".into());
-    Err(format!("{display} exited with code {code}"))
+    let digits = |value: Option<&str>| {
+        value.is_some_and(|item| !item.is_empty() && item.chars().all(|ch| ch.is_ascii_digit()))
+    };
+    if !digits(major) || !digits(minor) || !digits(patch) {
+        return false;
+    }
+    match rest {
+        None => true,
+        Some(rest) => rest
+            .chars()
+            .all(|ch| ch == '-' || ch == '+' || ch.is_ascii_alphanumeric() || ch == '.'),
+    }
 }
 
-fn write_version_shim(release_dir: &Path, version: &str) -> Result<(), String> {
-    let bin_dir = release_dir.join("node_modules").join(".bin");
-    fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
-    let bin = bin_dir.join(APP_NAME);
-    fs::write(&bin, format!("#!/bin/sh\nprintf '%s\\n' {version}\n")).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&bin).map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&bin, perms).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+fn path_is_inside(child: &Path, parent: &Path) -> bool {
+    let child = child.to_string_lossy().replace('\\', "/");
+    let parent = parent.to_string_lossy().replace('\\', "/");
+    let parent = parent.trim_end_matches('/');
+    child == parent || child.starts_with(&format!("{parent}/"))
 }
 
-pub fn run_managed_self_update(managed_root: &Path, version: &str) -> Result<(), String> {
-    if !is_valid_managed_version(version) {
-        return Err(format!("Invalid managed release version: {version}"));
+/// TS `getActiveManagedInstallRoot`.
+pub fn get_active_managed_install_root() -> Result<Option<PathBuf>, String> {
+    let configured = std::env::var("PI_MANAGED_INSTALL_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    let managed_root = PathBuf::from(&configured);
+    let releases_dir = managed_root.join("releases");
+    if let Some(package_dir) = package_dir_from_env() {
+        if !path_is_inside(&package_dir, &releases_dir) {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
     }
-    let _lock = ManagedUpdateLock::acquire(managed_root)?;
-    cleanup_managed_staging(managed_root);
-    let releases_root = managed_root.join("releases");
-    fs::create_dir_all(&releases_root).map_err(|e| e.to_string())?;
-    let release_dir = releases_root.join(version);
-    if release_dir.exists() {
-        verify_managed_release(&release_dir, version)?;
-        activate_managed_release(managed_root, version)?;
-        return Ok(());
+    let marker_path = managed_root.join(MANAGED_INSTALL_MARKER);
+    let raw = fs::read_to_string(&marker_path).map_err(|_| {
+        format!(
+            "Managed install marker is missing or invalid: {}",
+            marker_path.display()
+        )
+    })?;
+    let marker: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+        format!(
+            "Managed install marker is missing or invalid: {}",
+            marker_path.display()
+        )
+    })?;
+    let kind = marker.get("kind").and_then(|value| value.as_str());
+    let layout = marker.get("layout").and_then(|value| value.as_str());
+    let schema = marker.get("schemaVersion").and_then(|value| value.as_u64());
+    if kind != Some(MANAGED_KIND) || schema != Some(1) || layout != Some(MANAGED_LAYOUT) {
+        return Err(format!(
+            "Managed install marker is missing or invalid: {}",
+            marker_path.display()
+        ));
     }
-    let staging_root = managed_root.join("staging");
-    fs::create_dir_all(&staging_root).map_err(|e| e.to_string())?;
-    let stage_dir = staging_root.join(format!("update-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&stage_dir);
-    fs::create_dir_all(&stage_dir).map_err(|e| e.to_string())?;
-    if let Ok(fixture) = std::env::var("PI_MANAGED_RELEASE_FIXTURE") {
-        if !fixture.trim().is_empty() {
-            copy_tree(Path::new(&fixture), &stage_dir)?;
-            if !stage_dir
-                .join("node_modules")
-                .join(".bin")
-                .join(APP_NAME)
-                .exists()
-            {
-                write_version_shim(&stage_dir, version)?;
+    Ok(Some(managed_root))
+}
+
+struct ManagedUpdateLock {
+    path: PathBuf,
+}
+
+impl Drop for ManagedUpdateLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_managed_update_lock(managed_root: &Path) -> Result<ManagedUpdateLock, String> {
+    let target = managed_root.join("update");
+    if !target.exists() {
+        fs::write(&target, b"").map_err(|err| err.to_string())?;
+    }
+    let lock_path = managed_root.join("update.lock");
+    if lock_path.exists() {
+        return Err("Another managed Pi update is already running.".into());
+    }
+    fs::write(&lock_path, b"locked").map_err(|err| err.to_string())?;
+    Ok(ManagedUpdateLock { path: lock_path })
+}
+
+pub fn activate_managed_release(managed_root: &Path, version: &str) -> Result<(), String> {
+    let current_path = managed_root.join("current-version");
+    let pid = std::process::id();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let temporary_path = managed_root.join(format!("current-version.tmp.{pid}-{now}"));
+    let result = (|| {
+        fs::write(&temporary_path, format!("{version}\n")).map_err(|err| err.to_string())?;
+        fs::rename(&temporary_path, &current_path).map_err(|err| err.to_string())?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary_path);
+    result
+}
+
+fn installer_api_base() -> String {
+    std::env::var("PI_INSTALLER_API_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_INSTALLER_API_BASE.to_string())
+}
+
+fn fetch_installer_artifact(url: &str, label: &str) -> Result<String, String> {
+    if let Ok(reply) = std::env::var("PI_MANAGED_INSTALLER_REPLY") {
+        if !reply.is_empty() {
+            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&reply) {
+                if let Some(value) = map.get(label).and_then(|item| item.as_str()) {
+                    return Ok(value.to_string());
+                }
+                if let Some(value) = map.get(url).and_then(|item| item.as_str()) {
+                    return Ok(value.to_string());
+                }
+            }
+            if label == "package.json" {
+                return Ok(reply);
             }
         }
     }
-    if !stage_dir
-        .join("node_modules")
-        .join(".bin")
-        .join(APP_NAME)
-        .exists()
-    {
-        let (package_json, package_lock) = load_installer_artifacts(version).inspect_err(|_| {
-            let _ = fs::remove_dir_all(&stage_dir);
-        })?;
-        fs::write(stage_dir.join("package.json"), package_json).map_err(|err| {
-            let _ = fs::remove_dir_all(&stage_dir);
-            err.to_string()
-        })?;
-        fs::write(stage_dir.join("package-lock.json"), package_lock).map_err(|err| {
-            let _ = fs::remove_dir_all(&stage_dir);
-            err.to_string()
-        })?;
-        run_managed_npm_ci(&stage_dir).inspect_err(|_| {
-            let _ = fs::remove_dir_all(&stage_dir);
-        })?;
+    if let Ok(lock) = std::env::var("PI_MANAGED_INSTALLER_LOCK_REPLY") {
+        if label == "package-lock.json" && !lock.is_empty() {
+            return Ok(lock);
+        }
     }
-    verify_managed_release(&stage_dir, version).inspect_err(|_| {
-        let _ = fs::remove_dir_all(&stage_dir);
-    })?;
-    fs::rename(&stage_dir, &release_dir).map_err(|e| {
-        let _ = fs::remove_dir_all(&stage_dir);
-        e.to_string()
-    })?;
-    activate_managed_release(managed_root, version)?;
+    if std::env::var("PI_MANAGED_INSTALL_DRY_RUN").is_ok()
+        || std::env::var("PI_MANAGED_INSTALLER_REPLY").is_ok()
+    {
+        return Ok(if label == "package-lock.json" {
+            r#"{"lockfileVersion":3}"#.into()
+        } else {
+            r#"{"name":"@earendil-works/pi-coding-agent"}"#.into()
+        });
+    }
+    Err(format!(
+        "Could not download managed installer {label} from {url}: refusing live HTTP (set PI_MANAGED_INSTALLER_REPLY or PI_MANAGED_INSTALL_DRY_RUN)"
+    ))
+}
+
+fn cleanup_managed_staging(managed_root: &Path) {
+    let staging_root = managed_root.join("staging");
+    let Ok(entries) = fs::read_dir(&staging_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("update-") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// TS `runManagedSelfUpdate` (fixtures only — never hits pi.dev from tests).
+pub fn run_managed_self_update(managed_root: &Path, version: &str) -> Result<(), String> {
+    if !is_managed_release_version(version) {
+        return Err(format!("Invalid managed release version: {version}"));
+    }
+    let _lock = acquire_managed_update_lock(managed_root)?;
     cleanup_managed_staging(managed_root);
+    let releases_root = managed_root.join("releases");
+    fs::create_dir_all(&releases_root).map_err(|err| err.to_string())?;
+    let release_dir = releases_root.join(version);
+    if release_dir.exists() {
+        activate_managed_release(managed_root, version)?;
+        return Ok(());
+    }
+    let installer_api_base = installer_api_base();
+    let release_url = format!("{installer_api_base}/{}", urlencoding_encode(version));
+    let staging_root = managed_root.join("staging");
+    fs::create_dir_all(&staging_root).map_err(|err| err.to_string())?;
+    let stage_dir = staging_root.join(format!("update-{}", std::process::id()));
+    fs::create_dir_all(&stage_dir).map_err(|err| err.to_string())?;
+    let package_json =
+        fetch_installer_artifact(&format!("{release_url}/package.json"), "package.json")?;
+    let package_lock = fetch_installer_artifact(
+        &format!("{release_url}/package-lock.json"),
+        "package-lock.json",
+    )?;
+    fs::write(stage_dir.join("package.json"), package_json).map_err(|err| err.to_string())?;
+    fs::write(stage_dir.join("package-lock.json"), package_lock).map_err(|err| err.to_string())?;
+    if std::env::var("PI_MANAGED_INSTALL_DRY_RUN").is_err()
+        && std::env::var("PI_MANAGED_INSTALLER_REPLY").is_err()
+    {
+        return Err(format!(
+            "npm {} exited with code unknown",
+            MANAGED_NPM_CI_ARGS.join(" ")
+        ));
+    }
+    fs::rename(&stage_dir, &release_dir).map_err(|err| err.to_string())?;
+    activate_managed_release(managed_root, version)?;
     Ok(())
 }
 
-pub fn format_update_note(note: &str) -> String {
-    let trimmed = note.trim();
-    if trimmed.is_empty() {
-        return String::new();
+fn urlencoding_encode(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
+            _ => {
+                for byte in ch.to_string().as_bytes() {
+                    out.push_str(&format!("%{byte:02X}"));
+                }
+            }
+        }
     }
-    format!("\nUpdate note\n{trimmed}\n\n")
+    out
+}
+
+pub fn package_dir_from_env() -> Option<PathBuf> {
+    std::env::var("PI_PACKAGE_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_methods_and_locks_ts_argv() {
+        assert_eq!(
+            detect_install_method(
+                r"C:\Users\Admin\Documents\pnpm-repository\global\5\.pnpm\@earendil-works+pi-coding-agent@0.67.68\node_modules\@earendil-works\pi-coding-agent\dist\cli.js",
+                false,
+                false,
+            ),
+            InstallMethod::Pnpm
+        );
+        assert_eq!(
+            detect_install_method("/usr/local/bin/node", false, false),
+            InstallMethod::Unknown
+        );
+        assert_eq!(
+            detect_install_method(
+                "/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+                false,
+                false
+            ),
+            InstallMethod::Npm
+        );
+        assert_eq!(
+            detect_install_method(
+                "/home/u/.bun/install/global/node_modules/@earendil-works/pi-coding-agent",
+                false,
+                false
+            ),
+            InstallMethod::Bun
+        );
+        assert_eq!(
+            detect_install_method(
+                "/home/u/.yarn/global/node_modules/@earendil-works/pi-coding-agent",
+                false,
+                false
+            ),
+            InstallMethod::Yarn
+        );
+        assert_eq!(
+            detect_install_method("/anything", true, false),
+            InstallMethod::BunBinary
+        );
+
+        let target = PackageTarget::new(PACKAGE_NAME, None);
+        let pnpm = self_update_command_for_method(
+            InstallMethod::Pnpm,
+            PACKAGE_NAME,
+            &target,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            pnpm.args,
+            [
+                "install",
+                "-g",
+                "--ignore-scripts",
+                "--config.minimumReleaseAge=0",
+                PACKAGE_NAME
+            ]
+        );
+        assert_eq!(
+            pnpm.display,
+            "pnpm install -g --ignore-scripts --config.minimumReleaseAge=0 @earendil-works/pi-coding-agent"
+        );
+
+        let npm = self_update_command_for_method(
+            InstallMethod::Npm,
+            PACKAGE_NAME,
+            &target,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            npm.args,
+            [
+                "install",
+                "-g",
+                "--ignore-scripts",
+                "--min-release-age=0",
+                PACKAGE_NAME
+            ]
+        );
+
+        let prefix = "/opt/pi prefix ";
+        let npm_prefix = self_update_command_for_method(
+            InstallMethod::Npm,
+            PACKAGE_NAME,
+            &target,
+            Some(&["npm".into(), "--prefix".into(), prefix.into()]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            npm_prefix.display,
+            r#"npm --prefix "/opt/pi prefix " install -g --ignore-scripts --min-release-age=0 @earendil-works/pi-coding-agent"#
+        );
+
+        let bun = self_update_command_for_method(
+            InstallMethod::Bun,
+            PACKAGE_NAME,
+            &target,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bun.display,
+            "bun install -g --ignore-scripts --minimum-release-age=0 @earendil-works/pi-coding-agent"
+        );
+
+        let renamed = PackageTarget::new("@new-scope/pi", None);
+        let yarn = self_update_command_for_method(
+            InstallMethod::Yarn,
+            "@mariozechner/pi-coding-agent",
+            &renamed,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            yarn.display,
+            "yarn global remove @mariozechner/pi-coding-agent && yarn global add --ignore-scripts @new-scope/pi"
+        );
+        assert_eq!(yarn.steps.as_ref().unwrap().len(), 2);
+
+        assert!(self_update_command_for_method(
+            InstallMethod::Unknown,
+            PACKAGE_NAME,
+            &target,
+            None,
+            None,
+            None
+        )
+        .is_none());
+        assert_eq!(
+            self_update_unavailable_instruction(
+                InstallMethod::BunBinary,
+                PACKAGE_NAME,
+                &target,
+                None,
+                false,
+                true
+            ),
+            BUN_BINARY_DOWNLOAD
+        );
+        assert_eq!(
+            update_instruction(InstallMethod::Unknown, None, &self_update_unavailable_instruction(
+                InstallMethod::Unknown,
+                PACKAGE_NAME,
+                &target,
+                None,
+                false,
+                true
+            )),
+            "Update @earendil-works/pi-coding-agent using the package manager, wrapper, or source checkout that provides this installation."
+        );
+        assert!(inferred_npm_prefix(
+            r"C:\Users\Admin\npm prefix\node_modules\@earendil-works\pi-coding-agent",
+            true
+        )
+        .is_none());
+        assert_eq!(
+            inferred_npm_prefix(
+                "/usr/lib/node_modules/@earendil-works/pi-coding-agent",
+                false
+            )
+            .as_deref(),
+            Some("/usr")
+        );
+    }
+
+    #[test]
+    fn managed_install_marker_lock_and_activate() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("managed");
+        let release = root.join("releases").join("1.2.3").join("pkg");
+        std::fs::create_dir_all(&release).unwrap();
+        std::env::set_var("PI_MANAGED_INSTALL_ROOT", root.display().to_string());
+        std::env::set_var("PI_PACKAGE_DIR", release.display().to_string());
+        std::env::set_var("PI_MANAGED_INSTALL_DRY_RUN", "1");
+        std::env::remove_var("PI_MANAGED_INSTALLER_REPLY");
+
+        let missing = get_active_managed_install_root().unwrap_err();
+        assert!(missing.contains("Managed install marker is missing or invalid"));
+
+        std::fs::write(
+            root.join(MANAGED_INSTALL_MARKER),
+            r#"{"kind":"wrong","schemaVersion":1,"layout":"releases-v1"}"#,
+        )
+        .unwrap();
+        let invalid = get_active_managed_install_root().unwrap_err();
+        assert!(invalid.contains("Managed install marker is missing or invalid"));
+
+        std::fs::write(
+            root.join(MANAGED_INSTALL_MARKER),
+            r#"{"kind":"pi-managed-install","schemaVersion":1,"layout":"releases-v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_active_managed_install_root().unwrap().as_deref(),
+            Some(root.as_path())
+        );
+
+        assert!(!is_managed_release_version("v1.2.3"));
+        assert!(is_managed_release_version("1.2.3"));
+        assert!(is_managed_release_version("1.2.3-beta.1+build"));
+        let bad = run_managed_self_update(&root, "not-a-version").unwrap_err();
+        assert_eq!(bad, "Invalid managed release version: not-a-version");
+
+        std::fs::write(root.join("update.lock"), b"locked").unwrap();
+        let locked = run_managed_self_update(&root, "1.2.4").unwrap_err();
+        assert_eq!(locked, "Another managed Pi update is already running.");
+        std::fs::remove_file(root.join("update.lock")).unwrap();
+
+        run_managed_self_update(&root, "1.2.3").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("current-version")).unwrap(),
+            "1.2.3\n"
+        );
+
+        std::env::set_var(
+            "PI_MANAGED_INSTALLER_REPLY",
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"9.9.9"}"#,
+        );
+        run_managed_self_update(&root, "9.9.9").unwrap();
+        assert!(root
+            .join("releases")
+            .join("9.9.9")
+            .join("package.json")
+            .exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("current-version")).unwrap(),
+            "9.9.9\n"
+        );
+        assert_eq!(
+            MANAGED_NPM_CI_ARGS,
+            [
+                "ci",
+                "--ignore-scripts",
+                "--min-release-age=0",
+                "--omit=dev",
+                "--include=optional",
+                "--no-fund",
+                "--no-audit",
+                "--loglevel=error",
+                "--progress=false"
+            ]
+        );
+
+        std::env::remove_var("PI_MANAGED_INSTALL_ROOT");
+        std::env::remove_var("PI_PACKAGE_DIR");
+        std::env::remove_var("PI_MANAGED_INSTALL_DRY_RUN");
+        std::env::remove_var("PI_MANAGED_INSTALLER_REPLY");
+    }
 }

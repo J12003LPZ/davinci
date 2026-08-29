@@ -1,84 +1,154 @@
-use serde::{Deserialize, Serialize};
-use std::io::{self, Read};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Key {
-    Char(char),
-    Enter,
-    Backspace,
-    Tab,
-    Escape,
-    Left,
-    Right,
-    Up,
-    Down,
-    Ctrl(char),
-    Unknown(String),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Key {
+    pub name: String,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
 }
 
-pub fn parse_key(raw: &str) -> Key {
-    match raw {
-        "\r" | "\n" | "enter" => Key::Enter,
-        "\u{7f}" | "\u{8}" | "backspace" => Key::Backspace,
-        "\t" | "tab" => Key::Tab,
-        "\u{1b}" | "escape" => Key::Escape,
-        "left" | "\u{1b}[D" => Key::Left,
-        "right" | "\u{1b}[C" => Key::Right,
-        "up" | "\u{1b}[A" => Key::Up,
-        "down" | "\u{1b}[B" => Key::Down,
-        other if other.starts_with("ctrl+") && other.len() == 6 => {
-            Key::Ctrl(other.chars().last().unwrap_or('c'))
+pub fn parse_key(input: &str) -> Key {
+    let lower = input.to_ascii_lowercase();
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut name = lower.as_str();
+    if let Some(rest) = name.strip_prefix("ctrl+") {
+        ctrl = true;
+        name = rest;
+    }
+    if let Some(rest) = name.strip_prefix("alt+") {
+        alt = true;
+        name = rest;
+    }
+    if let Some(rest) = name.strip_prefix("shift+") {
+        shift = true;
+        name = rest;
+    }
+    Key {
+        name: name.to_string(),
+        ctrl,
+        alt,
+        shift,
+    }
+}
+
+const KITTY_FUNCTIONAL: &[(u32, u32)] = &[
+    (57399, 48),
+    (57400, 49),
+    (57401, 50),
+    (57402, 51),
+    (57403, 52),
+    (57404, 53),
+    (57405, 54),
+    (57406, 55),
+    (57407, 56),
+    (57408, 57),
+    (57409, 46),
+    (57410, 47),
+    (57411, 42),
+    (57412, 45),
+    (57413, 43),
+    (57415, 61),
+    (57416, 44),
+];
+
+fn normalize_kitty_functional(codepoint: u32) -> u32 {
+    KITTY_FUNCTIONAL
+        .iter()
+        .find(|(from, _)| *from == codepoint)
+        .map(|(_, to)| *to)
+        .unwrap_or(codepoint)
+}
+
+/// Decode Kitty CSI-u printable input matching `decodeKittyPrintable` in
+/// `vendor/pi/packages/tui/src/keys.ts`.
+pub fn decode_kitty_printable(data: &str) -> Option<String> {
+    let rest = data.strip_prefix("\u{1b}[")?;
+    let rest = rest.strip_suffix('u')?;
+    let (codepoint_part, mods) = rest.split_once(';').unwrap_or((rest, "1"));
+    let mut parts = codepoint_part.split(':');
+    let codepoint = parts.next()?.parse::<u32>().ok()?;
+    let shifted = parts.next().and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            value.parse::<u32>().ok()
         }
-        other if other.len() == 1 => parse_bytes(other.as_bytes()),
-        other => Key::Unknown(other.to_string()),
+    });
+    let mod_value = mods
+        .split(':')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let modifier = mod_value.saturating_sub(1);
+    // TS: reject alt/ctrl and unsupported Super/Meta bits. Shift (1) and lock (8) are allowed.
+    const SHIFT: u32 = 1;
+    const ALT: u32 = 2;
+    const CTRL: u32 = 4;
+    const LOCK: u32 = 8;
+    if (modifier & !(SHIFT | LOCK)) != 0 {
+        return None;
     }
+    if modifier & (ALT | CTRL) != 0 {
+        return None;
+    }
+    let mut effective = codepoint;
+    if modifier & SHIFT != 0 {
+        if let Some(shifted) = shifted {
+            effective = shifted;
+        }
+    }
+    effective = normalize_kitty_functional(effective);
+    if !(32..57344).contains(&effective) {
+        return None;
+    }
+    char::from_u32(effective).map(|ch| ch.to_string())
 }
 
-pub fn parse_bytes(bytes: &[u8]) -> Key {
-    if bytes.is_empty() {
-        return Key::Unknown(String::new());
-    }
-    if bytes.len() == 1 {
-        return match bytes[0] {
-            b'\r' | b'\n' => Key::Enter,
-            0x7f | 0x08 => Key::Backspace,
-            b'\t' => Key::Tab,
-            0x1b => Key::Escape,
-            b @ 1..=26 => Key::Ctrl((b'a' + b - 1) as char),
-            b => Key::Char(b as char),
-        };
-    }
-    parse_key(&String::from_utf8_lossy(bytes))
+/// Kitty functional key codepoints matching `KITTY_FUNCTIONAL_KEY_EQUIVALENTS`.
+pub fn kitty_functional_codepoint(name: &str) -> Option<u32> {
+    Some(match name {
+        "left" => 57417,
+        "right" => 57418,
+        "up" => 57419,
+        "down" => 57420,
+        "pageup" => 57421,
+        "pagedown" => 57422,
+        "home" => 57423,
+        "end" => 57424,
+        "insert" => 57425,
+        "delete" => 57426,
+        _ => return None,
+    })
 }
 
-pub fn read_key(stdin: &mut impl Read) -> io::Result<Option<Key>> {
-    let mut buf = [0u8; 64];
-    let n = stdin.read(&mut buf)?;
-    if n == 0 {
-        return Ok(None);
+/// Parse `\x1b[{code}[;{mods}[:3]]u` into (codepoint, modifier bits, release).
+pub fn parse_kitty_csi_u(data: &str) -> Option<(u32, u32, bool)> {
+    let rest = data.strip_prefix("\x1b[")?;
+    let rest = rest.strip_suffix('u')?;
+    let (code_part, mods_part) = rest.split_once(';').unwrap_or((rest, "1"));
+    let codepoint = code_part.split(':').next()?.parse().ok()?;
+    let mut mods_bits = mods_part.split(':');
+    let mod_value = mods_bits.next()?.parse::<u32>().ok().unwrap_or(1);
+    let release = mods_bits.next() == Some("3");
+    Some((codepoint, mod_value.saturating_sub(1), release))
+}
+
+pub fn key_modifier_bits(ctrl: bool, alt: bool, shift: bool) -> u32 {
+    u32::from(shift) + (u32::from(alt) * 2) + (u32::from(ctrl) * 4)
+}
+
+/// TS `isKeyRelease`.
+pub fn is_key_release(data: &str) -> bool {
+    if data.contains("\x1b[200~") {
+        return false;
     }
-    Ok(Some(parse_bytes(&buf[..n])))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Keybinding {
-    pub key: String,
-    pub action: String,
-}
-
-pub fn default_keybindings() -> Vec<Keybinding> {
-    vec![
-        Keybinding {
-            key: "ctrl+c".into(),
-            action: "interrupt".into(),
-        },
-        Keybinding {
-            key: "ctrl+p".into(),
-            action: "cycle_model".into(),
-        },
-        Keybinding {
-            key: "escape".into(),
-            action: "cancel".into(),
-        },
-    ]
+    data.contains(":3u")
+        || data.contains(":3~")
+        || data.contains(":3A")
+        || data.contains(":3B")
+        || data.contains(":3C")
+        || data.contains(":3D")
+        || data.contains(":3H")
+        || data.contains(":3F")
 }

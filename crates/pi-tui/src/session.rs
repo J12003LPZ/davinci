@@ -1,0 +1,2469 @@
+//! Interactive raw-mode session matching TS `ProcessTerminal` + `tui-alt-screen.ts`.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use std::collections::BTreeMap;
+
+use crate::autocomplete::{apply_completion, suggestions, SlashCommandSpec};
+use crate::chrome::ChatChrome;
+use crate::extension_ui::{
+    ExtensionConfirm, ExtensionDialogAction, ExtensionEditor, ExtensionInput, ExtensionProgress,
+    ExtensionSelector,
+};
+use crate::first_time::{FirstTimeAction, FirstTimeSetup};
+use crate::image::{delete_all_kitty_images, delete_kitty_image, encode_kitty};
+use crate::keybindings::Keybindings;
+use crate::keys::decode_kitty_printable;
+use crate::login_dialog::{LoginDialog, LoginDialogAction};
+use crate::mermaid::MermaidMode;
+use crate::model_selector::{ModelSelector, ModelSelectorAction, ModelSelectorItem};
+use crate::mouse::{parse_mouse_sgr, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
+use crate::oauth_selector::{
+    AuthSelectorMode, AuthSelectorProvider, OAuthSelector, OAuthSelectorAction,
+};
+use crate::osc::ThemeDetection;
+use crate::overlay::Overlay;
+use crate::render::Component;
+use crate::scoped_models::{EnabledIds, ScopedModel, ScopedModelsAction, ScopedModelsSelector};
+use crate::session_selector::{SessionItem, SessionSelector, SessionSelectorAction};
+use crate::settings::{SettingItem, SettingsList};
+use crate::settings_submenu::{
+    parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
+};
+use crate::terminal::{
+    resolve_escape_timeout_ms_from_env, rewrite_shift_enter_input, NATIVE_SHIFT_ENTER_SEQUENCE,
+};
+use crate::themes::Theme;
+use crate::thinking_selector::{ThinkingSelector, ThinkingSelectorAction};
+use crate::tool_card::ToolCard;
+use crate::tree::{FilterMode, SessionTreeNode, TreeAction, TreeSelector};
+use crate::trust_selector::{TrustSelector, TrustSelectorAction, TrustUpdate};
+use crate::{SelectList, ALT_BUFFER_ENTER, ALT_BUFFER_LEAVE};
+
+pub const DOUBLE_ESCAPE_MS: u64 = 500;
+pub const OSC_QUERY_TIMEOUT_MS: u64 = 100;
+
+pub const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
+pub const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
+pub const BRACKETED_PASTE_ENABLE: &str = "\x1b[?2004h";
+pub const BRACKETED_PASTE_DISABLE: &str = "\x1b[?2004l";
+/// TS `KITTY_KEYBOARD_PROTOCOL_QUERY` with flags 7: `\x1b[>7u\x1b[?u\x1b[c`
+pub const KITTY_KEYBOARD_QUERY: &str = "\x1b[>7u\x1b[?u\x1b[c";
+pub const KITTY_KEYBOARD_DISABLE: &str = "\x1b[<u";
+pub const BEGIN_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026h";
+pub const END_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026l";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionAction {
+    None,
+    Submit(String),
+    Abort,
+    Quit,
+    CycleModel,
+    CycleModelBackward,
+    CycleThinking,
+    ToggleHideThinking,
+    ExpandTools,
+    NewSession,
+    OpenResume,
+    Clear,
+    OpenModel,
+    OpenThinking,
+    SelectModel(String),
+    SelectModelAsDefault(String),
+    SelectThinking(String),
+    SelectThinkingAsDefault(String),
+    SelectSession(String),
+    SelectSetting(String),
+    CycleSetting,
+    OpenTree,
+    OpenFork,
+    OpenScopedModels,
+    OpenLogin,
+    SelectAuthProvider {
+        provider: String,
+        auth_type: String,
+    },
+    SelectTreeEntry(String),
+    RunBash(String),
+    CloseOverlay,
+    FirstTimeSubmit {
+        theme: String,
+        share_analytics: bool,
+    },
+    FirstTimeSkip,
+    LoginCancelled,
+    LoginSubmit(String),
+    PersistScopedModels(EnabledIds),
+    ChangeScopedModels(EnabledIds),
+    CopyText(Option<String>),
+    TreeLabel {
+        id: String,
+        label: Option<String>,
+    },
+    OpenSettingsSubmenu,
+    ApplySetting {
+        id: String,
+        value: String,
+    },
+    FollowUp(String),
+    Dequeue,
+    ExternalEditor,
+    PasteClipboard,
+    ExtensionShortcut {
+        key: String,
+        path: String,
+    },
+    RenameSession {
+        id: String,
+        name: String,
+    },
+    DeleteSession {
+        id: String,
+        path: String,
+    },
+    ExtensionSelect(Option<String>),
+    ExtensionInput(Option<String>),
+    ExtensionEditor(Option<String>),
+    ExtensionConfirm(bool),
+    ExtensionProgressCancel,
+    CustomEditorInput(String),
+    CustomOverlayInput(String),
+    Suspend,
+    SelectTrust {
+        trusted: bool,
+        updates: Vec<TrustUpdate>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct InteractiveSession {
+    pub chrome: ChatChrome,
+    pub models: Vec<String>,
+    pub model_items: Vec<ModelSelectorItem>,
+    pub default_model: Option<String>,
+    pub model_index: usize,
+    pub thinking_levels: Vec<String>,
+    pub thinking_index: usize,
+    pub aborted: bool,
+    pub width: usize,
+    pub overlay_kind: OverlayKind,
+    pub double_escape_action: DoubleEscapeAction,
+    pub slash_commands: Vec<SlashCommandSpec>,
+    pub extra_autocomplete: Vec<crate::autocomplete::ExtraAutocompleteProvider>,
+    pub last_autocomplete_debounce_ms: u64,
+    pub cwd: PathBuf,
+    pub login_providers: Vec<String>,
+    pub login_auth_options: Vec<AuthSelectorProvider>,
+    pub login_auth_type_labels: Option<(String, String)>,
+    pub auth_selector_logout: bool,
+    pub supports_thinking: bool,
+    pub autocomplete_max_visible: usize,
+    pub tree_filter_mode: FilterMode,
+    pub mermaid_mode: MermaidMode,
+    pub enabled_model_ids: EnabledIds,
+    pub keybindings: Keybindings,
+    pub extension_shortcuts: Vec<(String, String)>,
+    pub extension_dialog_context: Option<String>,
+    pub custom_editor_path: Option<String>,
+    pub custom_editor_snapshot: Option<serde_json::Value>,
+    pub follow_up_queue: Vec<String>,
+    pub model_thinking_levels: BTreeMap<String, String>,
+    pub scoped_thinking_levels: BTreeMap<String, String>,
+    pub warnings_anthropic_extra_usage: bool,
+    pub branch_summary_skip_prompt: bool,
+    pub branch_summary_reserve_tokens: u64,
+    osc_query: Option<OscQuery>,
+    last_escape: Option<Instant>,
+    next_image_id: u32,
+    paste_buf: Option<String>,
+    pub show_terminal_progress: bool,
+    pub quiet_startup: bool,
+    /// OSC window title (`updateTerminalTitle` / extension `setTitle`).
+    pub terminal_title: Option<String>,
+    progress_active: bool,
+    pub escape_timeout_ms: u64,
+    stdin_buffer: Option<crate::stdin_buffer::StdinBuffer>,
+}
+
+#[derive(Debug, Clone)]
+struct OscQuery {
+    started: Instant,
+    timeout: Duration,
+    osc11: Option<String>,
+    scheme: Option<String>,
+    finished: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoubleEscapeAction {
+    Tree,
+    Fork,
+    None,
+}
+
+impl DoubleEscapeAction {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "fork" => Self::Fork,
+            "none" => Self::None,
+            _ => Self::Tree,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Fork => "fork",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    None,
+    Model,
+    Thinking,
+    Session,
+    Settings,
+    SettingsSubmenu,
+    Tree,
+    ScopedModels,
+    Login,
+    AuthSelector,
+    FirstTime,
+    ExtensionSelect,
+    ExtensionInput,
+    ExtensionEditor,
+    ExtensionConfirm,
+    ExtensionProgress,
+    Trust,
+}
+
+impl InteractiveSession {
+    pub fn new(theme: Theme, title: impl Into<String>, models: Vec<String>) -> Self {
+        Self {
+            chrome: ChatChrome::new(theme, title),
+            model_items: models
+                .iter()
+                .map(|key| ModelSelectorItem::from_key(key))
+                .collect(),
+            models,
+            default_model: None,
+            model_index: 0,
+            thinking_levels: vec![
+                "off".into(),
+                "minimal".into(),
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+            ],
+            thinking_index: 0,
+            aborted: false,
+            width: 80,
+            overlay_kind: OverlayKind::None,
+            double_escape_action: DoubleEscapeAction::Tree,
+            slash_commands: Vec::new(),
+            extra_autocomplete: Vec::new(),
+            last_autocomplete_debounce_ms: 0,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            login_providers: Vec::new(),
+            login_auth_options: Vec::new(),
+            login_auth_type_labels: None,
+            auth_selector_logout: false,
+            supports_thinking: true,
+            autocomplete_max_visible: 5,
+            tree_filter_mode: FilterMode::Default,
+            mermaid_mode: MermaidMode::Streaming,
+            enabled_model_ids: None,
+            keybindings: Keybindings::defaults(),
+            extension_shortcuts: Vec::new(),
+            extension_dialog_context: None,
+            custom_editor_path: None,
+            custom_editor_snapshot: None,
+            follow_up_queue: Vec::new(),
+            model_thinking_levels: BTreeMap::new(),
+            scoped_thinking_levels: BTreeMap::new(),
+            warnings_anthropic_extra_usage: true,
+            branch_summary_skip_prompt: false,
+            branch_summary_reserve_tokens: 16_384,
+            osc_query: None,
+            last_escape: None,
+            next_image_id: 1,
+            paste_buf: None,
+            show_terminal_progress: false,
+            quiet_startup: false,
+            terminal_title: None,
+            progress_active: false,
+            escape_timeout_ms: resolve_escape_timeout_ms_from_env(),
+            stdin_buffer: None,
+        }
+    }
+
+    pub fn enter_sequences(fullscreen: bool) -> String {
+        let mut out = String::new();
+        if fullscreen {
+            out.push_str(ALT_BUFFER_ENTER);
+            out.push_str(DISABLE_AUTOWRAP);
+        }
+        out.push_str(MOUSE_ENABLE);
+        out.push_str(BRACKETED_PASTE_ENABLE);
+        out.push_str(KITTY_KEYBOARD_QUERY);
+        out.push_str(crate::osc::OSC_11_QUERY);
+        out.push_str(crate::osc::COLOR_SCHEME_QUERY);
+        out
+    }
+
+    /// OSC 9;4 progress sequences matching TS `ProcessTerminal.setProgress`.
+    pub fn progress_sequence(active: bool) -> &'static str {
+        if active {
+            crate::osc::TERMINAL_PROGRESS_ACTIVE_SEQUENCE
+        } else {
+            crate::osc::TERMINAL_PROGRESS_CLEAR_SEQUENCE
+        }
+    }
+
+    pub fn set_progress(&mut self, active: bool) -> Option<&'static str> {
+        if !self.show_terminal_progress && active {
+            return None;
+        }
+        self.progress_active = active;
+        Some(Self::progress_sequence(active))
+    }
+
+    pub fn leave_sequences(fullscreen: bool) -> String {
+        let mut out = String::new();
+        out.push_str(crate::osc::TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+        out.push_str(KITTY_KEYBOARD_DISABLE);
+        out.push_str(BRACKETED_PASTE_DISABLE);
+        out.push_str(MOUSE_DISABLE);
+        if fullscreen {
+            out.push_str(ENABLE_AUTOWRAP);
+            out.push_str(ALT_BUFFER_LEAVE);
+        }
+        out
+    }
+
+    pub fn current_model(&self) -> Option<&str> {
+        self.models.get(self.model_index).map(String::as_str)
+    }
+
+    pub fn current_thinking(&self) -> &str {
+        self.thinking_levels
+            .get(self.thinking_index)
+            .map(String::as_str)
+            .unwrap_or("off")
+    }
+
+    pub fn open_model_overlay(&mut self) {
+        self.overlay_kind = OverlayKind::Model;
+        self.chrome.selector = None;
+        let items = if self.model_items.is_empty() {
+            self.models
+                .iter()
+                .map(|key| ModelSelectorItem::from_key(key))
+                .collect()
+        } else {
+            self.model_items.clone()
+        };
+        let scoped = self
+            .enabled_model_ids
+            .as_ref()
+            .map(|ids| {
+                items
+                    .iter()
+                    .filter(|item| ids.iter().any(|id| id == &item.key()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.chrome.model_selector = Some(
+            ModelSelector::new(
+                items,
+                self.current_model().map(str::to_string),
+                self.default_model.clone(),
+                scoped,
+            )
+            .with_theme(self.chrome.theme.clone()),
+        );
+        self.chrome.status = "Select model".into();
+    }
+
+    pub fn open_trust_selector(&mut self, selector: TrustSelector) {
+        self.overlay_kind = OverlayKind::Trust;
+        self.chrome.trust_selector = Some(selector);
+        self.chrome.status = "Project trust".into();
+    }
+
+    pub fn open_thinking_selector(&mut self, default_level: Option<&str>) {
+        self.overlay_kind = OverlayKind::Thinking;
+        self.chrome.thinking_selector = Some(
+            ThinkingSelector::new(
+                self.current_thinking().to_string(),
+                self.thinking_levels.clone(),
+                default_level.unwrap_or("off"),
+            )
+            .with_theme(self.chrome.theme.clone()),
+        );
+        self.chrome.status = "Select thinking level".into();
+    }
+
+    pub fn open_session_overlay(&mut self, sessions: Vec<String>) {
+        self.overlay_kind = OverlayKind::Session;
+        self.chrome.selector = Some(SelectList::new(sessions));
+        self.chrome.session_selector = None;
+        self.chrome.status = "Select session".into();
+    }
+
+    pub fn open_session_selector(&mut self, items: Vec<SessionItem>) {
+        self.overlay_kind = OverlayKind::Session;
+        self.chrome.session_selector = Some(SessionSelector::new(items));
+        self.chrome.selector = None;
+        self.chrome.status = "Select session".into();
+    }
+
+    pub fn open_settings_overlay(&mut self, items: Vec<String>) {
+        self.open_settings_list(SettingsList::new(
+            items
+                .into_iter()
+                .map(|label| SettingItem {
+                    id: label.clone(),
+                    label,
+                    description: None,
+                    current_value: String::new(),
+                    values: Vec::new(),
+                })
+                .collect(),
+            self.autocomplete_max_visible,
+        ));
+    }
+
+    pub fn open_settings_list(&mut self, list: SettingsList) {
+        self.overlay_kind = OverlayKind::Settings;
+        self.chrome.settings_list = Some(list);
+        self.chrome.settings_submenu = None;
+        self.chrome.selector = None;
+        self.chrome.status = "Settings".into();
+    }
+
+    pub fn open_settings_submenu(&mut self, submenu: SettingsSubmenu) {
+        self.overlay_kind = OverlayKind::SettingsSubmenu;
+        self.chrome.settings_submenu = Some(submenu);
+        self.chrome.status = "Settings".into();
+    }
+
+    pub fn open_first_time_setup(&mut self, detected_theme: &str, app_name: &str) {
+        self.overlay_kind = OverlayKind::FirstTime;
+        self.chrome.first_time = Some(FirstTimeSetup::new(detected_theme, app_name));
+        self.chrome.status = "First-time setup".into();
+    }
+
+    pub fn open_login_dialog(
+        &mut self,
+        provider_id: &str,
+        provider_name: Option<&str>,
+        title: Option<&str>,
+    ) {
+        self.overlay_kind = OverlayKind::Login;
+        self.chrome.oauth_selector = None;
+        self.chrome.login_dialog = Some(LoginDialog::new(provider_id, provider_name, title));
+        self.chrome.status = format!("Login to {provider_id}");
+    }
+
+    pub fn open_oauth_selector(
+        &mut self,
+        mode: AuthSelectorMode,
+        providers: Vec<AuthSelectorProvider>,
+        initial_search: Option<&str>,
+    ) {
+        self.login_auth_options = providers.clone();
+        self.auth_selector_logout = mode == AuthSelectorMode::Logout;
+        self.overlay_kind = OverlayKind::AuthSelector;
+        self.chrome.oauth_selector = Some(
+            OAuthSelector::new(mode, providers, initial_search)
+                .with_theme(self.chrome.theme.clone()),
+        );
+        self.chrome.status = match mode {
+            AuthSelectorMode::Login => "Select provider to configure".into(),
+            AuthSelectorMode::Logout => "Select provider to logout".into(),
+        };
+    }
+
+    pub fn set_supported_thinking_levels(&mut self, reasoning: bool, levels: Vec<String>) {
+        self.supports_thinking = reasoning;
+        if levels.is_empty() {
+            return;
+        }
+        let current = self.current_thinking().to_string();
+        self.thinking_levels = levels;
+        self.thinking_index = self
+            .thinking_levels
+            .iter()
+            .position(|level| level == &current)
+            .unwrap_or(0);
+    }
+
+    pub fn open_tree_overlay(&mut self, roots: Vec<SessionTreeNode>, leaf_id: Option<String>) {
+        self.overlay_kind = OverlayKind::Tree;
+        self.chrome.tree = Some(TreeSelector::new(
+            roots,
+            leaf_id,
+            self.autocomplete_max_visible.max(8),
+            self.tree_filter_mode,
+        ));
+        self.chrome.status = "Session Tree".into();
+    }
+
+    pub fn open_scoped_models(&mut self, models: Vec<ScopedModel>) {
+        self.overlay_kind = OverlayKind::ScopedModels;
+        self.chrome.scoped_models = Some(ScopedModelsSelector::new(
+            models,
+            self.enabled_model_ids.clone(),
+        ));
+        self.chrome.status = "Model Configuration".into();
+    }
+
+    pub fn close_overlays(&mut self) {
+        self.chrome.selector = None;
+        self.chrome.model_selector = None;
+        self.chrome.thinking_selector = None;
+        self.chrome.trust_selector = None;
+        self.chrome.settings_list = None;
+        self.chrome.settings_submenu = None;
+        self.chrome.session_selector = None;
+        self.chrome.first_time = None;
+        self.chrome.login_dialog = None;
+        self.chrome.oauth_selector = None;
+        self.chrome.tree = None;
+        self.chrome.scoped_models = None;
+        self.chrome.extension_selector = None;
+        self.chrome.extension_input = None;
+        self.chrome.extension_editor = None;
+        self.chrome.extension_confirm = None;
+        self.chrome.extension_progress = None;
+        self.chrome.custom_overlay_lines = None;
+        self.chrome.custom_overlay_path = None;
+        self.chrome.custom_overlay_command = None;
+        self.chrome.custom_overlay_snapshot = None;
+        self.chrome.custom_overlay_composite = false;
+        self.chrome.custom_overlay_options = None;
+        self.overlay_kind = OverlayKind::None;
+        self.chrome.status.clear();
+    }
+
+    fn overlay_open(&self) -> bool {
+        self.chrome.first_time.is_some()
+            || self.chrome.login_dialog.is_some()
+            || self.chrome.oauth_selector.is_some()
+            || self.chrome.tree.is_some()
+            || self.chrome.scoped_models.is_some()
+            || self.chrome.selector.is_some()
+            || self.chrome.model_selector.is_some()
+            || self.chrome.thinking_selector.is_some()
+            || self.chrome.trust_selector.is_some()
+            || self.chrome.settings_list.is_some()
+            || self.chrome.settings_submenu.is_some()
+            || self.chrome.session_selector.is_some()
+            || self.chrome.extension_selector.is_some()
+            || self.chrome.extension_input.is_some()
+            || self.chrome.extension_editor.is_some()
+            || self.chrome.extension_confirm.is_some()
+            || self.chrome.extension_progress.is_some()
+            || self.chrome.custom_overlay_path.is_some()
+            || self.chrome.custom_overlay_lines.is_some()
+    }
+
+    pub fn apply_extension_ui_calls(&mut self, calls: &[serde_json::Value]) {
+        for call in calls {
+            self.chrome.apply_ui_call(call);
+            if call.get("op").and_then(|value| value.as_str()) == Some("setTitle") {
+                if let Some(title) = call.get("title").and_then(|value| value.as_str()) {
+                    self.terminal_title = Some(title.to_string());
+                }
+            }
+        }
+    }
+
+    pub fn open_extension_selector(&mut self, title: impl Into<String>, options: Vec<String>) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionSelect;
+        self.chrome.extension_selector = Some(ExtensionSelector::new(title, options));
+        self.chrome.status = "Extension selector".into();
+        if self.extension_dialog_context.is_none() {
+            self.extension_dialog_context = Some("extension-select".into());
+        }
+    }
+
+    pub fn open_extension_input(
+        &mut self,
+        title: impl Into<String>,
+        placeholder: impl Into<String>,
+    ) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionInput;
+        self.chrome.extension_input = Some(ExtensionInput::new(title, placeholder));
+        self.chrome.status = "Extension input".into();
+    }
+
+    pub fn open_extension_editor(&mut self, title: impl Into<String>, prefill: impl Into<String>) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionEditor;
+        self.chrome.extension_editor = Some(ExtensionEditor::new(title, prefill));
+        self.chrome.status = "Extension editor".into();
+    }
+
+    pub fn open_custom_overlay(
+        &mut self,
+        path: impl Into<String>,
+        command: impl Into<String>,
+        lines: Vec<String>,
+        snapshot: Option<serde_json::Value>,
+    ) {
+        self.close_overlays();
+        self.chrome.custom_overlay_path = Some(path.into());
+        self.chrome.custom_overlay_command = Some(command.into());
+        self.chrome.custom_overlay_snapshot = snapshot;
+        self.chrome.custom_overlay_lines = Some(lines);
+        self.chrome.status = "Extension custom UI".into();
+    }
+
+    pub fn open_extension_confirm(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let keep_progress = self.chrome.extension_progress.clone();
+        self.close_overlays();
+        self.chrome.extension_progress = keep_progress;
+        self.overlay_kind = OverlayKind::ExtensionConfirm;
+        self.chrome.extension_confirm = Some(ExtensionConfirm::new(title, message));
+        self.chrome.status = "Extension confirm".into();
+    }
+
+    pub fn open_extension_progress(
+        &mut self,
+        title: impl Into<String>,
+        model: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionProgress;
+        self.chrome.extension_progress = Some(ExtensionProgress::new(title, model, message));
+        self.chrome.status = "Extension progress".into();
+    }
+
+    pub fn update_extension_progress(
+        &mut self,
+        message: impl Into<String>,
+        ratio: Option<f64>,
+        detail: Option<String>,
+    ) {
+        if let Some(progress) = &mut self.chrome.extension_progress {
+            progress.message = message.into();
+            progress.ratio = ratio;
+            progress.detail = detail;
+        }
+    }
+
+    pub fn begin_osc_query(&mut self, timeout_ms: u64) -> String {
+        self.osc_query = Some(OscQuery {
+            started: Instant::now(),
+            timeout: Duration::from_millis(timeout_ms),
+            osc11: None,
+            scheme: None,
+            finished: false,
+        });
+        format!(
+            "{}{}",
+            crate::osc::OSC_11_QUERY,
+            crate::osc::COLOR_SCHEME_QUERY
+        )
+    }
+
+    pub fn finish_osc_query(&mut self, now: Instant) -> Option<ThemeDetection> {
+        let query = self.osc_query.as_mut()?;
+        if query.finished {
+            return None;
+        }
+        let has_reply = query.scheme.is_some() || query.osc11.is_some();
+        let expired = now.saturating_duration_since(query.started) >= query.timeout;
+        if !has_reply && !expired {
+            return None;
+        }
+        query.finished = true;
+        Some(crate::osc::detect_terminal_theme_for_auto(
+            query.scheme.as_deref(),
+            query.osc11.as_deref(),
+            std::env::var("COLORFGBG").ok().as_deref(),
+        ))
+    }
+
+    fn ingest_osc_reply(&mut self, data: &str) {
+        if let Some(query) = &mut self.osc_query {
+            if crate::osc::parse_terminal_color_scheme_report(data).is_some() {
+                query.scheme = Some(data.to_string());
+            }
+            if crate::osc::parse_osc11_background_color(data).is_some()
+                || crate::osc::is_osc11_background_color_response(data)
+            {
+                query.osc11 = Some(data.to_string());
+            }
+        }
+    }
+
+    pub fn push_tool_card(&mut self, card: ToolCard) {
+        if let Some(existing) = self
+            .chrome
+            .tool_cards
+            .iter_mut()
+            .find(|item| item.tool_call_id == card.tool_call_id)
+        {
+            *existing = card;
+        } else {
+            self.chrome.tool_cards.push(card);
+        }
+    }
+
+    pub fn finish_tool_card(
+        &mut self,
+        tool_call_id: &str,
+        result: &serde_json::Value,
+        is_error: bool,
+    ) {
+        if let Some(card) = self
+            .chrome
+            .tool_cards
+            .iter_mut()
+            .find(|item| item.tool_call_id == tool_call_id)
+        {
+            card.finish(result, is_error);
+            for (data, _mime) in card.image_payloads() {
+                self.place_kitty_image(&data, None);
+            }
+        }
+    }
+
+    pub fn place_kitty_image(&mut self, base64_data: &str, rows: Option<u32>) -> u32 {
+        if std::env::var("PI_TERMINAL_IMAGES").ok().as_deref() == Some("off") {
+            return 0;
+        }
+        let image_id = self.next_image_id;
+        self.next_image_id = self.next_image_id.saturating_add(1);
+        let sequence = encode_kitty(
+            base64_data,
+            Some(40),
+            rows.or(Some(1)),
+            Some(image_id),
+            false,
+        );
+        self.chrome.transcript.push("image", sequence);
+        image_id
+    }
+
+    pub fn remove_kitty_image(&self, image_id: u32) -> String {
+        delete_kitty_image(image_id)
+    }
+
+    pub fn refresh_autocomplete(&mut self, force_path: bool) {
+        let text = self.chrome.editor.buffer.clone();
+        self.last_autocomplete_debounce_ms = crate::autocomplete::autocomplete_debounce_ms(
+            force_path,
+            &text,
+            &self.extra_autocomplete,
+        );
+        let found = suggestions(crate::autocomplete::SuggestionQuery {
+            text: &text,
+            commands: &self.slash_commands,
+            models: &self.models,
+            thinking_levels: &self.thinking_levels,
+            login_providers: &self.login_providers,
+            extra_providers: &self.extra_autocomplete,
+            cwd: &self.cwd,
+            force_path,
+        });
+        if let Some(mut found) = found {
+            found.items.truncate(self.autocomplete_max_visible);
+            self.chrome.autocomplete_selected = 0;
+            self.chrome.autocomplete = Some(found);
+        } else {
+            self.chrome.autocomplete = None;
+        }
+    }
+
+    pub fn accept_autocomplete(&mut self) -> bool {
+        let Some(suggestions) = self.chrome.autocomplete.clone() else {
+            return false;
+        };
+        let Some(item) = suggestions.items.get(self.chrome.autocomplete_selected) else {
+            return false;
+        };
+        let cursor = self.chrome.editor.cursor;
+        self.chrome.editor.buffer = apply_completion(
+            &self.chrome.editor.buffer,
+            cursor,
+            &suggestions.prefix,
+            item,
+        );
+        self.chrome.editor.cursor = self.chrome.editor.buffer.len();
+        self.chrome.autocomplete = None;
+        true
+    }
+
+    pub fn render_frame(&self) -> String {
+        let mut lines = self.chrome.render(self.width);
+        if let Some(selector) = &self.chrome.model_selector {
+            let overlay = Overlay::new("model", Box::new(selector.clone()));
+            lines.extend(overlay.render(self.width));
+        } else if let Some(selector) = &self.chrome.selector {
+            let overlay = Overlay::new("model", Box::new(selector.clone()));
+            lines.extend(overlay.render(self.width));
+        }
+        format!(
+            "{BEGIN_SYNCHRONIZED_OUTPUT}{}{END_SYNCHRONIZED_OUTPUT}",
+            lines.join("\n")
+        )
+    }
+
+    pub fn handle_line(&mut self, line: &str) -> SessionAction {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "/tree" {
+            return SessionAction::OpenTree;
+        }
+        if trimmed == "/scoped-models" {
+            return SessionAction::OpenScopedModels;
+        }
+        if trimmed == "/thinking"
+            || (trimmed.starts_with("/thinking ") && trimmed["/thinking ".len()..].is_empty())
+        {
+            self.open_thinking_selector(None);
+            return SessionAction::OpenThinking;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/thinking ") {
+            if !rest.is_empty() {
+                return SessionAction::SelectThinking(rest.to_string());
+            }
+        }
+        if trimmed == "/model"
+            || (trimmed.starts_with("/model ") && trimmed["/model ".len()..].is_empty())
+        {
+            self.open_model_overlay();
+            return SessionAction::OpenModel;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/model ") {
+            if !rest.is_empty() {
+                return SessionAction::SelectModel(rest.to_string());
+            }
+        }
+        self.chrome.editor.handle_input(trimmed);
+        let submitted = self.chrome.editor.submit();
+        if submitted.is_empty() {
+            SessionAction::None
+        } else {
+            SessionAction::Submit(submitted)
+        }
+    }
+
+    /// Feed raw stdin through [`StdinBuffer`] then [`handle_bytes`].
+    /// Default [`handle_bytes`] stays immediate so existing tests keep ESC-as-Abort.
+    pub fn process_stdin(&mut self, data: &str) -> SessionAction {
+        if self.stdin_buffer.is_none() {
+            self.stdin_buffer = Some(crate::stdin_buffer::StdinBuffer::with_options(
+                crate::stdin_buffer::StdinBufferOptions {
+                    timeout: 50,
+                    escape_timeout: self.escape_timeout_ms,
+                },
+            ));
+        }
+        let events = self
+            .stdin_buffer
+            .as_mut()
+            .expect("stdin buffer")
+            .process(data);
+        let mut last = SessionAction::None;
+        for paste in events.paste {
+            last = self.handle_bytes(&format!("\x1b[200~{paste}\x1b[201~"));
+        }
+        for sequence in events.data {
+            last = self.handle_bytes(&sequence);
+        }
+        last
+    }
+
+    pub fn tick_stdin(&mut self, ms: u64) -> SessionAction {
+        let Some(buffer) = self.stdin_buffer.as_mut() else {
+            return SessionAction::None;
+        };
+        let events = buffer.tick(ms);
+        let mut last = SessionAction::None;
+        for sequence in events.data {
+            last = self.handle_bytes(&sequence);
+        }
+        last
+    }
+
+    pub fn handle_bytes(&mut self, data: &str) -> SessionAction {
+        if data.is_empty() {
+            return SessionAction::None;
+        }
+        let rewritten = rewrite_shift_enter_input(data);
+        if rewritten != data {
+            return self.handle_bytes(&rewritten);
+        }
+        if crate::osc::is_osc11_background_color_response(data)
+            || crate::osc::parse_terminal_color_scheme_report(data).is_some()
+        {
+            self.ingest_osc_reply(data);
+            if let Some(setup) = &mut self.chrome.first_time {
+                let scheme = crate::osc::parse_terminal_color_scheme_report(data);
+                let osc11 = crate::osc::parse_osc11_background_color(data).map(|_| data);
+                let colorfgbg = std::env::var("COLORFGBG").ok();
+                let detected =
+                    crate::osc::detect_terminal_theme_for_auto(scheme, osc11, colorfgbg.as_deref());
+                if detected.source != "fallback" {
+                    setup.detected_theme = detected.theme.clone();
+                    if let Some(index) = crate::first_time::THEME_OPTIONS
+                        .iter()
+                        .position(|(value, _)| *value == detected.theme)
+                    {
+                        setup.theme_index = index;
+                    }
+                }
+            }
+            return SessionAction::None;
+        }
+        if let Some(mut buf) = self.paste_buf.take() {
+            if let Some(end) = data.find("\x1b[201~") {
+                buf.push_str(&data[..end]);
+                self.chrome.editor.handle_paste(&buf);
+                let rest = &data[end + "\x1b[201~".len()..];
+                if rest.is_empty() {
+                    return SessionAction::None;
+                }
+                return self.handle_bytes(rest);
+            }
+            buf.push_str(data);
+            self.paste_buf = Some(buf);
+            return SessionAction::None;
+        }
+        if let Some(rest) = data.strip_prefix("\x1b[200~") {
+            if let Some(end) = rest.find("\x1b[201~") {
+                self.chrome.editor.handle_paste(&rest[..end]);
+                return self.handle_bytes(&rest[end + "\x1b[201~".len()..]);
+            }
+            self.paste_buf = Some(rest.to_string());
+            return SessionAction::None;
+        }
+        if let Some(mouse) = parse_mouse_sgr(data) {
+            if mouse.kind == MouseKind::Down || mouse.kind == MouseKind::ScrollDown {
+                self.chrome.apply_mouse(mouse.y, self.width);
+            }
+            if mouse.kind == MouseKind::ScrollUp {
+                if let Some(selector) = &mut self.chrome.selector {
+                    selector.move_by(-1);
+                }
+            }
+            if mouse.kind == MouseKind::ScrollDown {
+                if let Some(selector) = &mut self.chrome.selector {
+                    selector.move_by(1);
+                }
+            }
+            return SessionAction::None;
+        }
+        if let Some(text) = decode_kitty_printable(data) {
+            return self.handle_printable(&text);
+        }
+        if let Some(action) = self.handle_special_overlay(data) {
+            return action;
+        }
+        if self.chrome.custom_overlay_path.is_some() {
+            if data == "\x03" {
+                self.close_overlays();
+                return SessionAction::CloseOverlay;
+            }
+            return SessionAction::CustomOverlayInput(data.to_string());
+        }
+        if !self.overlay_open() && self.custom_editor_path.is_some() && is_custom_editor_input(data)
+        {
+            return SessionAction::CustomEditorInput(data.to_string());
+        }
+        if !self.overlay_open() {
+            if let Some((key, path)) = self.matching_extension_shortcut(data) {
+                return SessionAction::ExtensionShortcut { key, path };
+            }
+            if self.keybindings.matches(data, "app.editor.external") {
+                return SessionAction::ExternalEditor;
+            }
+            if self.keybindings.matches(data, "app.clipboard.pasteImage") {
+                return SessionAction::PasteClipboard;
+            }
+            if self.keybindings.matches(data, "app.message.followUp") {
+                let text = self.chrome.editor.submit();
+                if text.is_empty() {
+                    return SessionAction::None;
+                }
+                self.follow_up_queue.push(text.clone());
+                return SessionAction::FollowUp(text);
+            }
+            if self.keybindings.matches(data, "app.message.dequeue") {
+                if let Some(text) = self.follow_up_queue.pop() {
+                    self.chrome.editor.buffer = text;
+                    self.chrome.editor.cursor = self.chrome.editor.buffer.len();
+                }
+                return SessionAction::Dequeue;
+            }
+            if self.keybindings.matches(data, "app.model.select") {
+                self.open_model_overlay();
+                return SessionAction::OpenModel;
+            }
+            if self.keybindings.matches(data, "app.tools.expand") {
+                self.chrome.set_tools_expanded(!self.chrome.tools_expanded);
+                return SessionAction::ExpandTools;
+            }
+            if self.keybindings.matches(data, "app.thinking.toggle") {
+                self.chrome.transcript.hide_thinking_block =
+                    !self.chrome.transcript.hide_thinking_block;
+                return SessionAction::ToggleHideThinking;
+            }
+            if self.keybindings.matches(data, "app.thinking.cycle") {
+                self.cycle_thinking();
+                return SessionAction::CycleThinking;
+            }
+            if self.keybindings.matches(data, "app.model.cycleBackward") {
+                self.cycle_model_backward();
+                return SessionAction::CycleModelBackward;
+            }
+            if self.keybindings.matches(data, "app.model.cycleForward") {
+                self.cycle_model();
+                return SessionAction::CycleModel;
+            }
+            if self.keybindings.matches(data, "app.session.new") {
+                return SessionAction::NewSession;
+            }
+            if self.keybindings.matches(data, "app.session.tree") {
+                return SessionAction::OpenTree;
+            }
+            if self.keybindings.matches(data, "app.session.fork") {
+                return SessionAction::OpenFork;
+            }
+            if self.keybindings.matches(data, "app.session.resume") {
+                return SessionAction::OpenResume;
+            }
+            if self.keybindings.matches(data, "app.suspend") {
+                return SessionAction::Suspend;
+            }
+            if self.keybindings.matches(data, "app.clear") && !self.chrome.editor.buffer.is_empty()
+            {
+                self.chrome.editor.buffer.clear();
+                self.chrome.editor.cursor = 0;
+                return SessionAction::None;
+            }
+            if self.keybindings.matches(data, "app.exit") && self.chrome.editor.buffer.is_empty() {
+                return SessionAction::Quit;
+            }
+            if self.apply_editor_key(data) {
+                return SessionAction::None;
+            }
+        }
+        match data {
+            "\x03" => SessionAction::Quit,
+            "\x10" => {
+                self.cycle_model();
+                SessionAction::CycleModel
+            }
+            "\x14" => {
+                self.cycle_thinking();
+                SessionAction::CycleThinking
+            }
+            "\x0c" => {
+                self.chrome.transcript.lines.clear();
+                self.chrome.tool_cards.clear();
+                let _ = delete_all_kitty_images();
+                SessionAction::Clear
+            }
+            "\x1b" => self.handle_escape(),
+            "\t" => self.handle_tab(),
+            " " if self.chrome.settings_list.is_some() || self.chrome.scoped_models.is_some() => {
+                if let Some(settings) = &mut self.chrome.settings_list {
+                    settings.cycle();
+                }
+                SessionAction::CycleSetting
+            }
+            "\r" => self.handle_enter(),
+            "\n" | NATIVE_SHIFT_ENTER_SEQUENCE => {
+                if self.overlay_open() {
+                    self.handle_enter()
+                } else {
+                    self.chrome.editor.insert_str("\n");
+                    SessionAction::None
+                }
+            }
+            "\x1b[A" => {
+                self.move_overlay(-1);
+                SessionAction::None
+            }
+            "\x1b[B" => {
+                self.move_overlay(1);
+                SessionAction::None
+            }
+            other => self.handle_printable(other),
+        }
+    }
+
+    fn handle_tab(&mut self) -> SessionAction {
+        if self.accept_autocomplete() {
+            return SessionAction::None;
+        }
+        self.refresh_autocomplete(true);
+        if self
+            .chrome
+            .autocomplete
+            .as_ref()
+            .is_some_and(|items| items.items.len() == 1)
+        {
+            self.accept_autocomplete();
+        }
+        SessionAction::None
+    }
+
+    fn handle_special_overlay(&mut self, data: &str) -> Option<SessionAction> {
+        if let Some(selector) = &mut self.chrome.trust_selector {
+            return Some(match selector.handle_key(data) {
+                TrustSelectorAction::None => SessionAction::None,
+                TrustSelectorAction::Select { trusted, updates } => {
+                    self.close_overlays();
+                    SessionAction::SelectTrust { trusted, updates }
+                }
+                TrustSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
+        if let Some(selector) = &mut self.chrome.thinking_selector {
+            return Some(match selector.handle_key(data) {
+                ThinkingSelectorAction::None => SessionAction::None,
+                ThinkingSelectorAction::Select(value) => {
+                    if let Some(index) = self.thinking_levels.iter().position(|item| item == &value)
+                    {
+                        self.thinking_index = index;
+                    }
+                    self.close_overlays();
+                    SessionAction::SelectThinking(value)
+                }
+                ThinkingSelectorAction::SelectAsDefault(value) => {
+                    if let Some(index) = self.thinking_levels.iter().position(|item| item == &value)
+                    {
+                        self.thinking_index = index;
+                    }
+                    self.close_overlays();
+                    SessionAction::SelectThinkingAsDefault(value)
+                }
+                ThinkingSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
+        if let Some(selector) = &mut self.chrome.model_selector {
+            return Some(match selector.handle_key(data) {
+                ModelSelectorAction::None => SessionAction::None,
+                ModelSelectorAction::Select(value) => {
+                    if let Some(index) = self.models.iter().position(|item| item == &value) {
+                        self.model_index = index;
+                    }
+                    self.close_overlays();
+                    SessionAction::SelectModel(value)
+                }
+                ModelSelectorAction::SelectAsDefault(value) => {
+                    if let Some(index) = self.models.iter().position(|item| item == &value) {
+                        self.model_index = index;
+                    }
+                    self.default_model = Some(value.clone());
+                    self.close_overlays();
+                    SessionAction::SelectModelAsDefault(value)
+                }
+                ModelSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
+        if let Some(selector) = &mut self.chrome.extension_selector {
+            return Some(match selector.handle_key(data) {
+                ExtensionDialogAction::None => SessionAction::None,
+                ExtensionDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::ExtensionSelect(None)
+                }
+                ExtensionDialogAction::Select(value) => {
+                    self.close_overlays();
+                    SessionAction::ExtensionSelect(Some(value))
+                }
+                _ => SessionAction::None,
+            });
+        }
+        if let Some(input) = &mut self.chrome.extension_input {
+            return Some(match input.handle_key(data) {
+                ExtensionDialogAction::None => SessionAction::None,
+                ExtensionDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::ExtensionInput(None)
+                }
+                ExtensionDialogAction::Submit(value) => {
+                    self.close_overlays();
+                    SessionAction::ExtensionInput(Some(value))
+                }
+                _ => SessionAction::None,
+            });
+        }
+        if let Some(editor) = &mut self.chrome.extension_editor {
+            return Some(match editor.handle_key(data) {
+                ExtensionDialogAction::None => SessionAction::None,
+                ExtensionDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::ExtensionEditor(None)
+                }
+                ExtensionDialogAction::Submit(value) => {
+                    self.close_overlays();
+                    SessionAction::ExtensionEditor(Some(value))
+                }
+                _ => SessionAction::None,
+            });
+        }
+        if let Some(confirm) = &mut self.chrome.extension_confirm {
+            return Some(match confirm.handle_key(data) {
+                ExtensionDialogAction::None => SessionAction::None,
+                ExtensionDialogAction::Confirm(value) => {
+                    self.chrome.extension_confirm = None;
+                    if self.chrome.extension_progress.is_none() {
+                        self.close_overlays();
+                    } else {
+                        self.overlay_kind = OverlayKind::ExtensionProgress;
+                    }
+                    SessionAction::ExtensionConfirm(value)
+                }
+                ExtensionDialogAction::Cancel => {
+                    self.chrome.extension_confirm = None;
+                    if self.chrome.extension_progress.is_none() {
+                        self.close_overlays();
+                    } else {
+                        self.overlay_kind = OverlayKind::ExtensionProgress;
+                    }
+                    SessionAction::ExtensionConfirm(false)
+                }
+                _ => SessionAction::None,
+            });
+        }
+        if let Some(progress) = &mut self.chrome.extension_progress {
+            return Some(match progress.handle_key(data) {
+                ExtensionDialogAction::Cancel => SessionAction::ExtensionProgressCancel,
+                _ => SessionAction::None,
+            });
+        }
+        if self.chrome.first_time.is_some() {
+            let action = self
+                .chrome
+                .first_time
+                .as_mut()
+                .expect("first-time overlay")
+                .handle_key(data);
+            return Some(match action {
+                FirstTimeAction::PreviewTheme(theme) => {
+                    if let Some(found) = crate::builtin_themes()
+                        .into_iter()
+                        .find(|item| item.name == theme)
+                    {
+                        self.chrome.theme = found;
+                    }
+                    SessionAction::None
+                }
+                FirstTimeAction::None => SessionAction::None,
+                FirstTimeAction::Submit(result) => {
+                    self.close_overlays();
+                    SessionAction::FirstTimeSubmit {
+                        theme: result.theme,
+                        share_analytics: result.share_analytics,
+                    }
+                }
+                FirstTimeAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::FirstTimeSkip
+                }
+            });
+        }
+        if let Some(selector) = &mut self.chrome.oauth_selector {
+            return Some(match selector.handle_key(data) {
+                OAuthSelectorAction::None => SessionAction::None,
+                OAuthSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+                OAuthSelectorAction::Select {
+                    provider_id,
+                    auth_type,
+                } => {
+                    self.close_overlays();
+                    SessionAction::SelectAuthProvider {
+                        provider: provider_id,
+                        auth_type,
+                    }
+                }
+            });
+        }
+        if let Some(login) = &mut self.chrome.login_dialog {
+            return Some(match login.handle_key(data) {
+                LoginDialogAction::None => SessionAction::None,
+                LoginDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::LoginCancelled
+                }
+                LoginDialogAction::Submit(value) => SessionAction::LoginSubmit(value),
+            });
+        }
+        if let Some(tree) = &mut self.chrome.tree {
+            return Some(match tree.handle_key(data) {
+                TreeAction::None => SessionAction::None,
+                TreeAction::Select(id) => {
+                    self.close_overlays();
+                    SessionAction::SelectTreeEntry(id)
+                }
+                TreeAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+                TreeAction::Copy(text) => SessionAction::CopyText(text),
+                TreeAction::LabelChange { id, label } => SessionAction::TreeLabel { id, label },
+            });
+        }
+        if let Some(scoped) = &mut self.chrome.scoped_models {
+            return Some(match scoped.handle_key(data) {
+                ScopedModelsAction::None => SessionAction::None,
+                ScopedModelsAction::Change(ids) => {
+                    self.enabled_model_ids = ids.clone();
+                    SessionAction::ChangeScopedModels(ids)
+                }
+                ScopedModelsAction::Persist(ids) => {
+                    self.enabled_model_ids = ids.clone();
+                    SessionAction::PersistScopedModels(ids)
+                }
+                ScopedModelsAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
+        if let Some(menu) = &mut self.chrome.settings_submenu {
+            return Some(match menu.handle_key(data) {
+                SettingsSubmenuAction::None => SessionAction::None,
+                SettingsSubmenuAction::Cancel => {
+                    self.chrome.settings_submenu = None;
+                    self.overlay_kind = OverlayKind::Settings;
+                    SessionAction::None
+                }
+                SettingsSubmenuAction::Preview(value) => {
+                    self.preview_theme_setting(&value);
+                    SessionAction::None
+                }
+                SettingsSubmenuAction::Apply { id, value } => {
+                    self.chrome.settings_submenu = None;
+                    self.overlay_kind = OverlayKind::Settings;
+                    SessionAction::ApplySetting { id, value }
+                }
+            });
+        }
+        if let Some(selector) = &mut self.chrome.session_selector {
+            return Some(match selector.handle_key(data) {
+                SessionSelectorAction::None => SessionAction::None,
+                SessionSelectorAction::Select(id) => {
+                    self.close_overlays();
+                    SessionAction::SelectSession(id)
+                }
+                SessionSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+                SessionSelectorAction::Rename { id, name } => {
+                    SessionAction::RenameSession { id, name }
+                }
+                SessionSelectorAction::Delete { id, path } => {
+                    SessionAction::DeleteSession { id, path }
+                }
+            });
+        }
+        None
+    }
+
+    fn preview_theme_setting(&mut self, value: &str) {
+        let resolved = if let Some((light, dark)) = parse_auto_theme(value) {
+            let detected = crate::osc::detect_terminal_theme_for_auto(
+                std::env::var("PI_COLOR_SCHEME_REPLY").ok().as_deref(),
+                std::env::var("PI_OSC11_REPLY").ok().as_deref(),
+                std::env::var("COLORFGBG").ok().as_deref(),
+            );
+            if detected.theme == "light" {
+                light
+            } else {
+                dark
+            }
+        } else {
+            value.to_string()
+        };
+        if let Some(found) = crate::builtin_themes()
+            .into_iter()
+            .find(|item| item.name == resolved)
+        {
+            self.chrome.theme = found;
+        }
+    }
+
+    fn move_overlay(&mut self, delta: isize) {
+        if let Some(setup) = &mut self.chrome.first_time {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = setup.handle_key(key);
+        } else if let Some(tree) = &mut self.chrome.tree {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = tree.handle_key(key);
+        } else if let Some(scoped) = &mut self.chrome.scoped_models {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = scoped.handle_key(key);
+        } else if let Some(submenu) = &mut self.chrome.settings_submenu {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = submenu.handle_key(key);
+        } else if let Some(sessions) = &mut self.chrome.session_selector {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = sessions.handle_key(key);
+        } else if let Some(settings) = &mut self.chrome.settings_list {
+            settings.move_by(delta);
+        } else if let Some(selector) = &mut self.chrome.model_selector {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = selector.handle_key(key);
+        } else if let Some(selector) = &mut self.chrome.thinking_selector {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = selector.handle_key(key);
+        } else if let Some(selector) = &mut self.chrome.trust_selector {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = selector.handle_key(key);
+        } else if let Some(selector) = &mut self.chrome.selector {
+            selector.move_by(delta);
+        } else if let Some(suggestions) = &self.chrome.autocomplete {
+            let len = suggestions.items.len() as isize;
+            if len > 0 {
+                self.chrome.autocomplete_selected =
+                    (self.chrome.autocomplete_selected as isize + delta).rem_euclid(len) as usize;
+            }
+        }
+    }
+
+    fn handle_escape(&mut self) -> SessionAction {
+        if self.chrome.autocomplete.is_some() {
+            self.chrome.autocomplete = None;
+            return SessionAction::None;
+        }
+        if self.overlay_open() {
+            self.close_overlays();
+            return SessionAction::CloseOverlay;
+        }
+        if self.chrome.editor.buffer.trim().is_empty()
+            && self.double_escape_action != DoubleEscapeAction::None
+        {
+            let now = Instant::now();
+            if self.last_escape.is_some_and(|prev| {
+                now.duration_since(prev) < Duration::from_millis(DOUBLE_ESCAPE_MS)
+            }) {
+                self.last_escape = None;
+                return match self.double_escape_action {
+                    DoubleEscapeAction::Tree => SessionAction::OpenTree,
+                    DoubleEscapeAction::Fork => SessionAction::OpenFork,
+                    DoubleEscapeAction::None => SessionAction::Abort,
+                };
+            }
+            self.last_escape = Some(now);
+            return SessionAction::None;
+        }
+        self.aborted = true;
+        SessionAction::Abort
+    }
+
+    fn handle_enter(&mut self) -> SessionAction {
+        if self.accept_autocomplete() {
+            return SessionAction::None;
+        }
+        if self.chrome.thinking_selector.is_some() {
+            return self
+                .handle_special_overlay("\r")
+                .unwrap_or(SessionAction::None);
+        }
+        if self.chrome.trust_selector.is_some() {
+            return self
+                .handle_special_overlay("\r")
+                .unwrap_or(SessionAction::None);
+        }
+        if self.chrome.settings_submenu.is_some() {
+            return self
+                .handle_special_overlay("\r")
+                .unwrap_or(SessionAction::None);
+        }
+        if self.chrome.session_selector.is_some() {
+            return self
+                .handle_special_overlay("\r")
+                .unwrap_or(SessionAction::None);
+        }
+        if let Some(settings) = &self.chrome.settings_list {
+            if let Some(item) = settings.selected_item() {
+                if SettingsSubmenu::is_submenu_setting(&item.id) {
+                    let submenu = match item.id.as_str() {
+                        "theme" => SettingsSubmenu::theme(
+                            &item.current_value,
+                            crate::builtin_themes()
+                                .into_iter()
+                                .map(|theme| theme.name)
+                                .collect(),
+                        ),
+                        "warnings" => {
+                            SettingsSubmenu::warnings(self.warnings_anthropic_extra_usage)
+                        }
+                        "model-thinking" => SettingsSubmenu::model_thinking(
+                            self.models
+                                .iter()
+                                .map(|key| ModelThinkingItem {
+                                    key: key.clone(),
+                                    label: key.clone(),
+                                    level: self.model_thinking_levels.get(key).cloned(),
+                                })
+                                .collect(),
+                        ),
+                        _ => return SessionAction::None,
+                    };
+                    self.open_settings_submenu(submenu);
+                    return SessionAction::OpenSettingsSubmenu;
+                }
+                let value = format!("{}={}", item.id, item.current_value);
+                self.chrome.settings_list = None;
+                self.overlay_kind = OverlayKind::None;
+                self.chrome.status.clear();
+                return SessionAction::SelectSetting(value);
+            }
+            self.chrome.settings_list = None;
+            self.overlay_kind = OverlayKind::None;
+            return SessionAction::CloseOverlay;
+        }
+        if let Some(selector) = &self.chrome.selector {
+            if let Some(item) = selector.selected_item() {
+                let item = item.to_string();
+                let kind = self.overlay_kind;
+                self.chrome.selector = None;
+                self.overlay_kind = OverlayKind::None;
+                self.chrome.status.clear();
+                return match kind {
+                    OverlayKind::Session => SessionAction::SelectSession(item),
+                    OverlayKind::Settings => SessionAction::SelectSetting(item),
+                    OverlayKind::Model | OverlayKind::None => {
+                        if let Some(index) = self.models.iter().position(|m| m == &item) {
+                            self.model_index = index;
+                        }
+                        SessionAction::SelectModel(item)
+                    }
+                    OverlayKind::Tree => SessionAction::SelectTreeEntry(item),
+                    OverlayKind::ScopedModels
+                    | OverlayKind::Login
+                    | OverlayKind::AuthSelector
+                    | OverlayKind::FirstTime
+                    | OverlayKind::SettingsSubmenu
+                    | OverlayKind::ExtensionSelect
+                    | OverlayKind::ExtensionInput
+                    | OverlayKind::ExtensionEditor
+                    | OverlayKind::ExtensionConfirm
+                    | OverlayKind::ExtensionProgress
+                    | OverlayKind::Thinking
+                    | OverlayKind::Trust => SessionAction::CloseOverlay,
+                };
+            }
+            self.chrome.selector = None;
+            self.overlay_kind = OverlayKind::None;
+            return SessionAction::CloseOverlay;
+        }
+        if self.chrome.editor.cursor > 0
+            && self.chrome.editor.buffer[..self.chrome.editor.cursor].ends_with('\\')
+        {
+            self.chrome.editor.backspace();
+            self.chrome.editor.insert_str("\n");
+            return SessionAction::None;
+        }
+        let submitted = self.chrome.editor.submit();
+        if let Some(command) = submitted.trim_start().strip_prefix('!') {
+            return SessionAction::RunBash(command.trim().to_string());
+        }
+        if submitted == "/scoped-models" {
+            return SessionAction::OpenScopedModels;
+        }
+        if submitted == "/tree" {
+            return SessionAction::OpenTree;
+        }
+        if submitted == "/login" || submitted.starts_with("/login ") {
+            return SessionAction::Submit(submitted);
+        }
+        if submitted == "/model" {
+            self.open_model_overlay();
+            return SessionAction::OpenModel;
+        }
+        if let Some(rest) = submitted.strip_prefix("/model ") {
+            if !rest.is_empty() {
+                return SessionAction::SelectModel(rest.to_string());
+            }
+            self.open_model_overlay();
+            return SessionAction::OpenModel;
+        }
+        if submitted.is_empty() {
+            SessionAction::None
+        } else {
+            SessionAction::Submit(submitted)
+        }
+    }
+
+    fn apply_editor_key(&mut self, data: &str) -> bool {
+        let editor = &mut self.chrome.editor;
+        if editor.jump_mode().is_some()
+            && (self.keybindings.matches(data, "tui.editor.jumpForward")
+                || self.keybindings.matches(data, "tui.editor.jumpBackward"))
+        {
+            editor.cancel_jump();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.historyPrevious") {
+            editor.navigate_history(-1);
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.historyNext") {
+            editor.navigate_history(1);
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorUp") {
+            editor.cursor_up();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorDown") {
+            editor.cursor_down();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.pageUp") {
+            editor.page_up();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.pageDown") {
+            editor.page_down();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorWordLeft") {
+            editor.move_word_backwards();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorWordRight") {
+            editor.move_word_forwards();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorLeft") {
+            editor.move_left();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorRight") {
+            editor.move_right();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorLineStart") {
+            editor.move_line_start();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorLineEnd") {
+            editor.move_line_end();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteWordBackward")
+        {
+            editor.delete_word_backwards();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteWordForward")
+        {
+            editor.delete_word_forwards();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteCharForward")
+            && !editor.buffer.is_empty()
+        {
+            editor.delete_forward();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteCharBackward")
+        {
+            editor.backspace();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteToLineStart")
+        {
+            editor.delete_to_line_start();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.deleteToLineEnd") {
+            editor.delete_to_line_end();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.yank") {
+            editor.yank();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.yankPop") {
+            editor.yank_pop();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.undo") {
+            editor.undo();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.jumpForward") {
+            editor.begin_jump_forward();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.jumpBackward") {
+            editor.begin_jump_backward();
+            return true;
+        }
+        false
+    }
+
+    fn handle_printable(&mut self, data: &str) -> SessionAction {
+        if self.chrome.selector.is_some()
+            || self.chrome.thinking_selector.is_some()
+            || self.chrome.trust_selector.is_some()
+            || self.chrome.model_selector.is_some()
+        {
+            if let Some(action) = self.handle_special_overlay(data) {
+                return action;
+            }
+            self.chrome.handle_input(data);
+            return SessionAction::None;
+        }
+        if self.custom_editor_path.is_some() {
+            return SessionAction::CustomEditorInput(data.to_string());
+        }
+        if let Some(forward) = self.chrome.editor.take_jump_mode() {
+            if let Some(ch) = data.chars().find(|ch| !ch.is_control()) {
+                self.chrome.editor.jump_to_char(ch, forward);
+                return SessionAction::None;
+            }
+        }
+        self.chrome.editor.handle_input(data);
+        self.refresh_autocomplete(false);
+        SessionAction::None
+    }
+
+    fn cycle_ids(&self) -> Vec<String> {
+        match &self.enabled_model_ids {
+            None => self.models.clone(),
+            Some(ids) => {
+                let filtered: Vec<String> = ids
+                    .iter()
+                    .filter(|id| self.models.iter().any(|model| model == *id))
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    self.models.clone()
+                } else {
+                    filtered
+                }
+            }
+        }
+    }
+
+    fn cycle_model(&mut self) {
+        let ids = self.cycle_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self.current_model().unwrap_or_default().to_string();
+        let position = ids.iter().position(|id| id == &current).unwrap_or(0);
+        let next = ids[(position + 1) % ids.len()].clone();
+        if let Some(index) = self.models.iter().position(|model| model == &next) {
+            self.model_index = index;
+        }
+        if let Some(model) = self.current_model() {
+            self.chrome.status = format!("model={model}");
+        }
+    }
+
+    fn cycle_thinking(&mut self) {
+        if !self.supports_thinking || self.thinking_levels.is_empty() {
+            return;
+        }
+        self.thinking_index = (self.thinking_index + 1) % self.thinking_levels.len();
+        self.chrome.status = format!("thinking={}", self.current_thinking());
+    }
+
+    fn cycle_model_backward(&mut self) {
+        let ids = self.cycle_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self.current_model().unwrap_or_default().to_string();
+        let position = ids.iter().position(|id| id == &current).unwrap_or(0);
+        let prev = ids[(position + ids.len() - 1) % ids.len()].clone();
+        if let Some(index) = self.models.iter().position(|model| model == &prev) {
+            self.model_index = index;
+        }
+        if let Some(model) = self.current_model() {
+            self.chrome.status = format!("model={model}");
+        }
+    }
+
+    pub fn osc_query_pending(&self) -> bool {
+        self.osc_query.as_ref().is_some_and(|query| !query.finished)
+    }
+
+    fn matching_extension_shortcut(&self, data: &str) -> Option<(String, String)> {
+        self.extension_shortcuts.iter().find_map(|(key, path)| {
+            (crate::keybindings::key_to_bytes(key) == data).then(|| (key.clone(), path.clone()))
+        })
+    }
+}
+
+fn is_custom_editor_input(data: &str) -> bool {
+    matches!(
+        data,
+        "\x1b"
+            | "\r"
+            | "\n"
+            | "\x7f"
+            | "\x08"
+            | "\x1b[A"
+            | "\x1b[B"
+            | "\x1b[C"
+            | "\x1b[D"
+            | "\x1b[3~"
+            | "\x01"
+            | "\x05"
+    ) || (!data.is_empty() && data.chars().all(|ch| !ch.is_control()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtin_themes;
+
+    #[test]
+    fn enter_leave_match_ts_sequences() {
+        let enter = InteractiveSession::enter_sequences(true);
+        assert!(enter.contains(ALT_BUFFER_ENTER));
+        assert!(enter.contains("\x1b[?1003h"));
+        assert!(enter.contains("\x1b[?1004h"));
+        assert!(enter.contains(BRACKETED_PASTE_ENABLE));
+        assert!(enter.contains(KITTY_KEYBOARD_QUERY));
+        assert!(enter.contains(crate::osc::OSC_11_QUERY));
+        assert!(enter.contains(crate::osc::COLOR_SCHEME_QUERY));
+        let leave = InteractiveSession::leave_sequences(true);
+        assert!(leave.contains(crate::osc::TERMINAL_PROGRESS_CLEAR_SEQUENCE));
+        assert!(leave.contains(KITTY_KEYBOARD_DISABLE));
+        assert_eq!(
+            InteractiveSession::progress_sequence(true),
+            crate::osc::TERMINAL_PROGRESS_ACTIVE_SEQUENCE
+        );
+        let mut progress = InteractiveSession::new(
+            builtin_themes().into_iter().next().expect("theme"),
+            "pi",
+            vec!["openai/gpt-4".into()],
+        );
+        assert!(progress.set_progress(true).is_none());
+        progress.show_terminal_progress = true;
+        assert_eq!(
+            progress.set_progress(true),
+            Some(crate::osc::TERMINAL_PROGRESS_ACTIVE_SEQUENCE)
+        );
+        assert!(leave.contains(BRACKETED_PASTE_DISABLE));
+        assert!(leave.contains(MOUSE_DISABLE));
+        assert!(leave.contains(ALT_BUFFER_LEAVE));
+    }
+
+    #[test]
+    fn handles_keys_overlays_mouse_and_kitty_without_tty() {
+        let theme = builtin_themes().into_iter().next().expect("theme");
+        let mut session = InteractiveSession::new(
+            theme,
+            "pi 0.84.4",
+            vec!["google/gemini".into(), "anthropic/sonnet".into()],
+        );
+        assert_eq!(session.handle_bytes("\x10"), SessionAction::CycleModel);
+        assert_eq!(session.current_model(), Some("anthropic/sonnet"));
+        assert_eq!(session.handle_bytes("\x1b[Z"), SessionAction::CycleThinking);
+        assert_eq!(session.current_thinking(), "minimal");
+        assert_eq!(
+            session.handle_bytes("\x14"),
+            SessionAction::ToggleHideThinking
+        );
+        assert!(session.chrome.transcript.hide_thinking_block);
+        assert_eq!(session.handle_bytes("\x0c"), SessionAction::OpenModel);
+        session.close_overlays();
+        session.chrome.tool_cards.push(crate::ToolCard::start(
+            "bash",
+            "call-1",
+            serde_json::json!({}),
+        ));
+        session.chrome.tool_cards.push(crate::ToolCard::start(
+            "read",
+            "call-2",
+            serde_json::json!({}),
+        ));
+        session
+            .chrome
+            .transcript
+            .push_custom("note", "first line\nsecond line", None);
+        assert_eq!(session.handle_bytes("\x0f"), SessionAction::ExpandTools);
+        assert!(session.chrome.tools_expanded);
+        assert!(session.chrome.transcript.tools_expanded);
+        assert!(session.chrome.tool_cards.iter().all(|card| card.expanded));
+        assert!(session
+            .chrome
+            .transcript
+            .render(40)
+            .iter()
+            .any(|line| line.contains("second line")));
+        assert_eq!(session.handle_bytes("\x0f"), SessionAction::ExpandTools);
+        assert!(!session.chrome.tools_expanded);
+        assert!(!session.chrome.transcript.tools_expanded);
+        assert!(session.chrome.tool_cards.iter().all(|card| !card.expanded));
+        assert!(!session
+            .chrome
+            .transcript
+            .render(40)
+            .iter()
+            .any(|line| line.contains("second line")));
+        session.chrome.editor.handle_input("busy");
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::Abort);
+        assert!(session.aborted);
+        session.chrome.editor.buffer.clear();
+        session.double_escape_action = DoubleEscapeAction::Tree;
+        session.last_escape = Some(Instant::now());
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::OpenTree);
+        session.aborted = false;
+        assert_eq!(
+            session.handle_line("/thinking"),
+            SessionAction::OpenThinking
+        );
+        assert!(session.chrome.thinking_selector.is_some());
+        let thinking_frame = session
+            .chrome
+            .thinking_selector
+            .as_ref()
+            .unwrap()
+            .render(80);
+        assert!(thinking_frame
+            .iter()
+            .any(|line| line.contains("Thinking Level")));
+        assert!(thinking_frame
+            .iter()
+            .any(|line| line.contains("Enter to select · Ctrl+S to set as default")));
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectThinking("minimal".into())
+        );
+        assert!(session.chrome.thinking_selector.is_none());
+        assert_eq!(
+            session.handle_line("/thinking high"),
+            SessionAction::SelectThinking("high".into())
+        );
+        session.open_trust_selector(crate::TrustSelector::new(
+            "/project",
+            vec![crate::TrustOption {
+                label: "Trust".into(),
+                trusted: true,
+                updates: vec![crate::TrustUpdate {
+                    path: "/project".into(),
+                    decision: Some(true),
+                }],
+                saved_path: Some("/project".into()),
+            }],
+            None,
+            false,
+        ));
+        assert!(session.chrome.trust_selector.is_some());
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectTrust {
+                trusted: true,
+                updates: vec![crate::TrustUpdate {
+                    path: "/project".into(),
+                    decision: Some(true),
+                }],
+            }
+        );
+        assert!(session.chrome.trust_selector.is_none());
+        assert_eq!(session.handle_line("/model"), SessionAction::OpenModel);
+        assert!(session.chrome.model_selector.is_some());
+        assert!(session.render_frame().contains('┌'));
+        assert!(session
+            .chrome
+            .model_selector
+            .as_ref()
+            .unwrap()
+            .render(80)
+            .iter()
+            .any(|line| line.contains("→ sonnet") || line.contains("sonnet")));
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectModel("anthropic/sonnet".into())
+        );
+        assert!(session.chrome.model_selector.is_none());
+        session.open_model_overlay();
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::CloseOverlay);
+        session.open_session_overlay(vec!["abc".into(), "def".into()]);
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectSession("abc".into())
+        );
+        session.open_settings_list(SettingsList::new(
+            vec![SettingItem {
+                id: "double-escape-action".into(),
+                label: "Double-escape action".into(),
+                description: None,
+                current_value: "tree".into(),
+                values: vec!["tree".into(), "fork".into(), "none".into()],
+            }],
+            8,
+        ));
+        assert_eq!(session.handle_bytes(" "), SessionAction::CycleSetting);
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectSetting("double-escape-action=fork".into())
+        );
+        let mut card =
+            crate::tool_card::ToolCard::start("bash", "t1", serde_json::json!({"command": "ls"}));
+        card.finish(&serde_json::json!({"content": "ok"}), false);
+        session.push_tool_card(card);
+        session.place_kitty_image("QQ==", Some(1));
+        assert!(session
+            .chrome
+            .transcript
+            .lines
+            .iter()
+            .any(|line| line.role == "image" && line.text.contains("a=T,f=100,q=2")));
+        session.slash_commands = vec![crate::autocomplete::SlashCommandSpec {
+            name: "model".into(),
+            description: "Select model".into(),
+            argument_hint: Some("<provider/model>".into()),
+            argument_items: Vec::new(),
+        }];
+        session.extra_autocomplete = vec![crate::autocomplete::ExtraAutocompleteProvider {
+            trigger_characters: vec!['#'],
+            items: vec![crate::autocomplete::AutocompleteItem {
+                value: "#42".into(),
+                label: "#42".into(),
+                description: Some("[open] Login crash".into()),
+            }],
+            live_query: None,
+        }];
+        session.chrome.editor.buffer = "#4".into();
+        session.chrome.editor.cursor = 2;
+        session.refresh_autocomplete(false);
+        assert_eq!(
+            session.last_autocomplete_debounce_ms,
+            crate::autocomplete::ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS
+        );
+        assert_eq!(
+            session
+                .chrome
+                .autocomplete
+                .as_ref()
+                .and_then(|found| found.items.first())
+                .map(|item| item.value.as_str()),
+            Some("#42")
+        );
+        session.chrome.autocomplete = None;
+        session.extra_autocomplete.clear();
+        session.chrome.editor.buffer = "/mo".into();
+        session.chrome.editor.cursor = 3;
+        assert_eq!(session.handle_bytes("\t"), SessionAction::None);
+        assert!(session.chrome.editor.buffer.starts_with("/model"));
+        session.chrome.autocomplete = None;
+        session.chrome.selector = None;
+        session.chrome.settings_list = None;
+        session.overlay_kind = OverlayKind::None;
+        session.chrome.editor.buffer.clear();
+        session.chrome.editor.cursor = 0;
+        session.chrome.editor.handle_input("hi");
+        assert_eq!(session.handle_bytes("\n"), SessionAction::None);
+        assert!(session.chrome.editor.buffer.contains('\n'));
+        session.chrome.editor.buffer = "!echo ok".into();
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::RunBash("echo ok".into())
+        );
+        session.chrome.editor.buffer = "hi".into();
+        session.chrome.editor.cursor = 2;
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::Submit("hi".into())
+        );
+        assert_eq!(session.handle_bytes("\x1a"), SessionAction::Suspend);
+        assert_eq!(session.handle_bytes("\x03"), SessionAction::Quit);
+        assert_eq!(session.handle_bytes("\x1b[<0;1;2M"), SessionAction::None);
+        assert_eq!(session.handle_bytes("\u{1b}[57399u"), SessionAction::None);
+        assert!(session.chrome.editor.buffer.contains('0'));
+        assert_eq!(
+            session.handle_bytes("\x1b[200~pasted\x1b[201~"),
+            SessionAction::None
+        );
+        assert!(session.chrome.editor.buffer.contains("pasted"));
+        assert!(session.render_frame().contains(BEGIN_SYNCHRONIZED_OUTPUT));
+        session.open_first_time_setup("dark", "pi");
+        assert!(session
+            .render_frame()
+            .contains("Welcome to pi, the minimal coding agent."));
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::FirstTimeSkip);
+        session.open_login_dialog("openai", None, None);
+        if let Some(dialog) = &mut session.chrome.login_dialog {
+            dialog.show_auth("https://example.test", None);
+        }
+        assert!(session.render_frame().contains("Login to openai"));
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::LoginCancelled);
+        session.open_tree_overlay(
+            crate::build_session_tree(vec![crate::SessionTreeEntry::message(
+                "u1", None, "user", "hello",
+            )]),
+            Some("u1".into()),
+        );
+        assert!(session.render_frame().contains("Session Tree"));
+        assert_eq!(
+            session.handle_bytes("\x18"),
+            SessionAction::CopyText(Some("hello".into()))
+        );
+        assert!(session.chrome.tree.is_some());
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectTreeEntry("u1".into())
+        );
+        session.open_scoped_models(vec![crate::ScopedModel {
+            provider: "faux".into(),
+            id: "one".into(),
+            name: "One".into(),
+        }]);
+        assert!(session.render_frame().contains("Model Configuration"));
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::CloseOverlay);
+    }
+
+    #[test]
+    fn settings_submenus_session_selector_and_osc_query() {
+        let theme = builtin_themes().into_iter().next().expect("theme");
+        let mut session = InteractiveSession::new(theme, "pi", vec!["openai/gpt".into()]);
+        assert_eq!(session.autocomplete_max_visible, 5);
+        session.open_settings_list(crate::interactive_settings_list(
+            &crate::InteractiveSettingsConfig {
+                theme: "dark".into(),
+                ..crate::InteractiveSettingsConfig::default()
+            },
+        ));
+        if let Some(list) = &mut session.chrome.settings_list {
+            if let Some(index) = list.items.iter().position(|item| item.id == "theme") {
+                list.selected = index;
+            }
+        }
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::OpenSettingsSubmenu
+        );
+        assert!(session.render_frame().contains("Automatic"));
+        assert_eq!(session.handle_bytes("\r"), SessionAction::None);
+        assert!(session.render_frame().contains("Automatic Theme"));
+        session.chrome.settings_submenu = None;
+        session.open_settings_list(crate::interactive_settings_list(
+            &crate::InteractiveSettingsConfig::default(),
+        ));
+        if let Some(list) = &mut session.chrome.settings_list {
+            if let Some(index) = list.items.iter().position(|item| item.id == "warnings") {
+                list.selected = index;
+            }
+        }
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::OpenSettingsSubmenu
+        );
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::ApplySetting {
+                id: "warnings.anthropic-extra-usage".into(),
+                value: "false".into(),
+            }
+        );
+
+        session.open_session_selector(vec![crate::SessionItem {
+            id: "aaa".into(),
+            name: Some("alpha".into()),
+            path: "/tmp/aaa.jsonl".into(),
+            cwd: "/work".into(),
+            modified_at: 1,
+            parent_id: None,
+            all_messages_text: String::new(),
+        }]);
+        assert!(session.render_frame().contains("ctrl+p path"));
+        assert_eq!(session.handle_bytes("\x10"), SessionAction::None);
+        assert!(session
+            .chrome
+            .session_selector
+            .as_ref()
+            .is_some_and(|selector| selector.show_path));
+        assert_eq!(session.current_model(), Some("openai/gpt"));
+        assert_eq!(session.handle_bytes("\x12"), SessionAction::None);
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::RenameSession {
+                id: "aaa".into(),
+                name: "alpha".into(),
+            }
+        );
+
+        session.close_overlays();
+        session.chrome.editor.handle_input("later");
+        assert_eq!(
+            session.handle_bytes("\x1b\r"),
+            SessionAction::FollowUp("later".into())
+        );
+        assert!(session.chrome.editor.buffer.is_empty());
+        assert_eq!(session.handle_bytes("\x1b[1;3A"), SessionAction::Dequeue);
+        assert_eq!(session.chrome.editor.buffer, "later");
+        assert_eq!(session.handle_bytes("\x07"), SessionAction::ExternalEditor);
+        assert_eq!(session.handle_bytes("\x16"), SessionAction::PasteClipboard);
+        session.extension_shortcuts = vec![("ctrl+k".into(), "/ext/index.js".into())];
+        assert_eq!(
+            session.handle_bytes("\x0b"),
+            SessionAction::ExtensionShortcut {
+                key: "ctrl+k".into(),
+                path: "/ext/index.js".into(),
+            }
+        );
+
+        let _ = session.begin_osc_query(0);
+        let timeout = session
+            .finish_osc_query(Instant::now())
+            .expect("timeout fallback");
+        assert!(timeout.source == "fallback" || timeout.source == "COLORFGBG");
+        let _ = session.begin_osc_query(1_000);
+        assert_eq!(
+            session.handle_bytes("\x1b]11;#ffffff\x07"),
+            SessionAction::None
+        );
+        let detected = session.finish_osc_query(Instant::now()).expect("osc reply");
+        assert_eq!(detected.theme, "light");
+        assert_eq!(detected.source, "terminal background");
+    }
+
+    #[test]
+    fn extension_ui_surfaces_match_ts_context() {
+        let mut session =
+            InteractiveSession::new(crate::themes::builtin_themes()[0].clone(), "pi", vec![]);
+        session.apply_extension_ui_calls(&[
+            serde_json::json!({
+                "op": "setWidget",
+                "key": "banner",
+                "lines": ["hello widget"],
+                "placement": "aboveEditor"
+            }),
+            serde_json::json!({ "op": "setStatus", "key": "job", "text": "running" }),
+            serde_json::json!({ "op": "setHeader", "lines": ["ext header"] }),
+            serde_json::json!({ "op": "notify", "message": "ready", "type": "info" }),
+            serde_json::json!({ "op": "setWorkingMessage", "message": "Thinking…" }),
+            serde_json::json!({
+                "op": "setWorkingIndicator",
+                "options": { "frames": ["●"], "intervalMs": 80 }
+            }),
+            serde_json::json!({ "op": "setTitle", "title": "π - custom" }),
+        ]);
+        let frame = session.render_frame();
+        assert!(frame.contains("hello widget"));
+        assert!(frame.contains("job: running"));
+        assert!(frame.contains("ext header"));
+        assert_eq!(session.terminal_title.as_deref(), Some("π - custom"));
+        assert!(frame.contains("info: ready"));
+        assert!(frame.contains("●"));
+        session.apply_extension_ui_calls(&[serde_json::json!({
+            "op": "setWorkingVisible",
+            "visible": false
+        })]);
+        let hidden = session.render_frame();
+        assert!(!hidden.contains("●"));
+        assert!(!hidden.contains("Thinking…"));
+        assert!(session.thinking_levels.contains(&"xhigh".into()));
+        assert!(session.thinking_levels.contains(&"max".into()));
+
+        session.open_extension_selector("Pick", vec!["one".into(), "two".into()]);
+        assert_eq!(session.handle_bytes("\x1b[B"), SessionAction::None);
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::ExtensionSelect(Some("two".into()))
+        );
+        session.open_extension_confirm("Unload?", "model-a");
+        assert_eq!(
+            session.handle_bytes("y"),
+            SessionAction::ExtensionConfirm(true)
+        );
+
+        session.open_extension_progress("Loading model", "local", "Starting…");
+        session.update_extension_progress("Loading text model", Some(0.5), None);
+        assert!(session
+            .chrome
+            .extension_progress
+            .as_ref()
+            .unwrap()
+            .render(80)
+            .join("\n")
+            .contains("50%"));
+        assert_eq!(
+            session.handle_bytes("\x1b"),
+            SessionAction::ExtensionProgressCancel
+        );
+    }
+
+    #[test]
+    fn custom_editor_path_routes_keys_to_js_host() {
+        let mut session =
+            InteractiveSession::new(crate::themes::builtin_themes()[0].clone(), "pi", vec![]);
+        session.custom_editor_path = Some("/tmp/modal.js".into());
+        assert_eq!(
+            session.handle_bytes("i"),
+            SessionAction::CustomEditorInput("i".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::CustomEditorInput("\r".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\n"),
+            SessionAction::CustomEditorInput("\n".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\x1b"),
+            SessionAction::CustomEditorInput("\x1b".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\x1b[D"),
+            SessionAction::CustomEditorInput("\x1b[D".into())
+        );
+        assert_eq!(session.handle_bytes("\x03"), SessionAction::Quit);
+        assert_eq!(session.handle_bytes("\x0c"), SessionAction::OpenModel);
+    }
+
+    #[test]
+    fn custom_overlay_routes_keys_until_closed() {
+        let mut session =
+            InteractiveSession::new(crate::themes::builtin_themes()[0].clone(), "pi", vec![]);
+        session.open_custom_overlay("/tmp/board.js", "board", vec!["open".into()], None);
+        assert!(session.render_frame().contains("open"));
+        assert_eq!(
+            session.handle_bytes("x"),
+            SessionAction::CustomOverlayInput("x".into())
+        );
+        assert_eq!(
+            session.handle_bytes("\x1b"),
+            SessionAction::CustomOverlayInput("\x1b".into())
+        );
+        assert_eq!(session.handle_bytes("\x03"), SessionAction::CloseOverlay);
+        assert!(session.chrome.custom_overlay_path.is_none());
+    }
+
+    #[test]
+    fn editor_word_keys_move_and_delete() {
+        let mut session =
+            InteractiveSession::new(crate::themes::builtin_themes()[0].clone(), "pi", vec![]);
+        session.chrome.editor.set_text("hello world");
+        assert_eq!(session.handle_bytes("\x1b[1;5D"), SessionAction::None);
+        assert_eq!(session.chrome.editor.cursor, 6);
+        assert_eq!(session.handle_bytes("\x17"), SessionAction::None);
+        assert_eq!(session.chrome.editor.buffer, "world");
+        assert_eq!(session.handle_bytes("\x1b[1;5C"), SessionAction::None);
+        assert_eq!(session.chrome.editor.cursor, 5);
+        assert_eq!(session.handle_bytes("\x01"), SessionAction::None);
+        assert_eq!(session.chrome.editor.cursor, 0);
+        session.chrome.editor.set_text("yank-target");
+        session.chrome.editor.cursor = session.chrome.editor.buffer.len();
+        assert_eq!(session.handle_bytes("\x15"), SessionAction::None);
+        assert!(session.chrome.editor.buffer.is_empty());
+        assert_eq!(session.handle_bytes("\x19"), SessionAction::None);
+        assert_eq!(session.chrome.editor.buffer, "yank-target");
+        session.chrome.editor.cursor = 0;
+        assert_eq!(session.handle_bytes("\x1d"), SessionAction::None);
+        assert_eq!(session.handle_bytes("t"), SessionAction::None);
+        assert_eq!(session.chrome.editor.cursor, 5);
+        session.chrome.editor.add_to_history("older");
+        session.chrome.editor.add_to_history("newer");
+        session.chrome.editor.set_text("");
+        assert_eq!(session.handle_bytes("\x1b[A"), SessionAction::None);
+        assert_eq!(session.chrome.editor.buffer, "newer");
+        assert_eq!(session.handle_bytes("\x1b[A"), SessionAction::None);
+        assert_eq!(session.chrome.editor.buffer, "older");
+        let big = (0..12)
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        session.chrome.editor.set_text("");
+        assert_eq!(
+            session.handle_bytes(&format!("\x1b[200~{big}\x1b[201~")),
+            SessionAction::None
+        );
+        assert!(session
+            .chrome
+            .editor
+            .buffer
+            .contains("[paste #1 +12 lines]"));
+        assert_eq!(session.handle_bytes("\r"), SessionAction::Submit(big));
+        session.chrome.editor.set_text(
+            (0..40)
+                .map(|i| format!("row{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        session.chrome.editor.render(20);
+        let start_line = session.chrome.editor.get_cursor().0;
+        assert_eq!(session.handle_bytes("\x1b[5~"), SessionAction::None);
+        assert!(session.chrome.editor.get_cursor().0 < start_line);
+
+        session.chrome.editor.set_text("line");
+        session.chrome.editor.cursor = session.chrome.editor.buffer.len();
+        assert_eq!(
+            session.handle_bytes(crate::NATIVE_SHIFT_ENTER_SEQUENCE),
+            SessionAction::None
+        );
+        assert_eq!(session.chrome.editor.buffer, "line\n");
+        session.apply_extension_ui_calls(&[
+            serde_json::json!({ "op": "setTheme", "name": "light" }),
+            serde_json::json!({ "op": "setToolsExpanded", "expanded": true }),
+            serde_json::json!({ "op": "onTerminalInput" }),
+        ]);
+        assert_eq!(session.chrome.theme.name, "light");
+        assert!(session.chrome.tools_expanded);
+        assert!(session.chrome.terminal_input_registered);
+        assert_eq!(
+            session.escape_timeout_ms,
+            crate::resolve_escape_timeout_ms_from_env()
+        );
+
+        session.set_supported_thinking_levels(false, vec!["off".into()]);
+        session.thinking_index = 0;
+        session.cycle_thinking();
+        assert_eq!(session.current_thinking(), "off");
+        session.open_thinking_selector(None);
+        let thinking_levels = session
+            .chrome
+            .thinking_selector
+            .as_ref()
+            .unwrap()
+            .render(80)
+            .join("\n");
+        assert!(thinking_levels.contains("off"));
+        assert!(!thinking_levels.contains("xhigh"));
+    }
+}

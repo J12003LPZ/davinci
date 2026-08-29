@@ -1,588 +1,331 @@
-//! JSONL session store compatible with TypeScript pi (`~/.pi` and `--session-dir`).
+//! JSONL session store matching `@earendil-works/pi-agent-core` session harness.
 
-pub mod backend;
-pub mod conformance;
+mod codec;
+mod discovery;
+mod errors;
+mod jsonl_repo;
+mod repo;
+mod tree;
+mod types;
 
-pub use backend::{
-    CreateOptions, EntryQuery, ForkOptions, ForkPosition, ForkScope, MemorySessionRepo, Session,
-    SessionMeta, SessionRepository,
+pub use codec::{
+    encode_header, encode_mutation, metadata_from_header, migrate_v3_to_v4, parse_header,
+    parse_mutation,
 };
+pub use discovery::{
+    cwd_encoded_dir, default_agent_dir, default_session_dir, discover_sessions,
+    encode_cwd_component, expand_tilde, latest_session, resolve_session_dir,
+    resolve_session_dir_from, resolve_session_ref, SessionSummary,
+};
+pub use errors::{JsonlDecodeError, SessionError};
+pub use jsonl_repo::{
+    expected_session_path, jsonl_session_directory_name, session_file_name, validate_session_id,
+    JsonlCreateOptions, JsonlSessionInfo, JsonlSessionRepo, JsonlStoredSession,
+};
+pub use repo::{
+    assistant_message_entry, compaction_entry, custom_entry, operation_started, user_message_entry,
+    BranchBounds, EntryOrder, EntryQuery, ForkOptions, ForkPosition, ForkScope,
+    InMemorySessionRepo, LanePointer, LogItem, LogOptions, RecordQuery, Session,
+    SessionCreateOptions, SessionMetadata, SessionState, SessionStats, SessionView,
+};
+pub use tree::{
+    branch_entries, build_context_entries, build_session_path, build_session_tree, entries_since,
+    export_session_jsonl, fork_user_messages, resolved_labels, session_usage_stats,
+    SessionUsageStats,
+};
+pub use types::*;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use thiserror::Error;
-use walkdir::WalkDir;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Error)]
-pub enum SessionError {
-    #[error("is not valid JSON")]
-    Syntax,
-    #[error("is not a JSON object")]
-    NotObject,
-    #[error("has invalid {0}")]
-    InvalidField(&'static str),
-    #[error("is not a header")]
-    NotHeader,
-    #[error("has unsupported session version")]
-    UnsupportedVersion,
-    #[error("has both parentSessionId and legacyParentSessionPath")]
-    BothParents,
-    #[error("has unknown entry type {0}")]
-    UnknownEntryType(String),
-    #[error("Invalid JSONL v4 session {path}: line {line} {message}")]
-    InvalidFile {
-        path: String,
-        line: usize,
-        message: String,
-    },
-    #[error("{0}")]
-    Storage(String),
-}
+use uuid::Uuid;
 
-impl SessionError {
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Syntax => "syntax",
-            _ => "schema",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct JsonlV4Header {
-    pub kind: String,
-    pub version: u32,
-    pub id: String,
-    #[serde(rename = "createdAt")]
-    pub created_at: i64,
-    pub cwd: String,
-    #[serde(rename = "parentSessionId", skip_serializing_if = "Option::is_none")]
-    pub parent_session_id: Option<String>,
-    #[serde(
-        rename = "legacyParentSessionPath",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub legacy_parent_session_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SessionInfo {
-    pub id: String,
-    pub path: PathBuf,
-    pub cwd: String,
-    pub created_at: i64,
-    pub modified_at: i64,
-    pub source_format: u8,
-    pub name: Option<String>,
-    pub parent_session_id: Option<String>,
-}
-
-pub fn parse_header(line: &str) -> Result<JsonlV4Header, SessionError> {
-    let value: Value = serde_json::from_str(line).map_err(|_| SessionError::Syntax)?;
-    let obj = value.as_object().ok_or(SessionError::NotObject)?;
-    if obj.get("kind").and_then(|v| v.as_str()) != Some("header") {
-        return Err(SessionError::NotHeader);
-    }
-    if obj.get("version").and_then(|v| v.as_u64()) != Some(4) {
-        return Err(SessionError::UnsupportedVersion);
-    }
-    let parent = obj.get("parentSessionId");
-    if parent.is_some() && !parent.unwrap().is_string() {
-        return Err(SessionError::InvalidField("parentSessionId"));
-    }
-    let legacy = obj.get("legacyParentSessionPath");
-    if legacy.is_some() && !legacy.unwrap().is_string() {
-        return Err(SessionError::InvalidField("legacyParentSessionPath"));
-    }
-    if parent.is_some() && legacy.is_some() {
-        return Err(SessionError::BothParents);
-    }
-    if let Some(meta) = obj.get("metadata") {
-        if !meta.is_object() {
-            return Err(SessionError::InvalidField("metadata"));
-        }
-    }
-    let id = obj
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or(SessionError::InvalidField("id"))?
-        .to_string();
-    let created_at = obj
-        .get("createdAt")
-        .and_then(|v| v.as_i64())
-        .ok_or(SessionError::InvalidField("timestamp"))?;
-    if created_at < 0 {
-        return Err(SessionError::InvalidField("timestamp"));
-    }
-    let cwd = obj
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .ok_or(SessionError::InvalidField("cwd"))?
-        .to_string();
-    Ok(JsonlV4Header {
-        kind: "header".into(),
-        version: 4,
-        id,
-        created_at,
-        cwd,
-        parent_session_id: parent.and_then(|v| v.as_str()).map(str::to_string),
-        legacy_parent_session_path: legacy.and_then(|v| v.as_str()).map(str::to_string),
-        metadata: obj.get("metadata").cloned(),
-    })
-}
-
-pub fn encode_header(header: &JsonlV4Header) -> String {
-    format!("{}\n", serde_json::to_string(header).expect("header json"))
-}
-
-const ENTRY_TYPES: &[&str] = &[
-    "message",
-    "model_change",
-    "thinking_level_change",
-    "active_tools_change",
-    "compaction",
-    "branch_summary",
-    "custom",
-    "session_info",
-];
-
-pub fn parse_entry_line(line: &str) -> Result<Value, SessionError> {
-    let value: Value = serde_json::from_str(line).map_err(|_| SessionError::Syntax)?;
-    let obj = value.as_object().ok_or(SessionError::NotObject)?;
-    if let Some(kind) = obj.get("kind").and_then(|v| v.as_str()) {
-        if kind == "header" {
-            parse_header(line)?;
-            return Ok(value);
-        }
-    }
-    if let Some(entry_type) = obj.get("type").and_then(|v| v.as_str()) {
-        if !ENTRY_TYPES.contains(&entry_type) {
-            return Err(SessionError::UnknownEntryType(entry_type.to_string()));
-        }
-    }
-    Ok(value)
-}
-
-/// v3 files are a stream of entries without a v4 header. First line is typically a message.
-pub fn is_v3_session(first_line: &str) -> bool {
-    parse_header(first_line).is_err()
-        && serde_json::from_str::<Value>(first_line)
-            .ok()
-            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
-            .is_some()
-}
-
-pub fn migrate_v3_to_v4(
-    raw: &str,
-    path: &Path,
-    cwd: &str,
-    id: &str,
-) -> Result<String, SessionError> {
-    let mut out = String::new();
-    let header = JsonlV4Header {
-        kind: "header".into(),
-        version: 4,
-        id: id.to_string(),
-        created_at: path
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0),
-        cwd: cwd.to_string(),
-        parent_session_id: None,
-        legacy_parent_session_path: None,
-        metadata: None,
-    };
-    out.push_str(&encode_header(&header));
-    for line in raw.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        parse_entry_line(line)?;
-        out.push_str(line);
-        out.push('\n');
-    }
-    Ok(out)
-}
-
-/// Encode a cwd as TypeScript does for session directory names.
-pub fn encode_cwd_dir(cwd: &str) -> String {
-    cwd.replace(['/', '\\', ':'], "--")
-}
-
-pub fn default_sessions_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR") {
-        return PathBuf::from(dir);
-    }
-    dirs_agent_sessions()
-}
-
-fn dirs_agent_sessions() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let agent = std::env::var("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home.join(".pi").join("agent"));
-    agent.join("sessions")
-}
-
-pub fn discover_sessions(root: &Path, cwd: Option<&str>) -> Result<Vec<SessionInfo>, SessionError> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut sessions = Vec::new();
-    let walker = WalkDir::new(root).follow_links(true).max_depth(4);
-    for entry in walker {
-        let entry = entry.map_err(|e| SessionError::Storage(e.to_string()))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        if let Ok(info) = read_session_info(path) {
-            if let Some(cwd) = cwd {
-                if info.cwd != cwd && !path_matches_cwd(path, cwd) {
-                    continue;
-                }
-            }
-            sessions.push(info);
-        }
-    }
-    sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
-    Ok(sessions)
-}
-
-fn path_matches_cwd(path: &Path, cwd: &str) -> bool {
-    path.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .is_some_and(|name| name == encode_cwd_dir(cwd) || name.contains(&encode_cwd_dir(cwd)))
-}
-
-pub fn read_session_info(path: &Path) -> Result<SessionInfo, SessionError> {
-    let file = fs::File::open(path).map_err(|e| SessionError::Storage(e.to_string()))?;
-    let mut lines = BufReader::new(file).lines();
-    let first = lines
-        .next()
-        .ok_or_else(|| SessionError::Storage("empty session".into()))?
-        .map_err(|e| SessionError::Storage(e.to_string()))?;
-    let modified_at = path
-        .metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    if let Ok(header) = parse_header(&first) {
-        let mut name = None;
-        for line in lines.map_while(Result::ok) {
-            if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                if value.get("type").and_then(|v| v.as_str()) == Some("session_info") {
-                    name = value
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                }
-            }
-        }
-        return Ok(SessionInfo {
-            id: header.id,
-            path: path.to_path_buf(),
-            cwd: header.cwd,
-            created_at: header.created_at,
-            modified_at,
-            source_format: 4,
-            name,
-            parent_session_id: header.parent_session_id,
-        });
-    }
-    let id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    Ok(SessionInfo {
-        id,
-        path: path.to_path_buf(),
-        cwd: String::new(),
-        created_at: modified_at,
-        modified_at,
-        source_format: 3,
-        name: None,
-        parent_session_id: None,
-    })
-}
-
-pub fn continue_latest(
-    root: &Path,
-    cwd: Option<&str>,
-) -> Result<Option<SessionInfo>, SessionError> {
-    Ok(discover_sessions(root, cwd)?.into_iter().next())
-}
-
-pub fn resume_by_id_or_path(
-    root: &Path,
-    query: &str,
-    cwd: Option<&str>,
-) -> Result<Option<SessionInfo>, SessionError> {
-    let query_path = PathBuf::from(query);
-    if query_path.exists() {
-        return read_session_info(&query_path).map(Some);
-    }
-    let sessions = discover_sessions(root, cwd)?;
-    Ok(sessions.into_iter().find(|s| {
-        s.id == query
-            || s.id.starts_with(query)
-            || s.path.to_string_lossy().contains(query)
-            || s.name.as_deref() == Some(query)
-    }))
-}
-
-pub fn create_session(
-    root: &Path,
-    cwd: &str,
-    id: Option<&str>,
-) -> Result<SessionInfo, SessionError> {
-    let id = id
-        .map(str::to_string)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let dir = root.join(encode_cwd_dir(cwd));
-    fs::create_dir_all(&dir).map_err(|e| SessionError::Storage(e.to_string()))?;
-    let path = dir.join(format!("{id}.jsonl"));
-    let created_at = now_ms();
-    let header = JsonlV4Header {
-        kind: "header".into(),
-        version: 4,
-        id: id.clone(),
-        created_at,
-        cwd: cwd.to_string(),
-        parent_session_id: None,
-        legacy_parent_session_path: None,
-        metadata: None,
-    };
-    fs::write(&path, encode_header(&header)).map_err(|e| SessionError::Storage(e.to_string()))?;
-    Ok(SessionInfo {
-        id,
-        path,
-        cwd: cwd.to_string(),
-        created_at,
-        modified_at: created_at,
-        source_format: 4,
-        name: None,
-        parent_session_id: None,
-    })
-}
-
-pub fn append_entry(path: &Path, entry: &Value) -> Result<(), SessionError> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| SessionError::Storage(e.to_string()))?;
-    writeln!(file, "{entry}").map_err(|e| SessionError::Storage(e.to_string()))
-}
-
-pub fn fork_session(
-    root: &Path,
-    source: &SessionInfo,
-    cwd: &str,
-) -> Result<SessionInfo, SessionError> {
-    let mut dest = create_session(root, cwd, None)?;
-    dest.parent_session_id = Some(source.id.clone());
-    let raw = fs::read_to_string(&source.path).map_err(|e| SessionError::Storage(e.to_string()))?;
-    let mut rewritten = String::new();
-    for (i, line) in raw.lines().enumerate() {
-        if i == 0 {
-            if let Ok(mut header) = parse_header(line) {
-                header.id = dest.id.clone();
-                header.parent_session_id = Some(source.id.clone());
-                header.cwd = cwd.to_string();
-                rewritten.push_str(&encode_header(&header));
-                continue;
-            }
-        }
-        rewritten.push_str(line);
-        rewritten.push('\n');
-    }
-    fs::write(&dest.path, rewritten).map_err(|e| SessionError::Storage(e.to_string()))?;
-    Ok(dest)
-}
-
-pub fn clone_session(
-    root: &Path,
-    source: &SessionInfo,
-    cwd: &str,
-) -> Result<SessionInfo, SessionError> {
-    fork_session(root, source, cwd)
-}
-
-pub fn append_session_name(path: &Path, name: &str) -> Result<(), SessionError> {
-    append_entry(
-        path,
-        &json!({
-            "type": "session_info",
-            "name": name,
-            "timestamp": now_ms(),
-        }),
-    )
-}
-
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
-pub fn read_entries(path: &Path) -> Result<Vec<Value>, SessionError> {
-    let raw = fs::read_to_string(path).map_err(|e| SessionError::Storage(e.to_string()))?;
-    let mut entries = Vec::new();
-    for line in raw.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = parse_entry_line(line)?;
-        if value.get("kind").and_then(|v| v.as_str()) == Some("header") {
-            continue;
-        }
-        entries.push(value);
-    }
-    Ok(entries)
+#[derive(Debug, Clone)]
+pub struct JsonlSession {
+    pub path: PathBuf,
+    pub header: JsonlV4Header,
+    pub entries: Vec<SessionEntry>,
+    pub records: Vec<LaneRecord>,
+    pub leaf_id: Option<String>,
 }
 
-pub fn last_assistant_text(path: &Path) -> Result<Option<String>, SessionError> {
-    let mut last = None;
-    for entry in read_entries(path)? {
-        if entry.get("type").and_then(|v| v.as_str()) != Some("message") {
-            continue;
-        }
-        let role = entry
-            .get("role")
-            .or_else(|| entry.get("message").and_then(|m| m.get("role")))
-            .and_then(|v| v.as_str());
-        if role != Some("assistant") {
-            continue;
-        }
-        let text = entry
-            .get("content")
-            .or_else(|| entry.get("text"))
-            .or_else(|| entry.get("message").and_then(|m| m.get("content")))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if text.is_some() {
-            last = text;
-        }
-    }
-    Ok(last)
-}
-
-pub fn session_tree(path: &Path) -> Result<Vec<Value>, SessionError> {
-    let entries = read_entries(path)?;
-    Ok(entries
-        .into_iter()
-        .map(|entry| {
-            json!({
-                "id": entry.get("id").cloned().unwrap_or(json!(null)),
-                "parentId": entry.get("parentId").cloned().unwrap_or(json!(null)),
-                "type": entry.get("type").cloned().unwrap_or(json!("message")),
-                "role": entry.get("role").cloned().unwrap_or(json!(null)),
-                "label": entry.get("content").or_else(|| entry.get("text")).cloned().unwrap_or(json!("")),
-            })
+impl JsonlSession {
+    pub fn create(
+        sessions_root: &Path,
+        cwd: &str,
+        name: Option<&str>,
+    ) -> Result<Self, SessionError> {
+        fs::create_dir_all(sessions_root).map_err(|err| {
+            SessionError::storage(format!("Unable to create session directory: {err}"))
+        })?;
+        let dir = sessions_root.join(encode_cwd_component(cwd));
+        fs::create_dir_all(&dir).map_err(|err| {
+            SessionError::storage(format!("Unable to create cwd session directory: {err}"))
+        })?;
+        let id = Uuid::new_v4().to_string();
+        let path = dir.join(format!("{id}.jsonl"));
+        let header = JsonlV4Header {
+            kind: "header".into(),
+            version: 4,
+            id: id.clone(),
+            created_at: now_ms(),
+            cwd: cwd.to_string(),
+            parent_session_id: None,
+            legacy_parent_session_path: None,
+            metadata: name.map(|n| {
+                let mut map = serde_json::Map::new();
+                map.insert("name".into(), serde_json::Value::String(n.to_string()));
+                serde_json::Value::Object(map)
+            }),
+        };
+        let mut file = File::create(&path).map_err(|err| {
+            SessionError::storage(format!("Unable to create session file: {err}"))
+        })?;
+        file.write_all(encode_header(&header).as_bytes())
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to write session header: {err}"))
+            })?;
+        Ok(Self {
+            path,
+            header,
+            entries: Vec::new(),
+            records: Vec::new(),
+            leaf_id: None,
         })
-        .collect())
-}
-
-pub fn session_stats(path: &Path) -> Result<Value, SessionError> {
-    let entries = read_entries(path)?;
-    let mut message_count = 0u64;
-    let mut user = 0u64;
-    let mut assistant = 0u64;
-    for entry in &entries {
-        if entry.get("type").and_then(|v| v.as_str()) == Some("message") {
-            message_count += 1;
-            match entry.get("role").and_then(|v| v.as_str()) {
-                Some("user") => user += 1,
-                Some("assistant") => assistant += 1,
-                _ => {}
-            }
-        }
     }
-    Ok(json!({
-        "messageCount": message_count,
-        "userMessages": user,
-        "assistantMessages": assistant,
-        "entryCount": entries.len(),
-    }))
-}
 
-pub fn fork_from_entry(
-    root: &Path,
-    source: &SessionInfo,
-    cwd: &str,
-    entry_id: &str,
-) -> Result<SessionInfo, SessionError> {
-    let mut dest = create_session(root, cwd, None)?;
-    dest.parent_session_id = Some(source.id.clone());
-    let raw = fs::read_to_string(&source.path).map_err(|e| SessionError::Storage(e.to_string()))?;
-    let mut rewritten = String::new();
-    let mut found = false;
-    for (i, line) in raw.lines().enumerate() {
-        if i == 0 {
-            if let Ok(mut header) = parse_header(line) {
-                header.id = dest.id.clone();
-                header.parent_session_id = Some(source.id.clone());
-                header.cwd = cwd.to_string();
-                rewritten.push_str(&encode_header(&header));
+    pub fn open(path: &Path) -> Result<Self, SessionError> {
+        let file = File::open(path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                SessionError::not_found(format!("Session file not found: {}", path.display()))
+            } else {
+                SessionError::storage(format!("Unable to open session file: {err}"))
+            }
+        })?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let first = lines
+            .next()
+            .ok_or_else(|| {
+                SessionError::invalid_entry(format!(
+                    "Invalid JSONL v4 session {}: line 1 is empty",
+                    path.display()
+                ))
+            })?
+            .map_err(|err| SessionError::storage(format!("Unable to read session file: {err}")))?;
+        let header = match parse_header(&first) {
+            Ok(header) => header,
+            Err(_err) if first.contains("\"type\"") || first.contains("\"role\"") => {
+                return migrate_v3_to_v4(path, &first, lines);
+            }
+            Err(err) => {
+                return Err(SessionError::invalid_entry(format!(
+                    "Invalid JSONL v4 session {}: line 1 {}",
+                    path.display(),
+                    err
+                )));
+            }
+        };
+        let mut session = Self {
+            path: path.to_path_buf(),
+            header,
+            entries: Vec::new(),
+            records: Vec::new(),
+            leaf_id: None,
+        };
+        for (index, line) in lines.enumerate() {
+            let line_no = index + 2;
+            let line = line.map_err(|err| {
+                SessionError::storage(format!("Unable to read session file: {err}"))
+            })?;
+            if line.trim().is_empty() {
                 continue;
             }
-        }
-        rewritten.push_str(line);
-        rewritten.push('\n');
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            if value.get("id").and_then(|v| v.as_str()) == Some(entry_id) {
-                found = true;
-                break;
+            match parse_mutation(&line) {
+                Ok(SessionMutation::Entry { entry, .. }) => {
+                    session.leaf_id = Some(entry.id.clone());
+                    session.entries.push(entry);
+                }
+                Ok(SessionMutation::Record { record, .. }) => session.records.push(record),
+                Ok(
+                    SessionMutation::Lane { .. }
+                    | SessionMutation::FactName { .. }
+                    | SessionMutation::FactLabel { .. },
+                ) => {}
+                Err(err) => {
+                    return Err(SessionError::invalid_entry(format!(
+                        "Invalid JSONL v4 session {}: line {line_no} {}",
+                        path.display(),
+                        err
+                    )));
+                }
             }
         }
+        Ok(session)
     }
-    if !found {
-        return Err(SessionError::Storage(format!(
-            "entry {entry_id} not found in session"
-        )));
+
+    pub fn append_entry(&mut self, mut entry: SessionEntry) -> Result<(), SessionError> {
+        entry.seq = self.next_seq();
+        if entry.timestamp == 0 {
+            entry.timestamp = now_ms();
+        }
+        if entry.id.is_empty() {
+            entry.id = Uuid::new_v4().to_string();
+        }
+        entry.parent_id = self.leaf_id.clone();
+        self.leaf_id = Some(entry.id.clone());
+        self.write_line(&encode_mutation(&SessionMutation::Entry {
+            lane: None,
+            entry: entry.clone(),
+        }))?;
+        self.entries.push(entry);
+        Ok(())
     }
-    fs::write(&dest.path, rewritten).map_err(|e| SessionError::Storage(e.to_string()))?;
-    Ok(dest)
-}
 
-pub fn fork_messages(path: &Path) -> Result<Vec<Value>, SessionError> {
-    Ok(read_entries(path)?
-        .into_iter()
-        .filter(|e| {
-            e.get("type").and_then(|v| v.as_str()) == Some("message")
-                && e.get("role").and_then(|v| v.as_str()) == Some("user")
-        })
-        .map(|e| {
-            json!({
-                "entryId": e.get("id").cloned().unwrap_or(json!(null)),
-                "text": e.get("content").or_else(|| e.get("text")).cloned().unwrap_or(json!("")),
-            })
-        })
-        .collect())
-}
+    pub fn set_leaf(&mut self, leaf_id: Option<String>) {
+        self.leaf_id = leaf_id;
+    }
 
-pub fn leaf_id(path: &Path) -> Result<Option<String>, SessionError> {
-    Ok(read_entries(path)?
-        .into_iter()
-        .rev()
-        .find_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string)))
+    /// TS `branchWithSummary`: move the leaf to `branch_from_id`, then append a
+    /// `branch_summary` whose `fromId` is the abandoned leaf.
+    pub fn branch_with_summary(
+        &mut self,
+        branch_from_id: Option<String>,
+        summary: &str,
+        details: serde_json::Value,
+        usage: Option<serde_json::Value>,
+        from_hook: bool,
+    ) -> Result<String, SessionError> {
+        if let Some(id) = branch_from_id.as_deref() {
+            if !id.is_empty() && !self.entries.iter().any(|entry| entry.id == id) {
+                return Err(SessionError::not_found(format!("Entry {id} not found")));
+            }
+        }
+        let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".into());
+        self.leaf_id = branch_from_id;
+        let mut extra = serde_json::Map::new();
+        extra.insert("fromId".into(), serde_json::Value::String(from_id));
+        extra.insert("summary".into(), serde_json::Value::String(summary.into()));
+        extra.insert("details".into(), details);
+        extra.insert("fromHook".into(), serde_json::Value::Bool(from_hook));
+        if let Some(usage) = usage {
+            extra.insert("usage".into(), usage);
+        }
+        self.append_entry(SessionEntry {
+            id: String::new(),
+            entry_type: "branch_summary".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: None,
+            extra,
+        })?;
+        Ok(self.leaf_id.clone().unwrap_or_default())
+    }
+
+    pub fn fork(&self, entry_id: &str, sessions_root: &Path) -> Result<Self, SessionError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == entry_id)
+            .ok_or_else(|| SessionError::not_found(format!("Entry {entry_id} not found")))?;
+        let mut forked = Self::create(sessions_root, &self.header.cwd, None)?;
+        forked.header.parent_session_id = Some(self.header.id.clone());
+        forked.rewrite_header()?;
+        for entry in self.entries.iter().take(index + 1) {
+            let mut clone = entry.clone();
+            clone.id = Uuid::new_v4().to_string();
+            clone.parent_id = forked.leaf_id.clone();
+            forked.append_entry(clone)?;
+        }
+        Ok(forked)
+    }
+
+    pub fn clone_session(&self, sessions_root: &Path) -> Result<Self, SessionError> {
+        let mut cloned = Self::create(sessions_root, &self.header.cwd, None)?;
+        cloned.header.parent_session_id = Some(self.header.id.clone());
+        cloned.rewrite_header()?;
+        for entry in &self.entries {
+            let mut clone = entry.clone();
+            clone.id = Uuid::new_v4().to_string();
+            clone.parent_id = cloned.leaf_id.clone();
+            cloned.append_entry(clone)?;
+        }
+        Ok(cloned)
+    }
+
+    pub fn set_name(&mut self, name: &str) -> Result<(), SessionError> {
+        let mut map = match &self.header.metadata {
+            Some(serde_json::Value::Object(map)) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        if name.is_empty() {
+            map.remove("name");
+        } else {
+            map.insert("name".into(), serde_json::Value::String(name.to_string()));
+        }
+        self.header.metadata = if map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(map))
+        };
+        self.rewrite_header()
+    }
+
+    pub fn display_name(&self) -> Option<String> {
+        self.header
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|e| e.seq)
+            .chain(self.records.iter().map(|r| r.seq))
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    fn write_line(&self, line: &str) -> Result<(), SessionError> {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to append session file: {err}"))
+            })?;
+        file.write_all(line.as_bytes())
+            .map_err(|err| SessionError::storage(format!("Unable to append session file: {err}")))
+    }
+
+    fn rewrite_header(&self) -> Result<(), SessionError> {
+        let rest = fs::read_to_string(&self.path)
+            .map_err(|err| SessionError::storage(format!("Unable to read session file: {err}")))?;
+        let mut lines = rest.lines();
+        let _ = lines.next();
+        let mut body = encode_header(&self.header);
+        for line in lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        fs::write(&self.path, body).map_err(|err| {
+            SessionError::storage(format!("Unable to rewrite session header: {err}"))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -591,82 +334,186 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn header_roundtrip_matches_ts_errors() {
-        assert!(matches!(
-            parse_header("not-json"),
-            Err(SessionError::Syntax)
-        ));
-        assert!(matches!(parse_header("[]"), Err(SessionError::NotObject)));
-        assert!(matches!(
-            parse_header(r#"{"kind":"entry","version":4}"#),
-            Err(SessionError::NotHeader)
-        ));
-        assert!(matches!(
-            parse_header(r#"{"kind":"header","version":3,"id":"a","createdAt":1,"cwd":"/"}"#),
-            Err(SessionError::UnsupportedVersion)
-        ));
-        let header =
-            parse_header(r#"{"kind":"header","version":4,"id":"abc","createdAt":1,"cwd":"/tmp"}"#)
-                .unwrap();
-        assert_eq!(header.id, "abc");
-        assert!(encode_header(&header).contains("\"version\":4"));
-    }
-
-    #[test]
-    fn continue_resume_fork_discovery() {
+    fn create_append_and_reopen_v4() {
         let dir = tempdir().unwrap();
-        let created = create_session(dir.path(), "/proj", Some("aaaa-1111")).unwrap();
-        append_session_name(&created.path, "first").unwrap();
-        let latest = continue_latest(dir.path(), Some("/proj")).unwrap().unwrap();
-        assert_eq!(latest.id, "aaaa-1111");
-        let resumed = resume_by_id_or_path(dir.path(), "aaaa", Some("/proj"))
-            .unwrap()
+        let mut session = JsonlSession::create(dir.path(), "/tmp/project", Some("demo")).unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"hello"}]),
+            ))
             .unwrap();
-        assert_eq!(resumed.id, "aaaa-1111");
-        let forked = fork_session(dir.path(), &resumed, "/proj").unwrap();
-        assert_eq!(forked.parent_session_id.as_deref(), Some("aaaa-1111"));
-        assert_ne!(forked.id, resumed.id);
+        let reopened = JsonlSession::open(&session.path).unwrap();
+        assert_eq!(reopened.header.version, 4);
+        assert_eq!(reopened.entries.len(), 1);
+        assert_eq!(reopened.display_name().as_deref(), Some("demo"));
     }
 
     #[test]
-    fn v3_migrate_adds_v4_header() {
+    fn migrate_v3_headerless_message() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("old.jsonl");
-        fs::write(&path, "{\"type\":\"message\",\"id\":\"m1\"}\n").unwrap();
-        let migrated = migrate_v3_to_v4(
-            &fs::read_to_string(&path).unwrap(),
+        let path = dir.path().join("legacy.jsonl");
+        fs::write(
             &path,
-            "/old",
-            "migrated",
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":1,"message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+"#,
         )
         .unwrap();
-        assert!(migrated.starts_with("{\"kind\":\"header\"") || migrated.contains("\"version\":4"));
-        parse_header(migrated.lines().next().unwrap()).unwrap();
+        let session = JsonlSession::open(&path).unwrap();
+        assert_eq!(session.header.version, 4);
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(session.header.source_format_hint(), 3);
     }
 
     #[test]
-    fn entries_tree_fork_from_id() {
+    fn tree_fork_stats_and_jsonl_export_match_ts_shapes() {
         let dir = tempdir().unwrap();
-        let created = create_session(dir.path(), "/proj", Some("bbbb-2222")).unwrap();
-        append_entry(
-            &created.path,
-            &json!({"type":"message","id":"m1","role":"user","content":"hello"}),
-        )
-        .unwrap();
-        append_entry(
-            &created.path,
-            &json!({"type":"message","id":"m2","role":"assistant","content":"world"}),
-        )
-        .unwrap();
-        assert_eq!(
-            last_assistant_text(&created.path).unwrap().as_deref(),
-            Some("world")
+        let mut session = JsonlSession::create(dir.path(), "/tmp/project", Some("demo")).unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"hello"}]),
+            ))
+            .unwrap();
+        let mut assistant = SessionEntry::message(
+            "assistant",
+            serde_json::json!([
+                {"type":"text","text":"hi"},
+                {"type":"toolCall","name":"read"}
+            ]),
         );
-        assert_eq!(session_tree(&created.path).unwrap().len(), 2);
-        assert_eq!(session_stats(&created.path).unwrap()["messageCount"], 2);
-        let forked = fork_from_entry(dir.path(), &created, "/proj", "m1").unwrap();
-        assert_eq!(read_entries(&forked.path).unwrap().len(), 1);
-        assert_eq!(fork_messages(&created.path).unwrap().len(), 1);
-        assert_eq!(leaf_id(&created.path).unwrap().as_deref(), Some("m2"));
+        assistant.message = Some(serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type":"text","text":"hi"},
+                {"type":"toolCall","name":"read"}
+            ],
+            "usage": { "input": 10, "output": 4, "cacheRead": 1, "cacheWrite": 2, "cost": { "total": 0.5 } }
+        }));
+        session.append_entry(assistant).unwrap();
+        session
+            .append_entry(SessionEntry::label_change(
+                &session.entries[0].id,
+                Some("root"),
+            ))
+            .unwrap();
+
+        let tree = build_session_tree(&session.entries);
+        assert_eq!(tree.as_array().unwrap().len(), 1);
+        assert_eq!(tree[0]["label"], "root");
+        assert_eq!(tree[0]["children"].as_array().unwrap().len(), 1);
+
+        let fork = fork_user_messages(&session.entries);
+        assert_eq!(fork[0]["text"], "hello");
+        assert_eq!(fork[0]["entryId"], session.entries[0].id);
+
+        let missing = entries_since(&session.entries, Some("missing")).unwrap_err();
+        assert_eq!(missing, "Entry not found: missing");
+        assert_eq!(
+            entries_since(&session.entries, Some(&session.entries[0].id))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let stats = session_usage_stats(&session.entries);
+        assert_eq!(stats.user_messages, 1);
+        assert_eq!(stats.assistant_messages, 1);
+        assert_eq!(stats.tool_calls, 1);
+        assert_eq!(stats.input, 10);
+        assert_eq!(stats.token_total(), 17);
+        assert!((stats.cost - 0.5).abs() < f64::EPSILON);
+
+        let out = dir.path().join("export.jsonl");
+        export_session_jsonl(&session, &out).unwrap();
+        let raw = std::fs::read_to_string(&out).unwrap();
+        let header: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(header["type"], "session");
+        assert_eq!(header["id"], session.header.id);
+        assert!(raw.contains("\"parentId\":null"));
+    }
+
+    #[test]
+    fn build_context_entries_follows_leaf_and_latest_compaction() {
+        fn msg(id: &str, parent: Option<&str>, role: &str, text: &str) -> SessionEntry {
+            SessionEntry {
+                id: id.into(),
+                entry_type: "message".into(),
+                parent_id: parent.map(str::to_string),
+                seq: 0,
+                timestamp: 0,
+                message: Some(serde_json::json!({
+                    "role": role,
+                    "content": [{"type": "text", "text": text}],
+                })),
+                custom_type: None,
+                extra: serde_json::Map::new(),
+            }
+        }
+        fn compaction(id: &str, parent: &str, summary: &str, first_kept: &str) -> SessionEntry {
+            let mut extra = serde_json::Map::new();
+            extra.insert("summary".into(), serde_json::json!(summary));
+            extra.insert("firstKeptEntryId".into(), serde_json::json!(first_kept));
+            SessionEntry {
+                id: id.into(),
+                entry_type: "compaction".into(),
+                parent_id: Some(parent.into()),
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: None,
+                extra,
+            }
+        }
+        fn branch_summary(id: &str, parent: &str, summary: &str, from: &str) -> SessionEntry {
+            let mut extra = serde_json::Map::new();
+            extra.insert("summary".into(), serde_json::json!(summary));
+            extra.insert("fromId".into(), serde_json::json!(from));
+            SessionEntry {
+                id: id.into(),
+                entry_type: "branch_summary".into(),
+                parent_id: Some(parent.into()),
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: None,
+                extra,
+            }
+        }
+
+        let entries = vec![
+            msg("1", None, "user", "start"),
+            msg("2", Some("1"), "assistant", "r1"),
+            msg("3", Some("2"), "user", "q2"),
+            msg("4", Some("3"), "assistant", "r2"),
+            compaction("5", "4", "Compacted history", "3"),
+            msg("6", Some("5"), "user", "q3"),
+            msg("7", Some("6"), "assistant", "r3"),
+            msg("8", Some("3"), "user", "wrong path"),
+            msg("9", Some("8"), "assistant", "wrong response"),
+            branch_summary("10", "3", "Tried wrong approach", "9"),
+            msg("11", Some("10"), "user", "better approach"),
+        ];
+        assert_eq!(
+            build_context_entries(&entries, Some("7"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5", "3", "4", "6", "7"]
+        );
+        assert_eq!(
+            build_context_entries(&entries, Some("11"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "10", "11"]
+        );
+        assert_eq!(
+            build_context_entries(&entries, Some("missing"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "10", "11"]
+        );
     }
 }

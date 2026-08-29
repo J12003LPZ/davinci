@@ -1,39 +1,99 @@
+use pi_ai::{AssistantMessageEvent, ChatMessage};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentMessage {
-    pub role: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Events emitted by the Agent, locked to `vendor/pi/packages/agent/src/types.ts`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentEvent {
     #[serde(rename = "agent_start")]
     AgentStart,
-    #[serde(rename = "turn_start")]
-    TurnStart { turn: u32 },
-    #[serde(rename = "message")]
-    Message { message: AgentMessage },
-    #[serde(rename = "tool_start")]
-    ToolStart { name: String, id: String },
-    #[serde(rename = "tool_end")]
-    ToolEnd {
-        name: String,
-        id: String,
-        is_error: bool,
-        output: String,
-    },
-    #[serde(rename = "usage")]
-    Usage { usage: pi_ai::Usage },
-    #[serde(rename = "compaction")]
-    Compaction { summary: String },
-    #[serde(rename = "retry")]
-    Retry { attempt: u32, message: String },
     #[serde(rename = "agent_end")]
-    AgentEnd,
-    #[serde(rename = "error")]
-    Error { message: String },
+    AgentEnd {
+        messages: Vec<ChatMessage>,
+        #[serde(rename = "willRetry", default)]
+        will_retry: bool,
+    },
+    #[serde(rename = "turn_start")]
+    TurnStart,
+    #[serde(rename = "turn_end")]
+    TurnEnd {
+        message: ChatMessage,
+        #[serde(rename = "toolResults")]
+        tool_results: Vec<ChatMessage>,
+    },
+    #[serde(rename = "message_start")]
+    MessageStart { message: ChatMessage },
+    #[serde(rename = "message_update")]
+    MessageUpdate {
+        message: ChatMessage,
+        #[serde(rename = "assistantMessageEvent")]
+        assistant_message_event: AssistantMessageEvent,
+    },
+    #[serde(rename = "message_end")]
+    MessageEnd { message: ChatMessage },
+    #[serde(rename = "tool_execution_start")]
+    ToolExecutionStart {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        args: Value,
+    },
+    #[serde(rename = "tool_execution_update")]
+    ToolExecutionUpdate {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        args: Value,
+        #[serde(rename = "partialResult")]
+        partial_result: Value,
+    },
+    #[serde(rename = "tool_execution_end")]
+    ToolExecutionEnd {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        result: Value,
+        #[serde(rename = "isError")]
+        is_error: bool,
+    },
+    #[serde(rename = "auto_retry_start")]
+    AutoRetryStart {
+        attempt: u32,
+        #[serde(rename = "maxAttempts")]
+        max_attempts: u32,
+        #[serde(rename = "delayMs")]
+        delay_ms: u64,
+        #[serde(rename = "errorMessage")]
+        error_message: String,
+    },
+    #[serde(rename = "auto_retry_end")]
+    AutoRetryEnd {
+        success: bool,
+        attempt: u32,
+        #[serde(rename = "finalError", skip_serializing_if = "Option::is_none")]
+        final_error: Option<String>,
+    },
+}
+
+impl AgentEvent {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AgentStart => "agent_start",
+            Self::AgentEnd { .. } => "agent_end",
+            Self::TurnStart => "turn_start",
+            Self::TurnEnd { .. } => "turn_end",
+            Self::MessageStart { .. } => "message_start",
+            Self::MessageUpdate { .. } => "message_update",
+            Self::MessageEnd { .. } => "message_end",
+            Self::ToolExecutionStart { .. } => "tool_execution_start",
+            Self::ToolExecutionUpdate { .. } => "tool_execution_update",
+            Self::ToolExecutionEnd { .. } => "tool_execution_end",
+            Self::AutoRetryStart { .. } => "auto_retry_start",
+            Self::AutoRetryEnd { .. } => "auto_retry_end",
+        }
+    }
 }

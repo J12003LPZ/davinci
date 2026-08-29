@@ -1,46 +1,163 @@
-//! Vendor-neutral telemetry contracts matching `@earendil-works/pi-telemetry`.
+//! Telemetry contracts matching `@earendil-works/pi-telemetry`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub type AttributeValue = Value;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpanAttributes {
     #[serde(flatten)]
     pub values: serde_json::Map<String, Value>,
 }
 
-impl SpanAttributes {
-    pub fn insert(&mut self, name: impl Into<String>, value: impl Into<Value>) {
-        self.values.insert(name.into(), value.into());
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpanOptions {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attributes: Option<SpanAttributes>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "status")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
 pub enum SpanStatus {
-    #[serde(rename = "ok")]
     Ok,
-    #[serde(rename = "error")]
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<SpanErrorInfo>,
+        error: Option<SpanError>,
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SpanErrorInfo {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpanError {
     pub name: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub trait TelemetrySpan: Send {
+    fn add_event(&mut self, name: &str, attributes: Option<SpanAttributes>);
+    fn set_attributes(&mut self, attributes: SpanAttributes);
+    fn set_status(&mut self, status: SpanStatus);
+}
+
+pub trait TelemetryContext: Send + Sync {
+    fn start_span<T, F>(&self, options: SpanOptions, callback: F) -> T
+    where
+        F: FnOnce(&mut dyn TelemetrySpan) -> T;
+}
+
+#[derive(Debug, Default)]
+pub struct NoopSpan;
+
+impl TelemetrySpan for NoopSpan {
+    fn add_event(&mut self, _name: &str, _attributes: Option<SpanAttributes>) {}
+    fn set_attributes(&mut self, _attributes: SpanAttributes) {}
+    fn set_status(&mut self, _status: SpanStatus) {}
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopTelemetryContext;
+
+impl TelemetryContext for NoopTelemetryContext {
+    fn start_span<T, F>(&self, _options: SpanOptions, callback: F) -> T
+    where
+        F: FnOnce(&mut dyn TelemetrySpan) -> T,
+    {
+        let mut span = NoopSpan;
+        callback(&mut span)
+    }
+}
+
+pub const NOOP_TELEMETRY_CONTEXT: NoopTelemetryContext = NoopTelemetryContext;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEvent {
+    pub name: String,
+    pub attributes: SpanAttributes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySpan {
+    pub name: String,
+    pub attributes: SpanAttributes,
+    pub events: Vec<MemoryEvent>,
+    pub status: SpanStatus,
+}
+
+#[derive(Debug, Default)]
+pub struct MemoryTelemetryContext {
+    pub spans: std::sync::Mutex<Vec<MemorySpan>>,
+}
+
+impl TelemetryContext for MemoryTelemetryContext {
+    fn start_span<T, F>(&self, options: SpanOptions, callback: F) -> T
+    where
+        F: FnOnce(&mut dyn TelemetrySpan) -> T,
+    {
+        let mut span = RecordingSpan {
+            name: options.name,
+            attributes: options.attributes.unwrap_or_default(),
+            events: Vec::new(),
+            status: SpanStatus::Ok,
+        };
+        let result = callback(&mut span);
+        if let Ok(mut spans) = self.spans.lock() {
+            spans.push(MemorySpan {
+                name: span.name,
+                attributes: span.attributes,
+                events: span.events,
+                status: span.status,
+            });
+        }
+        result
+    }
+}
+
+struct RecordingSpan {
+    name: String,
+    attributes: SpanAttributes,
+    events: Vec<MemoryEvent>,
+    status: SpanStatus,
+}
+
+impl TelemetrySpan for RecordingSpan {
+    fn add_event(&mut self, name: &str, attributes: Option<SpanAttributes>) {
+        self.events.push(MemoryEvent {
+            name: name.to_string(),
+            attributes: attributes.unwrap_or_default(),
+        });
+    }
+
+    fn set_attributes(&mut self, attributes: SpanAttributes) {
+        self.attributes = attributes;
+    }
+
+    fn set_status(&mut self, status: SpanStatus) {
+        self.status = status;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetryAttributeDefinition {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetrySpanDefinition {
+    pub description: String,
+    #[serde(default)]
+    pub start_attributes: serde_json::Map<String, Value>,
+    #[serde(default)]
+    pub end_attributes: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TelemetrySchemaDefinition {
     pub version: u32,
     pub spans: serde_json::Map<String, Value>,
@@ -50,228 +167,54 @@ pub fn define_telemetry_schema(schema: TelemetrySchemaDefinition) -> TelemetrySc
     schema
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RecordedTelemetryEvent {
-    pub name: String,
-    pub attributes: SpanAttributes,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RecordedTelemetrySpan {
-    pub id: u64,
-    pub parent_id: Option<u64>,
-    pub name: String,
-    pub attributes: SpanAttributes,
-    pub events: Vec<RecordedTelemetryEvent>,
-    pub status: SpanStatus,
-    pub settled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_sequence: Option<u64>,
-}
-
-#[derive(Debug, Default)]
-struct MemoryState {
-    spans: Vec<RecordedTelemetrySpan>,
-    next_span_id: u64,
-    next_end_sequence: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct InMemoryTelemetryContext {
-    state: Arc<Mutex<MemoryState>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TelemetrySpan {
-    state: Option<Arc<Mutex<MemoryState>>>,
-    id: u64,
-}
-
-impl TelemetrySpan {
-    pub fn add_event(&self, name: &str, attributes: Option<SpanAttributes>) {
-        let Some(state) = &self.state else {
-            return;
-        };
-        let mut guard = state.lock().expect("telemetry lock");
-        if let Some(span) = guard.spans.iter_mut().find(|s| s.id == self.id) {
-            if span.settled {
-                return;
-            }
-            span.events.push(RecordedTelemetryEvent {
-                name: name.to_string(),
-                attributes: attributes.unwrap_or_default(),
-            });
-        }
-    }
-
-    pub fn set_attributes(&self, attributes: SpanAttributes) {
-        let Some(state) = &self.state else {
-            return;
-        };
-        let mut guard = state.lock().expect("telemetry lock");
-        if let Some(span) = guard.spans.iter_mut().find(|s| s.id == self.id) {
-            if span.settled {
-                return;
-            }
-            span.attributes.values.extend(attributes.values);
-        }
-    }
-
-    pub fn set_status(&self, status: SpanStatus) {
-        let Some(state) = &self.state else {
-            return;
-        };
-        let mut guard = state.lock().expect("telemetry lock");
-        if let Some(span) = guard.spans.iter_mut().find(|s| s.id == self.id) {
-            if span.settled {
-                return;
-            }
-            span.status = status;
-        }
-    }
-
-    pub fn start_span<T>(
-        &self,
-        options: SpanOptions,
-        callback: impl FnOnce(&TelemetrySpan) -> T,
-    ) -> T {
-        match &self.state {
-            Some(state) => start_memory_span(state, Some(self.id), options, callback),
-            None => callback(&NOOP_SPAN),
-        }
-    }
-}
-
-pub static NOOP_SPAN: TelemetrySpan = TelemetrySpan { state: None, id: 0 };
-
-pub struct NoopTelemetry;
-
-pub static NOOP_TELEMETRY_CONTEXT: NoopTelemetry = NoopTelemetry;
-
-impl NoopTelemetry {
-    pub fn start_span<T>(
-        &self,
-        _options: SpanOptions,
-        callback: impl FnOnce(&TelemetrySpan) -> T,
-    ) -> T {
-        callback(&NOOP_SPAN)
-    }
-}
-
-impl InMemoryTelemetryContext {
-    pub fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(MemoryState {
-                spans: Vec::new(),
-                next_span_id: 1,
-                next_end_sequence: 1,
-            })),
-        }
-    }
-
-    pub fn start_span<T>(
-        &self,
-        options: SpanOptions,
-        callback: impl FnOnce(&TelemetrySpan) -> T,
-    ) -> T {
-        start_memory_span(&self.state, None, options, callback)
-    }
-
-    pub fn get_spans(&self) -> Vec<RecordedTelemetrySpan> {
-        self.state.lock().expect("telemetry lock").spans.clone()
-    }
-}
-
-fn start_memory_span<T>(
-    state: &Arc<Mutex<MemoryState>>,
-    parent_id: Option<u64>,
-    options: SpanOptions,
-    callback: impl FnOnce(&TelemetrySpan) -> T,
-) -> T {
-    if let Some(parent) = parent_id {
-        let settled = state
-            .lock()
-            .expect("telemetry lock")
-            .spans
-            .iter()
-            .find(|s| s.id == parent)
-            .map(|s| s.settled)
-            .unwrap_or(true);
-        if settled {
-            return NOOP_TELEMETRY_CONTEXT.start_span(options, callback);
-        }
-    }
-
-    let id = {
-        let mut guard = state.lock().expect("telemetry lock");
-        let id = guard.next_span_id;
-        guard.next_span_id += 1;
-        guard.spans.push(RecordedTelemetrySpan {
-            id,
-            parent_id,
-            name: options.name,
-            attributes: options.attributes.unwrap_or_default(),
-            events: Vec::new(),
-            status: SpanStatus::Ok,
-            settled: false,
-            end_sequence: None,
-        });
-        id
-    };
-
-    let span = TelemetrySpan {
-        state: Some(Arc::clone(state)),
-        id,
-    };
-    let result = callback(&span);
-    let mut guard = state.lock().expect("telemetry lock");
-    let end_sequence = guard.next_end_sequence;
-    if let Some(recorded) = guard.spans.iter_mut().find(|s| s.id == id) {
-        if !recorded.settled {
-            recorded.settled = true;
-            recorded.end_sequence = Some(end_sequence);
-            guard.next_end_sequence += 1;
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn define_schema_is_identity() {
-        let schema = define_telemetry_schema(TelemetrySchemaDefinition {
-            version: 1,
-            spans: serde_json::Map::new(),
-        });
-        assert_eq!(schema.version, 1);
-    }
-
-    #[test]
-    fn memory_records_nested_spans() {
-        let ctx = InMemoryTelemetryContext::new();
-        ctx.start_span(
+    fn memory_context_records_spans() {
+        let context = MemoryTelemetryContext::default();
+        context.start_span(
             SpanOptions {
-                name: "operation".into(),
+                name: "agent.turn".into(),
                 attributes: None,
             },
             |span| {
-                span.add_event("result", None);
-                span.start_span(
-                    SpanOptions {
-                        name: "child".into(),
-                        attributes: None,
-                    },
-                    |_| 1,
-                )
+                span.add_event("start", None);
+                span.set_status(SpanStatus::Ok);
             },
         );
-        let spans = ctx.get_spans();
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].name, "operation");
-        assert_eq!(spans[1].parent_id, Some(spans[0].id));
-        assert!(spans.iter().all(|s| s.settled));
+        let spans = context.spans.lock().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "agent.turn");
+        assert_eq!(spans[0].events[0].name, "start");
+        let span = TelemetrySpanDefinition {
+            description: "One agent turn".into(),
+            start_attributes: {
+                let mut attrs = serde_json::Map::new();
+                attrs.insert(
+                    "provider".into(),
+                    serde_json::to_value(TelemetryAttributeDefinition {
+                        type_name: "string".into(),
+                        description: "Provider id".into(),
+                        required: true,
+                        sensitive: None,
+                    })
+                    .unwrap(),
+                );
+                attrs
+            },
+            end_attributes: serde_json::Map::new(),
+        };
+        let schema = define_telemetry_schema(TelemetrySchemaDefinition {
+            version: 1,
+            spans: {
+                let mut spans = serde_json::Map::new();
+                spans.insert("agent.turn".into(), serde_json::to_value(span).unwrap());
+                spans
+            },
+        });
+        assert_eq!(schema.version, 1);
+        assert!(schema.spans.contains_key("agent.turn"));
     }
 }

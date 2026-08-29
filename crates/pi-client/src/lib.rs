@@ -1,163 +1,183 @@
-//! Transport-neutral client for remote pi sessions.
+//! Protocol client matching `@earendil-works/pi-client`.
 
-use pi_protocol::{
-    encode_client_message, parse_server_message, ClientMessageDecoder, PROTOCOL_VERSION,
+mod connection;
+mod session;
+mod state;
+mod unix;
+
+pub use connection::{
+    loopback_factory, ByteTransport, ByteTransportHandlers, Connection, ConnectionState,
+    ConnectionStateChange, LoopbackTransport, TransportFactory, MAX_UINT32,
 };
-use serde_json::{json, Value};
+pub use session::{SessionClient, SessionHandle, SessionLeaseMode};
+pub use state::{ClientState, Unsubscribe};
+pub use unix::{
+    connect_unix_transport, create_unix_transport_factory, max_unix_socket_path_bytes,
+    resolve_unix_transport_options, UnixByteTransport, UnixTransportOptions,
+};
+
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
+
+use pi_protocol::{
+    encode_client_message, ClientMessage, ClientMessageDecoder, Command, ProtocolError,
+    ProtocolErrorCode, ServerMessage, PROTOCOL_VERSION,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ClientError {
-    #[error("handshake timeout")]
-    HandshakeTimeout,
     #[error("{0}")]
-    Message(String),
+    Io(String),
+    #[error("{0}")]
+    Protocol(String),
+    #[error("Handshake timed out")]
+    HandshakeTimeout,
 }
 
 pub enum Transport {
-    Memory { inbound: Vec<u8>, outbound: Vec<u8> },
     Unix(UnixStream),
     Tcp(TcpStream),
+    Memory(MemoryPipe),
 }
 
-impl Transport {
-    pub fn connect_unix(path: impl AsRef<std::path::Path>) -> Result<Self, ClientError> {
-        UnixStream::connect(path)
-            .map(Self::Unix)
-            .map_err(|e| ClientError::Message(e.to_string()))
-    }
+#[derive(Default)]
+pub struct MemoryPipe {
+    pub incoming: Vec<u8>,
+    pub outgoing: Vec<u8>,
+}
 
-    pub fn connect_tcp(addr: impl ToSocketAddrs) -> Result<Self, ClientError> {
-        TcpStream::connect(addr)
-            .map(Self::Tcp)
-            .map_err(|e| ClientError::Message(e.to_string()))
-    }
-
-    pub fn memory() -> Self {
-        Self::Memory {
-            inbound: Vec::new(),
-            outbound: Vec::new(),
-        }
-    }
-
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), ClientError> {
-        match self {
-            Self::Unix(s) => s.set_read_timeout(timeout),
-            Self::Tcp(s) => s.set_read_timeout(timeout),
-            Self::Memory { .. } => return Ok(()),
-        }
-        .map_err(|e| ClientError::Message(e.to_string()))
-    }
-
-    fn write_all(&mut self, bytes: &[u8]) -> Result<(), ClientError> {
-        match self {
-            Self::Memory { outbound, .. } => {
-                outbound.extend_from_slice(bytes);
-                Ok(())
-            }
-            Self::Unix(s) => s
-                .write_all(bytes)
-                .map_err(|e| ClientError::Message(e.to_string())),
-            Self::Tcp(s) => s
-                .write_all(bytes)
-                .map_err(|e| ClientError::Message(e.to_string())),
-        }
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, ClientError> {
-        match self {
-            Self::Memory { inbound, .. } => {
-                let n = inbound.len().min(buf.len());
-                buf[..n].copy_from_slice(&inbound[..n]);
-                inbound.drain(..n);
-                Ok(n)
-            }
-            Self::Unix(s) => s.read(buf).map_err(|e| ClientError::Message(e.to_string())),
-            Self::Tcp(s) => s.read(buf).map_err(|e| ClientError::Message(e.to_string())),
-        }
+impl MemoryPipe {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
-pub struct Client {
-    pub transport: Transport,
-    pub handshake_timeout: Duration,
+pub struct PiClient {
+    pub connection_id: Option<String>,
+    pending: HashMap<String, String>,
+    handshake_timeout: Duration,
 }
 
-impl Client {
-    pub fn new(transport: Transport) -> Self {
+impl Default for PiClient {
+    fn default() -> Self {
         Self {
-            transport,
-            handshake_timeout: Duration::from_secs(10),
+            connection_id: None,
+            pending: HashMap::new(),
+            handshake_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+impl PiClient {
+    pub fn set_handshake_timeout(&mut self, timeout: Duration) {
+        self.handshake_timeout = timeout;
+    }
+
+    pub fn hello_message() -> ClientMessage {
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
         }
     }
 
-    pub fn hello(&mut self) -> Result<Value, ClientError> {
-        let hello = json!({ "type": "hello", "version": PROTOCOL_VERSION });
-        let frame = encode_client_message(&hello, None).map_err(|e| ClientError::Message(e.0))?;
-        self.transport
-            .set_read_timeout(Some(self.handshake_timeout))?;
-        self.transport.write_all(&frame)?;
-        let mut buf = [0u8; 8192];
-        let n = self.transport.read(&mut buf).map_err(|e| {
-            if e.to_string().contains("timed out") {
-                ClientError::HandshakeTimeout
-            } else {
-                e
-            }
-        })?;
-        if n == 0 {
-            return Err(ClientError::HandshakeTimeout);
-        }
-        let decoder = ClientMessageDecoder::new(None).map_err(|e| ClientError::Message(e.0))?;
-        // Server hello is a server message; decode framed CBOR via protocol helper.
-        let decoded = pi_protocol::decode_cbor(
-            {
-                let frames = pi_protocol::FrameDecoder::new(None)
-                    .map_err(|e| ClientError::Message(e.0))?
-                    .push(&buf[..n])
-                    .map_err(|e| ClientError::Message(e.0))?;
-                frames.into_iter().next().unwrap_or_default()
-            }
-            .as_slice(),
-            None,
-        )
-        .map_err(|e| ClientError::Message(e.0))?;
-        let _ = decoder;
-        parse_server_message(&decoded.to_json()).map_err(|e| ClientError::Message(e.0))
-    }
-
-    pub fn request(&mut self, command: Value) -> Result<String, ClientError> {
+    pub fn request(&mut self, command: Command) -> (String, ClientMessage) {
         let id = Uuid::new_v4().to_string();
-        let envelope = json!({
-            "type": "request",
-            "id": id,
-            "request": command
-        });
-        let frame =
-            encode_client_message(&envelope, None).map_err(|e| ClientError::Message(e.0))?;
-        self.transport.write_all(&frame)?;
-        Ok(id)
+        self.pending.insert(id.clone(), command.name().to_string());
+        (
+            id.clone(),
+            ClientMessage::Request {
+                id,
+                request: command,
+            },
+        )
     }
+
+    pub fn correlate<'a>(&self, message: &'a ServerMessage) -> Option<&'a str> {
+        match message {
+            ServerMessage::Response { id, .. } => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn encode(&self, message: &ClientMessage) -> Result<Vec<u8>, ClientError> {
+        encode_client_message(message, None).map_err(|err| ClientError::Protocol(err.to_string()))
+    }
+
+    pub fn handshake_error(version: u32) -> ServerMessage {
+        ServerMessage::HelloError {
+            error: ProtocolError {
+                code: ProtocolErrorCode::Version,
+                message: format!("Unsupported protocol version {version}"),
+                details: None,
+            },
+        }
+    }
+}
+
+pub fn connect_unix(path: &str) -> Result<UnixStream, ClientError> {
+    UnixStream::connect(path).map_err(|err| ClientError::Io(err.to_string()))
+}
+
+pub fn connect_tcp(addr: &str) -> Result<TcpStream, ClientError> {
+    TcpStream::connect(addr).map_err(|err| ClientError::Io(err.to_string()))
+}
+
+pub fn write_message<W: Write>(writer: &mut W, message: &ClientMessage) -> Result<(), ClientError> {
+    let bytes = encode_client_message(message, None)
+        .map_err(|err| ClientError::Protocol(err.to_string()))?;
+    writer
+        .write_all(&bytes)
+        .map_err(|err| ClientError::Io(err.to_string()))
+}
+
+pub fn read_messages<R: Read>(
+    reader: &mut R,
+    decoder: &mut ClientMessageDecoder,
+) -> Result<Vec<ClientMessage>, ClientError> {
+    let mut buf = [0u8; 4096];
+    let n = reader
+        .read(&mut buf)
+        .map_err(|err| ClientError::Io(err.to_string()))?;
+    decoder
+        .push(&buf[..n])
+        .map_err(|err| ClientError::Protocol(err.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_protocol::{create_client_message_decoder, CommandResult};
 
     #[test]
-    fn memory_transport_writes_hello_frame() {
-        let mut client = Client::new(Transport::memory());
-        let hello = json!({ "type": "hello", "version": 1 });
-        let frame = encode_client_message(&hello, None).unwrap();
-        client.transport.write_all(&frame).unwrap();
-        match &client.transport {
-            Transport::Memory { outbound, .. } => assert_eq!(outbound, &frame),
-            _ => unreachable!(),
+    fn request_correlation_and_hello() {
+        let mut client = PiClient::default();
+        let (id, message) = client.request(Command::List);
+        let encoded = client.encode(&message).unwrap();
+        let mut decoder = create_client_message_decoder(None).unwrap();
+        let decoded = decoder.push(&encoded).unwrap();
+        decoder.end().unwrap();
+        match &decoded[0] {
+            ClientMessage::Request {
+                id: decoded_id,
+                request,
+            } => {
+                assert_eq!(decoded_id, &id);
+                assert!(matches!(request, Command::List));
+            }
+            _ => panic!("expected request"),
         }
+        assert_eq!(
+            client.correlate(&ServerMessage::Response {
+                id: id.clone(),
+                ok: true,
+                result: Some(CommandResult::List { sessions: vec![] }),
+                error: None,
+            }),
+            Some(id.as_str())
+        );
     }
 }

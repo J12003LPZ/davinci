@@ -2,13 +2,16 @@
 name = "pi-client"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
-description = "Transport-neutral client for remote pi sessions"
+rust-version.workspace = true
+description = "Protocol client matching @earendil-works/pi-client"
 
 [dependencies]
-pi-protocol.workspace = true
+pi-protocol = { path = "../pi-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

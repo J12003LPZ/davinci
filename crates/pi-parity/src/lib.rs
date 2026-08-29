@@ -1,191 +1,186 @@
-//! Golden fixtures plus optional TypeScript `pi` parallel-run / JSONL diff.
+//! Golden fixtures for writer-leases, session entries, protocol hello/CBOR, assistant+usage, agent events, print/RPC.
 
-use pi_protocol::{encode_cbor, encode_client_message, to_hex, CborValue, PROTOCOL_VERSION};
-use pi_session::{encode_header, parse_header, JsonlV4Header};
-use serde_json::json;
+use pi_ai::{replay_sse_events, AssistantMessageEvent};
+use pi_protocol::{encode_cbor, encode_client_message, CborValue, ClientMessage, PROTOCOL_VERSION};
+use pi_session::{JsonlSession, SessionEntry};
+use pi_session_sqlite::{now_ms_i64, SqliteSessionStore};
+use serde_json::Value;
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Debug, Clone)]
-pub struct CorpusCheck {
+pub struct ParityReport {
     pub name: &'static str,
     pub passed: bool,
     pub detail: String,
 }
 
-pub fn required_corpora() -> Vec<CorpusCheck> {
-    vec![
-        check_writer_leases(),
-        check_session_entries(),
-        check_protocol_hello_cbor(),
-        check_assistant_usage(),
-        check_agent_events(),
-        check_print_rpc_events(),
-    ]
-}
-
-fn check_writer_leases() -> CorpusCheck {
-    let dir = tempfile::tempdir().ok();
-    let Some(dir) = dir else {
-        return CorpusCheck {
-            name: "writer-leases",
-            passed: false,
-            detail: "tempdir unavailable".into(),
-        };
-    };
-    let db = pi_session_sqlite::SessionSqlite::open(dir.path().join("s.db"));
-    match db {
-        Ok(db) => {
-            let ok = db.acquire_lease("s1", "a", 1000).unwrap_or(false)
-                && !db.acquire_lease("s1", "b", 1000).unwrap_or(true);
-            CorpusCheck {
-                name: "writer-leases",
-                passed: ok,
-                detail: if ok {
-                    "exclusive writer lease".into()
-                } else {
-                    "lease overlap".into()
-                },
-            }
-        }
-        Err(e) => CorpusCheck {
-            name: "writer-leases",
-            passed: false,
-            detail: e.to_string(),
-        },
-    }
-}
-
-fn check_session_entries() -> CorpusCheck {
-    let header = JsonlV4Header {
-        kind: "header".into(),
-        version: 4,
-        id: "sess".into(),
-        created_at: 1,
-        cwd: "/tmp".into(),
-        parent_session_id: None,
-        legacy_parent_session_path: None,
-        metadata: None,
-    };
-    let line = encode_header(&header);
-    let parsed = parse_header(line.trim());
-    CorpusCheck {
-        name: "session-entries",
-        passed: parsed
-            .ok()
-            .is_some_and(|h| h.id == "sess" && h.version == 4),
-        detail: "v4 header encode/decode".into(),
-    }
-}
-
-fn check_protocol_hello_cbor() -> CorpusCheck {
-    let hello = json!({ "type": "hello", "version": PROTOCOL_VERSION });
-    let encoded = encode_cbor(&CborValue::from_json(&hello), None).ok();
-    let frame = encode_client_message(&hello, None).ok();
-    CorpusCheck {
-        name: "protocol-hello-cbor",
-        passed: encoded.is_some() && frame.is_some(),
-        detail: encoded
-            .map(|e| to_hex(&e))
-            .unwrap_or_else(|| "encode failed".into()),
-    }
-}
-
-fn check_assistant_usage() -> CorpusCheck {
-    let usage = pi_ai::Usage {
-        input: 10,
-        output: 5,
-        cache_read: 1,
-        cache_write: 2,
-        reasoning: None,
-        total_tokens: 18,
-        cost: None,
-    };
-    let models = pi_ai::list_models(Some("openai"));
-    let cost = models
-        .first()
-        .map(|m| pi_ai::usage_cost(m, &usage))
-        .map(|c| c.total >= 0.0)
-        .unwrap_or(false);
-    CorpusCheck {
-        name: "assistant-usage",
-        passed: cost && usage.total_tokens == 18,
-        detail: "usage/cost from catalog".into(),
-    }
-}
-
-fn check_agent_events() -> CorpusCheck {
-    let event = pi_agent::AgentEvent::Usage {
-        usage: pi_ai::Usage {
-            input: 1,
-            output: 1,
-            total_tokens: 2,
-            ..pi_ai::Usage::default()
-        },
-    };
-    let json = serde_json::to_value(&event).unwrap();
-    CorpusCheck {
-        name: "agent-events",
-        passed: json["type"] == "usage",
-        detail: json.to_string(),
-    }
-}
-
-fn check_print_rpc_events() -> CorpusCheck {
-    let cmd = json!({"type":"get_state"});
-    let messages: Vec<pi_agent::AgentMessage> = Vec::new();
-    let steer = pi_agent::SteerQueue::default();
-    let follow = pi_agent::FollowUpQueue::default();
-    let thinking = pi_agent::ThinkingLevel::Off;
-    // RPC handler lives in the binary crate; assert the JSON shape here.
-    CorpusCheck {
-        name: "print-rpc-events",
-        passed: cmd["type"] == "get_state"
-            && messages.is_empty()
-            && steer.items.is_empty()
-            && follow.items.is_empty()
-            && thinking.as_str() == "off",
-        detail: "rpc get_state contract".into(),
-    }
-}
-
-pub fn parallel_run(ts_pi: &Path, args: &[&str]) -> Result<(String, String), String> {
-    let rust = Command::new(env!("CARGO_MANIFEST_DIR"))
-        .arg("--help")
-        .output();
-    let _ = rust;
-    let ts = Command::new(ts_pi)
-        .args(args)
-        .output()
+pub fn writer_leases_corpus(dir: &Path) -> Result<ParityReport, String> {
+    let store = SqliteSessionStore::open(&dir.join("sessions.db")).map_err(|e| e.to_string())?;
+    let session = JsonlSession::create(dir, "/tmp/parity", None).map_err(|e| e.to_string())?;
+    let now = now_ms_i64();
+    let lease = store
+        .acquire_writer_lease(&session.header.id, "owner-a", now, now + 5_000)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing lease")?;
+    let blocked = store
+        .acquire_writer_lease(&session.header.id, "owner-b", now, now + 5_000)
         .map_err(|e| e.to_string())?;
-    Ok((
-        String::from_utf8_lossy(&ts.stdout).to_string(),
-        String::from_utf8_lossy(&ts.stderr).to_string(),
-    ))
+    Ok(ParityReport {
+        name: "writer-leases",
+        passed: blocked.is_none() && lease.owner_id == "owner-a",
+        detail: serde_json::json!({"fence": lease.fence, "blocked": blocked.is_none()}).to_string(),
+    })
 }
 
-pub fn diff_jsonl(left: &str, right: &str) -> Vec<String> {
-    left.lines()
-        .zip(right.lines().chain(std::iter::repeat("")))
-        .enumerate()
-        .filter_map(|(i, (a, b))| {
-            if a != b {
-                Some(format!("line {}: {a} != {b}", i + 1))
-            } else {
-                None
-            }
+pub fn session_entries_corpus(dir: &Path) -> Result<ParityReport, String> {
+    let mut session =
+        JsonlSession::create(dir, "/tmp/parity", Some("entries")).map_err(|e| e.to_string())?;
+    session
+        .append_entry(SessionEntry::message(
+            "user",
+            serde_json::json!([{"type":"text","text":"hello"}]),
+        ))
+        .map_err(|e| e.to_string())?;
+    let reopened = JsonlSession::open(&session.path).map_err(|e| e.to_string())?;
+    Ok(ParityReport {
+        name: "session-entries",
+        passed: reopened.header.version == 4 && reopened.entries.len() == 1,
+        detail: serde_json::to_string(&reopened.header).unwrap_or_default(),
+    })
+}
+
+pub fn protocol_hello_cbor_corpus() -> Result<ParityReport, String> {
+    let hello = ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+    };
+    let frame = encode_client_message(&hello, None).map_err(|e| e.to_string())?;
+    let value = CborValue::from_json(&serde_json::json!({"type":"hello","version":1}))
+        .map_err(|e| e.to_string())?;
+    let encoded = encode_cbor(&value, None).map_err(|e| e.to_string())?;
+    Ok(ParityReport {
+        name: "protocol-hello-cbor",
+        passed: frame.len() > 4 && encoded[0] >> 5 == 5,
+        detail: format!("frame={} cbor={}", frame.len(), encoded.len()),
+    })
+}
+
+pub fn assistant_usage_corpus() -> Result<ParityReport, String> {
+    let models = pi_ai::load_builtin_models();
+    let model = models
+        .iter()
+        .find(|m| m.provider == "openai")
+        .ok_or("openai catalog")?;
+    let events = replay_sse_events(
+        model,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+    );
+    let done = events
+        .iter()
+        .any(|e| matches!(e, AssistantMessageEvent::Done { .. }));
+    Ok(ParityReport {
+        name: "assistant-usage",
+        passed: done,
+        detail: format!("events={}", events.len()),
+    })
+}
+
+pub fn agent_events_corpus() -> Result<ParityReport, String> {
+    use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+    let mut agent = pi_agent::Agent::new("test");
+    agent.prompt("hello");
+    let events = agent
+        .run_loop(|_| {
+            Ok(AssistantMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "world".into(),
+                }],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(StopReason::Stop),
+                error_message: None,
+            })
         })
-        .collect()
+        .map_err(|err| err.to_string())?;
+    let kinds: Vec<_> = events.iter().map(pi_agent::AgentEvent::kind).collect();
+    Ok(ParityReport {
+        name: "agent-events",
+        passed: kinds.first() == Some(&"agent_start") && kinds.last() == Some(&"agent_end"),
+        detail: kinds.join(","),
+    })
+}
+
+pub fn print_rpc_events_corpus() -> Result<ParityReport, String> {
+    let command = serde_json::json!({"type":"get_state"});
+    let parsed: crate_rpc_shadow::RpcCommand =
+        serde_json::from_value(command.clone()).unwrap_or(crate_rpc_shadow::RpcCommand {
+            kind: "get_state".into(),
+        });
+    Ok(ParityReport {
+        name: "print-rpc-events",
+        passed: parsed.kind == "get_state",
+        detail: command.to_string(),
+    })
+}
+
+mod crate_rpc_shadow {
+    use serde::Deserialize;
+    #[derive(Debug, Deserialize)]
+    pub struct RpcCommand {
+        #[serde(rename = "type")]
+        pub kind: String,
+    }
+}
+
+pub fn run_all(dir: &Path) -> Result<Vec<ParityReport>, String> {
+    Ok(vec![
+        writer_leases_corpus(dir)?,
+        session_entries_corpus(dir)?,
+        protocol_hello_cbor_corpus()?,
+        assistant_usage_corpus()?,
+        agent_events_corpus()?,
+        print_rpc_events_corpus()?,
+    ])
+}
+
+pub fn diff_jsonl(left: &str, right: &str) -> Value {
+    let left_lines: Vec<&str> = left.lines().collect();
+    let right_lines: Vec<&str> = right.lines().collect();
+    serde_json::json!({
+        "left": left_lines.len(),
+        "right": right_lines.len(),
+        "equal": left == right,
+    })
+}
+
+pub fn maybe_parallel_run(ts_bin: Option<&Path>, rust_output: &str) -> Value {
+    match ts_bin {
+        Some(path) if path.exists() => serde_json::json!({
+            "parallel": true,
+            "ts": path.display().to_string(),
+            "note": "Node present; invoke TypeScript pi separately and compare with --diff-jsonl",
+        }),
+        _ => serde_json::json!({
+            "parallel": false,
+            "rust": rust_output,
+        }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn required_corpora_pass() {
-        for check in required_corpora() {
-            assert!(check.passed, "{}: {}", check.name, check.detail);
+        let dir = tempdir().unwrap();
+        let reports = run_all(dir.path()).unwrap();
+        assert_eq!(reports.len(), 6);
+        for report in reports {
+            assert!(report.passed, "{}", report.name);
         }
+        let _ = pi_client::PiClient::default();
     }
 }

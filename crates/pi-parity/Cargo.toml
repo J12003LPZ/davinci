@@ -2,22 +2,25 @@
 name = "pi-parity"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
-description = "Golden fixtures and optional TypeScript pi parallel-run"
+rust-version.workspace = true
+description = "Golden fixtures and optional TypeScript pi parallel-run diffs"
 
 [dependencies]
-pi-protocol.workspace = true
-pi-session.workspace = true
-pi-session-sqlite.workspace = true
-pi-ai.workspace = true
-pi-agent.workspace = true
+pi-agent = { path = "../pi-agent" }
+pi-ai = { path = "../pi-ai" }
+pi-client = { path = "../pi-client" }
+pi-protocol = { path = "../pi-protocol" }
+pi-server = { path = "../pi-server" }
+pi-session = { path = "../pi-session" }
+pi-session-sqlite = { path = "../pi-session-sqlite" }
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-hex.workspace = true
-tempfile.workspace = true
 
 [[bin]]
 name = "pi-parity"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS session_stats (
 	cost_total REAL NOT NULL
 ) WITHOUT ROWID;
 
+-- Derived branch cache. Parent links in entries remain canonical; this cache
+-- exists only to make branch scans cheap.
 CREATE TABLE IF NOT EXISTS branch_entries (
 	session_id TEXT NOT NULL,
 	branch_id TEXT NOT NULL,
@@ -90,6 +92,7 @@ CREATE TABLE IF NOT EXISTS lane_moves (
 	PRIMARY KEY (session_id, seq)
 ) WITHOUT ROWID;
 
+
 CREATE TABLE IF NOT EXISTS facts (
 	session_id TEXT NOT NULL,
 	seq INTEGER NOT NULL,
@@ -109,6 +112,8 @@ CREATE TABLE IF NOT EXISTS branch_tips (
 	UNIQUE (session_id, branch_id)
 ) WITHOUT ROWID;
 
+-- Per-session writer claim. The fence prevents an expired owner from writing
+-- after a new owner takes over the session.
 CREATE TABLE IF NOT EXISTS writer_leases (
 	session_id TEXT PRIMARY KEY,
 	owner_id TEXT NOT NULL,
