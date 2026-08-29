@@ -491,6 +491,9 @@ impl InteractiveMode {
                             for event in events {
                                 self.apply_ui_request(&event);
                             }
+                            for (kind, line) in self.runtime.take_custom_lines() {
+                                self.chat.push(&kind, line);
+                            }
                             self.chat.push("system", format!("/{other}"));
                         }
                         Err(err) => self.chat.push("error", err),
@@ -504,13 +507,22 @@ impl InteractiveMode {
     }
 
     pub fn submit_prompt(&mut self, text: &str) -> Result<(), String> {
-        self.chat.push("user", text);
+        let user = self
+            .runtime
+            .transform_markdown(text, "user", false, self.tui.columns.max(1));
+        self.chat.push("user", user);
         let events = self.runtime.prompt(text, vec![])?;
         self.last_json_events = events.iter().map(to_json_event).collect();
         for event in events {
             match event {
                 pi_agent::AgentEvent::Message { message } => {
-                    let md = Markdown::new(&message.content);
+                    let transformed = self.runtime.transform_markdown(
+                        &message.content,
+                        "assistant",
+                        false,
+                        self.tui.columns.max(1),
+                    );
+                    let md = Markdown::new(&transformed);
                     for line in md.render(self.tui.columns) {
                         self.chat.push("assistant", line);
                     }
@@ -527,6 +539,9 @@ impl InteractiveMode {
                 }
                 _ => {}
             }
+        }
+        for (kind, line) in self.runtime.take_custom_lines() {
+            self.chat.push(&kind, line);
         }
         Ok(())
     }
@@ -590,6 +605,9 @@ impl InteractiveMode {
                 Ok(events) => {
                     for event in events {
                         self.apply_ui_request(&event);
+                    }
+                    for (kind, line) in self.runtime.take_custom_lines() {
+                        self.chat.push(&kind, line);
                     }
                     self.chat.push("system", format!("shortcut {id}"));
                     return Ok(true);

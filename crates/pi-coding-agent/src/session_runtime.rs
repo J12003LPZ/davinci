@@ -51,6 +51,7 @@ pub struct SessionRuntime {
     pub registry: ExtensionRegistry,
     pub theme: String,
     pub flag_values: BTreeMap<String, Value>,
+    pub pending_custom_lines: Vec<(String, String)>,
 }
 
 impl SessionRuntime {
@@ -169,6 +170,7 @@ impl SessionRuntime {
             &self.flags_json(),
             &json!({}),
         )?;
+        self.apply_extension_actions(&invoked.ui_calls);
         Ok(self.ui.apply_calls(&invoked.ui_calls))
     }
 
@@ -290,6 +292,7 @@ impl SessionRuntime {
                 &json!({}),
             )?
         };
+        self.apply_extension_actions(&invoked.ui_calls);
         Ok(self.ui.apply_calls(&invoked.ui_calls))
     }
 
@@ -356,10 +359,162 @@ impl SessionRuntime {
             if let Ok(invoked) =
                 extensions::invoke_extension_event(&path, event, &payload, &json!({}))
             {
+                self.apply_extension_actions(&invoked.ui_calls);
                 events.extend(self.ui.apply_calls(&invoked.ui_calls));
             }
         }
         events
+    }
+
+    fn apply_extension_actions(&mut self, calls: &[Value]) {
+        for call in calls {
+            match call.get("method").and_then(|v| v.as_str()) {
+                Some("appendEntry") => {
+                    let custom_type = call
+                        .get("customType")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let data = call.get("data").cloned().unwrap_or(json!({}));
+                    self.append_custom_entry(custom_type, data.clone());
+                    let entry = json!({
+                        "type": "custom",
+                        "customType": custom_type,
+                        "data": data,
+                    });
+                    if let Some(lines) = self.render_custom_entry(&entry, 80) {
+                        for line in lines {
+                            self.pending_custom_lines.push(("custom".into(), line));
+                        }
+                    }
+                }
+                Some("sendMessage") => {
+                    if let Some(message) = call.get("message") {
+                        self.append_custom_message(message);
+                        if message.get("display").and_then(|v| v.as_bool()) != Some(false) {
+                            for line in self.render_custom_message(message, 80) {
+                                self.pending_custom_lines.push(("custom".into(), line));
+                            }
+                        }
+                    }
+                }
+                Some("sendUserMessage") => {
+                    if let Some(content) = call.get("content").and_then(|v| v.as_str()) {
+                        self.messages.push(AgentMessage {
+                            role: "user".into(),
+                            content: content.to_string(),
+                            images: vec![],
+                        });
+                        self.append_message("user", content);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn append_custom_entry(&self, custom_type: &str, data: Value) {
+        self.append_typed(
+            "custom",
+            json!({
+                "customType": custom_type,
+                "data": data,
+                "id": uuid::Uuid::new_v4().to_string(),
+            }),
+        );
+    }
+
+    pub fn append_custom_message(&self, message: &Value) {
+        let custom_type = message
+            .get("customType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("custom");
+        let display = message
+            .get("display")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        self.append_typed(
+            "message",
+            json!({
+                "role": "custom",
+                "customType": custom_type,
+                "content": message.get("content").cloned().unwrap_or(json!("")),
+                "display": display,
+                "details": message.get("details").cloned().unwrap_or(json!({})),
+                "id": uuid::Uuid::new_v4().to_string(),
+            }),
+        );
+    }
+
+    pub fn transform_markdown(
+        &self,
+        markdown: &str,
+        message_type: &str,
+        is_streaming: bool,
+        available_width: usize,
+    ) -> String {
+        let mut text = markdown.to_string();
+        for path in &self.registry.markdown_transformers {
+            if let Ok(next) = extensions::invoke_transform_markdown(
+                path,
+                &text,
+                message_type,
+                is_streaming,
+                available_width,
+            ) {
+                text = next;
+            }
+        }
+        text
+    }
+
+    pub fn render_custom_message(&self, message: &Value, width: usize) -> Vec<String> {
+        let custom_type = message
+            .get("customType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(renderer) = self
+            .registry
+            .message_renderers
+            .iter()
+            .find(|r| r.custom_type == custom_type)
+        {
+            if let Ok(Some(lines)) = extensions::invoke_message_renderer(
+                &renderer.path,
+                custom_type,
+                message,
+                false,
+                width,
+            ) {
+                return lines;
+            }
+        }
+        let content = match message.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        vec![format!("[{custom_type}]"), content]
+    }
+
+    pub fn take_custom_lines(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_custom_lines)
+    }
+
+    pub fn render_custom_entry(&self, entry: &Value, width: usize) -> Option<Vec<String>> {
+        let custom_type = entry
+            .get("customType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let renderer = self
+            .registry
+            .entry_renderers
+            .iter()
+            .find(|r| r.custom_type == custom_type)?;
+        extensions::invoke_entry_renderer(&renderer.path, custom_type, entry, false, width).ok()?
     }
 
     fn append_message(&self, role: &str, content: &str) {
@@ -808,6 +963,7 @@ mod tests {
             registry: ExtensionRegistry::default(),
             theme: "dark".into(),
             flag_values: Default::default(),
+            pending_custom_lines: Vec::new(),
         };
         runtime.registry.providers.push(RegisteredProviderMeta {
             name: "my-proxy".into(),

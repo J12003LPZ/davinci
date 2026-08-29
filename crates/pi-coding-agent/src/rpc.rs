@@ -445,6 +445,7 @@ mod tests {
             registry: crate::extensions::ExtensionRegistry::default(),
             theme: "dark".into(),
             flag_values: Default::default(),
+            pending_custom_lines: Vec::new(),
         }
     }
 

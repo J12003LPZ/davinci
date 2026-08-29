@@ -114,6 +114,18 @@ pub struct RegisteredFlagMeta {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegisteredMessageRenderer {
+    pub custom_type: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisteredEntryRenderer {
+    pub custom_type: String,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ExtensionRegistry {
     pub tools: Vec<RegisteredToolMeta>,
@@ -121,6 +133,9 @@ pub struct ExtensionRegistry {
     pub providers: Vec<RegisteredProviderMeta>,
     pub shortcuts: Vec<RegisteredShortcutMeta>,
     pub flags: Vec<RegisteredFlagMeta>,
+    pub message_renderers: Vec<RegisteredMessageRenderer>,
+    pub entry_renderers: Vec<RegisteredEntryRenderer>,
+    pub markdown_transformers: Vec<PathBuf>,
 }
 
 impl ExtensionRegistry {
@@ -144,6 +159,21 @@ impl ExtensionRegistry {
         for flag in other.flags {
             self.flags.retain(|f| f.name != flag.name);
             self.flags.push(flag);
+        }
+        for renderer in other.message_renderers {
+            self.message_renderers
+                .retain(|r| r.custom_type != renderer.custom_type);
+            self.message_renderers.push(renderer);
+        }
+        for renderer in other.entry_renderers {
+            self.entry_renderers
+                .retain(|r| r.custom_type != renderer.custom_type);
+            self.entry_renderers.push(renderer);
+        }
+        for path in other.markdown_transformers {
+            if !self.markdown_transformers.contains(&path) {
+                self.markdown_transformers.push(path);
+            }
         }
     }
 
@@ -283,10 +313,13 @@ const ui = {
 function jsonSafe(value) {
   try { return JSON.parse(JSON.stringify(value)); } catch (err) { return {}; }
 }
-const registrations = { tools: [], commands: [], providers: [], shortcuts: [], flags: [] };
+const registrations = { tools: [], commands: [], providers: [], shortcuts: [], flags: [], messageRenderers: [], entryRenderers: [], markdownTransformers: [] };
 const liveTools = {};
 const liveCommands = {};
 const liveShortcuts = {};
+const liveMessageRenderers = {};
+const liveEntryRenderers = {};
+let liveMarkdownTransformer = null;
 const handlers = {};
 const ctx = {
   ui,
@@ -373,12 +406,27 @@ function buildPi() {
       if (payload.flags && payload.flags[flagName] !== undefined) return payload.flags[flagName];
       return flag.default;
     },
-    registerMessageRenderer() {},
-    registerMarkdownTransformer() {},
-    registerEntryRenderer() {},
-    sendMessage() {},
-    sendUserMessage() {},
-    appendEntry() {},
+    registerMessageRenderer(customType, renderer) {
+      registrations.messageRenderers.push({ customType: String(customType || '') });
+      liveMessageRenderers[customType] = renderer;
+    },
+    registerMarkdownTransformer(transformer) {
+      registrations.markdownTransformers.push({ enabled: true });
+      liveMarkdownTransformer = transformer;
+    },
+    registerEntryRenderer(customType, renderer) {
+      registrations.entryRenderers.push({ customType: String(customType || '') });
+      liveEntryRenderers[customType] = renderer;
+    },
+    sendMessage(message, options) {
+      uiCalls.push({ method: 'sendMessage', message: jsonSafe(message), options: jsonSafe(options || {}) });
+    },
+    sendUserMessage(content, options) {
+      uiCalls.push({ method: 'sendUserMessage', content, options: jsonSafe(options || {}) });
+    },
+    appendEntry(customType, data) {
+      uiCalls.push({ method: 'appendEntry', customType, data: jsonSafe(data) });
+    },
     setSessionName() {},
     getSessionName() { return payload.sessionName; },
     setLabel() {},
@@ -481,6 +529,47 @@ async function main() {
       ? component.render(payload.width || 100)
       : null;
     console.log(JSON.stringify({ ok: true, result: { lines }, uiCalls, registrations }));
+    return;
+  }
+  if (kind === 'render_message') {
+    const renderer = liveMessageRenderers[name];
+    if (typeof renderer !== 'function') {
+      console.log(JSON.stringify({ ok: true, result: { lines: null }, uiCalls, registrations }));
+      return;
+    }
+    const component = renderer(payload.message || {}, payload.options || { expanded: false, outputPad: 1 }, {
+      fg(_c, text) { return text; },
+      bold(text) { return text; },
+    });
+    const lines = component && typeof component.render === 'function' ? component.render(payload.width || 80) : null;
+    console.log(JSON.stringify({ ok: true, result: { lines }, uiCalls, registrations }));
+    return;
+  }
+  if (kind === 'render_entry') {
+    const renderer = liveEntryRenderers[name];
+    if (typeof renderer !== 'function') {
+      console.log(JSON.stringify({ ok: true, result: { lines: null }, uiCalls, registrations }));
+      return;
+    }
+    const component = renderer(payload.entry || {}, payload.options || { expanded: false }, {
+      fg(_c, text) { return text; },
+      bold(text) { return text; },
+    });
+    const lines = component && typeof component.render === 'function' ? component.render(payload.width || 80) : null;
+    console.log(JSON.stringify({ ok: true, result: { lines }, uiCalls, registrations }));
+    return;
+  }
+  if (kind === 'transform_markdown') {
+    if (typeof liveMarkdownTransformer !== 'function') {
+      console.log(JSON.stringify({ ok: true, result: { text: payload.markdown || '' }, uiCalls, registrations }));
+      return;
+    }
+    let text = payload.markdown || '';
+    try {
+      const next = liveMarkdownTransformer(text, payload.context || {});
+      if (typeof next === 'string') text = next;
+    } catch (_err) {}
+    console.log(JSON.stringify({ ok: true, result: { text }, uiCalls, registrations }));
     return;
   }
   if (kind === 'shortcut') {
@@ -616,6 +705,74 @@ pub fn invoke_extension_render(
         )),
         _ => Ok(None),
     }
+}
+
+pub fn invoke_transform_markdown(
+    extension: &Path,
+    markdown: &str,
+    message_type: &str,
+    is_streaming: bool,
+    available_width: usize,
+) -> Result<String, String> {
+    let invoked = invoke_extension(
+        extension,
+        "transform_markdown",
+        "",
+        &json!({
+            "markdown": markdown,
+            "context": {
+                "messageType": message_type,
+                "isStreaming": is_streaming,
+                "availableWidth": available_width,
+            }
+        }),
+        &json!({}),
+    )?;
+    Ok(invoked
+        .result
+        .get("result")
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(markdown)
+        .to_string())
+}
+
+pub fn invoke_message_renderer(
+    extension: &Path,
+    custom_type: &str,
+    message: &Value,
+    expanded: bool,
+    width: usize,
+) -> Result<Option<Vec<String>>, String> {
+    invoke_extension_render(
+        extension,
+        "render_message",
+        custom_type,
+        &json!({
+            "message": message,
+            "options": { "expanded": expanded, "outputPad": 1 },
+            "width": width,
+        }),
+    )
+}
+
+pub fn invoke_entry_renderer(
+    extension: &Path,
+    custom_type: &str,
+    entry: &Value,
+    expanded: bool,
+    width: usize,
+) -> Result<Option<Vec<String>>, String> {
+    invoke_extension_render(
+        extension,
+        "render_entry",
+        custom_type,
+        &json!({
+            "entry": entry,
+            "options": { "expanded": expanded },
+            "width": width,
+        }),
+    )
 }
 
 pub fn load_extension(path: &Path) -> Result<ExtensionRegistry, String> {
@@ -779,12 +936,48 @@ fn parse_registry(value: &Value, path: &Path) -> ExtensionRegistry {
             })
         })
         .collect();
+    let message_renderers = raw
+        .get("messageRenderers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|renderer| {
+            Some(RegisteredMessageRenderer {
+                custom_type: renderer.get("customType")?.as_str()?.to_string(),
+                path: path.to_path_buf(),
+            })
+        })
+        .collect();
+    let entry_renderers = raw
+        .get("entryRenderers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|renderer| {
+            Some(RegisteredEntryRenderer {
+                custom_type: renderer.get("customType")?.as_str()?.to_string(),
+                path: path.to_path_buf(),
+            })
+        })
+        .collect();
+    let markdown_transformers = if raw
+        .get("markdownTransformers")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| !arr.is_empty())
+    {
+        vec![path.to_path_buf()]
+    } else {
+        Vec::new()
+    };
     ExtensionRegistry {
         tools,
         commands,
         providers,
         shortcuts,
         flags,
+        message_renderers,
+        entry_renderers,
+        markdown_transformers,
     }
 }
 
@@ -1030,6 +1223,9 @@ module.exports = function (pi) {
     handler: async (ctx) => { ctx.ui.setTitle("short:" + String(pi.getFlag("verbose"))); }
   });
   pi.registerFlag("verbose", { type: "boolean", default: false, description: "Verbose" });
+  pi.registerMessageRenderer("note", (message) => ({ render: () => ["NOTE " + (message.content || "")] }));
+  pi.registerEntryRenderer("bookmark", (entry) => ({ render: () => ["BOOK " + ((entry.data && entry.data.label) || "")] }));
+  pi.registerMarkdownTransformer((md) => md.split("secret").join("****"));
 };
 "#,
         )
@@ -1072,6 +1268,32 @@ module.exports = function (pi) {
         assert_eq!(registry.commands[0].name, "echo-cmd");
         assert_eq!(registry.shortcuts[0].shortcut, "ctrl+l");
         assert_eq!(registry.flags[0].name, "verbose");
+        assert_eq!(registry.message_renderers[0].custom_type, "note");
+        assert_eq!(registry.entry_renderers[0].custom_type, "bookmark");
+        assert_eq!(registry.markdown_transformers.len(), 1);
+        let transformed =
+            invoke_transform_markdown(&path, "keep secret", "user", false, 80).unwrap();
+        assert_eq!(transformed, "keep ****");
+        let note = invoke_message_renderer(
+            &path,
+            "note",
+            &json!({"customType":"note","content":"hi","display":true}),
+            false,
+            80,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(note, vec!["NOTE hi".to_string()]);
+        let book = invoke_entry_renderer(
+            &path,
+            "bookmark",
+            &json!({"type":"custom","customType":"bookmark","data":{"label":"x"}}),
+            false,
+            80,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(book, vec!["BOOK x".to_string()]);
 
         let tool = invoke_registered_tool(&path, "echo_tool", &json!({"text": "hi"})).unwrap();
         assert_eq!(tool["ok"], true);

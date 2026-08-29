@@ -292,6 +292,7 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         registry: crate::extensions::ExtensionRegistry::default(),
         theme: parsed.use_theme.clone().unwrap_or_else(|| "dark".into()),
         flag_values: Default::default(),
+        pending_custom_lines: Vec::new(),
     };
     runtime.bind_extensions();
     if let Err(errors) = runtime.apply_cli_flags(&parsed.unknown_flags) {
