@@ -31,9 +31,18 @@ pi --mode rpc                   # JSONL RPC on stdin/stdout
 pi --continue
 pi --resume
 pi auth check --provider anthropic
-pi install <source>
+pi install <source>             # local path, npm:, git:, or URL
+pi config                       # enable/disable package resources
+pi update --extensions          # refresh installed package trees
 pi --export session.jsonl out.html
 ```
+
+`pi install npm:…` / `git:…` materializes TypeScript's managed trees
+(`~/.pi/agent/npm/node_modules/<name>` and `~/.pi/agent/git/<host>/<path>`).
+Tests and offline runs copy from `PI_PACKAGE_FIXTURE` instead of the network.
+`PI_DISABLE_NETWORK=1` blocks live `npm`/`git` spawns. `pi update` without a
+target is self-update only (same as TypeScript); cargo/source installs print
+the TypeScript unavailable instruction.
 
 Sessions default to `~/.pi/agent/sessions/`, overridable with `--session-dir`
 or `PI_CODING_AGENT_SESSION_DIR`. Credentials use the same `auth.json` layout

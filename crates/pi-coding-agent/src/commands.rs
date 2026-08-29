@@ -1,29 +1,15 @@
-use crate::args::{parse_args, APP_NAME};
+use crate::args::{parse_args, APP_NAME, VERSION};
+use crate::config_selector::{render_config, run_interactive_config, WriteScope};
+use crate::package_manager::{
+    format_package_list, install_and_persist, list_configured_packages, project_is_trusted,
+    remove_and_persist, update_configured,
+};
 use pi_ai::{get_env_api_key, AuthStorage, FileAuthStorage};
-use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Write};
 
-pub fn agent_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
-        return PathBuf::from(dir);
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pi")
-        .join("agent")
-}
+pub use crate::settings::{agent_dir, settings_path};
 
-pub fn settings_path(local: bool) -> PathBuf {
-    if local {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".pi")
-            .join("settings.json")
-    } else {
-        agent_dir().join("settings.json")
-    }
-}
+pub const PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
 
 #[derive(Debug)]
 pub struct CommandOutcome {
@@ -237,204 +223,571 @@ Auth commands require at least one of --provider or --model. Checks refresh expi
     }
 }
 
-fn is_local_install_source(source: &str) -> bool {
-    let trimmed = source.trim();
-    !(trimmed.starts_with("npm:")
-        || trimmed.starts_with("git:")
-        || trimmed.starts_with("github:")
-        || trimmed.starts_with("http:")
-        || trimmed.starts_with("https:")
-        || trimmed.starts_with("ssh:"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateTarget {
+    All,
+    SelfOnly,
+    Extensions,
+    Models,
 }
 
-fn expand_install_path(source: &str) -> PathBuf {
-    if let Some(rest) = source.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
+fn package_usage(command: &str) -> String {
+    match command {
+        "install" => format!("{APP_NAME} install <source> [-l] [--approve|--no-approve]"),
+        "remove" | "uninstall" => {
+            format!("{APP_NAME} remove <source> [-l] [--approve|--no-approve]")
+        }
+        "update" => format!(
+            "{APP_NAME} update [source|self|pi] [--self|--extensions|--models|--all] [--extension <source>] [--approve|--no-approve] [--force]"
+        ),
+        "list" => format!("{APP_NAME} list [--approve|--no-approve]"),
+        "config" => format!("{APP_NAME} config [-l] [--approve|--no-approve]"),
+        other => format!("{APP_NAME} {other}"),
+    }
+}
+
+fn package_help(command: &str) -> String {
+    match command {
+        "install" => format!(
+            "Usage:
+  {}
+
+Install a package and add it to settings.
+
+Options:
+  -l, --local       Install project-locally (.pi/settings.json)
+  -a, --approve     Trust project-local files for this command
+  -na, --no-approve Ignore project-local files for this command
+
+Examples:
+  {APP_NAME} install npm:@foo/bar
+  {APP_NAME} install git:github.com/user/repo
+  {APP_NAME} install git:git@github.com:user/repo
+  {APP_NAME} install https://github.com/user/repo
+  {APP_NAME} install ssh://git@github.com/user/repo
+  {APP_NAME} install ./local/path
+",
+            package_usage("install")
+        ),
+        "remove" | "uninstall" => format!(
+            "Usage:
+  {}
+
+Remove a package and its source from settings.
+Alias: {APP_NAME} uninstall <source> [-l]
+
+Options:
+  -l, --local       Remove from project settings (.pi/settings.json)
+  -a, --approve     Trust project-local files for this command
+  -na, --no-approve Ignore project-local files for this command
+",
+            package_usage("remove")
+        ),
+        "update" => format!(
+            "Usage:
+  {}
+
+Update pi, installed packages, or model catalogs.
+
+Options:
+  --self                  Update pi only (default when no target is given)
+  --extensions            Update installed packages only
+  --models                Refresh model catalogs only
+  --all                   Update pi and installed packages
+  --extension <source>    Update one package only
+  --force                 Reinstall pi even if the current version is latest
+",
+            package_usage("update")
+        ),
+        "list" => format!(
+            "Usage:
+  {}
+
+List installed packages from user and project settings.
+",
+            package_usage("list")
+        ),
+        "config" => format!(
+            "Usage:
+  {}
+
+Open the resource configuration TUI to enable or disable package resources.
+Without -l, starts in global settings (~/.pi/agent/settings.json).
+Press Tab in the TUI to switch between global and project-local modes.
+
+Options:
+  -l, --local       Edit project overrides (.pi/settings.json)
+  -a, --approve     Trust project-local files for this command with -l
+  -na, --no-approve Ignore project-local files for this command with -l
+",
+            package_usage("config")
+        ),
+        other => format!("Usage: {}\n", package_usage(other)),
+    }
+}
+
+fn detect_install_method() -> &'static str {
+    if let Ok(method) = std::env::var("PI_INSTALL_METHOD") {
+        return match method.as_str() {
+            "npm" => "npm",
+            "pnpm" => "pnpm",
+            "yarn" => "yarn",
+            "bun" => "bun",
+            "bun-binary" => "bun-binary",
+            _ => "unknown",
+        };
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+        .unwrap_or_default();
+    if exe.contains("/pnpm/") || exe.contains("/.pnpm/") {
+        "pnpm"
+    } else if exe.contains("/yarn/") || exe.contains("/.yarn/") {
+        "yarn"
+    } else if exe.contains("/install/global/node_modules/") {
+        "bun"
+    } else if exe.contains("/npm/") || exe.contains("/node_modules/") {
+        "npm"
+    } else {
+        "unknown"
+    }
+}
+
+fn self_update_unavailable_instruction() -> String {
+    let method = detect_install_method();
+    if method == "bun-binary" {
+        return "Download from: https://github.com/earendil-works/pi-mono/releases/latest".into();
+    }
+    if method == "unknown" {
+        return format!(
+            "Update {PACKAGE_NAME} using the package manager, wrapper, or source checkout that provides this installation."
+        );
+    }
+    format!(
+        "This installation is not managed by a global {method} install. Update it with the package manager, wrapper, or source checkout that provides it."
+    )
+}
+
+fn run_self_update(force: bool) -> CommandOutcome {
+    let _ = force;
+    if let Ok(fixture) = std::env::var("PI_SELF_UPDATE_FIXTURE") {
+        if let Ok(raw) = std::fs::read_to_string(&fixture) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
+                    return CommandOutcome::done(
+                        0,
+                        format!("Updated {APP_NAME} from {VERSION} to {version}\n"),
+                        "",
+                    );
+                }
+            }
         }
     }
-    PathBuf::from(source)
-}
-
-fn package_source_string(value: &serde_json::Value) -> Option<String> {
-    value.as_str().map(str::to_string).or_else(|| {
-        value
-            .get("source")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    })
-}
-
-fn package_is_filtered(value: &serde_json::Value) -> bool {
-    value.as_object().is_some_and(|obj| {
-        obj.contains_key("extensions")
-            || obj.contains_key("skills")
-            || obj.contains_key("prompts")
-            || obj.contains_key("themes")
-            || obj.get("autoload").and_then(|v| v.as_bool()) == Some(false)
-    })
-}
-
-fn load_packages(path: &std::path::Path) -> Vec<serde_json::Value> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("packages").and_then(|p| p.as_array()).cloned())
-        .unwrap_or_default()
-}
-
-fn write_packages(path: &std::path::Path, packages: &[serde_json::Value]) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    let mut stderr = format!("error: {APP_NAME} cannot self-update this installation.\n");
+    stderr.push_str(&self_update_unavailable_instruction());
+    stderr.push('\n');
+    if let Ok(exe) = std::env::current_exe() {
+        stderr.push('\n');
+        stderr.push_str(&format!(
+            "Location of {APP_NAME} executable: {}\n",
+            exe.display()
+        ));
     }
-    let mut settings: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path).unwrap_or_else(|_| "{}".into()))
-            .unwrap_or(serde_json::json!({}));
-    if let Some(obj) = settings.as_object_mut() {
-        obj.insert("packages".into(), serde_json::json!(packages));
+    CommandOutcome::done(1, "", stderr)
+}
+
+fn refresh_model_catalogs() -> Result<(), String> {
+    if crate::package_manager::network_disabled() {
+        if let Ok(fixture) = std::env::var("PI_MODELS_REFRESH_FIXTURE") {
+            let dest = agent_dir().join("models.json");
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::copy(fixture, dest).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        return Err("Model catalog refresh timed out.".into());
     }
-    let _ = fs::write(path, serde_json::to_string_pretty(&settings).unwrap());
+    Ok(())
+}
+
+fn parse_approve(args: &[String]) -> Result<Option<bool>, String> {
+    let mut approve = None;
+    for arg in args {
+        if arg == "-a" || arg == "--approve" {
+            approve = Some(true);
+        } else if arg == "-na" || arg == "--no-approve" {
+            approve = Some(false);
+        }
+    }
+    Ok(approve)
 }
 
 fn run_package(command: &str, args: &[String]) -> CommandOutcome {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return CommandOutcome::done(0, package_help(command), "");
     }
-    let local = args.iter().any(|a| a == "-l" || a == "--local");
-    let path = settings_path(local);
-    match command {
-        "list" => {
-            let packages = load_packages(&path);
-            if packages.is_empty() {
-                return CommandOutcome::done(0, "No packages installed.\n", "");
-            }
-            let heading = if local {
-                "Project packages:"
+
+    if command == "config" {
+        return run_config(args);
+    }
+
+    let mut local = false;
+    let mut force = false;
+    let mut source: Option<String> = None;
+    let mut self_flag = false;
+    let mut extensions_flag = false;
+    let mut models_flag = false;
+    let mut all_flag = false;
+    let mut extension_flag_source: Option<String> = None;
+    let mut invalid_option = None;
+    let mut invalid_argument = None;
+    let mut missing_option_value = None;
+    let mut conflicting = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "-l" || arg == "--local" {
+            if command == "install" || command == "remove" || command == "uninstall" {
+                local = true;
             } else {
-                "User packages:"
-            };
-            let mut out = format!("{heading}\n");
-            for pkg in packages {
-                let source = package_source_string(&pkg).unwrap_or_default();
-                if package_is_filtered(&pkg) {
-                    out.push_str(&format!("  {source} (filtered)\n"));
+                invalid_option = invalid_option.or(Some(arg.clone()));
+            }
+        } else if arg == "--self" {
+            if command == "update" {
+                self_flag = true;
+            } else {
+                invalid_option = invalid_option.or(Some(arg.clone()));
+            }
+        } else if arg == "--extensions" {
+            if command == "update" {
+                extensions_flag = true;
+            } else {
+                invalid_option = invalid_option.or(Some(arg.clone()));
+            }
+        } else if arg == "--models" {
+            if command == "update" {
+                models_flag = true;
+            } else {
+                invalid_option = invalid_option.or(Some(arg.clone()));
+            }
+        } else if arg == "--all" {
+            if command == "update" {
+                all_flag = true;
+            } else {
+                invalid_option = invalid_option.or(Some(arg.clone()));
+            }
+        } else if arg == "--force" {
+            if command == "update" {
+                force = true;
+            } else {
+                invalid_option = invalid_option.or(Some(arg.clone()));
+            }
+        } else if arg == "--extension" {
+            if command != "update" {
+                invalid_option = invalid_option.or(Some(arg.clone()));
+            } else {
+                let value = args.get(i + 1);
+                if value.is_none() || value.is_some_and(|v| v.starts_with('-')) {
+                    missing_option_value = missing_option_value.or(Some(arg.clone()));
+                } else if extension_flag_source.is_some() {
+                    conflicting =
+                        conflicting.or(Some("--extension can only be provided once".into()));
+                    i += 1;
                 } else {
-                    out.push_str(&format!("  {source}\n"));
+                    extension_flag_source = value.cloned();
+                    i += 1;
                 }
             }
-            CommandOutcome::done(0, out, "")
+        } else if arg == "-a" || arg == "--approve" || arg == "-na" || arg == "--no-approve" {
+        } else if arg.starts_with('-') {
+            invalid_option = invalid_option.or(Some(arg.clone()));
+        } else if source.is_none() {
+            source = Some(arg.clone());
+        } else {
+            invalid_argument = invalid_argument.or(Some(arg.clone()));
         }
+        i += 1;
+    }
+
+    if let Some(option) = invalid_option {
+        return CommandOutcome::done(
+            1,
+            "",
+            format!(
+                "Unknown option {option} for \"{command}\".\nUse \"{APP_NAME} --help\" or \"{}\".\n",
+                package_usage(command)
+            ),
+        );
+    }
+    if let Some(option) = missing_option_value {
+        return CommandOutcome::done(
+            1,
+            "",
+            format!(
+                "Missing value for {option}.\nUsage: {}\n",
+                package_usage(command)
+            ),
+        );
+    }
+    if let Some(arg) = invalid_argument {
+        return CommandOutcome::done(
+            1,
+            "",
+            format!(
+                "Unexpected argument {arg}.\nUsage: {}\n",
+                package_usage(command)
+            ),
+        );
+    }
+
+    let approve = parse_approve(args).unwrap_or(None);
+    let trusted = project_is_trusted(approve);
+    if local && !trusted && (command == "install" || command == "remove" || command == "uninstall")
+    {
+        return CommandOutcome::done(
+            1,
+            "",
+            "Project is not trusted. Use --approve to modify local package config.\n",
+        );
+    }
+
+    match command {
+        "list" => CommandOutcome::done(0, format_package_list(&list_configured_packages()), ""),
         "install" => {
-            let source = args.iter().find(|a| !a.starts_with('-'));
             let Some(source) = source else {
-                return CommandOutcome::done(1, "", "Error: install requires a source\n");
-            };
-            if is_local_install_source(source) {
-                let resolved = expand_install_path(source);
-                if !resolved.exists() {
-                    return CommandOutcome::done(
-                        1,
-                        "",
-                        format!("Error: Path does not exist: {}\n", resolved.display()),
-                    );
-                }
-            }
-            let mut packages = load_packages(&path);
-            if !packages
-                .iter()
-                .any(|pkg| package_source_string(pkg).as_deref() == Some(source.as_str()))
-            {
-                packages.push(serde_json::json!(source));
-            }
-            write_packages(&path, &packages);
-            CommandOutcome::done(0, format!("Installed {source}\n"), "")
-        }
-        "remove" | "uninstall" => {
-            let source = args.iter().find(|a| !a.starts_with('-')).cloned();
-            let Some(source) = source else {
-                return CommandOutcome::done(1, "", "Error: remove requires a source\n");
-            };
-            let mut packages = load_packages(&path);
-            let before = packages.len();
-            packages.retain(|pkg| package_source_string(pkg).as_deref() != Some(source.as_str()));
-            if packages.len() == before {
                 return CommandOutcome::done(
                     1,
                     "",
-                    format!("Error: No matching package found for {source}\n"),
-                );
-            }
-            write_packages(&path, &packages);
-            CommandOutcome::done(0, format!("Removed {source}\n"), "")
-        }
-        "update" => {
-            let target = args
-                .iter()
-                .find(|a| !a.starts_with('-'))
-                .map(String::as_str);
-            let packages = load_packages(&path);
-            if let Some(source) = target {
-                if source != "all"
-                    && source != "self"
-                    && source != "pi"
-                    && !packages
-                        .iter()
-                        .any(|pkg| package_source_string(pkg).as_deref() == Some(source))
-                {
-                    return CommandOutcome::done(
-                        1,
-                        "",
-                        format!("Error: No matching package found for {source}\n"),
-                    );
-                }
-            }
-            let offline = std::env::var("PI_OFFLINE")
-                .ok()
-                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
-            if offline {
-                return CommandOutcome::done(0, String::new(), "");
-            }
-            let label = target.unwrap_or("packages");
-            CommandOutcome::done(
-                0,
-                if target.is_some() && target != Some("all") {
-                    format!("Updated {label}\n")
-                } else {
-                    "Updated packages\n".into()
-                },
-                "",
-            )
-        }
-        "config" => {
-            let settings = crate::settings::load_settings(&path);
-            let list = pi_tui::SettingsList {
-                items: vec![
-                    ("packages".into(), !settings.packages.is_empty()),
-                    ("trusted".into(), settings.trusted),
-                    (
-                        "theme".into(),
-                        settings.theme.as_deref().unwrap_or("default") != "off",
+                    format!(
+                        "Missing install source.\nUsage: {}\n",
+                        package_usage("install")
                     ),
-                ],
-                selected: 0,
+                );
             };
-            let rendered = pi_tui::component::Component::render(&list, 48).join("\n");
-            CommandOutcome::done(
-                0,
-                format!(
-                    "Config file: {}\n{rendered}\npackages: {}\n",
-                    path.display(),
-                    settings.packages.join(", ")
-                ),
-                "",
-            )
+            match install_and_persist(&source, local) {
+                Ok(_) => CommandOutcome::done(0, format!("Installed {source}\n"), ""),
+                Err(err) => CommandOutcome::done(1, "", format!("Error: {err}\n")),
+            }
         }
+        "remove" | "uninstall" => {
+            let Some(source) = source else {
+                return CommandOutcome::done(
+                    1,
+                    "",
+                    format!(
+                        "Missing remove source.\nUsage: {}\n",
+                        package_usage("remove")
+                    ),
+                );
+            };
+            match remove_and_persist(&source, local) {
+                Ok(true) => CommandOutcome::done(0, format!("Removed {source}\n"), ""),
+                Ok(false) => {
+                    CommandOutcome::done(1, "", format!("No matching package found for {source}\n"))
+                }
+                Err(err) => CommandOutcome::done(1, "", format!("Error: {err}\n")),
+            }
+        }
+        "update" => run_update(
+            source,
+            self_flag,
+            extensions_flag,
+            models_flag,
+            all_flag,
+            extension_flag_source,
+            force,
+            conflicting,
+        ),
         _ => CommandOutcome::skip(),
     }
 }
 
-fn package_help(command: &str) -> String {
-    format!("Usage: {APP_NAME} {command} [source] [-l]\n  -l  project-local settings\n")
+#[allow(clippy::too_many_arguments)]
+fn run_update(
+    source: Option<String>,
+    self_flag: bool,
+    extensions_flag: bool,
+    models_flag: bool,
+    all_flag: bool,
+    extension_flag_source: Option<String>,
+    force: bool,
+    mut conflicting: Option<String>,
+) -> CommandOutcome {
+    if all_flag && (self_flag || extensions_flag || models_flag || extension_flag_source.is_some())
+    {
+        conflicting = conflicting.or(Some(
+            "--all cannot be combined with --self, --extensions, --models, or --extension".into(),
+        ));
+    }
+    if all_flag && source.is_some() {
+        conflicting = conflicting.or(Some(
+            "--all cannot be combined with a positional source".into(),
+        ));
+    }
+    if models_flag && (self_flag || extensions_flag || all_flag || extension_flag_source.is_some())
+    {
+        conflicting = conflicting.or(Some(
+            "--models cannot be combined with --self, --extensions, --all, or --extension".into(),
+        ));
+    }
+    if models_flag && source.is_some() {
+        conflicting = conflicting.or(Some(
+            "--models cannot be combined with a positional source".into(),
+        ));
+    }
+    if extension_flag_source.is_some() && (self_flag || extensions_flag || all_flag) {
+        conflicting = conflicting.or(Some(
+            "--extension cannot be combined with --self, --extensions, or --all".into(),
+        ));
+    }
+    if extension_flag_source.is_some() && source.is_some() {
+        conflicting = conflicting.or(Some(
+            "--extension cannot be combined with a positional source".into(),
+        ));
+    }
+    if source.is_some()
+        && !matches!(source.as_deref(), Some("self") | Some("pi"))
+        && (extensions_flag || self_flag || all_flag)
+    {
+        conflicting = conflicting.or(Some(
+            "positional update targets cannot be combined with --self, --extensions, or --all"
+                .into(),
+        ));
+    }
+    if let Some(message) = conflicting {
+        return CommandOutcome::done(
+            1,
+            "",
+            format!("{message}\nUsage: {}\n", package_usage("update")),
+        );
+    }
+
+    let (target, skipped_note) = if models_flag {
+        (UpdateTarget::Models, false)
+    } else if let Some(ext) = extension_flag_source.clone() {
+        return update_extensions(Some(ext));
+    } else if let Some(source) = source.clone() {
+        if source == "self" || source == "pi" {
+            if extensions_flag {
+                (UpdateTarget::All, false)
+            } else {
+                (UpdateTarget::SelfOnly, false)
+            }
+        } else {
+            return update_extensions(Some(source));
+        }
+    } else if all_flag || (self_flag && extensions_flag) {
+        (UpdateTarget::All, false)
+    } else if self_flag {
+        (UpdateTarget::SelfOnly, false)
+    } else if extensions_flag {
+        (UpdateTarget::Extensions, false)
+    } else {
+        (UpdateTarget::SelfOnly, true)
+    };
+
+    let mut stdout = String::new();
+    if skipped_note {
+        stdout.push_str(&format!(
+            "Extensions are skipped. Run {APP_NAME} update --extensions to update extensions.\n"
+        ));
+    }
+    match target {
+        UpdateTarget::Models => match refresh_model_catalogs() {
+            Ok(()) => CommandOutcome::done(0, "Model catalogs refreshed\n", ""),
+            Err(err) => CommandOutcome::done(1, "", format!("Error: {err}\n")),
+        },
+        UpdateTarget::Extensions => {
+            let mut out = stdout;
+            let result = update_extensions(None);
+            out.push_str(&result.stdout);
+            CommandOutcome::done(result.exit_code, out, result.stderr)
+        }
+        UpdateTarget::SelfOnly => {
+            let result = run_self_update(force);
+            CommandOutcome::done(result.exit_code, stdout + &result.stdout, result.stderr)
+        }
+        UpdateTarget::All => {
+            let ext = update_extensions(None);
+            if ext.exit_code != 0 {
+                return CommandOutcome::done(ext.exit_code, stdout + &ext.stdout, ext.stderr);
+            }
+            stdout.push_str(&ext.stdout);
+            let self_update = run_self_update(force);
+            CommandOutcome::done(
+                self_update.exit_code,
+                stdout + &self_update.stdout,
+                self_update.stderr,
+            )
+        }
+    }
+}
+
+fn update_extensions(source: Option<String>) -> CommandOutcome {
+    match update_configured(source.as_deref()) {
+        Ok(_) => {
+            if let Some(source) = source {
+                CommandOutcome::done(0, format!("Updated {source}\n"), "")
+            } else {
+                CommandOutcome::done(0, "Updated packages\n", "")
+            }
+        }
+        Err(err) => CommandOutcome::done(1, "", format!("Error: {err}\n")),
+    }
+}
+
+fn run_config(args: &[String]) -> CommandOutcome {
+    let mut local = false;
+    let mut approve = None;
+    for arg in args {
+        if arg == "-l" || arg == "--local" {
+            local = true;
+        } else if arg == "-a" || arg == "--approve" {
+            approve = Some(true);
+        } else if arg == "-na" || arg == "--no-approve" {
+            approve = Some(false);
+        } else if arg.starts_with('-') {
+            return CommandOutcome::done(
+                1,
+                "",
+                format!(
+                    "Unknown option {arg} for \"config\".\nUse \"{APP_NAME} --help\" or \"{}\".\n",
+                    package_usage("config")
+                ),
+            );
+        } else {
+            return CommandOutcome::done(
+                1,
+                "",
+                format!(
+                    "Unexpected argument {arg}.\nUsage: {}\n",
+                    package_usage("config")
+                ),
+            );
+        }
+    }
+    let trusted = project_is_trusted(approve);
+    if local && !trusted {
+        return CommandOutcome::done(
+            1,
+            "",
+            "Project is not trusted. Use --approve to modify local resource config.\n",
+        );
+    }
+    let scope = if local {
+        WriteScope::Project
+    } else {
+        WriteScope::Global
+    };
+    let stdin_tty = std::io::stdin().is_terminal();
+    let stdout_tty = std::io::stdout().is_terminal();
+    let rendered = if stdin_tty && stdout_tty {
+        run_interactive_config(scope, trusted)
+    } else {
+        render_config(scope, trusted)
+    };
+    CommandOutcome::done(0, rendered, "")
 }
 
 #[allow(dead_code)]
@@ -458,13 +811,25 @@ mod tests {
     use tempfile::tempdir;
 
     fn with_agent_dir(f: impl FnOnce()) {
+        let _lock = crate::settings::test_env_lock();
         let dir = tempdir().unwrap();
         let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        let previous_cwd = std::env::current_dir().ok();
+        let previous_net = std::env::var("PI_DISABLE_NETWORK").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        std::env::set_var("PI_DISABLE_NETWORK", "1");
+        let _ = std::env::set_current_dir(dir.path());
         f();
         match previous {
             Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+        match previous_net {
+            Some(value) => std::env::set_var("PI_DISABLE_NETWORK", value),
+            None => std::env::remove_var("PI_DISABLE_NETWORK"),
+        }
+        if let Some(cwd) = previous_cwd {
+            let _ = std::env::set_current_dir(cwd);
         }
     }
 
@@ -480,7 +845,7 @@ mod tests {
             assert_eq!(empty.stdout, "No packages installed.\n");
             let dir = tempdir().unwrap();
             let ext = dir.path().join("my-ext");
-            fs::create_dir_all(&ext).unwrap();
+            std::fs::create_dir_all(&ext).unwrap();
             let installed = dispatch_subcommand(&["install".into(), ext.to_string_lossy().into()]);
             assert_eq!(installed.exit_code, 0);
             assert!(installed.stdout.starts_with("Installed "));
@@ -500,6 +865,44 @@ mod tests {
             assert!(update_missing
                 .stderr
                 .contains("No matching package found for npm:missing"));
+        });
+    }
+
+    #[test]
+    fn fixture_npm_install_lists_installed_path_and_config_resources() {
+        with_agent_dir(|| {
+            let dir = tempdir().unwrap();
+            let fixture = dir.path().join("fixture").join("npm").join("pi-cli");
+            std::fs::create_dir_all(fixture.join("extensions")).unwrap();
+            std::fs::write(
+                fixture.join("extensions").join("index.ts"),
+                "export default function () {}",
+            )
+            .unwrap();
+            let previous_fixture = std::env::var("PI_PACKAGE_FIXTURE").ok();
+            std::env::set_var("PI_PACKAGE_FIXTURE", dir.path().join("fixture"));
+            std::env::set_var("PI_DISABLE_NETWORK", "1");
+            let installed = dispatch_subcommand(&["install".into(), "npm:pi-cli".into()]);
+            assert_eq!(installed.exit_code, 0, "{}", installed.stderr);
+            let listed = dispatch_subcommand(&["list".into()]);
+            assert!(listed.stdout.contains("npm:pi-cli"));
+            assert!(listed.stdout.contains("npm/node_modules/pi-cli"));
+            let config = dispatch_subcommand(&["config".into()]);
+            assert_eq!(config.exit_code, 0);
+            assert!(config.stdout.contains("Global Resources"));
+            assert!(config.stdout.contains("npm:pi-cli (user)"));
+            let update = dispatch_subcommand(&["update".into()]);
+            assert!(update.stdout.contains("Extensions are skipped"));
+            assert!(update
+                .stderr
+                .contains("cannot self-update this installation"));
+            let unknown = dispatch_subcommand(&["list".into(), "-l".into()]);
+            assert_eq!(unknown.exit_code, 1);
+            assert!(unknown.stderr.contains("Unknown option -l for \"list\""));
+            match previous_fixture {
+                Some(v) => std::env::set_var("PI_PACKAGE_FIXTURE", v),
+                None => std::env::remove_var("PI_PACKAGE_FIXTURE"),
+            }
         });
     }
 }

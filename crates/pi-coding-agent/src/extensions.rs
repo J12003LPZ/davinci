@@ -28,6 +28,12 @@ pub fn discover_extensions(
     if no_discover {
         return found;
     }
+    let trusted = crate::package_manager::project_is_trusted(None);
+    for ext in crate::package_manager::resolve_resources(agent_dir, cwd, trusted).extensions {
+        if ext.enabled && !found.iter().any(|e| e.path == ext.path) {
+            push_extension(&ext.path, &mut found);
+        }
+    }
     for dir in [
         cwd.join(".pi").join("extensions"),
         agent_dir.join("extensions"),
@@ -1083,7 +1089,7 @@ pub fn settings_packages(settings: &Value) -> Vec<String> {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter_map(crate::settings::package_source_string)
                 .collect()
         })
         .unwrap_or_default()
