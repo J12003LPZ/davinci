@@ -233,6 +233,22 @@ pub fn is_trusted(agent_dir: &Path, cwd: &Path) -> bool {
     trust_decision(agent_dir, cwd) == Some(true)
 }
 
+pub fn trust_entry(agent_dir: &Path, cwd: &Path) -> Option<(PathBuf, bool)> {
+    let data = read_trust_file(agent_dir);
+    let obj = data.as_object()?;
+    let mut dir = canonicalize_path(cwd);
+    loop {
+        let key = dir.to_string_lossy();
+        if let Some(decision) = obj.get(key.as_ref()).and_then(|value| value.as_bool()) {
+            return Some((dir, decision));
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
 fn session_trust_cache() -> &'static Mutex<Vec<(PathBuf, bool)>> {
     static CACHE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
     &CACHE
@@ -281,6 +297,7 @@ pub struct ProjectTrustOption {
     pub label: String,
     pub trusted: bool,
     pub updates: Vec<(PathBuf, Option<bool>)>,
+    pub saved_path: Option<PathBuf>,
 }
 
 pub fn project_trust_prompt(cwd: &Path) -> String {
@@ -296,6 +313,7 @@ pub fn project_trust_options(cwd: &Path, include_session_only: bool) -> Vec<Proj
         label: "Trust".into(),
         trusted: true,
         updates: vec![(trust_path.clone(), Some(true))],
+        saved_path: Some(trust_path.clone()),
     }];
     if let Some(parent) = trust_path.parent() {
         if parent != trust_path {
@@ -306,6 +324,7 @@ pub fn project_trust_options(cwd: &Path, include_session_only: bool) -> Vec<Proj
                     (parent.to_path_buf(), Some(true)),
                     (trust_path.clone(), None),
                 ],
+                saved_path: Some(parent.to_path_buf()),
             });
         }
     }
@@ -314,18 +333,21 @@ pub fn project_trust_options(cwd: &Path, include_session_only: bool) -> Vec<Proj
             label: "Trust (this session only)".into(),
             trusted: true,
             updates: Vec::new(),
+            saved_path: None,
         });
     }
     options.push(ProjectTrustOption {
         label: "Do not trust".into(),
         trusted: false,
         updates: vec![(trust_path.clone(), Some(false))],
+        saved_path: Some(trust_path.clone()),
     });
     if include_session_only {
         options.push(ProjectTrustOption {
             label: "Do not trust (this session only)".into(),
             trusted: false,
             updates: Vec::new(),
+            saved_path: None,
         });
     }
     options

@@ -9,6 +9,7 @@ mod export;
 mod extension_ui;
 mod extensions;
 mod interactive;
+mod login;
 mod package_manager;
 mod rpc;
 mod self_update;
@@ -18,6 +19,7 @@ mod share;
 mod slash;
 mod theme;
 mod tool_html;
+mod trust_selector;
 
 use std::io::{self, BufRead, IsTerminal};
 use std::path::{Path, PathBuf};

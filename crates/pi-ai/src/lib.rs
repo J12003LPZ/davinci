@@ -6,6 +6,7 @@ pub mod cost;
 pub mod events;
 pub mod http;
 pub mod oauth;
+pub mod oauth_flow;
 pub mod providers;
 pub mod request;
 pub mod retry;
@@ -25,6 +26,10 @@ pub use cost::usage_cost;
 pub use events::{AssistantMessage, AssistantMessageEvent, StopReason};
 pub use oauth::{
     authorize_url, oauth_app, oauth_needs_refresh, parse_token_response, refresh_oauth_token,
+};
+pub use oauth_flow::{
+    anthropic_authorize_url, generate_pkce, login_anthropic_oauth, oauth_error_html,
+    oauth_success_html, parse_authorization_input, wait_for_oauth_callback,
 };
 pub use request::{build_request_body, resolve_api, RequestContext};
 pub use retry::{is_retryable_assistant_error, RetryPolicy};

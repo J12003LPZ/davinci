@@ -2,11 +2,12 @@
 
 use crate::commands;
 use crate::extensions::{self, Extension};
+use crate::login;
 use crate::session_runtime::{to_json_event, SessionRuntime};
 use crate::settings;
 use crate::slash::{self, BUILTIN_SLASH_COMMANDS};
+use crate::trust_selector::{TrustSelector, TrustSelectorAction};
 use pi_agent::ThinkingLevel;
-use pi_ai::AuthStorage;
 use pi_session::{default_sessions_root, discover_sessions};
 use pi_tui::component::Component;
 use pi_tui::{
@@ -26,6 +27,7 @@ pub struct InteractiveMode {
     pub discovered: Vec<Extension>,
     pub auto_approve: bool,
     pub last_json_events: Vec<serde_json::Value>,
+    trust_selector: Option<TrustSelector>,
 }
 
 impl InteractiveMode {
@@ -55,6 +57,7 @@ impl InteractiveMode {
             discovered,
             auto_approve: true,
             last_json_events: Vec::new(),
+            trust_selector: None,
         }
     }
 
@@ -417,22 +420,25 @@ impl InteractiveMode {
             "trust" => {
                 let cwd = self.runtime.cwd.clone();
                 let agent = commands::agent_dir();
-                let options = settings::project_trust_options(&cwd, false);
                 if args.is_empty() {
+                    let trusted = crate::package_manager::project_is_trusted(
+                        None,
+                        crate::package_manager::ProjectTrustMode::Full,
+                    );
+                    let selector = TrustSelector::new(&cwd, &agent, trusted);
                     self.show_selector(
                         "Project trust",
-                        options.iter().map(|option| option.label.clone()).collect(),
+                        settings::project_trust_options(&cwd, false)
+                            .iter()
+                            .map(|option| option.label.clone())
+                            .collect(),
                     );
-                    self.chat.push(
-                        "system",
-                        format!(
-                            "{}\nUse /trust <option> to save a trust decision.",
-                            settings::render_project_trust_options(&cwd, false).trim_end()
-                        ),
-                    );
+                    self.chat.push("system", selector.render());
+                    self.trust_selector = Some(selector);
                 } else if let Some(trusted) =
                     settings::apply_project_trust_selection(&agent, &cwd, args, false)
                 {
+                    self.trust_selector = None;
                     self.chat.push(
                         "system",
                         format!(
@@ -446,21 +452,14 @@ impl InteractiveMode {
                         .push("error", format!("Unknown trust option: {args}"));
                 }
             }
-            "login" => {
-                if let Some(url) = pi_ai::authorize_url(args, "http://127.0.0.1:8765/cb", "pi") {
-                    self.chat.push("system", format!("Open: {url}"));
-                } else {
-                    self.chat.push("error", "usage: /login <provider>");
-                }
-            }
-            "logout" => {
-                if let Ok(mut store) =
-                    pi_ai::FileAuthStorage::open(commands::agent_dir().join("auth.json"))
-                {
-                    let _ = store.delete(args);
-                }
-                self.chat.push("system", format!("logged out {args}"));
-            }
+            "login" => match login::handle_login_command(&commands::agent_dir(), args) {
+                Ok(message) => self.chat.push("system", message),
+                Err(err) => self.chat.push("error", err),
+            },
+            "logout" => match login::handle_logout_command(&commands::agent_dir(), args) {
+                Ok(message) => self.chat.push("system", message),
+                Err(err) => self.chat.push("error", err),
+            },
             "new" => {
                 let events = self.runtime.new_session(None)?;
                 self.chat = ChatView::default();
@@ -647,7 +646,47 @@ impl InteractiveMode {
         Ok(false)
     }
 
+    fn apply_trust_selector_key(&mut self, key: &Key) -> bool {
+        let Some(selector) = self.trust_selector.as_mut() else {
+            return false;
+        };
+        match selector.handle_key(key) {
+            TrustSelectorAction::Continue => {
+                let rendered = selector.render();
+                self.chat.push("system", rendered);
+                true
+            }
+            TrustSelectorAction::Selected(option) => {
+                settings::apply_trust_option(&commands::agent_dir(), &option);
+                settings::remember_session_trust(&self.runtime.cwd, option.trusted);
+                self.trust_selector = None;
+                self.tui.hide_all_overlays();
+                self.chat.push(
+                    "system",
+                    format!(
+                        "Saved trust decision: {}. Restart {} for this to take effect.",
+                        if option.trusted {
+                            "trusted"
+                        } else {
+                            "untrusted"
+                        },
+                        crate::args::APP_NAME
+                    ),
+                );
+                true
+            }
+            TrustSelectorAction::Cancelled => {
+                self.trust_selector = None;
+                self.tui.hide_all_overlays();
+                true
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key: &Key) -> Result<bool, String> {
+        if self.apply_trust_selector_key(key) {
+            return Ok(false);
+        }
         if self.try_extension_shortcut(key)? {
             return Ok(false);
         }

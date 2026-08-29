@@ -24,6 +24,86 @@ pub fn resolve_prompt_input(input: &str) -> String {
     }
 }
 
+fn canonicalize(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPaths {
+    pub repo_dir: PathBuf,
+    pub common_git_dir: PathBuf,
+    pub head_path: PathBuf,
+}
+
+pub fn find_git_paths(cwd: &Path) -> Option<GitPaths> {
+    let mut dir = canonicalize(cwd);
+    loop {
+        let git_path = dir.join(".git");
+        if git_path.exists() {
+            if git_path.is_file() {
+                let content = fs::read_to_string(&git_path).ok()?;
+                let content = content.trim();
+                if let Some(rest) = content.strip_prefix("gitdir: ") {
+                    let git_dir = canonicalize(&dir.join(rest.trim()));
+                    let head_path = git_dir.join("HEAD");
+                    if !head_path.exists() {
+                        return None;
+                    }
+                    let common_dir_path = git_dir.join("commondir");
+                    let common_git_dir = if common_dir_path.exists() {
+                        let rel = fs::read_to_string(&common_dir_path).ok()?;
+                        canonicalize(&git_dir.join(rel.trim()))
+                    } else {
+                        git_dir
+                    };
+                    return Some(GitPaths {
+                        repo_dir: dir,
+                        common_git_dir,
+                        head_path,
+                    });
+                }
+            } else if git_path.is_dir() {
+                let head_path = git_path.join("HEAD");
+                if !head_path.exists() {
+                    return None;
+                }
+                return Some(GitPaths {
+                    repo_dir: dir,
+                    common_git_dir: git_path,
+                    head_path,
+                });
+            }
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+pub fn find_shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
+    let git_paths = find_git_paths(cwd)?;
+    let common_git_dir = canonicalize(&git_paths.common_git_dir);
+    let worktree_root = canonicalize(&git_paths.repo_dir);
+    let main_repo_root = common_git_dir.parent()?.to_path_buf();
+    if !worktree_root.starts_with(&main_repo_root) || worktree_root == main_repo_root {
+        return None;
+    }
+    if canonicalize(&main_repo_root.join(".git")) != common_git_dir {
+        return None;
+    }
+    let worktree_context = load_context_file_from_dir(&worktree_root)?;
+    Some(main_repo_root.join(worktree_context.0))
+}
+
 fn load_context_file_from_dir(dir: &Path) -> Option<(String, String, PathBuf)> {
     for name in CONTEXT_FILES {
         let path = dir.join(name);
@@ -57,11 +137,18 @@ pub fn load_project_context_files(
             files.push((name, content));
         }
     }
+    let shadowed = find_shadowed_context_file(cwd).map(|path| canonicalize(&path));
     let mut ancestors = Vec::new();
     let mut dir = cwd.to_path_buf();
     loop {
         if let Some((name, content, path)) = load_context_file_from_dir(&dir) {
-            if !seen.iter().any(|existing| existing == &path) {
+            let resolved = canonicalize(&path);
+            let is_shadowed = shadowed.as_ref().is_some_and(|shadow| shadow == &resolved);
+            if !is_shadowed
+                && !seen
+                    .iter()
+                    .any(|existing| existing == &path || canonicalize(existing) == resolved)
+            {
                 seen.push(path);
                 ancestors.push((name, content));
             }
@@ -135,5 +222,37 @@ mod tests {
             render_system_prompt(Some(&from_file.to_string_lossy()), &[], &[]),
             "file prompt"
         );
+    }
+
+    #[test]
+    fn shadows_main_repo_context_for_nested_worktree() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let feat = repo.join("worktrees").join("feat");
+        let git_worktree = repo.join(".git").join("worktrees").join("feat");
+        fs::create_dir_all(&feat).unwrap();
+        fs::create_dir_all(&git_worktree).unwrap();
+        fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_worktree.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
+        fs::write(git_worktree.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            feat.join(".git"),
+            format!("gitdir: {}\n", git_worktree.display()),
+        )
+        .unwrap();
+        fs::write(repo.join("AGENTS.md"), "main context").unwrap();
+        fs::write(feat.join("AGENTS.md"), "worktree context").unwrap();
+        let shadowed = find_shadowed_context_file(&feat).unwrap();
+        assert_eq!(
+            canonicalize(&shadowed),
+            canonicalize(&repo.join("AGENTS.md"))
+        );
+        let files = load_project_context_files(&feat, None, false);
+        let ours: Vec<_> = files
+            .iter()
+            .filter(|(_, content)| content.contains("context"))
+            .map(|(name, content)| (name.as_str(), content.as_str()))
+            .collect();
+        assert_eq!(ours, vec![("AGENTS.md", "worktree context")]);
     }
 }
