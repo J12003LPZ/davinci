@@ -80,6 +80,8 @@ npm test
 
 Node 22.19+ is required only if you are comparing against the vendored TypeScript suite. It is not the install path for `pi`.
 
+Current crate-by-crate status lives in [`progress.md`](progress.md).
+
 ## License
 
 MIT. Vendored TypeScript retains the upstream copyright of Mario Zechner / Earendil Works.
