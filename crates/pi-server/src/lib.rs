@@ -1243,10 +1243,10 @@ mod tests {
         assert!(bound.owned_bind_path.exists());
         assert_eq!(bound.owned_bind_path, owned_bind_path(&path_str));
         let again = bind_unix(&path_str);
-        assert!(again
-            .unwrap_err()
-            .to_string()
-            .contains("Unix listener is already running"));
+        match again {
+            Err(err) => assert!(err.to_string().contains("Unix listener is already running")),
+            Ok(_) => panic!("expected already-running Unix listener"),
+        }
         drop(bound);
     }
 

@@ -141,16 +141,33 @@ impl SqliteSessionStore {
     }
 
     pub fn insert_entry(&self, session_id: &str, entry: &SessionEntry) -> Result<(), SessionError> {
-        self.insert_entry_row(session_id, entry)?;
-        append_entry_to_branch_cache(
-            &self.conn,
-            session_id,
-            &entry.id,
-            entry.seq as i64,
-            &entry.entry_type,
-            entry.custom_type.as_deref(),
-            entry.parent_id.as_deref(),
-        )
+        self.conn
+            .execute("BEGIN IMMEDIATE", [])
+            .map_err(|err| SessionError::storage(format!("Unable to begin entry write: {err}")))?;
+        let result = (|| {
+            self.insert_entry_row(session_id, entry)?;
+            append_entry_to_branch_cache(
+                &self.conn,
+                session_id,
+                &entry.id,
+                entry.seq as i64,
+                &entry.entry_type,
+                entry.custom_type.as_deref(),
+                entry.parent_id.as_deref(),
+            )
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", []).map_err(|err| {
+                    SessionError::storage(format!("Unable to commit entry write: {err}"))
+                })?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+                Err(error)
+            }
+        }
     }
 
     fn insert_entry_row(&self, session_id: &str, entry: &SessionEntry) -> Result<(), SessionError> {

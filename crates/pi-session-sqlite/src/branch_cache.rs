@@ -52,7 +52,7 @@ pub fn build_cached_branch(
 ) -> Result<(), SessionError> {
     conn.execute("SAVEPOINT build_branch_cache", [])
         .map_err(|err| SessionError::storage(format!("Unable to open branch savepoint: {err}")))?;
-    let result = (|| {
+    let result: Result<(), SessionError> = (|| {
         let branch_id = Uuid::now_v7().to_string();
         insert_branch_entries_for_path(conn, session_id, &branch_id, leaf_id)?;
         insert_branch_tip(conn, session_id, leaf_id, &branch_id)?;
@@ -79,6 +79,7 @@ pub fn build_cached_branch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn append_entry_to_branch_cache(
     conn: &Connection,
     session_id: &str,
@@ -176,6 +177,7 @@ pub fn branch_id_for_entry(
     .map_err(|err| SessionError::storage(format!("Unable to read cached branch id: {err}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extend_branch(
     conn: &Connection,
     session_id: &str,
@@ -203,6 +205,7 @@ fn extend_branch(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_branch_entry(
     conn: &Connection,
     session_id: &str,

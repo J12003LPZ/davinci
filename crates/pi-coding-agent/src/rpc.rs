@@ -406,13 +406,16 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
         ),
         "get_session_stats" => ok(id, &kind, Some(session_stats_json(runtime))),
         "set_session_name" => {
-            if let (Some(session), Some(name)) =
+            let changed = if let (Some(session), Some(name)) =
                 (runtime.agent.session.as_mut(), command.name.as_deref())
             {
                 let _ = session.set_name(name);
-                runtime.emit(RpcSessionEvent::SessionInfoChanged {
-                    name: session.display_name(),
-                });
+                session.display_name()
+            } else {
+                None
+            };
+            if changed.is_some() {
+                runtime.emit(RpcSessionEvent::SessionInfoChanged { name: changed });
             }
             ok(id, &kind, None)
         }
@@ -1098,11 +1101,12 @@ mod tests {
         assert!(kinds.contains(&"session_info_changed"));
         let queue = events
             .iter()
+            .rev()
             .find_map(|event| match event {
                 RpcSessionEvent::QueueUpdate {
                     steering,
                     follow_up,
-                } => Some((steering.clone(), follow_up.clone())),
+                } if !follow_up.is_empty() => Some((steering.clone(), follow_up.clone())),
                 _ => None,
             })
             .expect("queue_update");
