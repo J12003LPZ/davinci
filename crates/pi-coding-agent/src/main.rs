@@ -21,10 +21,8 @@ mod slash;
 mod startup;
 mod trust;
 
-use std::cell::RefCell;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use pi_agent::{
@@ -40,8 +38,8 @@ use pi_ai::{
     ModelRuntimeSnapshot, ResolvedAuth, StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE,
 };
 use pi_coding_agent::interactive_tui::{
-    create_interactive_tui, handle_copy_command, remount_chrome, stop_interactive_tui,
-    switch_tui_mode, sync_chrome_lines, CopyCommandResult, InteractiveTui, InteractiveTuiOptions,
+    create_interactive_tui, handle_copy_command, remount_chrome_panes, stop_interactive_tui,
+    switch_tui_mode, ChromePanes, CopyCommandResult, InteractiveTui, InteractiveTuiOptions,
 };
 use pi_session::{
     default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir_from,
@@ -1360,12 +1358,12 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
 }
 
 fn finish_interactive_tui(
-    tui_host: Option<(InteractiveTui, Rc<RefCell<Vec<String>>>)>,
+    tui_host: Option<(InteractiveTui, ChromePanes)>,
     session: &InteractiveSession,
     stored: &settings::Settings,
     fullscreen: bool,
 ) {
-    if let Some((tui, chrome_lines)) = tui_host {
+    if let Some((tui, panes)) = tui_host {
         stop_interactive_tui(
             tui,
             stored
@@ -1379,7 +1377,7 @@ fn finish_interactive_tui(
                 default_agent_dir(),
                 stored.fullscreen_copy_on_select.unwrap_or(true),
             ),
-            |next| remount_chrome(next, chrome_lines),
+            |next| remount_chrome_panes(next, &panes),
         );
     } else {
         print!("{}", InteractiveSession::leave_sequences(fullscreen));
@@ -1400,12 +1398,11 @@ fn tui_options_from_session(
     )
 }
 
-fn sync_hosted_chrome(
-    tui: &mut InteractiveTui,
-    chrome_lines: &Rc<RefCell<Vec<String>>>,
-    session: &InteractiveSession,
-) {
-    sync_chrome_lines(chrome_lines, session.chrome.render(session.width));
+fn sync_hosted_chrome(tui: &mut InteractiveTui, panes: &ChromePanes, session: &InteractiveSession) {
+    panes.sync(
+        session.chrome.render_document(session.width),
+        session.chrome.render_dock(session.width),
+    );
     tui.invalidate();
     tui.render_now(false);
 }
@@ -1524,7 +1521,10 @@ fn run_interactive(
         if let Ok((cols, _rows)) = crossterm::terminal::size() {
             session.width = cols as usize;
         }
-        let chrome_lines = Rc::new(RefCell::new(session.chrome.render(session.width)));
+        let panes = ChromePanes::new(
+            session.chrome.render_document(session.width),
+            session.chrome.render_dock(session.width),
+        );
         let options = InteractiveTuiOptions::with_process_terminal(
             tui_mode,
             session.chrome.theme.clone(),
@@ -1534,12 +1534,12 @@ fn run_interactive(
         );
         let mut tui = create_interactive_tui(options);
         tui.set_clear_on_shrink(stored.clear_on_shrink());
-        remount_chrome(&mut tui, chrome_lines.clone());
+        remount_chrome_panes(&mut tui, &panes);
         if let Ok((cols, rows)) = crossterm::terminal::size() {
             tui.set_terminal_size(cols as usize, rows as usize);
         }
         tui.start();
-        Some((tui, chrome_lines))
+        Some((tui, panes))
     } else {
         print!("{}", InteractiveSession::enter_sequences(fullscreen));
         println!("{}", session.chrome.render(session.width).join("\n"));
@@ -1557,10 +1557,8 @@ fn run_interactive(
             finish_interactive_tui(tui_host.take(), &session, &stored, fullscreen);
             return Ok(0);
         }
-        if let Some((tui, lines)) = &mut tui_host {
-            sync_chrome_lines(lines, session.chrome.render(session.width));
-            tui.invalidate();
-            tui.render_now(false);
+        if let Some((tui, panes)) = &mut tui_host {
+            sync_hosted_chrome(tui, panes, &session);
         }
     }
     for extra in &prepared.remaining_messages {
@@ -1568,22 +1566,12 @@ fn run_interactive(
             finish_interactive_tui(tui_host.take(), &session, &stored, fullscreen);
             return Ok(0);
         }
-        if let Some((tui, lines)) = &mut tui_host {
-            sync_chrome_lines(lines, session.chrome.render(session.width));
-            tui.invalidate();
-            tui.render_now(false);
+        if let Some((tui, panes)) = &mut tui_host {
+            sync_hosted_chrome(tui, panes, &session);
         }
     }
-    if let Some((tui, chrome_lines)) = tui_host.take() {
-        run_raw_session(
-            parsed,
-            agent,
-            &mut session,
-            &mut host,
-            tui,
-            chrome_lines,
-            &stored,
-        )
+    if let Some((tui, panes)) = tui_host.take() {
+        run_raw_session(parsed, agent, &mut session, &mut host, tui, panes, &stored)
     } else {
         let result = run_line_session(parsed, agent, &mut session);
         print!("{}", InteractiveSession::leave_sequences(fullscreen));
@@ -1672,7 +1660,7 @@ fn run_raw_session(
     session: &mut InteractiveSession,
     host: &mut ExtensionHost,
     mut tui: InteractiveTui,
-    chrome_lines: Rc<RefCell<Vec<String>>>,
+    panes: ChromePanes,
     stored: &settings::Settings,
 ) -> Result<i32, String> {
     let _raw = RawModeGuard::enter()?;
@@ -1686,12 +1674,12 @@ fn run_raw_session(
                         break;
                     }
                 }
-                sync_hosted_chrome(&mut tui, &chrome_lines, session);
+                sync_hosted_chrome(&mut tui, &panes, session);
             }
         }
         if let Some(detection) = session.finish_osc_query(std::time::Instant::now()) {
             apply_osc_theme(session, &detection);
-            sync_hosted_chrome(&mut tui, &chrome_lines, session);
+            sync_hosted_chrome(&mut tui, &panes, session);
         }
         if !crossterm::event::poll(std::time::Duration::from_millis(50))
             .map_err(|err| err.to_string())?
@@ -1700,7 +1688,7 @@ fn run_raw_session(
             let mut dirty = poll_llama_job(session);
             dirty |= tick_custom_overlay(parsed, session);
             if dirty {
-                sync_hosted_chrome(&mut tui, &chrome_lines, session);
+                sync_hosted_chrome(&mut tui, &panes, session);
             }
             continue;
         }
@@ -1714,11 +1702,11 @@ fn run_raw_session(
                 let bytes = key_event_to_bytes(&key);
                 if host.dispatch_terminal_input(&bytes) {
                     session.apply_extension_ui_calls(&host.ui_calls);
-                    sync_hosted_chrome(&mut tui, &chrome_lines, session);
+                    sync_hosted_chrome(&mut tui, &panes, session);
                     continue;
                 }
                 if tui.handle_host_input(&bytes) {
-                    sync_hosted_chrome(&mut tui, &chrome_lines, session);
+                    sync_hosted_chrome(&mut tui, &panes, session);
                     continue;
                 }
                 let action = session.handle_bytes(&bytes);
@@ -1728,7 +1716,7 @@ fn run_raw_session(
                     });
                     apply_suspend(session, true);
                     tui.start();
-                    sync_hosted_chrome(&mut tui, &chrome_lines, session);
+                    sync_hosted_chrome(&mut tui, &panes, session);
                     continue;
                 }
                 if !apply_session_action(parsed, agent, session, action, Some(&mut tui))? {
@@ -1764,15 +1752,15 @@ fn run_raw_session(
             );
             tui = next;
             if switched {
-                remount_chrome(&mut tui, chrome_lines.clone());
+                remount_chrome_panes(&mut tui, &panes);
             }
         }
         if session.show_terminal_progress {
             tui.set_progress(true);
         }
-        sync_hosted_chrome(&mut tui, &chrome_lines, session);
+        sync_hosted_chrome(&mut tui, &panes, session);
     }
-    finish_interactive_tui(Some((tui, chrome_lines)), session, &stored, false);
+    finish_interactive_tui(Some((tui, panes)), session, &stored, false);
     Ok(0)
 }
 

@@ -6,8 +6,9 @@ use std::rc::Rc;
 
 use pi_tui::{
     copy_text, open_browser, Component, MemoryTerminal, OverlayHandle, OverlayOptions,
-    ProcessTerminal, TerminalIo, Theme, TuiAltScreen, TuiAltScreenOptions, TuiMainScreen,
-    TuiMainScreenRenderState, TuiMode, TuiRuntimeMode, TuiStopOptions,
+    ProcessTerminal, ScrollFollow, ScrollView, ScrollViewOptions, StackBasis, StackEntryOptions,
+    TerminalIo, Theme, TuiAltScreen, TuiAltScreenOptions, TuiMainScreen, TuiMainScreenRenderState,
+    TuiMode, TuiRuntimeMode, TuiStopOptions, VStack,
 };
 
 type OpenUrlFn = Box<dyn FnMut(&str)>;
@@ -35,6 +36,51 @@ impl Component for SharedLineView {
     }
 
     fn invalidate(&mut self) {}
+}
+
+/// Full chrome for the main-screen renderer (document + dock stacked).
+pub struct CombinedLineView {
+    pub document: Rc<RefCell<Vec<String>>>,
+    pub dock: Rc<RefCell<Vec<String>>>,
+}
+
+impl Component for CombinedLineView {
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut lines = SharedLineView {
+            lines: self.document.clone(),
+        }
+        .render(width);
+        lines.extend(
+            SharedLineView {
+                lines: self.dock.clone(),
+            }
+            .render(width),
+        );
+        lines
+    }
+
+    fn invalidate(&mut self) {}
+}
+
+/// TS document ScrollView + editor/footer dock panes.
+#[derive(Clone)]
+pub struct ChromePanes {
+    pub document: Rc<RefCell<Vec<String>>>,
+    pub dock: Rc<RefCell<Vec<String>>>,
+}
+
+impl ChromePanes {
+    pub fn new(document: Vec<String>, dock: Vec<String>) -> Self {
+        Self {
+            document: Rc::new(RefCell::new(document)),
+            dock: Rc::new(RefCell::new(dock)),
+        }
+    }
+
+    pub fn sync(&self, document: Vec<String>, dock: Vec<String>) {
+        *self.document.borrow_mut() = document;
+        *self.dock.borrow_mut() = dock;
+    }
 }
 
 pub struct InteractiveTuiOptions {
@@ -414,6 +460,52 @@ pub fn remount_chrome(tui: &mut InteractiveTui, lines: Rc<RefCell<Vec<String>>>)
     tui.set_focus_child(0);
 }
 
+pub fn remount_chrome_panes(tui: &mut InteractiveTui, panes: &ChromePanes) {
+    if tui.is_viewport_tui() {
+        let scroll = ScrollView::new(
+            Box::new(SharedLineView {
+                lines: panes.document.clone(),
+            }),
+            ScrollViewOptions {
+                follow: ScrollFollow::End,
+                primary: true,
+                ..ScrollViewOptions::default()
+            },
+        )
+        .expect("scroll view");
+        let mut root = VStack::new(0);
+        root.add_child(
+            Box::new(scroll),
+            StackEntryOptions {
+                basis: Some(StackBasis::Fixed(0)),
+                grow: Some(1),
+                min_size: Some(1),
+                ..StackEntryOptions::default()
+            },
+        );
+        root.add_child(
+            Box::new(SharedLineView {
+                lines: panes.dock.clone(),
+            }),
+            StackEntryOptions {
+                basis: Some(StackBasis::Auto),
+                min_size: Some(1),
+                ..StackEntryOptions::default()
+            },
+        );
+        tui.set_layout_root(Box::new(root));
+        tui.add_child(Box::new(SharedLineView {
+            lines: panes.document.clone(),
+        }));
+    } else {
+        tui.add_child(Box::new(CombinedLineView {
+            document: panes.document.clone(),
+            dock: panes.dock.clone(),
+        }));
+    }
+    tui.set_focus_child(0);
+}
+
 pub fn sync_chrome_lines(lines: &Rc<RefCell<Vec<String>>>, rendered: Vec<String>) {
     *lines.borrow_mut() = rendered;
 }
@@ -558,5 +650,25 @@ mod tests {
         assert_eq!(view.render(40), vec!["hello".to_string()]);
         sync_chrome_lines(&lines, vec!["updated".into()]);
         assert_eq!(view.render(40), vec!["updated".to_string()]);
+    }
+
+    #[test]
+    fn fullscreen_layout_keeps_dock_visible() {
+        let mut tui = create_interactive_tui(memory_options(TuiMode::Fullscreen, 20, 6));
+        let panes = ChromePanes::new(
+            (1..=8).map(|index| format!("line {index}")).collect(),
+            vec!["editor".into(), "footer".into()],
+        );
+        remount_chrome_panes(&mut tui, &panes);
+        tui.start();
+        let view = match &tui {
+            InteractiveTui::Alt(inner) => inner.viewport_lines(),
+            InteractiveTui::Main(_) => Vec::new(),
+        };
+        assert_eq!(
+            view,
+            vec!["line 5", "line 6", "line 7", "line 8", "editor", "footer"]
+        );
+        tui.stop(TuiStopOptions::default());
     }
 }

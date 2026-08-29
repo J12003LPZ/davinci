@@ -378,8 +378,9 @@ impl ChatChrome {
     }
 }
 
-impl Component for ChatChrome {
-    fn render(&self, width: usize) -> Vec<String> {
+impl ChatChrome {
+    /// Transcript / header / tool cards (TS `documentContainer` + chat).
+    pub fn render_document(&self, width: usize) -> Vec<String> {
         let mut lines = Vec::new();
         if !self.quiet_startup || self.extension_header.is_some() {
             lines.push(format!("{}  theme={}", self.title, self.theme.name));
@@ -387,6 +388,16 @@ impl Component for ChatChrome {
         if let Some(header) = &self.extension_header {
             lines.extend(header.iter().cloned());
         }
+        lines.extend(self.transcript.render(width));
+        for card in &self.tool_cards {
+            lines.extend(card.render(width));
+        }
+        lines
+    }
+
+    /// Editor, overlays, status, and footer (TS dock under the transcript ScrollView).
+    pub fn render_dock(&self, width: usize) -> Vec<String> {
+        let mut lines = Vec::new();
         if !self.status.is_empty() {
             lines.push(self.status.clone());
         }
@@ -407,10 +418,6 @@ impl Component for ChatChrome {
             } else if let Some(working) = &self.working_message {
                 lines.push(working.clone());
             }
-        }
-        lines.extend(self.transcript.render(width));
-        for card in &self.tool_cards {
-            lines.extend(card.render(width));
         }
         if let Some(setup) = &self.first_time {
             lines.push(String::new());
@@ -526,6 +533,14 @@ impl Component for ChatChrome {
         if let Some(footer) = &self.extension_footer {
             lines.extend(footer.iter().cloned());
         }
+        lines
+    }
+}
+
+impl Component for ChatChrome {
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut lines = self.render_document(width);
+        lines.extend(self.render_dock(width));
         lines
     }
 
