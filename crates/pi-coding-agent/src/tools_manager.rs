@@ -481,6 +481,9 @@ fn download_tool(tool: ManagedTool, bin_dir: &Path) -> Result<String, String> {
 
 /// TS `ensureTool`.
 pub fn ensure_tool(tool: ManagedTool) -> (Option<String>, Vec<ToolStatus>) {
+    if let Some(path) = get_tool_path(tool) {
+        return (Some(path), Vec::new());
+    }
     ensure_tool_in(&tools_bin_dir(&default_agent_dir()), tool)
 }
 

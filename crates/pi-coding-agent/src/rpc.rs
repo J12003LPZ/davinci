@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use pi_agent::{Agent, QueueMode};
-use pi_ai::{
-    available_thinking_levels, cycle_thinking_level, find_model, load_builtin_models, Model,
-};
+#[cfg(test)]
+use pi_ai::load_builtin_models;
+use pi_ai::{available_thinking_levels, cycle_thinking_level, find_model, Model};
 use pi_protocol::ThinkingLevel;
 use pi_session::JsonlSession;
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,7 @@ pub struct RpcRuntime {
 }
 
 impl RpcRuntime {
+    #[cfg(test)]
     pub fn new(agent: Agent, session_dir: PathBuf, cwd: PathBuf) -> Self {
         Self::with_models(agent, session_dir, cwd, load_builtin_models())
     }
