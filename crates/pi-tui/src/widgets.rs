@@ -315,11 +315,7 @@ impl Input {
     fn handle_paste(&mut self, pasted: &str) {
         self.last_action = None;
         self.push_undo();
-        let clean = pasted
-            .replace("\r\n", "")
-            .replace('\r', "")
-            .replace('\n', "")
-            .replace('\t', "    ");
+        let clean = pasted.replace(['\r', '\n'], "").replace('\t', "    ");
         self.insert_str(&clean);
     }
 

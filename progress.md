@@ -41,4 +41,4 @@ Port remaining Kitty / iTerm2 image compositor behavior, then re-audit the Done 
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: pending workspace gates after Input yank-pop / undo coalescing, Radius OAuth discovery, and CURSOR_MARKER hardware cursor.
+Last run: green on 1.83 after Input yank-pop / undo coalescing, Radius OAuth discovery, and CURSOR_MARKER hardware cursor.
