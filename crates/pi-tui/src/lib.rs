@@ -13,6 +13,7 @@ mod fuzzy;
 mod image;
 mod keybindings;
 mod keys;
+mod kill_ring;
 mod latex;
 mod login_dialog;
 mod markdown;

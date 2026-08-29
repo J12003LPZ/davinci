@@ -1369,6 +1369,13 @@ impl InteractiveSession {
 
     fn apply_editor_key(&mut self, data: &str) -> bool {
         let editor = &mut self.chrome.editor;
+        if editor.jump_mode().is_some()
+            && (self.keybindings.matches(data, "tui.editor.jumpForward")
+                || self.keybindings.matches(data, "tui.editor.jumpBackward"))
+        {
+            editor.cancel_jump();
+            return true;
+        }
         if self.keybindings.matches(data, "tui.editor.cursorWordLeft") {
             editor.move_word_backwards();
             return true;
@@ -1422,6 +1429,33 @@ impl InteractiveSession {
             editor.backspace();
             return true;
         }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteToLineStart")
+        {
+            editor.delete_to_line_start();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.deleteToLineEnd") {
+            editor.delete_to_line_end();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.yank") {
+            editor.yank();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.yankPop") {
+            editor.yank_pop();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.jumpForward") {
+            editor.begin_jump_forward();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.jumpBackward") {
+            editor.begin_jump_backward();
+            return true;
+        }
         false
     }
 
@@ -1432,6 +1466,12 @@ impl InteractiveSession {
         }
         if self.custom_editor_path.is_some() {
             return SessionAction::CustomEditorInput(data.to_string());
+        }
+        if let Some(forward) = self.chrome.editor.take_jump_mode() {
+            if let Some(ch) = data.chars().find(|ch| !ch.is_control()) {
+                self.chrome.editor.jump_to_char(ch, forward);
+                return SessionAction::None;
+            }
         }
         self.chrome.editor.handle_input(data);
         self.refresh_autocomplete(false);
@@ -1925,5 +1965,15 @@ mod tests {
         assert_eq!(session.chrome.editor.cursor, 5);
         assert_eq!(session.handle_bytes("\x01"), SessionAction::None);
         assert_eq!(session.chrome.editor.cursor, 0);
+        session.chrome.editor.set_text("yank-target");
+        session.chrome.editor.cursor = session.chrome.editor.buffer.len();
+        assert_eq!(session.handle_bytes("\x15"), SessionAction::None);
+        assert!(session.chrome.editor.buffer.is_empty());
+        assert_eq!(session.handle_bytes("\x19"), SessionAction::None);
+        assert_eq!(session.chrome.editor.buffer, "yank-target");
+        session.chrome.editor.cursor = 0;
+        assert_eq!(session.handle_bytes("\x1d"), SessionAction::None);
+        assert_eq!(session.handle_bytes("t"), SessionAction::None);
+        assert_eq!(session.chrome.editor.cursor, 5);
     }
 }

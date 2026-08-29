@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (editor word-nav, settings.json.lock, sqlite lease/FTS/cwd conformance). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (SessionRepo fork/conformance + sqlite replay, TUI kill-ring/yank/jump). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -81,7 +81,10 @@ Closed this slice: interactive cache-miss notices (`showCacheMissNotices`, TS 20
 
 Closed this slice: TUI editor word-nav (`findWordBackward`/`findWordForward` ASCII fixtures, atomic paste markers, `tui.editor.cursor*` / `delete*` keybindings wired in InteractiveSession); settings writes use `settings.json.lock` (10×20ms, TS `ELOCKED` retry); sqlite backend tests cover expired-lease fence steal, cwd list, FTS, and label import.
 
+Closed this slice: `InMemorySessionRepo` + `SessionState` lock TS `createSessionBackendConformance` — parents/one sequence, records, duplicate ids, lane isolation, invalid queries, bounded/cursor filters, record lane/type/run/kind filters, list/open/delete, and fork (`scope=branch|tree`, `position=before|at`, `invalid_fork_target`, facts copied, records not copied). sqlite `persist_session` / `open_repo_session` replays entries/records/lane_moves/facts and restores lane leaves. TUI kill-ring/yank/yank-pop/jump-to-char (`ctrl+y` / `alt+y` / `ctrl+]` / `ctrl+alt+]` / `ctrl+u` / `ctrl+k`) wired in InteractiveSession; `ctrl+k` is reserved for extensions (TS `deleteToLineEnd`).
+
 Still not product-equivalent:
 
-- `pi-session-sqlite` is the sqlite-node crate (WAL, leases, FTS, `001_initial.sql`) and is not the coding-agent default (TS coding-agent is JSONL too). Full `createSessionBackendConformance` SessionRepo (lanes, records, facts, fork/clone as first-class mutations) is still a library gap
-- Live Codex websocket remains fixture/localhost; TUI kill-ring/yank/jump-to-char and Intl.Segmenter CJK dictionary grouping are still thinner than TS
+- Live Codex websocket remains fixture/localhost
+- Intl.Segmenter CJK dictionary grouping is still walk-to-boundary (no ICU dictionary)
+- JSONL-on-disk `SessionRepo` (`jsonl/repo.ts` harness backend) is still thinner than in-memory/sqlite; coding-agent default stays JSONL files like TS

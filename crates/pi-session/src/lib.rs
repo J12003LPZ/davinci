@@ -3,6 +3,7 @@
 mod codec;
 mod discovery;
 mod errors;
+mod repo;
 mod tree;
 mod types;
 
@@ -16,6 +17,12 @@ pub use discovery::{
     resolve_session_dir_from, resolve_session_ref, SessionSummary,
 };
 pub use errors::{JsonlDecodeError, SessionError};
+pub use repo::{
+    assistant_message_entry, compaction_entry, custom_entry, operation_started, user_message_entry,
+    BranchBounds, EntryOrder, EntryQuery, ForkOptions, ForkPosition, ForkScope,
+    InMemorySessionRepo, LanePointer, LogItem, LogOptions, RecordQuery, Session,
+    SessionCreateOptions, SessionMetadata, SessionState, SessionStats, SessionView,
+};
 pub use tree::{
     branch_entries, build_context_entries, build_session_path, build_session_tree, entries_since,
     export_session_jsonl, fork_user_messages, resolved_labels, session_usage_stats,

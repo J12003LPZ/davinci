@@ -160,6 +160,12 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
             &["ctrl+w", "alt+backspace"],
         ),
         ("tui.editor.deleteWordForward", &["alt+d", "alt+delete"]),
+        ("tui.editor.deleteToLineStart", &["ctrl+u"]),
+        ("tui.editor.deleteToLineEnd", &["ctrl+k"]),
+        ("tui.editor.yank", &["ctrl+y"]),
+        ("tui.editor.yankPop", &["alt+y"]),
+        ("tui.editor.jumpForward", &["ctrl+]"]),
+        ("tui.editor.jumpBackward", &["ctrl+alt+]"]),
     ]
 }
 
@@ -185,7 +191,10 @@ pub fn key_to_bytes(key: &str) -> String {
         "ctrl+v" => "\x16".into(),
         "ctrl+w" => "\x17".into(),
         "ctrl+x" => "\x18".into(),
+        "ctrl+y" => "\x19".into(),
         "ctrl+z" => "\x1a".into(),
+        "ctrl+]" => "\x1d".into(),
+        "ctrl+alt+]" => "\x1b\x1d".into(),
         "ctrl+backspace" => "\x1b[3;5~".into(),
         "shift+tab" => "\x1b[Z".into(),
         "shift+ctrl+p" => "\x1b[80;6u".into(),
@@ -199,6 +208,7 @@ pub fn key_to_bytes(key: &str) -> String {
         "alt+b" => "\x1bb".into(),
         "alt+f" => "\x1bf".into(),
         "alt+d" => "\x1bd".into(),
+        "alt+y" => "\x1by".into(),
         "alt+backspace" => "\x1b\x7f".into(),
         "alt+delete" => "\x1b[3;3~".into(),
         "left" => "\x1b[D".into(),
@@ -246,6 +256,12 @@ mod tests {
         assert!(Keybindings::defaults().matches("\x1b[1;5D", "tui.editor.cursorWordLeft"));
         assert!(Keybindings::defaults().matches("\x17", "tui.editor.deleteWordBackward"));
         assert!(Keybindings::defaults().matches("\x7f", "tui.editor.deleteCharBackward"));
+        assert!(Keybindings::defaults().matches("\x19", "tui.editor.yank"));
+        assert!(Keybindings::defaults().matches("\x1by", "tui.editor.yankPop"));
+        assert!(Keybindings::defaults().matches("\x15", "tui.editor.deleteToLineStart"));
+        assert!(Keybindings::defaults().matches("\x0b", "tui.editor.deleteToLineEnd"));
+        assert!(Keybindings::defaults().matches("\x1d", "tui.editor.jumpForward"));
+        assert!(Keybindings::defaults().matches("\x1b\x1d", "tui.editor.jumpBackward"));
         let migrated = Keybindings::from_json(r#"{"clear":"ctrl+u"}"#);
         assert!(migrated.matches("\x15", "app.clear"));
     }

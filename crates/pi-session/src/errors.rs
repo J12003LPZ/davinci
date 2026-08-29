@@ -57,6 +57,34 @@ impl SessionError {
             message: message.into(),
         }
     }
+
+    pub fn already_exists(message: impl Into<String>) -> Self {
+        Self {
+            code: "already_exists",
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid_query(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_query",
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid_lane(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_lane",
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid_fork_target(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_fork_target",
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for SessionError {

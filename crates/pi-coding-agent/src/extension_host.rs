@@ -625,22 +625,32 @@ mod tests {
         let bindings = Keybindings::defaults();
         let (shortcuts, diagnostics) = resolve_extension_shortcuts(
             &[
-                ("/one.js".into(), vec!["ctrl+c".into(), "ctrl+k".into()]),
-                ("/two.js".into(), vec!["ctrl+k".into(), "ctrl+y".into()]),
+                (
+                    "/one.js".into(),
+                    vec!["ctrl+c".into(), "ctrl+k".into(), "ctrl+shift+x".into()],
+                ),
+                (
+                    "/two.js".into(),
+                    vec!["ctrl+shift+x".into(), "ctrl+y".into()],
+                ),
             ],
             &bindings,
         );
         assert!(diagnostics
             .iter()
             .any(|line| line.contains("conflicts with built-in shortcut")));
+        assert!(diagnostics.iter().any(|line| {
+            line.contains("ctrl+k") && line.contains("conflicts with built-in shortcut")
+        }));
         assert!(diagnostics
             .iter()
             .any(|line| line.contains("registered by both")));
         assert!(!shortcuts.iter().any(|(key, _)| key == "ctrl+c"));
+        assert!(!shortcuts.iter().any(|(key, _)| key == "ctrl+k"));
         assert_eq!(
             shortcuts
                 .iter()
-                .find(|(key, _)| key == "ctrl+k")
+                .find(|(key, _)| key == "ctrl+shift+x")
                 .map(|item| item.1.as_str()),
             Some("/two.js")
         );
