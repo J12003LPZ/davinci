@@ -44,8 +44,8 @@ use pi_tui::{
     drain_osc_tty, encode_kitty, interactive_settings_list, load_themes_from_dir, parse_auto_theme,
     parse_http_idle_timeout, resolve_git_branch, AutocompleteItem, ChatChrome, Component,
     CustomMessage, DoubleEscapeAction, ExtraAutocompleteProvider, FilterMode, InteractiveSession,
-    Keybindings, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction, SessionItem,
-    SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TuiMode,
+    Keybindings, LiveAutocompleteQuery, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction,
+    SessionItem, SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TuiMode,
     FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
@@ -909,7 +909,15 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
         host.emit(ExtensionEvent::BeforeAgentStart);
         host.emit(ExtensionEvent::AgentStart);
         host.emit(ExtensionEvent::TurnStart);
+        host.emit(ExtensionEvent::BeforeProviderRequest {
+            provider: agent.provider.clone(),
+            model: agent.model_id.clone(),
+        });
     }
+    let js_stream = {
+        let host = host.lock().unwrap_or_else(|err| err.into_inner());
+        host.js_stream_provider(&agent.provider)
+    };
     let hook_host = host.clone();
     agent.pre_tool = Some(pi_agent::PreToolHook(Arc::new(move |name, args| {
         let mut host = hook_host.lock().ok()?;
@@ -939,8 +947,17 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                 .find(|m| m.role == "user")
                 .map(|m| content_text(&m.content).len())
                 .unwrap_or(0);
-            match (offline, model.as_ref(), auth.as_ref()) {
-                (false, Some(model), Some(auth)) => live_complete_with(
+            match (offline, model.as_ref(), auth.as_ref(), js_stream.as_ref()) {
+                (false, Some(model), _, Some((path, name))) => {
+                    crate::js_host::run_js_stream_simple(
+                        Path::new(path),
+                        name,
+                        model,
+                        &current.messages_for_provider(),
+                        &current.system_prompt,
+                    )
+                }
+                (false, Some(model), Some(auth), None) => live_complete_with(
                     model,
                     &current.messages_for_provider(),
                     auth,
@@ -1006,17 +1023,47 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
         host.emit(ExtensionEvent::AgentSettled);
         for event in &events {
             match event {
+                AgentEvent::MessageStart { message } => {
+                    host.emit(ExtensionEvent::MessageStart {
+                        text: content_text(&message.content),
+                    });
+                }
+                AgentEvent::MessageUpdate { message, .. } => {
+                    host.emit(ExtensionEvent::MessageUpdate {
+                        text: content_text(&message.content),
+                    });
+                }
+                AgentEvent::MessageEnd { message } => {
+                    host.emit(ExtensionEvent::MessageEnd {
+                        text: content_text(&message.content),
+                    });
+                }
                 AgentEvent::ToolExecutionEnd {
                     tool_name,
                     is_error,
                     ..
                 } => {
+                    host.emit(ExtensionEvent::ToolExecutionEnd {
+                        tool_name: tool_name.clone(),
+                        is_error: *is_error,
+                    });
                     host.emit(ExtensionEvent::ToolResult {
                         tool_name: tool_name.clone(),
                         is_error: *is_error,
                     });
                 }
-                AgentEvent::ToolExecutionStart { tool_name, .. } => {
+                AgentEvent::ToolExecutionUpdate { tool_name, .. } => {
+                    host.emit(ExtensionEvent::ToolExecutionUpdate {
+                        tool_name: tool_name.clone(),
+                    });
+                }
+                AgentEvent::ToolExecutionStart {
+                    tool_name, args, ..
+                } => {
+                    host.emit(ExtensionEvent::ToolExecutionStart {
+                        tool_name: tool_name.clone(),
+                        args: args.clone(),
+                    });
                     if let Some(result) = host.execute_named_tool(tool_name, &agent.cwd) {
                         let _ = result;
                     }
@@ -1647,13 +1694,7 @@ fn apply_session_action(
                 cwd: agent.cwd.display().to_string(),
             });
             session.apply_extension_ui_calls(&host.ui_calls);
-            apply_session_calls(
-                Some(parsed),
-                agent,
-                Some(&mut session.chrome),
-                &host.session_calls,
-                true,
-            );
+            apply_host_session_calls(parsed, agent, session, &host.session_calls, true);
             match crate::js_host::execute_command_tool(&command, &agent.cwd) {
                 Ok(out) => {
                     session.chrome.transcript.push("bash", &out);
@@ -1991,10 +2032,7 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Reload => {
-            agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
-            agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
-            agent.context_files = load_context_files(&agent.cwd, true);
-            let _host = loaded_extension_host(parsed);
+            reload_interactive_resources(parsed, agent, session);
             session.chrome.status =
                 "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
                     .into();
@@ -2585,26 +2623,49 @@ fn interactive_extra_autocomplete(parsed: &Args) -> Vec<ExtraAutocompleteProvide
     loaded_extension_host(parsed)
         .js
         .iter()
-        .flat_map(|ext| ext.autocomplete_providers.iter())
-        .map(|provider| ExtraAutocompleteProvider {
-            trigger_characters: provider
-                .trigger_characters
+        .flat_map(|ext| {
+            ext.autocomplete_providers
                 .iter()
-                .filter_map(|value| value.chars().next())
-                .collect(),
-            items: provider
-                .items
-                .iter()
-                .map(|item| AutocompleteItem {
-                    value: item.value.clone(),
-                    label: if item.label.is_empty() {
-                        item.value.clone()
-                    } else {
-                        item.label.clone()
-                    },
-                    description: item.description.clone(),
+                .map(|provider| {
+                    let path = ext.path.clone();
+                    ExtraAutocompleteProvider {
+                        trigger_characters: provider
+                            .trigger_characters
+                            .iter()
+                            .filter_map(|value| value.chars().next())
+                            .collect(),
+                        items: provider
+                            .items
+                            .iter()
+                            .map(|item| AutocompleteItem {
+                                value: item.value.clone(),
+                                label: if item.label.is_empty() {
+                                    item.value.clone()
+                                } else {
+                                    item.label.clone()
+                                },
+                                description: item.description.clone(),
+                            })
+                            .collect(),
+                        live_query: Some(LiveAutocompleteQuery(std::sync::Arc::new(
+                            move |text: &str| {
+                                crate::js_host::query_js_autocomplete(Path::new(&path), text)
+                                    .into_iter()
+                                    .map(|item| AutocompleteItem {
+                                        value: item.value.clone(),
+                                        label: if item.label.is_empty() {
+                                            item.value.clone()
+                                        } else {
+                                            item.label.clone()
+                                        },
+                                        description: item.description.clone(),
+                                    })
+                                    .collect()
+                            },
+                        ))),
+                    }
                 })
-                .collect(),
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -2657,13 +2718,7 @@ fn apply_extension_shortcuts(
     let (shortcuts, diagnostics) = host.resolve_shortcuts(&session.keybindings);
     session.extension_shortcuts = shortcuts;
     session.apply_extension_ui_calls(&host.ui_calls);
-    apply_session_calls(
-        Some(parsed),
-        agent,
-        Some(&mut session.chrome),
-        &host.session_calls,
-        true,
-    );
+    apply_host_session_calls(parsed, agent, session, &host.session_calls, true);
     activate_custom_editor(session, host);
     if let Some(warning) = diagnostics.first() {
         session.chrome.status = warning.clone();
@@ -2784,13 +2839,7 @@ fn host_invoke_shortcut(
         ExtensionHost::default().invoke_shortcut(path, key)?
     };
     session.apply_extension_ui_calls(&host.ui_calls);
-    apply_session_calls(
-        Some(parsed),
-        agent,
-        Some(&mut session.chrome),
-        &host.session_calls,
-        true,
-    );
+    apply_host_session_calls(parsed, agent, session, &host.session_calls, true);
     Ok(result)
 }
 
@@ -2815,13 +2864,7 @@ fn try_extension_slash(
     host.runtime_flag_values = flag_values_json(parsed);
     let result = host.invoke_command(&path, name)?;
     session.apply_extension_ui_calls(&host.ui_calls);
-    apply_session_calls(
-        Some(parsed),
-        agent,
-        Some(&mut session.chrome),
-        &host.session_calls,
-        true,
-    );
+    apply_host_session_calls(parsed, agent, session, &host.session_calls, true);
     apply_custom_overlay_result(&mut session.chrome, &path, name, result.as_ref());
     session.chrome.status = format!("/{name}");
     println!("{}", session.chrome.status);
@@ -2891,13 +2934,7 @@ fn handle_custom_overlay_input(
     match host.invoke_command_with(&path, &name, data, snapshot.as_ref(), session.width) {
         Ok(result) => {
             session.apply_extension_ui_calls(&host.ui_calls);
-            apply_session_calls(
-                Some(parsed),
-                agent,
-                Some(&mut session.chrome),
-                &host.session_calls,
-                true,
-            );
+            apply_host_session_calls(parsed, agent, session, &host.session_calls, true);
             apply_custom_overlay_result(&mut session.chrome, &path, &name, result.as_ref());
             if session.chrome.custom_overlay_lines.is_none() {
                 if let Some(value) = result {
@@ -3355,6 +3392,39 @@ fn apply_progress_events(session: &mut InteractiveSession, events: &[AgentEvent]
     }
 }
 
+fn apply_host_session_calls(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    calls: &[serde_json::Value],
+    trigger_turns: bool,
+) {
+    let mut host = loaded_extension_host(parsed);
+    host.runtime_flag_values = flag_values_json(parsed);
+    for call in calls {
+        match call.get("op").and_then(|value| value.as_str()) {
+            Some("fork") => host.emit(ExtensionEvent::SessionBeforeFork),
+            Some("switchSession") => host.emit(ExtensionEvent::SessionBeforeSwitch),
+            Some("navigateTree") => host.emit(ExtensionEvent::SessionBeforeTree),
+            Some("reload") => host.emit(ExtensionEvent::SessionShutdown),
+            _ => {}
+        }
+    }
+    apply_session_calls(
+        Some(parsed),
+        agent,
+        Some(&mut session.chrome),
+        calls,
+        trigger_turns,
+    );
+    if calls
+        .iter()
+        .any(|call| call.get("op").and_then(|value| value.as_str()) == Some("reload"))
+    {
+        reload_interactive_resources(parsed, agent, session);
+    }
+}
+
 fn apply_session_calls(
     parsed: Option<&Args>,
     agent: &mut Agent,
@@ -3520,6 +3590,7 @@ fn apply_session_calls(
                     }
                 }
             }
+            Some("waitForIdle") => {}
             Some("switchSession") => {
                 if let Some(path) = call.get("sessionPath").and_then(|value| value.as_str()) {
                     if let Ok(next) = JsonlSession::open(Path::new(path)) {
@@ -3544,8 +3615,13 @@ fn apply_session_calls(
                 }
             }
             Some("reload") => {
+                agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
+                agent.templates =
+                    discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
+                agent.context_files = load_context_files(&agent.cwd, true);
                 if let Some(chrome) = chrome.as_mut() {
-                    chrome.status = "reload".into();
+                    chrome.status = "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
+                        .into();
                 }
             }
             Some("setActiveTools") => {

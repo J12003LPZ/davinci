@@ -1737,6 +1737,7 @@ mod tests {
                 label: "#42".into(),
                 description: Some("[open] Login crash".into()),
             }],
+            live_query: None,
         }];
         session.chrome.editor.buffer = "#4".into();
         session.chrome.editor.cursor = 2;

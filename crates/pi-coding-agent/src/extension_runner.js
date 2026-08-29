@@ -480,7 +480,11 @@ async function main() {
 		sessionCalls: [],
 		providers: [],
 		autocompleteProviders: [],
+		eventEmits: [],
+		streamHandlers: {},
+		refreshHandlers: {},
 	};
+	const eventBus = {};
 	let editorFactory;
 	let customComponent;
 	let pendingCustom;
@@ -612,7 +616,12 @@ async function main() {
 							}
 						} catch {}
 					}
-					recorded.autocompleteProviders.push({ triggerCharacters: triggers, items });
+					recorded.autocompleteProviders.push({
+						triggerCharacters: triggers,
+						items,
+						getSuggestions:
+							typeof wrapped.getSuggestions === "function" ? wrapped.getSuggestions : null,
+					});
 				} catch {}
 			},
 			onTerminalInput() {
@@ -714,14 +723,33 @@ async function main() {
 			}
 		},
 		registerProvider(nameOrProvider, config) {
-			if (typeof nameOrProvider === "string") {
-				recorded.providers.push({ name: nameOrProvider, config: config || {} });
-			} else if (nameOrProvider && typeof nameOrProvider === "object") {
-				recorded.providers.push({
-					name: nameOrProvider.id || nameOrProvider.name || "custom",
-					config: nameOrProvider,
-				});
+			const source =
+				typeof nameOrProvider === "string" ? config || {} : nameOrProvider && typeof nameOrProvider === "object" ? nameOrProvider : {};
+			const name =
+				typeof nameOrProvider === "string"
+					? nameOrProvider
+					: (nameOrProvider && (nameOrProvider.id || nameOrProvider.name)) || "custom";
+			const copy = Object.assign({}, source);
+			const hasStreamSimple = typeof source.streamSimple === "function";
+			const hasRefreshModels = typeof source.refreshModels === "function";
+			const hasOauth = Boolean(source.oauth);
+			delete copy.streamSimple;
+			delete copy.refreshModels;
+			if (hasStreamSimple) recorded.streamHandlers[name] = source.streamSimple;
+			if (hasRefreshModels) recorded.refreshHandlers[name] = source.refreshModels;
+			if (source.oauth && typeof source.oauth === "object") {
+				copy.oauth = {
+					name: source.oauth.name,
+					id: source.oauth.id,
+				};
 			}
+			recorded.providers.push({
+				name,
+				config: copy,
+				hasStreamSimple,
+				hasRefreshModels,
+				hasOauth,
+			});
 		},
 		ui,
 		registerFlag(name, options) {
@@ -796,6 +824,7 @@ async function main() {
 			return Promise.resolve();
 		},
 		waitForIdle() {
+			recorded.sessionCalls.push({ op: "waitForIdle" });
 			return Promise.resolve();
 		},
 		exec(command, args, options) {
@@ -871,9 +900,20 @@ async function main() {
 			return recorded.flagDefaults[name];
 		},
 		events: {
-			emit() {},
-			on() {
-				return () => {};
+			emit(channel, data) {
+				recorded.eventEmits.push({ channel, data });
+				for (const handler of eventBus[channel] || []) {
+					try {
+						handler(data);
+					} catch {}
+				}
+			},
+			on(channel, handler) {
+				if (!eventBus[channel]) eventBus[channel] = [];
+				eventBus[channel].push(handler);
+				return () => {
+					eventBus[channel] = (eventBus[channel] || []).filter((item) => item !== handler);
+				};
 			},
 		},
 	};
@@ -1142,6 +1182,72 @@ async function main() {
 				action,
 			};
 		}
+	} else if (op === "autocomplete") {
+		const text = String(payload.text || payload.prefix || "");
+		const lines = text.split("\n");
+		const cursorLine = Math.max(0, lines.length - 1);
+		const cursorCol = lines[cursorLine] ? lines[cursorLine].length : 0;
+		const fixture = process.env.PI_EXTENSION_AUTOCOMPLETE_REPLY;
+		if (fixture) {
+			try {
+				result = { items: JSON.parse(fixture) };
+			} catch {
+				result = { items: [] };
+			}
+		} else {
+			const items = [];
+			for (const provider of recorded.autocompleteProviders) {
+				if (typeof provider.getSuggestions === "function") {
+					const out = await provider.getSuggestions(lines, cursorLine, cursorCol, {
+						signal: { aborted: false },
+					});
+					if (out && Array.isArray(out.items)) items.push(...out.items);
+				} else if (Array.isArray(provider.items)) {
+					items.push(...provider.items);
+				}
+			}
+			result = { items };
+		}
+	} else if (op === "event") {
+		const channel = String(payload.channel || "");
+		let delivered = 0;
+		for (const handler of eventBus[channel] || []) {
+			try {
+				handler(payload.data);
+				delivered += 1;
+			} catch {}
+		}
+		result = { delivered };
+	} else if (op === "streamSimple") {
+		const handler = recorded.streamHandlers[payload.provider];
+		if (typeof handler === "function") {
+			const out = await handler(payload.model || {}, payload.context || {}, payload.options || {});
+			if (out && typeof out[Symbol.asyncIterator] === "function") {
+				let text = "";
+				let message;
+				for await (const ev of out) {
+					if (ev && ev.type === "text_delta" && ev.delta) text += ev.delta;
+					if (ev && ev.type === "text" && ev.text) text += ev.text;
+					if (ev && ev.message) message = ev.message;
+				}
+				result = message || {
+					role: "assistant",
+					content: [{ type: "text", text }],
+				};
+			} else if (out && (out.content || out.text)) {
+				result = out;
+			} else {
+				result = {
+					role: "assistant",
+					content: [{ type: "text", text: out == null ? "" : String(out) }],
+				};
+			}
+		}
+	} else if (op === "refreshModels") {
+		const handler = recorded.refreshHandlers[payload.provider];
+		if (typeof handler === "function") {
+			result = { models: await handler(payload.context || {}) };
+		}
 	}
 	}
 	function emitResult() {
@@ -1157,10 +1263,14 @@ async function main() {
 			markdownTransformers: recorded.markdownTransformers.length,
 			uiCalls: recorded.uiCalls,
 			sessionCalls: recorded.sessionCalls,
+			eventEmits: recorded.eventEmits,
 			hasEditor: typeof editorFactory === "function",
 			hasCustom: Boolean(customComponent),
 			providers: recorded.providers,
-			autocompleteProviders: recorded.autocompleteProviders,
+			autocompleteProviders: recorded.autocompleteProviders.map((provider) => ({
+				triggerCharacters: provider.triggerCharacters,
+				items: provider.items || [],
+			})),
 			result,
 		};
 	}

@@ -38,6 +38,8 @@ pub struct JsExtensionResult {
     pub ui_calls: Vec<Value>,
     #[serde(default, rename = "sessionCalls")]
     pub session_calls: Vec<Value>,
+    #[serde(default, rename = "eventEmits")]
+    pub event_emits: Vec<Value>,
     #[serde(default, rename = "hasEditor")]
     pub has_editor: bool,
     #[serde(default, rename = "hasCustom")]
@@ -62,6 +64,12 @@ pub struct JsRegisteredProvider {
     pub name: String,
     #[serde(default)]
     pub config: Value,
+    #[serde(default, rename = "hasStreamSimple")]
+    pub has_stream_simple: bool,
+    #[serde(default, rename = "hasRefreshModels")]
+    pub has_refresh_models: bool,
+    #[serde(default, rename = "hasOauth")]
+    pub has_oauth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -289,6 +297,85 @@ pub fn run_js_extension(
     })
 }
 
+pub fn query_js_autocomplete(module: &Path, text: &str) -> Vec<JsAutocompleteItem> {
+    let result =
+        run_persistent_js_extension(module, "autocomplete", &serde_json::json!({ "text": text }))
+            .ok();
+    result
+        .and_then(|loaded| loaded.result)
+        .and_then(|value| value.get("items").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+pub fn run_js_stream_simple(
+    module: &Path,
+    provider: &str,
+    model: &pi_ai::Model,
+    messages: &[pi_ai::ChatMessage],
+    system: &str,
+) -> Result<pi_ai::AssistantMessage, String> {
+    let result = run_persistent_js_extension(
+        module,
+        "streamSimple",
+        &serde_json::json!({
+            "provider": provider,
+            "model": {
+                "id": model.id,
+                "provider": model.provider,
+                "name": model.name,
+            },
+            "context": {
+                "systemPrompt": system,
+                "messages": messages,
+            },
+        }),
+    )?;
+    let value = result.result.unwrap_or(Value::Null);
+    if let Some(text) = value.as_str() {
+        return Ok(pi_ai::AssistantMessage {
+            id: pi_agent::new_message_id(),
+            role: "assistant".into(),
+            content: vec![pi_ai::ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            model: format!("{}/{}", model.provider, model.id),
+            usage: None,
+            stop_reason: Some(pi_ai::StopReason::Stop),
+            error_message: None,
+        });
+    }
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            value.get("content").and_then(|content| {
+                if let Some(text) = content.as_str() {
+                    Some(text.to_string())
+                } else {
+                    content.as_array().map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                }
+            })
+        })
+        .unwrap_or_default();
+    Ok(pi_ai::AssistantMessage {
+        id: pi_agent::new_message_id(),
+        role: "assistant".into(),
+        content: vec![pi_ai::ContentBlock::Text { text }],
+        model: format!("{}/{}", model.provider, model.id),
+        usage: None,
+        stop_reason: Some(pi_ai::StopReason::Stop),
+        error_message: None,
+    })
+}
+
 pub fn execute_js_tool(
     module: &Path,
     name: &str,
@@ -479,6 +566,136 @@ module.exports = (pi) => {
             .any(|item| item.value == "extension"));
         assert_eq!(loaded.autocomplete_providers[0].trigger_characters, ["#"]);
         assert_eq!(loaded.autocomplete_providers[0].items[0].value, "#42");
+    }
+
+    #[test]
+    fn live_autocomplete_queries_get_suggestions_with_prefix() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r##"
+module.exports = (pi) => {
+  pi.ui.addAutocompleteProvider(() => ({
+    triggerCharacters: ["#"],
+    getSuggestions: async (lines) => {
+      const text = lines.join("\n");
+      return { items: [{ value: "live:" + text, label: "live:" + text }] };
+    },
+  }));
+};
+"##,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        stop_persistent_js_extension();
+        let items = query_js_autocomplete(&module, "#99");
+        stop_persistent_js_extension();
+        assert_eq!(items[0].value, "live:#99");
+    }
+
+    #[test]
+    fn events_emit_delivers_to_same_extension_listeners() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerCommand("ping", {
+    handler: () => {
+      let seen;
+      pi.events.on("demo", (data) => { seen = data; });
+      pi.events.emit("demo", { ok: true });
+      return { seen };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let command = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "ping", "ctx": { "mode": "tui" } }),
+        )
+        .unwrap();
+        assert_eq!(command.result.as_ref().unwrap()["seen"]["ok"], true);
+        assert_eq!(
+            command.event_emits[0]
+                .get("channel")
+                .and_then(|v| v.as_str()),
+            Some("demo")
+        );
+    }
+
+    #[test]
+    fn stream_simple_handler_returns_assistant_text() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerProvider("fixture-ai", {
+    models: [{ id: "echo", name: "echo" }],
+    streamSimple: async (_model, context) => {
+      const last = (context.messages || []).slice(-1)[0];
+      return { text: "streamed:" + (last && last.content ? JSON.stringify(last.content) : "") };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.providers[0].has_stream_simple);
+        stop_persistent_js_extension();
+        let model = pi_ai::Model {
+            id: "echo".into(),
+            name: "echo".into(),
+            api: "openai-completions".into(),
+            provider: "fixture-ai".into(),
+            base_url: None,
+            reasoning: false,
+            input: vec!["text".into()],
+            cost: pi_ai::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1000,
+            max_tokens: 100,
+            compat: serde_json::json!(null),
+            headers: Default::default(),
+        };
+        let message = run_js_stream_simple(
+            &module,
+            "fixture-ai",
+            &model,
+            &[pi_ai::ChatMessage::text("user", "hi")],
+            "sys",
+        )
+        .unwrap();
+        stop_persistent_js_extension();
+        let text = message
+            .content
+            .iter()
+            .find_map(|block| match block {
+                pi_ai::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(text.contains("streamed:"));
     }
 
     #[test]

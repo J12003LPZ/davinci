@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (extension runtime session ops, tool_call blocking, lifecycle events, flags). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (live extension autocomplete, events.emit, ctx.reload, JS streamSimple, lifecycle events). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -103,11 +103,11 @@ Closed this slice: JS `pi.setActiveTools` / `pi.setThinkingLevel` match TS `setA
 
 Closed this slice: extension runtime P0s — `complete_prompt` uses the loaded JS host (not an empty default), emits `before_agent_start` / `agent_start` / `turn_*` / `agent_end` / `agent_settled` / `tool_call` / `tool_result`, and installs a `pre_tool` hook so `pi.on("tool_call")` can block before execution. `apply_session_calls` performs `newSession` / `fork` / `exec` (real `spawnSync` unless `PI_EXTENSION_EXEC_REPLY`) / `sendMessage`+`deliverAs`+`triggerTurn` / `setModel` / `switchSession` / `navigateTree`. Command `ctx` exposes `reload` / `switchSession` / `navigateTree` / `waitForIdle`. `registerFlag` / `getFlag` read CLI `unknown_flags` (and registered defaults); `--help` lists extension flags. `!` lines emit `user_bash` first; `--no-extensions` still loads explicit `-e` paths; RPC uses the same host as `-e`. Interactive startup/reload emit `session_start`.
 
+Closed this slice: live `#` `getSuggestions` on each keystroke via persistent JS `autocomplete` (static snapshot is fallback); `pi.events.emit` / `on` is an in-process bus and Rust rebroadcasts to other loaded extensions; `ctx.reload` reloads skills/prompts/themes/extensions and emits `session_shutdown`; `waitForIdle` is recorded in session-call order (sync turns are already idle); print/RPC emit `message_*`, `tool_execution_*`, `before_provider_request`, and `session_before_{fork,switch,tree}`; JS `registerProvider({ streamSimple, refreshModels, oauth })` keeps live `streamSimple` / `refreshModels` handlers and `complete_prompt` calls `streamSimple` for that provider.
+
 Still not product-equivalent:
 
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
-- Extra autocomplete providers are snapshotted at load, not re-queried live on each keystroke.
-- `pi.events.emit` is a no-op; `ctx.reload` records status only; `waitForIdle` resolves immediately.
-- JS `registerProvider({ oauth, streamSimple, refreshModels })` merges catalog JSON only — no live JS OAuth/stream callbacks.
-- Some TS lifecycle events are still not emitted (`message_*`, `tool_execution_*`, `session_before_*`, `before_provider_*`, `session_shutdown`).
+- JS `registerProvider` OAuth login/refresh still has no live JS authorize/token callbacks (catalog `oauth` metadata only).
+- `refreshModels` handlers are stored but not invoked from `pi update --models` / catalog refresh.
 - TypeScript under `vendor/pi` remains the behavioral spec.

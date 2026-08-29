@@ -28,6 +28,38 @@ pub enum ExtensionEvent {
     SessionShutdown,
     #[serde(rename = "session_before_compact")]
     SessionBeforeCompact,
+    #[serde(rename = "session_before_switch")]
+    SessionBeforeSwitch,
+    #[serde(rename = "session_before_fork")]
+    SessionBeforeFork,
+    #[serde(rename = "session_before_tree")]
+    SessionBeforeTree,
+    #[serde(rename = "before_provider_request")]
+    BeforeProviderRequest { provider: String, model: String },
+    #[serde(rename = "message_start")]
+    MessageStart { text: String },
+    #[serde(rename = "message_update")]
+    MessageUpdate { text: String },
+    #[serde(rename = "message_end")]
+    MessageEnd { text: String },
+    #[serde(rename = "tool_execution_start")]
+    ToolExecutionStart {
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        args: Value,
+    },
+    #[serde(rename = "tool_execution_update")]
+    ToolExecutionUpdate {
+        #[serde(rename = "toolName")]
+        tool_name: String,
+    },
+    #[serde(rename = "tool_execution_end")]
+    ToolExecutionEnd {
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        #[serde(rename = "isError")]
+        is_error: bool,
+    },
     #[serde(rename = "tool_call")]
     ToolCall {
         #[serde(rename = "toolName")]
@@ -192,15 +224,48 @@ impl ExtensionHost {
                 Value::String(self.runtime_thinking_level.clone()),
             );
         }
+        let mut emits = Vec::new();
         for ext in &self.js {
             if let Ok(result) = run_js_extension(Path::new(&ext.path), "emit", &payload) {
                 if result.ok {
                     self.last_js_result = result.result;
                     self.ui_calls.extend(result.ui_calls);
                     self.session_calls.extend(result.session_calls);
+                    emits.extend(result.event_emits);
                 }
             }
         }
+        self.deliver_event_emits(&emits);
+    }
+
+    pub fn deliver_event_emits(&self, emits: &[Value]) {
+        for emit in emits {
+            let Some(channel) = emit.get("channel").and_then(Value::as_str) else {
+                continue;
+            };
+            if channel.is_empty() {
+                continue;
+            }
+            let data = emit.get("data").cloned().unwrap_or(Value::Null);
+            for ext in &self.js {
+                let _ = run_js_extension(
+                    Path::new(&ext.path),
+                    "event",
+                    &serde_json::json!({ "channel": channel, "data": data }),
+                );
+            }
+        }
+    }
+
+    pub fn js_stream_provider(&self, provider: &str) -> Option<(String, String)> {
+        for ext in &self.js {
+            for registered in &ext.providers {
+                if registered.name == provider && registered.has_stream_simple {
+                    return Some((ext.path.clone(), registered.name.clone()));
+                }
+            }
+        }
+        None
     }
 
     pub fn tool_call_blocked(&self) -> bool {
@@ -404,6 +469,16 @@ impl ExtensionHost {
                 ExtensionEvent::SessionStart => "session_start",
                 ExtensionEvent::SessionShutdown => "session_shutdown",
                 ExtensionEvent::SessionBeforeCompact => "session_before_compact",
+                ExtensionEvent::SessionBeforeSwitch => "session_before_switch",
+                ExtensionEvent::SessionBeforeFork => "session_before_fork",
+                ExtensionEvent::SessionBeforeTree => "session_before_tree",
+                ExtensionEvent::BeforeProviderRequest { .. } => "before_provider_request",
+                ExtensionEvent::MessageStart { .. } => "message_start",
+                ExtensionEvent::MessageUpdate { .. } => "message_update",
+                ExtensionEvent::MessageEnd { .. } => "message_end",
+                ExtensionEvent::ToolExecutionStart { .. } => "tool_execution_start",
+                ExtensionEvent::ToolExecutionUpdate { .. } => "tool_execution_update",
+                ExtensionEvent::ToolExecutionEnd { .. } => "tool_execution_end",
                 ExtensionEvent::ToolCall { .. } => "tool_call",
                 ExtensionEvent::ToolResult { .. } => "tool_result",
                 ExtensionEvent::Input { .. } => "input",
@@ -498,6 +573,7 @@ impl ExtensionHost {
         }
         self.ui_calls.extend(result.ui_calls);
         self.session_calls.extend(result.session_calls);
+        self.deliver_event_emits(&result.event_emits);
         if result
             .result
             .as_ref()

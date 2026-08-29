@@ -4,8 +4,21 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::fuzzy::fuzzy_filter;
+
+type LiveAutocompleteFn = dyn Fn(&str) -> Vec<AutocompleteItem> + Send + Sync;
+
+/// Live `getSuggestions` callback from a JS/native extension provider.
+#[derive(Clone)]
+pub struct LiveAutocompleteQuery(pub Arc<LiveAutocompleteFn>);
+
+impl std::fmt::Debug for LiveAutocompleteQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LiveAutocompleteQuery")
+    }
+}
 
 /// TS `ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS`.
 pub const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS: u64 = 20;
@@ -39,6 +52,7 @@ pub struct SlashCommandSpec {
 pub struct ExtraAutocompleteProvider {
     pub trigger_characters: Vec<char>,
     pub items: Vec<AutocompleteItem>,
+    pub live_query: Option<LiveAutocompleteQuery>,
 }
 
 pub struct SuggestionQuery<'a> {
@@ -110,7 +124,16 @@ pub fn suggestions(query: SuggestionQuery<'_>) -> Option<AutocompleteSuggestions
             .iter()
             .find(|ch| prefix.starts_with(**ch))?;
         let rest = prefix[trigger.len_utf8()..].to_string();
-        let items = filter_extra_items(&provider.items, &rest);
+        let items = if let Some(live) = &provider.live_query {
+            let live_items = (live.0)(query.text);
+            if live_items.is_empty() {
+                filter_extra_items(&provider.items, &rest)
+            } else {
+                live_items
+            }
+        } else {
+            filter_extra_items(&provider.items, &rest)
+        };
         if items.is_empty() {
             return None;
         }
@@ -952,6 +975,7 @@ mod tests {
                     description: Some("[closed] Docs".into()),
                 },
             ],
+            live_query: None,
         };
         let found = suggestions(SuggestionQuery {
             extra_providers: std::slice::from_ref(&extra),
@@ -969,6 +993,27 @@ mod tests {
             autocomplete_debounce_ms(false, "@re", &[]),
             ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS
         );
+    }
+
+    #[test]
+    fn extra_provider_live_query_is_called_with_editor_text() {
+        let extra = ExtraAutocompleteProvider {
+            trigger_characters: vec!['#'],
+            items: Vec::new(),
+            live_query: Some(LiveAutocompleteQuery(std::sync::Arc::new(|text| {
+                vec![AutocompleteItem {
+                    value: format!("live:{text}"),
+                    label: format!("live:{text}"),
+                    description: None,
+                }]
+            }))),
+        };
+        let found = suggestions(SuggestionQuery {
+            extra_providers: std::slice::from_ref(&extra),
+            ..query("#abc", &[], &[], Path::new("."))
+        })
+        .unwrap();
+        assert_eq!(found.items[0].value, "live:#abc");
     }
 
     #[test]
