@@ -27,7 +27,10 @@ use pi_session::{
     fork_session, resume_by_id_or_path,
 };
 use pi_tui::component::Component;
-use pi_tui::{enter_alt_screen, leave_alt_screen, Editor, Markdown, SelectList, Text, TuiMode};
+use pi_tui::{
+    enter_alt_screen, leave_alt_screen, ChatView, Editor, Markdown, Overlay, SelectList, Text,
+    TuiMode,
+};
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -383,16 +386,24 @@ fn run_interactive(
     if fullscreen {
         enter_alt_screen(&mut stdout).ok();
     }
-    println!("{APP_NAME} {VERSION}  {provider}/{model_id}");
+    let mut chat = ChatView::default();
+    chat.push(
+        "system",
+        format!("{APP_NAME} {VERSION}  {provider}/{model_id}"),
+    );
     if let Some(path) = &session_path {
-        println!("session {}", path.display());
+        chat.push("session", path.display().to_string());
+    }
+    for line in chat.render(80) {
+        println!("{line}");
     }
     let commands: Vec<String> = slash::BUILTIN_SLASH_COMMANDS
         .iter()
         .map(|(n, _)| format!("/{n}"))
         .collect();
     let selector = SelectList::new(commands);
-    for line in selector.render(80) {
+    let overlay = Overlay::new("slash commands", selector.filtered());
+    for line in overlay.render(80) {
         println!("{line}");
     }
     let _ = tools;
@@ -428,8 +439,12 @@ fn run_interactive(
             match cmd {
                 "quit" | "exit" => break,
                 "help" => {
-                    for (name, desc) in slash::BUILTIN_SLASH_COMMANDS {
-                        println!("/{name}  {desc}");
+                    let body = slash::BUILTIN_SLASH_COMMANDS
+                        .iter()
+                        .map(|(name, desc)| format!("/{name}  {desc}"))
+                        .collect();
+                    for line in Overlay::new("help", body).render(80) {
+                        println!("{line}");
                     }
                 }
                 "clone" => {

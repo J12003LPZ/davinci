@@ -105,6 +105,8 @@ pub fn build_request_body(api: &str, model_id: &str, ctx: &RequestContext) -> Va
         "openai-responses" | "openai-codex-responses" | "azure-openai-responses" => {
             openai_responses(model_id, ctx)
         }
+        "bedrock-converse-stream" => bedrock_converse(model_id, ctx),
+        "mistral-conversations" => mistral_conversations(model_id, ctx),
         _ => openai_completions(model_id, ctx),
     }
 }
@@ -256,6 +258,41 @@ fn openai_responses(model_id: &str, ctx: &RequestContext) -> Value {
     body
 }
 
+fn bedrock_converse(model_id: &str, ctx: &RequestContext) -> Value {
+    let mut messages = Vec::new();
+    for message in &ctx.messages {
+        messages.push(json!({
+            "role": if message.role == Role::Assistant { "assistant" } else { "user" },
+            "content": [{"text": text_of(&message.content)}]
+        }));
+    }
+    let mut body = json!({
+        "modelId": model_id,
+        "messages": messages,
+    });
+    if let Some(system) = &ctx.system {
+        body["system"] = json!([{"text": system}]);
+    }
+    if !ctx.tools.is_empty() {
+        body["toolConfig"] = json!({
+            "tools": ctx.tools.iter().map(|tool| {
+                json!({"toolSpec":{
+                    "name": tool.get("name"),
+                    "description": tool.get("description").cloned().unwrap_or(json!("")),
+                    "inputSchema": {"json": tool.get("parameters").cloned().unwrap_or(json!({"type":"object"}))}
+                }})
+            }).collect::<Vec<_>>()
+        });
+    }
+    body
+}
+
+fn mistral_conversations(model_id: &str, ctx: &RequestContext) -> Value {
+    let mut body = openai_completions(model_id, ctx);
+    body["stream"] = json!(ctx.stream);
+    body
+}
+
 fn google_generative_ai(_model_id: &str, ctx: &RequestContext) -> Value {
     let mut contents = Vec::new();
     for message in &ctx.messages {
@@ -345,5 +382,14 @@ mod tests {
         assert_eq!(resolve_api(None, "anthropic"), "anthropic-messages");
         assert_eq!(resolve_api(None, "openai"), "openai-completions");
         assert_eq!(resolve_api(None, "google"), "google-generative-ai");
+        let bedrock =
+            build_request_body("bedrock-converse-stream", "anthropic.claude-sonnet-4", &ctx);
+        assert_eq!(bedrock["messages"][0]["role"], "user");
+        assert_eq!(bedrock["system"][0]["text"], "sys");
+        assert_eq!(
+            resolve_api(None, "amazon-bedrock"),
+            "bedrock-converse-stream"
+        );
+        assert_eq!(resolve_api(None, "mistral"), "mistral-conversations");
     }
 }

@@ -4,14 +4,16 @@ pub mod component;
 pub mod editor;
 pub mod fuzzy;
 pub mod keys;
+pub mod layout;
 pub mod markdown;
 pub mod selectors;
 pub mod terminal;
 pub mod themes;
 
-pub use component::{Component, Text};
+pub use component::{wrap_text_with_ansi, Component, Text};
 pub use editor::Editor;
 pub use keys::{parse_key, Key};
+pub use layout::{ChatView, Container, Overlay};
 pub use markdown::Markdown;
 pub use selectors::SelectList;
 pub use terminal::{enter_alt_screen, leave_alt_screen, TuiMode};
