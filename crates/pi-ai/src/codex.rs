@@ -393,6 +393,7 @@ pub fn reset_openai_codex_websocket_debug_stats(session_id: Option<&str>) {
 }
 
 pub fn close_openai_codex_websocket_sessions(session_id: Option<&str>) {
+    crate::codex_ws::close_live_sockets(session_id);
     let mut state = lock_state();
     if let Some(session_id) = session_id {
         state.sessions.remove(session_id);
@@ -1361,6 +1362,127 @@ data: {"type":"response.completed","response":{"status":"completed"}}
             CodexWebsocketOutcome::FallbackToSse => panic!("expected loopback websocket"),
         }
         server.join().unwrap();
+        match previous_reply {
+            Some(value) => std::env::set_var("PI_CODEX_WS_REPLY", value),
+            None => std::env::remove_var("PI_CODEX_WS_REPLY"),
+        }
+        match previous_url {
+            Some(value) => std::env::set_var("PI_CODEX_WS_URL", value),
+            None => std::env::remove_var("PI_CODEX_WS_URL"),
+        }
+        reset_openai_codex_websocket_debug_stats(None);
+        close_openai_codex_websocket_sessions(None);
+    }
+
+    #[test]
+    fn localhost_websocket_reuses_the_live_socket() {
+        let _guard = lock_env();
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        reset_openai_codex_websocket_debug_stats(None);
+        close_openai_codex_websocket_sessions(None);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_count = accepts.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            accept_count.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let key = request
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("sec-websocket-key")
+                            .then_some(value.trim().to_string())
+                    })
+                })
+                .unwrap();
+            let accept = crate::codex_ws::accept_key_for_tests(&key);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            for (id, text) in [("resp_1", "One"), ("resp_2", "Two")] {
+                let body: Value =
+                    serde_json::from_str(&crate::codex_ws::read_masked_text(&mut stream).unwrap())
+                        .unwrap();
+                assert_eq!(body["type"], "response.create");
+                crate::codex_ws::write_unmasked_text(
+                    &mut stream,
+                    &format!(r#"{{"type":"response.created","response":{{"id":"{id}"}}}}"#),
+                )
+                .unwrap();
+                crate::codex_ws::write_unmasked_text(
+                    &mut stream,
+                    &format!(r#"{{"type":"response.output_text.delta","delta":"{text}"}}"#),
+                )
+                .unwrap();
+                crate::codex_ws::write_unmasked_text(
+                    &mut stream,
+                    &format!(
+                        r#"{{"type":"response.completed","response":{{"id":"{id}","status":"completed"}}}}"#
+                    ),
+                )
+                .unwrap();
+            }
+        });
+
+        let previous_reply = std::env::var("PI_CODEX_WS_REPLY").ok();
+        let previous_url = std::env::var("PI_CODEX_WS_URL").ok();
+        std::env::remove_var("PI_CODEX_WS_REPLY");
+        std::env::set_var("PI_CODEX_WS_URL", format!("ws://{addr}/codex/responses"));
+        let token = mock_token("acc_reuse");
+        let first = try_codex_websocket_transport(
+            &model(),
+            &serde_json::json!({"model":"gpt-5","input":[{"role":"user","content":"one"}]}),
+            &token,
+            Some("websocket"),
+            Some("reuse-session"),
+            None,
+            Some(2000),
+            Some(2000),
+        )
+        .unwrap();
+        assert!(matches!(first, CodexWebsocketOutcome::Message(_)));
+        let second = try_codex_websocket_transport(
+            &model(),
+            &serde_json::json!({"model":"gpt-5","input":[{"role":"user","content":"two"}]}),
+            &token,
+            Some("websocket"),
+            Some("reuse-session"),
+            None,
+            Some(2000),
+            Some(2000),
+        )
+        .unwrap();
+        match second {
+            CodexWebsocketOutcome::Message(message) => {
+                assert_eq!(
+                    match &message.content[0] {
+                        ContentBlock::Text { text } => text.as_str(),
+                        _ => "",
+                    },
+                    "Two"
+                );
+            }
+            CodexWebsocketOutcome::FallbackToSse => panic!("expected reused websocket"),
+        }
+        server.join().unwrap();
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        let stats = get_openai_codex_websocket_debug_stats("reuse-session").unwrap();
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.connections_reused, 1);
         match previous_reply {
             Some(value) => std::env::set_var("PI_CODEX_WS_REPLY", value),
             None => std::env::remove_var("PI_CODEX_WS_REPLY"),

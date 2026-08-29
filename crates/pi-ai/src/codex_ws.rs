@@ -2,8 +2,10 @@
 //! `vendor/pi/packages/ai/src/api/openai-codex-responses.ts`.
 //! Tests never open ChatGPT: fixtures and loopback only.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -16,7 +18,8 @@ use crate::codex::{
     acquire_cached_continuation, build_cached_websocket_request_body,
     record_websocket_request_stats, replay_codex_events, store_cached_continuation,
     websocket_connect_timeout_error, websocket_handshake_headers, websocket_idle_timeout_error,
-    CachedWebSocketContinuation, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
+    CachedWebSocketContinuation, SESSION_WEBSOCKET_CACHE_TTL_MS, SESSION_WEBSOCKET_MAX_AGE_MS,
+    WEBSOCKET_CLOSED_BEFORE_COMPLETED,
 };
 use crate::stream::{AssistantMessage, AssistantMessageEvent, StopReason};
 
@@ -55,13 +58,27 @@ pub fn process_codex_websocket(
     if !allows_live_websocket(url) {
         return Err("WebSocket transport is not available in this runtime".into());
     }
-    let (reused, continuation) =
+    let (continuation_hit, continuation) =
         acquire_cached_continuation(cache_session_id, account_id, Instant::now());
+    let _ = continuation_hit;
     let (request_body, used_delta) =
         build_cached_websocket_request_body(body, continuation.as_ref());
     let _ = used_delta;
-    record_websocket_request_stats(cache_session_id, reused, use_cached_context, &request_body);
-    let mut stream = open_codex_websocket(url, headers, connect_timeout_ms)?;
+    let acquired = acquire_live_socket(
+        url,
+        headers,
+        connect_timeout_ms,
+        cache_session_id,
+        account_id,
+    )?;
+    let mut stream = acquired.stream;
+    let socket_reused = acquired.reused;
+    record_websocket_request_stats(
+        cache_session_id,
+        socket_reused,
+        use_cached_context,
+        &request_body,
+    );
     if let Some(idle_ms) = idle_timeout_ms.filter(|ms| *ms > 0) {
         stream
             .set_read_timeout(Some(Duration::from_millis(idle_ms)))
@@ -71,10 +88,27 @@ pub fn process_codex_websocket(
     if let Value::Object(map) = &mut outgoing {
         map.insert("type".into(), Value::String("response.create".into()));
     }
-    write_text_frame(&mut stream, &outgoing.to_string())?;
-    let events = read_codex_events(&mut stream, idle_timeout_ms, started)?;
+    let send = write_text_frame(&mut stream, &outgoing.to_string());
+    if let Err(err) = send {
+        release_live_socket(acquired.key, stream, false);
+        return Err(err);
+    }
+    let events = match read_codex_events(&mut stream, idle_timeout_ms, started) {
+        Ok(events) => events,
+        Err(err) => {
+            release_live_socket(acquired.key, stream, false);
+            return Err(err);
+        }
+    };
     let replayed = replay_codex_events(model, &events_to_corpus(&events));
-    let message = done_message(&replayed)?;
+    let message = match done_message(&replayed) {
+        Ok(message) => message,
+        Err(err) => {
+            release_live_socket(acquired.key, stream, false);
+            return Err(err);
+        }
+    };
+    let mut keep = acquired.key.is_some();
     if use_cached_context {
         if let Some(response_id) = events.iter().rev().find_map(|event| {
             event
@@ -90,12 +124,14 @@ pub fn process_codex_websocket(
                     last_response_id: response_id,
                     last_response_items: Value::Array(Vec::new()),
                 },
-                reused,
+                socket_reused,
                 Instant::now(),
             );
+        } else {
+            keep = false;
         }
     }
-    let _ = stream;
+    release_live_socket(acquired.key, stream, keep);
     Ok(message)
 }
 
@@ -183,6 +219,158 @@ fn events_to_corpus(events: &[Value]) -> String {
         .map(|event| format!("data: {event}\n"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+struct LiveSocketKey {
+    session_id: String,
+    account_id: String,
+}
+
+struct AcquiredSocket {
+    stream: WsStream,
+    reused: bool,
+    key: Option<LiveSocketKey>,
+}
+
+struct LiveSocketEntry {
+    stream: Option<WsStream>,
+    busy: bool,
+    created_at: Instant,
+    last_used: Instant,
+}
+
+struct LiveSocketCache {
+    sessions: HashMap<String, HashMap<String, LiveSocketEntry>>,
+}
+
+fn live_cache() -> &'static Mutex<LiveSocketCache> {
+    static CACHE: OnceLock<Mutex<LiveSocketCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(LiveSocketCache {
+            sessions: HashMap::new(),
+        })
+    })
+}
+
+fn lock_live() -> std::sync::MutexGuard<'static, LiveSocketCache> {
+    live_cache().lock().unwrap_or_else(|err| err.into_inner())
+}
+
+pub(crate) fn close_live_sockets(session_id: Option<&str>) {
+    let mut cache = lock_live();
+    if let Some(session_id) = session_id {
+        cache.sessions.remove(session_id);
+        return;
+    }
+    cache.sessions.clear();
+}
+
+fn stream_is_open(stream: &WsStream) -> bool {
+    match &stream.inner {
+        WsInner::Plain(inner) => inner.peer_addr().is_ok(),
+        WsInner::Tls(inner) => inner.sock.peer_addr().is_ok(),
+    }
+}
+
+fn is_live_expired(entry: &LiveSocketEntry, now: Instant) -> bool {
+    now.duration_since(entry.last_used).as_millis() as u64 >= SESSION_WEBSOCKET_CACHE_TTL_MS
+        || now.duration_since(entry.created_at).as_millis() as u64 >= SESSION_WEBSOCKET_MAX_AGE_MS
+}
+
+fn acquire_live_socket(
+    url: &str,
+    headers: &[(String, String)],
+    connect_timeout_ms: u64,
+    session_id: Option<&str>,
+    account_id: &str,
+) -> Result<AcquiredSocket, String> {
+    let now = Instant::now();
+    if let Some(session_id) = session_id {
+        let mut cache = lock_live();
+        if let Some(account_entries) = cache.sessions.get_mut(session_id) {
+            if let Some(entry) = account_entries.get_mut(account_id) {
+                if entry.busy {
+                    drop(cache);
+                    let stream = open_codex_websocket(url, headers, connect_timeout_ms)?;
+                    return Ok(AcquiredSocket {
+                        stream,
+                        reused: false,
+                        key: None,
+                    });
+                }
+                if is_live_expired(entry, now)
+                    || entry.stream.as_ref().is_some_and(|s| !stream_is_open(s))
+                {
+                    account_entries.remove(account_id);
+                    if account_entries.is_empty() {
+                        cache.sessions.remove(session_id);
+                    }
+                } else if let Some(stream) = entry.stream.take() {
+                    entry.busy = true;
+                    entry.last_used = now;
+                    return Ok(AcquiredSocket {
+                        stream,
+                        reused: true,
+                        key: Some(LiveSocketKey {
+                            session_id: session_id.to_string(),
+                            account_id: account_id.to_string(),
+                        }),
+                    });
+                }
+            }
+        }
+    }
+    let stream = open_codex_websocket(url, headers, connect_timeout_ms)?;
+    let key = session_id.map(|session_id| {
+        let mut cache = lock_live();
+        let account_entries = cache.sessions.entry(session_id.to_string()).or_default();
+        account_entries.insert(
+            account_id.to_string(),
+            LiveSocketEntry {
+                stream: None,
+                busy: true,
+                created_at: now,
+                last_used: now,
+            },
+        );
+        LiveSocketKey {
+            session_id: session_id.to_string(),
+            account_id: account_id.to_string(),
+        }
+    });
+    Ok(AcquiredSocket {
+        stream,
+        reused: false,
+        key,
+    })
+}
+
+fn release_live_socket(key: Option<LiveSocketKey>, mut stream: WsStream, keep: bool) {
+    let Some(key) = key else {
+        let _ = write_frame(&mut stream, OPCODE_CLOSE, &[], true);
+        return;
+    };
+    if !keep || !stream_is_open(&stream) {
+        let _ = write_frame(&mut stream, OPCODE_CLOSE, &[], true);
+        let mut cache = lock_live();
+        if let Some(account_entries) = cache.sessions.get_mut(&key.session_id) {
+            account_entries.remove(&key.account_id);
+            if account_entries.is_empty() {
+                cache.sessions.remove(&key.session_id);
+            }
+        }
+        return;
+    }
+    let mut cache = lock_live();
+    if let Some(entry) = cache
+        .sessions
+        .get_mut(&key.session_id)
+        .and_then(|accounts| accounts.get_mut(&key.account_id))
+    {
+        entry.stream = Some(stream);
+        entry.busy = false;
+        entry.last_used = Instant::now();
+    }
 }
 
 struct WsStream {
@@ -581,6 +769,27 @@ fn map_io_error(err: std::io::Error, idle_timeout_ms: Option<u64>) -> String {
 #[cfg(test)]
 pub(crate) fn accept_key_for_tests(key: &str) -> String {
     accept_key(key)
+}
+
+#[cfg(test)]
+pub(crate) fn read_masked_text(stream: &mut impl Read) -> std::io::Result<String> {
+    let mut frame = [0u8; 2];
+    stream.read_exact(&mut frame)?;
+    let mut len = (frame[1] & 0x7f) as usize;
+    if len == 126 {
+        let mut ext = [0u8; 2];
+        stream.read_exact(&mut ext)?;
+        len = u16::from_be_bytes(ext) as usize;
+    }
+    let mut mask = [0u8; 4];
+    stream.read_exact(&mut mask)?;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+    String::from_utf8(payload)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
 #[cfg(test)]

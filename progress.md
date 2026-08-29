@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (editor wrap/page/paste-delete + expanded external editor). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (Codex live WebSocket socket reuse). Documented backlog from prior slices is closed. Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -95,9 +95,10 @@ Closed this slice: TUI Editor prompt history matches TS `editor.test.ts` / `edit
 
 Closed this slice: TUI Editor wrap/page/paste-delete matches TS `editor.ts` / `editor.test.ts` — `wordWrapLine` (word + CJK + oversized marker split), bordered render with reverse-video cursor and `─── ↑/↓ N more` scroll, visual-line Up/Down with sticky column and paste-marker snap, `pageUp`/`pageDown`, backspace deletes a valid marker and renumbers the registry (undo restores pastes), typed fake markers stay non-atomic, `getExpandedText` feeds the external editor, `insertTextAtCursor` normalizes CRLF, `editorPaddingX` applies from settings. Tests: `vendor/pi/packages/tui/test/editor.test.ts`.
 
+Closed this slice: Codex WebSocket **live socket reuse** matches TS `acquireWebSocket` / `websocketSessionCache` — park the RFC 6455 stream per session+account, reuse when idle and not expired (`SESSION_WEBSOCKET_CACHE_TTL_MS` / `MAX_AGE`), open a side connection when busy, drop on send/read failure or `closeOpenAICodexWebSocketSessions`. Debug `connectionsCreated` / `connectionsReused` count sockets, not continuation hits. Loopback test: one TCP accept, two `response.create` cycles.
+
 Still not product-equivalent:
 
-- Codex websocket live socket reuse (TS `websocketSessionCache` keeps the TCP/TLS socket; Rust caches continuation state and reconnects per request).
-- In-editor AutocompleteProvider host (slash/`@` completion already runs on InteractiveSession).
+- Autocomplete: `#` trigger, `fd` fuzzy/gitignore file search, editor-hosted `AutocompleteProvider` debounce, extension `addAutocompleteProvider` / slash `getArgumentCompletions`.
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
 - TypeScript under `vendor/pi` remains the behavioral spec.
