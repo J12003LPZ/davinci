@@ -1,0 +1,16 @@
+[package]
+name = "pi-session-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite session backend with FTS and v3→v4 migrate"
+
+[dependencies]
+pi-session.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tempfile.workspace = true

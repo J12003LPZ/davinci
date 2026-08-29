@@ -1,0 +1,38 @@
+[package]
+name = "pi-coding-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Coding agent CLI with read, bash, edit, write tools and session management"
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+pi-ai.workspace = true
+pi-agent.workspace = true
+pi-tui.workspace = true
+pi-session.workspace = true
+pi-session-sqlite.workspace = true
+pi-protocol.workspace = true
+pi-client.workspace = true
+pi-server.workspace = true
+pi-telemetry.workspace = true
+pi-evals.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+ureq.workspace = true
+ctrlc.workspace = true
+chrono.workspace = true
+walkdir.workspace = true
+similar.workspace = true
+tempfile.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

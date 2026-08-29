@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+.DS_Store
+*.swp
+.env
+/vendor/pi/node_modules
+/vendor/pi/packages/*/dist
+/vendor/pi/packages/*/node_modules
+/agent-tools
