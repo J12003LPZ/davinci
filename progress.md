@@ -41,4 +41,4 @@ Port `TuiAltScreen` Kitty upload/eviction and the `Image` component, then re-aud
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: pending workspace gates after Kitty/iTerm2 protocol helpers.
+Last run: green on 1.83 after Input yank-pop, Radius OAuth discovery, CURSOR_MARKER hardware cursor, and Kitty/iTerm2 protocol helpers.
