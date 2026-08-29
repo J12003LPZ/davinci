@@ -41,6 +41,7 @@ impl Agent {
     where
         F: FnMut(&Agent) -> Result<AssistantMessage, String>,
     {
+        self.is_streaming = true;
         let mut events = Vec::new();
         let mut new_messages: Vec<ChatMessage> = Vec::new();
         events.push(AgentEvent::AgentStart);
@@ -62,6 +63,7 @@ impl Agent {
                 events.push(AgentEvent::AgentEnd {
                     messages: new_messages,
                 });
+                self.is_streaming = false;
                 return Ok(events);
             }
 
@@ -71,7 +73,13 @@ impl Agent {
                 let _ = self.compact(None);
             }
 
-            let assistant = self.complete_with_retry(&mut complete)?;
+            let assistant = match self.complete_with_retry(&mut complete) {
+                Ok(message) => message,
+                Err(err) => {
+                    self.is_streaming = false;
+                    return Err(err);
+                }
+            };
             let chat = assistant_to_chat(&assistant);
             self.messages.push(chat.clone());
             self.persist_chat(&chat);
@@ -94,6 +102,7 @@ impl Agent {
                 events.push(AgentEvent::AgentEnd {
                     messages: new_messages,
                 });
+                self.is_streaming = false;
                 return Ok(events);
             }
 
@@ -223,6 +232,7 @@ impl Agent {
         events.push(AgentEvent::AgentEnd {
             messages: new_messages,
         });
+        self.is_streaming = false;
         Ok(events)
     }
 

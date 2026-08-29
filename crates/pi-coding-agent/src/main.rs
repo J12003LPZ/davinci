@@ -299,7 +299,7 @@ fn export_session(parsed: &Args, export: &str) -> Result<i32, String> {
     } else {
         PathBuf::from("session.html")
     };
-    println!("{}", export::export_html(&session, &output)?);
+    println!("{}", export::export_session(&session, &output)?);
     Ok(0)
 }
 
@@ -536,6 +536,20 @@ fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
         session_dir,
         cwd,
     );
+    let host = loaded_extension_host(&Args::default());
+    runtime.invocable_commands = slash::invocable_commands(
+        &host
+            .js
+            .iter()
+            .flat_map(|ext| {
+                ext.commands
+                    .iter()
+                    .map(|name| (name.clone(), String::new(), ext.path.clone()))
+            })
+            .collect::<Vec<_>>(),
+        &runtime.agent.templates,
+        &runtime.agent.skills,
+    );
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.map_err(|err| err.to_string())?;
@@ -595,14 +609,7 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         session.model_index = index;
     }
     session.cwd = agent.cwd.clone();
-    session.slash_commands = slash::builtin_slash_commands()
-        .into_iter()
-        .map(|command| SlashCommandSpec {
-            name: command.name,
-            description: command.description,
-            argument_hint: command.argument_hint,
-        })
-        .collect();
+    session.slash_commands = interactive_slash_commands(agent, parsed);
     session.login_providers = pi_ai::oauth_providers()
         .iter()
         .map(|name| (*name).to_string())
@@ -628,6 +635,7 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     let _ = session.begin_osc_query(OSC_QUERY_TIMEOUT_MS);
     let host = loaded_extension_host(parsed);
     apply_extension_shortcuts(&mut session, &host);
+    session.slash_commands = interactive_slash_commands(agent, parsed);
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
     if should_run_first_time_setup(&settings_path(&default_agent_dir())) {
@@ -1138,15 +1146,11 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::SessionInfo => {
-            let info = format!(
-                "session={} messages={}",
-                agent
-                    .session
-                    .as_ref()
-                    .map(|s| s.header.id.clone())
-                    .unwrap_or_else(|| "(none)".into()),
-                agent.messages.len()
-            );
+            let models = load_builtin_models();
+            let model = find_model(&models, &agent.provider, &agent.model_id);
+            let stats = rpc::session_stats_for_agent(agent, model);
+            let info = format_session_info(&stats);
+            chrome.status = info.clone();
             println!("{info}");
             Ok(true)
         }
@@ -1192,7 +1196,7 @@ fn handle_user_line(
         SlashAction::Export(path) => {
             if let Some(session) = &agent.session {
                 let output = PathBuf::from(path.unwrap_or_else(|| "session.html".into()));
-                println!("{}", export::export_html(session, &output)?);
+                println!("{}", export::export_session(session, &output)?);
             }
             Ok(true)
         }
@@ -1346,6 +1350,7 @@ fn reload_interactive_resources(
     agent.context_files = load_context_files(&agent.cwd, true);
     let host = loaded_extension_host(parsed);
     apply_extension_shortcuts(session, &host);
+    session.slash_commands = interactive_slash_commands(agent, parsed);
     replay_custom_messages(agent, session, &host);
     let current = session.chrome.theme.name.clone();
     apply_theme_value(session, &current);
@@ -1740,6 +1745,67 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     }
     println!("Usage: /login <provider> <api-key>");
     Ok(())
+}
+
+fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandSpec> {
+    let host = loaded_extension_host(parsed);
+    let mut commands: Vec<SlashCommandSpec> = slash::builtin_slash_commands()
+        .into_iter()
+        .map(|command| SlashCommandSpec {
+            name: command.name,
+            description: command.description,
+            argument_hint: command.argument_hint,
+        })
+        .collect();
+    for spec in slash::invocable_commands(
+        &host
+            .js
+            .iter()
+            .flat_map(|ext| {
+                ext.commands
+                    .iter()
+                    .map(|name| (name.clone(), String::new(), ext.path.clone()))
+            })
+            .collect::<Vec<_>>(),
+        &agent.templates,
+        &agent.skills,
+    ) {
+        let Some(name) = spec.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if commands.iter().any(|command| command.name == name) {
+            continue;
+        }
+        commands.push(SlashCommandSpec {
+            name: name.to_string(),
+            description: spec
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string(),
+            argument_hint: None,
+        });
+    }
+    commands
+}
+
+fn format_session_info(stats: &serde_json::Value) -> String {
+    format!(
+        "Session Info\n\nFile: {}\nID: {}\n\nMessages\nTotal: {}\nUser: {}\nAssistant: {}\nTools: {} calls, {} results\n\nTokens\nInput: {}\nOutput: {}\nCache read: {}\nCache write: {}\nTotal: {}\nCost: {}",
+        stats.get("sessionFile").and_then(|value| value.as_str()).unwrap_or("In-memory"),
+        stats.get("sessionId").and_then(|value| value.as_str()).unwrap_or(""),
+        stats.get("totalMessages").and_then(|value| value.as_u64()).unwrap_or(0),
+        stats.get("userMessages").and_then(|value| value.as_u64()).unwrap_or(0),
+        stats.get("assistantMessages").and_then(|value| value.as_u64()).unwrap_or(0),
+        stats.get("toolCalls").and_then(|value| value.as_u64()).unwrap_or(0),
+        stats.get("toolResults").and_then(|value| value.as_u64()).unwrap_or(0),
+        stats["tokens"]["input"].as_u64().unwrap_or(0),
+        stats["tokens"]["output"].as_u64().unwrap_or(0),
+        stats["tokens"]["cacheRead"].as_u64().unwrap_or(0),
+        stats["tokens"]["cacheWrite"].as_u64().unwrap_or(0),
+        stats["tokens"]["total"].as_u64().unwrap_or(0),
+        stats.get("cost").and_then(|value| value.as_f64()).unwrap_or(0.0),
+    )
 }
 
 fn apply_extension_shortcuts(session: &mut InteractiveSession, host: &ExtensionHost) {

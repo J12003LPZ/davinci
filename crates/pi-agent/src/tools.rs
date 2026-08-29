@@ -35,7 +35,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         AgentTool {
             name: "read".into(),
             description: "Read file contents".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":["path"]}),
         },
         AgentTool {
             name: "write".into(),
@@ -80,10 +80,20 @@ pub fn execute_tool(
             let path = resolve(cwd, required_str(input, "path")?)?;
             let content =
                 fs::read_to_string(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+            let offset = input
+                .get("offset")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1)
+                .max(1) as usize;
+            let limit = input
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as usize);
+            let (content, truncation) = truncate_read(&content, offset, limit);
             Ok(ToolResult {
                 content,
                 is_error: false,
-                details: Some(serde_json::json!({"path": path})),
+                details: Some(serde_json::json!({"path": path, "truncation": truncation})),
             })
         }
         "write" => {
@@ -244,6 +254,61 @@ fn walk_find(path: &Path, pattern: &str, hits: &mut Vec<String>, depth: usize) {
     }
 }
 
+const DEFAULT_MAX_LINES: usize = 2000;
+const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+
+fn truncate_read(
+    content: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> (String, serde_json::Value) {
+    let lines: Vec<&str> = if content.is_empty() {
+        Vec::new()
+    } else {
+        let mut lines: Vec<&str> = content.split('\n').collect();
+        if content.ends_with('\n') {
+            lines.pop();
+        }
+        lines
+    };
+    let start = offset.saturating_sub(1).min(lines.len());
+    let max_lines = limit.unwrap_or(DEFAULT_MAX_LINES);
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    let mut truncated_by = None;
+    for (index, line) in lines.iter().enumerate().skip(start) {
+        if out.len() >= max_lines {
+            truncated_by = Some("lines");
+            break;
+        }
+        let add = if index > start || !out.is_empty() {
+            line.len() + 1
+        } else {
+            line.len()
+        };
+        if bytes + add > DEFAULT_MAX_BYTES {
+            truncated_by = Some("bytes");
+            break;
+        }
+        out.push(*line);
+        bytes += add;
+    }
+    let output = out.join("\n");
+    (
+        output.clone(),
+        serde_json::json!({
+            "truncated": truncated_by.is_some(),
+            "truncatedBy": truncated_by,
+            "totalLines": lines.len(),
+            "totalBytes": content.len(),
+            "outputLines": out.len(),
+            "outputBytes": output.len(),
+            "maxLines": max_lines,
+            "maxBytes": DEFAULT_MAX_BYTES,
+        }),
+    )
+}
+
 fn glob_match(pattern: &str, name: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -281,5 +346,22 @@ mod tests {
         .unwrap();
         let read = execute_tool(dir.path(), "read", &serde_json::json!({"path":"a.txt"})).unwrap();
         assert_eq!(read.content, "world");
+        execute_tool(
+            dir.path(),
+            "write",
+            &serde_json::json!({"path":"b.txt","content":"one\ntwo\nthree\n"}),
+        )
+        .unwrap();
+        let sliced = execute_tool(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path":"b.txt","offset":2,"limit":1}),
+        )
+        .unwrap();
+        assert_eq!(sliced.content, "two");
+        assert_eq!(
+            sliced.details.as_ref().unwrap()["truncation"]["totalLines"],
+            3
+        );
     }
 }

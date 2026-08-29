@@ -11,6 +11,22 @@ const TEMPLATE_JS: &str = include_str!("../export-html/template.js");
 const MARKED_JS: &str = include_str!("../export-html/vendor/marked.min.js");
 const HIGHLIGHT_JS: &str = include_str!("../export-html/vendor/highlight.min.js");
 
+pub fn export_session(session: &JsonlSession, output: &Path) -> Result<String, String> {
+    if output
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+    {
+        export_jsonl(session, output)
+    } else {
+        export_html(session, output)
+    }
+}
+
+pub fn export_jsonl(session: &JsonlSession, output: &Path) -> Result<String, String> {
+    pi_session::export_session_jsonl(session, output).map_err(|err| err.to_string())
+}
+
 pub fn export_html(session: &JsonlSession, output: &Path) -> Result<String, String> {
     let html = generate_html(session, None)?;
     if let Some(parent) = output.parent() {
@@ -82,5 +98,10 @@ mod tests {
         assert!(html.contains("id=\"session-data\""));
         assert!(html.contains("function buildTree"));
         assert!(!html.contains("<script>alert(1)</script>"));
+        let jsonl = dir.path().join("session.jsonl");
+        export_session(&session, &jsonl).unwrap();
+        let raw = std::fs::read_to_string(&jsonl).unwrap();
+        assert!(raw.starts_with("{\"cwd\"") || raw.contains("\"type\":\"session\""));
+        assert!(raw.contains("hello") || raw.contains("<script>"));
     }
 }

@@ -184,16 +184,41 @@ pub fn parse_line(line: &str) -> SlashAction {
     }
 }
 
-pub fn rpc_commands() -> Vec<serde_json::Value> {
-    builtin_slash_commands()
-        .into_iter()
-        .map(|command| {
-            serde_json::json!({
-                "name": command.name,
-                "description": command.description,
-                "source": "prompt",
-                "sourceInfo": { "path": "core/slash-commands.ts" }
-            })
-        })
-        .collect()
+pub fn invocable_commands(
+    extensions: &[(String, String, String)],
+    templates: &[pi_agent::PromptTemplate],
+    skills: &[pi_agent::Skill],
+) -> Vec<serde_json::Value> {
+    let mut commands = Vec::new();
+    for (name, description, path) in extensions {
+        commands.push(serde_json::json!({
+            "name": name,
+            "description": description,
+            "source": "extension",
+            "sourceInfo": { "path": path }
+        }));
+    }
+    for template in templates {
+        let description = template
+            .body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .to_string();
+        commands.push(serde_json::json!({
+            "name": template.name,
+            "description": description,
+            "source": "prompt",
+            "sourceInfo": { "path": template.path.display().to_string() }
+        }));
+    }
+    for skill in skills {
+        commands.push(serde_json::json!({
+            "name": format!("skill:{}", skill.name),
+            "description": skill.description,
+            "source": "skill",
+            "sourceInfo": { "path": skill.path.display().to_string() }
+        }));
+    }
+    commands
 }

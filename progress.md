@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: 100%**
+**Complete: 100% of the previously documented editor/SSE gaps; remaining product deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -27,4 +27,15 @@ Gates on this slice: `cargo test --workspace`, `cargo fmt --check`, `clippy --wo
 
 ## Remaining product gaps
 
-None. TypeScript under `vendor/pi` remains the reference spec only.
+Closed this slice: `/export` `.jsonl` (TS branch rewrite), `/session` + `get_session_stats` token/cost shape, RPC `get_tree`/`get_entries`/`get_fork_messages`/`get_state` streaming flags, `get_commands` + slash autocomplete for extension/prompt/skill commands, `read` offset/limit + 2000-line/50KB truncation, RPC `images`/`streamingBehavior`/`excludeFromContext` fields.
+
+Still not product-equivalent:
+
+- **`pi config` TUI** and **`pi install` package resolve/fetch** (text-only / persist-only today)
+- **Experimental `pi server` / `pi client` CLIs**
+- **RPC extension UI protocol** (`extension_ui_request` / `extension_ui_response`)
+- **Tool fidelity:** Windows `powershell`, ripgrep/fd-quality `grep`/`find`/`ls`, JS `registerTool()` execute, image `read`
+- **Dynamic providers:** Radius live catalog, `pi.registerProvider()`, `openrouter-images`, llama catalog refresh into `/model`
+- **`/llama` UX:** live SSE stream (not 250ms snapshot), progress overlay, connection retry UI
+- **JS virtual TUI:** Editor + custom overlay host works; full TS component tree (`Container`/`SelectList`/`Input`) is not mounted
+- Startup deprecation warnings and live interactive model-catalog refresh

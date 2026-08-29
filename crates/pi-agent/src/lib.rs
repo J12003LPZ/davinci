@@ -47,6 +47,8 @@ pub struct Agent {
     pub session: Option<JsonlSession>,
     pub cwd: PathBuf,
     pub aborted: bool,
+    pub is_streaming: bool,
+    pub is_compacting: bool,
     pub provider: String,
     pub model_id: String,
     pub tool_execution_mode: ToolExecutionMode,
@@ -69,6 +71,8 @@ impl Agent {
             session: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             aborted: false,
+            is_streaming: false,
+            is_compacting: false,
             provider: "google".into(),
             model_id: String::new(),
             tool_execution_mode: ToolExecutionMode::Sequential,
@@ -117,8 +121,10 @@ impl Agent {
     }
 
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
+        self.is_compacting = true;
         let result = compact_messages(&self.messages, custom_instructions);
         self.messages = result.messages.clone();
+        self.is_compacting = false;
         result
     }
 

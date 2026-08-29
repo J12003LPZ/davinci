@@ -43,6 +43,12 @@ pub struct RpcCommand {
     pub since: Option<String>,
     #[serde(rename = "parentSession", default)]
     pub parent_session: Option<String>,
+    #[serde(default)]
+    pub images: Option<Vec<Value>>,
+    #[serde(rename = "streamingBehavior", default)]
+    pub streaming_behavior: Option<String>,
+    #[serde(rename = "excludeFromContext", default)]
+    pub exclude_from_context: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +71,7 @@ pub struct RpcRuntime {
     pub cwd: PathBuf,
     pub models: Vec<Model>,
     pub bash_aborted: bool,
+    pub invocable_commands: Vec<Value>,
 }
 
 impl RpcRuntime {
@@ -76,6 +83,7 @@ impl RpcRuntime {
             cwd,
             models,
             bash_aborted: false,
+            invocable_commands: Vec::new(),
         }
     }
 
@@ -101,6 +109,13 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             if let Some(message) = &command.message {
                 runtime.agent.prompt(message);
             }
+            if command.streaming_behavior.as_deref() == Some("followUp") {
+                runtime.agent.queues.follow_up_mode = QueueMode::All;
+            }
+            if command.streaming_behavior.as_deref() == Some("steer") {
+                runtime.agent.queues.steer_mode = QueueMode::All;
+            }
+            let _ = command.images;
             ok(id, &kind, None)
         }
         "steer" => {
@@ -133,8 +148,8 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             Some(serde_json::json!({
                 "model": runtime.current_model().map(RpcRuntime::model_json),
                 "thinkingLevel": runtime.agent.thinking_level,
-                "isStreaming": false,
-                "isCompacting": false,
+                "isStreaming": runtime.agent.is_streaming,
+                "isCompacting": runtime.agent.is_compacting,
                 "steeringMode": runtime.agent.queues.steer_mode,
                 "followUpMode": runtime.agent.queues.follow_up_mode,
                 "sessionFile": runtime.agent.session.as_ref().map(|s| s.path.display().to_string()),
@@ -192,15 +207,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             &kind,
             Some(serde_json::json!({ "text": runtime.agent.last_assistant_text() })),
         ),
-        "get_session_stats" => ok(
-            id,
-            &kind,
-            Some(serde_json::json!({
-                "messageCount": runtime.agent.messages.len(),
-                "user": runtime.agent.messages.iter().filter(|m| m.role == "user").count(),
-                "assistant": runtime.agent.messages.iter().filter(|m| m.role == "assistant").count(),
-            })),
-        ),
+        "get_session_stats" => ok(id, &kind, Some(session_stats_json(runtime))),
         "set_session_name" => {
             if let (Some(session), Some(name)) =
                 (runtime.agent.session.as_mut(), command.name.as_deref())
@@ -212,17 +219,21 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
         "get_commands" => ok(
             id,
             &kind,
-            Some(serde_json::json!({ "commands": crate::slash::rpc_commands() })),
+            Some(serde_json::json!({ "commands": runtime.invocable_commands })),
         ),
         "bash" => {
             if runtime.bash_aborted {
                 runtime.bash_aborted = false;
                 return ok(id, &kind, Some(serde_json::json!({ "cancelled": true })));
             }
+            let exclude = command.exclude_from_context.unwrap_or(false);
             match pi_agent::execute_tool(
                 &runtime.cwd,
                 "bash",
-                &serde_json::json!({ "command": command.command.unwrap_or_default() }),
+                &serde_json::json!({
+                    "command": command.command.unwrap_or_default(),
+                    "excludeFromContext": exclude
+                }),
             ) {
                 Ok(result) => ok(
                     id,
@@ -330,23 +341,48 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 Err(err) => fail(id, &kind, err),
             }
         }
-        "get_entries" => ok(
-            id,
-            &kind,
-            Some(serde_json::json!({
-                "entries": runtime.agent.entries_since(command.since.as_deref())
-            })),
-        ),
-        "get_tree" => ok(
-            id,
-            &kind,
-            Some(serde_json::json!({ "nodes": runtime.agent.session_tree() })),
-        ),
-        "get_fork_messages" => ok(
-            id,
-            &kind,
-            Some(serde_json::json!({ "messages": runtime.agent.messages })),
-        ),
+        "get_entries" => {
+            let session = runtime.agent.session.as_ref();
+            let entries = session.map(|item| item.entries.as_slice()).unwrap_or(&[]);
+            match pi_session::entries_since(entries, command.since.as_deref()) {
+                Ok(entries) => ok(
+                    id,
+                    &kind,
+                    Some(serde_json::json!({
+                        "entries": entries,
+                        "leafId": session.and_then(|item| item.leaf_id.clone())
+                    })),
+                ),
+                Err(err) => fail(id, &kind, err),
+            }
+        }
+        "get_tree" => {
+            let session = runtime.agent.session.as_ref();
+            let entries = session.map(|item| item.entries.as_slice()).unwrap_or(&[]);
+            ok(
+                id,
+                &kind,
+                Some(serde_json::json!({
+                    "tree": pi_session::build_session_tree(entries),
+                    "leafId": session.and_then(|item| item.leaf_id.clone())
+                })),
+            )
+        }
+        "get_fork_messages" => {
+            let entries = runtime
+                .agent
+                .session
+                .as_ref()
+                .map(|item| item.entries.as_slice())
+                .unwrap_or(&[]);
+            ok(
+                id,
+                &kind,
+                Some(serde_json::json!({
+                    "messages": pi_session::fork_user_messages(entries)
+                })),
+            )
+        }
         "abort_bash" => {
             runtime.bash_aborted = true;
             ok(id, &kind, None)
@@ -410,6 +446,90 @@ fn switch_session(runtime: &mut RpcRuntime, session_path: Option<&str>) -> Resul
     let session = JsonlSession::open(path).map_err(|err| err.to_string())?;
     runtime.agent.load_from_session(session);
     Ok(false)
+}
+
+pub fn session_stats_json(runtime: &RpcRuntime) -> Value {
+    session_stats_for_agent(&runtime.agent, runtime.current_model())
+}
+
+pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
+    let session = agent.session.as_ref();
+    let entries = session.map(|item| item.entries.as_slice()).unwrap_or(&[]);
+    let stats = pi_session::session_usage_stats(entries);
+    let context_usage = context_usage_json(
+        entries,
+        session.and_then(|item| item.leaf_id.as_deref()),
+        model,
+    );
+    serde_json::json!({
+        "sessionFile": session.map(|item| item.path.display().to_string()),
+        "sessionId": session.map(|item| item.header.id.clone()).unwrap_or_default(),
+        "userMessages": stats.user_messages,
+        "assistantMessages": stats.assistant_messages,
+        "toolCalls": stats.tool_calls,
+        "toolResults": stats.tool_results,
+        "totalMessages": stats.total_messages,
+        "tokens": {
+            "input": stats.input,
+            "output": stats.output,
+            "cacheRead": stats.cache_read,
+            "cacheWrite": stats.cache_write,
+            "total": stats.token_total(),
+        },
+        "cost": stats.cost,
+        "contextUsage": context_usage,
+    })
+}
+
+fn context_usage_json(
+    entries: &[pi_session::SessionEntry],
+    leaf_id: Option<&str>,
+    model: Option<&Model>,
+) -> Option<Value> {
+    let model = model?;
+    let context_window = model.context_window;
+    if context_window == 0 {
+        return None;
+    }
+    let branch = pi_session::branch_entries(entries, leaf_id);
+    let compaction = branch
+        .iter()
+        .rposition(|entry| entry.entry_type == "compaction");
+    if let Some(index) = compaction {
+        let has_post = branch[index + 1..].iter().any(|entry| {
+            entry.entry_type == "message"
+                && entry
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("assistant")
+                && entry
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.get("usage"))
+                    .is_some()
+        });
+        if !has_post {
+            return Some(serde_json::json!({
+                "tokens": Value::Null,
+                "contextWindow": context_window,
+                "percent": Value::Null
+            }));
+        }
+    }
+    let tokens = pi_session::session_usage_stats(
+        &branch
+            .iter()
+            .map(|entry| (*entry).clone())
+            .collect::<Vec<_>>(),
+    )
+    .token_total();
+    Some(serde_json::json!({
+        "tokens": tokens,
+        "contextWindow": context_window,
+        "percent": (tokens as f64 / context_window as f64) * 100.0
+    }))
 }
 
 fn parse_queue_mode(value: Option<&str>) -> QueueMode {

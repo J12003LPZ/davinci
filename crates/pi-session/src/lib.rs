@@ -3,6 +3,7 @@
 mod codec;
 mod discovery;
 mod errors;
+mod tree;
 mod types;
 
 pub use codec::{
@@ -15,6 +16,10 @@ pub use discovery::{
     SessionSummary,
 };
 pub use errors::{JsonlDecodeError, SessionError};
+pub use tree::{
+    branch_entries, build_session_tree, entries_since, export_session_jsonl, fork_user_messages,
+    resolved_labels, session_usage_stats, SessionUsageStats,
+};
 pub use types::*;
 
 use std::fs::{self, File, OpenOptions};
@@ -298,5 +303,73 @@ mod tests {
         assert_eq!(session.header.version, 4);
         assert_eq!(session.entries.len(), 1);
         assert_eq!(session.header.source_format_hint(), 3);
+    }
+
+    #[test]
+    fn tree_fork_stats_and_jsonl_export_match_ts_shapes() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/project", Some("demo")).unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"hello"}]),
+            ))
+            .unwrap();
+        let mut assistant = SessionEntry::message(
+            "assistant",
+            serde_json::json!([
+                {"type":"text","text":"hi"},
+                {"type":"toolCall","name":"read"}
+            ]),
+        );
+        assistant.message = Some(serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type":"text","text":"hi"},
+                {"type":"toolCall","name":"read"}
+            ],
+            "usage": { "input": 10, "output": 4, "cacheRead": 1, "cacheWrite": 2, "cost": { "total": 0.5 } }
+        }));
+        session.append_entry(assistant).unwrap();
+        session
+            .append_entry(SessionEntry::label_change(
+                &session.entries[0].id,
+                Some("root"),
+            ))
+            .unwrap();
+
+        let tree = build_session_tree(&session.entries);
+        assert_eq!(tree.as_array().unwrap().len(), 1);
+        assert_eq!(tree[0]["label"], "root");
+        assert_eq!(tree[0]["children"].as_array().unwrap().len(), 1);
+
+        let fork = fork_user_messages(&session.entries);
+        assert_eq!(fork[0]["text"], "hello");
+        assert_eq!(fork[0]["entryId"], session.entries[0].id);
+
+        let missing = entries_since(&session.entries, Some("missing")).unwrap_err();
+        assert_eq!(missing, "Entry not found: missing");
+        assert_eq!(
+            entries_since(&session.entries, Some(&session.entries[0].id))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let stats = session_usage_stats(&session.entries);
+        assert_eq!(stats.user_messages, 1);
+        assert_eq!(stats.assistant_messages, 1);
+        assert_eq!(stats.tool_calls, 1);
+        assert_eq!(stats.input, 10);
+        assert_eq!(stats.token_total(), 17);
+        assert!((stats.cost - 0.5).abs() < f64::EPSILON);
+
+        let out = dir.path().join("export.jsonl");
+        export_session_jsonl(&session, &out).unwrap();
+        let raw = std::fs::read_to_string(&out).unwrap();
+        let header: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(header["type"], "session");
+        assert_eq!(header["id"], session.header.id);
+        assert!(raw.contains("\"parentId\":null"));
     }
 }
