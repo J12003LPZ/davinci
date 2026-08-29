@@ -3,6 +3,7 @@ mod auth_cmd;
 mod export;
 mod extension_host;
 mod extensions;
+mod js_host;
 mod packages;
 mod rpc;
 mod settings;
@@ -171,10 +172,16 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     let mut extensions = settings.extensions.clone();
     extensions.extend(parsed.extensions.clone());
     if !parsed.no_extensions && !extensions.is_empty() {
-        let manifests = extensions::discover_extensions(&default_agent_dir(), &extensions);
+        let host = ExtensionHost::load(&default_agent_dir(), &extensions);
         let mut names = extensions.clone();
-        names.extend(extensions::extension_tool_names(&manifests));
+        names.extend(extensions::extension_tool_names(&host.manifests));
+        for ext in &host.js {
+            names.extend(ext.tools.iter().cloned());
+            names.extend(ext.commands.iter().cloned());
+            let _ = ext.handlers.as_slice();
+        }
         agent.apply_extension_tools(&names);
+        let _ = host.describe_js();
     }
     agent.cwd = cwd.to_path_buf();
     let (provider, model_id) = parse_model_ref(
@@ -437,7 +444,25 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
         })
         .unwrap_or_default();
     host.emit(ExtensionEvent::AgentEnd);
+    for event in &events {
+        if let AgentEvent::ToolExecutionStart {
+            tool_name, args, ..
+        } = event
+        {
+            host.emit(ExtensionEvent::ToolCall {
+                tool_name: tool_name.clone(),
+                args: args.clone(),
+            });
+            if host.tool_call_blocked() {
+                continue;
+            }
+            if let Some(result) = host.execute_named_tool(tool_name, &agent.cwd) {
+                let _ = result;
+            }
+        }
+    }
     let _ = host.kinds();
+    let _ = ExtensionHost::js_summary(&crate::js_host::JsExtensionResult::default());
     (reply, events)
 }
 
@@ -665,32 +690,7 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Login { provider, key } => {
-            let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
-            if key.is_none() && !provider.is_empty() {
-                let id = uuid::Uuid::new_v4();
-                let pkce = pi_ai::generate_pkce(id.as_bytes());
-                if let Some(request) = pi_ai::authorize_request(&provider, &pkce, "pi") {
-                    println!("{}", request.url);
-                    println!("{}", request.instructions);
-                    return Ok(true);
-                }
-            }
-            if let Some(key) = key {
-                storage
-                    .login_api_key(&provider, key)
-                    .map_err(|e| e.to_string())?;
-                println!("stored api key for {provider}");
-            } else if let (Ok(access), refresh) = (
-                std::env::var("PI_OAUTH_ACCESS"),
-                std::env::var("PI_OAUTH_REFRESH").ok(),
-            ) {
-                storage
-                    .login_oauth(&provider, access, refresh, None)
-                    .map_err(|e| e.to_string())?;
-                println!("stored oauth token for {provider}");
-            } else {
-                println!("Usage: /login <provider> <api-key>");
-            }
+            login_provider(&provider, key.as_deref())?;
             Ok(true)
         }
         SlashAction::Logout { provider } => {
@@ -765,6 +765,93 @@ fn handle_user_line(
             Ok(true)
         }
     }
+}
+
+fn looks_like_oauth_input(value: &str) -> bool {
+    value.starts_with("pi-fixture-")
+        || value.contains("://")
+        || value.contains("code=")
+        || value.contains('#')
+}
+
+fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
+    let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+    if let Some(key) = key {
+        if looks_like_oauth_input(key) {
+            let (code, _) = pi_ai::parse_authorization_input(key);
+            let code = code.ok_or_else(|| "Missing authorization code.".to_string())?;
+            let pkce = pi_ai::generate_pkce(uuid::Uuid::new_v4().as_bytes());
+            let (access, refresh) =
+                pi_ai::exchange_authorization_code(provider, &code, Some(&pkce))?;
+            storage
+                .login_oauth(provider, access, refresh, None)
+                .map_err(|err| err.to_string())?;
+            println!("stored oauth token for {provider}");
+            return Ok(());
+        }
+        storage
+            .login_api_key(provider, key)
+            .map_err(|err| err.to_string())?;
+        println!("stored api key for {provider}");
+        return Ok(());
+    }
+    if provider.is_empty() {
+        println!("Usage: /login <provider> <api-key>");
+        return Ok(());
+    }
+    let id = uuid::Uuid::new_v4();
+    let pkce = pi_ai::generate_pkce(id.as_bytes());
+    if let Some(request) = pi_ai::authorize_request(provider, &pkce, "pi") {
+        println!("{}", request.url);
+        println!("{}", request.instructions);
+        if let Ok(code) = std::env::var("PI_OAUTH_CODE") {
+            let (access, refresh) =
+                pi_ai::exchange_authorization_code(provider, &code, request.pkce.as_ref())?;
+            storage
+                .login_oauth(provider, access, refresh, None)
+                .map_err(|err| err.to_string())?;
+            println!("stored oauth token for {provider}");
+            return Ok(());
+        }
+        if std::env::var("PI_OAUTH_WAIT").is_ok() {
+            if let Some(kind) = pi_ai::CallbackProvider::parse(provider) {
+                let host = pi_ai::callback_host();
+                let port = std::env::var("PI_OAUTH_CALLBACK_PORT")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let expected = request
+                    .state
+                    .clone()
+                    .unwrap_or_else(|| pkce.verifier.clone());
+                let mut server = pi_ai::CallbackServer::bind(&host, port, kind, expected)?;
+                println!("Waiting for browser callback on {}", server.redirect_uri()?);
+                let response = server.accept_one()?;
+                if let Some(code) = response.code {
+                    let (access, refresh) =
+                        pi_ai::exchange_authorization_code(provider, &code, request.pkce.as_ref())?;
+                    storage
+                        .login_oauth(provider, access, refresh, None)
+                        .map_err(|err| err.to_string())?;
+                    println!("stored oauth token for {provider}");
+                    return Ok(());
+                }
+            }
+        }
+        return Ok(());
+    }
+    if let (Ok(access), refresh) = (
+        std::env::var("PI_OAUTH_ACCESS"),
+        std::env::var("PI_OAUTH_REFRESH").ok(),
+    ) {
+        storage
+            .login_oauth(provider, access, refresh, None)
+            .map_err(|err| err.to_string())?;
+        println!("stored oauth token for {provider}");
+        return Ok(());
+    }
+    println!("Usage: /login <provider> <api-key>");
+    Ok(())
 }
 
 #[allow(dead_code)]

@@ -2,7 +2,9 @@
 
 mod auth;
 mod catalog;
+mod codex;
 mod oauth;
+mod oauth_callback;
 mod oauth_providers;
 mod providers;
 mod stream;
@@ -14,7 +16,20 @@ pub use catalog::{
     builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models, Model,
     ModelCost, KNOWN_PROVIDERS,
 };
+pub use codex::{
+    is_previous_response_not_found, is_websocket_connection_limit_reached, map_codex_event_type,
+    normalize_codex_terminal_event, replay_codex_events, should_fallback_to_sse,
+    should_retry_missing_previous_response, should_retry_websocket_connection_limit,
+    DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS, PREVIOUS_RESPONSE_NOT_FOUND,
+    WEBSOCKET_CLOSED_BEFORE_COMPLETED, WEBSOCKET_CONNECTION_LIMIT_REACHED,
+    WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
+};
 pub use oauth::{poll_oauth_device_code_flow, DeviceCodePoller, DevicePollStatus};
+pub use oauth_callback::{
+    callback_host, handle_callback_request, oauth_error_html, oauth_success_html, CallbackProvider,
+    CallbackResponse, CallbackServer, ERR_CALLBACK_ROUTE_NOT_FOUND, ERR_INTERNAL_HTML,
+    ERR_MISSING_CODE_OR_STATE, ERR_STATE_MISMATCH, TITLE_FAILED, TITLE_SUCCESS,
+};
 pub use oauth_providers::{
     authorize_request, device_status_from_error, exchange_authorization_code, generate_pkce,
     oauth_providers, parse_authorization_input, AuthorizeRequest, Pkce,

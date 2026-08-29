@@ -20,8 +20,11 @@ pub use box_comp::TuiBox;
 pub use chrome::ChatChrome;
 pub use editor::Editor;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
-pub use image::{iterm_image, kitty_image_chunk, KITTY_IMAGE_PREFIX};
-pub use keys::{parse_key, Key};
+pub use image::{
+    iterm_image, kitty_image_chunk, kitty_image_ids, parse_kitty_image_header, KittyImageHeader,
+    KITTY_IMAGE_PREFIX,
+};
+pub use keys::{decode_kitty_printable, parse_key, Key};
 pub use latex::render_latex;
 pub use markdown::render_markdown;
 pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
@@ -154,6 +157,15 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains("pi 0.84.4")));
         assert!(parse_mouse_sgr("\x1b[<0;2;2M").is_some());
         assert_eq!(render_latex("\\pi", false).as_deref(), Some("π"));
+        assert_eq!(
+            decode_kitty_printable("\u{1b}[57399u").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            decode_kitty_printable("\u{1b}[57416u").as_deref(),
+            Some(",")
+        );
+        assert!(decode_kitty_printable("\u{1b}[57417u").is_none());
         let mut settings = SettingsList::new(
             vec![SettingItem {
                 id: "theme".into(),

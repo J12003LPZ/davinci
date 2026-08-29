@@ -165,6 +165,11 @@ pub fn replay_sse_events(model: &Model, corpus: &str) -> Vec<AssistantMessageEve
         let Some(value) = parse_sse_block(block) else {
             continue;
         };
+        if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+            if crate::codex::map_codex_event_type(event_type).is_some() {
+                return crate::codex::replay_codex_events(model, corpus);
+            }
+        }
         if let Some(delta) = value
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
