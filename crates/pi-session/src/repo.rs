@@ -58,6 +58,29 @@ impl LogItem {
             | Self::FactLabel { seq, .. } => *seq,
         }
     }
+
+    pub fn into_mutation(self) -> crate::SessionMutation {
+        match self {
+            Self::Entry { entry, .. } => crate::SessionMutation::Entry { lane: None, entry },
+            Self::Record { record, .. } => crate::SessionMutation::Record {
+                lane: record.lane.clone(),
+                record,
+            },
+            Self::Lane { seq, lane, leaf_id } => {
+                crate::SessionMutation::Lane { seq, lane, leaf_id }
+            }
+            Self::FactName { seq, name } => crate::SessionMutation::FactName { seq, name },
+            Self::FactLabel {
+                seq,
+                target_id,
+                label,
+            } => crate::SessionMutation::FactLabel {
+                seq,
+                target_id,
+                label,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -591,20 +614,24 @@ impl SessionState {
     }
 
     pub fn apply_log_item(&mut self, item: LogItem) -> Result<(), SessionError> {
-        match item {
-            LogItem::Entry { entry, .. } => {
-                self.apply_entry_mutation(None, entry)?;
+        self.apply_mutation(item.into_mutation())
+    }
+
+    pub fn apply_mutation(&mut self, mutation: crate::SessionMutation) -> Result<(), SessionError> {
+        match mutation {
+            crate::SessionMutation::Entry { lane, entry } => {
+                self.apply_entry_mutation(lane.as_deref(), entry)?;
             }
-            LogItem::Record { record, .. } => {
+            crate::SessionMutation::Record { record, .. } => {
                 self.apply_record(record)?;
             }
-            LogItem::Lane { lane, leaf_id, .. } => {
+            crate::SessionMutation::Lane { lane, leaf_id, .. } => {
                 self.apply_lane(&lane, leaf_id.as_deref())?;
             }
-            LogItem::FactName { name, .. } => {
+            crate::SessionMutation::FactName { name, .. } => {
                 self.apply_name(name.as_deref());
             }
-            LogItem::FactLabel {
+            crate::SessionMutation::FactLabel {
                 target_id, label, ..
             } => {
                 self.apply_label(&target_id, label.as_deref())?;
@@ -865,6 +892,10 @@ impl Session {
 
     pub fn apply_log_item(&mut self, item: LogItem) -> Result<(), SessionError> {
         self.state.apply_log_item(item)
+    }
+
+    pub fn apply_mutation(&mut self, mutation: crate::SessionMutation) -> Result<(), SessionError> {
+        self.state.apply_mutation(mutation)
     }
 
     pub fn apply_fork_mutations(&mut self, mutations: Vec<LogItem>) -> Result<(), SessionError> {

@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (SessionRepo fork/conformance + sqlite replay, TUI kill-ring/yank/jump). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (JSONL-on-disk SessionRepo). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -83,8 +83,9 @@ Closed this slice: TUI editor word-nav (`findWordBackward`/`findWordForward` ASC
 
 Closed this slice: `InMemorySessionRepo` + `SessionState` lock TS `createSessionBackendConformance` — parents/one sequence, records, duplicate ids, lane isolation, invalid queries, bounded/cursor filters, record lane/type/run/kind filters, list/open/delete, and fork (`scope=branch|tree`, `position=before|at`, `invalid_fork_target`, facts copied, records not copied). sqlite `persist_session` / `open_repo_session` replays entries/records/lane_moves/facts and restores lane leaves. TUI kill-ring/yank/yank-pop/jump-to-char (`ctrl+y` / `alt+y` / `ctrl+]` / `ctrl+alt+]` / `ctrl+u` / `ctrl+k`) wired in InteractiveSession; `ctrl+k` is reserved for extensions (TS `deleteToLineEnd`).
 
+Closed this slice: JSONL-on-disk `SessionRepo` (`vendor/pi/packages/agent/src/harness/session/jsonl`) — harness cwd dirs (`--tmp-workspace-project--`), ISO-dashed filenames (`2026-01-01T00-00-00-000Z_{id}.jsonl`), session-id filename validation (`invalid_payload`), same id allowed across cwds, one line per mutation with shared seq, torn-tail syntax repair (`path.jsonl.tmp` then rename), missing-newline append, unknown-kind / schema last-line `invalid_entry` without rewrite, tree fork writes imported entries without `lane`, list skips unparsable headers. Coding-agent default stays JSONL **files** with the `--` cwd encoder (TS coding-agent), not this harness directory scheme.
+
 Still not product-equivalent:
 
 - Live Codex websocket remains fixture/localhost
 - Intl.Segmenter CJK dictionary grouping is still walk-to-boundary (no ICU dictionary)
-- JSONL-on-disk `SessionRepo` (`jsonl/repo.ts` harness backend) is still thinner than in-memory/sqlite; coding-agent default stays JSONL files like TS

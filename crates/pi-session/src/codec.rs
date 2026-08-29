@@ -112,25 +112,80 @@ pub fn metadata_from_header(
 
 pub fn parse_mutation(line: &str) -> Result<SessionMutation, JsonlDecodeError> {
     let value = parse_object(line)?;
-    let kind = value.get("kind").and_then(Value::as_str).unwrap_or("entry");
+    let kind = value.get("kind").and_then(Value::as_str);
     let seq = value
         .get("seq")
-        .map(Some)
-        .unwrap_or(None)
-        .and_then(|v| require_sequence(Some(v)).ok())
+        .map(|v| require_sequence(Some(v)))
+        .transpose()?
         .or_else(|| value.get("seq").and_then(Value::as_u64))
         .unwrap_or(1);
-    if kind == "record"
-        || RECORD_TYPES.contains(&value.get("type").and_then(Value::as_str).unwrap_or(""))
-            && value.get("message").is_none()
-            && value.get("kind").and_then(Value::as_str) == Some("record")
-    {
-        return parse_record(value, seq);
+    match kind {
+        Some("record") => parse_record(value, seq),
+        Some("lane") => parse_lane(value, seq),
+        Some("fact") => parse_fact(value, seq),
+        Some("entry") | None => {
+            if value.get("type").and_then(Value::as_str) == Some("header") {
+                return Err(JsonlDecodeError::schema("is not a header"));
+            }
+            parse_entry(value, seq)
+        }
+        Some(_) => Err(JsonlDecodeError::schema("has unknown mutation kind")),
     }
-    if value.get("type").and_then(Value::as_str) == Some("header") {
-        return Err(JsonlDecodeError::schema("is not a header"));
+}
+
+fn parse_lane(
+    value: serde_json::Map<String, Value>,
+    seq: u64,
+) -> Result<SessionMutation, JsonlDecodeError> {
+    let seq = require_sequence(value.get("seq")).unwrap_or(seq);
+    Ok(SessionMutation::Lane {
+        seq,
+        lane: require_string(value.get("lane"), "lane")?,
+        leaf_id: match value.get("leafId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(id.clone()),
+            _ => return Err(JsonlDecodeError::schema("has invalid leafId")),
+        },
+    })
+}
+
+fn parse_fact(
+    value: serde_json::Map<String, Value>,
+    seq: u64,
+) -> Result<SessionMutation, JsonlDecodeError> {
+    let seq = require_sequence(value.get("seq")).unwrap_or(seq);
+    match value.get("fact").and_then(Value::as_str) {
+        Some("name") => {
+            if let Some(name) = value.get("name") {
+                if !name.is_string() {
+                    return Err(JsonlDecodeError::schema("has invalid name"));
+                }
+            }
+            Ok(SessionMutation::FactName {
+                seq,
+                name: value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        }
+        Some("label") => {
+            if let Some(label) = value.get("label") {
+                if !label.is_string() {
+                    return Err(JsonlDecodeError::schema("has invalid label"));
+                }
+            }
+            Ok(SessionMutation::FactLabel {
+                seq,
+                target_id: require_string(value.get("targetId"), "targetId")?,
+                label: value
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        }
+        _ => Err(JsonlDecodeError::schema("has unknown fact type")),
     }
-    parse_entry(value, seq)
 }
 
 fn parse_entry(
@@ -248,6 +303,38 @@ pub fn encode_mutation(mutation: &SessionMutation) -> String {
             }
             format!("{}\n", serde_json::to_string(&value).expect("record line"))
         }
+        SessionMutation::Lane { seq, lane, leaf_id } => format!(
+            "{}\n",
+            serde_json::json!({
+                "kind": "lane",
+                "seq": seq,
+                "lane": lane,
+                "leafId": leaf_id,
+            })
+        ),
+        SessionMutation::FactName { seq, name } => format!(
+            "{}\n",
+            serde_json::json!({
+                "kind": "fact",
+                "seq": seq,
+                "fact": "name",
+                "name": name,
+            })
+        ),
+        SessionMutation::FactLabel {
+            seq,
+            target_id,
+            label,
+        } => format!(
+            "{}\n",
+            serde_json::json!({
+                "kind": "fact",
+                "seq": seq,
+                "fact": "label",
+                "targetId": target_id,
+                "label": label,
+            })
+        ),
     }
 }
 

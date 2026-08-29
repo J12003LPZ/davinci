@@ -96,20 +96,29 @@ pub struct LaneRecord {
     pub extra: serde_json::Map<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SessionMutation {
-    #[serde(rename = "entry")]
     Entry {
-        #[serde(skip_serializing_if = "Option::is_none")]
         lane: Option<String>,
         entry: SessionEntry,
     },
-    #[serde(rename = "record")]
     Record {
-        #[serde(skip_serializing_if = "Option::is_none")]
         lane: Option<String>,
         record: LaneRecord,
+    },
+    Lane {
+        seq: u64,
+        lane: String,
+        leaf_id: Option<String>,
+    },
+    FactName {
+        seq: u64,
+        name: Option<String>,
+    },
+    FactLabel {
+        seq: u64,
+        target_id: String,
+        label: Option<String>,
     },
 }
 

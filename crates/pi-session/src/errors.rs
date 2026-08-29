@@ -85,6 +85,13 @@ impl SessionError {
             message: message.into(),
         }
     }
+
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_payload",
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for SessionError {

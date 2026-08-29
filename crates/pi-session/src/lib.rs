@@ -3,6 +3,7 @@
 mod codec;
 mod discovery;
 mod errors;
+mod jsonl_repo;
 mod repo;
 mod tree;
 mod types;
@@ -17,6 +18,10 @@ pub use discovery::{
     resolve_session_dir_from, resolve_session_ref, SessionSummary,
 };
 pub use errors::{JsonlDecodeError, SessionError};
+pub use jsonl_repo::{
+    expected_session_path, jsonl_session_directory_name, session_file_name, validate_session_id,
+    JsonlCreateOptions, JsonlSessionInfo, JsonlSessionRepo, JsonlStoredSession,
+};
 pub use repo::{
     assistant_message_entry, compaction_entry, custom_entry, operation_started, user_message_entry,
     BranchBounds, EntryOrder, EntryQuery, ForkOptions, ForkPosition, ForkScope,
@@ -151,6 +156,11 @@ impl JsonlSession {
                     session.entries.push(entry);
                 }
                 Ok(SessionMutation::Record { record, .. }) => session.records.push(record),
+                Ok(
+                    SessionMutation::Lane { .. }
+                    | SessionMutation::FactName { .. }
+                    | SessionMutation::FactLabel { .. },
+                ) => {}
                 Err(err) => {
                     return Err(SessionError::invalid_entry(format!(
                         "Invalid JSONL v4 session {}: line {line_no} {}",
