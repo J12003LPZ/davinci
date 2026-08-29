@@ -3,28 +3,38 @@
 mod autocomplete;
 mod box_comp;
 mod chrome;
+mod custom_message;
 mod editor;
+mod first_time;
 mod fuzzy;
 mod image;
 mod keys;
 mod latex;
+mod login_dialog;
 mod markdown;
+mod mermaid;
 mod mouse;
 mod overlay;
 mod render;
+mod scoped_models;
 mod scroll;
 mod session;
 mod settings;
 mod themes;
 mod tool_card;
 mod transcript;
+mod tree;
 
 pub use autocomplete::{
     apply_completion, suggestions, AutocompleteItem, AutocompleteSuggestions, SlashCommandSpec,
 };
 pub use box_comp::TuiBox;
 pub use chrome::ChatChrome;
+pub use custom_message::CustomMessage;
 pub use editor::Editor;
+pub use first_time::{
+    detect_terminal_theme, FirstTimeAction, FirstTimeSetup, FirstTimeSetupResult, SETUP_LOGO_LINES,
+};
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use image::{
     delete_all_kitty_images, delete_kitty_image, encode_kitty, iterm_image, kitty_image_chunk,
@@ -32,10 +42,16 @@ pub use image::{
 };
 pub use keys::{decode_kitty_printable, parse_key, Key};
 pub use latex::render_latex;
+pub use login_dialog::{AuthInfoLink, DeviceCodeInfo, LoginDialog, LoginDialogAction};
 pub use markdown::render_markdown;
+pub use mermaid::{transform_mermaid, MermaidArt, MermaidContext, MermaidMode, MermaidTheme};
 pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
 pub use overlay::Overlay;
 pub use render::{visible_width, Component, Text};
+pub use scoped_models::{
+    clear_all, enable_all, get_sorted_ids, is_enabled, move_id, toggle, EnabledIds, ScopedModel,
+    ScopedModelsAction, ScopedModelsSelector,
+};
 pub use scroll::ScrollView;
 pub use session::{
     DoubleEscapeAction, InteractiveSession, OverlayKind, SessionAction, BRACKETED_PASTE_DISABLE,
@@ -46,6 +62,10 @@ pub use settings::{default_interactive_settings, SettingItem, SettingsList};
 pub use themes::{builtin_themes, Theme};
 pub use tool_card::{ToolCard, ToolCardState, FALLBACK_PREVIEW_LINES};
 pub use transcript::{Transcript, TranscriptLine};
+pub use tree::{
+    build_session_tree, FilterMode, SessionTreeEntry, SessionTreeNode, TreeAction, TreeSelector,
+    FILTER_MODES,
+};
 
 pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 pub const ALT_BUFFER_ENTER: &str = "\x1b[?1049h";

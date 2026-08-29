@@ -110,6 +110,7 @@ pub enum SlashAction {
     Settings,
     Hotkeys,
     SessionInfo,
+    ScopedModels,
 }
 
 pub fn parse_line(line: &str) -> SlashAction {
@@ -160,6 +161,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "trust" => SlashAction::Trust,
         "reload" => SlashAction::Reload,
         "settings" => SlashAction::Settings,
+        "scoped-models" => SlashAction::ScopedModels,
         "hotkeys" => SlashAction::Hotkeys,
         "session" => SlashAction::SessionInfo,
         "help" => SlashAction::Status(

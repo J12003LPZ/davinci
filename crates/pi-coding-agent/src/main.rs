@@ -27,9 +27,9 @@ use pi_session::{
     resolve_session_ref, JsonlSession,
 };
 use pi_tui::{
-    builtin_themes, default_interactive_settings, encode_kitty, ChatChrome, Component,
-    DoubleEscapeAction, InteractiveSession, SessionAction, SlashCommandSpec, ToolCard, TuiMode,
-    FALLBACK_PREVIEW_LINES,
+    builtin_themes, default_interactive_settings, detect_terminal_theme, encode_kitty, ChatChrome,
+    Component, DoubleEscapeAction, FilterMode, InteractiveSession, MermaidMode, ScopedModel,
+    SessionAction, SessionTreeEntry, SlashCommandSpec, ToolCard, TuiMode, FALLBACK_PREVIEW_LINES,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -40,7 +40,10 @@ use auth_cmd::{
 use extension_host::{ExtensionEvent, ExtensionHost};
 use packages::handle_package_command;
 use rpc::{handle_rpc, RpcCommand, RpcRuntime};
-use settings::{is_trusted, load_settings, save_settings};
+use settings::{
+    is_trusted, load_settings, save_settings, set_enable_analytics, settings_path,
+    should_run_first_time_setup,
+};
 use slash::SlashAction;
 
 fn main() {
@@ -601,7 +604,16 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
     session.autocomplete_max_visible =
         stored.autocomplete_max_visible.unwrap_or(8).clamp(3, 20) as usize;
+    session.tree_filter_mode =
+        FilterMode::parse(stored.tree_filter_mode.as_deref().unwrap_or("default"));
+    session.mermaid_mode =
+        MermaidMode::parse(stored.markdown.mermaid.as_deref().unwrap_or("streaming"));
+    session.chrome.transcript.mermaid_mode = session.mermaid_mode;
+    session.enabled_model_ids = stored.enabled_models.clone();
     let _ = FALLBACK_PREVIEW_LINES;
+    if should_run_first_time_setup(&settings_path(&default_agent_dir())) {
+        session.open_first_time_setup(&detect_terminal_theme(&session.chrome.theme), APP_NAME);
+    }
     print!("{}", InteractiveSession::enter_sequences(fullscreen));
     println!("{}", session.chrome.render(session.width).join("\n"));
     if !parsed.messages.is_empty() {
@@ -643,6 +655,19 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
             KeyCode::Char('p') | KeyCode::Char('P') => "\x10".into(),
             KeyCode::Char('t') | KeyCode::Char('T') => "\x14".into(),
             KeyCode::Char('l') | KeyCode::Char('L') => "\x0c".into(),
+            KeyCode::Char('d') | KeyCode::Char('D') => "\x04".into(),
+            KeyCode::Char('u') | KeyCode::Char('U') => "\x15".into(),
+            KeyCode::Char('a') | KeyCode::Char('A') => "\x01".into(),
+            KeyCode::Char('o') | KeyCode::Char('O') => "\x0f".into(),
+            KeyCode::Char('s') | KeyCode::Char('S') => "\x13".into(),
+            KeyCode::Char('x') | KeyCode::Char('X') => "\x18".into(),
+            _ => String::new(),
+        };
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return match key.code {
+            KeyCode::Up => "\x1b[1;3A".into(),
+            KeyCode::Down => "\x1b[1;3B".into(),
             _ => String::new(),
         };
     }
@@ -761,7 +786,55 @@ fn apply_session_action(
             }
             Ok(true)
         }
-        SessionAction::OpenTree => handle_user_line(parsed, agent, &mut session.chrome, "/tree"),
+        SessionAction::OpenTree => {
+            open_session_tree(agent, session);
+            Ok(true)
+        }
+        SessionAction::OpenScopedModels => {
+            open_scoped_models(session);
+            Ok(true)
+        }
+        SessionAction::OpenLogin => Ok(true),
+        SessionAction::SelectTreeEntry(id) => {
+            session.chrome.status = format!("tree={id}");
+            Ok(true)
+        }
+        SessionAction::FirstTimeSubmit {
+            theme,
+            share_analytics,
+        } => {
+            apply_first_time_result(session, &theme, share_analytics)?;
+            Ok(true)
+        }
+        SessionAction::FirstTimeSkip => Ok(true),
+        SessionAction::LoginCancelled => {
+            session.chrome.status = "Login cancelled".into();
+            println!("Login cancelled");
+            Ok(true)
+        }
+        SessionAction::LoginSubmit(value) => {
+            if let Some(provider) = session
+                .chrome
+                .status
+                .strip_prefix("Login to ")
+                .map(str::to_string)
+            {
+                login_provider(&provider, Some(&value))?;
+            }
+            Ok(true)
+        }
+        SessionAction::PersistScopedModels(ids) => {
+            session.enabled_model_ids = ids.clone();
+            let dir = default_agent_dir();
+            let mut stored = load_settings(&dir);
+            stored.enabled_models = ids;
+            save_settings(&dir, &stored)?;
+            Ok(true)
+        }
+        SessionAction::ChangeScopedModels(ids) => {
+            session.enabled_model_ids = ids;
+            Ok(true)
+        }
         SessionAction::OpenFork => handle_user_line(parsed, agent, &mut session.chrome, "/fork"),
         SessionAction::RunBash(command) => {
             match crate::js_host::execute_command_tool(&command, &agent.cwd) {
@@ -805,7 +878,21 @@ fn apply_session_action(
             session.chrome.status = format!("model={}/{}", agent.provider, agent.model_id);
             Ok(true)
         }
-        SessionAction::Submit(text) => handle_user_line(parsed, agent, &mut session.chrome, &text),
+        SessionAction::Submit(text) => match slash::parse_line(&text) {
+            SlashAction::Tree => {
+                open_session_tree(agent, session);
+                Ok(true)
+            }
+            SlashAction::ScopedModels => {
+                open_scoped_models(session);
+                Ok(true)
+            }
+            SlashAction::Login { provider, key } => {
+                start_login(session, &provider, key.as_deref())?;
+                Ok(true)
+            }
+            _ => handle_user_line(parsed, agent, &mut session.chrome, &text),
+        },
     }
 }
 
@@ -849,6 +936,9 @@ fn handle_user_line(
                 stored.double_escape_action.as_deref().unwrap_or("tree"),
                 stored.quiet_startup,
                 stored.autocomplete_max_visible.unwrap_or(8),
+                stored.tree_filter_mode.as_deref().unwrap_or("default"),
+                stored.markdown.mermaid.as_deref().unwrap_or("streaming"),
+                stored.enable_analytics.unwrap_or(false),
             );
             chrome.settings_list = Some(list);
             chrome.status = "Settings".into();
@@ -959,7 +1049,12 @@ fn handle_user_line(
             }
             Ok(true)
         }
-        SlashAction::Resume | SlashAction::Tree => {
+        SlashAction::ScopedModels => {
+            chrome.status = "Model Configuration".into();
+            println!("{}", chrome.status);
+            Ok(true)
+        }
+        SlashAction::Resume => {
             let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
             let sessions = discover_sessions(&session_dir, Some(&agent.cwd.to_string_lossy()))
                 .map_err(|e| e.to_string())?;
@@ -974,6 +1069,11 @@ fn handle_user_line(
             for item in items {
                 println!("{item}");
             }
+            Ok(true)
+        }
+        SlashAction::Tree => {
+            chrome.status = "Session Tree".into();
+            println!("{}", chrome.status);
             Ok(true)
         }
         SlashAction::Copy => {
@@ -1083,6 +1183,13 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
                 session.chrome.theme = theme;
             }
         }
+        "tree-filter-mode" => {
+            session.tree_filter_mode = FilterMode::parse(value);
+        }
+        "mermaid-rendering" => {
+            session.mermaid_mode = MermaidMode::parse(value);
+            session.chrome.transcript.mermaid_mode = session.mermaid_mode;
+        }
         _ => {}
     }
     let dir = default_agent_dir();
@@ -1094,6 +1201,9 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
         }
         "theme" => stored.theme = Some(value.to_string()),
         "quiet-startup" => stored.quiet_startup = value == "true",
+        "tree-filter-mode" => stored.tree_filter_mode = Some(value.to_string()),
+        "mermaid-rendering" => stored.markdown.mermaid = Some(value.to_string()),
+        "enable-analytics" => set_enable_analytics(&mut stored, value == "true"),
         _ => {}
     }
     save_settings(&dir, &stored)?;
@@ -1187,6 +1297,150 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+fn tree_entry_from_session(entry: &pi_session::SessionEntry) -> SessionTreeEntry {
+    let message = entry.message.clone().unwrap_or(serde_json::Value::Null);
+    SessionTreeEntry {
+        id: entry.id.clone(),
+        parent_id: entry.parent_id.clone(),
+        entry_type: entry.entry_type.clone(),
+        role: message
+            .get("role")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        content: message.get("content").cloned(),
+        stop_reason: message
+            .get("stopReason")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        error_message: message
+            .get("errorMessage")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        tool_call_id: message
+            .get("toolCallId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        tool_name: message
+            .get("toolName")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        command: message
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        custom_type: entry.custom_type.clone(),
+        model_id: entry
+            .extra
+            .get("modelId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        thinking_level: entry
+            .extra
+            .get("thinkingLevel")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        label: entry
+            .extra
+            .get("label")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        name: entry
+            .extra
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        tokens_before: entry
+            .extra
+            .get("tokensBefore")
+            .and_then(|value| value.as_u64()),
+        summary: entry
+            .extra
+            .get("summary")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }
+}
+
+fn open_session_tree(agent: &Agent, session: &mut InteractiveSession) {
+    let entries = agent
+        .session
+        .as_ref()
+        .map(|item| {
+            item.entries
+                .iter()
+                .map(tree_entry_from_session)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let roots = pi_tui::build_session_tree(entries);
+    let leaf = agent.session.as_ref().and_then(|item| item.leaf_id.clone());
+    session.open_tree_overlay(roots, leaf);
+    if let Some(tree) = &session.chrome.tree {
+        println!("{}", tree.render(80).join("\n"));
+    }
+}
+
+fn open_scoped_models(session: &mut InteractiveSession) {
+    let models = load_builtin_models()
+        .into_iter()
+        .map(|model| ScopedModel {
+            provider: model.provider,
+            id: model.id,
+            name: model.name,
+        })
+        .collect();
+    session.open_scoped_models(models);
+    if let Some(scoped) = &session.chrome.scoped_models {
+        println!("{}", scoped.render(80).join("\n"));
+    }
+}
+
+fn start_login(
+    session: &mut InteractiveSession,
+    provider: &str,
+    key: Option<&str>,
+) -> Result<(), String> {
+    session.open_login_dialog(provider, None, None);
+    if let Some(key) = key {
+        login_provider(provider, Some(key))?;
+        if let Some(dialog) = &mut session.chrome.login_dialog {
+            dialog.show_progress(&format!("stored credentials for {provider}"));
+        }
+        return Ok(());
+    }
+    let pkce = pi_ai::generate_pkce(uuid::Uuid::new_v4().as_bytes());
+    if let Some(request) = pi_ai::authorize_request(provider, &pkce, "pi") {
+        if let Some(dialog) = &mut session.chrome.login_dialog {
+            dialog.show_auth(&request.url, Some(request.instructions.as_str()));
+            dialog.show_manual_input("Paste the redirect URL or authorization code");
+        }
+        println!("{}", request.url);
+        println!("{}", request.instructions);
+    } else if let Some(dialog) = &mut session.chrome.login_dialog {
+        dialog.show_manual_input("Enter API key");
+        println!("Usage: /login <provider> <api-key>");
+    }
+    if let Some(dialog) = &session.chrome.login_dialog {
+        println!("{}", dialog.render(80).join("\n"));
+    }
+    Ok(())
+}
+
+fn apply_first_time_result(
+    session: &mut InteractiveSession,
+    theme: &str,
+    share_analytics: bool,
+) -> Result<(), String> {
+    if let Some(found) = builtin_themes().into_iter().find(|item| item.name == theme) {
+        session.chrome.theme = found;
+    }
+    let dir = default_agent_dir();
+    let mut stored = load_settings(&dir);
+    stored.theme = Some(theme.to_string());
+    set_enable_analytics(&mut stored, share_analytics);
+    save_settings(&dir, &stored)
+}
+
 #[allow(dead_code)]
 fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
     let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
@@ -1259,6 +1513,14 @@ mod tests {
         assert!(matches!(
             slash::parse_line("/model"),
             slash::SlashAction::OpenModel
+        ));
+        assert!(matches!(
+            slash::parse_line("/scoped-models"),
+            slash::SlashAction::ScopedModels
+        ));
+        assert!(matches!(
+            slash::parse_line("/tree"),
+            slash::SlashAction::Tree
         ));
     }
 }

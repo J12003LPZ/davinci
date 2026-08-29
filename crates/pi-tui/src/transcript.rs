@@ -1,5 +1,8 @@
+use crate::custom_message::CustomMessage;
 use crate::markdown::render_markdown;
+use crate::mermaid::{transform_mermaid, MermaidContext, MermaidMode};
 use crate::render::{visible_width, Component};
+use crate::themes::Theme;
 
 #[derive(Debug, Clone)]
 pub struct TranscriptLine {
@@ -7,10 +10,21 @@ pub struct TranscriptLine {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Transcript {
     pub lines: Vec<TranscriptLine>,
     pub scroll: usize,
+    pub mermaid_mode: MermaidMode,
+}
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            scroll: 0,
+            mermaid_mode: MermaidMode::Streaming,
+        }
+    }
 }
 
 impl Transcript {
@@ -41,8 +55,29 @@ impl Component for Transcript {
                 out.push(line.text.clone());
             } else if line.role == "tool" {
                 out.extend(crate::render::wrap_text(&line.text, width));
+            } else if line.role == "custom" {
+                let (custom_type, content) = line
+                    .text
+                    .split_once('\n')
+                    .unwrap_or((line.text.as_str(), ""));
+                out.extend(CustomMessage::new(custom_type, content).render(width));
             } else if line.role == "assistant" {
-                out.extend(render_markdown(&line.text, width));
+                let transformed = transform_mermaid(
+                    &line.text,
+                    MermaidContext {
+                        available_width: width,
+                        is_streaming: false,
+                        message_type: "assistant",
+                        mode: self.mermaid_mode,
+                    },
+                    Some(&Theme {
+                        name: "dark".into(),
+                        background: String::new(),
+                        foreground: String::new(),
+                        accent: String::new(),
+                    }),
+                );
+                out.extend(render_markdown(&transformed, width));
             } else {
                 out.extend(crate::render::wrap_text(&line.text, width));
             }

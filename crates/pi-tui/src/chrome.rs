@@ -1,10 +1,14 @@
 use crate::autocomplete::AutocompleteSuggestions;
 use crate::editor::Editor;
+use crate::first_time::FirstTimeSetup;
+use crate::login_dialog::LoginDialog;
 use crate::render::Component;
+use crate::scoped_models::ScopedModelsSelector;
 use crate::settings::SettingsList;
 use crate::themes::Theme;
 use crate::tool_card::ToolCard;
 use crate::transcript::Transcript;
+use crate::tree::TreeSelector;
 use crate::SelectList;
 
 /// Fullscreen / regular chat chrome used by interactive mode.
@@ -14,6 +18,10 @@ pub struct ChatChrome {
     pub editor: Editor,
     pub selector: Option<SelectList>,
     pub settings_list: Option<SettingsList>,
+    pub first_time: Option<FirstTimeSetup>,
+    pub login_dialog: Option<LoginDialog>,
+    pub tree: Option<TreeSelector>,
+    pub scoped_models: Option<ScopedModelsSelector>,
     pub tool_cards: Vec<ToolCard>,
     pub autocomplete: Option<AutocompleteSuggestions>,
     pub autocomplete_selected: usize,
@@ -29,6 +37,10 @@ impl ChatChrome {
             editor: Editor::new(),
             selector: None,
             settings_list: None,
+            first_time: None,
+            login_dialog: None,
+            tree: None,
+            scoped_models: None,
             tool_cards: Vec::new(),
             autocomplete: None,
             autocomplete_selected: 0,
@@ -59,7 +71,19 @@ impl Component for ChatChrome {
         for card in &self.tool_cards {
             lines.extend(card.render(width));
         }
-        if let Some(settings) = &self.settings_list {
+        if let Some(setup) = &self.first_time {
+            lines.push(String::new());
+            lines.extend(setup.render(width));
+        } else if let Some(login) = &self.login_dialog {
+            lines.push(String::new());
+            lines.extend(login.render(width));
+        } else if let Some(tree) = &self.tree {
+            lines.push(String::new());
+            lines.extend(tree.render(width));
+        } else if let Some(scoped) = &self.scoped_models {
+            lines.push(String::new());
+            lines.extend(scoped.render(width));
+        } else if let Some(settings) = &self.settings_list {
             lines.push(String::new());
             lines.extend(settings.render(width));
         } else if let Some(selector) = &self.selector {
@@ -87,7 +111,15 @@ impl Component for ChatChrome {
     }
 
     fn handle_input(&mut self, data: &str) {
-        if let Some(settings) = &mut self.settings_list {
+        if let Some(setup) = &mut self.first_time {
+            setup.handle_input(data);
+        } else if let Some(login) = &mut self.login_dialog {
+            login.handle_input(data);
+        } else if let Some(tree) = &mut self.tree {
+            tree.handle_input(data);
+        } else if let Some(scoped) = &mut self.scoped_models {
+            scoped.handle_input(data);
+        } else if let Some(settings) = &mut self.settings_list {
             settings.handle_input(data);
         } else if let Some(selector) = &mut self.selector {
             selector.query.push_str(data);

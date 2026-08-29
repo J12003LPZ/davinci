@@ -5,14 +5,19 @@ use std::time::{Duration, Instant};
 
 use crate::autocomplete::{apply_completion, suggestions, SlashCommandSpec};
 use crate::chrome::ChatChrome;
+use crate::first_time::{FirstTimeAction, FirstTimeSetup};
 use crate::image::{delete_all_kitty_images, delete_kitty_image, encode_kitty};
 use crate::keys::decode_kitty_printable;
+use crate::login_dialog::{LoginDialog, LoginDialogAction};
+use crate::mermaid::MermaidMode;
 use crate::mouse::{parse_mouse_sgr, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
 use crate::overlay::Overlay;
 use crate::render::Component;
+use crate::scoped_models::{EnabledIds, ScopedModel, ScopedModelsAction, ScopedModelsSelector};
 use crate::settings::{SettingItem, SettingsList};
 use crate::themes::Theme;
 use crate::tool_card::ToolCard;
+use crate::tree::{FilterMode, SessionTreeNode, TreeAction, TreeSelector};
 use crate::{SelectList, ALT_BUFFER_ENTER, ALT_BUFFER_LEAVE};
 
 pub const DOUBLE_ESCAPE_MS: u64 = 500;
@@ -43,8 +48,20 @@ pub enum SessionAction {
     CycleSetting,
     OpenTree,
     OpenFork,
+    OpenScopedModels,
+    OpenLogin,
+    SelectTreeEntry(String),
     RunBash(String),
     CloseOverlay,
+    FirstTimeSubmit {
+        theme: String,
+        share_analytics: bool,
+    },
+    FirstTimeSkip,
+    LoginCancelled,
+    LoginSubmit(String),
+    PersistScopedModels(EnabledIds),
+    ChangeScopedModels(EnabledIds),
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +79,9 @@ pub struct InteractiveSession {
     pub cwd: PathBuf,
     pub login_providers: Vec<String>,
     pub autocomplete_max_visible: usize,
+    pub tree_filter_mode: FilterMode,
+    pub mermaid_mode: MermaidMode,
+    pub enabled_model_ids: EnabledIds,
     last_escape: Option<Instant>,
     next_image_id: u32,
     paste_buf: Option<String>,
@@ -98,6 +118,10 @@ pub enum OverlayKind {
     Model,
     Session,
     Settings,
+    Tree,
+    ScopedModels,
+    Login,
+    FirstTime,
 }
 
 impl InteractiveSession {
@@ -122,6 +146,9 @@ impl InteractiveSession {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             login_providers: Vec::new(),
             autocomplete_max_visible: 8,
+            tree_filter_mode: FilterMode::Default,
+            mermaid_mode: MermaidMode::Streaming,
+            enabled_model_ids: None,
             last_escape: None,
             next_image_id: 1,
             paste_buf: None,
@@ -196,6 +223,63 @@ impl InteractiveSession {
         self.chrome.settings_list = Some(list);
         self.chrome.selector = None;
         self.chrome.status = "Settings".into();
+    }
+
+    pub fn open_first_time_setup(&mut self, detected_theme: &str, app_name: &str) {
+        self.overlay_kind = OverlayKind::FirstTime;
+        self.chrome.first_time = Some(FirstTimeSetup::new(detected_theme, app_name));
+        self.chrome.status = "First-time setup".into();
+    }
+
+    pub fn open_login_dialog(
+        &mut self,
+        provider_id: &str,
+        provider_name: Option<&str>,
+        title: Option<&str>,
+    ) {
+        self.overlay_kind = OverlayKind::Login;
+        self.chrome.login_dialog = Some(LoginDialog::new(provider_id, provider_name, title));
+        self.chrome.status = format!("Login to {provider_id}");
+    }
+
+    pub fn open_tree_overlay(&mut self, roots: Vec<SessionTreeNode>, leaf_id: Option<String>) {
+        self.overlay_kind = OverlayKind::Tree;
+        self.chrome.tree = Some(TreeSelector::new(
+            roots,
+            leaf_id,
+            self.autocomplete_max_visible.max(8),
+            self.tree_filter_mode,
+        ));
+        self.chrome.status = "Session Tree".into();
+    }
+
+    pub fn open_scoped_models(&mut self, models: Vec<ScopedModel>) {
+        self.overlay_kind = OverlayKind::ScopedModels;
+        self.chrome.scoped_models = Some(ScopedModelsSelector::new(
+            models,
+            self.enabled_model_ids.clone(),
+        ));
+        self.chrome.status = "Model Configuration".into();
+    }
+
+    pub fn close_overlays(&mut self) {
+        self.chrome.selector = None;
+        self.chrome.settings_list = None;
+        self.chrome.first_time = None;
+        self.chrome.login_dialog = None;
+        self.chrome.tree = None;
+        self.chrome.scoped_models = None;
+        self.overlay_kind = OverlayKind::None;
+        self.chrome.status.clear();
+    }
+
+    fn overlay_open(&self) -> bool {
+        self.chrome.first_time.is_some()
+            || self.chrome.login_dialog.is_some()
+            || self.chrome.tree.is_some()
+            || self.chrome.scoped_models.is_some()
+            || self.chrome.selector.is_some()
+            || self.chrome.settings_list.is_some()
     }
 
     pub fn push_tool_card(&mut self, card: ToolCard) {
@@ -301,6 +385,12 @@ impl InteractiveSession {
 
     pub fn handle_line(&mut self, line: &str) -> SessionAction {
         let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "/tree" {
+            return SessionAction::OpenTree;
+        }
+        if trimmed == "/scoped-models" {
+            return SessionAction::OpenScopedModels;
+        }
         if trimmed == "/model"
             || (trimmed.starts_with("/model ") && trimmed["/model ".len()..].is_empty())
         {
@@ -366,6 +456,9 @@ impl InteractiveSession {
         if let Some(text) = decode_kitty_printable(data) {
             return self.handle_printable(&text);
         }
+        if let Some(action) = self.handle_special_overlay(data) {
+            return action;
+        }
         match data {
             "\x03" => SessionAction::Quit,
             "\x10" => {
@@ -384,7 +477,7 @@ impl InteractiveSession {
             }
             "\x1b" => self.handle_escape(),
             "\t" => self.handle_tab(),
-            " " if self.chrome.settings_list.is_some() => {
+            " " if self.chrome.settings_list.is_some() || self.chrome.scoped_models.is_some() => {
                 if let Some(settings) = &mut self.chrome.settings_list {
                     settings.cycle();
                 }
@@ -392,7 +485,7 @@ impl InteractiveSession {
             }
             "\r" => self.handle_enter(),
             "\n" => {
-                if self.chrome.selector.is_some() || self.chrome.settings_list.is_some() {
+                if self.overlay_open() {
                     self.handle_enter()
                 } else {
                     self.chrome.editor.insert_str("\n");
@@ -427,8 +520,92 @@ impl InteractiveSession {
         SessionAction::None
     }
 
+    fn handle_special_overlay(&mut self, data: &str) -> Option<SessionAction> {
+        if self.chrome.first_time.is_some() {
+            let action = self
+                .chrome
+                .first_time
+                .as_mut()
+                .expect("first-time overlay")
+                .handle_key(data);
+            return Some(match action {
+                FirstTimeAction::PreviewTheme(theme) => {
+                    if let Some(found) = crate::builtin_themes()
+                        .into_iter()
+                        .find(|item| item.name == theme)
+                    {
+                        self.chrome.theme = found;
+                    }
+                    SessionAction::None
+                }
+                FirstTimeAction::None => SessionAction::None,
+                FirstTimeAction::Submit(result) => {
+                    self.close_overlays();
+                    SessionAction::FirstTimeSubmit {
+                        theme: result.theme,
+                        share_analytics: result.share_analytics,
+                    }
+                }
+                FirstTimeAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::FirstTimeSkip
+                }
+            });
+        }
+        if let Some(login) = &mut self.chrome.login_dialog {
+            return Some(match login.handle_key(data) {
+                LoginDialogAction::None => SessionAction::None,
+                LoginDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::LoginCancelled
+                }
+                LoginDialogAction::Submit(value) => SessionAction::LoginSubmit(value),
+            });
+        }
+        if let Some(tree) = &mut self.chrome.tree {
+            return Some(match tree.handle_key(data) {
+                TreeAction::None => SessionAction::None,
+                TreeAction::Select(id) => {
+                    self.close_overlays();
+                    SessionAction::SelectTreeEntry(id)
+                }
+                TreeAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
+        if let Some(scoped) = &mut self.chrome.scoped_models {
+            return Some(match scoped.handle_key(data) {
+                ScopedModelsAction::None => SessionAction::None,
+                ScopedModelsAction::Change(ids) => {
+                    self.enabled_model_ids = ids.clone();
+                    SessionAction::ChangeScopedModels(ids)
+                }
+                ScopedModelsAction::Persist(ids) => {
+                    self.enabled_model_ids = ids.clone();
+                    SessionAction::PersistScopedModels(ids)
+                }
+                ScopedModelsAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
+        None
+    }
+
     fn move_overlay(&mut self, delta: isize) {
-        if let Some(settings) = &mut self.chrome.settings_list {
+        if let Some(setup) = &mut self.chrome.first_time {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = setup.handle_key(key);
+        } else if let Some(tree) = &mut self.chrome.tree {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = tree.handle_key(key);
+        } else if let Some(scoped) = &mut self.chrome.scoped_models {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = scoped.handle_key(key);
+        } else if let Some(settings) = &mut self.chrome.settings_list {
             settings.move_by(delta);
         } else if let Some(selector) = &mut self.chrome.selector {
             selector.move_by(delta);
@@ -446,11 +623,8 @@ impl InteractiveSession {
             self.chrome.autocomplete = None;
             return SessionAction::None;
         }
-        if self.chrome.selector.is_some() || self.chrome.settings_list.is_some() {
-            self.chrome.selector = None;
-            self.chrome.settings_list = None;
-            self.overlay_kind = OverlayKind::None;
-            self.chrome.status.clear();
+        if self.overlay_open() {
+            self.close_overlays();
             return SessionAction::CloseOverlay;
         }
         if self.chrome.editor.buffer.trim().is_empty()
@@ -506,6 +680,10 @@ impl InteractiveSession {
                         }
                         SessionAction::SelectModel(item)
                     }
+                    OverlayKind::Tree => SessionAction::SelectTreeEntry(item),
+                    OverlayKind::ScopedModels | OverlayKind::Login | OverlayKind::FirstTime => {
+                        SessionAction::CloseOverlay
+                    }
                 };
             }
             self.chrome.selector = None;
@@ -515,6 +693,15 @@ impl InteractiveSession {
         let submitted = self.chrome.editor.submit();
         if let Some(command) = submitted.trim_start().strip_prefix('!') {
             return SessionAction::RunBash(command.trim().to_string());
+        }
+        if submitted == "/scoped-models" {
+            return SessionAction::OpenScopedModels;
+        }
+        if submitted == "/tree" {
+            return SessionAction::OpenTree;
+        }
+        if submitted == "/login" || submitted.starts_with("/login ") {
+            return SessionAction::Submit(submitted);
         }
         if submitted == "/model" {
             self.open_model_overlay();
@@ -544,11 +731,35 @@ impl InteractiveSession {
         SessionAction::None
     }
 
+    fn cycle_ids(&self) -> Vec<String> {
+        match &self.enabled_model_ids {
+            None => self.models.clone(),
+            Some(ids) => {
+                let filtered: Vec<String> = ids
+                    .iter()
+                    .filter(|id| self.models.iter().any(|model| model == *id))
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    self.models.clone()
+                } else {
+                    filtered
+                }
+            }
+        }
+    }
+
     fn cycle_model(&mut self) {
-        if self.models.is_empty() {
+        let ids = self.cycle_ids();
+        if ids.is_empty() {
             return;
         }
-        self.model_index = (self.model_index + 1) % self.models.len();
+        let current = self.current_model().unwrap_or_default().to_string();
+        let position = ids.iter().position(|id| id == &current).unwrap_or(0);
+        let next = ids[(position + 1) % ids.len()].clone();
+        if let Some(index) = self.models.iter().position(|model| model == &next) {
+            self.model_index = index;
+        }
         if let Some(model) = self.current_model() {
             self.chrome.status = format!("model={model}");
         }
@@ -681,5 +892,34 @@ mod tests {
         );
         assert!(session.chrome.editor.buffer.contains("pasted"));
         assert!(session.render_frame().contains(BEGIN_SYNCHRONIZED_OUTPUT));
+        session.open_first_time_setup("dark", "pi");
+        assert!(session
+            .render_frame()
+            .contains("Welcome to pi, the minimal coding agent."));
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::FirstTimeSkip);
+        session.open_login_dialog("openai", None, None);
+        if let Some(dialog) = &mut session.chrome.login_dialog {
+            dialog.show_auth("https://example.test", None);
+        }
+        assert!(session.render_frame().contains("Login to openai"));
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::LoginCancelled);
+        session.open_tree_overlay(
+            crate::build_session_tree(vec![crate::SessionTreeEntry::message(
+                "u1", None, "user", "hello",
+            )]),
+            Some("u1".into()),
+        );
+        assert!(session.render_frame().contains("Session Tree"));
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectTreeEntry("u1".into())
+        );
+        session.open_scoped_models(vec![crate::ScopedModel {
+            provider: "faux".into(),
+            id: "one".into(),
+            name: "One".into(),
+        }]);
+        assert!(session.render_frame().contains("Model Configuration"));
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::CloseOverlay);
     }
 }

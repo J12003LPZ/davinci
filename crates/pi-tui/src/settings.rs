@@ -106,6 +106,9 @@ pub fn default_interactive_settings(
     double_escape: &str,
     quiet_startup: bool,
     autocomplete_max_visible: u32,
+    tree_filter_mode: &str,
+    mermaid_mode: &str,
+    enable_analytics: bool,
 ) -> SettingsList {
     SettingsList::new(
         vec![
@@ -135,6 +138,33 @@ pub fn default_interactive_settings(
                 label: "Quiet startup".into(),
                 description: Some("Disable verbose printing at startup".into()),
                 current_value: if quiet_startup { "true" } else { "false" }.into(),
+                values: vec!["true".into(), "false".into()],
+            },
+            SettingItem {
+                id: "tree-filter-mode".into(),
+                label: "Tree filter mode".into(),
+                description: Some("Default filter when opening /tree".into()),
+                current_value: tree_filter_mode.into(),
+                values: vec![
+                    "default".into(),
+                    "no-tools".into(),
+                    "user-only".into(),
+                    "labeled-only".into(),
+                    "all".into(),
+                ],
+            },
+            SettingItem {
+                id: "mermaid-rendering".into(),
+                label: "Mermaid diagrams".into(),
+                description: Some("Render Mermaid code blocks as Unicode diagrams".into()),
+                current_value: mermaid_mode.into(),
+                values: vec!["off".into(), "final".into(), "streaming".into()],
+            },
+            SettingItem {
+                id: "enable-analytics".into(),
+                label: "Share anonymous usage data".into(),
+                description: Some("Opt-in analytics data sharing".into()),
+                current_value: if enable_analytics { "true" } else { "false" }.into(),
                 values: vec!["true".into(), "false".into()],
             },
         ],
