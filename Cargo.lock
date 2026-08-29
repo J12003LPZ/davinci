@@ -764,6 +764,8 @@ dependencies = [
  "pi-ai",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
 ]
 
@@ -804,6 +806,7 @@ dependencies = [
  "pi-session",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "uuid",

@@ -20,6 +20,14 @@ pub struct JsExtensionResult {
     pub tools: Vec<JsRegisteredTool>,
     #[serde(default)]
     pub providers: Vec<JsRegisteredProvider>,
+    #[serde(default, rename = "unregisteredProviders")]
+    pub unregistered_providers: Vec<String>,
+    #[serde(default, rename = "terminalInputHandlers")]
+    pub terminal_input_handlers: u32,
+    #[serde(default, rename = "currentTheme")]
+    pub current_theme: Option<Value>,
+    #[serde(default, rename = "toolsExpanded")]
+    pub tools_expanded: bool,
     #[serde(default)]
     pub commands: Vec<JsRegisteredCommand>,
     #[serde(default, rename = "autocompleteProviders")]
@@ -1724,5 +1732,94 @@ module.exports = (pi) => {
         )
         .unwrap();
         assert_eq!(handled.result.as_ref().unwrap()["action"], "handled");
+    }
+
+    #[test]
+    fn records_theme_tools_terminal_input_and_unregister_provider() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerProvider("temp-proxy", {
+    baseUrl: "https://proxy.example.com",
+    api: "anthropic-messages",
+    models: [{ id: "demo", name: "Demo", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 128 }],
+  });
+  pi.unregisterProvider("temp-proxy");
+  pi.unregisterProvider("anthropic");
+  const themes = pi.ui.getAllThemes();
+  const result = pi.ui.setTheme("light");
+  pi.ui.setToolsExpanded(true);
+  pi.ui.onTerminalInput((data) => data === "ctrl+q");
+  return {
+    theme: pi.ui.getTheme(),
+    toolsExpanded: pi.ui.getToolsExpanded(),
+    themeCount: themes.length,
+    setTheme: result,
+  };
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(
+            &module,
+            "load",
+            &serde_json::json!({
+                "themes": [{ "name": "dark" }, { "name": "light" }],
+                "theme": "dark",
+                "toolsExpanded": false,
+            }),
+        )
+        .unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        assert!(loaded.providers.is_empty());
+        assert!(loaded
+            .unregistered_providers
+            .iter()
+            .any(|name| name == "temp-proxy"));
+        assert!(loaded
+            .unregistered_providers
+            .iter()
+            .any(|name| name == "anthropic"));
+        assert!(loaded
+            .ui_calls
+            .iter()
+            .any(|call| call["op"] == "setTheme" && call["name"] == "light"));
+        assert!(loaded
+            .ui_calls
+            .iter()
+            .any(|call| call["op"] == "setToolsExpanded" && call["expanded"] == true));
+        assert!(loaded
+            .ui_calls
+            .iter()
+            .any(|call| call["op"] == "onTerminalInput"));
+        assert_eq!(loaded.terminal_input_handlers, 1);
+        assert_eq!(
+            loaded
+                .current_theme
+                .as_ref()
+                .and_then(|value| value.as_str()),
+            Some("light")
+        );
+        assert!(loaded.tools_expanded);
+        let missing = run_js_extension(
+            &module,
+            "load",
+            &serde_json::json!({
+                "themes": [{ "name": "dark" }],
+                "theme": "dark",
+            }),
+        )
+        .unwrap();
+        assert!(missing.ui_calls.iter().any(|call| {
+            call["op"] == "setTheme"
+                && call["success"] == false
+                && call["error"] == "Theme not found: light"
+        }));
     }
 }

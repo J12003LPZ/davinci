@@ -31,6 +31,7 @@ mod session;
 mod session_selector;
 mod settings;
 mod settings_submenu;
+mod terminal;
 mod themes;
 mod thinking_selector;
 mod tool_card;
@@ -120,6 +121,16 @@ pub use settings::{
 pub use settings_submenu::{
     parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
     SettingsSubmenuKind, AUTOMATIC_THEME_VALUE,
+};
+pub use terminal::{
+    is_apple_terminal_session, is_keyboard_protocol_negotiation_sequence_prefix,
+    normalize_apple_terminal_input, normalize_native_shift_enter_input,
+    parse_keyboard_protocol_negotiation_sequence, resolve_escape_timeout_ms,
+    resolve_escape_timeout_ms_from_env, rewrite_shift_enter_input,
+    KeyboardProtocolNegotiationSequence, DEFAULT_ESCAPE_TIMEOUT_MS, DEFAULT_SSH_ESCAPE_TIMEOUT_MS,
+    DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS, KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT_MS,
+    KITTY_KEYBOARD_PROTOCOL_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE,
+    NATIVE_SHIFT_ENTER_SEQUENCE,
 };
 pub use themes::{builtin_themes, load_themes_from_dir, Theme};
 pub use thinking_selector::{

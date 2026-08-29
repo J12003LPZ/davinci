@@ -28,6 +28,9 @@ use crate::settings::{SettingItem, SettingsList};
 use crate::settings_submenu::{
     parse_auto_theme, ModelThinkingItem, SettingsSubmenu, SettingsSubmenuAction,
 };
+use crate::terminal::{
+    resolve_escape_timeout_ms_from_env, rewrite_shift_enter_input, NATIVE_SHIFT_ENTER_SEQUENCE,
+};
 use crate::themes::Theme;
 use crate::thinking_selector::{ThinkingSelector, ThinkingSelectorAction};
 use crate::tool_card::ToolCard;
@@ -166,6 +169,7 @@ pub struct InteractiveSession {
     pub show_terminal_progress: bool,
     pub quiet_startup: bool,
     progress_active: bool,
+    pub escape_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +277,7 @@ impl InteractiveSession {
             show_terminal_progress: false,
             quiet_startup: false,
             progress_active: false,
+            escape_timeout_ms: resolve_escape_timeout_ms_from_env(),
         }
     }
 
@@ -798,6 +803,10 @@ impl InteractiveSession {
         if data.is_empty() {
             return SessionAction::None;
         }
+        let rewritten = rewrite_shift_enter_input(data);
+        if rewritten != data {
+            return self.handle_bytes(&rewritten);
+        }
         if crate::osc::is_osc11_background_color_response(data)
             || crate::osc::parse_terminal_color_scheme_report(data).is_some()
         {
@@ -980,7 +989,7 @@ impl InteractiveSession {
                 SessionAction::CycleSetting
             }
             "\r" => self.handle_enter(),
-            "\n" => {
+            "\n" | NATIVE_SHIFT_ENTER_SEQUENCE => {
                 if self.overlay_open() {
                     self.handle_enter()
                 } else {
@@ -2262,5 +2271,25 @@ mod tests {
         let start_line = session.chrome.editor.get_cursor().0;
         assert_eq!(session.handle_bytes("\x1b[5~"), SessionAction::None);
         assert!(session.chrome.editor.get_cursor().0 < start_line);
+
+        session.chrome.editor.set_text("line");
+        session.chrome.editor.cursor = session.chrome.editor.buffer.len();
+        assert_eq!(
+            session.handle_bytes(crate::NATIVE_SHIFT_ENTER_SEQUENCE),
+            SessionAction::None
+        );
+        assert_eq!(session.chrome.editor.buffer, "line\n");
+        session.apply_extension_ui_calls(&[
+            serde_json::json!({ "op": "setTheme", "name": "light" }),
+            serde_json::json!({ "op": "setToolsExpanded", "expanded": true }),
+            serde_json::json!({ "op": "onTerminalInput" }),
+        ]);
+        assert_eq!(session.chrome.theme.name, "light");
+        assert!(session.chrome.tools_expanded);
+        assert!(session.chrome.terminal_input_registered);
+        assert_eq!(
+            session.escape_timeout_ms,
+            crate::resolve_escape_timeout_ms_from_env()
+        );
     }
 }

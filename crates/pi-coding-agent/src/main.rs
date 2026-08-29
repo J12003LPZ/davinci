@@ -604,7 +604,9 @@ fn load_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
             models
         }
     };
-    for provider in loaded_extension_host(parsed).registered_providers() {
+    let extension_host = loaded_extension_host(parsed);
+    extension_host.filter_models(&mut models);
+    for provider in extension_host.registered_providers() {
         models.extend(pi_ai::models_from_provider_config(
             &provider.name,
             &provider.config,
@@ -1416,6 +1418,7 @@ fn run_interactive(
         reason: "startup".into(),
     });
     host.emit(ExtensionEvent::SessionStart);
+    session.apply_extension_ui_calls(&host.ui_calls);
     apply_extension_shortcuts(parsed, &mut session, agent, &host);
     session.slash_commands = interactive_slash_commands(agent, parsed);
     session.extra_autocomplete = interactive_extra_autocomplete(parsed);
@@ -1461,7 +1464,7 @@ fn run_interactive(
         }
     }
     let result = if io::stdin().is_terminal() {
-        run_raw_session(parsed, agent, &mut session)
+        run_raw_session(parsed, agent, &mut session, &mut host)
     } else {
         run_line_session(parsed, agent, &mut session)
     };
@@ -1525,7 +1528,9 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
     }
     match key.code {
         KeyCode::Esc => "\x1b".into(),
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => "\n".into(),
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            pi_tui::NATIVE_SHIFT_ENTER_SEQUENCE.into()
+        }
         KeyCode::Enter => "\r".into(),
         KeyCode::Tab => "\t".into(),
         KeyCode::Backspace => "\x7f".into(),
@@ -1544,6 +1549,7 @@ fn run_raw_session(
     parsed: &Args,
     agent: &mut Agent,
     session: &mut InteractiveSession,
+    host: &mut ExtensionHost,
 ) -> Result<i32, String> {
     let _raw = RawModeGuard::enter()?;
     loop {
@@ -1576,7 +1582,12 @@ fn run_raw_session(
                 {
                     continue;
                 }
-                let action = session.handle_bytes(&key_event_to_bytes(&key));
+                let bytes = key_event_to_bytes(&key);
+                if host.dispatch_terminal_input(&bytes) {
+                    session.apply_extension_ui_calls(&host.ui_calls);
+                    continue;
+                }
+                let action = session.handle_bytes(&bytes);
                 if !apply_session_action(parsed, agent, session, action)? {
                     break;
                 }
@@ -3939,6 +3950,19 @@ fn apply_host_session_calls(
         .any(|call| call.get("op").and_then(|value| value.as_str()) == Some("reload"))
     {
         reload_interactive_resources(parsed, agent, session);
+    }
+    for call in calls {
+        if call.get("op").and_then(|value| value.as_str()) != Some("unregisterProvider") {
+            continue;
+        }
+        let Some(name) = call.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        session
+            .models
+            .retain(|model| !model.starts_with(&format!("{name}/")));
+        session.model_items.retain(|item| item.provider != name);
+        session.login_providers.retain(|provider| provider != name);
     }
 }
 

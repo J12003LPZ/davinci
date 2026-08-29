@@ -137,6 +137,7 @@ pub struct LoadedJsExtension {
     pub has_editor: bool,
     pub providers: Vec<JsRegisteredProvider>,
     pub flags: Vec<String>,
+    pub terminal_input: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +166,7 @@ pub struct ExtensionHost {
     pub runtime_flag_values: Value,
     pub editor_text: String,
     pub runtime_system_prompt: String,
+    pub unregistered_providers: Vec<String>,
 }
 
 impl ExtensionHost {
@@ -188,6 +190,7 @@ impl ExtensionHost {
             runtime_flag_values: Value::Object(serde_json::Map::new()),
             editor_text: String::new(),
             runtime_system_prompt: String::new(),
+            unregistered_providers: Vec::new(),
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -197,7 +200,24 @@ impl ExtensionHost {
                 let Some(module) = resolve_extension_module(dir) else {
                     continue;
                 };
-                if let Ok(loaded) = run_js_extension(&module, "load", &serde_json::json!({})) {
+                let themes: Vec<Value> = pi_tui::builtin_themes()
+                    .into_iter()
+                    .map(|theme| {
+                        serde_json::json!({
+                            "name": theme.name,
+                            "path": serde_json::Value::Null,
+                        })
+                    })
+                    .collect();
+                if let Ok(loaded) = run_js_extension(
+                    &module,
+                    "load",
+                    &serde_json::json!({
+                        "themes": themes,
+                        "theme": "dark",
+                        "toolsExpanded": false,
+                    }),
+                ) {
                     if loaded.ok {
                         let path = module.display().to_string();
                         for custom_type in &loaded.message_renderers {
@@ -213,6 +233,8 @@ impl ExtensionHost {
                         }
                         host.ui_calls.extend(loaded.ui_calls.clone());
                         host.session_calls.extend(loaded.session_calls.clone());
+                        host.unregistered_providers
+                            .extend(loaded.unregistered_providers.clone());
                         let has_editor = loaded.has_editor
                             || loaded.handlers.iter().any(|name| name == "session_start");
                         if has_editor {
@@ -237,12 +259,60 @@ impl ExtensionHost {
                             has_editor,
                             providers: loaded.providers,
                             flags: loaded.flags,
+                            terminal_input: loaded.terminal_input_handlers > 0
+                                || loaded.ui_calls.iter().any(|call| {
+                                    call.get("op").and_then(Value::as_str)
+                                        == Some("onTerminalInput")
+                                }),
                         });
                     }
                 }
             }
         }
+        host.drop_unregistered_providers();
         host
+    }
+
+    fn drop_unregistered_providers(&mut self) {
+        let names = self.unregistered_providers.clone();
+        for ext in &mut self.js {
+            ext.providers
+                .retain(|provider| !names.iter().any(|name| name == &provider.name));
+        }
+    }
+
+    pub fn filter_models(&self, models: &mut Vec<pi_ai::Model>) {
+        models.retain(|model| {
+            !self
+                .unregistered_providers
+                .iter()
+                .any(|name| name == &model.provider)
+        });
+    }
+
+    pub fn dispatch_terminal_input(&mut self, data: &str) -> bool {
+        for ext in &self.js {
+            if !ext.terminal_input {
+                continue;
+            }
+            let Ok(result) = run_persistent_js_extension(
+                Path::new(&ext.path),
+                "terminalInput",
+                &serde_json::json!({ "data": data }),
+            ) else {
+                continue;
+            };
+            if result
+                .result
+                .as_ref()
+                .and_then(|value| value.get("consumed"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn emit(&mut self, event: ExtensionEvent) {
@@ -275,6 +345,8 @@ impl ExtensionHost {
             if let Ok(result) = run_js_extension(Path::new(&ext.path), "emit", &payload) {
                 if result.ok {
                     self.last_js_result = result.result.clone();
+                    self.unregistered_providers
+                        .extend(result.unregistered_providers.clone());
                     self.ui_calls.extend(result.ui_calls);
                     self.session_calls.extend(result.session_calls);
                     if let Some(value) = &result.result {
@@ -358,6 +430,8 @@ impl ExtensionHost {
             if let Ok(result) = run_js_extension(Path::new(&ext.path), "emit", &payload) {
                 if result.ok {
                     self.last_js_result = result.result;
+                    self.unregistered_providers
+                        .extend(result.unregistered_providers.clone());
                     self.ui_calls.extend(result.ui_calls);
                     self.session_calls.extend(result.session_calls);
                     emits.extend(result.event_emits);
@@ -669,6 +743,12 @@ impl ExtensionHost {
         self.js
             .iter()
             .flat_map(|ext| ext.providers.clone())
+            .filter(|provider| {
+                !self
+                    .unregistered_providers
+                    .iter()
+                    .any(|name| name == &provider.name)
+            })
             .collect()
     }
 
@@ -754,8 +834,11 @@ impl ExtensionHost {
                 .error
                 .unwrap_or_else(|| "Shortcut handler error".into()));
         }
+        self.unregistered_providers
+            .extend(result.unregistered_providers.clone());
         self.ui_calls.extend(result.ui_calls.clone());
         self.session_calls.extend(result.session_calls.clone());
+        self.drop_unregistered_providers();
         Ok(result.result)
     }
 
@@ -798,8 +881,11 @@ impl ExtensionHost {
                 .error
                 .unwrap_or_else(|| "Command handler error".into()));
         }
+        self.unregistered_providers
+            .extend(result.unregistered_providers.clone());
         self.ui_calls.extend(result.ui_calls);
         self.session_calls.extend(result.session_calls);
+        self.drop_unregistered_providers();
         self.deliver_event_emits(&result.event_emits);
         if result
             .result
@@ -970,6 +1056,7 @@ fn resolve_extension_shortcuts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::js_host::JsRegisteredProvider;
 
     #[test]
     fn event_names_match_ts() {
@@ -1046,5 +1133,78 @@ mod tests {
         assert!(shortcuts
             .iter()
             .any(|(key, path)| key == "ctrl+y" && path == "/two.js"));
+    }
+
+    #[test]
+    fn unregister_provider_drops_models_from_catalog() {
+        let mut host = ExtensionHost {
+            unregistered_providers: vec!["anthropic".into()],
+            ..ExtensionHost::default()
+        };
+        host.js.push(LoadedJsExtension {
+            path: "/ext.js".into(),
+            handlers: Vec::new(),
+            tools: Vec::new(),
+            tool_defs: Vec::new(),
+            commands: Vec::new(),
+            command_details: Vec::new(),
+            autocomplete_providers: Vec::new(),
+            message_renderers: Vec::new(),
+            entry_renderers: Vec::new(),
+            markdown_transformers: 0,
+            shortcuts: Vec::new(),
+            has_editor: false,
+            providers: vec![JsRegisteredProvider {
+                name: "anthropic".into(),
+                ..JsRegisteredProvider::default()
+            }],
+            flags: Vec::new(),
+            terminal_input: false,
+        });
+        host.drop_unregistered_providers();
+        assert!(host.registered_providers().is_empty());
+        let mut models = vec![
+            pi_ai::Model {
+                id: "sonnet".into(),
+                name: "Sonnet".into(),
+                api: "anthropic-messages".into(),
+                provider: "anthropic".into(),
+                base_url: None,
+                reasoning: false,
+                input: vec!["text".into()],
+                cost: pi_ai::ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 1000,
+                max_tokens: 128,
+                compat: serde_json::Value::Null,
+                headers: Default::default(),
+            },
+            pi_ai::Model {
+                id: "gpt".into(),
+                name: "GPT".into(),
+                api: "openai-responses".into(),
+                provider: "openai".into(),
+                base_url: None,
+                reasoning: false,
+                input: vec!["text".into()],
+                cost: pi_ai::ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 1000,
+                max_tokens: 128,
+                compat: serde_json::Value::Null,
+                headers: Default::default(),
+            },
+        ];
+        host.filter_models(&mut models);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider, "openai");
     }
 }

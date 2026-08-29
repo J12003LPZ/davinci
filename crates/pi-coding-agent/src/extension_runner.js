@@ -481,6 +481,10 @@ async function main() {
 		providers: [],
 		autocompleteProviders: [],
 		eventEmits: [],
+		unregisteredProviders: [],
+		terminalInputHandlers: [],
+		currentTheme: payload.theme,
+		toolsExpanded: Boolean(payload.toolsExpanded),
 		streamHandlers: {},
 		refreshHandlers: {},
 		oauthLogin: {},
@@ -650,8 +654,16 @@ async function main() {
 					});
 				} catch {}
 			},
-			onTerminalInput() {
-				return () => {};
+			onTerminalInput(handler) {
+				if (typeof handler === "function") {
+					recorded.terminalInputHandlers.push(handler);
+				}
+				recorded.uiCalls.push({ op: "onTerminalInput" });
+				return () => {
+					recorded.terminalInputHandlers = recorded.terminalInputHandlers.filter(
+						(item) => item !== handler,
+					);
+				};
 			},
 			async custom(factory, options) {
 				const overlay = Boolean(options && options.overlay);
@@ -699,18 +711,41 @@ async function main() {
 			},
 			theme: { fg(_role, text) { return text; }, bg(_role, text) { return text; }, bold(text) { return text; } },
 			getAllThemes() {
-				return [];
+				return Array.isArray(payload.themes) ? payload.themes : [];
 			},
 			getTheme() {
-				return undefined;
+				if (recorded.currentTheme !== undefined) return recorded.currentTheme;
+				return payload.theme;
 			},
-			setTheme() {
+			setTheme(theme) {
+				if (theme && typeof theme === "object") {
+					recorded.currentTheme = theme.name || "<in-memory>";
+					recorded.uiCalls.push({ op: "setTheme", theme, success: true });
+					return { success: true };
+				}
+				const name = theme == null ? "" : String(theme);
+				const themes = Array.isArray(payload.themes) ? payload.themes : [];
+				const found = themes.some((item) => item && item.name === name);
+				if (name && themes.length > 0 && !found) {
+					recorded.uiCalls.push({
+						op: "setTheme",
+						name,
+						success: false,
+						error: "Theme not found: " + name,
+					});
+					return { success: false, error: "Theme not found: " + name };
+				}
+				recorded.currentTheme = name;
+				recorded.uiCalls.push({ op: "setTheme", name, success: true });
 				return { success: true };
 			},
 			getToolsExpanded() {
-				return false;
+				return Boolean(recorded.toolsExpanded);
 			},
-			setToolsExpanded() {},
+			setToolsExpanded(expanded) {
+				recorded.toolsExpanded = Boolean(expanded);
+				recorded.uiCalls.push({ op: "setToolsExpanded", expanded: Boolean(expanded) });
+			},
 		};
 	}
 	const ui = makeUi();
@@ -950,6 +985,8 @@ async function main() {
 		},
 		unregisterProvider(name) {
 			recorded.providers = recorded.providers.filter((provider) => provider.name !== name);
+			if (name) recorded.unregisteredProviders.push(String(name));
+			recorded.sessionCalls.push({ op: "unregisterProvider", name: String(name || "") });
 		},
 		getFlag(name) {
 			if (!recorded.flags.includes(name)) return undefined;
@@ -1410,6 +1447,18 @@ async function main() {
 		} else if (payload.credentials && payload.credentials.access) {
 			result = { apiKey: payload.credentials.access };
 		}
+	} else if (op === "terminalInput") {
+		let consumed = false;
+		const data = payload.data == null ? "" : String(payload.data);
+		for (const handler of recorded.terminalInputHandlers) {
+			try {
+				if (handler(data) === true) {
+					consumed = true;
+					break;
+				}
+			} catch {}
+		}
+		result = { consumed };
 	}
 	}
 	function emitResult() {
@@ -1429,6 +1478,10 @@ async function main() {
 			hasEditor: typeof editorFactory === "function",
 			hasCustom: Boolean(customComponent),
 			providers: recorded.providers,
+			unregisteredProviders: recorded.unregisteredProviders,
+			terminalInputHandlers: recorded.terminalInputHandlers.length,
+			currentTheme: recorded.currentTheme,
+			toolsExpanded: Boolean(recorded.toolsExpanded),
 			autocompleteProviders: recorded.autocompleteProviders.map((provider) => ({
 				triggerCharacters: provider.triggerCharacters,
 				items: provider.items || [],

@@ -14,7 +14,7 @@ use crate::scoped_models::ScopedModelsSelector;
 use crate::session_selector::SessionSelector;
 use crate::settings::SettingsList;
 use crate::settings_submenu::SettingsSubmenu;
-use crate::themes::Theme;
+use crate::themes::{builtin_themes, Theme};
 use crate::thinking_selector::ThinkingSelector;
 use crate::tool_card::ToolCard;
 use crate::transcript::Transcript;
@@ -72,6 +72,9 @@ pub struct ChatChrome {
     pub footer_branch: Option<String>,
     pub footer_session_name: Option<String>,
     pub footer_stats: Option<String>,
+    pub tools_expanded: bool,
+    pub available_themes: Vec<Theme>,
+    pub terminal_input_registered: bool,
 }
 
 impl ChatChrome {
@@ -124,6 +127,59 @@ impl ChatChrome {
             footer_branch: None,
             footer_session_name: None,
             footer_stats: None,
+            tools_expanded: false,
+            available_themes: builtin_themes(),
+            terminal_input_registered: false,
+        }
+    }
+
+    pub fn get_theme_name(&self) -> &str {
+        &self.theme.name
+    }
+
+    pub fn get_all_themes(&self) -> Vec<(String, Option<String>)> {
+        self.available_themes
+            .iter()
+            .map(|theme| (theme.name.clone(), None))
+            .collect()
+    }
+
+    pub fn set_theme_by_name(&mut self, name: &str) -> Result<(), String> {
+        if let Some(theme) = self
+            .available_themes
+            .iter()
+            .find(|theme| theme.name == name)
+            .cloned()
+            .or_else(|| {
+                builtin_themes()
+                    .into_iter()
+                    .find(|theme| theme.name == name)
+            })
+        {
+            self.theme = theme;
+            Ok(())
+        } else {
+            Err(format!("Theme not found: {name}"))
+        }
+    }
+
+    pub fn set_theme_instance(&mut self, theme: Theme) {
+        if let Some(existing) = self
+            .available_themes
+            .iter_mut()
+            .find(|item| item.name == theme.name)
+        {
+            *existing = theme.clone();
+        } else {
+            self.available_themes.push(theme.clone());
+        }
+        self.theme = theme;
+    }
+
+    pub fn set_tools_expanded(&mut self, expanded: bool) {
+        self.tools_expanded = expanded;
+        for card in &mut self.tool_cards {
+            card.expanded = expanded;
         }
     }
 
@@ -285,6 +341,27 @@ impl ChatChrome {
                 if call.get("enabled").and_then(|value| value.as_bool()) == Some(false) {
                     self.custom_editor_lines = None;
                 }
+            }
+            "setTheme" => {
+                if let Some(theme) = call.get("theme").filter(|value| value.is_object()) {
+                    if let Ok(parsed) = serde_json::from_value::<Theme>(theme.clone()) {
+                        self.set_theme_instance(parsed);
+                    } else if let Some(name) = theme.get("name").and_then(|value| value.as_str()) {
+                        let _ = self.set_theme_by_name(name);
+                    }
+                } else if let Some(name) = call.get("name").and_then(|value| value.as_str()) {
+                    let _ = self.set_theme_by_name(name);
+                }
+            }
+            "setToolsExpanded" => {
+                self.set_tools_expanded(
+                    call.get("expanded")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                );
+            }
+            "onTerminalInput" => {
+                self.terminal_input_registered = true;
             }
             _ => {}
         }

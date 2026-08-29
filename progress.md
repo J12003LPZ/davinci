@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (RPC `AgentSessionEvent` extras, SQLite branch-cache, Unix listener mode/link + attach sets + exclusive acquire/dispose). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (evals comparison reporter + artifacts + harness table, TUI Shift+Enter / ESC timeout / Kitty negotiation helpers, extension `getTheme`/`setTheme`/`getAllThemes`/`onTerminalInput`/`setToolsExpanded` + `unregisterProvider`). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -123,7 +123,9 @@ Closed this slice: `pi-server` prompt drives `Agent::run_loop` (fixture `PI_SERV
 
 Closed this slice: RPC streams TS `AgentSessionEvent` extras (`queue_update`, `compaction_start`/`compaction_end`, `session_info_changed`, `thinking_level_changed`, `agent_settled`, `entry_appended`) and `agent_end.willRetry`. `pi-session-sqlite` ports `branch_tips`/`branch_entries` rebuild/append with TS error strings (`Failed to build SQLite branch cache at entry`, `Branch tip changed during append`, `has no branch containing parent entry`). `pi-server` Unix bind uses private `.p-{sha256}` path, `link` to the public socket, mode `0o600`, parent `0o700`, and TS path/mode/`maxFrameLength` validation; live sessions use per-connection attach sets, exclusive acquire (`session_locked` while terminating), and dispose when idle and unattached. Unix connections lock TS pending-byte and closed strings.
 
+Closed this slice: `pi-evals` ports TS `summarizeHarnessComparisons` / `formatHarnessComparisonReport` (schemaVersion 1, paired lift, diagnostics `missing-observation`/`duplicate-observation`/`harness-error`/`missing-score`/`unscorable-outcome`, terminal report strings after VT strip), `persistEvalArtifactReferences` (`piSessionJsonl`, `Pi eval session artifact metadata is invalid.`, sha256 run dirs 0o700/0o600), and `deriveEvalGroupKey` / `evalHarnessTable` / `parseEvalHarnessIterationArtifact`. `pi-tui` ports `normalizeNativeShiftEnterInput` / `normalizeAppleTerminalInput` / `resolveEscapeTimeoutMs` / Kitty negotiation parse; Shift+Enter is CSI-u `\x1b[13;2u` (crossterm SHIFT or `PI_TUI_NATIVE_SHIFT`+`PI_TUI_SHIFT`); InteractiveSession inserts a newline for that sequence. JS host records `getAllThemes`/`getTheme`/`setTheme` (`Theme not found: {name}`), `getToolsExpanded`/`setToolsExpanded`, `onTerminalInput` (persistent `terminalInput` consume), and `unregisterProvider` (drops registered + built-in catalog models). Chrome applies theme / tools-expanded / terminal-input registrations.
+
 Still not product-equivalent:
 
-- Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
+- Native TUI C addons (`tui/native/darwin`, `tui/native/win32`) — optional; Shift detection uses crossterm modifiers plus the TS rewrite helpers. Darwin/Win32 `.node` binaries are not shipped.
 - TypeScript under `vendor/pi` remains the behavioral spec.

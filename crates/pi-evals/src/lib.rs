@@ -1,5 +1,22 @@
 //! Fixture-driven eval harness matching `@earendil-works/pi-evals`.
 
+pub mod artifacts;
+pub mod harness_table;
+pub mod summary;
+
+pub use artifacts::{
+    persist_eval_artifact_references, record_eval_session_artifact, record_eval_source_artifact,
+    ArtifactReference, EvalArtifact, EvalAttachment, PI_SESSION_SNAPSHOT_ARTIFACT,
+};
+pub use harness_table::{
+    derive_eval_group_key, eval_harness_table, parse_eval_harness_iteration_artifact,
+    EvalHarnessIterationArtifact, EvalHarnessTableRow, EVAL_HARNESS_ITERATION_ARTIFACT,
+};
+pub use summary::{
+    format_harness_comparison_report, strip_vt_control_characters, summarize_harness_comparisons,
+    HarnessComparisonReport, HarnessObservation,
+};
+
 use pi_agent::Agent;
 use pi_ai::{
     content_text, AssistantMessage, ChatMessage, ContentBlock, MessageContent, StopReason,
