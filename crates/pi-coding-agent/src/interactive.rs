@@ -195,6 +195,33 @@ impl InteractiveMode {
                 argument_completions: None,
             });
         }
+        for template in &self.runtime.prompt_templates {
+            if builtin_names.iter().any(|name| name == &template.name)
+                || commands.iter().any(|command| command.name == template.name)
+            {
+                continue;
+            }
+            commands.push(SlashCommand {
+                name: template.name.clone(),
+                description: template.description.clone(),
+                argument_hint: template.argument_hint.clone(),
+                argument_completions: None,
+            });
+        }
+        if self.runtime.enable_skill_commands {
+            for skill in &self.runtime.skills {
+                let name = format!("skill:{}", skill.name);
+                if commands.iter().any(|command| command.name == name) {
+                    continue;
+                }
+                commands.push(SlashCommand {
+                    name,
+                    description: Some(skill.description.clone()).filter(|d| !d.is_empty()),
+                    argument_hint: None,
+                    argument_completions: None,
+                });
+            }
+        }
         if let Some(command) = commands.iter_mut().find(|command| command.name == "login") {
             let providers = providers.clone();
             command.argument_completions = Some(Rc::new(move |prefix: &str| {
@@ -386,24 +413,49 @@ impl InteractiveMode {
         );
     }
 
+    fn help_lines(&self) -> Vec<String> {
+        let mut body: Vec<String> = BUILTIN_SLASH_COMMANDS
+            .iter()
+            .map(|(name, desc)| format!("/{name}  {desc}"))
+            .collect();
+        for command in &self.runtime.registry.commands {
+            body.push(format!(
+                "/{}  {}",
+                command.name,
+                command
+                    .description
+                    .as_deref()
+                    .unwrap_or("extension command")
+            ));
+        }
+        for template in &self.runtime.prompt_templates {
+            body.push(format!(
+                "/{}  {}",
+                template.name,
+                template.description.as_deref().unwrap_or("prompt template")
+            ));
+        }
+        if self.runtime.enable_skill_commands {
+            for skill in &self.runtime.skills {
+                body.push(format!(
+                    "/skill:{}  {}",
+                    skill.name,
+                    if skill.description.is_empty() {
+                        "skill"
+                    } else {
+                        skill.description.as_str()
+                    }
+                ));
+            }
+        }
+        body
+    }
+
     pub fn handle_slash(&mut self, cmd: &str, args: &str) -> Result<bool, String> {
         match cmd {
             "quit" | "exit" => return Ok(true),
             "help" => {
-                let mut body: Vec<String> = BUILTIN_SLASH_COMMANDS
-                    .iter()
-                    .map(|(name, desc)| format!("/{name}  {desc}"))
-                    .collect();
-                for command in &self.runtime.registry.commands {
-                    body.push(format!(
-                        "/{}  {}",
-                        command.name,
-                        command
-                            .description
-                            .as_deref()
-                            .unwrap_or("extension command")
-                    ));
-                }
+                let body = self.help_lines();
                 self.tui.show_overlay(
                     Overlay::new("help", body).render(80),
                     OverlayOptions {
@@ -850,7 +902,15 @@ impl InteractiveMode {
             _ => {}
         }
         if let Some((cmd, args)) = slash::parse_slash(line) {
-            return self.handle_slash(cmd, args);
+            if slash::is_builtin_slash(cmd) || self.runtime.registry.command(cmd).is_some() {
+                return self.handle_slash(cmd, args);
+            }
+            self.submit_prompt(line)?;
+            if !self.runtime.ui.editor_text.is_empty() {
+                self.editor.buffer = self.runtime.ui.editor_text.clone();
+                self.editor.cursor = self.editor.buffer.chars().count();
+            }
+            return Ok(false);
         }
         if !line.trim().is_empty() {
             self.submit_prompt(line)?;
@@ -1113,4 +1173,145 @@ pub fn run_interactive(mut mode: InteractiveMode, fullscreen: bool) -> Result<i3
         leave_alt_screen(&mut stdout).ok();
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_bus::EventBus;
+    use crate::extensions::ExtensionRegistry;
+    use pi_agent::{PromptTemplate, Skill, ToolRegistry};
+    use std::path::PathBuf;
+
+    fn test_runtime() -> SessionRuntime {
+        SessionRuntime {
+            cwd: PathBuf::from("."),
+            provider: "google".into(),
+            model_id: "gemini-2.5-flash".into(),
+            system_prompt: "test".into(),
+            messages: vec![],
+            steer: Default::default(),
+            follow_up: Default::default(),
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::with_names(&[]),
+            session_path: None,
+            session_id: "sess".into(),
+            session_name: None,
+            scoped_models: vec![],
+            auto_compact: true,
+            auto_retry: true,
+            is_streaming: false,
+            is_compacting: false,
+            aborted: false,
+            api_key: None,
+            allow_network: false,
+            fixture: Some(pi_ai::stream::FixtureResponse {
+                events: vec![pi_ai::events::AssistantMessageEvent::Done {
+                    reason: pi_ai::events::StopReason::Stop,
+                    message: pi_ai::events::AssistantMessage {
+                        id: "1".into(),
+                        role: "assistant".into(),
+                        content: vec![pi_ai::ContentBlock::Text { text: "ok".into() }],
+                        model: None,
+                        stop_reason: Some(pi_ai::events::StopReason::Stop),
+                        usage: None,
+                        error_message: None,
+                        timestamp: 1,
+                    },
+                }],
+                sse: None,
+            }),
+            bus: EventBus::new(),
+            max_turns: 2,
+            context_window: 128_000,
+            ui: crate::extension_ui::ExtensionUiHost::default(),
+            extensions: vec![],
+            registry: ExtensionRegistry::default(),
+            theme: "dark".into(),
+            flag_values: Default::default(),
+            pending_custom_lines: Vec::new(),
+            pending_next_turn: Vec::new(),
+            pending_custom_messages: Vec::new(),
+            pending_trigger_turn: false,
+            running_turn: false,
+            last_extension_turn_events: Vec::new(),
+            skills: vec![Skill {
+                name: "review".into(),
+                path: PathBuf::from("/tmp/review/SKILL.md"),
+                description: "Review a diff".into(),
+                body: "Review the patch.".into(),
+                disable_model_invocation: false,
+            }],
+            prompt_templates: vec![PromptTemplate {
+                name: "brief".into(),
+                path: PathBuf::from("/tmp/brief.md"),
+                body: "Summarize $1".into(),
+                description: Some("Summarize".into()),
+                argument_hint: Some("<text>".into()),
+            }],
+            enable_skill_commands: true,
+        }
+    }
+
+    #[test]
+    fn autocomplete_lists_skill_and_template_slash_names() {
+        let mut mode = InteractiveMode::new(test_runtime(), TuiMode::Regular, vec![]);
+        for ch in "/sk".chars() {
+            mode.editor.handle_key(&Key::Char(ch));
+        }
+        let values: Vec<_> = mode
+            .editor
+            .autocomplete_items()
+            .iter()
+            .map(|item| item.value.clone())
+            .collect();
+        assert!(
+            values.iter().any(|value| value == "skill:review"),
+            "{values:?}"
+        );
+        mode.editor.buffer.clear();
+        mode.editor.cursor = 0;
+        for ch in "/br".chars() {
+            mode.editor.handle_key(&Key::Char(ch));
+        }
+        let values: Vec<_> = mode
+            .editor
+            .autocomplete_items()
+            .iter()
+            .map(|item| item.value.clone())
+            .collect();
+        assert!(values.iter().any(|value| value == "brief"), "{values:?}");
+    }
+
+    #[test]
+    fn handle_line_expands_skill_and_template_before_unknown_slash_echo() {
+        let mut mode = InteractiveMode::new(test_runtime(), TuiMode::Regular, vec![]);
+        mode.handle_line("/skill:review now").unwrap();
+        assert!(mode
+            .runtime
+            .messages
+            .iter()
+            .any(|message| message.content.contains("<skill name=\"review\"")
+                && message.content.contains("now")));
+        mode.handle_line("/brief src.rs").unwrap();
+        assert!(mode
+            .runtime
+            .messages
+            .iter()
+            .any(|message| message.content == "Summarize src.rs"));
+    }
+
+    #[test]
+    fn help_lists_templates_and_skill_commands() {
+        let mode = InteractiveMode::new(test_runtime(), TuiMode::Regular, vec![]);
+        let lines = mode.help_lines();
+        assert!(
+            lines.iter().any(|line| line.starts_with("/brief")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("/skill:review")),
+            "{lines:?}"
+        );
+    }
 }

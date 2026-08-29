@@ -1,7 +1,6 @@
 //! RPC stdin/stdout protocol matching TypeScript `rpc-types.ts`.
 
 use crate::session_runtime::{to_json_event, SessionRuntime};
-use crate::slash::BUILTIN_SLASH_COMMANDS;
 use pi_agent::{QueueMode, ThinkingLevel};
 use serde_json::{json, Value};
 
@@ -64,9 +63,15 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
                 .cloned()
                 .unwrap_or_default();
             if runtime.is_streaming {
+                if let Some((cmd, args)) = crate::slash::parse_slash(text) {
+                    if runtime.registry.command(cmd).is_some() {
+                        let _ = runtime.invoke_registered_command(cmd, args);
+                        return (success(id, "prompt", None), vec![]);
+                    }
+                }
                 let message = pi_agent::AgentMessage {
                     role: "user".into(),
-                    content: text.to_string(),
+                    content: runtime.expand_user_text(text),
                     images,
                 };
                 match command
@@ -91,7 +96,7 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
             if let Some(text) = command.get("message").and_then(|v| v.as_str()) {
                 runtime.steer.enqueue(pi_agent::AgentMessage {
                     role: "user".into(),
-                    content: text.to_string(),
+                    content: runtime.expand_user_text(text),
                     images: command
                         .get("images")
                         .and_then(|v| v.as_array())
@@ -105,7 +110,7 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
             if let Some(text) = command.get("message").and_then(|v| v.as_str()) {
                 runtime.follow_up.enqueue(pi_agent::AgentMessage {
                     role: "user".into(),
-                    content: text.to_string(),
+                    content: runtime.expand_user_text(text),
                     images: vec![],
                 });
             }
@@ -372,14 +377,27 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
                     })
                 })
                 .collect();
-            commands.extend(BUILTIN_SLASH_COMMANDS.iter().map(|(name, description)| {
+            commands.extend(runtime.prompt_templates.iter().map(|template| {
                 json!({
-                    "name": name,
-                    "description": description,
+                    "name": template.name,
+                    "description": template.description,
                     "source": "prompt",
                     "sourceInfo": {
-                        "path": *name,
-                        "source": *name,
+                        "path": template.path.display().to_string(),
+                        "source": "local",
+                        "scope": "temporary",
+                        "origin": "top-level"
+                    }
+                })
+            }));
+            commands.extend(runtime.skills.iter().map(|skill| {
+                json!({
+                    "name": format!("skill:{}", skill.name),
+                    "description": skill.description,
+                    "source": "skill",
+                    "sourceInfo": {
+                        "path": skill.path.display().to_string(),
+                        "source": "local",
                         "scope": "temporary",
                         "origin": "top-level"
                     }
@@ -451,6 +469,9 @@ mod tests {
             pending_trigger_turn: false,
             running_turn: false,
             last_extension_turn_events: Vec::new(),
+            skills: Vec::new(),
+            prompt_templates: Vec::new(),
+            enable_skill_commands: true,
         }
     }
 
@@ -467,7 +488,28 @@ mod tests {
         let (reply, _) = handle_rpc(&json!({"type":"cycle_thinking_level"}), &mut rt);
         assert_eq!(reply["data"]["level"], "minimal");
         let (reply, _) = handle_rpc(&json!({"type":"get_commands"}), &mut rt);
-        assert!(reply["data"]["commands"].as_array().unwrap().len() >= 20);
+        assert!(reply["data"]["commands"].as_array().unwrap().is_empty());
+        rt.skills.push(pi_agent::Skill {
+            name: "review".into(),
+            path: PathBuf::from("/tmp/review/SKILL.md"),
+            description: "Review a diff".into(),
+            body: "Review".into(),
+            disable_model_invocation: false,
+        });
+        rt.prompt_templates.push(pi_agent::PromptTemplate {
+            name: "brief".into(),
+            path: PathBuf::from("/tmp/brief.md"),
+            body: "Summarize $1".into(),
+            description: Some("Summarize".into()),
+            argument_hint: None,
+        });
+        let (reply, _) = handle_rpc(&json!({"type":"get_commands"}), &mut rt);
+        let commands = reply["data"]["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["name"], "brief");
+        assert_eq!(commands[0]["source"], "prompt");
+        assert_eq!(commands[1]["name"], "skill:review");
+        assert_eq!(commands[1]["source"], "skill");
         let (reply, _) = handle_rpc(&json!({"type":"unknown_cmd"}), &mut rt);
         assert_eq!(reply["success"], false);
         assert_eq!(reply["error"], "Unknown command: unknown_cmd");

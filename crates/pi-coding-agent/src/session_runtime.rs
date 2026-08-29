@@ -8,7 +8,7 @@ use crate::extensions::{self, Extension, ExtensionRegistry, ExtensionTool};
 use crate::slash;
 use pi_agent::{
     compact_messages, run_agent, AgentConfig, AgentEvent, AgentMessage, AllowAllPermissionPolicy,
-    FollowUpQueue, QueueMode, SteerQueue, ThinkingLevel, ToolRegistry,
+    FollowUpQueue, PromptTemplate, QueueMode, Skill, SteerQueue, ThinkingLevel, ToolRegistry,
 };
 use pi_ai::catalog::{resolve_model, Model, ModelCost};
 use pi_ai::list_models;
@@ -57,6 +57,9 @@ pub struct SessionRuntime {
     pub pending_trigger_turn: bool,
     pub running_turn: bool,
     pub last_extension_turn_events: Vec<AgentEvent>,
+    pub skills: Vec<Skill>,
+    pub prompt_templates: Vec<PromptTemplate>,
+    pub enable_skill_commands: bool,
 }
 
 impl SessionRuntime {
@@ -301,23 +304,44 @@ impl SessionRuntime {
         Ok(self.ui.apply_calls(&invoked.ui_calls))
     }
 
+    pub fn expand_user_text(&self, text: &str) -> String {
+        let after_skill = expand_skill_command(text, &self.skills);
+        expand_prompt_template(&after_skill, &self.prompt_templates)
+    }
+
     pub fn prompt(&mut self, text: &str, images: Vec<Value>) -> Result<Vec<AgentEvent>, String> {
-        if let Some((cmd, args)) = slash::parse_slash(text) {
-            if self.registry.command(cmd).is_some() {
-                let _ = self.invoke_registered_command(cmd, args)?;
-                return Ok(vec![]);
+        self.prompt_with_expand(text, images, true)
+    }
+
+    pub fn prompt_with_expand(
+        &mut self,
+        text: &str,
+        images: Vec<Value>,
+        expand: bool,
+    ) -> Result<Vec<AgentEvent>, String> {
+        if expand {
+            if let Some((cmd, args)) = slash::parse_slash(text) {
+                if self.registry.command(cmd).is_some() {
+                    let _ = self.invoke_registered_command(cmd, args)?;
+                    return Ok(vec![]);
+                }
             }
         }
+        let text = if expand {
+            self.expand_user_text(text)
+        } else {
+            text.to_string()
+        };
         if self.aborted {
             self.aborted = false;
         }
         self.flush_pending_next_turn();
         self.messages.push(AgentMessage {
             role: "user".into(),
-            content: text.to_string(),
+            content: text.clone(),
             images,
         });
-        self.append_message("user", text);
+        self.append_message("user", &text);
         self.run_turn()
     }
 
@@ -533,6 +557,21 @@ impl SessionRuntime {
             _ => Vec::new(),
         };
         let deliver = options.get("deliverAs").and_then(|v| v.as_str());
+        let expand = options
+            .get("expandPromptTemplates")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let text = if expand {
+            if let Some((cmd, args)) = slash::parse_slash(&text) {
+                if self.registry.command(cmd).is_some() {
+                    let _ = self.invoke_registered_command(cmd, args);
+                    return;
+                }
+            }
+            self.expand_user_text(&text)
+        } else {
+            text
+        };
         if self.is_streaming {
             let msg = AgentMessage {
                 role: "user".into(),
@@ -556,7 +595,7 @@ impl SessionRuntime {
             self.pending_trigger_turn = true;
             return;
         }
-        let _ = self.prompt(&text, images);
+        let _ = self.prompt_with_expand(&text, images, false);
     }
 
     fn trigger_agent_turn(&mut self) {
@@ -1068,6 +1107,172 @@ fn models_from_provider(provider: &extensions::RegisteredProviderMeta) -> Vec<Mo
         .collect()
 }
 
+fn strip_frontmatter(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        let rest = rest
+            .strip_prefix('\n')
+            .or_else(|| rest.strip_prefix("\r\n"))
+            .unwrap_or(rest);
+        if let Some(end) = rest.find("\n---") {
+            let after = &rest[end + 4..];
+            return after
+                .strip_prefix('\n')
+                .or_else(|| after.strip_prefix("\r\n"))
+                .unwrap_or(after)
+                .to_string();
+        }
+    }
+    content.to_string()
+}
+
+fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
+    let Some(rest) = text.strip_prefix("/skill:") else {
+        return text.to_string();
+    };
+    let (name, args) = match rest.split_once(' ') {
+        Some((name, args)) => (name, args.trim()),
+        None => (rest, ""),
+    };
+    let Some(skill) = skills.iter().find(|skill| skill.name == name) else {
+        return text.to_string();
+    };
+    let body = strip_frontmatter(&skill.body).trim().to_string();
+    let base_dir = skill.base_dir().display().to_string();
+    let block = format!(
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {base_dir}.\n\n{body}\n</skill>",
+        skill.name,
+        skill.path.display()
+    );
+    if args.is_empty() {
+        block
+    } else {
+        format!("{block}\n\n{args}")
+    }
+}
+
+fn parse_command_args(args_string: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = None;
+    for ch in args_string.chars() {
+        if let Some(quote) = in_quote {
+            if ch == quote {
+                in_quote = None;
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> String {
+    let Some(rest) = text.strip_prefix('/') else {
+        return text.to_string();
+    };
+    if rest.starts_with("skill:") {
+        return text.to_string();
+    }
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..end];
+    let args_string = rest[end..].trim_start();
+    let Some(template) = templates.iter().find(|template| template.name == name) else {
+        return text.to_string();
+    };
+    substitute_args(&template.body, &parse_command_args(args_string))
+}
+
+fn substitute_args(content: &str, args: &[String]) -> String {
+    let all_args = args.join(" ");
+    let mut out = String::new();
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let rest: String = chars[i + 1..].iter().collect();
+        if let Some(stripped) = rest.strip_prefix('{') {
+            if let Some(end) = stripped.find('}') {
+                let inner = &stripped[..end];
+                let consumed = 1 + 1 + inner.len() + 1;
+                if let Some((target, default)) = inner.split_once(":-") {
+                    let value = if target == "@" || target == "ARGUMENTS" {
+                        all_args.as_str()
+                    } else {
+                        target
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|n| args.get(n.saturating_sub(1)))
+                            .map(String::as_str)
+                            .unwrap_or("")
+                    };
+                    out.push_str(if value.is_empty() { default } else { value });
+                    i += consumed;
+                    continue;
+                }
+                if let Some(slice) = inner.strip_prefix("@:") {
+                    let (start, length) = match slice.split_once(':') {
+                        Some((start, length)) => {
+                            (start.parse::<usize>().ok(), length.parse::<usize>().ok())
+                        }
+                        None => (slice.parse::<usize>().ok(), None),
+                    };
+                    let mut start = start.unwrap_or(1).saturating_sub(1);
+                    if start > args.len() {
+                        start = args.len();
+                    }
+                    let end = length
+                        .map(|len| start.saturating_add(len).min(args.len()))
+                        .unwrap_or(args.len());
+                    out.push_str(&args[start..end].join(" "));
+                    i += consumed;
+                    continue;
+                }
+            }
+        }
+        if rest.starts_with("ARGUMENTS") {
+            out.push_str(&all_args);
+            i += 1 + "ARGUMENTS".len();
+            continue;
+        }
+        if rest.starts_with('@') {
+            out.push_str(&all_args);
+            i += 2;
+            continue;
+        }
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            if let Ok(n) = digits.parse::<usize>() {
+                if n >= 1 {
+                    if let Some(arg) = args.get(n - 1) {
+                        out.push_str(arg);
+                    }
+                }
+            }
+            i += 1 + digits.len();
+            continue;
+        }
+        out.push('$');
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,6 +1316,9 @@ mod tests {
             pending_trigger_turn: false,
             running_turn: false,
             last_extension_turn_events: Vec::new(),
+            skills: Vec::new(),
+            prompt_templates: Vec::new(),
+            enable_skill_commands: true,
         };
         runtime.registry.providers.push(RegisteredProviderMeta {
             name: "my-proxy".into(),
@@ -1256,5 +1464,115 @@ mod tests {
             .items
             .iter()
             .any(|m| m.content == "queued-user"));
+    }
+
+    #[test]
+    fn expand_skill_command_matches_typescript() {
+        let skill = Skill {
+            name: "test".into(),
+            path: PathBuf::from("/tmp/skills/test/SKILL.md"),
+            description: "Test skill".into(),
+            body: "---\ndescription: Test skill\n---\nDo the thing.".into(),
+            disable_model_invocation: false,
+        };
+        let expanded = expand_skill_command("/skill:test explain this", &[skill.clone()]);
+        assert_eq!(
+            expanded,
+            "<skill name=\"test\" location=\"/tmp/skills/test/SKILL.md\">\nReferences are relative to /tmp/skills/test.\n\nDo the thing.\n</skill>\n\nexplain this"
+        );
+        assert_eq!(
+            expand_skill_command("/skill:missing args", &[skill]),
+            "/skill:missing args"
+        );
+    }
+
+    #[test]
+    fn expand_prompt_template_and_substitute_args_match_typescript() {
+        assert_eq!(
+            substitute_args("Test: $ARGUMENTS", &["a".into(), "b".into(), "c".into()]),
+            "Test: a b c"
+        );
+        assert_eq!(
+            substitute_args("$@", &["$100".into(), "$1".into()]),
+            "$100 $1"
+        );
+        assert_eq!(substitute_args("$0", &["a".into(), "b".into()]), "");
+        assert_eq!(substitute_args("$1.5", &["a".into()]), "a.5");
+        assert_eq!(substitute_args("${1:-7}", &[] as &[String]), "7");
+        assert_eq!(
+            substitute_args("${@:2}", &["a".into(), "b".into(), "c".into(), "d".into()]),
+            "b c d"
+        );
+        assert_eq!(
+            substitute_args(
+                "${@:2:2}",
+                &["a".into(), "b".into(), "c".into(), "d".into()]
+            ),
+            "b c"
+        );
+        assert_eq!(
+            substitute_args("${@:0}", &["a".into(), "b".into(), "c".into()]),
+            "a b c"
+        );
+        assert_eq!(
+            parse_command_args(r#""first arg" second"#),
+            ["first arg", "second"]
+        );
+        assert_eq!(
+            parse_command_args("label-2\n\nHere is some description #2."),
+            ["label-2", "Here", "is", "some", "description", "#2."]
+        );
+        let template = PromptTemplate {
+            name: "arg-test".into(),
+            path: PathBuf::from("/tmp/arg-test.md"),
+            body: "- arg1: $1\n- rest: ${@:2}".into(),
+            description: Some("test".into()),
+            argument_hint: None,
+        };
+        assert_eq!(
+            expand_prompt_template(
+                "/arg-test label-2\n\nHere is some description #2.",
+                &[template.clone()]
+            ),
+            "- arg1: label-2\n- rest: Here is some description #2."
+        );
+        let newline_template = PromptTemplate {
+            name: "arg-test".into(),
+            path: PathBuf::from("/tmp/arg-test.md"),
+            body: "arg1: $1".into(),
+            description: Some("test".into()),
+            argument_hint: None,
+        };
+        assert_eq!(
+            expand_prompt_template("/arg-test\nlabel-2", &[newline_template]),
+            "arg1: label-2"
+        );
+    }
+
+    #[test]
+    fn expand_user_text_runs_skill_then_template() {
+        let mut runtime = runtime_with_provider();
+        runtime.skills.push(Skill {
+            name: "review".into(),
+            path: PathBuf::from("/tmp/review/SKILL.md"),
+            description: "Review".into(),
+            body: "Review the code.".into(),
+            disable_model_invocation: false,
+        });
+        runtime.prompt_templates.push(PromptTemplate {
+            name: "brief".into(),
+            path: PathBuf::from("/tmp/brief.md"),
+            body: "Summarize $1".into(),
+            description: Some("brief".into()),
+            argument_hint: None,
+        });
+        let skill = runtime.expand_user_text("/skill:review now");
+        assert!(skill.contains("<skill name=\"review\""));
+        assert!(skill.ends_with("\n\nnow"));
+        assert_eq!(
+            runtime.expand_user_text("/brief src.rs"),
+            "Summarize src.rs"
+        );
+        assert_eq!(runtime.expand_user_text("/help"), "/help");
     }
 }

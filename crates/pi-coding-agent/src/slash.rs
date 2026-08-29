@@ -43,3 +43,10 @@ pub fn parse_slash(input: &str) -> Option<(&str, &str)> {
     let (name, args) = rest.split_once(' ').unwrap_or((rest, ""));
     Some((name, args.trim()))
 }
+
+pub fn is_builtin_slash(name: &str) -> bool {
+    matches!(name, "help" | "exit")
+        || BUILTIN_SLASH_COMMANDS
+            .iter()
+            .any(|(command, _)| *command == name)
+}

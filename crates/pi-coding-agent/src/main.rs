@@ -32,8 +32,8 @@ use event_bus::EventBus;
 use interactive::{run_interactive, InteractiveMode};
 use pi_agent::context::{load_project_context_files, render_system_prompt};
 use pi_agent::{
-    discover_default_skill_dirs, load_skills, AgentMessage, FollowUpQueue, SteerQueue,
-    ThinkingLevel, ToolRegistry,
+    discover_default_skill_dirs, format_skills_for_prompt, load_prompt_templates, load_skills,
+    AgentMessage, FollowUpQueue, SteerQueue, ThinkingLevel, ToolRegistry,
 };
 use pi_ai::catalog::resolve_model;
 use pi_ai::list_models;
@@ -208,13 +208,17 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
     };
     skill_paths.extend(parsed.skills.iter().map(PathBuf::from));
     let skills = load_skills(&skill_paths, parsed.no_skills);
-    let mut system_prompt = system_prompt;
-    if !skills.is_empty() {
-        system_prompt.push_str("\n\n# Skills\n");
-        for skill in &skills {
-            system_prompt.push_str(&format!("## {}\n{}\n", skill.name, skill.body));
-        }
+    let mut template_paths = vec![commands::agent_dir().join("prompts")];
+    if project_trusted {
+        template_paths.push(cwd.join(".pi").join("prompts"));
     }
+    template_paths.extend(parsed.prompt_templates.iter().map(PathBuf::from));
+    let prompt_templates = load_prompt_templates(&template_paths, parsed.no_prompt_templates);
+    let enable_skill_commands =
+        crate::settings::SettingsDocument::load(&crate::settings::settings_path(false))
+            .bool_setting("enableSkillCommands", true);
+    let mut system_prompt = system_prompt;
+    system_prompt.push_str(&format_skills_for_prompt(&skills));
 
     let discovered = extensions::discover_extensions(
         &commands::agent_dir(),
@@ -315,6 +319,9 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         pending_trigger_turn: false,
         running_turn: false,
         last_extension_turn_events: Vec::new(),
+        skills,
+        prompt_templates,
+        enable_skill_commands,
     };
     runtime.bind_extensions();
     if let Err(errors) = runtime.apply_cli_flags(&parsed.unknown_flags) {

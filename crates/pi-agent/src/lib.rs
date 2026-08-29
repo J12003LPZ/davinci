@@ -21,7 +21,8 @@ pub use permission::{
     NamedPermissionPolicy, PermissionDecision, PermissionPolicy, StdinAskPermissionPolicy,
 };
 pub use queues::{FollowUpQueue, QueueMode, SteerQueue};
-pub use skills::{discover_default_skill_dirs, load_skills, Skill};
+pub use skills::{discover_default_skill_dirs, format_skills_for_prompt, load_skills, Skill};
+pub use templates::{load_prompt_templates, PromptTemplate};
 pub use tools::{
     bash, edit, find_files, grep, ls, powershell, read_file, write_file, BuiltinTool, ToolError,
     ToolRegistry, ToolResult,

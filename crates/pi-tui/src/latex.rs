@@ -2042,4 +2042,161 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn satellite_and_jacobian_session_fixtures() {
+        assert_eq!(
+            render(r"E \approx \frac{0.1\ \text{lux}}{100\ \text{lm/W}} = 0.001\ \text{W/m}^2"),
+            "E ≈ (0.1 lux)/(100 lm/W) = 0.001 W/m²",
+        );
+        assert_eq!(
+            render(r"\boxed{1\ \text{milliwatt per square metre}}"),
+            "[1 milliwatt per square metre]",
+        );
+        assert_eq!(
+            render(r"5\ \text{km}^2 = 5{,}000{,}000\ \text{m}^2"),
+            "5 km² = 5,000,000 m²",
+        );
+        assert_eq!(
+            render(
+                r"P_{\text{light}} = 0.001 \times 5{,}000{,}000
+= \boxed{5{,}000\ \text{W}}"
+            ),
+            "P_light = 0.001 × 5,000,000 = [5,000 W]",
+        );
+        assert_eq!(
+            render(r"\pi(2.5\ \text{km})^2 = 19.6\ \text{km}^2"),
+            "π(2.5 km)² = 19.6 km²",
+        );
+        assert_eq!(
+            render(r"\det\!\left(\frac{\partial(F_1,F_2,F_3)}{\partial(x,y,z)}\right)=-2."),
+            "det((∂(F₁,F₂,F₃))/(∂(x,y,z))) = -2.",
+        );
+        assert_eq!(
+            render(
+                r"\begin{aligned}
+F(0,0,-\tfrac14)&=(-\tfrac14,0,0),\\
+F(1,-\tfrac32,\tfrac{13}2)&=(-\tfrac14,0,0),\\
+F(-1,\tfrac32,\tfrac{13}2)&=(-\tfrac14,0,0).
+\end{aligned}"
+            ),
+            "F(0,0,-1/4) = (-1/4,0,0),\nF(1,-3/2,13/2) = (-1/4,0,0),\nF(-1,3/2,13/2) = (-1/4,0,0).",
+        );
+        assert_eq!(
+            render(
+                r"J = \begin{pmatrix}
+\frac{\partial f_1}{\partial x} & \frac{\partial f_1}{\partial y} & \frac{\partial f_1}{\partial z} \\
+\frac{\partial f_2}{\partial x} & \frac{\partial f_2}{\partial y} & \frac{\partial f_2}{\partial z} \\
+\frac{\partial f_3}{\partial x} & \frac{\partial f_3}{\partial y} & \frac{\partial f_3}{\partial z}
+\end{pmatrix}"
+            ),
+            "J = ⎛ (∂ f₁)/(∂ x) │ (∂ f₁)/(∂ y) │ (∂ f₁)/(∂ z) ⎞\n    ⎜ (∂ f₂)/(∂ x) │ (∂ f₂)/(∂ y) │ (∂ f₂)/(∂ z) ⎟\n    ⎝ (∂ f₃)/(∂ x) │ (∂ f₃)/(∂ y) │ (∂ f₃)/(∂ z) ⎠",
+        );
+        assert_eq!(render(r"F: \mathbb{C}^3 \to \mathbb{C}^3"), "F: ℂ³ → ℂ³");
+        assert_eq!(render(r"\mathbb{P}^3"), "ℙ³");
+        assert_eq!(render(r"x \neq 0"), "x ≠ 0");
+        assert_eq!(render(r"n \geq 2"), "n ≥ 2");
+        assert_eq!(render(r"f_1^{\text{ut}}, f_2^{\text{ut}}"), "f₁ᵘᵗ, f₂ᵘᵗ");
+    }
+
+    #[test]
+    fn stress_test_and_display_matrix_fixtures() {
+        assert_eq!(render(r"e^{i\pi}+1=0"), "e^(iπ)+1 = 0");
+        assert_eq!(
+            render(r"x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}"),
+            "x = (-b±√(b²-4ac))/(2a)",
+        );
+        assert_eq!(
+            render(r"\int_0^\infty e^{-x^2}\,dx=\frac{\sqrt{\pi}}{2}"),
+            "∫₀^∞ e^(-x²) dx = (√π)/2",
+        );
+        assert_eq!(
+            render(r"\sum_{n=1}^{\infty}\frac{1}{n^2}=\frac{\pi^2}{6}"),
+            "∑ₙ₌₁^∞1/(n²) = π²/6",
+        );
+        assert_eq!(
+            render(r"\lim_{x\to 0}\frac{\sin x}{x}=1"),
+            "lim[x→0] (sin x)/x = 1"
+        );
+        assert_eq!(
+            render(r"\epsilon+\varepsilon+\varsigma+\varkappa+\oplus+\otimes+\therefore+\because"),
+            "ϵ+ε+ς+ϰ+⊕+⊗+∴+∵",
+        );
+        assert_eq!(
+            render(r"\begin{alignedat}{2}a&=b&\quad c&=d\\e&=f&g&=h\end{alignedat}"),
+            "a = b c = d\ne = f g = h",
+        );
+        assert_eq!(
+            render(r"\begin{cases}a & x<0 \\ b & x=0 \\ c & x>0\end{cases}"),
+            "⎧ a if x < 0\n⎨ b if x = 0\n⎩ c if x > 0",
+        );
+        assert_eq!(
+            display(
+                r"R\left(\frac{\pi}{4}\right)
+=
+\begin{pmatrix}
+\frac{\sqrt{2}}{2} & -\frac{\sqrt{2}}{2}\\
+\frac{\sqrt{2}}{2} & \frac{\sqrt{2}}{2}
+\end{pmatrix}."
+            ),
+            "   π\nR( ─ ) = ⎛ (√2)/2 │ -(√2)/2 ⎞\n   4     ⎝ (√2)/2 │ (√2)/2  ⎠.",
+        );
+        assert_eq!(
+            display(r"\sum_{i=0}^n x_i=\begin{pmatrix}a&b\\c&d\end{pmatrix}."),
+            " n\n ∑  xᵢ = ⎛ a │ b ⎞\ni=0      ⎝ c │ d ⎠.",
+        );
+        assert_eq!(
+            display(r"\frac{\frac{x^2+1}{x-1}-\frac{2x}{x+1}}{\frac{x}{x^2-1}}"),
+            "(x²+1)/(x-1)-2x/(x+1)\n─────────────────────\n      x/(x²-1)",
+        );
+        let boxed = r"\boxed{
+(1,1,1),\ (1,1,2),\ (1,2,5),\ (1,5,13),\ (2,5,29),\
+(1,13,34),\ (1,34,89)
+}.";
+        assert_eq!(
+            display(boxed),
+            "[(1,1,1), (1,1,2), (1,2,5), (1,5,13), (2,5,29), (1,13,34), (1,34,89)].",
+        );
+        assert_eq!(render("a\\\r\nb"), "a b");
+        assert_eq!(
+            render(
+                r"P_{\text{electric}} = 5\ \text{kW} \times 0.2
+= \boxed{1\ \text{kW}}"
+            ),
+            "P_electric = 5 kW × 0.2 = [1 kW]",
+        );
+        assert_eq!(
+            render(r"e^{i\theta}=\cos\theta+i\sin\theta"),
+            "e^(iθ) = cos θ+i sin θ",
+        );
+        assert_eq!(
+            render(r"\lim_{n\to\infty}\left(1+\frac{1}{n}\right)^n=e"),
+            "lim[n→∞] (1+1/n)ⁿ = e",
+        );
+        assert_eq!(
+            render(r"\int_0^1 \frac{x^2}{1+x^3}\,dx=\frac{1}{3}\ln 2"),
+            "∫₀¹ x²/(1+x³) dx = 1/3 ln 2",
+        );
+        assert_eq!(
+            render(r"\sum_{k=1}^{n}\frac{k}{k+1}=n+1-H_{n+1}"),
+            "∑ₖ₌₁ⁿk/(k+1) = n+1-Hₙ₊₁",
+        );
+        assert_eq!(
+            display(
+                r"A\mathbf e_1=\begin{pmatrix}\pi\\0\end{pmatrix},\qquad A\mathbf e_2=\begin{pmatrix}0\\\frac{1}{\pi}\end{pmatrix}."
+            ),
+            "Ae₁ = ⎛ π ⎞, Ae₂ = ⎛ 0   ⎞\n      ⎝ 0 ⎠        ⎝ 1/π ⎠.",
+        );
+        assert_eq!(
+            display(
+                r"\mathbf w
+=
+R\left(\frac{\pi}{4}\right)
+\begin{pmatrix}1\\0\end{pmatrix}
+=
+\begin{pmatrix}\frac{\sqrt{2}}{2}\\\frac{\sqrt{2}}{2}\end{pmatrix}."
+            ),
+            "       π\nw = R( ─ ) ⎛ 1 ⎞ = ⎛ (√2)/2 ⎞\n       4   ⎝ 0 ⎠   ⎝ (√2)/2 ⎠.",
+        );
+    }
 }

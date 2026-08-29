@@ -110,6 +110,13 @@ impl SettingsDocument {
         }
     }
 
+    pub fn bool_setting(&self, key: &str, default: bool) -> bool {
+        self.value
+            .get(key)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(default)
+    }
+
     pub fn npm_command(&self) -> Option<Vec<String>> {
         let args = self
             .value
