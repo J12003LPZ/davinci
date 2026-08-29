@@ -2053,9 +2053,6 @@ fn run_interactive(
     apply_project_trust_warning(&mut session, parsed, agent);
     apply_changelog_overlay(&mut session, agent, &stored, &default_agent_dir());
     refresh_chrome_footer(&mut session, agent);
-    if tui_host.is_none() {
-        apply_terminal_title(&mut session, agent, None);
-    }
     apply_cache_miss_notices(
         &mut session.chrome,
         agent,
@@ -2098,6 +2095,7 @@ fn run_interactive(
     } else {
         print!("{}", InteractiveSession::enter_sequences(fullscreen));
         println!("{}", session.chrome.render(session.width).join("\n"));
+        apply_terminal_title(&mut session, agent, None);
         None
     };
     let prepared = prepare_initial_message(
@@ -4834,8 +4832,7 @@ fn apply_terminal_title(
 }
 
 fn ensure_interactive_tools(session: &mut InteractiveSession) {
-    let mut statuses = Vec::new();
-    tools_manager::ensure_managed_tools(Some(&mut |status| statuses.push(status)));
+    let statuses = tools_manager::ensure_managed_tools();
     for status in statuses {
         show_managed_tool_status(session, &status);
     }

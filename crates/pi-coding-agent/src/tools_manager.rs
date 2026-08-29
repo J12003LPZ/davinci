@@ -18,13 +18,6 @@ pub enum ManagedTool {
 }
 
 impl ManagedTool {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Fd => "fd",
-            Self::Rg => "rg",
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             Self::Fd => "fd",
@@ -487,85 +480,70 @@ fn download_tool(tool: ManagedTool, bin_dir: &Path) -> Result<String, String> {
 }
 
 /// TS `ensureTool`.
-pub fn ensure_tool(
-    tool: ManagedTool,
-    mut on_status: Option<&mut dyn FnMut(ToolStatus)>,
-) -> Option<String> {
-    ensure_tool_in(
-        &tools_bin_dir(&default_agent_dir()),
-        tool,
-        on_status.as_deref_mut(),
-    )
+pub fn ensure_tool(tool: ManagedTool) -> (Option<String>, Vec<ToolStatus>) {
+    ensure_tool_in(&tools_bin_dir(&default_agent_dir()), tool)
 }
 
-pub fn ensure_tool_in(
-    bin_dir: &Path,
-    tool: ManagedTool,
-    mut on_status: Option<&mut dyn FnMut(ToolStatus)>,
-) -> Option<String> {
+pub fn ensure_tool_in(bin_dir: &Path, tool: ManagedTool) -> (Option<String>, Vec<ToolStatus>) {
+    let mut statuses = Vec::new();
     if let Some(existing) = get_tool_path_in(bin_dir, tool) {
-        return Some(existing);
+        return (Some(existing), statuses);
     }
-    let mut emit = |status: ToolStatus| {
-        if let Some(callback) = on_status.as_mut() {
-            callback(status);
-        }
-    };
     if let Some(reply) = fixture_reply(tool) {
         if reply == "offline" || reply.eq_ignore_ascii_case("skip") {
-            emit(ToolStatus {
+            statuses.push(ToolStatus {
                 kind: ToolStatusKind::Warning,
                 message: format!(
                     "{} not found. Offline mode enabled, skipping download.",
                     tool.name()
                 ),
             });
-            return None;
+            return (None, statuses);
         }
         if let Some(message) = reply.strip_prefix("error:") {
-            emit(ToolStatus {
+            statuses.push(ToolStatus {
                 kind: ToolStatusKind::Warning,
                 message: format!("Failed to download {}: {message}", tool.name()),
             });
-            return None;
+            return (None, statuses);
         }
         let src = PathBuf::from(&reply);
         if src.is_file() {
             let dest = bin_dir.join(binary_file_name(tool));
-            emit(ToolStatus {
+            statuses.push(ToolStatus {
                 kind: ToolStatusKind::Info,
                 message: format!("{} not found. Downloading...", tool.name()),
             });
             match copy_fixture_binary(&src, &dest) {
                 Ok(path) => {
-                    emit(ToolStatus {
+                    statuses.push(ToolStatus {
                         kind: ToolStatusKind::Info,
                         message: format!("{} installed to {path}", tool.name()),
                     });
-                    return Some(path);
+                    return (Some(path), statuses);
                 }
                 Err(err) => {
-                    emit(ToolStatus {
+                    statuses.push(ToolStatus {
                         kind: ToolStatusKind::Warning,
                         message: format!("Failed to download {}: {err}", tool.name()),
                     });
-                    return None;
+                    return (None, statuses);
                 }
             }
         }
     }
     if is_offline_mode_enabled() {
-        emit(ToolStatus {
+        statuses.push(ToolStatus {
             kind: ToolStatusKind::Warning,
             message: format!(
                 "{} not found. Offline mode enabled, skipping download.",
                 tool.name()
             ),
         });
-        return None;
+        return (None, statuses);
     }
     if cfg!(target_os = "android") {
-        emit(ToolStatus {
+        statuses.push(ToolStatus {
             kind: ToolStatusKind::Warning,
             message: format!(
                 "{} not found. Install with: pkg install {}",
@@ -573,39 +551,40 @@ pub fn ensure_tool_in(
                 tool.termux_package()
             ),
         });
-        return None;
+        return (None, statuses);
     }
-    emit(ToolStatus {
+    statuses.push(ToolStatus {
         kind: ToolStatusKind::Info,
         message: format!("{} not found. Downloading...", tool.name()),
     });
     match download_tool(tool, bin_dir) {
         Ok(path) => {
-            emit(ToolStatus {
+            statuses.push(ToolStatus {
                 kind: ToolStatusKind::Info,
                 message: format!("{} installed to {path}", tool.name()),
             });
-            Some(path)
+            (Some(path), statuses)
         }
         Err(err) => {
-            emit(ToolStatus {
+            statuses.push(ToolStatus {
                 kind: ToolStatusKind::Warning,
                 message: format!("Failed to download {}: {err}", tool.name()),
             });
-            None
+            (None, statuses)
         }
     }
 }
 
-pub fn ensure_managed_tools(mut on_status: Option<&mut dyn FnMut(ToolStatus)>) {
-    let bin_dir = tools_bin_dir(&default_agent_dir());
-    let _ = ensure_tool_in(&bin_dir, ManagedTool::Fd, on_status.as_deref_mut());
-    let _ = ensure_tool_in(&bin_dir, ManagedTool::Rg, on_status.as_deref_mut());
-    if let Some(path) = get_tool_path_in(&bin_dir, ManagedTool::Fd) {
+pub fn ensure_managed_tools() -> Vec<ToolStatus> {
+    let (fd_path, mut statuses) = ensure_tool(ManagedTool::Fd);
+    let (_rg_path, rg_statuses) = ensure_tool(ManagedTool::Rg);
+    statuses.extend(rg_statuses);
+    if let Some(path) = fd_path {
         if path.contains('/') || path.contains('\\') {
             std::env::set_var("PI_FD_PATH", path);
         }
     }
+    statuses
 }
 
 #[cfg(test)]
@@ -685,14 +664,7 @@ mod tests {
         std::env::set_var("PI_OFFLINE", "1");
         std::env::remove_var("PI_ENSURE_TOOL_REPLY");
         std::env::remove_var("PI_ENSURE_TOOL_FD_REPLY");
-        let mut statuses = Vec::new();
-        let result = ensure_tool_in(
-            dir.path(),
-            ManagedTool::Fd,
-            Some(&mut |status| {
-                statuses.push(status);
-            }),
-        );
+        let (result, statuses) = ensure_tool_in(dir.path(), ManagedTool::Fd);
         std::env::remove_var("PI_OFFLINE");
         restore_path(previous_path);
         assert!(result.is_none());
@@ -714,14 +686,7 @@ mod tests {
         let previous_path = isolate_path();
         std::env::remove_var("PI_OFFLINE");
         std::env::set_var("PI_ENSURE_TOOL_FD_REPLY", src.to_string_lossy().as_ref());
-        let mut statuses = Vec::new();
-        let installed = ensure_tool_in(
-            dir.path(),
-            ManagedTool::Fd,
-            Some(&mut |status| {
-                statuses.push(status);
-            }),
-        );
+        let (installed, statuses) = ensure_tool_in(dir.path(), ManagedTool::Fd);
         std::env::remove_var("PI_ENSURE_TOOL_FD_REPLY");
         restore_path(previous_path);
         let dest = dir.path().join("fd");
