@@ -166,7 +166,7 @@ pub struct ThemeDetection {
 }
 
 /// Dedicated OSC drain independent of the crossterm key loop.
-/// Reads `PI_OSC_DRAIN_REPLY`, then polls `PI_OSC_TTY` (or `/dev/tty` when set via env)
+/// Reads `PI_OSC_DRAIN_REPLY`, then polls `PI_OSC_TTY`, then `/dev/tty`,
 /// until data arrives or `timeout_ms` elapses — matching TS `queryTerminalBackgroundColor`.
 pub fn drain_osc_tty(timeout_ms: u64) -> Option<String> {
     if let Ok(reply) = std::env::var("PI_OSC_DRAIN_REPLY") {
@@ -174,10 +174,21 @@ pub fn drain_osc_tty(timeout_ms: u64) -> Option<String> {
             return Some(reply);
         }
     }
-    let path = std::env::var("PI_OSC_TTY").ok()?;
+    if let Ok(path) = std::env::var("PI_OSC_TTY") {
+        if let Some(data) = poll_path(&path, timeout_ms) {
+            return Some(data);
+        }
+    }
+    if std::env::var("PI_OSC_TTY").is_err() {
+        return read_tty_timeout("/dev/tty", timeout_ms);
+    }
+    None
+}
+
+fn poll_path(path: &str, timeout_ms: u64) -> Option<String> {
     let started = std::time::Instant::now();
     loop {
-        if let Ok(data) = std::fs::read_to_string(&path) {
+        if let Ok(data) = std::fs::read_to_string(path) {
             if !data.is_empty() {
                 return Some(data);
             }
@@ -187,6 +198,25 @@ pub fn drain_osc_tty(timeout_ms: u64) -> Option<String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+fn read_tty_timeout(path: &str, timeout_ms: u64) -> Option<String> {
+    let path = path.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let mut buf = [0u8; 4096];
+        if let Ok(n) = std::io::Read::read(&mut file, &mut buf) {
+            if n > 0 {
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+        }
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
+        .ok()
 }
 
 pub fn query_terminal_background_color(timeout_ms: u64) -> Option<RgbColor> {
@@ -341,6 +371,14 @@ mod tests {
             })
         );
         assert!(drained.contains("11;"));
+        std::env::remove_var("PI_OSC_TTY");
+    }
+
+    #[test]
+    fn drain_osc_tty_times_out_when_path_empty() {
+        std::env::remove_var("PI_OSC_DRAIN_REPLY");
+        std::env::set_var("PI_OSC_TTY", "/no/such/pi-osc-tty");
+        assert!(drain_osc_tty(15).is_none());
         std::env::remove_var("PI_OSC_TTY");
     }
 }
