@@ -89,3 +89,33 @@ impl AgentTool for WriteFileTool {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_read_and_write_file_tools() {
+        let temp_dir = tempdir().unwrap();
+        let write_tool = WriteFileTool {
+            root_dir: temp_dir.path().to_path_buf(),
+        };
+        let read_tool = ReadFileTool {
+            root_dir: temp_dir.path().to_path_buf(),
+        };
+
+        let write_args = serde_json::json!({
+            "path": "test.txt",
+            "content": "Hello Rust Migration!"
+        });
+        let write_res = write_tool.execute(write_args).await.unwrap();
+        assert!(write_res.contains("Successfully wrote"));
+
+        let read_args = serde_json::json!({
+            "path": "test.txt"
+        });
+        let content = read_tool.execute(read_args).await.unwrap();
+        assert_eq!(content, "Hello Rust Migration!");
+    }
+}

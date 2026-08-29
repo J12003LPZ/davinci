@@ -874,6 +874,7 @@ dependencies = [
  "pi-session-sqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

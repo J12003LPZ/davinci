@@ -74,3 +74,17 @@ impl TuiState {
         frame.render_widget(input, chunks[2]);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tui_state_initialization() {
+        let state = TuiState::new("test-session");
+        assert_eq!(state.session_id, "test-session");
+        assert!(state.messages.is_empty());
+        assert_eq!(state.input_buffer, "");
+        assert!(!state.is_streaming);
+    }
+}
