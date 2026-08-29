@@ -93,6 +93,32 @@ pub enum ExtensionEvent {
     TurnStart,
     #[serde(rename = "turn_end")]
     TurnEnd,
+    #[serde(rename = "project_trust")]
+    ProjectTrust { path: String },
+    #[serde(rename = "resources_discover")]
+    ResourcesDiscover { cwd: String, reason: String },
+    #[serde(rename = "session_info_changed")]
+    SessionInfoChanged,
+    #[serde(rename = "session_compact")]
+    SessionCompact,
+    #[serde(rename = "session_compact_failed")]
+    SessionCompactFailed { error: String },
+    #[serde(rename = "session_tree")]
+    SessionTree,
+    #[serde(rename = "context")]
+    Context,
+    #[serde(rename = "before_provider_headers")]
+    BeforeProviderHeaders { provider: String, model: String },
+    #[serde(rename = "after_provider_response")]
+    AfterProviderResponse { provider: String, model: String },
+    #[serde(rename = "ui_prompt_start")]
+    UiPromptStart { kind: String },
+    #[serde(rename = "ui_prompt_end")]
+    UiPromptEnd { kind: String },
+    #[serde(rename = "model_select")]
+    ModelSelect { provider: String, model: String },
+    #[serde(rename = "thinking_level_select")]
+    ThinkingLevelSelect { level: String },
 }
 
 #[derive(Debug, Clone)]
@@ -673,6 +699,19 @@ impl ExtensionHost {
                 ExtensionEvent::UserBash { .. } => "user_bash",
                 ExtensionEvent::TurnStart => "turn_start",
                 ExtensionEvent::TurnEnd => "turn_end",
+                ExtensionEvent::ProjectTrust { .. } => "project_trust",
+                ExtensionEvent::ResourcesDiscover { .. } => "resources_discover",
+                ExtensionEvent::SessionInfoChanged => "session_info_changed",
+                ExtensionEvent::SessionCompact => "session_compact",
+                ExtensionEvent::SessionCompactFailed { .. } => "session_compact_failed",
+                ExtensionEvent::SessionTree => "session_tree",
+                ExtensionEvent::Context => "context",
+                ExtensionEvent::BeforeProviderHeaders { .. } => "before_provider_headers",
+                ExtensionEvent::AfterProviderResponse { .. } => "after_provider_response",
+                ExtensionEvent::UiPromptStart { .. } => "ui_prompt_start",
+                ExtensionEvent::UiPromptEnd { .. } => "ui_prompt_end",
+                ExtensionEvent::ModelSelect { .. } => "model_select",
+                ExtensionEvent::ThinkingLevelSelect { .. } => "thinking_level_select",
             })
             .collect()
     }
@@ -948,6 +987,13 @@ mod tests {
         });
         host.emit(ExtensionEvent::TurnStart);
         host.emit(ExtensionEvent::TurnEnd);
+        host.emit(ExtensionEvent::ProjectTrust {
+            path: "/tmp".into(),
+        });
+        host.emit(ExtensionEvent::BeforeProviderHeaders {
+            provider: "google".into(),
+            model: "gemini".into(),
+        });
         assert_eq!(
             host.kinds(),
             [
@@ -956,7 +1002,9 @@ mod tests {
                 "session_start",
                 "user_bash",
                 "turn_start",
-                "turn_end"
+                "turn_end",
+                "project_trust",
+                "before_provider_headers"
             ]
         );
     }

@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use pi_client::{connect_unix, write_message, PiClient};
-use pi_server::{bind_unix, serve_stream, PiServer};
+use pi_server::{bind_unix, encode_auth_preamble, serve_stream_with_auth, PiServer};
+use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnixAddress {
@@ -139,7 +140,6 @@ pub fn parse_client_command(args: &[String]) -> Result<ClientCommand, String> {
 }
 
 pub fn run_server(command: ServerCommand) -> Result<String, String> {
-    let _ = command.auth_token;
     if command.listen.is_empty() {
         return Err("server requires --listen unix:///absolute/path".into());
     }
@@ -162,12 +162,12 @@ pub fn run_server(command: ServerCommand) -> Result<String, String> {
         .unwrap_or_else(|_| pi_session::default_session_dir());
     let mut server = PiServer::new(sessions_dir);
     let (stream, _) = listener.accept().map_err(|err| err.to_string())?;
-    serve_stream(&mut server, stream).map_err(|err| err.to_string())?;
+    serve_stream_with_auth(&mut server, stream, command.auth_token.as_deref())
+        .map_err(|err| err.to_string())?;
     Ok(format!("Served {}", address.path))
 }
 
 pub fn run_client(command: ClientCommand) -> Result<String, String> {
-    let _ = command.auth_token;
     let address = command
         .connect
         .ok_or_else(|| "client requires --connect unix:///absolute/path".to_string())?;
@@ -175,6 +175,11 @@ pub fn run_client(command: ClientCommand) -> Result<String, String> {
         return Ok(format!("Connecting to unix://{}", address.path));
     }
     let mut stream = connect_unix(&address.path).map_err(|err| err.to_string())?;
+    if let Some(token) = &command.auth_token {
+        stream
+            .write_all(&encode_auth_preamble(token))
+            .map_err(|err| err.to_string())?;
+    }
     write_message(&mut stream, &PiClient::hello_message()).map_err(|err| err.to_string())?;
     Ok(format!("Connected to unix://{}", address.path))
 }

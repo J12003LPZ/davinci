@@ -7,6 +7,8 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pi_agent::{default_system_prompt, Agent, AgentEvent};
+use pi_ai::{content_text, AssistantMessage, ContentBlock, StopReason};
 use pi_protocol::{
     encode_server_message, AssistantContent, ClientMessage, ClientMessageDecoder, Command,
     CommandResult, ModelCost, ModelMetadata, ModelRef, ProtocolError, ProtocolErrorCode,
@@ -28,11 +30,18 @@ pub enum ServerError {
 
 struct LiveSession {
     session: JsonlSession,
+    agent: Agent,
     phase: SessionPhase,
     model: ModelRef,
     thinking_level: ThinkingLevel,
     queued_steer: Vec<TranscriptItem>,
     attached: bool,
+}
+
+fn new_runtime_agent(cwd: &str) -> Agent {
+    let mut agent = Agent::new(default_system_prompt());
+    agent.cwd = PathBuf::from(cwd);
+    agent
 }
 
 pub struct PiServer {
@@ -73,6 +82,42 @@ impl PiServer {
         self.pending_events.push(ServerEvent::ServerSnapshot {
             snapshot: self.snapshot(),
         });
+    }
+
+    fn emit_runtime_progress(&mut self, session_id: &str, events: &[AgentEvent]) {
+        for event in events {
+            match event {
+                AgentEvent::MessageStart { message } if message.role == "user" => {
+                    self.pending_events.push(ServerEvent::SessionProgress {
+                        session_id: session_id.into(),
+                        progress: TranscriptProgress::ItemStarted {
+                            item: TranscriptItem::User {
+                                id: "runtime-user".into(),
+                                content: vec![TextOrImage::Text {
+                                    text: content_text(&message.content),
+                                }],
+                                timestamp: 0,
+                            },
+                        },
+                    });
+                }
+                AgentEvent::MessageUpdate {
+                    assistant_message_event: pi_ai::AssistantMessageEvent::TextDelta { delta, .. },
+                    ..
+                } if !delta.is_empty() => {
+                    self.pending_events.push(ServerEvent::SessionProgress {
+                        session_id: session_id.into(),
+                        progress: TranscriptProgress::AssistantDelta {
+                            message_id: "runtime-assistant".into(),
+                            content_index: 0,
+                            kind: "text".into(),
+                            delta: delta.clone(),
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     fn emit_prompt_progress(&mut self, session_id: &str, snapshot: &SessionSnapshot) {
@@ -215,6 +260,7 @@ impl PiServer {
                     .map_err(internal)?;
                 let id = session.header.id.clone();
                 let live = LiveSession {
+                    agent: new_runtime_agent(&cwd),
                     session,
                     phase: SessionPhase::Idle,
                     model: model.unwrap_or_else(pi_protocol::default_model_ref),
@@ -248,6 +294,7 @@ impl PiServer {
             }
             Command::Prompt { session_id, text } => {
                 self.ensure_live(&session_id)?;
+                let mut loop_events = Vec::new();
                 {
                     let live = self
                         .live
@@ -262,26 +309,48 @@ impl PiServer {
                             serde_json::json!([{"type":"text","text": text}]),
                         ))
                         .map_err(internal)?;
+                    live.agent.prompt(&text);
                     live.phase = SessionPhase::Turn;
                     live.queued_steer.clear();
-                    if let Ok(reply) = std::env::var("PI_SERVER_PROMPT_REPLY") {
-                        let reply = if reply.is_empty() {
-                            format!("reply:{text}")
-                        } else {
-                            reply
-                        };
-                        live.session
-                            .append_entry(pi_session::SessionEntry::message(
-                                "assistant",
-                                serde_json::json!([{"type":"text","text": reply}]),
-                            ))
+                    if std::env::var("PI_SERVER_KEEP_TURN").is_err() {
+                        let user_text = text.clone();
+                        loop_events = live
+                            .agent
+                            .run_loop(|_| {
+                                let reply = std::env::var("PI_SERVER_PROMPT_REPLY")
+                                    .ok()
+                                    .map(|value| {
+                                        if value.is_empty() {
+                                            format!("reply:{user_text}")
+                                        } else {
+                                            value
+                                        }
+                                    })
+                                    .unwrap_or_else(|| format!("reply:{user_text}"));
+                                Ok(AssistantMessage {
+                                    id: pi_agent::new_message_id(),
+                                    role: "assistant".into(),
+                                    content: vec![ContentBlock::Text { text: reply }],
+                                    model: "server".into(),
+                                    usage: None,
+                                    stop_reason: Some(StopReason::Stop),
+                                    error_message: None,
+                                })
+                            })
                             .map_err(internal)?;
-                        live.phase = SessionPhase::Idle;
-                    } else if std::env::var("PI_SERVER_KEEP_TURN").is_err() {
+                        if let Some(reply) = live.agent.last_assistant_text() {
+                            live.session
+                                .append_entry(pi_session::SessionEntry::message(
+                                    "assistant",
+                                    serde_json::json!([{"type":"text","text": reply}]),
+                                ))
+                                .map_err(internal)?;
+                        }
                         live.phase = SessionPhase::Idle;
                     }
                 }
                 let session = self.live_snapshot(&session_id)?;
+                self.emit_runtime_progress(&session_id, &loop_events);
                 self.emit_prompt_progress(&session_id, &session);
                 Ok(CommandResult::Prompt { session })
             }
@@ -372,9 +441,12 @@ impl PiServer {
             return Ok(());
         }
         let session = open_named(&self.sessions_dir, session_id)?;
+        let mut agent = new_runtime_agent(&session.header.cwd);
+        hydrate_agent_messages(&mut agent, &session);
         self.live.insert(
             session_id.to_string(),
             LiveSession {
+                agent,
                 session,
                 phase: SessionPhase::Idle,
                 model: pi_protocol::default_model_ref(),
@@ -563,12 +635,88 @@ fn internal(err: impl ToString) -> ProtocolError {
     }
 }
 
+fn hydrate_agent_messages(agent: &mut Agent, session: &JsonlSession) {
+    agent.messages = session
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let message = entry.message.as_ref()?;
+            let role = message.get("role").and_then(Value::as_str)?.to_string();
+            let text = message
+                .get("content")
+                .map(|content| {
+                    if let Some(text) = content.as_str() {
+                        return text.to_string();
+                    }
+                    content
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            Some(pi_ai::ChatMessage::text(&role, text))
+        })
+        .collect();
+}
+
+/// Transport-level auth preamble sent before protocol bytes (TS listener auth).
+pub fn encode_auth_preamble(token: &str) -> Vec<u8> {
+    format!("AUTH {token}\n").into_bytes()
+}
+
+pub fn authorize_transport(expected: Option<&str>, preamble: &[u8]) -> Result<(), ServerError> {
+    let Some(expected) = expected.filter(|token| !token.is_empty()) else {
+        return Ok(());
+    };
+    let text = std::str::from_utf8(preamble).unwrap_or("");
+    let line = text.lines().next().unwrap_or("").trim();
+    let got = line.strip_prefix("AUTH ").map(str::trim);
+    if got == Some(expected) {
+        Ok(())
+    } else {
+        Err(ServerError::Protocol("Unauthorized".into()))
+    }
+}
+
+fn read_auth_line<R: Read>(stream: &mut R) -> Result<Vec<u8>, ServerError> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream
+            .read(&mut byte)
+            .map_err(|err| ServerError::Io(err.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        buf.push(byte[0]);
+        if byte[0] == b'\n' || buf.len() > 4096 {
+            break;
+        }
+    }
+    Ok(buf)
+}
+
 pub fn bind_unix(path: &str) -> Result<UnixListener, ServerError> {
     UnixListener::bind(path).map_err(|err| ServerError::Io(err.to_string()))
 }
 
 pub fn bind_tcp(addr: &str) -> Result<TcpListener, ServerError> {
     TcpListener::bind(addr).map_err(|err| ServerError::Io(err.to_string()))
+}
+
+pub fn serve_stream_with_auth<S: Read + Write>(
+    server: &mut PiServer,
+    mut stream: S,
+    expected_token: Option<&str>,
+) -> Result<(), ServerError> {
+    if expected_token.is_some() {
+        let preamble = read_auth_line(&mut stream)?;
+        authorize_transport(expected_token, &preamble)?;
+    }
+    serve_stream(server, stream)
 }
 
 pub fn serve_stream<S: Read + Write>(
@@ -843,7 +991,51 @@ mod tests {
             ServerEvent::SessionProgress {
                 progress: TranscriptProgress::AssistantDelta { kind, delta, .. },
                 ..
-            } if kind == "text" && delta == "delta-text"
+            }             if kind == "text" && delta == "delta-text"
         )));
+    }
+
+    #[test]
+    fn prompt_runs_agent_loop_without_fixture() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PI_SERVER_PROMPT_REPLY");
+        std::env::remove_var("PI_SERVER_KEEP_TURN");
+        let dir = tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let created = create_session(&mut server);
+        let prompted = match memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "p1".into(),
+                request: Command::Prompt {
+                    session_id: created.id.clone(),
+                    text: "hello-loop".into(),
+                },
+            },
+        ) {
+            ServerMessage::Response {
+                result: Some(CommandResult::Prompt { session }),
+                ..
+            } => session,
+            other => panic!("expected prompt: {other:?}"),
+        };
+        assert_eq!(prompted.phase, SessionPhase::Idle);
+        assert!(prompted.transcript.iter().any(|item| matches!(
+            item,
+            TranscriptItem::Assistant { content, .. }
+                if content.iter().any(|part| matches!(part, AssistantContent::Text { text } if text == "reply:hello-loop"))
+        )));
+    }
+
+    #[test]
+    fn authorize_transport_requires_auth_preamble() {
+        assert!(authorize_transport(None, b"").is_ok());
+        assert!(authorize_transport(Some("secret"), &encode_auth_preamble("secret")).is_ok());
+        assert_eq!(
+            authorize_transport(Some("secret"), b"AUTH wrong\n")
+                .unwrap_err()
+                .to_string(),
+            "Unauthorized"
+        );
     }
 }

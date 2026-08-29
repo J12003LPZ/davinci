@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Protocol server matching @earendil-works/pi-server"
 
 [dependencies]
+pi-agent = { path = "../pi-agent" }
 pi-ai = { path = "../pi-ai" }
 pi-client = { path = "../pi-client" }
 pi-protocol = { path = "../pi-protocol" }

@@ -137,7 +137,27 @@ impl TelemetrySpan for RecordingSpan {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetryAttributeDefinition {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetrySpanDefinition {
+    pub description: String,
+    #[serde(default)]
+    pub start_attributes: serde_json::Map<String, Value>,
+    #[serde(default)]
+    pub end_attributes: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TelemetrySchemaDefinition {
     pub version: u32,
     pub spans: serde_json::Map<String, Value>,
@@ -168,5 +188,33 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "agent.turn");
         assert_eq!(spans[0].events[0].name, "start");
+        let span = TelemetrySpanDefinition {
+            description: "One agent turn".into(),
+            start_attributes: {
+                let mut attrs = serde_json::Map::new();
+                attrs.insert(
+                    "provider".into(),
+                    serde_json::to_value(TelemetryAttributeDefinition {
+                        type_name: "string".into(),
+                        description: "Provider id".into(),
+                        required: true,
+                        sensitive: None,
+                    })
+                    .unwrap(),
+                );
+                attrs
+            },
+            end_attributes: serde_json::Map::new(),
+        };
+        let schema = define_telemetry_schema(TelemetrySchemaDefinition {
+            version: 1,
+            spans: {
+                let mut spans = serde_json::Map::new();
+                spans.insert("agent.turn".into(), serde_json::to_value(span).unwrap());
+                spans
+            },
+        });
+        assert_eq!(schema.version, 1);
+        assert!(schema.spans.contains_key("agent.turn"));
     }
 }

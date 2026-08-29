@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (framed `Connection`/`ByteTransport`, embed ModelRuntime + extensionsResult, live SSE `message_update`, managed-install self-update). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (server agent-loop runtime, transport AUTH preamble, missing extension events, evals harness). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -119,10 +119,12 @@ Closed this slice: `SessionHandle` / `SessionClient` matching TS create/acquire/
 
 Closed this slice: `pi-client` `Connection` + `ByteTransport` matching TS framed hello/handshake (`PiClient is already {state}`, data-before-hello, expected hello, hello_error, unexpected handshake, `Byte transport closed`, maxFrameLength TypeError). `SessionClient::with_factory` / `with_loopback` reconnects through a fresh factory result. Embed `createAgentSession` returns `modelRuntime` (`ModelRuntimeSnapshot`) and `extensionsResult` (loaded manifests + errors). Agent `complete` may return live SSE events via `live_complete_streaming_with`; `message_update` uses those instead of synthesizing from the final message. Managed-install self-update reads `PI_MANAGED_INSTALL_ROOT` / `managed-install.json`, locks `{root}/update`, fetches installer fixtures (`PI_MANAGED_INSTALLER_REPLY` / dry-run; no live pi.dev), and activates `current-version`.
 
+Closed this slice: `pi-server` prompt drives `Agent::run_loop` (fixture `PI_SERVER_PROMPT_REPLY` or TS `reply:{text}`; `PI_SERVER_KEEP_TURN` still holds the turn). Transport AUTH preamble (`AUTH {token}\\n`) is required before protocol bytes when `--auth-token` is set. Extension bus adds `project_trust`, `resources_discover`, `session_compact`/`_failed`, `session_tree`, `before_provider_headers`, `after_provider_response`, `ui_prompt_start`/`end`, `model_select`, `thinking_level_select`. `pi-evals` `run_harness` locks TS error strings and transcript tool_call/tool_result events. Telemetry schema records typed span/attribute definitions.
+
 Still not product-equivalent:
 
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
 - TypeScript under `vendor/pi` remains the behavioral spec.
-- `pi-server` is not yet a full TS session server (no live agent-loop runtime or authenticated transport service).
-- RPC full `AgentSessionEvent` stream extras and some extension events (`project_trust`, `resources_discover`, `session_info_changed`, `before_provider_headers`, …) are still incomplete.
-- `pi-evals` live harness, `pi-telemetry` typed schema, and `pi-session-sqlite` full TS repository/BM25/branch cache remain thinner than TypeScript.
+- `pi-server` is still not the full TS listener service (unix socket mode/link, multi-connection attach sets, exclusive runtime acquire/dispose).
+- RPC `AgentSessionEvent` extras (`queue_update`, `compaction_*`, `session_info_changed` streaming) remain incomplete.
+- `pi-session-sqlite` branch-cache / full TS repository API remains thinner than TypeScript.

@@ -958,6 +958,10 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
             provider: agent.provider.clone(),
             model: agent.model_id.clone(),
         });
+        host.emit(ExtensionEvent::BeforeProviderHeaders {
+            provider: agent.provider.clone(),
+            model: agent.model_id.clone(),
+        });
     }
     let js_stream = {
         let host = host.lock().unwrap_or_else(|err| err.into_inner());
@@ -1068,6 +1072,10 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
     agent.pre_tool = None;
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+        host.emit(ExtensionEvent::AfterProviderResponse {
+            provider: agent.provider.clone(),
+            model: agent.model_id.clone(),
+        });
         host.emit(ExtensionEvent::TurnEnd);
         host.emit(ExtensionEvent::AgentEnd);
         host.emit(ExtensionEvent::AgentSettled);
@@ -1394,6 +1402,10 @@ fn run_interactive(
     let _ = session.begin_osc_query(OSC_QUERY_TIMEOUT_MS);
     let mut host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
+    host.emit(ExtensionEvent::ResourcesDiscover {
+        cwd: agent.cwd.display().to_string(),
+        reason: "startup".into(),
+    });
     host.emit(ExtensionEvent::SessionStart);
     apply_extension_shortcuts(parsed, &mut session, agent, &host);
     session.slash_commands = interactive_slash_commands(agent, parsed);
@@ -2161,6 +2173,13 @@ fn handle_user_line(
                 return Ok(true);
             }
             let result = agent.compact(instructions.as_deref());
+            if result.compacted {
+                host.emit(ExtensionEvent::SessionCompact);
+            } else {
+                host.emit(ExtensionEvent::SessionCompactFailed {
+                    error: result.summary.clone(),
+                });
+            }
             println!("{}", result.summary);
             Ok(true)
         }
@@ -2179,10 +2198,20 @@ fn handle_user_line(
             let (provider, model_id) = parse_model_ref("google", Some(&value));
             agent.provider = provider;
             agent.model_id = model_id;
+            loaded_extension_host(parsed).emit(ExtensionEvent::ModelSelect {
+                provider: agent.provider.clone(),
+                model: agent.model_id.clone(),
+            });
             println!("model={}/{}", agent.provider, agent.model_id);
             Ok(true)
         }
-        SlashAction::SetThinking(level) => apply_thinking_level(agent, session, &level, false),
+        SlashAction::SetThinking(level) => {
+            let result = apply_thinking_level(agent, session, &level, false);
+            loaded_extension_host(parsed).emit(ExtensionEvent::ThinkingLevelSelect {
+                level: level.clone(),
+            });
+            result
+        }
         SlashAction::Export(path) => {
             if let Some(session) = &agent.session {
                 let output = PathBuf::from(path.unwrap_or_else(|| "session.html".into()));
@@ -2271,6 +2300,13 @@ fn handle_user_line(
                 println!("{}", session.chrome.status);
                 return Ok(true);
             }
+            host.emit(ExtensionEvent::UiPromptStart {
+                kind: "tree".into(),
+            });
+            host.emit(ExtensionEvent::SessionTree);
+            host.emit(ExtensionEvent::UiPromptEnd {
+                kind: "tree".into(),
+            });
             session.chrome.status = "Session Tree".into();
             println!("{}", session.chrome.status);
             Ok(true)
@@ -2282,6 +2318,13 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Trust => {
+            let mut host = loaded_extension_host(parsed);
+            host.emit(ExtensionEvent::UiPromptStart {
+                kind: "trust".into(),
+            });
+            host.emit(ExtensionEvent::ProjectTrust {
+                path: agent.cwd.display().to_string(),
+            });
             open_trust_selector(agent, session);
             Ok(true)
         }
