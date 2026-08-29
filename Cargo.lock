@@ -569,6 +569,7 @@ dependencies = [
  "pi-session-sqlite",
  "pi-telemetry",
  "pi-tui",
+ "regex",
  "serde",
  "serde_json",
  "similar",

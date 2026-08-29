@@ -1,4 +1,6 @@
 mod args;
+mod changelog;
+mod clipboard;
 mod commands;
 mod event_bus;
 mod export;
@@ -8,6 +10,7 @@ mod interactive;
 mod rpc;
 mod session_runtime;
 mod settings;
+mod share;
 mod slash;
 
 use std::io::{self, BufRead, IsTerminal};

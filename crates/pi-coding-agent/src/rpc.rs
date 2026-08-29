@@ -63,6 +63,22 @@ pub fn handle_rpc(command: &Value, runtime: &mut SessionRuntime) -> (Value, Vec<
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
+            if runtime.is_streaming {
+                let message = pi_agent::AgentMessage {
+                    role: "user".into(),
+                    content: text.to_string(),
+                    images,
+                };
+                match command
+                    .get("streamingBehavior")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("steer")
+                {
+                    "followUp" => runtime.follow_up.enqueue(message),
+                    _ => runtime.steer.enqueue(message),
+                }
+                return (success(id, "prompt", None), vec![]);
+            }
             match runtime.prompt(text, images) {
                 Ok(events) => (
                     success(id, "prompt", None),
@@ -424,6 +440,14 @@ mod tests {
         let (reply, _) = handle_rpc(&json!({"type":"unknown_cmd"}), &mut rt);
         assert_eq!(reply["success"], false);
         assert_eq!(reply["error"], "Unknown command: unknown_cmd");
+        rt.is_streaming = true;
+        let (reply, events) = handle_rpc(
+            &json!({"type":"prompt","message":"later","streamingBehavior":"followUp"}),
+            &mut rt,
+        );
+        assert_eq!(reply["success"], true);
+        assert!(events.is_empty());
+        assert_eq!(rt.follow_up.items[0].content, "later");
     }
 
     #[test]

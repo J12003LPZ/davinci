@@ -325,26 +325,35 @@ impl InteractiveMode {
                     self.chat.push("system", format!("imported {args}"));
                 }
             }
-            "share" => {
-                self.chat.push(
-                    "system",
-                    "Share: export HTML then create a secret GitHub gist (gh gist create --secret)",
-                );
-            }
-            "copy" => match self.runtime.last_assistant() {
-                Some(text) => self
+            "share" => match self.runtime.export_html(None) {
+                Ok(path) => match crate::share::share_via_gist(&path) {
+                    Ok(shared) => self.chat.push(
+                        "system",
+                        format!(
+                            "Share URL: {}\nGist: {}",
+                            shared.preview_url, shared.gist_url
+                        ),
+                    ),
+                    Err(err) => self.chat.push("error", err),
+                },
+                Err(err) => self
                     .chat
-                    .push("system", format!("copied {} chars", text.len())),
-                None => self.chat.push("error", "no assistant message"),
+                    .push("error", format!("Failed to export session: {err}")),
+            },
+            "copy" => match self.runtime.last_assistant() {
+                Some(text) => match crate::clipboard::copy_to_clipboard(&text) {
+                    Ok(()) => self
+                        .chat
+                        .push("system", "Copied last agent message to clipboard"),
+                    Err(err) => self.chat.push("error", err),
+                },
+                None => self.chat.push("error", "No agent messages to copy yet."),
             },
             "changelog" => {
-                self.chat.push(
-                    "system",
-                    format!(
-                        "pi {} changelog: see vendor/pi CHANGELOG",
-                        crate::args::VERSION
-                    ),
-                );
+                let markdown =
+                    crate::changelog::render_changelog(&crate::changelog::changelog_path());
+                self.chat.push("system", "What's New");
+                self.chat.push("changelog", markdown);
             }
             "fork" => {
                 if args.is_empty() {
