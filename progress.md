@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (nested settings: compaction, retry, thinkingBudgets, branchSummary, httpProxy, sessionDir). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (compaction file-ops + checkpoint serialize). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -65,7 +65,9 @@ Closed this slice: nested settings wired to product paths — `compaction` (`ena
 
 Closed this slice: `packages` object form (`source`/`autoload`/resource globs) plus nested `terminal`/`images` with flat fallback; capability overrides (`images`/`trueColor`/`hyperlinks`) applied to Kitty/env.
 
+Closed this slice: compaction file-ops (`read`/`write`/`edit` → `<read-files>`/`<modified-files>`), TS conversation serialize, checkpoint prompt, and JSONL `compaction` entries with `details`.
+
 Still not product-equivalent:
 
-- LLM compaction summarization still local (no `completeSimple` checkpoint prompt / file-ops details)
+- Compaction still uses a local serialize+file-ops summary rather than `completeSimple` LLM checkpoint generation
 - Provider SDK retries (`maxRetries`/`maxRetryDelayMs` on the HTTP client) are stored and timeout is applied; undici-style retry-after is not

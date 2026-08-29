@@ -22,12 +22,30 @@ impl Default for CompactionSettings {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOperations {
+    pub read: Vec<String>,
+    pub written: Vec<String>,
+    pub edited: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionDetails {
+    #[serde(rename = "readFiles")]
+    pub read_files: Vec<String>,
+    #[serde(rename = "modifiedFiles")]
+    pub modified_files: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionResult {
     pub summary: String,
     pub messages: Vec<ChatMessage>,
     pub compacted: bool,
+    pub details: CompactionDetails,
 }
+
+pub const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.";
 
 pub fn calculate_context_tokens(
     total_tokens: u64,
@@ -173,6 +191,7 @@ pub fn compact_messages_with(
             summary: String::new(),
             messages: messages.to_vec(),
             compacted: false,
+            details: CompactionDetails::default(),
         };
     }
     let cut = find_cut_point(messages, keep_recent_tokens);
@@ -186,20 +205,25 @@ pub fn compact_messages_with(
             summary: String::new(),
             messages: messages.to_vec(),
             compacted: false,
+            details: CompactionDetails::default(),
         };
     }
 
-    let mut summary = String::from("Compacted conversation:\n");
-    for message in &messages[..cut_index] {
-        let text = message_text(message);
-        if !text.is_empty() {
-            summary.push_str(&format!("- {}: {}\n", message.role, truncate(&text, 240)));
-        }
-    }
+    let prefix = &messages[..cut_index];
+    let file_ops = extract_file_ops(prefix);
+    let details = compute_file_lists(&file_ops);
+    let mut summary = serialize_conversation(prefix);
     if let Some(instructions) = custom_instructions {
         summary.push_str("\nInstructions: ");
         summary.push_str(instructions);
+    } else {
+        summary.push('\n');
+        summary.push_str(SUMMARIZATION_PROMPT);
     }
+    summary.push_str(&format_file_operations(
+        &details.read_files,
+        &details.modified_files,
+    ));
 
     let mut compacted = vec![ChatMessage::text("user", summary.clone())];
     compacted.extend(messages[cut_index..].iter().cloned());
@@ -207,7 +231,101 @@ pub fn compact_messages_with(
         summary,
         messages: compacted,
         compacted: true,
+        details,
     }
+}
+
+pub fn extract_file_ops(messages: &[ChatMessage]) -> FileOperations {
+    let mut ops = FileOperations::default();
+    for message in messages {
+        if message.role != "assistant" {
+            continue;
+        }
+        for block in &message.content {
+            let MessageContent::ToolCall {
+                name, arguments, ..
+            } = block
+            else {
+                continue;
+            };
+            let Some(path) = arguments.get("path").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            match name.as_str() {
+                "read" => ops.read.push(path.to_string()),
+                "write" => ops.written.push(path.to_string()),
+                "edit" => ops.edited.push(path.to_string()),
+                _ => {}
+            }
+        }
+    }
+    ops.read.sort();
+    ops.read.dedup();
+    ops.written.sort();
+    ops.written.dedup();
+    ops.edited.sort();
+    ops.edited.dedup();
+    ops
+}
+
+pub fn compute_file_lists(file_ops: &FileOperations) -> CompactionDetails {
+    let mut modified: Vec<String> = file_ops
+        .edited
+        .iter()
+        .chain(file_ops.written.iter())
+        .cloned()
+        .collect();
+    modified.sort();
+    modified.dedup();
+    let read_files = file_ops
+        .read
+        .iter()
+        .filter(|path| !modified.iter().any(|item| item == *path))
+        .cloned()
+        .collect();
+    CompactionDetails {
+        read_files,
+        modified_files: modified,
+    }
+}
+
+pub fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
+    let mut sections = Vec::new();
+    if !read_files.is_empty() {
+        sections.push(format!(
+            "<read-files>\n{}\n</read-files>",
+            read_files.join("\n")
+        ));
+    }
+    if !modified_files.is_empty() {
+        sections.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified_files.join("\n")
+        ));
+    }
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", sections.join("\n\n"))
+    }
+}
+
+fn serialize_conversation(messages: &[ChatMessage]) -> String {
+    let mut parts = Vec::new();
+    for message in messages {
+        let text = message_text(message);
+        if text.is_empty() {
+            continue;
+        }
+        let label = match message.role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            "toolResult" => "Tool",
+            other => other,
+        };
+        parts.push(format!("[{label}]: {}", truncate(&text, 2000)));
+    }
+    parts.join("\n")
 }
 
 fn message_text(message: &ChatMessage) -> String {
@@ -286,5 +404,38 @@ mod tests {
         assert!(!cut.is_split_turn);
         let mid = find_cut_point(&messages, 8);
         assert_ne!(mid.first_kept_index, 2);
+    }
+
+    #[test]
+    fn file_ops_and_summary_tags_match_ts() {
+        let assistant = ChatMessage {
+            role: "assistant".into(),
+            content: vec![
+                MessageContent::ToolCall {
+                    id: "1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "a.rs"}),
+                },
+                MessageContent::ToolCall {
+                    id: "2".into(),
+                    name: "edit".into(),
+                    arguments: serde_json::json!({"path": "a.rs"}),
+                },
+                MessageContent::ToolCall {
+                    id: "3".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "b.rs"}),
+                },
+            ],
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+        };
+        let details = compute_file_lists(&extract_file_ops(&[assistant]));
+        assert_eq!(details.read_files, vec!["b.rs"]);
+        assert_eq!(details.modified_files, vec!["a.rs"]);
+        let xml = format_file_operations(&details.read_files, &details.modified_files);
+        assert!(xml.contains("<read-files>\nb.rs\n</read-files>"));
+        assert!(xml.contains("<modified-files>\na.rs\n</modified-files>"));
     }
 }

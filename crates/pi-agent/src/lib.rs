@@ -10,9 +10,11 @@ mod tools;
 mod turn;
 
 pub use compaction::{
-    calculate_context_tokens, compact_messages, compact_messages_with, estimate_context_tokens,
-    estimate_tokens, find_cut_point, should_compact, CompactionResult, CompactionSettings,
-    CutPointResult, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
+    calculate_context_tokens, compact_messages, compact_messages_with, compute_file_lists,
+    estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
+    format_file_operations, should_compact, CompactionDetails, CompactionResult,
+    CompactionSettings, CutPointResult, FileOperations, DEFAULT_KEEP_RECENT_TOKENS,
+    DEFAULT_RESERVE_TOKENS, SUMMARIZATION_PROMPT,
 };
 pub use context::{load_context_files, ContextFile};
 pub use events::AgentEvent;
@@ -177,6 +179,33 @@ impl Agent {
             custom_instructions,
             self.compaction.keep_recent_tokens,
         );
+        if result.compacted {
+            if let Some(session) = &mut self.session {
+                let first_kept = session
+                    .entries
+                    .last()
+                    .map(|entry| entry.id.clone())
+                    .unwrap_or_default();
+                let mut extra = serde_json::Map::new();
+                extra.insert("summary".into(), serde_json::json!(result.summary));
+                extra.insert("firstKeptEntryId".into(), serde_json::json!(first_kept));
+                extra.insert(
+                    "details".into(),
+                    serde_json::to_value(&result.details).unwrap_or_default(),
+                );
+                extra.insert("fromHook".into(), serde_json::json!(false));
+                let _ = session.append_entry(SessionEntry {
+                    id: String::new(),
+                    entry_type: "compaction".into(),
+                    parent_id: session.leaf_id.clone(),
+                    seq: 0,
+                    timestamp: 0,
+                    message: None,
+                    custom_type: None,
+                    extra,
+                });
+            }
+        }
         self.messages = result.messages.clone();
         self.is_compacting = false;
         result
