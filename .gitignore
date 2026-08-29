@@ -1,0 +1,10 @@
+/target
+*.rs.bk
+.idea
+.vscode
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+node_modules
+dist
+/agent-tools

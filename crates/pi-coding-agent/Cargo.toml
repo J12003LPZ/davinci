@@ -1,0 +1,25 @@
+[package]
+name = "pi-coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pi coding-agent CLI (Rust port; TypeScript remains authoritative)"
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+pi-agent.workspace = true
+pi-ai.workspace = true
+pi-core.workspace = true
+pi-session.workspace = true
+pi-session-sqlite.workspace = true
+pi-tui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

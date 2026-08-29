@@ -1,0 +1,17 @@
+[package]
+name = "pi-session-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite session backend with writer-leases"
+
+[dependencies]
+pi-core.workspace = true
+pi-session.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "pi-parity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Differential fixtures locking TypeScript/Rust JSON and CBOR shapes"
+
+[dependencies]
+pi-ai.workspace = true
+pi-agent.workspace = true
+pi-client.workspace = true
+pi-core.workspace = true
+pi-protocol.workspace = true
+pi-server.workspace = true
+pi-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true

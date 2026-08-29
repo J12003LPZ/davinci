@@ -1,0 +1,25 @@
+{
+  "role": "assistant",
+  "content": [
+    { "type": "text", "text": "echo:hi" },
+    { "type": "toolCall", "id": "c1", "name": "echo", "arguments": { "text": "hi" } }
+  ],
+  "api": "openai-completions",
+  "provider": "mock",
+  "model": "mock-1",
+  "usage": {
+    "input": 8,
+    "output": 7,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "totalTokens": 15,
+    "cost": {
+      "input": 0.008,
+      "output": 0.014,
+      "cacheRead": 0.0,
+      "cacheWrite": 0.0,
+      "total": 0.022
+    }
+  },
+  "stopReason": "toolUse"
+}

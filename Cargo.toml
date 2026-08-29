@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pi-core",
+    "crates/pi-protocol",
+    "crates/pi-session",
+    "crates/pi-session-sqlite",
+    "crates/pi-ai",
+    "crates/pi-agent",
+    "crates/pi-client",
+    "crates/pi-server",
+    "crates/pi-tui",
+    "crates/pi-coding-agent",
+    "crates/pi-parity",
+]
+
+[workspace.package]
+version = "0.84.4"
+edition = "2021"
+license = "MIT"
+description = "Rust port of the pi TypeScript monorepo"
+repository = "https://github.com/earendil-works/pi"
+
+[workspace.dependencies]
+pi-core = { path = "crates/pi-core" }
+pi-protocol = { path = "crates/pi-protocol" }
+pi-session = { path = "crates/pi-session" }
+pi-session-sqlite = { path = "crates/pi-session-sqlite" }
+pi-ai = { path = "crates/pi-ai" }
+pi-agent = { path = "crates/pi-agent" }
+pi-client = { path = "crates/pi-client" }
+pi-server = { path = "crates/pi-server" }
+pi-tui = { path = "crates/pi-tui" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "=1.11.0", features = ["v4", "v7"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "=3.14.0"
+hex = "0.4"
+clap = { version = "=4.5.23", features = ["derive"] }
+
+[profile.dev]
+opt-level = 0
