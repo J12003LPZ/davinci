@@ -1,10 +1,11 @@
 //! Unix listener matching `vendor/pi/packages/server/src/transports/unix/listener.ts`.
 
 use std::fs::{self, Permissions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use pi_protocol::DEFAULT_MAX_FRAME_LENGTH;
 use sha2::{Digest, Sha256};
@@ -207,5 +208,121 @@ fn is_socket_live(path: &Path) -> bool {
             err.kind(),
             ErrorKind::ConnectionRefused | ErrorKind::NotFound | ErrorKind::BrokenPipe
         ),
+    }
+}
+
+pub struct UnixByteConnection {
+    stream: Option<UnixStream>,
+    graceful_close_timeout_ms: u64,
+    max_pending_bytes: u64,
+    pending_bytes: u64,
+    closed: bool,
+    closing: bool,
+}
+
+impl UnixByteConnection {
+    pub fn new(stream: UnixStream, graceful_close_timeout_ms: u64, max_pending_bytes: u64) -> Self {
+        Self {
+            stream: Some(stream),
+            graceful_close_timeout_ms,
+            max_pending_bytes,
+            pending_bytes: 0,
+            closed: false,
+            closing: false,
+        }
+    }
+
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn send(&mut self, chunk: &[u8]) -> Result<(), ServerError> {
+        if self.closed || self.closing {
+            return Err(ServerError::Io("Unix connection is closed".into()));
+        }
+        if self.pending_bytes + chunk.len() as u64 > self.max_pending_bytes {
+            return Err(ServerError::Io(
+                "Unix connection exceeded its pending byte limit".into(),
+            ));
+        }
+        self.pending_bytes += chunk.len() as u64;
+        let result = self.write_all(chunk);
+        self.pending_bytes = self.pending_bytes.saturating_sub(chunk.len() as u64);
+        result
+    }
+
+    pub fn close(&mut self, final_chunk: Option<&[u8]>) -> Result<(), ServerError> {
+        if self.closed || self.stream.is_none() {
+            self.mark_closed();
+            return Ok(());
+        }
+        if self.closing {
+            return Ok(());
+        }
+        self.closing = true;
+        let started = Instant::now();
+        if let Some(chunk) = final_chunk {
+            if let Err(error) = self.write_all(chunk) {
+                self.mark_closed();
+                return Err(error);
+            }
+        }
+        if started.elapsed() > Duration::from_millis(self.graceful_close_timeout_ms) {
+            self.mark_closed();
+            return Ok(());
+        }
+        self.mark_closed();
+        Ok(())
+    }
+
+    pub fn mark_closed(&mut self) {
+        self.closed = true;
+        self.closing = true;
+        self.stream.take();
+    }
+
+    fn write_all(&mut self, chunk: &[u8]) -> Result<(), ServerError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(ServerError::Io("Unix connection is closed".into()));
+        };
+        stream.write_all(chunk).map_err(|err| {
+            if err.kind() == ErrorKind::BrokenPipe
+                || err.kind() == ErrorKind::ConnectionReset
+                || err.kind() == ErrorKind::NotConnected
+            {
+                ServerError::Io("Unix connection closed during write".into())
+            } else {
+                ServerError::Io(err.to_string())
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn unix_byte_connection_send_close_and_pending_limit_match_ts() {
+        let (left, mut right) = UnixStream::pair().unwrap();
+        let mut conn = UnixByteConnection::new(left, 5_000, 8);
+        conn.send(b"hello").unwrap();
+        let mut buf = [0u8; 5];
+        right.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        match conn.send(b"too-large") {
+            Err(err) => assert_eq!(
+                err.to_string(),
+                "Unix connection exceeded its pending byte limit"
+            ),
+            Ok(()) => panic!("expected pending byte limit"),
+        }
+        conn.close(Some(b"!")).unwrap();
+        match conn.send(b"x") {
+            Err(err) => assert_eq!(err.to_string(), "Unix connection is closed"),
+            Ok(()) => panic!("expected closed"),
+        }
     }
 }

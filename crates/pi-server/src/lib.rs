@@ -24,7 +24,7 @@ use uuid::Uuid;
 pub use unix::{
     bind_unix, bind_unix_with, max_unix_socket_path_bytes, owned_bind_path,
     resolve_unix_listener_options, validate_unix_socket_path, BoundUnixListener,
-    UnixListenerOptions, UnixListenerOptionsBuilder, DEFAULT_SOCKET_MODE,
+    UnixByteConnection, UnixListenerOptions, UnixListenerOptionsBuilder, DEFAULT_SOCKET_MODE,
 };
 
 #[derive(Debug, Error)]

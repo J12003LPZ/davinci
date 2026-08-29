@@ -371,6 +371,16 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 will_retry: false,
                 error_message: None,
             });
+            if let Some(entry) = runtime
+                .agent
+                .session
+                .as_ref()
+                .and_then(|session| session.entries.last())
+            {
+                runtime.emit(RpcSessionEvent::EntryAppended {
+                    entry: serde_json::to_value(entry).unwrap_or(Value::Null),
+                });
+            }
             ok(
                 id,
                 &kind,
@@ -1099,6 +1109,11 @@ mod tests {
         assert!(kinds.contains(&"compaction_end"));
         assert!(kinds.contains(&"thinking_level_changed"));
         assert!(kinds.contains(&"session_info_changed"));
+        let appended = serde_json::to_value(RpcSessionEvent::EntryAppended {
+            entry: serde_json::json!({"id": "e1", "type": "message"}),
+        })
+        .unwrap();
+        assert_eq!(appended["type"], "entry_appended");
         let queue = events
             .iter()
             .rev()
