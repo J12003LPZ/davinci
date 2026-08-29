@@ -5,6 +5,7 @@ mod box_comp;
 mod chrome;
 mod custom_message;
 mod editor;
+mod extension_ui;
 mod first_time;
 mod fuzzy;
 mod image;
@@ -39,6 +40,10 @@ pub use custom_message::{
     CustomMessage, MessageRenderOptions, MessageRenderer, MessageRendererRegistry,
 };
 pub use editor::Editor;
+pub use extension_ui::{
+    ExtensionConfirm, ExtensionDialogAction, ExtensionEditor, ExtensionInput, ExtensionSelector,
+    ExtensionWidget, WidgetPlacement, MAX_WIDGET_LINES,
+};
 pub use first_time::{
     detect_terminal_theme, FirstTimeAction, FirstTimeSetup, FirstTimeSetupResult, SETUP_LOGO_LINES,
 };
@@ -73,7 +78,8 @@ pub use session::{
     KITTY_KEYBOARD_DISABLE, KITTY_KEYBOARD_QUERY, OSC_QUERY_TIMEOUT_MS,
 };
 pub use session_selector::{
-    NameFilter, SessionItem, SessionScope, SessionSelector, SessionSelectorAction, SortMode,
+    match_session, parse_search_query, NameFilter, ParsedSearchQuery, SearchMode, SessionItem,
+    SessionScope, SessionSelector, SessionSelectorAction, SortMode,
 };
 pub use settings::{
     default_interactive_settings, format_http_idle_timeout, interactive_settings_list,

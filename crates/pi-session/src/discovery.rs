@@ -16,6 +16,8 @@ pub struct SessionSummary {
     pub name: Option<String>,
     pub parent_session_id: Option<String>,
     pub source_format: u8,
+    /// Concatenated user/assistant text matching TS `SessionInfo.allMessagesText`.
+    pub all_messages_text: String,
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -85,30 +87,77 @@ fn modified_at(path: &Path) -> u64 {
 fn summarize_file(path: &Path) -> Option<SessionSummary> {
     let first = fs::read_to_string(path).ok()?;
     let first_line = first.lines().next()?;
-    if let Ok(header) = parse_header(first_line) {
-        return Some(crate::codec::metadata_from_header(
-            &header,
-            path,
-            modified_at(path),
-        ));
+    let mut summary = if let Ok(header) = parse_header(first_line) {
+        crate::codec::metadata_from_header(&header, path, modified_at(path))
+    } else {
+        let session = JsonlSession::open(path).ok()?;
+        SessionSummary {
+            id: session.header.id,
+            path: path.to_path_buf(),
+            cwd: session.header.cwd,
+            created_at: session.header.created_at,
+            modified_at: modified_at(path),
+            name: session
+                .header
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("name"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            parent_session_id: session.header.parent_session_id,
+            source_format: 3,
+            all_messages_text: String::new(),
+        }
+    };
+    summary.all_messages_text = extract_all_messages_text(path);
+    Some(summary)
+}
+
+fn extract_text_content(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                (block.get("type").and_then(|value| value.as_str()) == Some("text"))
+                    .then(|| block.get("text").and_then(|value| value.as_str()))
+                    .flatten()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
     }
-    let session = JsonlSession::open(path).ok()?;
-    Some(SessionSummary {
-        id: session.header.id,
-        path: path.to_path_buf(),
-        cwd: session.header.cwd,
-        created_at: session.header.created_at,
-        modified_at: modified_at(path),
-        name: session
-            .header
-            .metadata
-            .as_ref()
-            .and_then(|value| value.get("name"))
+}
+
+fn extract_all_messages_text(path: &Path) -> String {
+    let Ok(session) = JsonlSession::open(path) else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for entry in &session.entries {
+        if entry.entry_type != "message" {
+            continue;
+        }
+        let Some(message) = &entry.message else {
+            continue;
+        };
+        let role = message
+            .get("role")
             .and_then(|value| value.as_str())
-            .map(str::to_string),
-        parent_session_id: session.header.parent_session_id,
-        source_format: 3,
-    })
+            .unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        let text = extract_text_content(content);
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    parts.join(" ")
 }
 
 pub fn discover_sessions(
@@ -227,5 +276,11 @@ mod tests {
         let prefix = &first.header.id[..8];
         let resolved = resolve_session_ref(dir.path(), Some("/tmp/work"), prefix).unwrap();
         assert_eq!(resolved.id, first.header.id);
+        let found = discover_sessions(dir.path(), Some("/tmp/work"))
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == first.header.id)
+            .unwrap();
+        assert_eq!(found.all_messages_text, "a");
     }
 }

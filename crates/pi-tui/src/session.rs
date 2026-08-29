@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 
 use crate::autocomplete::{apply_completion, suggestions, SlashCommandSpec};
 use crate::chrome::ChatChrome;
+use crate::extension_ui::{
+    ExtensionConfirm, ExtensionDialogAction, ExtensionEditor, ExtensionInput, ExtensionSelector,
+};
 use crate::first_time::{FirstTimeAction, FirstTimeSetup};
 use crate::image::{delete_all_kitty_images, delete_kitty_image, encode_kitty};
 use crate::keybindings::Keybindings;
@@ -102,6 +105,10 @@ pub enum SessionAction {
         id: String,
         path: String,
     },
+    ExtensionSelect(Option<String>),
+    ExtensionInput(Option<String>),
+    ExtensionEditor(Option<String>),
+    ExtensionConfirm(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +131,7 @@ pub struct InteractiveSession {
     pub enabled_model_ids: EnabledIds,
     pub keybindings: Keybindings,
     pub extension_shortcuts: Vec<(String, String)>,
+    pub extension_dialog_context: Option<String>,
     pub follow_up_queue: Vec<String>,
     pub model_thinking_levels: BTreeMap<String, String>,
     pub warnings_anthropic_extra_usage: bool,
@@ -178,6 +186,10 @@ pub enum OverlayKind {
     ScopedModels,
     Login,
     FirstTime,
+    ExtensionSelect,
+    ExtensionInput,
+    ExtensionEditor,
+    ExtensionConfirm,
 }
 
 impl InteractiveSession {
@@ -207,6 +219,7 @@ impl InteractiveSession {
             enabled_model_ids: None,
             keybindings: Keybindings::defaults(),
             extension_shortcuts: Vec::new(),
+            extension_dialog_context: None,
             follow_up_queue: Vec::new(),
             model_thinking_levels: BTreeMap::new(),
             warnings_anthropic_extra_usage: true,
@@ -350,6 +363,10 @@ impl InteractiveSession {
         self.chrome.login_dialog = None;
         self.chrome.tree = None;
         self.chrome.scoped_models = None;
+        self.chrome.extension_selector = None;
+        self.chrome.extension_input = None;
+        self.chrome.extension_editor = None;
+        self.chrome.extension_confirm = None;
         self.overlay_kind = OverlayKind::None;
         self.chrome.status.clear();
     }
@@ -363,6 +380,51 @@ impl InteractiveSession {
             || self.chrome.settings_list.is_some()
             || self.chrome.settings_submenu.is_some()
             || self.chrome.session_selector.is_some()
+            || self.chrome.extension_selector.is_some()
+            || self.chrome.extension_input.is_some()
+            || self.chrome.extension_editor.is_some()
+            || self.chrome.extension_confirm.is_some()
+    }
+
+    pub fn apply_extension_ui_calls(&mut self, calls: &[serde_json::Value]) {
+        for call in calls {
+            self.chrome.apply_ui_call(call);
+        }
+    }
+
+    pub fn open_extension_selector(&mut self, title: impl Into<String>, options: Vec<String>) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionSelect;
+        self.chrome.extension_selector = Some(ExtensionSelector::new(title, options));
+        self.chrome.status = "Extension selector".into();
+        if self.extension_dialog_context.is_none() {
+            self.extension_dialog_context = Some("extension-select".into());
+        }
+    }
+
+    pub fn open_extension_input(
+        &mut self,
+        title: impl Into<String>,
+        placeholder: impl Into<String>,
+    ) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionInput;
+        self.chrome.extension_input = Some(ExtensionInput::new(title, placeholder));
+        self.chrome.status = "Extension input".into();
+    }
+
+    pub fn open_extension_editor(&mut self, title: impl Into<String>, prefill: impl Into<String>) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionEditor;
+        self.chrome.extension_editor = Some(ExtensionEditor::new(title, prefill));
+        self.chrome.status = "Extension editor".into();
+    }
+
+    pub fn open_extension_confirm(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        self.close_overlays();
+        self.overlay_kind = OverlayKind::ExtensionConfirm;
+        self.chrome.extension_confirm = Some(ExtensionConfirm::new(title, message));
+        self.chrome.status = "Extension confirm".into();
     }
 
     pub fn begin_osc_query(&mut self, timeout_ms: u64) -> String {
@@ -746,6 +808,62 @@ impl InteractiveSession {
     }
 
     fn handle_special_overlay(&mut self, data: &str) -> Option<SessionAction> {
+        if let Some(selector) = &mut self.chrome.extension_selector {
+            return Some(match selector.handle_key(data) {
+                ExtensionDialogAction::None => SessionAction::None,
+                ExtensionDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::ExtensionSelect(None)
+                }
+                ExtensionDialogAction::Select(value) => {
+                    self.close_overlays();
+                    SessionAction::ExtensionSelect(Some(value))
+                }
+                _ => SessionAction::None,
+            });
+        }
+        if let Some(input) = &mut self.chrome.extension_input {
+            return Some(match input.handle_key(data) {
+                ExtensionDialogAction::None => SessionAction::None,
+                ExtensionDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::ExtensionInput(None)
+                }
+                ExtensionDialogAction::Submit(value) => {
+                    self.close_overlays();
+                    SessionAction::ExtensionInput(Some(value))
+                }
+                _ => SessionAction::None,
+            });
+        }
+        if let Some(editor) = &mut self.chrome.extension_editor {
+            return Some(match editor.handle_key(data) {
+                ExtensionDialogAction::None => SessionAction::None,
+                ExtensionDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::ExtensionEditor(None)
+                }
+                ExtensionDialogAction::Submit(value) => {
+                    self.close_overlays();
+                    SessionAction::ExtensionEditor(Some(value))
+                }
+                _ => SessionAction::None,
+            });
+        }
+        if let Some(confirm) = &mut self.chrome.extension_confirm {
+            return Some(match confirm.handle_key(data) {
+                ExtensionDialogAction::None => SessionAction::None,
+                ExtensionDialogAction::Confirm(value) => {
+                    self.close_overlays();
+                    SessionAction::ExtensionConfirm(value)
+                }
+                ExtensionDialogAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::ExtensionConfirm(false)
+                }
+                _ => SessionAction::None,
+            });
+        }
         if self.chrome.first_time.is_some() {
             let action = self
                 .chrome
@@ -1015,7 +1133,11 @@ impl InteractiveSession {
                     OverlayKind::ScopedModels
                     | OverlayKind::Login
                     | OverlayKind::FirstTime
-                    | OverlayKind::SettingsSubmenu => SessionAction::CloseOverlay,
+                    | OverlayKind::SettingsSubmenu
+                    | OverlayKind::ExtensionSelect
+                    | OverlayKind::ExtensionInput
+                    | OverlayKind::ExtensionEditor
+                    | OverlayKind::ExtensionConfirm => SessionAction::CloseOverlay,
                 };
             }
             self.chrome.selector = None;
@@ -1346,6 +1468,7 @@ mod tests {
             cwd: "/work".into(),
             modified_at: 1,
             parent_id: None,
+            all_messages_text: String::new(),
         }]);
         assert!(session.render_frame().contains("ctrl+p path"));
         assert_eq!(session.handle_bytes("\x10"), SessionAction::None);
@@ -1397,5 +1520,39 @@ mod tests {
         let detected = session.finish_osc_query(Instant::now()).expect("osc reply");
         assert_eq!(detected.theme, "light");
         assert_eq!(detected.source, "terminal background");
+    }
+
+    #[test]
+    fn extension_ui_surfaces_match_ts_context() {
+        let mut session =
+            InteractiveSession::new(crate::themes::builtin_themes()[0].clone(), "pi", vec![]);
+        session.apply_extension_ui_calls(&[
+            serde_json::json!({
+                "op": "setWidget",
+                "key": "banner",
+                "lines": ["hello widget"],
+                "placement": "aboveEditor"
+            }),
+            serde_json::json!({ "op": "setStatus", "key": "job", "text": "running" }),
+            serde_json::json!({ "op": "setHeader", "lines": ["ext header"] }),
+            serde_json::json!({ "op": "notify", "message": "ready", "type": "info" }),
+        ]);
+        let frame = session.render_frame();
+        assert!(frame.contains("hello widget"));
+        assert!(frame.contains("job: running"));
+        assert!(frame.contains("ext header"));
+        assert!(frame.contains("info: ready"));
+
+        session.open_extension_selector("Pick", vec!["one".into(), "two".into()]);
+        assert_eq!(session.handle_bytes("\x1b[B"), SessionAction::None);
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::ExtensionSelect(Some("two".into()))
+        );
+        session.open_extension_confirm("Unload?", "model-a");
+        assert_eq!(
+            session.handle_bytes("y"),
+            SessionAction::ExtensionConfirm(true)
+        );
     }
 }

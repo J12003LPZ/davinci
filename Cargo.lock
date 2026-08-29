@@ -645,6 +645,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "ureq",
+ "url",
  "uuid",
 ]
 

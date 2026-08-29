@@ -69,6 +69,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Reload keybindings, extensions, skills, prompts, themes, and context files",
             None,
         ),
+        ("llama", "Manage llama.cpp router models", None),
         ("quit", "Quit pi", None),
     ]
     .into_iter()
@@ -114,6 +115,7 @@ pub enum SlashAction {
     Hotkeys,
     SessionInfo,
     ScopedModels,
+    Llama,
 }
 
 pub fn parse_line(line: &str) -> SlashAction {
@@ -170,6 +172,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "scoped-models" => SlashAction::ScopedModels,
         "hotkeys" => SlashAction::Hotkeys,
         "session" => SlashAction::SessionInfo,
+        "llama" => SlashAction::Llama,
         "help" => SlashAction::Status(
             builtin_slash_commands()
                 .into_iter()

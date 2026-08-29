@@ -174,13 +174,114 @@ async function main() {
 		handlers: {},
 		tools: [],
 		commands: [],
+		commandHandlers: {},
 		flags: [],
 		shortcuts: [],
 		shortcutHandlers: {},
 		messageRenderers: {},
 		markdownTransformers: [],
 		entryRenderers: {},
+		uiCalls: [],
 	};
+	function uiReply(kind) {
+		const raw = process.env.PI_EXTENSION_UI_REPLY;
+		if (raw === undefined || raw === "") return kind === "confirm" ? false : undefined;
+		if (kind === "confirm") return raw === "1" || raw === "true" || raw === "yes";
+		try {
+			return JSON.parse(raw);
+		} catch (_error) {
+			return raw;
+		}
+	}
+	function makeUi() {
+		return {
+			select(title, options) {
+				recorded.uiCalls.push({ op: "select", title, options });
+				return Promise.resolve(uiReply("select"));
+			},
+			confirm(title, message) {
+				recorded.uiCalls.push({ op: "confirm", title, message });
+				return Promise.resolve(uiReply("confirm"));
+			},
+			input(title, placeholder) {
+				recorded.uiCalls.push({ op: "input", title, placeholder });
+				return Promise.resolve(uiReply("input"));
+			},
+			editor(title, prefill) {
+				recorded.uiCalls.push({ op: "editor", title, prefill });
+				return Promise.resolve(uiReply("editor"));
+			},
+			notify(message, type) {
+				recorded.uiCalls.push({ op: "notify", message, type: type || "info" });
+			},
+			setStatus(key, text) {
+				recorded.uiCalls.push({ op: "setStatus", key, text });
+			},
+			setWidget(key, content, options) {
+				const lines = Array.isArray(content) ? content : content == null ? undefined : [String(content)];
+				recorded.uiCalls.push({
+					op: "setWidget",
+					key,
+					lines,
+					placement: options && options.placement ? options.placement : "aboveEditor",
+				});
+			},
+			setHeader(factory) {
+				const lines = typeof factory === "function" ? undefined : factory;
+				recorded.uiCalls.push({ op: "setHeader", lines });
+			},
+			setFooter(factory) {
+				const lines = typeof factory === "function" ? undefined : factory;
+				recorded.uiCalls.push({ op: "setFooter", lines });
+			},
+			setTitle(title) {
+				recorded.uiCalls.push({ op: "setTitle", title });
+			},
+			setWorkingMessage(message) {
+				recorded.uiCalls.push({ op: "setWorkingMessage", message });
+			},
+			setWorkingVisible() {},
+			setWorkingIndicator() {},
+			setHiddenThinkingLabel(label) {
+				recorded.uiCalls.push({ op: "setHiddenThinkingLabel", label });
+			},
+			setEditorText(text) {
+				recorded.uiCalls.push({ op: "setEditorText", text });
+			},
+			getEditorText() {
+				return "";
+			},
+			pasteToEditor(text) {
+				recorded.uiCalls.push({ op: "pasteToEditor", text });
+			},
+			setEditorComponent() {},
+			getEditorComponent() {
+				return undefined;
+			},
+			addAutocompleteProvider() {},
+			onTerminalInput() {
+				return () => {};
+			},
+			custom() {
+				return Promise.resolve(uiReply("custom"));
+			},
+			theme: { fg(_role, text) { return text; }, bg(_role, text) { return text; }, bold(text) { return text; } },
+			getAllThemes() {
+				return [];
+			},
+			getTheme() {
+				return undefined;
+			},
+			setTheme() {
+				return { success: true };
+			},
+			getToolsExpanded() {
+				return false;
+			},
+			setToolsExpanded() {},
+		};
+	}
+	const ui = makeUi();
 	const pi = {
 		on(event, handler) {
 			if (!recorded.handlers[event]) recorded.handlers[event] = [];
@@ -191,7 +292,12 @@ async function main() {
 		},
 		registerCommand(name, options) {
 			recorded.commands.push({ name, description: (options && options.description) || "" });
+			if (options && typeof options.handler === "function") {
+				recorded.commandHandlers[name] = options.handler;
+			}
 		},
+		registerProvider() {},
+		ui,
 		registerFlag(name) {
 			recorded.flags.push(name);
 		},
@@ -238,7 +344,6 @@ async function main() {
 			return "off";
 		},
 		setThinkingLevel() {},
-		registerProvider() {},
 		unregisterProvider() {},
 		getFlag() {
 			return undefined;
@@ -352,7 +457,17 @@ async function main() {
 		const key = String(payload.key || "").toLowerCase();
 		const handler = recorded.shortcutHandlers[key];
 		if (typeof handler === "function") {
-			result = await handler(payload.ctx || {});
+			const ctx = payload.ctx || {};
+			ctx.ui = ctx.ui || ui;
+			result = await handler(ctx);
+		}
+	} else if (op === "command") {
+		const name = String(payload.name || "");
+		const handler = recorded.commandHandlers[name];
+		if (typeof handler === "function") {
+			const ctx = payload.ctx || { mode: "tui" };
+			ctx.ui = ctx.ui || ui;
+			result = await handler(payload.args || "", ctx);
 		}
 	}
 	process.stdout.write(
@@ -366,6 +481,7 @@ async function main() {
 			messageRenderers: Object.keys(recorded.messageRenderers),
 			entryRenderers: Object.keys(recorded.entryRenderers),
 			markdownTransformers: recorded.markdownTransformers.length,
+			uiCalls: recorded.uiCalls,
 			result,
 		}),
 	);

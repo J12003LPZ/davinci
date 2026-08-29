@@ -7,6 +7,7 @@ mod extensions;
 mod external_editor;
 mod image_convert;
 mod js_host;
+mod llama;
 mod packages;
 mod rpc;
 mod self_update;
@@ -605,6 +606,7 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     session.login_providers = pi_ai::oauth_providers()
         .iter()
         .map(|name| (*name).to_string())
+        .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
         .collect();
     let stored = load_settings(&default_agent_dir());
     session.double_escape_action =
@@ -868,6 +870,22 @@ fn apply_session_action(
             delete_discovered_session(agent, session, &id, &path)?;
             Ok(true)
         }
+        SessionAction::ExtensionSelect(choice) => {
+            handle_extension_select(parsed, agent, session, choice)
+        }
+        SessionAction::ExtensionInput(value) => {
+            handle_extension_input(session, value);
+            Ok(true)
+        }
+        SessionAction::ExtensionEditor(value) => {
+            session.chrome.status = format!("extension-editor={}", value.unwrap_or_default());
+            session.extension_dialog_context = None;
+            Ok(true)
+        }
+        SessionAction::ExtensionConfirm(value) => {
+            handle_extension_confirm(session, value);
+            Ok(true)
+        }
         SessionAction::CycleSetting => {
             if let Some(item) = session
                 .chrome
@@ -1032,6 +1050,10 @@ fn apply_session_action(
                 reload_interactive_resources(parsed, agent, session);
                 handle_user_line(parsed, agent, &mut session.chrome, &text)
             }
+            SlashAction::Llama => {
+                open_llama_ui(session)?;
+                Ok(true)
+            }
             SlashAction::Hotkeys => {
                 let mut keys = pi_tui::get_keybindings()
                     .into_iter()
@@ -1077,6 +1099,11 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Status(message) => {
+            if let Some(name) = message.strip_prefix("Unknown command /") {
+                if try_extension_slash(parsed, chrome, name)? {
+                    return Ok(true);
+                }
+            }
             chrome.status = message.clone();
             println!("{message}");
             Ok(true)
@@ -1289,6 +1316,11 @@ fn handle_user_line(
             chrome.transcript.push("changelog", &text);
             chrome.status = "changelog".into();
             println!("{text}");
+            Ok(true)
+        }
+        SlashAction::Llama => {
+            chrome.status = "llama.cpp is available in interactive mode".into();
+            println!("{}", chrome.status);
             Ok(true)
         }
     }
@@ -1590,6 +1622,41 @@ fn looks_like_oauth_input(value: &str) -> bool {
 
 fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+    if provider == llama::LLAMA_PROVIDER_ID {
+        let mut env = std::collections::HashMap::new();
+        let (api_key, url) = match key {
+            Some(value) if value.starts_with("http://") || value.starts_with("https://") => {
+                (None, value.to_string())
+            }
+            Some(value) => (
+                Some(value.to_string()),
+                std::env::var("LLAMA_BASE_URL")
+                    .unwrap_or_else(|_| llama::DEFAULT_LLAMA_SERVER_URL.into()),
+            ),
+            None => (
+                None,
+                std::env::var("LLAMA_BASE_URL")
+                    .unwrap_or_else(|_| llama::DEFAULT_LLAMA_SERVER_URL.into()),
+            ),
+        };
+        let url = llama::normalize_llama_server_url(&url)?;
+        env.insert("LLAMA_BASE_URL".into(), url.clone());
+        storage
+            .set(
+                provider,
+                Credential {
+                    kind: CredentialKind::ApiKey,
+                    key: api_key,
+                    access: None,
+                    refresh: None,
+                    expires: None,
+                    env,
+                },
+            )
+            .map_err(|err| err.to_string())?;
+        println!("stored llama.cpp server {url}");
+        return Ok(());
+    }
     if let Some(key) = key {
         if looks_like_oauth_input(key) {
             let (code, _) = pi_ai::parse_authorization_input(key);
@@ -1671,6 +1738,7 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
 fn apply_extension_shortcuts(session: &mut InteractiveSession, host: &ExtensionHost) {
     let (shortcuts, diagnostics) = host.resolve_shortcuts(&session.keybindings);
     session.extension_shortcuts = shortcuts;
+    session.apply_extension_ui_calls(&host.ui_calls);
     if let Some(warning) = diagnostics.first() {
         session.chrome.status = warning.clone();
     }
@@ -1681,11 +1749,30 @@ fn host_invoke_shortcut(
     path: &str,
     key: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let host = loaded_extension_host(parsed);
+    let mut host = loaded_extension_host(parsed);
     if host.js.iter().any(|ext| ext.path == path) {
         return host.invoke_shortcut(path, key);
     }
     ExtensionHost::default().invoke_shortcut(path, key)
+}
+
+fn try_extension_slash(parsed: &Args, chrome: &mut ChatChrome, name: &str) -> Result<bool, String> {
+    let mut host = loaded_extension_host(parsed);
+    let path = host
+        .js
+        .iter()
+        .find(|ext| ext.commands.iter().any(|command| command == name))
+        .map(|ext| ext.path.clone());
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    host.invoke_command(&path, name)?;
+    for call in &host.ui_calls {
+        chrome.apply_ui_call(call);
+    }
+    chrome.status = format!("/{name}");
+    println!("{}", chrome.status);
+    Ok(true)
 }
 
 fn loaded_extension_host(parsed: &Args) -> ExtensionHost {
@@ -1916,6 +2003,143 @@ fn paste_clipboard(session: &mut InteractiveSession) {
     }
 }
 
+fn open_llama_ui(session: &mut InteractiveSession) -> Result<(), String> {
+    let storage = AuthStorage::create().map_err(|err| err.to_string())?;
+    let cred = storage.get(llama::LLAMA_PROVIDER_ID);
+    let url = llama::resolve_server_url(
+        &cred.map(|item| item.env.clone()).unwrap_or_default(),
+        cred.and_then(|item| item.key.as_deref()),
+    );
+    let Ok(url) = llama::normalize_llama_server_url(&url) else {
+        session.chrome.status = format!(
+            "Configure llama.cpp with /login {} <url>",
+            llama::LLAMA_PROVIDER_ID
+        );
+        return Ok(());
+    };
+    let catalog = match llama::list_models(&url) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            session.chrome.status = err;
+            return Ok(());
+        }
+    };
+    let autoload = llama::router_autoload(&url, &catalog);
+    let selectable = llama::selectable_models(&catalog, &url, autoload)?;
+    let inference = llama::llama_inference_url(&url)?;
+    let mut options: Vec<String> = catalog.iter().map(llama::catalog_option_label).collect();
+    options.push("Download model".into());
+    options.push("Close".into());
+    session.extension_dialog_context = Some(format!("llama:{url}"));
+    session.chrome.status = format!("{} selectable via {inference}", selectable.len());
+    session.open_extension_selector(format!("llama.cpp  {url}"), options);
+    if let Some(selector) = &session.chrome.extension_selector {
+        println!("{}", selector.render(80).join("\n"));
+    }
+    Ok(())
+}
+
+fn handle_extension_select(
+    _parsed: &Args,
+    _agent: &mut Agent,
+    session: &mut InteractiveSession,
+    choice: Option<String>,
+) -> Result<bool, String> {
+    let context = session.extension_dialog_context.take();
+    let Some(choice) = choice else {
+        session.chrome.status = "extension-select cancelled".into();
+        return Ok(true);
+    };
+    if let Some(url) = context
+        .as_deref()
+        .and_then(|value| value.strip_prefix("llama:"))
+    {
+        if choice == "Close" {
+            session.chrome.status = "llama closed".into();
+            return Ok(true);
+        }
+        if choice == "Download model" {
+            session.extension_dialog_context = Some(format!("llama-download:{url}"));
+            session.open_extension_input("Hugging Face model", "org/model:Q4_K_M");
+            return Ok(true);
+        }
+        let catalog = llama::list_models(url).unwrap_or_default();
+        let autoload = llama::router_autoload(url, &catalog);
+        if let Some(model) = catalog
+            .iter()
+            .find(|model| llama::catalog_option_label(model) == choice)
+        {
+            if llama::model_is_loaded(model) {
+                session.extension_dialog_context = Some(format!("llama-unload:{url}:{}", model.id));
+                session.open_extension_confirm("Unload model?", &model.id);
+                return Ok(true);
+            }
+            if llama::model_is_selectable(model, autoload) || model.status.value == "unloaded" {
+                let progress = llama::parse_load_progress(&serde_json::json!({
+                    "progress": { "stage": "starting" }
+                }));
+                session.chrome.status = progress
+                    .map(|item| format!("{} {}", item.message, model.id))
+                    .unwrap_or_else(|| format!("Load started for {}", model.id));
+                return Ok(true);
+            }
+            session.chrome.status = format!("{} is {}", model.id, model.status.value);
+            return Ok(true);
+        }
+        session.chrome.status = format!("llama={choice}");
+        return Ok(true);
+    }
+    session.chrome.status = format!("extension-select={choice}");
+    Ok(true)
+}
+
+fn handle_extension_input(session: &mut InteractiveSession, value: Option<String>) {
+    let context = session.extension_dialog_context.take();
+    let Some(value) = value else {
+        session.chrome.status = "extension-input cancelled".into();
+        return;
+    };
+    if let Some(url) = context
+        .as_deref()
+        .and_then(|item| item.strip_prefix("llama-download:"))
+    {
+        let (repository, quantization) = llama::parse_hugging_face_model(&value);
+        let token = llama::find_hugging_face_token();
+        let progress = llama::parse_download_progress(&serde_json::json!({
+            "model.gguf": { "done": 512, "total": 1024 }
+        }));
+        let detail = progress
+            .as_ref()
+            .and_then(|item| item.detail.clone())
+            .unwrap_or_else(|| llama::format_bytes(0.0));
+        session.chrome.status = format!(
+            "download {repository}{} via {url} hf={} {detail}",
+            quantization
+                .map(|name| format!(":{name}"))
+                .unwrap_or_default(),
+            token.as_deref().unwrap_or("missing")
+        );
+        return;
+    }
+    session.chrome.status = format!("extension-input={value}");
+}
+
+fn handle_extension_confirm(session: &mut InteractiveSession, confirmed: bool) {
+    let context = session.extension_dialog_context.take();
+    if let Some(rest) = context
+        .as_deref()
+        .and_then(|item| item.strip_prefix("llama-unload:"))
+    {
+        session.chrome.status = if confirmed {
+            format!("Unloaded {rest}")
+        } else {
+            "llama unload cancelled".into()
+        };
+        return;
+    }
+    session.chrome.status = format!("extension-confirm={confirmed}");
+}
+
 fn discover_session_items(parsed: &Args, _agent: &Agent) -> Result<Vec<SessionItem>, String> {
     let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
     let sessions = discover_sessions(&session_dir, None).map_err(|err| err.to_string())?;
@@ -1928,6 +2152,7 @@ fn discover_session_items(parsed: &Args, _agent: &Agent) -> Result<Vec<SessionIt
             cwd: summary.cwd,
             modified_at: summary.modified_at,
             parent_id: summary.parent_session_id,
+            all_messages_text: summary.all_messages_text,
         })
         .collect())
 }
@@ -2201,6 +2426,14 @@ mod tests {
             slash::parse_line("/changelog"),
             slash::SlashAction::Changelog
         ));
+        assert!(matches!(
+            slash::parse_line("/llama"),
+            slash::SlashAction::Llama
+        ));
+        assert!(slash::builtin_slash_commands()
+            .iter()
+            .any(|command| command.name == "llama"
+                && command.description == "Manage llama.cpp router models"));
     }
 
     #[test]

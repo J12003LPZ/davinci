@@ -29,6 +29,8 @@ pub struct JsExtensionResult {
     pub entry_renderers: Vec<String>,
     #[serde(default, rename = "markdownTransformers")]
     pub markdown_transformers: u32,
+    #[serde(default, rename = "uiCalls")]
+    pub ui_calls: Vec<Value>,
     #[serde(default)]
     pub result: Option<Value>,
     #[serde(default)]
@@ -232,6 +234,49 @@ module.exports = (pi) => {
         let invoked =
             run_js_extension(&module, "shortcut", &serde_json::json!({ "key": "ctrl+k" })).unwrap();
         assert_eq!(invoked.result.as_ref().unwrap()["handled"], true);
+    }
+
+    #[test]
+    fn records_extension_ui_calls() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.ui.setWidget("banner", ["hello widget"], { placement: "aboveEditor" });
+  pi.ui.setStatus("job", "running");
+  pi.ui.notify("ready", "info");
+  pi.registerCommand("ask", {
+    description: "ask",
+    handler: async (_args, ctx) => {
+      const choice = await ctx.ui.select("Pick", ["a", "b"]);
+      return { choice };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        assert!(loaded
+            .ui_calls
+            .iter()
+            .any(|call| call["op"] == "setWidget" && call["key"] == "banner"));
+        std::env::set_var("PI_EXTENSION_UI_REPLY", "a");
+        let command = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "ask", "ctx": { "mode": "tui" } }),
+        )
+        .unwrap();
+        std::env::remove_var("PI_EXTENSION_UI_REPLY");
+        assert_eq!(command.result.as_ref().unwrap()["choice"], "a");
+        assert!(command.ui_calls.iter().any(|call| call["op"] == "select"));
     }
 
     #[test]

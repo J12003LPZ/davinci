@@ -106,6 +106,7 @@ pub fn metadata_from_header(
         } else {
             4
         },
+        all_messages_text: String::new(),
     }
 }
 

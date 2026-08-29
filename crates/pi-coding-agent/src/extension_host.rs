@@ -65,6 +65,7 @@ pub struct ExtensionHost {
     pub message_renderers: std::collections::HashMap<String, String>,
     pub entry_renderers: std::collections::HashMap<String, String>,
     pub markdown_modules: Vec<String>,
+    pub ui_calls: Vec<Value>,
 }
 
 impl ExtensionHost {
@@ -78,6 +79,7 @@ impl ExtensionHost {
             message_renderers: std::collections::HashMap::new(),
             entry_renderers: std::collections::HashMap::new(),
             markdown_modules: Vec::new(),
+            ui_calls: Vec::new(),
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -101,6 +103,7 @@ impl ExtensionHost {
                         if loaded.markdown_transformers > 0 {
                             host.markdown_modules.push(path.clone());
                         }
+                        host.ui_calls.extend(loaded.ui_calls.clone());
                         host.js.push(LoadedJsExtension {
                             path,
                             handlers: loaded.handlers,
@@ -135,6 +138,7 @@ impl ExtensionHost {
             if let Ok(result) = run_js_extension(Path::new(&ext.path), "emit", &payload) {
                 if result.ok {
                     self.last_js_result = result.result;
+                    self.ui_calls.extend(result.ui_calls);
                 }
             }
         }
@@ -314,7 +318,7 @@ impl ExtensionHost {
         resolve_extension_shortcuts(&self.registered_shortcuts(), keybindings)
     }
 
-    pub fn invoke_shortcut(&self, path: &str, key: &str) -> Result<Option<Value>, String> {
+    pub fn invoke_shortcut(&mut self, path: &str, key: &str) -> Result<Option<Value>, String> {
         let result = run_js_extension(
             Path::new(path),
             "shortcut",
@@ -325,6 +329,22 @@ impl ExtensionHost {
                 .error
                 .unwrap_or_else(|| "Shortcut handler error".into()));
         }
+        self.ui_calls.extend(result.ui_calls.clone());
+        Ok(result.result)
+    }
+
+    pub fn invoke_command(&mut self, path: &str, name: &str) -> Result<Option<Value>, String> {
+        let result = run_js_extension(
+            Path::new(path),
+            "command",
+            &serde_json::json!({ "name": name, "ctx": { "mode": "tui" } }),
+        )?;
+        if !result.ok {
+            return Err(result
+                .error
+                .unwrap_or_else(|| "Command handler error".into()));
+        }
+        self.ui_calls.extend(result.ui_calls);
         Ok(result.result)
     }
 
