@@ -1,5 +1,9 @@
 //! In-memory Pi protocol server.
 
+mod unix;
+
+pub use unix::{listen_unix, UnixListenerOptions, UnixServer, DEFAULT_HANDSHAKE_TIMEOUT_MS};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -376,5 +380,189 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn temp_socket_path(label: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "pi-server-{}-{}-{}.sock",
+            label,
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn read_server_message(stream: &mut std::os::unix::net::UnixStream) -> ServerMessage {
+        use std::io::Read;
+        let mut decoder = ServerMessageDecoder::new();
+        let mut buf = [0u8; 8192];
+        let start = std::time::Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "timed out waiting for server message"
+            );
+            match stream.read(&mut buf) {
+                Ok(0) => panic!("connection closed before a server message arrived"),
+                Ok(n) => {
+                    let messages = decoder.push(&buf[..n]).unwrap();
+                    if let Some(message) = messages.into_iter().next() {
+                        return message;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    fn write_client_message(stream: &mut std::os::unix::net::UnixStream, message: &ClientMessage) {
+        use std::io::Write;
+        let bytes = encode_client_message(message).unwrap();
+        stream.write_all(&bytes).unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[test]
+    fn unix_loopback_hello_create_prompt_detach() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let path = temp_socket_path("loopback");
+        let _listener =
+            listen_unix(PiServer::default(), &path, UnixListenerOptions::default()).unwrap();
+
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        write_client_message(
+            &mut stream,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        );
+        assert!(matches!(
+            read_server_message(&mut stream),
+            ServerMessage::Hello { .. }
+        ));
+
+        write_client_message(
+            &mut stream,
+            &ClientMessage::Request {
+                id: "1".into(),
+                request: Command::Create {
+                    cwd: Some("/tmp".into()),
+                    name: Some("demo".into()),
+                    model: None,
+                    thinking_level: None,
+                },
+            },
+        );
+        let ServerMessage::Response {
+            result: Some(CommandResult::Create { session }),
+            ..
+        } = read_server_message(&mut stream)
+        else {
+            panic!("expected create");
+        };
+
+        write_client_message(
+            &mut stream,
+            &ClientMessage::Request {
+                id: "2".into(),
+                request: Command::Prompt {
+                    session_id: session.id.clone(),
+                    text: "hi".into(),
+                },
+            },
+        );
+        assert!(matches!(
+            read_server_message(&mut stream),
+            ServerMessage::Response {
+                ok: true,
+                result: Some(CommandResult::Prompt { .. }),
+                ..
+            }
+        ));
+
+        write_client_message(
+            &mut stream,
+            &ClientMessage::Request {
+                id: "3".into(),
+                request: Command::Detach {
+                    session_id: session.id,
+                },
+            },
+        );
+        assert!(matches!(
+            read_server_message(&mut stream),
+            ServerMessage::Response {
+                ok: true,
+                result: Some(CommandResult::Detach { .. }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unix_stale_socket_rebind() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let path = temp_socket_path("stale");
+        {
+            let _stale = UnixListener::bind(&path).unwrap();
+        }
+        assert!(path.exists());
+
+        let first =
+            listen_unix(PiServer::default(), &path, UnixListenerOptions::default()).unwrap();
+        UnixStream::connect(first.path()).unwrap();
+
+        let error =
+            listen_unix(PiServer::default(), &path, UnixListenerOptions::default()).unwrap_err();
+        assert!(
+            error.contains("already running"),
+            "expected live-listener error, got {error}"
+        );
+        UnixStream::connect(first.path()).unwrap();
+    }
+
+    #[test]
+    fn unix_handshake_timeout() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let path = temp_socket_path("handshake");
+        let _listener = listen_unix(
+            PiServer::default(),
+            &path,
+            UnixListenerOptions {
+                handshake_timeout_ms: 50,
+            },
+        )
+        .unwrap();
+
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        match read_server_message(&mut stream) {
+            ServerMessage::HelloError { error } => {
+                assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+                assert_eq!(error.message, "Handshake timeout");
+            }
+            other => panic!("expected handshake timeout, got {other:?}"),
+        }
     }
 }

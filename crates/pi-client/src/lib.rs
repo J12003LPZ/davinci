@@ -1,6 +1,9 @@
 //! Pi protocol client with exclusive/shared session leases.
 
+pub mod unix;
+
 use std::collections::HashMap;
+use std::path::Path;
 
 use pi_protocol::{
     encode_client_message, ClientMessage, Command, CommandResult, ServerMessage,
@@ -23,9 +26,16 @@ pub struct SessionLease {
     pub active: bool,
 }
 
+enum ClientIo {
+    Memory {
+        server: PiServer,
+        connection_id: String,
+    },
+    Unix(unix::UnixTransport),
+}
+
 pub struct PiClient {
-    server: PiServer,
-    connection_id: String,
+    io: ClientIo,
     pub snapshot: Option<ServerSnapshot>,
     leases: HashMap<String, u32>,
     request: u64,
@@ -35,36 +45,63 @@ impl PiClient {
     pub fn connect(server: PiServer) -> Result<Self, String> {
         let connection_id = Uuid::now_v7().to_string();
         let mut client = Self {
-            server,
-            connection_id,
+            io: ClientIo::Memory {
+                server,
+                connection_id,
+            },
             snapshot: None,
             leases: HashMap::new(),
             request: 0,
         };
-        let hello = client.roundtrip(ClientMessage::Hello {
+        client.finish_hello()
+    }
+
+    pub fn connect_unix(path: impl AsRef<Path>) -> Result<Self, String> {
+        let transport = unix::UnixTransport::connect(path)?;
+        let mut client = Self {
+            io: ClientIo::Unix(transport),
+            snapshot: None,
+            leases: HashMap::new(),
+            request: 0,
+        };
+        client.finish_hello()
+    }
+
+    fn finish_hello(mut self) -> Result<Self, String> {
+        let hello = self.roundtrip(ClientMessage::Hello {
             version: PROTOCOL_VERSION,
         })?;
         if let ServerMessage::Hello { snapshot, .. } = hello {
-            client.snapshot = Some(snapshot);
+            self.snapshot = Some(snapshot);
         } else if let ServerMessage::HelloError { error } = hello {
             return Err(error.message);
         }
-        Ok(client)
+        Ok(self)
     }
 
     fn roundtrip(&mut self, message: ClientMessage) -> Result<ServerMessage, String> {
-        let bytes = encode_client_message(&message).map_err(|error| error.to_string())?;
-        let reply = self
-            .server
-            .accept_bytes(&self.connection_id, &bytes)
-            .map_err(|error| error.to_string())?;
-        let messages = ServerMessageDecoder::new()
-            .push(&reply)
-            .map_err(|error| error.to_string())?;
-        messages
-            .into_iter()
-            .next()
-            .ok_or_else(|| "empty server reply".into())
+        match &mut self.io {
+            ClientIo::Memory {
+                server,
+                connection_id,
+            } => {
+                let bytes = encode_client_message(&message).map_err(|error| error.to_string())?;
+                let reply = server
+                    .accept_bytes(connection_id, &bytes)
+                    .map_err(|error| error.to_string())?;
+                let messages = ServerMessageDecoder::new()
+                    .push(&reply)
+                    .map_err(|error| error.to_string())?;
+                messages
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "empty server reply".into())
+            }
+            ClientIo::Unix(transport) => {
+                transport.send(&message)?;
+                transport.recv()
+            }
+        }
     }
 
     fn request(&mut self, command: Command) -> Result<CommandResult, String> {
@@ -214,5 +251,127 @@ mod tests {
         let mut shared = client.attach_session(&created.id).unwrap();
         assert_eq!(shared.mode, LeaseMode::Shared);
         client.detach(&mut shared).unwrap();
+    }
+
+    fn temp_socket_path(label: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "pi-client-{}-{}-{}.sock",
+            label,
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn unix_loopback_hello_create_prompt_detach() {
+        let path = temp_socket_path("loopback");
+        let _listener = pi_server::listen_unix(
+            PiServer::default(),
+            &path,
+            pi_server::UnixListenerOptions::default(),
+        )
+        .unwrap();
+        let mut client = PiClient::connect_unix(&path).unwrap();
+        assert!(client.snapshot.is_some());
+        let mut lease = client
+            .create_session(Some("/tmp".into()), Some("demo".into()))
+            .unwrap();
+        let snapshot = client.prompt(&mut lease, "hello").unwrap();
+        assert!(snapshot.transcript.len() >= 2);
+        client.detach(&mut lease).unwrap();
+        assert!(!lease.active);
+        assert!(client
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.id == snapshot.id));
+    }
+
+    #[test]
+    fn unix_stale_socket_rebind() {
+        use std::os::unix::net::UnixListener;
+
+        let path = temp_socket_path("stale");
+        {
+            let _stale = UnixListener::bind(&path).unwrap();
+        }
+        assert!(path.exists());
+        let first = pi_server::listen_unix(
+            PiServer::default(),
+            &path,
+            pi_server::UnixListenerOptions::default(),
+        )
+        .unwrap();
+        let mut client = PiClient::connect_unix(first.path()).unwrap();
+        assert!(client.snapshot.is_some());
+
+        let error = pi_server::listen_unix(
+            PiServer::default(),
+            &path,
+            pi_server::UnixListenerOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("already running"),
+            "expected live-listener error, got {error}"
+        );
+    }
+
+    #[test]
+    fn unix_handshake_timeout() {
+        use pi_protocol::{ProtocolErrorCode, ServerMessageDecoder};
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let path = temp_socket_path("handshake");
+        let _listener = pi_server::listen_unix(
+            PiServer::default(),
+            &path,
+            pi_server::UnixListenerOptions {
+                handshake_timeout_ms: 50,
+            },
+        )
+        .unwrap();
+
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut decoder = ServerMessageDecoder::new();
+        let mut buf = [0u8; 8192];
+        let start = std::time::Instant::now();
+        let message = loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "timed out waiting for handshake error"
+            );
+            match stream.read(&mut buf) {
+                Ok(0) => panic!("closed without hello_error"),
+                Ok(n) => {
+                    if let Some(message) = decoder.push(&buf[..n]).unwrap().into_iter().next() {
+                        break message;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => panic!("{error}"),
+            }
+        };
+        match message {
+            ServerMessage::HelloError { error } => {
+                assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+                assert_eq!(error.message, "Handshake timeout");
+            }
+            other => panic!("expected handshake timeout, got {other:?}"),
+        }
     }
 }
