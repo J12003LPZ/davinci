@@ -22,6 +22,7 @@ mod settings;
 mod shutdown;
 mod slash;
 mod startup;
+mod tools_manager;
 mod trust;
 
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -63,7 +64,9 @@ use pi_tui::{
     OSC_QUERY_TIMEOUT_MS,
 };
 
-use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
+use args::{
+    format_terminal_title, parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION,
+};
 use auth_cmd::{
     is_auth_command_help, parse_auth_command, print_auth_command_help, validate_auth_command_args,
     AuthCommandKind,
@@ -104,6 +107,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
             .http_proxy
             .as_deref(),
     );
+    tools_manager::prepend_tools_bin_to_path();
     if is_package_command(raw.first().map(String::as_str)) {
         let command = raw[0].as_str();
         if raw.iter().any(|a| a == "--help" || a == "-h") {
@@ -1479,10 +1483,11 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         .map(|path| path.parent().unwrap_or(path).to_path_buf())
         .unwrap_or_else(pi_session::default_session_dir);
     let cwd = agent.cwd.clone();
-    let mut runtime = RpcRuntime::new(
+    let mut runtime = RpcRuntime::with_models(
         std::mem::replace(agent, Agent::new(default_system_prompt())),
         session_dir,
         cwd,
+        available_models(parsed),
     );
     let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
     {
@@ -1900,6 +1905,9 @@ fn sync_hosted_chrome(tui: &mut InteractiveTui, panes: &ChromePanes, session: &I
         session.chrome.render_document(session.width),
         session.chrome.render_dock(session.width),
     );
+    if let Some(title) = session.terminal_title.as_deref() {
+        tui.set_title(title);
+    }
     tui.invalidate();
     tui.render_now(false);
 }
@@ -1952,7 +1960,7 @@ fn run_interactive(
     session.double_escape_action =
         DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
     session.autocomplete_max_visible =
-        stored.autocomplete_max_visible.unwrap_or(8).clamp(3, 20) as usize;
+        stored.autocomplete_max_visible.unwrap_or(5).clamp(3, 20) as usize;
     session
         .chrome
         .editor
@@ -2045,6 +2053,9 @@ fn run_interactive(
     apply_project_trust_warning(&mut session, parsed, agent);
     apply_changelog_overlay(&mut session, agent, &stored, &default_agent_dir());
     refresh_chrome_footer(&mut session, agent);
+    if tui_host.is_none() {
+        apply_terminal_title(&mut session, agent, None);
+    }
     apply_cache_miss_notices(
         &mut session.chrome,
         agent,
@@ -2081,6 +2092,8 @@ fn run_interactive(
             tui.set_terminal_size(cols as usize, rows as usize);
         }
         tui.start();
+        ensure_interactive_tools(&mut session);
+        apply_terminal_title(&mut session, agent, Some(&mut tui));
         Some((tui, panes))
     } else {
         print!("{}", InteractiveSession::enter_sequences(fullscreen));
@@ -2375,6 +2388,8 @@ fn apply_session_action(
                     .map(|s| s.header.id.clone())
                     .unwrap_or(id)
             );
+            refresh_chrome_footer(session, agent);
+            apply_terminal_title(session, agent, tui);
             Ok(true)
         }
         SessionAction::SelectSetting(value) => {
@@ -2923,11 +2938,13 @@ fn handle_user_line(
         }
         SlashAction::NewSession => {
             let session_dir = resolved_session_dir(parsed, &agent.cwd);
-            let session = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
+            let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
             agent.messages.clear();
-            agent.session = Some(session);
+            agent.session = Some(store);
             println!("Started new session");
+            refresh_chrome_footer(session, agent);
+            apply_terminal_title(session, agent, tui);
             Ok(true)
         }
         SlashAction::Compact(instructions) => {
@@ -2992,9 +3009,11 @@ fn handle_user_line(
         }
         SlashAction::Logout { provider } => handle_logout_command(session, provider.as_deref()),
         SlashAction::Name(name) => {
-            if let Some(session) = agent.session.as_mut() {
-                session.set_name(&name).map_err(|e| e.to_string())?;
+            if let Some(store) = agent.session.as_mut() {
+                store.set_name(&name).map_err(|e| e.to_string())?;
             }
+            refresh_chrome_footer(session, agent);
+            apply_terminal_title(session, agent, tui);
             Ok(true)
         }
         SlashAction::Fork => {
@@ -3017,6 +3036,8 @@ fn handle_user_line(
                 agent.load_from_session(next);
                 println!("session={}", agent.session.as_ref().unwrap().header.id);
             }
+            refresh_chrome_footer(session, agent);
+            apply_terminal_title(session, agent, tui);
             Ok(true)
         }
         SlashAction::Clone => {
@@ -3028,6 +3049,8 @@ fn handle_user_line(
                 agent.load_from_session(next);
                 println!("session={}", agent.session.as_ref().unwrap().header.id);
             }
+            refresh_chrome_footer(session, agent);
+            apply_terminal_title(session, agent, tui);
             Ok(true)
         }
         SlashAction::ScopedModels => {
@@ -4785,6 +4808,47 @@ fn refresh_chrome_footer(session: &mut InteractiveSession, agent: &Agent) {
         .as_ref()
         .and_then(|store| store.display_name());
     session.chrome.footer_stats = Some(footer_stats_line(agent));
+}
+
+fn apply_terminal_title(
+    session: &mut InteractiveSession,
+    agent: &Agent,
+    tui: Option<&mut InteractiveTui>,
+) {
+    session.terminal_title = Some(format_terminal_title(
+        agent
+            .session
+            .as_ref()
+            .and_then(|store| store.display_name())
+            .as_deref(),
+        &agent.cwd,
+    ));
+    if let Some(title) = session.terminal_title.as_deref() {
+        if let Some(tui) = tui {
+            tui.set_title(title);
+        } else if std::io::stdout().is_terminal() || std::env::var("PI_TERMINAL_TITLE").is_ok() {
+            print!("\x1b]0;{title}\x07");
+            let _ = io::stdout().flush();
+        }
+    }
+}
+
+fn ensure_interactive_tools(session: &mut InteractiveSession) {
+    let mut statuses = Vec::new();
+    tools_manager::ensure_managed_tools(Some(&mut |status| statuses.push(status)));
+    for status in statuses {
+        show_managed_tool_status(session, &status);
+    }
+}
+
+fn show_managed_tool_status(session: &mut InteractiveSession, status: &tools_manager::ToolStatus) {
+    let (role, text) = match status.kind {
+        tools_manager::ToolStatusKind::Warning => {
+            ("warning", format!("Warning: {}", status.message))
+        }
+        tools_manager::ToolStatusKind::Info => ("dim", status.message.clone()),
+    };
+    session.chrome.transcript.push(role, &text);
 }
 
 fn footer_stats_line(agent: &Agent) -> String {

@@ -573,6 +573,25 @@ fn resolve_fd_binary() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    let mut bin_dirs = Vec::new();
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+        bin_dirs.push(PathBuf::from(dir).join("bin"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        bin_dirs.push(PathBuf::from(home).join(".pi").join("agent").join("bin"));
+    }
+    for dir in bin_dirs {
+        for name in ["fd", "fdfind"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            let exe = dir.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
     for name in ["fd", "fdfind"] {
         if let Ok(output) = Command::new("which").arg(name).output() {
             if output.status.success() {

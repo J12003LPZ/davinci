@@ -872,7 +872,7 @@ pub fn to_interactive_config(
             .clone()
             .unwrap_or_else(|| "tree".into()),
         quiet_startup: settings.quiet_startup,
-        autocomplete_max_visible: settings.autocomplete_max_visible.unwrap_or(8),
+        autocomplete_max_visible: settings.autocomplete_max_visible.unwrap_or(5),
         tree_filter_mode: settings
             .tree_filter_mode
             .clone()
@@ -947,6 +947,20 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autocomplete_max_visible_defaults_to_ts_five() {
+        let config = to_interactive_config(&Settings::default(), "dark");
+        assert_eq!(config.autocomplete_max_visible, 5);
+        let config = to_interactive_config(
+            &Settings {
+                autocomplete_max_visible: Some(12),
+                ..Settings::default()
+            },
+            "dark",
+        );
+        assert_eq!(config.autocomplete_max_visible, 12);
+    }
 
     #[test]
     fn first_time_setup_gate_matches_ts() {

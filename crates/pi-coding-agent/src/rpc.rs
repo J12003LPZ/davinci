@@ -133,7 +133,15 @@ pub struct RpcRuntime {
 
 impl RpcRuntime {
     pub fn new(agent: Agent, session_dir: PathBuf, cwd: PathBuf) -> Self {
-        let models = load_builtin_models();
+        Self::with_models(agent, session_dir, cwd, load_builtin_models())
+    }
+
+    pub fn with_models(
+        agent: Agent,
+        session_dir: PathBuf,
+        cwd: PathBuf,
+        models: Vec<Model>,
+    ) -> Self {
         Self {
             agent,
             session_dir,
@@ -449,7 +457,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 runtime.agent.model_id = model_id;
                 ok(id, &kind, Some(RpcRuntime::model_json(&model)))
             } else {
-                fail(id, &kind, format!("Unknown model {provider}/{model_id}"))
+                fail(id, &kind, format!("Model not found: {provider}/{model_id}"))
             }
         }
         "cycle_model" => {
@@ -1229,5 +1237,41 @@ mod tests {
         assert_eq!(queue.1, vec!["later".to_string()]);
         let json = serde_json::to_value(&events[0]).unwrap();
         assert!(json.get("type").is_some());
+    }
+
+    #[test]
+    fn available_models_and_set_model_use_runtime_snapshot() {
+        let only = vec![load_builtin_models().into_iter().next().expect("model")];
+        let mut runtime = RpcRuntime::with_models(
+            pi_agent::Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+            only.clone(),
+        );
+        let listed = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_available_models".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(listed.success);
+        let models = listed.data.as_ref().unwrap()["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], only[0].id);
+        let missing = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "set_model".into(),
+                provider: Some("nope".into()),
+                model_id: Some("missing".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(!missing.success);
+        assert_eq!(
+            missing.error.as_deref(),
+            Some("Model not found: nope/missing")
+        );
     }
 }

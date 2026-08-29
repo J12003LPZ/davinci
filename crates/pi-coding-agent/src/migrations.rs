@@ -157,7 +157,7 @@ fn migrate_tools_to_bin(agent_dir: &Path, result: &mut MigrationResult) {
     if !tools_dir.exists() {
         return;
     }
-    let bin_dir = agent_dir.parent().unwrap_or(agent_dir).join("bin");
+    let bin_dir = agent_dir.join("bin");
     let binaries = ["fd", "rg", "fd.exe", "rg.exe"];
     let mut moved_any = false;
     for bin in binaries {
@@ -332,6 +332,8 @@ mod tests {
             .iter()
             .any(|item| item.contains("Global tools/")));
         assert!(agent.join("prompts").exists());
+        assert!(agent.join("bin").join("fd").exists());
+        assert!(!agent.join("tools").join("fd").exists());
         let text = format_deprecation_warnings(&result.deprecation_warnings);
         assert!(text.contains("Warning: Global hooks/ directory found."));
         assert!(text.contains("Move your extensions to the extensions/ directory."));

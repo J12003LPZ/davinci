@@ -180,6 +180,8 @@ pub struct InteractiveSession {
     paste_buf: Option<String>,
     pub show_terminal_progress: bool,
     pub quiet_startup: bool,
+    /// OSC window title (`updateTerminalTitle` / extension `setTitle`).
+    pub terminal_title: Option<String>,
     progress_active: bool,
     pub escape_timeout_ms: u64,
     stdin_buffer: Option<crate::stdin_buffer::StdinBuffer>,
@@ -274,7 +276,7 @@ impl InteractiveSession {
             login_auth_type_labels: None,
             auth_selector_logout: false,
             supports_thinking: true,
-            autocomplete_max_visible: 8,
+            autocomplete_max_visible: 5,
             tree_filter_mode: FilterMode::Default,
             mermaid_mode: MermaidMode::Streaming,
             enabled_model_ids: None,
@@ -295,6 +297,7 @@ impl InteractiveSession {
             paste_buf: None,
             show_terminal_progress: false,
             quiet_startup: false,
+            terminal_title: None,
             progress_active: false,
             escape_timeout_ms: resolve_escape_timeout_ms_from_env(),
             stdin_buffer: None,
@@ -577,6 +580,11 @@ impl InteractiveSession {
     pub fn apply_extension_ui_calls(&mut self, calls: &[serde_json::Value]) {
         for call in calls {
             self.chrome.apply_ui_call(call);
+            if call.get("op").and_then(|value| value.as_str()) == Some("setTitle") {
+                if let Some(title) = call.get("title").and_then(|value| value.as_str()) {
+                    self.terminal_title = Some(title.to_string());
+                }
+            }
         }
     }
 
@@ -2153,6 +2161,7 @@ mod tests {
     fn settings_submenus_session_selector_and_osc_query() {
         let theme = builtin_themes().into_iter().next().expect("theme");
         let mut session = InteractiveSession::new(theme, "pi", vec!["openai/gpt".into()]);
+        assert_eq!(session.autocomplete_max_visible, 5);
         session.open_settings_list(crate::interactive_settings_list(
             &crate::InteractiveSettingsConfig {
                 theme: "dark".into(),
@@ -2272,11 +2281,13 @@ mod tests {
                 "op": "setWorkingIndicator",
                 "options": { "frames": ["●"], "intervalMs": 80 }
             }),
+            serde_json::json!({ "op": "setTitle", "title": "π - custom" }),
         ]);
         let frame = session.render_frame();
         assert!(frame.contains("hello widget"));
         assert!(frame.contains("job: running"));
         assert!(frame.contains("ext header"));
+        assert_eq!(session.terminal_title.as_deref(), Some("π - custom"));
         assert!(frame.contains("info: ready"));
         assert!(frame.contains("●"));
         session.apply_extension_ui_calls(&[serde_json::json!({

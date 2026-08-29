@@ -376,6 +376,14 @@ impl InteractiveTui {
         }
     }
 
+    /// OSC 0 window title matching TS `ProcessTerminal.setTitle`.
+    pub fn set_title(&mut self, title: &str) {
+        match self {
+            Self::Main(tui) => tui.base.terminal.set_title(title),
+            Self::Alt(tui) => tui.base.terminal.set_title(title),
+        }
+    }
+
     pub fn take_terminal(self) -> Box<dyn TerminalIo> {
         match self {
             Self::Main(tui) => (*tui).take_terminal(),
@@ -571,6 +579,21 @@ mod tests {
         };
         assert!(output.contains("\x1b[?1049h"));
         alt.stop(TuiStopOptions::default());
+    }
+
+    #[test]
+    fn set_title_writes_osc_zero() {
+        let mut tui = create_interactive_tui(memory_options(TuiMode::Regular, 40, 8));
+        tui.set_title("π - demo - project");
+        let output = match &tui {
+            InteractiveTui::Main(inner) => (*inner.base.terminal)
+                .as_any()
+                .downcast_ref::<MemoryTerminal>()
+                .expect("memory")
+                .output(),
+            InteractiveTui::Alt(_) => String::new(),
+        };
+        assert!(output.contains("\x1b]0;π - demo - project\x07"));
     }
 
     #[test]

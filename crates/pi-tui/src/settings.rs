@@ -144,7 +144,7 @@ impl Default for InteractiveSettingsConfig {
             theme: "dark".into(),
             double_escape: "tree".into(),
             quiet_startup: false,
-            autocomplete_max_visible: 8,
+            autocomplete_max_visible: 5,
             tree_filter_mode: "default".into(),
             mermaid_mode: "streaming".into(),
             enable_analytics: false,

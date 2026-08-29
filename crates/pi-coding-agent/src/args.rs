@@ -3,7 +3,22 @@ use pi_tui::TuiMode;
 use std::collections::BTreeMap;
 
 pub const APP_NAME: &str = "pi";
+/// TS `APP_TITLE`: `π` when `APP_NAME` is the default `"pi"`.
+pub const APP_TITLE: &str = "π";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// TS `InteractiveMode.updateTerminalTitle`.
+pub fn format_terminal_title(session_name: Option<&str>, cwd: &std::path::Path) -> String {
+    let cwd_basename = cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+    match session_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{APP_TITLE} - {name} - {cwd_basename}"),
+        None => format!("{APP_TITLE} - {cwd_basename}"),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -336,4 +351,26 @@ pub fn print_help_with_extension_flags(flags: &[(String, String)]) -> String {
         help.push_str(&format!("  --{name:<24} Registered by {path}\n"));
     }
     help
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn terminal_title_matches_ts_update_terminal_title() {
+        assert_eq!(
+            format_terminal_title(None, Path::new("/tmp/project")),
+            "π - project"
+        );
+        assert_eq!(
+            format_terminal_title(Some("demo"), Path::new("/tmp/project")),
+            "π - demo - project"
+        );
+        assert_eq!(
+            format_terminal_title(Some("  "), Path::new("/tmp/project")),
+            "π - project"
+        );
+    }
 }
