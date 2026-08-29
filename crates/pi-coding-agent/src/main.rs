@@ -412,6 +412,8 @@ fn complete_simple_summarization(
         max_retries,
         max_retry_delay_ms,
         max_tokens: Some(request.max_tokens),
+        websocket_connect_timeout_ms: load_settings(&default_agent_dir())
+            .websocket_connect_timeout_ms,
     };
     let response = complete_simple(
         &model,
@@ -902,6 +904,7 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                         max_retries: current.provider_max_retries,
                         max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
                         max_tokens: None,
+                        websocket_connect_timeout_ms: None,
                     },
                 ),
                 _ => Ok(AssistantMessage {
@@ -1139,6 +1142,7 @@ fn run_interactive(
         MermaidMode::parse(stored.markdown.mermaid.as_deref().unwrap_or("streaming"));
     session.chrome.transcript.mermaid_mode = session.mermaid_mode;
     session.chrome.transcript.hide_thinking_block = stored.hide_thinking_block.unwrap_or(false);
+    session.chrome.transcript.code_block_indent = stored.code_block_indent().to_string();
     session.enabled_model_ids = stored.enabled_models.clone();
     session.default_model = match (&stored.default_provider, &stored.default_model) {
         (Some(provider), Some(id)) => Some(format!("{provider}/{id}")),
@@ -1149,7 +1153,6 @@ fn run_interactive(
     session.warnings_anthropic_extra_usage = stored.warnings.anthropic_extra_usage.unwrap_or(true);
     session.branch_summary_skip_prompt = stored.branch_summary_skip_prompt();
     session.branch_summary_reserve_tokens = stored.branch_summary_reserve_tokens();
-    let _indent = stored.code_block_indent();
     if let Some(levels) = stored.model_thinking_levels.clone() {
         session.model_thinking_levels = levels;
     }
@@ -3681,7 +3684,7 @@ fn delete_discovered_session(
 
 fn handle_branch_summary_choice(
     _parsed: &Args,
-    agent: &Agent,
+    agent: &mut Agent,
     session: &mut InteractiveSession,
     id: &str,
     choice: Option<String>,
@@ -3691,17 +3694,8 @@ fn handle_branch_summary_choice(
             open_session_tree(agent, session);
             Ok(true)
         }
-        Some("No summary") => {
-            session.chrome.status = format!("tree={id} summary=none");
-            Ok(true)
-        }
-        Some("Summarize") => {
-            session.chrome.status = format!(
-                "tree={id} summary=summarize reserve={}",
-                session.branch_summary_reserve_tokens
-            );
-            Ok(true)
-        }
+        Some("No summary") => apply_tree_navigation(agent, session, id, false, None),
+        Some("Summarize") => apply_tree_navigation(agent, session, id, true, None),
         Some("Summarize with custom prompt") => {
             session.extension_dialog_context = Some(format!("branch-summary-custom:{id}"));
             session.open_extension_editor("Custom summarization instructions", "");
@@ -3715,7 +3709,7 @@ fn handle_branch_summary_choice(
 }
 
 fn handle_branch_summary_editor(
-    _agent: &Agent,
+    agent: &mut Agent,
     session: &mut InteractiveSession,
     value: Option<String>,
 ) {
@@ -3737,8 +3731,11 @@ fn handle_branch_summary_editor(
                 );
             }
             Some(instructions) => {
-                session.chrome.status = format!("tree={id} summary=custom");
-                let _ = instructions;
+                if let Err(error) =
+                    apply_tree_navigation(agent, session, id, true, Some(instructions.as_str()))
+                {
+                    session.chrome.status = error;
+                }
             }
         }
         return;
@@ -3747,13 +3744,12 @@ fn handle_branch_summary_editor(
 }
 
 fn select_tree_entry(
-    agent: &Agent,
+    agent: &mut Agent,
     session: &mut InteractiveSession,
     id: String,
 ) -> Result<bool, String> {
     if session.branch_summary_skip_prompt {
-        session.chrome.status = format!("tree={id} summary=none");
-        return Ok(true);
+        return apply_tree_navigation(agent, session, &id, false, None);
     }
     session.extension_dialog_context = Some(format!("branch-summary:{id}"));
     session.open_extension_selector(
@@ -3764,8 +3760,41 @@ fn select_tree_entry(
             "Summarize with custom prompt".into(),
         ],
     );
-    let _ = session.branch_summary_reserve_tokens;
-    let _ = agent.compaction.reserve_tokens;
+    Ok(true)
+}
+
+fn apply_tree_navigation(
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    target_id: &str,
+    summarize: bool,
+    custom_instructions: Option<&str>,
+) -> Result<bool, String> {
+    let reserve = session.branch_summary_reserve_tokens;
+    let result =
+        agent.navigate_tree_entry(target_id, summarize, custom_instructions, false, reserve)?;
+    if result.cancelled {
+        session.chrome.status = format!("tree={target_id} cancelled");
+        return Ok(true);
+    }
+    if let Some(text) = result.editor_text {
+        session.chrome.editor.set_text(text);
+    }
+    session.chrome.status = if summarize {
+        format!(
+            "tree={target_id} summary={}",
+            if custom_instructions.is_some() {
+                "custom"
+            } else {
+                "summarize"
+            }
+        )
+    } else {
+        format!("tree={target_id} summary=none")
+    };
+    if let Some(summary) = result.summary {
+        session.chrome.transcript.push("assistant", summary);
+    }
     Ok(true)
 }
 

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::markdown::render_markdown;
+use crate::markdown::{render_markdown_with, DEFAULT_CODE_BLOCK_INDENT};
 use crate::render::Component;
 use crate::themes::Theme;
 
@@ -55,6 +55,7 @@ pub struct CustomMessage {
     pub renderer: Option<MessageRenderer>,
     pub renderer_lines: Option<Vec<String>>,
     pub theme: Theme,
+    pub code_block_indent: String,
 }
 
 impl CustomMessage {
@@ -72,6 +73,7 @@ impl CustomMessage {
                 foreground: String::new(),
                 accent: String::new(),
             },
+            code_block_indent: DEFAULT_CODE_BLOCK_INDENT.into(),
         }
     }
 
@@ -124,9 +126,10 @@ impl CustomMessage {
         } else {
             self.content.lines().next().unwrap_or("").to_string()
         };
-        for line in render_markdown(
+        for line in render_markdown_with(
             &body,
             width.saturating_sub(self.output_pad.saturating_mul(2)),
+            &self.code_block_indent,
         ) {
             lines.push(format!(
                 "{pad}{}",

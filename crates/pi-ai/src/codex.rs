@@ -15,6 +15,55 @@ pub const WEBSOCKET_CLOSED_BEFORE_COMPLETED: &str =
     "WebSocket stream closed before response.completed";
 pub const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
 
+/// TS `normalizeTimeoutMs(options?.websocketConnectTimeoutMs)` then default 15000.
+/// Settings export `PI_WEBSOCKET_CONNECT_TIMEOUT_MS`.
+pub fn resolve_websocket_connect_timeout_ms(explicit: Option<u64>) -> u64 {
+    explicit
+        .or_else(|| {
+            std::env::var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS)
+}
+
+pub fn websocket_connect_timeout_error(timeout_ms: u64) -> String {
+    format!("WebSocket connect timeout after {timeout_ms}ms")
+}
+
+/// Codex websocket connect using the TS timeout. Tests never hit ChatGPT:
+/// `PI_CODEX_WS_REPLY` / localhost only.
+pub fn connect_codex_websocket(url: &str, timeout_ms: u64) -> Result<(), String> {
+    if let Ok(reply) = std::env::var("PI_CODEX_WS_REPLY") {
+        if reply == "timeout" {
+            return Err(websocket_connect_timeout_error(timeout_ms));
+        }
+        return Ok(());
+    }
+    if cfg!(test) && !url.contains("127.0.0.1") && !url.contains("localhost") {
+        return Ok(());
+    }
+    let host_port = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url);
+    let addr: std::net::SocketAddr = host_port
+        .parse()
+        .or_else(|_| format!("{host_port}:80").parse())
+        .map_err(|err| format!("WebSocket address: {err}"))?;
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(timeout_ms))
+    {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+            Err(websocket_connect_timeout_error(timeout_ms))
+        }
+        Err(err) => Err(format!("WebSocket connect failed: {err}")),
+    }
+}
+
 /// Map a Codex / OpenAI Responses event `type` to a pi-ai stream event name.
 pub fn map_codex_event_type(event_type: &str) -> Option<&'static str> {
     match event_type {
@@ -311,6 +360,36 @@ mod tests {
             WEBSOCKET_CLOSED_BEFORE_COMPLETED,
             "WebSocket stream closed before response.completed"
         );
+    }
+
+    #[test]
+    fn websocket_connect_timeout_uses_explicit_then_env_then_default() {
+        let previous = std::env::var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS").ok();
+        std::env::remove_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS");
+        assert_eq!(
+            resolve_websocket_connect_timeout_ms(None),
+            DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(resolve_websocket_connect_timeout_ms(Some(2500)), 2500);
+        std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", "3200");
+        assert_eq!(resolve_websocket_connect_timeout_ms(None), 3200);
+        assert_eq!(resolve_websocket_connect_timeout_ms(Some(900)), 900);
+        match previous {
+            Some(value) => std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", value),
+            None => std::env::remove_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS"),
+        }
+    }
+
+    #[test]
+    fn websocket_connect_fixture_timeout_uses_resolved_ms() {
+        let previous = std::env::var("PI_CODEX_WS_REPLY").ok();
+        std::env::set_var("PI_CODEX_WS_REPLY", "timeout");
+        let error = connect_codex_websocket("wss://chatgpt.com/backend-api", 1234).unwrap_err();
+        assert_eq!(error, websocket_connect_timeout_error(1234));
+        match previous {
+            Some(value) => std::env::set_var("PI_CODEX_WS_REPLY", value),
+            None => std::env::remove_var("PI_CODEX_WS_REPLY"),
+        }
     }
 
     #[test]

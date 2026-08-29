@@ -51,6 +51,74 @@ pub fn resolved_labels(entries: &[SessionEntry]) -> HashMap<String, (Option<Stri
     labels
 }
 
+/// TS `buildSessionPath`: walk parent chain from `leaf_id`. Missing/unset leaf
+/// falls back to the last entry (not `getBranch`, which returns empty).
+pub fn build_session_path<'a>(
+    entries: &'a [SessionEntry],
+    leaf_id: Option<&str>,
+) -> Vec<&'a SessionEntry> {
+    let leaf = match leaf_id {
+        Some(id) => entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .or_else(|| entries.last()),
+        None => entries.last(),
+    };
+    let Some(leaf) = leaf else {
+        return Vec::new();
+    };
+    let mut by_id = HashMap::new();
+    for entry in entries {
+        by_id.insert(entry.id.as_str(), entry);
+    }
+    let mut path = Vec::new();
+    let mut current = Some(leaf);
+    while let Some(entry) = current {
+        path.push(entry);
+        current = entry
+            .parent_id
+            .as_deref()
+            .and_then(|id| by_id.get(id).copied());
+    }
+    path.reverse();
+    path
+}
+
+/// TS `buildContextEntries`: leaf path, latest compaction + firstKept + after.
+pub fn build_context_entries<'a>(
+    entries: &'a [SessionEntry],
+    leaf_id: Option<&str>,
+) -> Vec<&'a SessionEntry> {
+    let path = build_session_path(entries, leaf_id);
+    let Some(compaction) = path
+        .iter()
+        .copied()
+        .filter(|entry| entry.entry_type == "compaction")
+        .next_back()
+    else {
+        return path;
+    };
+    let Some(compaction_idx) = path.iter().position(|entry| entry.id == compaction.id) else {
+        return path;
+    };
+    let first_kept_id = compaction
+        .extra
+        .get("firstKeptEntryId")
+        .and_then(Value::as_str);
+    let mut context = vec![compaction];
+    let mut found_first_kept = false;
+    for entry in path.iter().take(compaction_idx) {
+        if first_kept_id == Some(entry.id.as_str()) {
+            found_first_kept = true;
+        }
+        if found_first_kept {
+            context.push(*entry);
+        }
+    }
+    context.extend(path.iter().skip(compaction_idx + 1).copied());
+    context
+}
+
 pub fn branch_entries<'a>(
     entries: &'a [SessionEntry],
     leaf_id: Option<&str>,

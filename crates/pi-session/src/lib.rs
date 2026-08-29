@@ -17,8 +17,9 @@ pub use discovery::{
 };
 pub use errors::{JsonlDecodeError, SessionError};
 pub use tree::{
-    branch_entries, build_session_tree, entries_since, export_session_jsonl, fork_user_messages,
-    resolved_labels, session_usage_stats, SessionUsageStats,
+    branch_entries, build_context_entries, build_session_path, build_session_tree, entries_since,
+    export_session_jsonl, fork_user_messages, resolved_labels, session_usage_stats,
+    SessionUsageStats,
 };
 pub use types::*;
 
@@ -171,6 +172,48 @@ impl JsonlSession {
         }))?;
         self.entries.push(entry);
         Ok(())
+    }
+
+    pub fn set_leaf(&mut self, leaf_id: Option<String>) {
+        self.leaf_id = leaf_id;
+    }
+
+    /// TS `branchWithSummary`: move the leaf to `branch_from_id`, then append a
+    /// `branch_summary` whose `fromId` is the abandoned leaf.
+    pub fn branch_with_summary(
+        &mut self,
+        branch_from_id: Option<String>,
+        summary: &str,
+        details: serde_json::Value,
+        usage: Option<serde_json::Value>,
+        from_hook: bool,
+    ) -> Result<String, SessionError> {
+        if let Some(id) = branch_from_id.as_deref() {
+            if !id.is_empty() && !self.entries.iter().any(|entry| entry.id == id) {
+                return Err(SessionError::not_found(format!("Entry {id} not found")));
+            }
+        }
+        let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".into());
+        self.leaf_id = branch_from_id;
+        let mut extra = serde_json::Map::new();
+        extra.insert("fromId".into(), serde_json::Value::String(from_id));
+        extra.insert("summary".into(), serde_json::Value::String(summary.into()));
+        extra.insert("details".into(), details);
+        extra.insert("fromHook".into(), serde_json::Value::Bool(from_hook));
+        if let Some(usage) = usage {
+            extra.insert("usage".into(), usage);
+        }
+        self.append_entry(SessionEntry {
+            id: String::new(),
+            entry_type: "branch_summary".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: None,
+            extra,
+        })?;
+        Ok(self.leaf_id.clone().unwrap_or_default())
     }
 
     pub fn fork(&self, entry_id: &str, sessions_root: &Path) -> Result<Self, SessionError> {
@@ -371,5 +414,89 @@ mod tests {
         assert_eq!(header["type"], "session");
         assert_eq!(header["id"], session.header.id);
         assert!(raw.contains("\"parentId\":null"));
+    }
+
+    #[test]
+    fn build_context_entries_follows_leaf_and_latest_compaction() {
+        fn msg(id: &str, parent: Option<&str>, role: &str, text: &str) -> SessionEntry {
+            SessionEntry {
+                id: id.into(),
+                entry_type: "message".into(),
+                parent_id: parent.map(str::to_string),
+                seq: 0,
+                timestamp: 0,
+                message: Some(serde_json::json!({
+                    "role": role,
+                    "content": [{"type": "text", "text": text}],
+                })),
+                custom_type: None,
+                extra: serde_json::Map::new(),
+            }
+        }
+        fn compaction(id: &str, parent: &str, summary: &str, first_kept: &str) -> SessionEntry {
+            let mut extra = serde_json::Map::new();
+            extra.insert("summary".into(), serde_json::json!(summary));
+            extra.insert("firstKeptEntryId".into(), serde_json::json!(first_kept));
+            SessionEntry {
+                id: id.into(),
+                entry_type: "compaction".into(),
+                parent_id: Some(parent.into()),
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: None,
+                extra,
+            }
+        }
+        fn branch_summary(id: &str, parent: &str, summary: &str, from: &str) -> SessionEntry {
+            let mut extra = serde_json::Map::new();
+            extra.insert("summary".into(), serde_json::json!(summary));
+            extra.insert("fromId".into(), serde_json::json!(from));
+            SessionEntry {
+                id: id.into(),
+                entry_type: "branch_summary".into(),
+                parent_id: Some(parent.into()),
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: None,
+                extra,
+            }
+        }
+
+        let entries = vec![
+            msg("1", None, "user", "start"),
+            msg("2", Some("1"), "assistant", "r1"),
+            msg("3", Some("2"), "user", "q2"),
+            msg("4", Some("3"), "assistant", "r2"),
+            compaction("5", "4", "Compacted history", "3"),
+            msg("6", Some("5"), "user", "q3"),
+            msg("7", Some("6"), "assistant", "r3"),
+            msg("8", Some("3"), "user", "wrong path"),
+            msg("9", Some("8"), "assistant", "wrong response"),
+            branch_summary("10", "3", "Tried wrong approach", "9"),
+            msg("11", Some("10"), "user", "better approach"),
+        ];
+        assert_eq!(
+            build_context_entries(&entries, Some("7"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5", "3", "4", "6", "7"]
+        );
+        assert_eq!(
+            build_context_entries(&entries, Some("11"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "10", "11"]
+        );
+        assert_eq!(
+            build_context_entries(&entries, Some("missing"))
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "10", "11"]
+        );
     }
 }

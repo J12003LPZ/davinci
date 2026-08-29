@@ -1,5 +1,5 @@
 use crate::custom_message::CustomMessage;
-use crate::markdown::render_markdown;
+use crate::markdown::{render_markdown_with, DEFAULT_CODE_BLOCK_INDENT};
 use crate::mermaid::{transform_mermaid, MermaidContext, MermaidMode};
 use crate::render::{visible_width, Component};
 use crate::themes::Theme;
@@ -19,6 +19,7 @@ pub struct Transcript {
     pub hide_thinking_block: bool,
     pub renderers: crate::custom_message::MessageRendererRegistry,
     pub extra_transformers: Vec<fn(&str, &str, usize) -> String>,
+    pub code_block_indent: String,
 }
 
 impl Default for Transcript {
@@ -30,6 +31,7 @@ impl Default for Transcript {
             hide_thinking_block: false,
             renderers: crate::custom_message::MessageRendererRegistry::default(),
             extra_transformers: Vec::new(),
+            code_block_indent: DEFAULT_CODE_BLOCK_INDENT.into(),
         }
     }
 }
@@ -89,6 +91,7 @@ impl Component for Transcript {
                     .split_once('\n')
                     .unwrap_or((line.text.as_str(), ""));
                 let mut message = CustomMessage::new(custom_type, content);
+                message.code_block_indent = self.code_block_indent.clone();
                 message.renderer_lines = line.custom_lines.clone();
                 if message.renderer_lines.is_none() {
                     message.renderer = self.renderers.get(custom_type);
@@ -116,7 +119,11 @@ impl Component for Transcript {
                     "assistant",
                     width,
                 );
-                out.extend(render_markdown(&transformed, width));
+                out.extend(render_markdown_with(
+                    &transformed,
+                    width,
+                    &self.code_block_indent,
+                ));
             } else if line.role == "user" {
                 let transformed =
                     apply_extra_transformers(&line.text, &self.extra_transformers, "user", width);

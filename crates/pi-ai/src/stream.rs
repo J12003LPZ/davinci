@@ -20,6 +20,7 @@ pub struct StreamOptions {
     pub max_retries: Option<u32>,
     pub max_retry_delay_ms: Option<u64>,
     pub max_tokens: Option<u64>,
+    pub websocket_connect_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +316,23 @@ pub fn live_complete_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
+    if model.api == "openai-codex-responses" {
+        let timeout = crate::codex::resolve_websocket_connect_timeout_ms(
+            options.websocket_connect_timeout_ms,
+        );
+        let ws_url = std::env::var("PI_CODEX_WS_URL").unwrap_or_else(|_| {
+            model
+                .base_url
+                .clone()
+                .unwrap_or_else(|| crate::codex::DEFAULT_CODEX_BASE_URL.into())
+        });
+        if std::env::var("PI_CODEX_WS_REPLY").is_ok()
+            || std::env::var("PI_CODEX_WS_URL").is_ok()
+            || (!cfg!(test) && (ws_url.contains("127.0.0.1") || ws_url.contains("localhost")))
+        {
+            crate::codex::connect_codex_websocket(&ws_url, timeout)?;
+        }
+    }
     let body = request_body_with(model, messages, system, tools, options);
     let url = request_url(model, auth);
     let headers = collect_request_headers(model, auth);

@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (LLM compaction completeSimple + provider Retry-After). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (LLM branch summaries, markdown codeBlockIndent, Codex websocket connect timeout, leaf-path session context). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -69,8 +69,18 @@ Closed this slice: compaction file-ops (`read`/`write`/`edit` → `<read-files>`
 
 Closed this slice: compaction `completeSimple` checkpoint generation — TS structured `## Goal` / update / turn-prefix prompts, `SUMMARIZATION_SYSTEM_PROMPT`, serialize with `[... N more characters truncated]`, split-turn merge, usage on JSONL `compaction` entries, `firstKeptEntryId` reload, fixture `PI_COMPACTION_REPLY`. Provider HTTP retries honor `retry-after` / `retry-after-ms` / `x-should-retry` (undici-style cap), and the agent loop emits `auto_retry_start` / `auto_retry_end` for retryable assistant errors.
 
+Closed this slice: LLM branch-tree summarization (`BRANCH_SUMMARY_PREAMBLE` / `BRANCH_SUMMARY_PROMPT`, `completeSimple` 2048 tokens, `branch_summary` JSONL), leaf-path `buildContextEntries` reload, TUI `markdown.codeBlockIndent`, Codex `websocketConnectTimeoutMs` on connect.
+
+Closed this slice: `/tree` “Summarize branch?” runs TS `completeSummarization` (structured `## Goal` prompt, 2048 tokens, preamble + file-ops XML, `branch_summary` JSONL via `branchWithSummary`, user/custom targets restore editor text). Session reload uses TS `buildContextEntries` (leaf path + latest compaction `firstKeptEntryId`). TUI markdown applies `markdown.codeBlockIndent` (default two spaces) to fenced code. Codex websocket connect honors `websocketConnectTimeoutMs` / `PI_WEBSOCKET_CONNECT_TIMEOUT_MS` (default 15000; fixture `PI_CODEX_WS_REPLY=timeout`).
+
 Still not product-equivalent:
 
-- Branch-tree “Summarize branch?” still writes a status string instead of `completeSummarization` LLM branch summaries
-- `markdown.codeBlockIndent` is parsed but not applied to the TUI markdown renderer
-- `websocketConnectTimeoutMs` is exported to `PI_WEBSOCKET_CONNECT_TIMEOUT_MS` but Codex websocket connect does not read it
+- Edit tool is legacy single `oldText`/`newText`; TS `edits[]` multi-replacement, uniqueness, overlap, and fuzzy match are missing
+- `images.blockImages` / `images.autoResize` and tool-result image normalization are parsed but not applied on the LLM path
+- Codex `transport` (`auto`/`sse`/`websocket`) is stored in settings but not passed into stream options
+- Bash tool has no `timeout` (TS kills after N seconds)
+- Provider attribution headers (OpenRouter referer, NIM, Cloudflare, OpenCode session) are not sent
+- RPC `abort_retry` is a no-op; RPC `images` on prompt/steer/follow_up are dropped
+- Interactive polish: cache-miss notices, OSC 9;4 terminal progress, git-branch footer, `quietStartup` banners, post-update changelog overlay
+- Packages: interactive `pi config` persist, `pi update --extensions` reinstall, `package.json` `"pi"` manifest, extension `ctx` session APIs
+- `pi-session-sqlite` is not the product session backend (JSONL-only in coding-agent)

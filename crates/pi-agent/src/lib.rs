@@ -1,5 +1,6 @@
 //! Agent runtime matching `@earendil-works/pi-agent-core`.
 
+mod branch;
 mod compaction;
 mod context;
 mod events;
@@ -9,10 +10,16 @@ mod templates;
 mod tools;
 mod turn;
 
+pub use branch::{
+    build_branch_summary_prompt, collect_entries_for_branch_summary, generate_branch_summary,
+    message_from_branch_entry, navigation_target, prepare_branch_entries, BranchPreparation,
+    BranchSummaryResult, BRANCH_SUMMARY_PREAMBLE, BRANCH_SUMMARY_PROMPT,
+};
 pub use compaction::{
-    build_history_prompt, calculate_context_tokens, compact_messages, compact_messages_with,
-    compact_messages_with_options, compaction_context_message, compute_file_lists, convert_to_llm,
-    env_summarizer, estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
+    branch_summary_context_message, build_history_prompt, calculate_context_tokens,
+    compact_messages, compact_messages_with, compact_messages_with_options,
+    compaction_context_message, compute_file_lists, convert_to_llm, env_summarizer,
+    estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
     format_file_operations, generate_summary_with_usage, get_summarization_failure,
     serialize_conversation, should_compact, CompactionDetails, CompactionResult,
     CompactionSettings, CutPointResult, FileOperations, SummarizeRequest, SummarizeResponse,
@@ -263,6 +270,90 @@ impl Agent {
         self.session = Some(session);
     }
 
+    /// Navigate the session tree. When `summarize` is true, generates a branch
+    /// summary of the abandoned path and appends a `branch_summary` entry.
+    pub fn navigate_tree_entry(
+        &mut self,
+        target_id: &str,
+        summarize: bool,
+        custom_instructions: Option<&str>,
+        replace_instructions: bool,
+        reserve_tokens: u64,
+    ) -> Result<TreeNavigateResult, String> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| "No session to navigate".to_string())?;
+        let target = session
+            .entries
+            .iter()
+            .find(|entry| entry.id == target_id)
+            .cloned()
+            .ok_or_else(|| format!("Entry {target_id} not found"))?;
+        let old_leaf = session.leaf_id.clone();
+        let (collected, _) =
+            collect_entries_for_branch_summary(&session.entries, old_leaf.as_deref(), target_id);
+        let (new_leaf, editor_text) = navigation_target(&target);
+        let mut summary_text = None;
+        if summarize && !collected.is_empty() {
+            let provider = self.provider.clone();
+            let model_id = self.model_id.clone();
+            let bound = self.summarizer.clone().map(|inner| {
+                Summarizer::new(move |request| {
+                    let mut request = request.clone();
+                    if request.provider.is_empty() {
+                        request.provider = provider.clone();
+                    }
+                    if request.model_id.is_empty() {
+                        request.model_id = model_id.clone();
+                    }
+                    inner.summarize(&request)
+                })
+            });
+            let result = generate_branch_summary(
+                &collected,
+                self.context_window,
+                reserve_tokens,
+                custom_instructions,
+                replace_instructions,
+                bound.as_ref(),
+            );
+            if result.aborted {
+                return Ok(TreeNavigateResult {
+                    cancelled: true,
+                    editor_text: None,
+                    summary: None,
+                });
+            }
+            if let Some(error) = result.error {
+                return Err(error);
+            }
+            if let Some(summary) = result.summary.clone() {
+                let details = serde_json::to_value(&result.details).unwrap_or_default();
+                let usage = result
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| serde_json::to_value(usage).ok());
+                self.session
+                    .as_mut()
+                    .ok_or_else(|| "No session to navigate".to_string())?
+                    .branch_with_summary(new_leaf.clone(), &summary, details, usage, false)
+                    .map_err(|err| err.to_string())?;
+                summary_text = Some(summary);
+            }
+        } else if let Some(session) = &mut self.session {
+            session.set_leaf(new_leaf);
+        }
+        if let Some(session) = &self.session {
+            self.messages = messages_from_session(session);
+        }
+        Ok(TreeNavigateResult {
+            cancelled: false,
+            editor_text,
+            summary: summary_text,
+        })
+    }
+
     pub fn session_tree(&self) -> Vec<serde_json::Value> {
         self.session
             .as_ref()
@@ -299,50 +390,58 @@ impl Agent {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TreeNavigateResult {
+    pub cancelled: bool,
+    pub editor_text: Option<String>,
+    pub summary: Option<String>,
+}
+
 fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
-    if entry.entry_type == "compaction" {
-        let summary = entry.extra.get("summary")?.as_str()?;
-        return Some(compaction_context_message(summary));
+    match entry.entry_type.as_str() {
+        "compaction" => {
+            let summary = entry.extra.get("summary")?.as_str()?;
+            Some(compaction_context_message(summary))
+        }
+        "branch_summary" => {
+            let summary = entry.extra.get("summary")?.as_str()?;
+            Some(branch_summary_context_message(summary))
+        }
+        "custom_message" => {
+            let content = entry
+                .extra
+                .get("content")
+                .cloned()
+                .or_else(|| entry.message.clone())
+                .unwrap_or(Value::Null);
+            let text = match &content {
+                Value::String(value) => value.clone(),
+                other => other
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default(),
+            };
+            Some(ChatMessage::text("custom", text))
+        }
+        "message" => {
+            let message = entry.message.as_ref()?;
+            serde_json::from_value(message.clone()).ok()
+        }
+        _ => None,
     }
-    let message = entry.message.as_ref()?;
-    serde_json::from_value(message.clone()).ok()
 }
 
 fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {
-    let Some(index) = session
-        .entries
-        .iter()
-        .rposition(|entry| entry.entry_type == "compaction")
-    else {
-        return session.entries.iter().filter_map(entry_to_chat).collect();
-    };
-    let first_kept_id = session.entries[index]
-        .extra
-        .get("firstKeptEntryId")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let first_kept_index = session
-        .entries
-        .iter()
-        .position(|entry| entry.id == first_kept_id)
-        .unwrap_or(index + 1);
-    let mut messages = Vec::new();
-    if let Some(summary) = session.entries[index]
-        .extra
-        .get("summary")
-        .and_then(Value::as_str)
-    {
-        messages.push(compaction_context_message(summary));
-    }
-    for entry in session.entries.iter().skip(first_kept_index) {
-        if entry.entry_type == "compaction" {
-            continue;
-        }
-        if let Some(message) = entry_to_chat(entry) {
-            messages.push(message);
-        }
-    }
-    messages
+    pi_session::build_context_entries(&session.entries, session.leaf_id.as_deref())
+        .into_iter()
+        .filter_map(entry_to_chat)
+        .collect()
 }
 
 fn first_kept_entry_id(
@@ -559,5 +658,99 @@ mod tests {
         assert_eq!(retry_delay_ms(2000, 1), 4000);
         assert_eq!(retry_delay_ms(2000, 2), 8000);
         assert_eq!(retry_delay_ms(1, 3), 8);
+    }
+
+    #[test]
+    fn navigate_tree_appends_llm_branch_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/project", Some("branch")).unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"start"}]),
+            ))
+            .unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "assistant",
+                serde_json::json!([{"type":"text","text":"ok"}]),
+            ))
+            .unwrap();
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"abandoned"}]),
+            ))
+            .unwrap();
+        let abandoned = session.leaf_id.clone().unwrap();
+        session.set_leaf(Some(session.entries[1].id.clone()));
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"other"}]),
+            ))
+            .unwrap();
+
+        let mut agent = Agent::new("x");
+        agent.summarizer = Some(Summarizer::new(|request| {
+            assert_eq!(request.system, SUMMARIZATION_SYSTEM_PROMPT);
+            assert!(request.prompt.contains("## Goal"));
+            assert_eq!(request.max_tokens, 2048);
+            Ok(SummarizeResponse {
+                text: "## Goal\nabandoned work".into(),
+                usage: pi_protocol::Usage {
+                    input: 1,
+                    output: 2,
+                    total_tokens: 3,
+                    ..pi_protocol::Usage::default()
+                },
+                stop_reason: Some(pi_ai::StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        }));
+        agent.load_from_session(session);
+        let result = agent
+            .navigate_tree_entry(&abandoned, true, None, false, 16_384)
+            .unwrap();
+        assert_eq!(result.editor_text.as_deref(), Some("abandoned"));
+        assert!(result
+            .summary
+            .as_deref()
+            .unwrap()
+            .starts_with(BRANCH_SUMMARY_PREAMBLE));
+        assert!(result
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("## Goal\nabandoned work"));
+        let stored = agent.session.as_ref().unwrap();
+        assert!(stored
+            .entries
+            .iter()
+            .any(|entry| entry.entry_type == "branch_summary"
+                && entry.extra.get("fromId").and_then(Value::as_str)
+                    == stored
+                        .entries
+                        .iter()
+                        .find(|e| {
+                            e.entry_type == "message"
+                                && e.message
+                                    .as_ref()
+                                    .and_then(|m| m.get("content"))
+                                    .and_then(|c| c.as_array())
+                                    .and_then(|items| items[0].get("text"))
+                                    .and_then(Value::as_str)
+                                    == Some("other")
+                        })
+                        .map(|e| e.id.as_str())));
+        assert!(agent
+            .messages
+            .iter()
+            .any(|message| content_text(&message.content).contains("abandoned work")));
+        assert!(!agent
+            .messages
+            .iter()
+            .any(|message| content_text(&message.content) == "other"));
     }
 }

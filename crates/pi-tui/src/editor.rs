@@ -40,6 +40,11 @@ impl Editor {
         self.buffer.drain(self.cursor..self.cursor + prev);
     }
 
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.buffer = text.into();
+        self.cursor = self.buffer.len();
+    }
+
     pub fn submit(&mut self) -> String {
         let value = std::mem::take(&mut self.buffer);
         self.cursor = 0;

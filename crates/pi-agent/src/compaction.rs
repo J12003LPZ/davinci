@@ -359,6 +359,13 @@ pub fn compaction_context_message(summary: &str) -> ChatMessage {
     )
 }
 
+pub fn branch_summary_context_message(summary: &str) -> ChatMessage {
+    ChatMessage::text(
+        "user",
+        format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"),
+    )
+}
+
 fn local_summary(messages: &[ChatMessage], custom_instructions: Option<&str>) -> String {
     let mut summary = serialize_conversation(messages);
     if let Some(instructions) = custom_instructions {
@@ -528,6 +535,7 @@ fn combine_usage(first: &Usage, second: &Usage) -> Usage {
 pub fn env_summarizer() -> Option<Summarizer> {
     if std::env::var("PI_COMPACTION_REPLY").is_err()
         && std::env::var("PI_COMPACTION_TURN_PREFIX_REPLY").is_err()
+        && std::env::var("PI_BRANCH_SUMMARY_REPLY").is_err()
     {
         return None;
     }
@@ -537,10 +545,13 @@ pub fn env_summarizer() -> Option<Summarizer> {
 fn summarize_from_env(request: &SummarizeRequest) -> Result<SummarizeResponse, String> {
     let key = if request.label.contains("Turn prefix") {
         "PI_COMPACTION_TURN_PREFIX_REPLY"
+    } else if request.label.contains("Branch") {
+        "PI_BRANCH_SUMMARY_REPLY"
     } else {
         "PI_COMPACTION_REPLY"
     };
     let raw = std::env::var(key)
+        .or_else(|_| std::env::var("PI_BRANCH_SUMMARY_REPLY"))
         .or_else(|_| std::env::var("PI_COMPACTION_REPLY"))
         .map_err(|_| format!("{} fixture missing", request.label))?;
     let text = if std::path::Path::new(&raw).is_file() {

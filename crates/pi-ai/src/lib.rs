@@ -28,12 +28,13 @@ pub use catalog::{
     radius_models_from_config, Model, ModelCost, KNOWN_PROVIDERS,
 };
 pub use codex::{
-    is_previous_response_not_found, is_websocket_connection_limit_reached, map_codex_event_type,
-    normalize_codex_terminal_event, replay_codex_events, should_fallback_to_sse,
+    connect_codex_websocket, is_previous_response_not_found, is_websocket_connection_limit_reached,
+    map_codex_event_type, normalize_codex_terminal_event, replay_codex_events,
+    resolve_websocket_connect_timeout_ms, should_fallback_to_sse,
     should_retry_missing_previous_response, should_retry_websocket_connection_limit,
-    DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS, PREVIOUS_RESPONSE_NOT_FOUND,
-    WEBSOCKET_CLOSED_BEFORE_COMPLETED, WEBSOCKET_CONNECTION_LIMIT_REACHED,
-    WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
+    websocket_connect_timeout_error, DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
+    PREVIOUS_RESPONSE_NOT_FOUND, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
+    WEBSOCKET_CONNECTION_LIMIT_REACHED, WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
 };
 pub use model_config::{
     apply_config_auth, apply_config_auth_with_shell, apply_models_config,

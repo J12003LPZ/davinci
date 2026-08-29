@@ -61,7 +61,7 @@ pub use keybindings::{key_to_bytes, Keybindings};
 pub use keys::{decode_kitty_printable, parse_key, Key};
 pub use latex::render_latex;
 pub use login_dialog::{AuthInfoLink, DeviceCodeInfo, LoginDialog, LoginDialogAction};
-pub use markdown::render_markdown;
+pub use markdown::{render_markdown, render_markdown_with, DEFAULT_CODE_BLOCK_INDENT};
 pub use mermaid::{transform_mermaid, MermaidArt, MermaidContext, MermaidMode, MermaidTheme};
 pub use model_selector::{ModelScope, ModelSelector, ModelSelectorAction, ModelSelectorItem};
 pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISABLE, MOUSE_ENABLE};
