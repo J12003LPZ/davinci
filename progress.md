@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (JSONL-on-disk SessionRepo). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (Codex websocket protocol). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -85,7 +85,8 @@ Closed this slice: `InMemorySessionRepo` + `SessionState` lock TS `createSession
 
 Closed this slice: JSONL-on-disk `SessionRepo` (`vendor/pi/packages/agent/src/harness/session/jsonl`) — harness cwd dirs (`--tmp-workspace-project--`), ISO-dashed filenames (`2026-01-01T00-00-00-000Z_{id}.jsonl`), session-id filename validation (`invalid_payload`), same id allowed across cwds, one line per mutation with shared seq, torn-tail syntax repair (`path.jsonl.tmp` then rename), missing-newline append, unknown-kind / schema last-line `invalid_entry` without rewrite, tree fork writes imported entries without `lane`, list skips unparsable headers. Coding-agent default stays JSONL **files** with the `--` cwd encoder (TS coding-agent), not this harness directory scheme.
 
+Closed this slice: Codex websocket protocol from `openai-codex-responses.ts` — `resolveCodexUrl` / `resolveCodexWebSocketUrl` (`/codex/responses`, https→wss), JWT `chatgpt_account_id`, SSE headers (`OpenAI-Beta: responses=experimental`, `originator: pi`, `chatgpt-account-id`) and WS headers (`OpenAI-Beta: responses_websockets=2026-02-06`, stripped from handshake like TS), session cache + continuation input deltas + debug stats, connection-limit / missing-`previous_response_id` retries, SSE fallback before first event, idle/connect timeout strings, RFC 6455 client (loopback tests + rustls `wss` for live ChatGPT). Compaction `complete_simple` sends `cacheRetention: none`. Tests use `PI_CODEX_WS_REPLY` / localhost only.
+
 Still not product-equivalent:
 
-- Live Codex websocket remains fixture/localhost
-- Intl.Segmenter CJK dictionary grouping is still walk-to-boundary (no ICU dictionary)
+- Intl.Segmenter CJK dictionary grouping in the TUI editor/input (`你好|世界`) is still walk-to-boundary. Word-nav tests lock per-character CJK (TS `word-navigation.test.ts`). No in-repo ICU; pair-grouping is not invented.

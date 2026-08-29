@@ -421,6 +421,7 @@ fn complete_simple_summarization(
             .websocket_connect_timeout_ms,
         transport: load_settings(&default_agent_dir()).transport.clone(),
         session_id: None,
+        cache_retention: Some("none".into()),
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
     };
     let response = complete_simple(
@@ -912,12 +913,14 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
                         max_retries: current.provider_max_retries,
                         max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
                         max_tokens: None,
-                        websocket_connect_timeout_ms: None,
+                        websocket_connect_timeout_ms: load_settings(&default_agent_dir())
+                            .websocket_connect_timeout_ms,
                         transport: current.transport.clone(),
                         session_id: current
                             .session
                             .as_ref()
                             .map(|session| session.header.id.clone()),
+                        cache_retention: None,
                         install_telemetry: Some(current.install_telemetry),
                     },
                 ),

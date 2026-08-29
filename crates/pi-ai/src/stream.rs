@@ -23,6 +23,7 @@ pub struct StreamOptions {
     pub websocket_connect_timeout_ms: Option<u64>,
     pub transport: Option<String>,
     pub session_id: Option<String>,
+    pub cache_retention: Option<String>,
     pub install_telemetry: Option<bool>,
 }
 
@@ -319,30 +320,31 @@ pub fn live_complete_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
-    if model.api == "openai-codex-responses" && options.transport.as_deref() != Some("sse") {
-        let timeout = crate::codex::resolve_websocket_connect_timeout_ms(
-            options.websocket_connect_timeout_ms,
-        );
-        let ws_url = std::env::var("PI_CODEX_WS_URL").unwrap_or_else(|_| {
-            model
-                .base_url
-                .clone()
-                .unwrap_or_else(|| crate::codex::DEFAULT_CODEX_BASE_URL.into())
-        });
-        if std::env::var("PI_CODEX_WS_REPLY").is_ok()
-            || std::env::var("PI_CODEX_WS_URL").is_ok()
-            || (!cfg!(test) && (ws_url.contains("127.0.0.1") || ws_url.contains("localhost")))
-        {
-            crate::codex::connect_codex_websocket(&ws_url, timeout)?;
+    let body = request_body_with(model, messages, system, tools, options);
+    if model.api == "openai-codex-responses" {
+        if let Some(token) = auth.api_key.as_deref() {
+            match crate::codex::try_codex_websocket_transport(
+                model,
+                &body,
+                token,
+                options.transport.as_deref(),
+                options.session_id.as_deref(),
+                options.cache_retention.as_deref(),
+                options.websocket_connect_timeout_ms,
+                options.timeout_ms,
+            ) {
+                Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => return Ok(*message),
+                Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {}
+                Err(error) => return Err(error),
+            }
         }
     }
-    let body = request_body_with(model, messages, system, tools, options);
     let url = request_url(model, auth);
     let headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
-        &collect_request_headers(model, auth),
+        &collect_request_headers(model, auth, options.session_id.as_deref()),
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let text = crate::provider_retry::retry_provider_request(
@@ -356,7 +358,29 @@ pub fn live_complete_with(
     Ok(parse_provider_response(model, &text))
 }
 
-fn collect_request_headers(model: &Model, auth: &ResolvedAuth) -> Vec<(String, String)> {
+fn collect_request_headers(
+    model: &Model,
+    auth: &ResolvedAuth,
+    session_id: Option<&str>,
+) -> Vec<(String, String)> {
+    if model.api == "openai-codex-responses" {
+        if let Some(token) = &auth.api_key {
+            if let Ok(account_id) = crate::codex::extract_account_id(token) {
+                let extra: Vec<(String, String)> = auth
+                    .headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                return crate::codex::build_sse_headers(
+                    &model.headers,
+                    &extra,
+                    &account_id,
+                    token,
+                    session_id,
+                );
+            }
+        }
+    }
     let mut headers = Vec::new();
     for (key, value) in &auth.headers {
         headers.push((key.clone(), value.clone()));
@@ -634,7 +658,8 @@ pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
             "{base}/v1/projects/default/locations/us-central1/publishers/google/models/{}:generateContent",
             model.id
         ),
-        "openai-responses" | "azure-openai-responses" | "openai-codex-responses" => {
+        "openai-codex-responses" => crate::codex::resolve_codex_url(model.base_url.as_deref()),
+        "openai-responses" | "azure-openai-responses" => {
             format!("{base}/responses")
         }
         "mistral-conversations" => format!("{base}/v1/conversations"),
