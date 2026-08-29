@@ -27,7 +27,7 @@ Gates on this slice: `cargo test --workspace`, `cargo fmt --check`, `clippy --wo
 
 ## Remaining product gaps
 
-- **Live clipboard grabbers**: image/text paste is fixture-driven (`PI_CLIPBOARD_*`). TS `pngpaste` / `wl-paste` / `xclip -t image` platform readers are not invoked outside fixtures.
+- **Clipboard conversion**: live `wl-paste` / `xclip` / `xsel` / `pngpaste` / `pbpaste` / WSL PowerShell readers run when `PI_CLIPBOARD_*` fixtures are unset. Photon BMP→PNG conversion from TS is not ported.
 - **Keybinding catalog**: `keybindings.json` covers the interactive extras wired above. Remaining TS ids (`app.model.select`, `app.tools.expand`, `app.session.new`, extension shortcuts, …) are not a complete override map.
 - **OSC TTY reader**: the 100ms probe consumes replies that arrive on the session byte path (including injected OSC). There is no separate raw-TTY drain independent of the crossterm event loop.
 - **Share / reload depth**: `/share` uses gist/`PI_SHARE_*` fixtures, not the live Radius artifact upload. `/reload` does not restart the JS extension host or rescan theme files.
