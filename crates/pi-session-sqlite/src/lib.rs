@@ -274,6 +274,265 @@ impl SessionSqlite {
         }
         Ok(sessions.len())
     }
+
+    pub fn next_sequence(&self, session_id: &str) -> Result<i64, SqliteError> {
+        let current: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT next_seq FROM session_sequences WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next = current.unwrap_or(1);
+        self.conn.execute(
+            "INSERT INTO session_sequences(session_id, next_seq) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET next_seq = excluded.next_seq",
+            params![session_id, next + 1],
+        )?;
+        Ok(next)
+    }
+
+    pub fn upsert_stats(
+        &self,
+        session_id: &str,
+        message_count: i64,
+        cached: f64,
+        uncached: f64,
+        total: f64,
+        cost: f64,
+    ) -> Result<(), SqliteError> {
+        self.conn.execute(
+            "INSERT INTO session_stats(session_id, message_count, cached_tokens, uncached_tokens, total_tokens, cost_total)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+                message_count=excluded.message_count,
+                cached_tokens=excluded.cached_tokens,
+                uncached_tokens=excluded.uncached_tokens,
+                total_tokens=excluded.total_tokens,
+                cost_total=excluded.cost_total",
+            params![session_id, message_count, cached, uncached, total, cost],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_stats(&self, session_id: &str) -> Result<Option<Value>, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT message_count, cached_tokens, uncached_tokens, total_tokens, cost_total
+                 FROM session_stats WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    Ok(json!({
+                        "messageCount": row.get::<_, i64>(0)?,
+                        "cachedTokens": row.get::<_, f64>(1)?,
+                        "uncachedTokens": row.get::<_, f64>(2)?,
+                        "totalTokens": row.get::<_, f64>(3)?,
+                        "costTotal": row.get::<_, f64>(4)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_branch_tip(
+        &self,
+        session_id: &str,
+        branch_id: &str,
+        tip_id: &str,
+    ) -> Result<(), SqliteError> {
+        self.conn.execute(
+            "INSERT INTO branch_tips(session_id, branch_id, tip_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id, branch_id) DO UPDATE SET tip_id = excluded.tip_id",
+            params![session_id, branch_id, tip_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_branch_tips(&self, session_id: &str) -> Result<Vec<Value>, SqliteError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT branch_id, tip_id FROM branch_tips WHERE session_id = ?1 ORDER BY branch_id",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok(json!({"branchId": row.get::<_, String>(0)?, "tipId": row.get::<_, String>(1)?}))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn add_branch_entry(
+        &self,
+        session_id: &str,
+        branch_id: &str,
+        entry_id: &str,
+        entry_seq: i64,
+        entry_type: &str,
+    ) -> Result<(), SqliteError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO branch_entries(session_id, branch_id, entry_id, entry_seq, entry_type, custom_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            params![session_id, branch_id, entry_id, entry_seq, entry_type],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_branch_entries(
+        &self,
+        session_id: &str,
+        branch_id: &str,
+    ) -> Result<Vec<Value>, SqliteError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entry_id, entry_seq, entry_type FROM branch_entries
+             WHERE session_id = ?1 AND branch_id = ?2 ORDER BY entry_seq",
+        )?;
+        let rows = stmt.query_map(params![session_id, branch_id], |row| {
+            Ok(json!({
+                "entryId": row.get::<_, String>(0)?,
+                "seq": row.get::<_, i64>(1)?,
+                "type": row.get::<_, Option<String>>(2)?,
+            }))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn upsert_lane(
+        &self,
+        session_id: &str,
+        lane: &str,
+        leaf_id: Option<&str>,
+        open_operation_id: Option<&str>,
+    ) -> Result<(), SqliteError> {
+        self.conn.execute(
+            "INSERT INTO lanes(session_id, lane, leaf_id, open_operation_id) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, lane) DO UPDATE SET
+                leaf_id=excluded.leaf_id,
+                open_operation_id=excluded.open_operation_id",
+            params![session_id, lane, leaf_id, open_operation_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn move_lane(
+        &self,
+        session_id: &str,
+        lane: &str,
+        leaf_id: Option<&str>,
+    ) -> Result<i64, SqliteError> {
+        let seq = self.next_sequence(session_id)?;
+        self.upsert_lane(session_id, lane, leaf_id, None)?;
+        self.conn.execute(
+            "INSERT INTO lane_moves(session_id, seq, lane, leaf_id) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, seq, lane, leaf_id],
+        )?;
+        Ok(seq)
+    }
+
+    pub fn list_lanes(&self, session_id: &str) -> Result<Vec<Value>, SqliteError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lane, leaf_id, open_operation_id FROM lanes WHERE session_id = ?1 ORDER BY lane",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok(json!({
+                "lane": row.get::<_, String>(0)?,
+                "leafId": row.get::<_, Option<String>>(1)?,
+                "openOperationId": row.get::<_, Option<String>>(2)?,
+            }))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn put_record(
+        &self,
+        session_id: &str,
+        id: &str,
+        lane: &str,
+        ty: &str,
+        payload: &Value,
+    ) -> Result<i64, SqliteError> {
+        let seq = self.next_sequence(session_id)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO records(session_id, seq, id, lane, run_id, type, op_kind, timestamp, payload)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7)",
+            params![session_id, seq, id, lane, ty, now_ms(), payload.to_string()],
+        )?;
+        Ok(seq)
+    }
+
+    pub fn list_records(
+        &self,
+        session_id: &str,
+        lane: Option<&str>,
+    ) -> Result<Vec<Value>, SqliteError> {
+        let mut sql =
+            String::from("SELECT id, seq, lane, type, payload FROM records WHERE session_id = ?1");
+        if lane.is_some() {
+            sql.push_str(" AND lane = ?2");
+        }
+        sql.push_str(" ORDER BY seq");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let payload: String = row.get(4)?;
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "seq": row.get::<_, i64>(1)?,
+                "lane": row.get::<_, String>(2)?,
+                "type": row.get::<_, String>(3)?,
+                "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null),
+            }))
+        };
+        let rows = if let Some(lane) = lane {
+            stmt.query_map(params![session_id, lane], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![session_id], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(rows)
+    }
+
+    pub fn put_fact(
+        &self,
+        session_id: &str,
+        kind: &str,
+        key: Option<&str>,
+        value: Option<&str>,
+    ) -> Result<i64, SqliteError> {
+        let seq = self.next_sequence(session_id)?;
+        self.conn.execute(
+            "INSERT INTO facts(session_id, seq, kind, key, value) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, seq, kind, key, value],
+        )?;
+        Ok(seq)
+    }
+
+    pub fn list_facts(
+        &self,
+        session_id: &str,
+        kind: Option<&str>,
+    ) -> Result<Vec<Value>, SqliteError> {
+        let mut sql = String::from("SELECT seq, kind, key, value FROM facts WHERE session_id = ?1");
+        if kind.is_some() {
+            sql.push_str(" AND kind = ?2");
+        }
+        sql.push_str(" ORDER BY seq");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(json!({
+                "seq": row.get::<_, i64>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "key": row.get::<_, Option<String>>(2)?,
+                "value": row.get::<_, Option<String>>(3)?,
+            }))
+        };
+        let rows = if let Some(kind) = kind {
+            stmt.query_map(params![session_id, kind], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![session_id], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(rows)
+    }
 }
 
 fn apply_migrations(conn: &Connection) -> Result<(), SqliteError> {
@@ -366,5 +625,30 @@ mod tests {
             err.to_string(),
             "writerLease.heartbeatIntervalMs must be positive and less than ttlMs"
         );
+    }
+
+    #[test]
+    fn repository_lanes_branches_stats_facts() {
+        let dir = tempdir().unwrap();
+        let db = SessionSqlite::open(dir.path().join("repo.db")).unwrap();
+        db.upsert_stats("s1", 2, 1.0, 3.0, 4.0, 0.01).unwrap();
+        let stats = db.get_stats("s1").unwrap().unwrap();
+        assert_eq!(stats["messageCount"], 2);
+        db.set_branch_tip("s1", "main", "e2").unwrap();
+        db.add_branch_entry("s1", "main", "e1", 1, "message")
+            .unwrap();
+        db.add_branch_entry("s1", "main", "e2", 2, "message")
+            .unwrap();
+        assert_eq!(db.list_branch_tips("s1").unwrap().len(), 1);
+        assert_eq!(db.list_branch_entries("s1", "main").unwrap().len(), 2);
+        db.upsert_lane("s1", "default", Some("e2"), None).unwrap();
+        db.move_lane("s1", "default", Some("e2")).unwrap();
+        assert_eq!(db.list_lanes("s1").unwrap()[0]["lane"], "default");
+        db.put_record("s1", "r1", "default", "note", &json!({"ok":true}))
+            .unwrap();
+        assert_eq!(db.list_records("s1", Some("default")).unwrap().len(), 1);
+        db.put_fact("s1", "model", Some("provider"), Some("google"))
+            .unwrap();
+        assert_eq!(db.list_facts("s1", Some("model")).unwrap().len(), 1);
     }
 }

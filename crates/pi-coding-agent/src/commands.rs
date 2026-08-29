@@ -124,21 +124,96 @@ Auth commands require at least one of --provider or --model. Checks refresh expi
             let stored = FileAuthStorage::open(agent_dir().join("auth.json"))
                 .ok()
                 .and_then(|s| s.read(&provider));
-            let ready = env.is_some() || stored.is_some();
-            let status = if ready { "ready" } else { "not_ready" };
+            let credentials = args.iter().any(|a| a == "--credentials");
+            let no_refresh = args.iter().any(|a| a == "--no-refresh");
+            let min_expiry = args
+                .windows(2)
+                .find(|w| w[0] == "--min-expiry")
+                .and_then(|w| w[1].parse::<i64>().ok())
+                .unwrap_or(60);
+            if !no_refresh {
+                if let Some(pi_ai::Credential::Oauth {
+                    ref refresh,
+                    expires,
+                    ..
+                }) = stored
+                {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let stale = refresh.is_some()
+                        && expires
+                            .map(|exp| exp.saturating_sub(now) <= min_expiry)
+                            .unwrap_or(false);
+                    if stale {
+                        if let Some(refresh) = refresh.clone() {
+                            let fixture = std::env::var("PI_OAUTH_REFRESH_FIXTURE")
+                                .ok()
+                                .and_then(|p| std::fs::read_to_string(p).ok());
+                            if let Ok(new_cred) =
+                                pi_ai::refresh_oauth_token(&provider, &refresh, fixture.as_deref())
+                            {
+                                if let Ok(mut store) =
+                                    FileAuthStorage::open(agent_dir().join("auth.json"))
+                                {
+                                    let _ = store.write(&provider, new_cred);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let stored = FileAuthStorage::open(agent_dir().join("auth.json"))
+                .ok()
+                .and_then(|s| s.read(&provider));
+            let invalid = stored.as_ref().is_some_and(|c| match c {
+                pi_ai::Credential::ApiKey { ref key, .. } => key.is_empty(),
+                pi_ai::Credential::Oauth { ref access, .. } => access.is_empty(),
+            });
+            let ready = !invalid && (env.is_some() || stored.is_some());
+            let status = if invalid {
+                "invalid"
+            } else if ready {
+                "ready"
+            } else {
+                "not_ready"
+            };
             let json =
                 parsed.unknown_flags.contains_key("json") || args.iter().any(|a| a == "--json");
+            let cred_value = if credentials {
+                env.clone().or_else(|| {
+                    stored.as_ref().map(|c| match c {
+                        pi_ai::Credential::ApiKey { ref key, .. } => key.clone(),
+                        pi_ai::Credential::Oauth { ref access, .. } => access.clone(),
+                    })
+                })
+            } else {
+                None
+            };
             let body = if json {
-                serde_json::json!({
+                let mut v = serde_json::json!({
                     "status": status,
                     "provider": provider,
-                    "reason": if ready { serde_json::Value::Null } else { serde_json::json!("credential_not_available") }
-                })
-                .to_string()
+                    "reason": if ready { serde_json::Value::Null } else if invalid { serde_json::json!("invalid_credential") } else { serde_json::json!("credential_not_available") }
+                });
+                if let Some(cred) = cred_value {
+                    v["credentials"] = serde_json::json!(cred);
+                }
+                v.to_string()
+            } else if let Some(cred) = cred_value {
+                format!("{status}\n{cred}")
             } else {
                 status.to_string()
             };
-            CommandOutcome::done(if ready { 0 } else { 1 }, format!("{body}\n"), "")
+            let code = if invalid {
+                2
+            } else if ready {
+                0
+            } else {
+                1
+            };
+            CommandOutcome::done(code, format!("{body}\n"), "")
         }
         "api_key" | "bearer_token" => {
             if let Some(key) = get_env_api_key(&provider) {
@@ -224,7 +299,30 @@ fn run_package(command: &str, args: &[String]) -> CommandOutcome {
                 "",
             )
         }
-        "config" => CommandOutcome::done(0, format!("Config file: {}\n", path.display()), ""),
+        "config" => {
+            let settings = crate::settings::load_settings(&path);
+            let list = pi_tui::SettingsList {
+                items: vec![
+                    ("packages".into(), !settings.packages.is_empty()),
+                    ("trusted".into(), settings.trusted),
+                    (
+                        "theme".into(),
+                        settings.theme.as_deref().unwrap_or("default") != "off",
+                    ),
+                ],
+                selected: 0,
+            };
+            let rendered = pi_tui::component::Component::render(&list, 48).join("\n");
+            CommandOutcome::done(
+                0,
+                format!(
+                    "Config file: {}\n{rendered}\npackages: {}\n",
+                    path.display(),
+                    settings.packages.join(", ")
+                ),
+                "",
+            )
+        }
         _ => CommandOutcome::skip(),
     }
 }

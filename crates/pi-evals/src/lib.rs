@@ -62,9 +62,16 @@ pub fn run_eval(case: &EvalCase) -> EvalResult {
     EvalResult {
         name: case.name.clone(),
         passed,
-        artifacts: vec![format!("events:{}", events.len())],
+        artifacts: vec![
+            format!("events:{}", events.len()),
+            format!("blob:{}", blob.len()),
+        ],
         events,
     }
+}
+
+pub fn run_suite(cases: &[EvalCase]) -> Vec<EvalResult> {
+    cases.iter().map(run_eval).collect()
 }
 
 pub fn summarize(results: &[EvalResult]) -> serde_json::Value {
@@ -108,7 +115,8 @@ mod tests {
         };
         let result = run_eval(&case);
         assert!(result.passed);
-        let summary = summarize(&[result]);
+        let suite = run_suite(&[case]);
+        let summary = summarize(&suite);
         assert_eq!(summary["passed"], 1);
     }
 }

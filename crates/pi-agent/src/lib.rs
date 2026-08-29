@@ -14,13 +14,14 @@ pub use compaction::compact_messages;
 pub use events::{AgentEvent, AgentMessage};
 pub use loop_::{run_agent, AgentConfig, AgentError};
 pub use permission::{
-    AllowAllPermissionPolicy, DenyAllPermissionPolicy, NamedPermissionPolicy, PermissionDecision,
-    PermissionPolicy,
+    AllowAllPermissionPolicy, CallbackPermissionPolicy, DenyAllPermissionPolicy,
+    NamedPermissionPolicy, PermissionDecision, PermissionPolicy, StdinAskPermissionPolicy,
 };
-pub use queues::{FollowUpQueue, SteerQueue};
+pub use queues::{FollowUpQueue, QueueMode, SteerQueue};
+pub use skills::{discover_default_skill_dirs, load_skills, Skill};
 pub use tools::{
-    bash, edit, find_files, grep, ls, read_file, write_file, BuiltinTool, ToolError, ToolRegistry,
-    ToolResult,
+    bash, edit, find_files, grep, ls, powershell, read_file, write_file, BuiltinTool, ToolError,
+    ToolRegistry, ToolResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,30 @@ impl ThinkingLevel {
             Self::High => "high",
             Self::Xhigh => "xhigh",
             Self::Max => "max",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Off,
+            Self::Minimal,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+            Self::Xhigh,
+            Self::Max,
+        ]
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::Minimal,
+            Self::Minimal => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Xhigh,
+            Self::Xhigh => Self::Max,
+            Self::Max => Self::Off,
         }
     }
 }

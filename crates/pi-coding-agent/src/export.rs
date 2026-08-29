@@ -53,7 +53,7 @@ pub fn session_to_html(raw: &str, title: &str) -> String {
         body.push_str(&format!("<pre>{escaped}</pre>\n"));
     }
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body>{body}</body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title><style>body{{font-family:ui-monospace,monospace;background:#111;color:#eee;padding:1.5rem}}pre{{white-space:pre-wrap;border-bottom:1px solid #333;padding:.5rem 0}} .role{{color:#8cf}}</style></head><body><h1>{title}</h1>{body}</body></html>"
     )
 }
 

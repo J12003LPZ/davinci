@@ -30,17 +30,19 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn builtins() -> Self {
-        Self {
-            tools: vec![
-                Box::new(ReadTool),
-                Box::new(WriteTool),
-                Box::new(EditTool),
-                Box::new(BashTool),
-                Box::new(LsTool),
-                Box::new(GrepTool),
-                Box::new(FindTool),
-            ],
+        let mut tools: Vec<Box<dyn BuiltinTool>> = vec![
+            Box::new(ReadTool),
+            Box::new(WriteTool),
+            Box::new(EditTool),
+            Box::new(BashTool),
+            Box::new(LsTool),
+            Box::new(GrepTool),
+            Box::new(FindTool),
+        ];
+        if cfg!(windows) || std::env::var("PI_ENABLE_POWERSHELL").is_ok() {
+            tools.push(Box::new(PowerShellTool));
         }
+        Self { tools }
     }
 
     pub fn register(&mut self, tool: Box<dyn BuiltinTool>) {
@@ -410,6 +412,51 @@ pub fn find_files(
         is_error: false,
         details: json!({"count": hits.len()}),
     })
+}
+
+struct PowerShellTool;
+impl BuiltinTool for PowerShellTool {
+    fn name(&self) -> &'static str {
+        "powershell"
+    }
+    fn description(&self) -> &'static str {
+        "Execute PowerShell commands"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})
+    }
+    fn execute(&self, input: &Value, cwd: &Path) -> Result<ToolResult, ToolError> {
+        powershell(cwd, input["command"].as_str().unwrap_or(""))
+    }
+}
+
+pub fn powershell(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {
+    let exe = if cfg!(windows) { "powershell" } else { "pwsh" };
+    let output = Command::new(exe)
+        .args(["-NoProfile", "-NonInteractive", "-Command", command])
+        .current_dir(cwd)
+        .output();
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let combined = if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{stdout}{stderr}")
+            };
+            Ok(ToolResult {
+                output: combined,
+                is_error: !output.status.success(),
+                details: json!({"exitCode": output.status.code(), "shell": exe}),
+            })
+        }
+        Err(e) => Ok(ToolResult {
+            output: format!("Error: {e}"),
+            is_error: true,
+            details: json!({"error": e.to_string()}),
+        }),
+    }
 }
 
 pub fn bash(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {

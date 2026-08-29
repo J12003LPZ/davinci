@@ -17,13 +17,16 @@ pub mod widgets;
 pub use component::{wrap_text_with_ansi, Component, Text};
 pub use diff::{composite_tui_line, visible_width, DiffScreen};
 pub use editor::Editor;
-pub use keys::{parse_key, Key};
+pub use keys::{default_keybindings, parse_key, Key, Keybinding};
 pub use layout::{ChatView, Container, Overlay};
 pub use markdown::Markdown;
 pub use mouse::{parse_sgr_mouse, MouseEvent};
 pub use screen::{OverlayHandle, OverlayOptions, Tui};
 pub use selectors::SelectList;
-pub use terminal::{disable_mouse, enable_mouse, enter_alt_screen, leave_alt_screen, TuiMode};
+pub use terminal::{
+    disable_mouse, disable_raw_input, enable_mouse, enable_raw_input, enter_alt_screen,
+    leave_alt_screen, TuiMode,
+};
 pub use themes::Theme;
 pub use widgets::{BoxWidget, HStack, Input, ScrollView, SettingsList, VStack};
 

@@ -86,6 +86,10 @@ impl Tui {
         self.overlays.retain(|o| o.id != handle.id);
     }
 
+    pub fn hide_all_overlays(&mut self) {
+        self.overlays.clear();
+    }
+
     pub fn set_hidden(&mut self, handle: OverlayHandle, hidden: bool) {
         if let Some(entry) = self.overlays.iter_mut().find(|o| o.id == handle.id) {
             entry.hidden = hidden;

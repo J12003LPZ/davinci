@@ -20,7 +20,9 @@ pub use catalog::{
 };
 pub use cost::usage_cost;
 pub use events::{AssistantMessage, AssistantMessageEvent, StopReason};
-pub use oauth::{authorize_url, oauth_app, parse_token_response};
+pub use oauth::{
+    authorize_url, oauth_app, oauth_needs_refresh, parse_token_response, refresh_oauth_token,
+};
 pub use request::{build_request_body, resolve_api, RequestContext};
 pub use retry::{is_retryable_assistant_error, RetryPolicy};
 pub use stream::{complete, stream_complete, StreamEvent, StreamOptions};

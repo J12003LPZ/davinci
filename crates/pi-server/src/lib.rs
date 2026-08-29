@@ -92,34 +92,132 @@ impl Server {
                 let result = match command.get("command").and_then(|v| v.as_str()) {
                     Some("list") => json!({"command":"list","sessions": self.sessions}),
                     Some("create") => {
-                        let session = json!({
-                            "id": Uuid::new_v4().to_string(),
-                            "cwd": command.get("cwd").and_then(|v| v.as_str()).unwrap_or("."),
-                            "createdAt": 1,
-                            "updatedAt": 1,
-                            "phase": "idle",
-                            "model": command.get("model").cloned().unwrap_or(json!({"provider":"anthropic","id":"claude-sonnet-4-5"})),
-                            "thinkingLevel": "off",
-                            "attached": true,
-                            "locked": false,
-                            "revision": 0,
-                            "transcript": [],
-                            "queuedSteer": [],
-                            "queuedSteerCount": 0
-                        });
-                        self.sessions.push(json!({
-                            "id": session["id"],
-                            "createdAt": 1,
-                            "cwd": session["cwd"]
-                        }));
+                        let session = self.create_session(&command);
                         json!({"command":"create","session": session})
+                    }
+                    Some("attach") => {
+                        let session_id = command
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        match self.session_snapshot(session_id) {
+                            Some(mut session) => {
+                                session["attached"] = json!(true);
+                                self.acquire_lease(session_id, "local");
+                                json!({"command":"attach","session": session})
+                            }
+                            None => {
+                                return Ok(json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "ok": false,
+                                    "error": { "code": "not_found", "message": format!("session {session_id} not found") }
+                                }));
+                            }
+                        }
+                    }
+                    Some("detach") => {
+                        let session_id = command
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.leases.remove(&session_id);
+                        json!({"command":"detach","sessionId": session_id})
+                    }
+                    Some("prompt") | Some("steer") => {
+                        let name = command
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("prompt");
+                        let session_id = command
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        match self.apply_prompt(
+                            session_id,
+                            command.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+                            name == "steer",
+                        ) {
+                            Some(session) => json!({"command": name, "session": session}),
+                            None => {
+                                return Ok(json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "ok": false,
+                                    "error": { "code": "not_found", "message": "session not found" }
+                                }));
+                            }
+                        }
+                    }
+                    Some("abort") => {
+                        let session_id = command
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        match self.set_phase(session_id, "idle") {
+                            Some(session) => json!({"command":"abort","session": session}),
+                            None => {
+                                return Ok(json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "ok": false,
+                                    "error": { "code": "not_found", "message": "session not found" }
+                                }));
+                            }
+                        }
+                    }
+                    Some("set_model") => {
+                        let session_id = command
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        match self.set_field(
+                            session_id,
+                            "model",
+                            command.get("model").cloned().unwrap_or(json!({})),
+                        ) {
+                            Some(session) => json!({"command":"set_model","session": session}),
+                            None => {
+                                return Ok(json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "ok": false,
+                                    "error": { "code": "not_found", "message": "session not found" }
+                                }));
+                            }
+                        }
+                    }
+                    Some("set_thinking") => {
+                        let session_id = command
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        match self.set_field(
+                            session_id,
+                            "thinkingLevel",
+                            command
+                                .get("thinkingLevel")
+                                .cloned()
+                                .unwrap_or(json!("off")),
+                        ) {
+                            Some(session) => json!({"command":"set_thinking","session": session}),
+                            None => {
+                                return Ok(json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "ok": false,
+                                    "error": { "code": "not_found", "message": "session not found" }
+                                }));
+                            }
+                        }
                     }
                     Some(other) => {
                         return Ok(json!({
                             "type": "response",
                             "id": id,
                             "ok": false,
-                            "error": { "code": "not_implemented", "message": format!("{other} is not implemented") }
+                            "error": { "code": "unknown_command", "message": format!("unknown command {other}") }
                         }));
                     }
                     None => {
@@ -138,6 +236,81 @@ impl Server {
                 "error": { "code": "invalid_request", "message": "expected hello or request" }
             })),
         }
+    }
+
+    fn create_session(&mut self, command: &Value) -> Value {
+        let session = json!({
+            "id": Uuid::new_v4().to_string(),
+            "cwd": command.get("cwd").and_then(|v| v.as_str()).unwrap_or("."),
+            "createdAt": 1,
+            "updatedAt": 1,
+            "phase": "idle",
+            "model": command.get("model").cloned().unwrap_or(json!({"provider":"anthropic","id":"claude-sonnet-4-5"})),
+            "thinkingLevel": command.get("thinkingLevel").cloned().unwrap_or(json!("off")),
+            "attached": true,
+            "locked": false,
+            "revision": 0,
+            "transcript": [],
+            "queuedSteer": [],
+            "queuedSteerCount": 0
+        });
+        self.sessions.push(session.clone());
+        session
+    }
+
+    fn session_index(&self, session_id: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|s| s.get("id").and_then(|v| v.as_str()) == Some(session_id))
+    }
+
+    fn session_snapshot(&self, session_id: &str) -> Option<Value> {
+        self.session_index(session_id)
+            .and_then(|i| self.sessions.get(i).cloned())
+    }
+
+    fn apply_prompt(&mut self, session_id: &str, text: &str, steer: bool) -> Option<Value> {
+        let idx = self.session_index(session_id)?;
+        if let Some(obj) = self.sessions[idx].as_object_mut() {
+            if steer {
+                let mut queued = obj
+                    .get("queuedSteer")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                queued.push(json!({"text": text}));
+                let count = queued.len();
+                obj.insert("queuedSteer".into(), json!(queued));
+                obj.insert("queuedSteerCount".into(), json!(count));
+            } else {
+                let mut transcript = obj
+                    .get("transcript")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                transcript.push(json!({"role":"user","content": text}));
+                obj.insert("transcript".into(), json!(transcript));
+                obj.insert("phase".into(), json!("running"));
+            }
+            obj.insert("updatedAt".into(), json!(1));
+        }
+        self.sessions.get(idx).cloned()
+    }
+
+    fn set_phase(&mut self, session_id: &str, phase: &str) -> Option<Value> {
+        let idx = self.session_index(session_id)?;
+        if let Some(obj) = self.sessions[idx].as_object_mut() {
+            obj.insert("phase".into(), json!(phase));
+        }
+        self.sessions.get(idx).cloned()
+    }
+
+    fn set_field(&mut self, session_id: &str, field: &str, value: Value) -> Option<Value> {
+        let idx = self.session_index(session_id)?;
+        if let Some(obj) = self.sessions[idx].as_object_mut() {
+            obj.insert(field.to_string(), value);
+        }
+        self.sessions.get(idx).cloned()
     }
 
     pub fn acquire_lease(&mut self, session_id: &str, owner: &str) -> bool {
@@ -194,5 +367,49 @@ mod tests {
         let reply = server.handle_client_bytes(&req).unwrap();
         assert!(!reply.is_empty());
         assert!(server.pending.contains_key("r1"));
+    }
+
+    #[test]
+    fn protocol_commands_beyond_list_create() {
+        let mut server = Server::default();
+        let created = server
+            .dispatch(
+                &json!({"type":"request","id":"c","request":{"command":"create","cwd":"/tmp"}}),
+            )
+            .unwrap();
+        let id = created["result"]["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let attach = server
+            .dispatch(
+                &json!({"type":"request","id":"a","request":{"command":"attach","sessionId": id}}),
+            )
+            .unwrap();
+        assert_eq!(attach["ok"], true);
+        let prompt = server
+            .dispatch(&json!({"type":"request","id":"p","request":{"command":"prompt","sessionId": id, "text":"hi"}}))
+            .unwrap();
+        assert_eq!(prompt["result"]["command"], "prompt");
+        let model = server
+            .dispatch(&json!({"type":"request","id":"m","request":{"command":"set_model","sessionId": id, "model":{"provider":"google","id":"g"}}}))
+            .unwrap();
+        assert_eq!(model["ok"], true);
+        let think = server
+            .dispatch(&json!({"type":"request","id":"t","request":{"command":"set_thinking","sessionId": id, "thinkingLevel":"low"}}))
+            .unwrap();
+        assert_eq!(think["ok"], true);
+        let abort = server
+            .dispatch(
+                &json!({"type":"request","id":"x","request":{"command":"abort","sessionId": id}}),
+            )
+            .unwrap();
+        assert_eq!(abort["ok"], true);
+        let detach = server
+            .dispatch(
+                &json!({"type":"request","id":"d","request":{"command":"detach","sessionId": id}}),
+            )
+            .unwrap();
+        assert_eq!(detach["result"]["command"], "detach");
     }
 }

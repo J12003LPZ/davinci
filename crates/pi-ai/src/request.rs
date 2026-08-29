@@ -34,7 +34,8 @@ pub fn resolve_api(model: Option<&Model>, provider: &str) -> String {
     }
     match provider {
         "anthropic" | "ant-ling" => "anthropic-messages".into(),
-        "google" | "google-vertex" => "google-generative-ai".into(),
+        "google" => "google-generative-ai".into(),
+        "google-vertex" => "google-vertex".into(),
         "amazon-bedrock" => "bedrock-converse-stream".into(),
         "mistral" => "mistral-conversations".into(),
         "openai-codex" => "openai-codex-responses".into(),
@@ -50,6 +51,16 @@ pub fn endpoint_url(api: &str, base_url: &str, model_id: &str, api_key: Option<&
         "google-generative-ai" => {
             let key = api_key.unwrap_or("");
             format!("{base}/v1beta/models/{model_id}:streamGenerateContent?alt=sse&key={key}")
+        }
+        "google-vertex" => {
+            let project = std::env::var("GOOGLE_CLOUD_PROJECT")
+                .or_else(|_| std::env::var("GCLOUD_PROJECT"))
+                .unwrap_or_else(|_| "project".into());
+            let location =
+                std::env::var("GOOGLE_CLOUD_LOCATION").unwrap_or_else(|_| "us-central1".into());
+            format!(
+                "{base}/v1/projects/{project}/locations/{location}/publishers/google/models/{model_id}:streamGenerateContent"
+            )
         }
         "openai-responses" | "openai-codex-responses" | "azure-openai-responses" => {
             format!("{base}/v1/responses")
@@ -101,7 +112,9 @@ pub fn request_headers(api: &str, provider: &str, api_key: &str) -> Vec<(String,
 pub fn build_request_body(api: &str, model_id: &str, ctx: &RequestContext) -> Value {
     match api {
         "anthropic-messages" => anthropic_messages(model_id, ctx),
-        "google-generative-ai" => google_generative_ai(model_id, ctx),
+        "google-generative-ai" | "google-vertex" => google_generative_ai(model_id, ctx),
+        "pi-messages" => anthropic_messages(model_id, ctx),
+        "openrouter-images" => openai_completions(model_id, ctx),
         "openai-responses" | "openai-codex-responses" | "azure-openai-responses" => {
             openai_responses(model_id, ctx)
         }
@@ -382,6 +395,11 @@ mod tests {
         assert_eq!(resolve_api(None, "anthropic"), "anthropic-messages");
         assert_eq!(resolve_api(None, "openai"), "openai-completions");
         assert_eq!(resolve_api(None, "google"), "google-generative-ai");
+        assert_eq!(resolve_api(None, "google-vertex"), "google-vertex");
+        let vertex = build_request_body("google-vertex", "gemini-2.5-flash", &ctx);
+        assert_eq!(vertex["contents"][0]["role"], "user");
+        let pi_messages = build_request_body("pi-messages", "pi", &ctx);
+        assert_eq!(pi_messages["messages"][0]["role"], "user");
         let bedrock =
             build_request_body("bedrock-converse-stream", "anthropic.claude-sonnet-4", &ctx);
         assert_eq!(bedrock["messages"][0]["role"], "user");

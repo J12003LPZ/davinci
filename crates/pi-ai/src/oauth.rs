@@ -109,6 +109,54 @@ pub fn parse_token_response(raw: &str) -> Result<Credential, AuthError> {
     })
 }
 
+pub fn oauth_needs_refresh(credential: &Credential, now_secs: i64, min_expiry_secs: i64) -> bool {
+    match credential {
+        Credential::Oauth {
+            expires, refresh, ..
+        } => {
+            if refresh.is_none() {
+                return false;
+            }
+            match expires {
+                Some(exp) => exp - now_secs <= min_expiry_secs,
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Refresh using a fixture body (tests) or a live token URL when network is allowed.
+pub fn refresh_oauth_token(
+    provider: &str,
+    refresh_token: &str,
+    fixture_body: Option<&str>,
+) -> Result<Credential, AuthError> {
+    if let Some(raw) = fixture_body {
+        return parse_token_response(raw);
+    }
+    if std::env::var("PI_DISABLE_NETWORK").is_ok() || std::env::var("PI_OFFLINE").is_ok() {
+        return Err(AuthError::Message(
+            "OAuth refresh disabled (offline)".into(),
+        ));
+    }
+    let app =
+        oauth_app(provider).ok_or_else(|| AuthError::Message("unknown oauth provider".into()))?;
+    let body = format!(
+        "grant_type=refresh_token&refresh_token={}&client_id={}",
+        urlencoding_lite(refresh_token),
+        urlencoding_lite(&app.client_id)
+    );
+    let response = ureq::post(&app.token_url)
+        .set("content-type", "application/x-www-form-urlencoded")
+        .send_string(&body)
+        .map_err(|e| AuthError::Message(e.to_string()))?;
+    let raw = response
+        .into_string()
+        .map_err(|e| AuthError::Message(e.to_string()))?;
+    parse_token_response(&raw)
+}
+
 pub fn store_oauth(
     storage: &mut impl AuthStorage,
     provider: &str,
@@ -162,5 +210,23 @@ mod tests {
         let mut store = InMemoryCredentialStore::new();
         store_oauth(&mut store, "anthropic", cred).unwrap();
         assert!(credential_from_env_or_store(&store, "anthropic").is_some());
+        let refreshed = refresh_oauth_token(
+            "anthropic",
+            "ref",
+            Some(r#"{"access_token":"new","refresh_token":"ref2","expires_in":60}"#),
+        )
+        .unwrap();
+        match refreshed {
+            Credential::Oauth { ref access, .. } => assert_eq!(access, "new"),
+            other => panic!("{other:?}"),
+        }
+        let stale = Credential::Oauth {
+            access: "old".into(),
+            refresh: Some("r".into()),
+            expires: Some(10),
+            extra: Default::default(),
+        };
+        assert!(oauth_needs_refresh(&stale, 10, 5));
+        assert!(!oauth_needs_refresh(&stale, 0, 5));
     }
 }

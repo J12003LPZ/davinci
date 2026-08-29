@@ -29,6 +29,45 @@ impl PermissionPolicy for DenyAllPermissionPolicy {
     }
 }
 
+pub struct CallbackPermissionPolicy {
+    callback: Box<dyn Fn(&str) -> PermissionDecision + Send + Sync>,
+}
+
+impl CallbackPermissionPolicy {
+    pub fn new(callback: impl Fn(&str) -> PermissionDecision + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Box::new(callback),
+        }
+    }
+}
+
+impl PermissionPolicy for CallbackPermissionPolicy {
+    fn decide(&self, tool_name: &str) -> PermissionDecision {
+        (self.callback)(tool_name)
+    }
+}
+
+/// Interactive Ask: prompt stdin unless auto-approve is on.
+pub struct StdinAskPermissionPolicy {
+    pub auto_approve: bool,
+}
+
+impl PermissionPolicy for StdinAskPermissionPolicy {
+    fn decide(&self, tool_name: &str) -> PermissionDecision {
+        if self.auto_approve || matches!(tool_name, "read" | "ls" | "grep" | "find") {
+            return PermissionDecision::Allow;
+        }
+        eprint!("Allow tool `{tool_name}`? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y") {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny
+        }
+    }
+}
+
 pub struct NamedPermissionPolicy {
     pub allow: Vec<String>,
     pub deny: Vec<String>,

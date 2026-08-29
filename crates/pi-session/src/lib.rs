@@ -427,11 +427,154 @@ pub fn append_session_name(path: &Path, name: &str) -> Result<(), SessionError> 
     )
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+pub fn read_entries(path: &Path) -> Result<Vec<Value>, SessionError> {
+    let raw = fs::read_to_string(path).map_err(|e| SessionError::Storage(e.to_string()))?;
+    let mut entries = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = parse_entry_line(line)?;
+        if value.get("kind").and_then(|v| v.as_str()) == Some("header") {
+            continue;
+        }
+        entries.push(value);
+    }
+    Ok(entries)
+}
+
+pub fn last_assistant_text(path: &Path) -> Result<Option<String>, SessionError> {
+    let mut last = None;
+    for entry in read_entries(path)? {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("message") {
+            continue;
+        }
+        let role = entry
+            .get("role")
+            .or_else(|| entry.get("message").and_then(|m| m.get("role")))
+            .and_then(|v| v.as_str());
+        if role != Some("assistant") {
+            continue;
+        }
+        let text = entry
+            .get("content")
+            .or_else(|| entry.get("text"))
+            .or_else(|| entry.get("message").and_then(|m| m.get("content")))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if text.is_some() {
+            last = text;
+        }
+    }
+    Ok(last)
+}
+
+pub fn session_tree(path: &Path) -> Result<Vec<Value>, SessionError> {
+    let entries = read_entries(path)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.get("id").cloned().unwrap_or(json!(null)),
+                "parentId": entry.get("parentId").cloned().unwrap_or(json!(null)),
+                "type": entry.get("type").cloned().unwrap_or(json!("message")),
+                "role": entry.get("role").cloned().unwrap_or(json!(null)),
+                "label": entry.get("content").or_else(|| entry.get("text")).cloned().unwrap_or(json!("")),
+            })
+        })
+        .collect())
+}
+
+pub fn session_stats(path: &Path) -> Result<Value, SessionError> {
+    let entries = read_entries(path)?;
+    let mut message_count = 0u64;
+    let mut user = 0u64;
+    let mut assistant = 0u64;
+    for entry in &entries {
+        if entry.get("type").and_then(|v| v.as_str()) == Some("message") {
+            message_count += 1;
+            match entry.get("role").and_then(|v| v.as_str()) {
+                Some("user") => user += 1,
+                Some("assistant") => assistant += 1,
+                _ => {}
+            }
+        }
+    }
+    Ok(json!({
+        "messageCount": message_count,
+        "userMessages": user,
+        "assistantMessages": assistant,
+        "entryCount": entries.len(),
+    }))
+}
+
+pub fn fork_from_entry(
+    root: &Path,
+    source: &SessionInfo,
+    cwd: &str,
+    entry_id: &str,
+) -> Result<SessionInfo, SessionError> {
+    let mut dest = create_session(root, cwd, None)?;
+    dest.parent_session_id = Some(source.id.clone());
+    let raw = fs::read_to_string(&source.path).map_err(|e| SessionError::Storage(e.to_string()))?;
+    let mut rewritten = String::new();
+    let mut found = false;
+    for (i, line) in raw.lines().enumerate() {
+        if i == 0 {
+            if let Ok(mut header) = parse_header(line) {
+                header.id = dest.id.clone();
+                header.parent_session_id = Some(source.id.clone());
+                header.cwd = cwd.to_string();
+                rewritten.push_str(&encode_header(&header));
+                continue;
+            }
+        }
+        rewritten.push_str(line);
+        rewritten.push('\n');
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            if value.get("id").and_then(|v| v.as_str()) == Some(entry_id) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        return Err(SessionError::Storage(format!(
+            "entry {entry_id} not found in session"
+        )));
+    }
+    fs::write(&dest.path, rewritten).map_err(|e| SessionError::Storage(e.to_string()))?;
+    Ok(dest)
+}
+
+pub fn fork_messages(path: &Path) -> Result<Vec<Value>, SessionError> {
+    Ok(read_entries(path)?
+        .into_iter()
+        .filter(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("message")
+                && e.get("role").and_then(|v| v.as_str()) == Some("user")
+        })
+        .map(|e| {
+            json!({
+                "entryId": e.get("id").cloned().unwrap_or(json!(null)),
+                "text": e.get("content").or_else(|| e.get("text")).cloned().unwrap_or(json!("")),
+            })
+        })
+        .collect())
+}
+
+pub fn leaf_id(path: &Path) -> Result<Option<String>, SessionError> {
+    Ok(read_entries(path)?
+        .into_iter()
+        .rev()
+        .find_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string)))
 }
 
 #[cfg(test)]
@@ -491,5 +634,31 @@ mod tests {
         .unwrap();
         assert!(migrated.starts_with("{\"kind\":\"header\"") || migrated.contains("\"version\":4"));
         parse_header(migrated.lines().next().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn entries_tree_fork_from_id() {
+        let dir = tempdir().unwrap();
+        let created = create_session(dir.path(), "/proj", Some("bbbb-2222")).unwrap();
+        append_entry(
+            &created.path,
+            &json!({"type":"message","id":"m1","role":"user","content":"hello"}),
+        )
+        .unwrap();
+        append_entry(
+            &created.path,
+            &json!({"type":"message","id":"m2","role":"assistant","content":"world"}),
+        )
+        .unwrap();
+        assert_eq!(
+            last_assistant_text(&created.path).unwrap().as_deref(),
+            Some("world")
+        );
+        assert_eq!(session_tree(&created.path).unwrap().len(), 2);
+        assert_eq!(session_stats(&created.path).unwrap()["messageCount"], 2);
+        let forked = fork_from_entry(dir.path(), &created, "/proj", "m1").unwrap();
+        assert_eq!(read_entries(&forked.path).unwrap().len(), 1);
+        assert_eq!(fork_messages(&created.path).unwrap().len(), 1);
+        assert_eq!(leaf_id(&created.path).unwrap().as_deref(), Some("m2"));
     }
 }

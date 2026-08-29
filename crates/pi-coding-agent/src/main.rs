@@ -3,7 +3,9 @@ mod commands;
 mod event_bus;
 mod export;
 mod extensions;
+mod interactive;
 mod rpc;
+mod session_runtime;
 mod settings;
 mod slash;
 
@@ -11,28 +13,25 @@ use std::io::{self, BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use args::{
-    normalize_session_name, parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION,
-};
+use args::{normalize_session_name, parse_args, print_help, Args, ListModels, Mode, VERSION};
 use commands::dispatch_subcommand;
 use event_bus::EventBus;
+use interactive::{run_interactive, InteractiveMode};
 use pi_agent::context::{load_context_files, render_system_prompt};
 use pi_agent::{
-    run_agent, AgentConfig, AgentEvent, AgentMessage, AllowAllPermissionPolicy, FollowUpQueue,
-    SteerQueue, ToolRegistry,
+    discover_default_skill_dirs, load_skills, AgentMessage, FollowUpQueue, SteerQueue,
+    ThinkingLevel, ToolRegistry,
 };
 use pi_ai::catalog::resolve_model;
 use pi_ai::list_models;
 use pi_ai::{get_env_api_key, AuthStorage, FileAuthStorage};
 use pi_session::{
-    append_session_name, clone_session, continue_latest, create_session, default_sessions_root,
-    fork_session, resume_by_id_or_path,
+    append_session_name, continue_latest, create_session, default_sessions_root, fork_session,
+    resume_by_id_or_path,
 };
-use pi_tui::component::Component;
-use pi_tui::{
-    disable_mouse, enable_mouse, enter_alt_screen, leave_alt_screen, ChatView, Editor, Markdown,
-    Overlay, OverlayOptions, SelectList, Text, Tui, TuiMode,
-};
+use pi_telemetry::{InMemoryTelemetryContext, SpanOptions};
+use pi_tui::TuiMode;
+use session_runtime::{to_json_event, SessionRuntime};
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -46,6 +45,21 @@ fn main() -> ExitCode {
 }
 
 fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String> {
+    let telemetry = InMemoryTelemetryContext::new();
+    let enable_telemetry = std::env::var("PI_TELEMETRY").is_ok();
+    telemetry.start_span(
+        SpanOptions {
+            name: "pi.startup".into(),
+            attributes: None,
+        },
+        |span| {
+            span.add_event("argv", None);
+            if enable_telemetry {
+                span.add_event("telemetry_enabled", None);
+            }
+        },
+    );
+
     let package = dispatch_subcommand(raw);
     if package.handled {
         print!("{}", package.stdout);
@@ -96,6 +110,18 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
     }
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    if parsed.project_trust_override == Some(false) {
+        // --no-approve: do not load project-local extensions/skills later
+    } else if parsed.project_trust_override != Some(true)
+        && !settings::is_trusted(&commands::agent_dir(), &cwd)
+        && cwd.join(".pi").exists()
+    {
+        eprintln!(
+            "Warning: project {} is not trusted. Use --approve or /trust.",
+            cwd.display()
+        );
+    }
+
     let session_dir = parsed
         .session_dir
         .as_ref()
@@ -112,6 +138,11 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         resume_by_id_or_path(&session_dir, query, Some(&cwd.to_string_lossy()))
             .ok()
             .flatten()
+            .or_else(|| {
+                resume_by_id_or_path(&session_dir, query, None)
+                    .ok()
+                    .flatten()
+            })
     } else if let Some(id) = &parsed.session_id {
         resume_by_id_or_path(&session_dir, id, Some(&cwd.to_string_lossy()))
             .ok()
@@ -147,6 +178,17 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         &parsed.append_system_prompt,
         &context,
     );
+    let mut skill_paths = discover_default_skill_dirs(&cwd, &commands::agent_dir());
+    skill_paths.extend(parsed.skills.iter().map(PathBuf::from));
+    let skills = load_skills(&skill_paths, parsed.no_skills);
+    let mut system_prompt = system_prompt;
+    if !skills.is_empty() {
+        system_prompt.push_str("\n\n# Skills\n");
+        for skill in &skills {
+            system_prompt.push_str(&format!("## {}\n{}\n", skill.name, skill.body));
+        }
+    }
+
     let discovered = extensions::discover_extensions(
         &commands::agent_dir(),
         &cwd,
@@ -193,48 +235,63 @@ fn run(raw: &[String], stdin_tty: bool, stdout_tty: bool) -> Result<i32, String>
         .map(|m| m.id.clone())
         .unwrap_or_else(|| model_id.to_string());
 
-    let mut messages = collect_messages(&parsed, &cwd)?;
-    let mut steer = SteerQueue::default();
-    let mut follow_up = FollowUpQueue::default();
-    let mut thinking = parsed
+    let messages = collect_messages(&parsed, &cwd)?;
+    let thinking = parsed
         .thinking
-        .map(|t| pi_agent::ThinkingLevel::parse(t.as_str()).unwrap_or(pi_agent::ThinkingLevel::Off))
+        .map(|t| ThinkingLevel::parse(t.as_str()).unwrap_or(ThinkingLevel::Off))
         .or(thinking_from_model)
-        .unwrap_or(pi_agent::ThinkingLevel::Off);
+        .unwrap_or(ThinkingLevel::Off);
+
+    let fixture = std::env::var("PI_STREAM_FIXTURE")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let offline = parsed.offline || std::env::var("PI_OFFLINE").is_ok();
+
+    let mut runtime = SessionRuntime {
+        cwd: cwd.clone(),
+        provider: provider.clone(),
+        model_id: model_id.clone(),
+        system_prompt,
+        messages,
+        steer: SteerQueue::default(),
+        follow_up: FollowUpQueue::default(),
+        thinking,
+        tools,
+        session_path: session.as_ref().map(|s| s.path.clone()),
+        session_id: session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .unwrap_or_else(|| "ephemeral".into()),
+        session_name: session.as_ref().and_then(|s| s.name.clone()),
+        scoped_models: parsed.models.clone(),
+        auto_compact: true,
+        auto_retry: true,
+        is_streaming: false,
+        is_compacting: false,
+        aborted: false,
+        api_key: resolve_api_key(&parsed, &provider),
+        allow_network: fixture.is_none() && !offline,
+        fixture,
+        bus,
+        max_turns: 16,
+        context_window: 128_000,
+    };
 
     match app_mode {
-        AppMode::Rpc => run_rpc(
-            &mut messages,
-            &mut steer,
-            &mut follow_up,
-            &mut thinking,
-            &tools,
-        ),
-        AppMode::Print | AppMode::Json => run_print(
-            &parsed,
-            &cwd,
-            &provider,
-            &model_id,
-            &system_prompt,
-            &tools,
-            &messages,
-            &mut steer,
-            &mut follow_up,
-            app_mode == AppMode::Json,
-            &bus,
-        ),
-        AppMode::Interactive => run_interactive(
-            &parsed,
-            &cwd,
-            &provider,
-            &model_id,
-            &system_prompt,
-            &tools,
-            &messages,
-            session.as_ref().map(|s| s.path.clone()),
-            &bus,
-            &discovered,
-        ),
+        AppMode::Rpc => run_rpc(&mut runtime),
+        AppMode::Print | AppMode::Json => {
+            run_print(&parsed, &mut runtime, app_mode == AppMode::Json)
+        }
+        AppMode::Interactive => {
+            let fullscreen = parsed.tui_mode == Some(TuiMode::Fullscreen);
+            let mode = InteractiveMode::new(
+                runtime,
+                parsed.tui_mode.unwrap_or(TuiMode::Regular),
+                discovered,
+            );
+            run_interactive(mode, fullscreen)
+        }
     }
 }
 
@@ -259,9 +316,9 @@ fn resolve_mode(parsed: &Args, stdin_tty: bool, stdout_tty: bool) -> AppMode {
     AppMode::Interactive
 }
 
-fn split_thinking(spec: &str) -> (&str, Option<pi_agent::ThinkingLevel>) {
+fn split_thinking(spec: &str) -> (&str, Option<ThinkingLevel>) {
     if let Some((model, level)) = spec.rsplit_once(':') {
-        if let Some(parsed) = pi_agent::ThinkingLevel::parse(level) {
+        if let Some(parsed) = ThinkingLevel::parse(level) {
             return (model, Some(parsed));
         }
     }
@@ -285,25 +342,71 @@ fn build_tools(parsed: &Args) -> ToolRegistry {
     tools
 }
 
+fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()),
+        Some(ext) if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
+    )
+}
+
 fn collect_messages(parsed: &Args, cwd: &Path) -> Result<Vec<AgentMessage>, String> {
     let mut parts = parsed.messages.clone();
+    let mut images = Vec::new();
     for file in &parsed.file_args {
         let path = if file.starts_with('/') {
             PathBuf::from(file)
         } else {
             cwd.join(file)
         };
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| format!("Failed to read @{file}: {e}"))?;
-        parts.push(format!("# {file}\n{content}"));
+        if is_image_path(&path) {
+            let bytes = std::fs::read(&path).map_err(|e| format!("Failed to read @{file}: {e}"))?;
+            let b64 = {
+                const TABLE: &[u8] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                let mut out = String::new();
+                for chunk in bytes.chunks(3) {
+                    let a = chunk[0] as usize;
+                    let b = chunk.get(1).copied().unwrap_or(0) as usize;
+                    let c = chunk.get(2).copied().unwrap_or(0) as usize;
+                    out.push(TABLE[a >> 2] as char);
+                    out.push(TABLE[((a & 3) << 4) | (b >> 4)] as char);
+                    if chunk.len() > 1 {
+                        out.push(TABLE[((b & 15) << 2) | (c >> 6)] as char);
+                    } else {
+                        out.push('=');
+                    }
+                    if chunk.len() > 2 {
+                        out.push(TABLE[c & 63] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+                out
+            };
+            images.push(serde_json::json!({
+                "type": "image",
+                "path": path.display().to_string(),
+                "mimeType": match path.extension().and_then(|e| e.to_str()) {
+                    Some("png") => "image/png",
+                    Some("gif") => "image/gif",
+                    Some("webp") => "image/webp",
+                    _ => "image/jpeg",
+                },
+                "data": b64,
+            }));
+        } else {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read @{file}: {e}"))?;
+            parts.push(format!("# {file}\n{content}"));
+        }
     }
-    if parts.is_empty() {
+    if parts.is_empty() && images.is_empty() {
         Ok(Vec::new())
     } else {
         Ok(vec![AgentMessage {
             role: "user".into(),
             content: parts.join("\n\n"),
-            images: vec![],
+            images,
         }])
     }
 }
@@ -328,54 +431,40 @@ fn list_models_cmd(list: &ListModels, provider: Option<&str>) -> Result<i32, Str
     Ok(0)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_print(
-    parsed: &Args,
-    cwd: &Path,
-    provider: &str,
-    model_id: &str,
-    system_prompt: &str,
-    tools: &ToolRegistry,
-    messages: &[AgentMessage],
-    steer: &mut SteerQueue,
-    follow_up: &mut FollowUpQueue,
-    json: bool,
-    bus: &EventBus,
-) -> Result<i32, String> {
-    if messages.is_empty() {
+fn run_print(parsed: &Args, runtime: &mut SessionRuntime, json: bool) -> Result<i32, String> {
+    if runtime.messages.is_empty() {
         eprintln!("Error: print mode requires a prompt");
         return Ok(1);
     }
-    bus.emit(
-        "agent_start",
-        serde_json::json!({"provider": provider, "model": model_id}),
-    );
-    let config = agent_config(parsed, cwd, provider, model_id, system_prompt);
-    let events =
-        run_agent(&config, messages, tools, steer, follow_up).map_err(|e| e.to_string())?;
+    let extra = parsed.messages.clone();
+    let first = runtime.messages.clone();
+    runtime.messages.clear();
+    for message in first {
+        let events = runtime.prompt(&message.content, message.images)?;
+        emit_print_events(&events, json);
+    }
+    for extra_msg in extra.iter().skip(1) {
+        let events = runtime.prompt(extra_msg, vec![])?;
+        emit_print_events(&events, json);
+    }
+    Ok(0)
+}
+
+fn emit_print_events(events: &[pi_agent::AgentEvent], json: bool) {
     if json {
         for event in events {
-            println!("{}", serde_json::to_string(&event).unwrap());
+            println!("{}", to_json_event(event));
         }
     } else {
         for event in events {
-            if let AgentEvent::Message { message } = event {
+            if let pi_agent::AgentEvent::Message { message } = event {
                 println!("{}", message.content);
             }
         }
     }
-    bus.emit("agent_end", serde_json::json!({"ok": true}));
-    let _ = parsed;
-    Ok(0)
 }
 
-fn run_rpc(
-    messages: &mut Vec<AgentMessage>,
-    steer: &mut SteerQueue,
-    follow_up: &mut FollowUpQueue,
-    thinking: &mut pi_agent::ThinkingLevel,
-    tools: &ToolRegistry,
-) -> Result<i32, String> {
+fn run_rpc(runtime: &mut SessionRuntime) -> Result<i32, String> {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -384,156 +473,11 @@ fn run_rpc(
         }
         let value: serde_json::Value =
             serde_json::from_str(&line).map_err(|e| format!("Invalid RPC JSON: {e}"))?;
-        let reply = rpc::handle_rpc(&value, messages, steer, follow_up, thinking, tools);
-        println!("{}", reply);
-    }
-    Ok(0)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_interactive(
-    parsed: &Args,
-    cwd: &Path,
-    provider: &str,
-    model_id: &str,
-    system_prompt: &str,
-    tools: &ToolRegistry,
-    initial: &[AgentMessage],
-    session_path: Option<PathBuf>,
-    bus: &EventBus,
-    discovered: &[extensions::Extension],
-) -> Result<i32, String> {
-    let fullscreen = parsed.tui_mode == Some(TuiMode::Fullscreen);
-    let mut stdout = io::stdout();
-    if fullscreen {
-        enter_alt_screen(&mut stdout).ok();
-        enable_mouse(&mut stdout).ok();
-    }
-    let mut tui = Tui::new(parsed.tui_mode.unwrap_or(TuiMode::Regular), 80, 24);
-    let mut chat = ChatView::default();
-    chat.push(
-        "system",
-        format!("{APP_NAME} {VERSION}  {provider}/{model_id}"),
-    );
-    if let Some(path) = &session_path {
-        chat.push("session", path.display().to_string());
-    }
-    tui.add_child_lines(chat.render(80));
-    let commands: Vec<String> = slash::BUILTIN_SLASH_COMMANDS
-        .iter()
-        .map(|(n, _)| format!("/{n}"))
-        .collect();
-    let selector = SelectList::new(commands);
-    let overlay = Overlay::new("slash commands", selector.filtered());
-    tui.show_overlay(
-        overlay.render(40),
-        OverlayOptions {
-            width: Some(40),
-            ..OverlayOptions::default()
-        },
-    );
-    print!("{}", tui.render_now(true));
-    println!();
-    let _ = tools;
-    let editor = Editor::default();
-    for line in editor.render(80) {
-        let _ = Text::new(line);
-    }
-    let mut messages = initial.to_vec();
-    let mut steer = SteerQueue::default();
-    let mut follow = FollowUpQueue::default();
-    if !messages.is_empty() {
-        print_agent_turn(
-            parsed,
-            cwd,
-            provider,
-            model_id,
-            system_prompt,
-            tools,
-            &messages,
-            &mut steer,
-            &mut follow,
-            session_path.as_deref(),
-            bus,
-        )?;
-    } else {
-        println!("Type a prompt, or /help. Ctrl+C to quit.");
-    }
-    for line in io::stdin().lock().lines() {
-        let line = line.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() {
-            continue;
+        let (reply, events) = rpc::handle_rpc(&value, runtime);
+        println!("{reply}");
+        for event in events {
+            println!("{event}");
         }
-        if let Some((_, hit)) = tui.hit_test_mouse(&line) {
-            bus.emit("mouse", serde_json::json!({"overlay": hit, "raw": line}));
-            continue;
-        }
-        if let Some((cmd, args)) = slash::parse_slash(&line) {
-            match cmd {
-                "quit" | "exit" => break,
-                "reload" => {
-                    bus.clear();
-                    extensions::attach_extensions(bus, discovered);
-                    println!("Reloaded extensions ({} channels)", bus.channel_count());
-                }
-                "help" => {
-                    let body = slash::BUILTIN_SLASH_COMMANDS
-                        .iter()
-                        .map(|(name, desc)| format!("/{name}  {desc}"))
-                        .collect();
-                    for line in Overlay::new("help", body).render(80) {
-                        println!("{line}");
-                    }
-                }
-                "clone" => {
-                    if let Some(path) = &session_path {
-                        if let Ok(info) = pi_session::read_session_info(path) {
-                            let _ = clone_session(
-                                &default_sessions_root(),
-                                &info,
-                                &cwd.to_string_lossy(),
-                            );
-                        }
-                    }
-                }
-                "trust" => {
-                    settings::save_trust(&commands::agent_dir(), cwd);
-                    println!("Trusted {}", cwd.display());
-                }
-                "login" => {
-                    if let Some(url) = pi_ai::authorize_url(args, "http://127.0.0.1:8765/cb", "pi")
-                    {
-                        println!("Open: {url}");
-                    } else {
-                        println!("Usage: /login <provider>");
-                    }
-                }
-                other => println!("/{other} {args}"),
-            }
-            continue;
-        }
-        messages.push(AgentMessage {
-            role: "user".into(),
-            content: line,
-            images: vec![],
-        });
-        print_agent_turn(
-            parsed,
-            cwd,
-            provider,
-            model_id,
-            system_prompt,
-            tools,
-            &messages,
-            &mut steer,
-            &mut follow,
-            session_path.as_deref(),
-            bus,
-        )?;
-    }
-    if fullscreen {
-        disable_mouse(&mut stdout).ok();
-        leave_alt_screen(&mut stdout).ok();
     }
     Ok(0)
 }
@@ -554,81 +498,6 @@ fn resolve_api_key(parsed: &Args, provider: &str) -> Option<String> {
         })
 }
 
-fn agent_config(
-    parsed: &Args,
-    cwd: &Path,
-    provider: &str,
-    model_id: &str,
-    system_prompt: &str,
-) -> AgentConfig {
-    let fixture = std::env::var("PI_STREAM_FIXTURE")
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok());
-    AgentConfig {
-        cwd: cwd.to_path_buf(),
-        system_prompt: system_prompt.to_string(),
-        model_provider: provider.to_string(),
-        model_id: model_id.to_string(),
-        api_key: resolve_api_key(parsed, provider),
-        allow_network: fixture.is_none() && !parsed.offline,
-        auto_retry: true,
-        max_retries: 2,
-        auto_compact: true,
-        context_window: 128_000,
-        max_turns: 16,
-        fixture,
-        permission: Box::new(AllowAllPermissionPolicy),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn print_agent_turn(
-    parsed: &Args,
-    cwd: &Path,
-    provider: &str,
-    model_id: &str,
-    system_prompt: &str,
-    tools: &ToolRegistry,
-    messages: &[AgentMessage],
-    steer: &mut SteerQueue,
-    follow_up: &mut FollowUpQueue,
-    session_path: Option<&Path>,
-    bus: &EventBus,
-) -> Result<i32, String> {
-    bus.emit(
-        "agent_start",
-        serde_json::json!({"provider": provider, "model": model_id}),
-    );
-    let config = agent_config(parsed, cwd, provider, model_id, system_prompt);
-    let events =
-        run_agent(&config, messages, tools, steer, follow_up).map_err(|e| e.to_string())?;
-    for event in events {
-        match event {
-            AgentEvent::Message { message } => {
-                let md = Markdown::new(&message.content);
-                for line in md.render(80) {
-                    println!("{line}");
-                }
-                if let Some(path) = session_path {
-                    let _ = pi_session::append_entry(
-                        path,
-                        &serde_json::json!({"type":"message","role": message.role, "content": message.content}),
-                    );
-                }
-            }
-            AgentEvent::ToolStart { name, .. } => println!("▶ {name}"),
-            AgentEvent::ToolEnd { name, output, .. } => {
-                println!("■ {name}\n{output}");
-            }
-            AgentEvent::Error { message } => eprintln!("Error: {message}"),
-            _ => {}
-        }
-    }
-    bus.emit("agent_end", serde_json::json!({"ok": true}));
-    Ok(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +506,23 @@ mod tests {
     fn help_and_version() {
         assert_eq!(run(&["--version".into()], true, true).unwrap(), 0);
         assert_eq!(run(&["--help".into()], true, true).unwrap(), 0);
+    }
+
+    #[test]
+    fn fork_conflict_is_error() {
+        assert_eq!(
+            run(
+                &[
+                    "--fork".into(),
+                    "abc".into(),
+                    "--session".into(),
+                    "abc".into()
+                ],
+                true,
+                true
+            )
+            .unwrap(),
+            1
+        );
     }
 }

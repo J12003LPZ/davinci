@@ -27,7 +27,10 @@ impl EventBus {
             guard.listeners.get(channel).cloned().unwrap_or_default()
         };
         for handler in handlers {
-            handler(&data);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&data)));
+            if let Err(err) = result {
+                eprintln!("Event handler error ({channel}): {err:?}");
+            }
         }
     }
 

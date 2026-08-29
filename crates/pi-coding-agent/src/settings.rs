@@ -14,7 +14,6 @@ pub struct Settings {
     pub trusted: bool,
 }
 
-#[allow(dead_code)]
 pub fn load_settings(path: &Path) -> Settings {
     fs::read_to_string(path)
         .ok()
@@ -26,7 +25,6 @@ pub fn trust_store_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("trusted-projects.json")
 }
 
-#[allow(dead_code)]
 pub fn is_trusted(agent_dir: &Path, cwd: &Path) -> bool {
     let path = trust_store_path(agent_dir);
     let Ok(raw) = fs::read_to_string(path) else {

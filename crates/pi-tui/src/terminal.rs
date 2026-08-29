@@ -31,3 +31,26 @@ pub fn enable_mouse(out: &mut impl Write) -> io::Result<()> {
 pub fn disable_mouse(out: &mut impl Write) -> io::Result<()> {
     write!(out, "\u{1b}[?1006l\u{1b}[?1000l")
 }
+
+/// Enable/disable cooked canonical input via `stty` (no `unsafe`).
+pub fn enable_raw_input() -> io::Result<()> {
+    let status = std::process::Command::new("stty")
+        .args(["-icanon", "-echo", "min", "1", "time", "0"])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("stty raw failed"))
+    }
+}
+
+pub fn disable_raw_input() -> io::Result<()> {
+    let status = std::process::Command::new("stty")
+        .args(["icanon", "echo"])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("stty cooked failed"))
+    }
+}

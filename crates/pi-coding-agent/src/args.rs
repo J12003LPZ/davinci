@@ -318,7 +318,38 @@ pub fn parse_args(args: &[String]) -> Args {
         }
         i += 1;
     }
+    if std::env::var("PI_OFFLINE").is_ok() {
+        result.offline = true;
+    }
+    if result.fork.is_some()
+        && (result.session.is_some()
+            || result.continue_session
+            || result.resume
+            || result.no_session)
+    {
+        result.diagnostics.push(Diagnostic {
+            kind: "error",
+            message:
+                "--fork cannot be combined with --session, --continue, --resume, or --no-session"
+                    .into(),
+        });
+    }
+    if let Some(id) = &result.session_id {
+        if !is_valid_session_id(id) {
+            result.diagnostics.push(Diagnostic {
+                kind: "error",
+                message: format!("Invalid --session-id: {id}"),
+            });
+        }
+    }
     result
+}
+
+pub fn is_valid_session_id(id: &str) -> bool {
+    let trimmed = id.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 pub fn print_help() -> String {
@@ -384,6 +415,13 @@ Options:
 Environment Variables:
   {ENV_AGENT_DIR} - Config directory (default: ~/{CONFIG_DIR_NAME}/agent)
   {ENV_SESSION_DIR} - Session storage directory (overridden by --session-dir)
+  PI_OFFLINE=1 - Disable startup network operations (same as --offline)
+  PI_DISABLE_NETWORK=1 - Block live provider HTTP (tests / airgap)
+  PI_STREAM_FIXTURE - Path to a fixture JSON used instead of a live model
+  PI_TELEMETRY=1 - Record in-memory startup/session spans
+  ANTHROPIC_API_KEY, ANTHROPIC_OAUTH_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY,
+  GROQ_API_KEY, OPENROUTER_API_KEY, XAI_API_KEY, MISTRAL_API_KEY, DEEPSEEK_API_KEY,
+  and other provider keys from packages/ai env-api-keys.ts
 "
     )
 }
