@@ -3,7 +3,7 @@ name = "pi-coding-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Pi coding-agent CLI (Rust port; TypeScript remains authoritative)"
+description = "Pi coding-agent CLI (default Rust product)"
 
 [[bin]]
 name = "pi"

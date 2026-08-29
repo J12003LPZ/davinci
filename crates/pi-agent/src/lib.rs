@@ -284,6 +284,90 @@ pub fn usage_zero() -> Usage {
     Usage::default()
 }
 
+fn user_text(text: impl Into<String>) -> Message {
+    Message::User {
+        content: Value::String(text.into()),
+        timestamp: pi_core::now_ms(),
+    }
+}
+
+/// Stateful wrapper around [`run_agent_loop`].
+///
+/// Queues steering and follow-up text the way TypeScript `Agent` does, then
+/// drains them on the next [`Agent::prompt`].
+#[derive(Debug, Clone)]
+pub struct Agent {
+    context: AgentContext,
+    config: AgentLoopConfig,
+    provider: MockProvider,
+    steering: VecDeque<Message>,
+    follow_up: VecDeque<Message>,
+    aborted: bool,
+}
+
+impl Agent {
+    pub fn new(config: AgentLoopConfig, provider: MockProvider) -> Self {
+        Self {
+            context: AgentContext {
+                system_prompt: None,
+                messages: Vec::new(),
+                tools: Vec::new(),
+            },
+            config,
+            provider,
+            steering: VecDeque::new(),
+            follow_up: VecDeque::new(),
+            aborted: false,
+        }
+    }
+
+    pub fn with_context(mut self, context: AgentContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    pub fn prompt(&mut self, text: impl AsRef<str>) -> Vec<AgentEvent> {
+        if self.aborted {
+            return vec![
+                AgentEvent::AgentStart,
+                AgentEvent::AgentEnd {
+                    messages: Vec::new(),
+                },
+            ];
+        }
+        let (events, produced) = run_agent_loop(
+            vec![user_text(text.as_ref())],
+            self.context.clone(),
+            self.config.clone(),
+            &self.provider,
+            std::mem::take(&mut self.steering),
+            std::mem::take(&mut self.follow_up),
+        );
+        self.context.messages.extend(produced);
+        events
+    }
+
+    pub fn steer(&mut self, text: impl AsRef<str>) {
+        self.steering.push_back(user_text(text.as_ref()));
+    }
+
+    pub fn follow_up(&mut self, text: impl AsRef<str>) {
+        self.follow_up.push_back(user_text(text.as_ref()));
+    }
+
+    pub fn abort(&mut self) {
+        self.aborted = true;
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        self.aborted
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.context.messages
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +513,59 @@ mod tests {
             .filter(|message| matches!(message, Message::ToolResult { .. }))
             .count();
         assert_eq!(tools, 2);
+    }
+
+    #[test]
+    fn agent_prompt_appends_user_and_assistant() {
+        let mut agent = Agent::new(config(), MockProvider::default());
+        let events = agent.prompt("hi");
+        assert!(matches!(events.first(), Some(AgentEvent::AgentStart)));
+        assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::User { content, .. } if content == "hi")));
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::Assistant { .. })));
+    }
+
+    #[test]
+    fn agent_steer_injects_after_turn() {
+        let mut agent = Agent::new(
+            config(),
+            MockProvider {
+                forced_text: Some("done".into()),
+                ..MockProvider::default()
+            },
+        );
+        agent.steer("steer");
+        agent.prompt("hi");
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::User { content, .. } if content == "steer")));
+    }
+
+    #[test]
+    fn agent_follow_up_runs_when_agent_would_stop() {
+        let mut agent = Agent::new(config(), MockProvider::default());
+        agent.follow_up("again");
+        agent.prompt("hi");
+        assert!(agent
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::User { content, .. } if content == "again")));
+    }
+
+    #[test]
+    fn agent_abort_skips_prompt() {
+        let mut agent = Agent::new(config(), MockProvider::default());
+        agent.abort();
+        assert!(agent.is_aborted());
+        let events = agent.prompt("hi");
+        assert!(agent.messages().is_empty());
+        assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
     }
 }

@@ -1,5 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use pi_core::{next_id, now_ms, SessionError};
 use pi_session::{
@@ -208,12 +212,42 @@ fn append_entry_to_branch_cache(
 }
 
 #[derive(Clone)]
+struct HeldLease {
+    lease: WriterLease,
+    refs: usize,
+    stop_heartbeat: Arc<AtomicBool>,
+}
+
+fn spawn_heartbeat(
+    db: Arc<Mutex<Connection>>,
+    session_id: String,
+    mut lease: WriterLease,
+    options: WriterLeaseOptions,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let interval = Duration::from_millis(options.heartbeat_interval_ms.max(1) as u64);
+        while !stop.load(Ordering::Relaxed) {
+            thread::sleep(interval);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(db) = db.lock() else {
+                break;
+            };
+            let now = now_ms();
+            let _ = renew_writer_lease(&db, &session_id, &mut lease, now, now + options.ttl_ms);
+        }
+    });
+}
+
 pub struct SqliteSessionStorage {
     db: Arc<Mutex<Connection>>,
     metadata: SessionMetadata,
     lease: WriterLease,
     options: WriterLeaseOptions,
     closed: bool,
+    held: Arc<Mutex<HashMap<String, HeldLease>>>,
 }
 
 impl SqliteSessionStorage {
@@ -576,13 +610,39 @@ impl SessionStore for SqliteSessionStorage {
         if self.closed {
             return Ok(());
         }
-        let db = self
-            .db
-            .lock()
-            .map_err(|error| SessionError::storage(error.to_string()))?;
-        release_writer_lease(&db, &self.metadata.id, &self.lease)?;
         self.closed = true;
+        let last_handle = {
+            let mut held = self
+                .held
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            if let Some(entry) = held.get_mut(&self.metadata.id) {
+                entry.refs = entry.refs.saturating_sub(1);
+                if entry.refs == 0 {
+                    entry.stop_heartbeat.store(true, Ordering::Relaxed);
+                    held.remove(&self.metadata.id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        };
+        if last_handle {
+            let db = self
+                .db
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            release_writer_lease(&db, &self.metadata.id, &self.lease)?;
+        }
         Ok(())
+    }
+}
+
+impl Drop for SqliteSessionStorage {
+    fn drop(&mut self) {
+        let _ = SessionStore::release(self);
     }
 }
 
@@ -638,6 +698,7 @@ pub struct SqliteSessionRepository {
     db: Arc<Mutex<Connection>>,
     path: PathBuf,
     options: WriterLeaseOptions,
+    held: Arc<Mutex<HashMap<String, HeldLease>>>,
 }
 
 impl SqliteSessionRepository {
@@ -648,6 +709,7 @@ impl SqliteSessionRepository {
             db: Arc::new(Mutex::new(db)),
             path,
             options,
+            held: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -708,17 +770,55 @@ impl SqliteSessionRepository {
         &self,
         metadata: SessionMetadata,
     ) -> Result<SqliteSessionStorage, SessionError> {
+        {
+            let mut held = self
+                .held
+                .lock()
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            if let Some(entry) = held.get_mut(&metadata.id) {
+                entry.refs += 1;
+                return Ok(SqliteSessionStorage {
+                    db: Arc::clone(&self.db),
+                    metadata,
+                    lease: entry.lease.clone(),
+                    options: self.options,
+                    closed: false,
+                    held: Arc::clone(&self.held),
+                });
+            }
+        }
         let db = self
             .db
             .lock()
             .map_err(|error| SessionError::storage(error.to_string()))?;
         let lease = claim_writer_lease(&db, &metadata.id, self.options, now_ms())?;
+        drop(db);
+        let stop_heartbeat = Arc::new(AtomicBool::new(false));
+        spawn_heartbeat(
+            Arc::clone(&self.db),
+            metadata.id.clone(),
+            lease.clone(),
+            self.options,
+            Arc::clone(&stop_heartbeat),
+        );
+        self.held
+            .lock()
+            .map_err(|error| SessionError::storage(error.to_string()))?
+            .insert(
+                metadata.id.clone(),
+                HeldLease {
+                    lease: lease.clone(),
+                    refs: 1,
+                    stop_heartbeat,
+                },
+            );
         Ok(SqliteSessionStorage {
             db: Arc::clone(&self.db),
             metadata,
             lease,
             options: self.options,
             closed: false,
+            held: Arc::clone(&self.held),
         })
     }
 }

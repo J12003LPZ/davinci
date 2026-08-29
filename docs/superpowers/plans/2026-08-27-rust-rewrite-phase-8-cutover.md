@@ -1,4 +1,8 @@
-# Phase 8: Gate and Sign-off
+# Phase 8: Cutover
+
+## Decision
+
+Rust is the default product. TypeScript remains vendored as `legacy-pi`.
 
 ## Checklist
 
@@ -6,6 +10,14 @@
 2. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 3. `cargo fmt --check` is clean.
 4. Phase 7 fixtures are green.
-5. TypeScript packages still compile as the authority; Rust is the port, not the product cutover.
+5. Default install is `cargo install --path crates/pi-coding-agent` / `./scripts/install.sh` / `make install`.
+6. Interactive TUI, print mode, and RPC JSONL are the CLI surfaces.
+7. `vendor/pi` is documented as the behavioral reference, not the shipped binary.
 
-This gate does **not** remove the TypeScript runtime. Product cutover is a later decision.
+## Follow-on (not blocking cutover)
+
+- Same-process SQLite reopen reuse and lease heartbeat thread.
+- JSONL v4 session repository.
+- Unix-socket client/server transport and handshake timeout.
+- Live OpenAI/Anthropic SSE adapters (fixture-tested; no CI network calls).
+- Stateful `Agent` wrapper around `run_agent_loop`.

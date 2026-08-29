@@ -20,4 +20,4 @@ Port the product CLI surface: print mode, session listing, and the four built-in
 
 ## Done when
 
-CLI unit/integration tests cover help, print, tools, and session list. TypeScript CLI remains the default product.
+CLI unit/integration tests cover help, print, RPC, interactive, tools, and session list. Rust `pi` is the default product.

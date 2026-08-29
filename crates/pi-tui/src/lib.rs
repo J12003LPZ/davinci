@@ -90,6 +90,91 @@ impl Component for Editor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    Exit,
+    Help,
+    Clear,
+    Sessions,
+    Unknown(String),
+}
+
+pub fn parse_slash(input: &str) -> Option<SlashCommand> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let name = trimmed
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    Some(match name {
+        "exit" | "quit" | "q" => SlashCommand::Exit,
+        "help" | "h" => SlashCommand::Help,
+        "clear" => SlashCommand::Clear,
+        "sessions" => SlashCommand::Sessions,
+        other => SlashCommand::Unknown(other.to_string()),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatView {
+    pub title: String,
+    pub history: Vec<String>,
+    pub editor: Editor,
+    pub status: String,
+}
+
+impl Default for ChatView {
+    fn default() -> Self {
+        Self {
+            title: "pi".into(),
+            history: Vec::new(),
+            editor: Editor::default(),
+            status: String::new(),
+        }
+    }
+}
+
+impl ChatView {
+    pub fn push_user(&mut self, text: &str) {
+        self.history.push(format!("you: {text}"));
+    }
+
+    pub fn push_assistant(&mut self, text: &str) {
+        self.history.push(format!("pi: {text}"));
+    }
+}
+
+impl Component for ChatView {
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut lines = vec![self.title.clone(), String::new()];
+        lines.extend(self.history.iter().cloned());
+        if !self.history.is_empty() {
+            lines.push(String::new());
+        }
+        if !self.status.is_empty() {
+            lines.push(self.status.clone());
+        }
+        lines.push(String::from("> ") + &self.editor.render(width.saturating_sub(2)).join("\n"));
+        lines
+            .into_iter()
+            .map(|line| {
+                if line.chars().count() > width {
+                    line.chars().take(width).collect()
+                } else {
+                    line
+                }
+            })
+            .collect()
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        self.editor.handle_input(data);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
     Enter,
     CtrlC,
@@ -179,5 +264,26 @@ mod tests {
     fn parse_enter_and_ctrl_c() {
         assert_eq!(parse_key("\n"), Key::Enter);
         assert_eq!(parse_key("\u{3}"), Key::CtrlC);
+    }
+
+    #[test]
+    fn slash_commands() {
+        assert_eq!(parse_slash("/exit"), Some(SlashCommand::Exit));
+        assert_eq!(parse_slash("/help"), Some(SlashCommand::Help));
+        assert_eq!(parse_slash("hello"), None);
+    }
+
+    #[test]
+    fn chat_view_renders_history_and_prompt() {
+        let mut view = ChatView {
+            title: "pi 0.84.4".into(),
+            ..ChatView::default()
+        };
+        view.push_user("hi");
+        view.push_assistant("echo:hi");
+        let lines = view.render(40);
+        assert!(lines.iter().any(|line| line.contains("you: hi")));
+        assert!(lines.iter().any(|line| line.contains("pi: echo:hi")));
+        assert!(lines.iter().any(|line| line.starts_with('>')));
     }
 }

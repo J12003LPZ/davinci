@@ -1,43 +1,76 @@
-# Pi monorepo (TypeScript + Rust port)
+# Pi
 
-This repository vendors the TypeScript pi monorepo and a Rust workspace that ports it crate-by-crate.
+Rust is the default product. The `pi` binary comes from `crates/pi-coding-agent`.
 
-**TypeScript is still the authoritative product.** The Rust port is complete through the Phase 8 shadow-complete gate defined in `docs/superpowers/plans/2026-08-27-rust-rewrite-program.md`. The default install path remains the TypeScript packages. Rust is a parity-tested port, not a cutover.
+This repository ports the Earendil Works TypeScript monorepo crate-by-crate. TypeScript under `vendor/pi` is the behavioral reference (`legacy-pi`) at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`. When Rust and TypeScript disagree, change Rust unless the TypeScript bug is independently confirmed.
 
-Upstream spec: `vendor/pi` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185` (`earendil-works/pi`).
+## Install
+
+Requires Rust 1.83+ (`rust-toolchain.toml` pins 1.83.0).
+
+```bash
+./scripts/install.sh
+# or
+make install
+# or
+cargo install --path crates/pi-coding-agent --force
+```
+
+`pi` is then on your PATH:
+
+```bash
+pi --help
+pi --version
+pi -p "summarize this repo"
+pi --mode json -p "hello"
+pi --mode rpc
+pi sessions --database sessions.sqlite
+```
+
+Interactive mode is the default when stdin is a TTY and you do not pass `-p` / `--mode rpc`. Type a prompt, or `/help`. `/exit` leaves the session.
+
+## Modes
+
+| Invocation | Behavior |
+|------------|----------|
+| `pi` | Interactive TUI (Editor + agent loop + slash commands) |
+| `pi -p "…"` / `--print` | One-shot print mode, then exit |
+| `pi --mode json -p "…"` / `--json` | Print mode as JSON event lines |
+| `pi --mode rpc` | JSONL RPC on stdin/stdout (`prompt`, `get_state`, `bash`, …) |
+| `pi sessions` | List sessions in the SQLite database |
+
+Print and RPC use the mock provider unless a live adapter is configured. CI never calls a network LLM.
 
 ## Layout
 
 | Tree | Role |
 |------|------|
-| `vendor/pi/packages/*` | TypeScript source of truth |
-| `crates/*` | Rust ports |
-| `docs/superpowers/plans/` | Program and per-phase plans |
+| `crates/*` | Shipped Rust product |
+| `vendor/pi/packages/*` | TypeScript reference (`legacy-pi`) |
+| `docs/superpowers/plans/` | Rewrite program and per-phase plans |
 
 | Crate | TypeScript package |
 |-------|--------------------|
 | `pi-core` | shared errors |
 | `pi-session` / `pi-session-sqlite` | harness sessions + sqlite-node writer-leases |
 | `pi-protocol` / `pi-client` / `pi-server` | framed CBOR protocol |
-| `pi-ai` | stream contract + mock provider |
+| `pi-ai` | stream contract, mock provider, fixture SSE adapters |
 | `pi-agent` | agent loop, steer, follow-up, tools |
-| `pi-tui` | component `render(width)` |
-| `pi-coding-agent` | `pi` CLI (print mode, sessions, tools) |
+| `pi-tui` | component `render(width)` + interactive chat view |
+| `pi-coding-agent` | `pi` CLI (interactive, print, RPC, sessions, tools) |
 | `pi-parity` | differential fixtures (leases, protocol, entries, agent/CLI events) |
 
-## Rust
-
-Requires Rust 1.83+ (bundled `rusqlite`).
+## Develop
 
 ```bash
-cargo test --workspace
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
+make test
+make fmt
+make clippy
 cargo run -p pi-coding-agent -- -p "hello"
 cargo run -p pi-coding-agent -- sessions --database sessions.sqlite
 ```
 
-## TypeScript (authoritative runtime)
+## TypeScript reference
 
 ```bash
 cd vendor/pi
@@ -45,8 +78,8 @@ npm install
 npm test
 ```
 
-Node 22.19+ is required for the TypeScript workspace. The Rust port does not replace `npm` install or the published `@earendil-works/*` packages.
+Node 22.19+ is required only if you are comparing against the vendored TypeScript suite. It is not the install path for `pi`.
 
 ## License
 
-MIT. TypeScript sources retain the upstream copyright of Mario Zechner / Earendil Works.
+MIT. Vendored TypeScript retains the upstream copyright of Mario Zechner / Earendil Works.

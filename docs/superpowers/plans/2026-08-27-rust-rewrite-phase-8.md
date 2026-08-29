@@ -1,8 +1,8 @@
-# Phase 8 — Differential fixtures and quality gate
+# Phase 8 — Differential fixtures, quality gate, and cutover
 
 ## Goal
 
-Lock cross-crate JSON/CBOR shapes against TypeScript fixtures and run the program quality gate. TypeScript stays authoritative.
+Lock cross-crate JSON/CBOR shapes against TypeScript fixtures, keep the quality gate green, and ship Rust `pi` as the default product.
 
 ## Deliverables
 
@@ -12,9 +12,9 @@ Lock cross-crate JSON/CBOR shapes against TypeScript fixtures and run the progra
   - assistant message + usage
   - agent events
   - CLI print JSON events
-- Scripts documented in the root README.
+- Root README, `Makefile`, and `scripts/install.sh` install the Rust binary.
 - `cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings`.
 
 ## End-state check
 
-All twelve items in `2026-08-27-rust-rewrite-program.md` § End state are true. Cutover is **not** performed.
+All twelve items in `2026-08-27-rust-rewrite-program.md` § End state are true. Cutover **has been performed**: `cargo install --path crates/pi-coding-agent` is the product path. `vendor/pi` is `legacy-pi`.

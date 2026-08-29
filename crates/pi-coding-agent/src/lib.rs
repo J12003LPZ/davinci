@@ -1,31 +1,53 @@
-//! Coding-agent library: CLI args, print mode, and built-in tools.
+//! Coding-agent library: CLI args, print mode, RPC, interactive TUI, and tools.
+
+mod interactive;
+mod rpc;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{Parser, Subcommand};
+
+pub use interactive::{run_interactive, run_interactive_lines};
 use pi_agent::{
     run_agent_loop, AgentContext, AgentLoopConfig, AgentTool, QueueMode, ToolExecutionMode,
 };
 use pi_ai::{test_model, Message, MockProvider, Tool};
 use pi_session::{provision_message, SessionCreateOptions, SessionRepository};
 use pi_session_sqlite::{SqliteSessionRepository, WriterLeaseOptions};
+pub use rpc::{run_rpc, run_rpc_lines};
 use serde_json::Value;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
-#[command(name = "pi", version = VERSION, about = "Pi coding agent (Rust port)")]
+#[command(name = "pi", version = VERSION, about = "Pi coding agent")]
 pub struct Args {
     /// Print mode: run one prompt and exit.
     #[arg(short = 'p', long = "print")]
     pub print: Option<String>,
-    /// Emit print-mode events as JSON lines.
+    /// Emit print-mode events as JSON lines (same as --mode json).
     #[arg(long)]
     pub json: bool,
+    /// Output mode: text (default), json, or rpc.
+    #[arg(long)]
+    pub mode: Option<String>,
+    /// SQLite session database used by interactive mode and /sessions.
+    #[arg(long, default_value = "sessions.sqlite")]
+    pub database: PathBuf,
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+impl Args {
+    pub fn is_rpc(&self) -> bool {
+        self.mode.as_deref() == Some("rpc")
+    }
+
+    pub fn is_json(&self) -> bool {
+        self.json || self.mode.as_deref() == Some("json")
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -90,7 +112,7 @@ thread_local! {
     static TOOL_CWD: std::cell::RefCell<PathBuf> = std::cell::RefCell::new(PathBuf::from("."));
 }
 
-fn with_cwd<T>(cwd: PathBuf, f: impl FnOnce() -> T) -> T {
+pub(crate) fn with_cwd<T>(cwd: PathBuf, f: impl FnOnce() -> T) -> T {
     TOOL_CWD.with(|slot| {
         *slot.borrow_mut() = cwd;
         f()
@@ -301,7 +323,38 @@ mod tests {
         let help = cmd.render_help().to_string();
         assert!(help.contains("print"));
         assert!(help.contains("sessions"));
+        assert!(help.contains("mode"));
         assert_eq!(cmd.get_version(), Some(VERSION));
+    }
+
+    #[test]
+    fn rpc_prompt_and_state() {
+        let lines = run_rpc_lines(&[
+            r#"{"id":"1","type":"prompt","message":"hello"}"#,
+            r#"{"id":"2","type":"get_state"}"#,
+            r#"{"id":"3","type":"get_last_assistant_text"}"#,
+        ])
+        .unwrap();
+        assert!(lines
+            .iter()
+            .any(|value| value["command"] == "prompt" && value["success"] == true));
+        assert!(lines.iter().any(|value| value["type"] == "agent_start"));
+        assert!(lines.iter().any(|value| value["command"] == "get_state"));
+        let text = lines
+            .iter()
+            .find(|value| value["command"] == "get_last_assistant_text")
+            .and_then(|value| value["data"]["text"].as_str())
+            .unwrap_or("");
+        assert!(text.contains("hello"));
+    }
+
+    #[test]
+    fn interactive_prompt_and_exit() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("sessions.sqlite");
+        let out = run_interactive_lines(&["hello", "/exit"], &db).unwrap();
+        assert!(out.contains("echo:hello") || out.contains("hello"));
+        assert!(out.contains("goodbye"));
     }
 
     #[test]

@@ -147,10 +147,16 @@ mod tests {
                 ..SessionCreateOptions::default()
             })
             .unwrap();
+        let metadata = session.metadata().unwrap();
+        let leases_before = repository.inspect_leases().unwrap();
+        let mut reopened = repository
+            .open(&metadata)
+            .expect("same-process reopen must reuse the active writer lease");
+        assert_eq!(repository.inspect_leases().unwrap(), leases_before);
         let first = session
             .append_entry(provision_message("first"), "main")
             .unwrap();
-        let second = session
+        let second = reopened
             .append_entry(provision_message("second"), "main")
             .unwrap();
         let ids: Vec<_> = session
@@ -163,6 +169,84 @@ mod tests {
             .map(|entry| entry.id().to_string())
             .collect();
         assert_eq!(ids, vec![first.id().to_string(), second.id().to_string()]);
+        assert_eq!(
+            reopened
+                .find_entries(EntryQuery {
+                    order: Some(QueryOrder::OldestFirst),
+                    ..EntryQuery::default()
+                })
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.id().to_string())
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[test]
+    fn second_repository_fails_with_exact_active_writer_error() {
+        let dir = tempdir().unwrap();
+        let mut first = repo(dir.path());
+        let mut second = repo(dir.path());
+        let session = first
+            .create(SessionCreateOptions {
+                cwd: dir.path().to_string_lossy().into_owned(),
+                id: Some("session-1".into()),
+                ..SessionCreateOptions::default()
+            })
+            .unwrap();
+        let metadata = session.metadata().unwrap();
+        let err = match second.open(&metadata) {
+            Err(error) => error,
+            Ok(_) => panic!("expected second writer to fail"),
+        };
+        assert_eq!(err.code, SessionErrorCode::Storage);
+        assert_eq!(
+            err.message,
+            format!(
+                "SQLite session {} already has an active writer",
+                metadata.id
+            )
+        );
+    }
+
+    #[test]
+    fn heartbeat_renews_idle_writer_lease() {
+        let dir = tempdir().unwrap();
+        let options = WriterLeaseOptions {
+            ttl_ms: 80,
+            heartbeat_interval_ms: 20,
+        };
+        let mut repository =
+            SqliteSessionRepository::open(dir.path().join("sessions.sqlite"), options).unwrap();
+        let session = repository
+            .create(SessionCreateOptions {
+                cwd: dir.path().to_string_lossy().into_owned(),
+                id: Some("session-1".into()),
+                ..SessionCreateOptions::default()
+            })
+            .unwrap();
+        let metadata = session.metadata().unwrap();
+        let initial = repository
+            .inspect_leases()
+            .unwrap()
+            .into_iter()
+            .find(|(id, _, _, _)| id == &metadata.id)
+            .map(|(_, _, _, expires)| expires)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        let renewed = repository
+            .inspect_leases()
+            .unwrap()
+            .into_iter()
+            .find(|(id, _, _, _)| id == &metadata.id)
+            .map(|(_, _, _, expires)| expires)
+            .unwrap();
+        assert!(
+            renewed > initial,
+            "heartbeat should extend expires_at_ms (initial={initial}, renewed={renewed})"
+        );
+        drop(session);
     }
 
     #[test]

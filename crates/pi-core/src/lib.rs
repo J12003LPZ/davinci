@@ -1,7 +1,9 @@
 //! Shared types for the pi Rust port.
 //!
-//! TypeScript remains the product authority (`vendor/pi`). These types
-//! mirror `@earendil-works/pi-agent-core` error codes and JSON helpers.
+//! Shared types for the shipped Rust product.
+//!
+//! TypeScript under `vendor/pi` is the behavioral reference (`legacy-pi`).
+//! These types mirror `@earendil-works/pi-agent-core` error codes and JSON helpers.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

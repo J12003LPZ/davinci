@@ -9,3 +9,7 @@ description = "LLM stream contract and mock provider"
 pi-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# rustc 1.83: ureq 2.10 without rustls (newer rustls/zeroize need edition2024).
+# Live HTTPS is optional; adapters still parse SSE fixtures and treat HTTP errors as events.
+ureq = { version = "=2.10.1", default-features = false, features = ["json"] }
+url = "=2.5.0"

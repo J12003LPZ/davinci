@@ -1,7 +1,15 @@
 //! LLM types and stream contract.
 //!
-//! Live provider HTTP is intentionally out of the Phase 4 CI surface.
-//! Tests use `MockProvider` fixtures so TypeScript remains the catalog owner.
+//! Live provider HTTP lives in [`http`]. Default `stream` / `complete` stay on
+//! `MockProvider` so CI never touches the network. Adapter tests parse SSE fixtures.
+
+mod http;
+
+pub use http::{
+    anthropic_messages_stream, build_anthropic_messages_request, build_openai_chat_request,
+    openai_compatible_stream, parse_anthropic_messages_sse, parse_openai_compatible_sse,
+    resolve_api_key, HttpChatRequest,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -188,6 +196,9 @@ pub enum AssistantMessageEvent {
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
     pub thinking_level: Option<String>,
+    /// Bearer / x-api-key override. When unset, adapters read `OPENAI_API_KEY`
+    /// or `ANTHROPIC_API_KEY`.
+    pub api_key: Option<String>,
 }
 
 /// Stream contract: never throw for request/model failures; encode them as events.
