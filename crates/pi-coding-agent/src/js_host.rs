@@ -76,7 +76,18 @@ fn runner_path() -> Result<PathBuf, String> {
 }
 
 pub fn resolve_extension_module(dir: &Path) -> Option<PathBuf> {
-    for name in ["index.js", "index.mjs", "index.cjs", "extension.js"] {
+    // TS `resolveExtensionEntries`: index.ts before index.js, then package.json main.
+    for name in [
+        "index.ts",
+        "index.tsx",
+        "index.mts",
+        "index.cts",
+        "extension.ts",
+        "index.js",
+        "index.mjs",
+        "index.cjs",
+        "extension.js",
+    ] {
         let candidate = dir.join(name);
         if candidate.exists() {
             return Some(candidate);
@@ -189,6 +200,34 @@ module.exports = (pi) => {
             emitted.result.as_ref().unwrap()["reason"],
             "blocked by fixture"
         );
+    }
+
+    #[test]
+    fn loads_typescript_factory_with_virtual_packages() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.ts"),
+            r#"
+import ai from "@earendil-works/pi-ai";
+import { version } from "@mariozechner/pi-agent-core";
+
+export default (pi) => {
+  pi.registerTool({ name: "ticket", description: String(ai.version || version || "ok") });
+  pi.on("tool_call", (event) => ({ block: event.toolName === "bash" }));
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        assert!(module.extension() == Some("ts".as_ref()));
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.ok, "{:?}", loaded.error);
+        assert_eq!(loaded.tools[0].name, "ticket");
+        assert!(loaded.tools[0].description.contains("0.84.4"));
+        assert!(loaded.handlers.contains(&"tool_call".into()));
     }
 
     #[test]

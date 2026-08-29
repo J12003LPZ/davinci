@@ -6,6 +6,7 @@ mod extensions;
 mod js_host;
 mod packages;
 mod rpc;
+mod self_update;
 mod settings;
 mod slash;
 
@@ -25,10 +26,7 @@ use pi_session::{
     default_agent_dir, discover_sessions, latest_session, now_ms, resolve_session_dir,
     resolve_session_ref, JsonlSession,
 };
-use pi_tui::{
-    builtin_themes, ChatChrome, Component, TuiMode, ALT_BUFFER_ENTER, ALT_BUFFER_LEAVE,
-    MOUSE_DISABLE, MOUSE_ENABLE,
-};
+use pi_tui::{builtin_themes, ChatChrome, Component, InteractiveSession, SessionAction, TuiMode};
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
 use auth_cmd::{
@@ -564,20 +562,124 @@ fn run_rpc(agent: &mut Agent) -> Result<i32, String> {
 
 fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     let fullscreen = parsed.tui_mode == Some(TuiMode::Fullscreen);
-    if fullscreen {
-        print!("{ALT_BUFFER_ENTER}{MOUSE_ENABLE}");
-    }
     let theme = builtin_themes()
         .into_iter()
         .find(|theme| parsed.use_theme.as_deref() == Some(theme.name.as_str()))
         .or_else(|| builtin_themes().into_iter().next())
         .expect("theme");
-    let mut chrome = ChatChrome::new(theme, format!("{APP_NAME} {VERSION}"));
-    println!("{}", chrome.render(80).join("\n"));
+    let models: Vec<String> = load_builtin_models()
+        .into_iter()
+        .map(|model| format!("{}/{}", model.provider, model.id))
+        .collect();
+    let mut session = InteractiveSession::new(theme, format!("{APP_NAME} {VERSION}"), models);
+    if let Some(index) = session
+        .models
+        .iter()
+        .position(|item| item == &format!("{}/{}", agent.provider, agent.model_id))
+    {
+        session.model_index = index;
+    }
+    print!("{}", InteractiveSession::enter_sequences(fullscreen));
+    println!("{}", session.chrome.render(session.width).join("\n"));
     if !parsed.messages.is_empty() {
         let prompt = parsed.messages.join("\n");
-        handle_user_line(parsed, agent, &mut chrome, &prompt)?;
+        if !apply_session_action(parsed, agent, &mut session, SessionAction::Submit(prompt))? {
+            print!("{}", InteractiveSession::leave_sequences(fullscreen));
+            return Ok(0);
+        }
     }
+    let result = if io::stdin().is_terminal() {
+        run_raw_session(parsed, agent, &mut session)
+    } else {
+        run_line_session(parsed, agent, &mut session)
+    };
+    print!("{}", InteractiveSession::leave_sequences(fullscreen));
+    result
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> Result<Self, String> {
+        crossterm::terminal::enable_raw_mode().map_err(|err| err.to_string())?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> String {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') | KeyCode::Char('C') => "\x03".into(),
+            KeyCode::Char('p') | KeyCode::Char('P') => "\x10".into(),
+            KeyCode::Char('t') | KeyCode::Char('T') => "\x14".into(),
+            KeyCode::Char('l') | KeyCode::Char('L') => "\x0c".into(),
+            _ => String::new(),
+        };
+    }
+    match key.code {
+        KeyCode::Esc => "\x1b".into(),
+        KeyCode::Enter => "\r".into(),
+        KeyCode::Backspace => "\x7f".into(),
+        KeyCode::Up => "\x1b[A".into(),
+        KeyCode::Down => "\x1b[B".into(),
+        KeyCode::Char(ch) => ch.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn run_raw_session(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+) -> Result<i32, String> {
+    let _raw = RawModeGuard::enter()?;
+    loop {
+        if !crossterm::event::poll(std::time::Duration::from_millis(250))
+            .map_err(|err| err.to_string())?
+        {
+            continue;
+        }
+        match crossterm::event::read().map_err(|err| err.to_string())? {
+            crossterm::event::Event::Key(key) => {
+                if key.kind != crossterm::event::KeyEventKind::Press
+                    && key.kind != crossterm::event::KeyEventKind::Repeat
+                {
+                    continue;
+                }
+                let action = session.handle_bytes(&key_event_to_bytes(&key));
+                if !apply_session_action(parsed, agent, session, action)? {
+                    break;
+                }
+            }
+            crossterm::event::Event::Mouse(mouse) => {
+                session.chrome.apply_mouse(mouse.row, session.width);
+            }
+            crossterm::event::Event::Paste(text) => {
+                session.handle_bytes(&format!("\x1b[200~{text}\x1b[201~"));
+            }
+            crossterm::event::Event::Resize(cols, _) => {
+                session.width = cols as usize;
+            }
+            _ => {}
+        }
+        print!("\x1b[H{}", session.render_frame());
+        io::stdout().flush().ok();
+    }
+    Ok(0)
+}
+
+fn run_line_session(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+) -> Result<i32, String> {
     let stdin = io::stdin();
     loop {
         print!("> ");
@@ -586,18 +688,72 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         if stdin.lock().read_line(&mut input).ok().unwrap_or(0) == 0 {
             break;
         }
-        let text = input.trim_end().to_string();
-        if text.is_empty() {
-            continue;
-        }
-        if !handle_user_line(parsed, agent, &mut chrome, &text)? {
+        let action = session.handle_line(&input);
+        if !apply_session_action(parsed, agent, session, action)? {
             break;
         }
     }
-    if fullscreen {
-        print!("{MOUSE_DISABLE}{ALT_BUFFER_LEAVE}");
-    }
     Ok(0)
+}
+
+fn apply_session_action(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    action: SessionAction,
+) -> Result<bool, String> {
+    match action {
+        SessionAction::None | SessionAction::OpenModel | SessionAction::CloseOverlay => Ok(true),
+        SessionAction::SelectSession(id) => {
+            let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
+            let summary =
+                resolve_session_ref(&session_dir, Some(&agent.cwd.to_string_lossy()), &id)
+                    .map_err(|err| err.to_string())?;
+            let next = JsonlSession::open(&summary.path).map_err(|err| err.to_string())?;
+            agent.load_from_session(next);
+            session.chrome.status = format!(
+                "session={}",
+                agent
+                    .session
+                    .as_ref()
+                    .map(|s| s.header.id.clone())
+                    .unwrap_or(id)
+            );
+            Ok(true)
+        }
+        SessionAction::SelectSetting(value) => {
+            session.chrome.status = value;
+            Ok(true)
+        }
+        SessionAction::Quit => Ok(false),
+        SessionAction::Abort => {
+            session.chrome.status = "aborted".into();
+            Ok(true)
+        }
+        SessionAction::CycleModel => {
+            if let Some(model) = session.current_model() {
+                let (provider, model_id) = parse_model_ref("google", Some(model));
+                agent.provider = provider;
+                agent.model_id = model_id;
+            }
+            Ok(true)
+        }
+        SessionAction::CycleThinking => {
+            if let Some(level) = pi_protocol::ThinkingLevel::parse(session.current_thinking()) {
+                agent.thinking_level = level;
+            }
+            Ok(true)
+        }
+        SessionAction::Clear => Ok(true),
+        SessionAction::SelectModel(value) => {
+            let (provider, model_id) = parse_model_ref("google", Some(&value));
+            agent.provider = provider;
+            agent.model_id = model_id;
+            session.chrome.status = format!("model={}/{}", agent.provider, agent.model_id);
+            Ok(true)
+        }
+        SessionAction::Submit(text) => handle_user_line(parsed, agent, &mut session.chrome, &text),
+    }
 }
 
 fn handle_user_line(
@@ -633,12 +789,13 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Settings => {
-            let keys = pi_tui::get_keybindings()
+            let items = pi_tui::get_keybindings()
                 .into_iter()
                 .map(|b| format!("{}: {}", b.action, b.keys.join(", ")))
-                .collect::<Vec<_>>()
-                .join("\n");
-            println!("{keys}");
+                .collect::<Vec<_>>();
+            chrome.selector = Some(pi_tui::SelectList::new(items.clone()));
+            chrome.status = "Settings".into();
+            println!("{}", items.join("\n"));
             Ok(true)
         }
         SlashAction::SessionInfo => {
@@ -666,6 +823,17 @@ fn handle_user_line(
         SlashAction::Compact(instructions) => {
             let result = agent.compact(instructions.as_deref());
             println!("{}", result.summary);
+            Ok(true)
+        }
+        SlashAction::OpenModel => {
+            chrome.selector = Some(pi_tui::SelectList::new(
+                load_builtin_models()
+                    .into_iter()
+                    .map(|model| format!("{}/{}", model.provider, model.id))
+                    .collect(),
+            ));
+            chrome.status = "Select model".into();
+            println!("{}", chrome.status);
             Ok(true)
         }
         SlashAction::SetModel(value) => {
@@ -736,8 +904,16 @@ fn handle_user_line(
             let session_dir = resolve_session_dir(parsed.session_dir.as_deref());
             let sessions = discover_sessions(&session_dir, Some(&agent.cwd.to_string_lossy()))
                 .map_err(|e| e.to_string())?;
-            for summary in sessions {
-                println!("{}  {}", summary.id, summary.path.display());
+            let items: Vec<String> = sessions
+                .iter()
+                .map(|summary| format!("{}  {}", summary.id, summary.path.display()))
+                .collect();
+            chrome.selector = Some(pi_tui::SelectList::new(
+                sessions.iter().map(|summary| summary.id.clone()).collect(),
+            ));
+            chrome.status = "Select session".into();
+            for item in items {
+                println!("{item}");
             }
             Ok(true)
         }
@@ -922,6 +1098,10 @@ mod tests {
         assert!(matches!(
             slash::parse_line("hello"),
             slash::SlashAction::Prompt(_)
+        ));
+        assert!(matches!(
+            slash::parse_line("/model"),
+            slash::SlashAction::OpenModel
         ));
     }
 }

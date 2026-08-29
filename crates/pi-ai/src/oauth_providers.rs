@@ -221,7 +221,101 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
     }
 }
 
-/// Fixture token exchange — never hits the network. Live exchange uses `PI_OAUTH_REFRESH_URL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenExchangeRequest {
+    pub url: String,
+    pub content_type: String,
+    pub body: String,
+    pub redirect_uri: String,
+}
+
+/// TS token POST bodies: Anthropic JSON, Codex/Radius form-urlencoded, OpenRouter JSON.
+pub fn token_exchange_request(
+    provider: &str,
+    code: &str,
+    pkce: Option<&Pkce>,
+    state: Option<&str>,
+) -> Option<TokenExchangeRequest> {
+    let verifier = pkce.map(|p| p.verifier.as_str()).unwrap_or("");
+    match provider {
+        "anthropic" => {
+            let state = state.unwrap_or(verifier);
+            let body = serde_json::json!({
+                "grant_type": "authorization_code",
+                "client_id": ANTHROPIC_CLIENT_ID,
+                "code": code,
+                "state": state,
+                "redirect_uri": ANTHROPIC_REDIRECT,
+                "code_verifier": verifier,
+            });
+            Some(TokenExchangeRequest {
+                url: ANTHROPIC_TOKEN_URL.into(),
+                content_type: "application/json".into(),
+                body: body.to_string(),
+                redirect_uri: ANTHROPIC_REDIRECT.into(),
+            })
+        }
+        "openai-codex" => {
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("grant_type", "authorization_code")
+                .append_pair("client_id", CODEX_CLIENT_ID)
+                .append_pair("code", code)
+                .append_pair("code_verifier", verifier)
+                .append_pair("redirect_uri", CODEX_REDIRECT)
+                .finish();
+            Some(TokenExchangeRequest {
+                url: CODEX_TOKEN_URL.into(),
+                content_type: "application/x-www-form-urlencoded".into(),
+                body,
+                redirect_uri: CODEX_REDIRECT.into(),
+            })
+        }
+        "openrouter" => {
+            let body = serde_json::json!({
+                "code": code,
+                "code_verifier": verifier,
+                "code_challenge_method": "S256",
+            });
+            Some(TokenExchangeRequest {
+                url: OPENROUTER_TOKEN_URL.into(),
+                content_type: "application/json".into(),
+                body: body.to_string(),
+                redirect_uri: "http://127.0.0.1:8080/callback".into(),
+            })
+        }
+        "radius" => {
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("grant_type", "authorization_code")
+                .append_pair("client_id", RADIUS_CLIENT_ID)
+                .append_pair("redirect_uri", RADIUS_REDIRECT)
+                .append_pair("code", code)
+                .append_pair("code_verifier", verifier)
+                .finish();
+            Some(TokenExchangeRequest {
+                url: "https://radius.example/oauth/token".into(),
+                content_type: "application/x-www-form-urlencoded".into(),
+                body,
+                redirect_uri: RADIUS_REDIRECT.into(),
+            })
+        }
+        other => authorize_request(other, &generate_pkce(&[0u8; 32]), state.unwrap_or("pi")).map(
+            |auth| TokenExchangeRequest {
+                url: auth.token_url,
+                content_type: "application/json".into(),
+                body: serde_json::json!({
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "code_verifier": verifier,
+                })
+                .to_string(),
+                redirect_uri: String::new(),
+            },
+        ),
+    }
+}
+
+/// Fixture token exchange never hits the network. Live POST uses the TS token URL
+/// (overridable with `PI_OAUTH_TOKEN_URL`). Tests use `pi-fixture-` / `PI_OAUTH_FIXTURE`.
 pub fn exchange_authorization_code(
     provider: &str,
     code: &str,
@@ -232,9 +326,48 @@ pub fn exchange_authorization_code(
         let refresh = pkce.map(|p| format!("pi-fixture-{}", p.verifier));
         return Ok((access, refresh));
     }
-    Err(format!(
-        "OAuth token exchange for {provider} requires a live callback or PI_OAUTH_FIXTURE / pi-fixture- code"
-    ))
+    let request =
+        token_exchange_request(provider, code, pkce, pkce.map(|p| p.verifier.as_str()))
+            .ok_or_else(|| format!("OAuth token exchange is not configured for {provider}"))?;
+    post_token_exchange(&request)
+}
+
+fn post_token_exchange(request: &TokenExchangeRequest) -> Result<(String, Option<String>), String> {
+    let url = std::env::var("PI_OAUTH_TOKEN_URL").unwrap_or_else(|_| request.url.clone());
+    let response = ureq::post(&url)
+        .set("content-type", &request.content_type)
+        .set("accept", "application/json")
+        .send_string(&request.body)
+        .map_err(|err| {
+            format!(
+                "Token exchange request failed. url={url}; redirect_uri={}; response_type=authorization_code; details={}",
+                request.redirect_uri,
+                err
+            )
+        })?;
+    let body = response.into_string().map_err(|err| {
+        format!(
+            "Token exchange request failed. url={url}; redirect_uri={}; response_type=authorization_code; details={}",
+            request.redirect_uri,
+            err
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
+        format!("Token exchange returned invalid JSON. url={url}; body={body}; details={err}")
+    })?;
+    let access = value
+        .get("access_token")
+        .or_else(|| value.get("access"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!("Token exchange returned invalid JSON. url={url}; body={body}; details=missing access_token")
+        })?;
+    let refresh = value
+        .get("refresh_token")
+        .or_else(|| value.get("refresh"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok((access.to_string(), refresh))
 }
 
 pub fn oauth_providers() -> &'static [&'static str] {
@@ -294,6 +427,34 @@ mod tests {
         let (access, _) =
             exchange_authorization_code("anthropic", "pi-fixture-code", Some(&pkce)).unwrap();
         assert!(access.contains("anthropic"));
+        let anthropic_token =
+            token_exchange_request("anthropic", "abc", Some(&pkce), Some("st")).unwrap();
+        assert_eq!(anthropic_token.content_type, "application/json");
+        assert!(anthropic_token
+            .body
+            .contains("\"grant_type\":\"authorization_code\""));
+        assert!(anthropic_token.body.contains(ANTHROPIC_CLIENT_ID));
+        assert!(anthropic_token.body.contains(ANTHROPIC_REDIRECT));
+        let codex_token = token_exchange_request("openai-codex", "abc", Some(&pkce), None).unwrap();
+        assert_eq!(
+            codex_token.content_type,
+            "application/x-www-form-urlencoded"
+        );
+        assert!(codex_token.body.contains("grant_type=authorization_code"));
+        assert!(codex_token.body.contains(CODEX_CLIENT_ID));
+        let openrouter_token =
+            token_exchange_request("openrouter", "abc", Some(&pkce), None).unwrap();
+        assert!(openrouter_token.body.contains("code_challenge_method"));
+        let failed = format!(
+            "Token exchange request failed. url={}; redirect_uri={}; response_type=authorization_code; details=fixture",
+            anthropic_token.url, anthropic_token.redirect_uri
+        );
+        assert!(failed.contains("response_type=authorization_code"));
+        let invalid = format!(
+            "Token exchange returned invalid JSON. url={}; body={{}}; details=fixture",
+            anthropic_token.url
+        );
+        assert!(invalid.contains("invalid JSON"));
         assert!(matches!(
             device_status_from_error("authorization_pending"),
             DevicePollStatus::Pending

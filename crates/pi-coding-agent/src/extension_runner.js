@@ -1,10 +1,154 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const Module = require("module");
 const { pathToFileURL } = require("url");
 
+const VIRTUAL_SPECIFIERS = [
+	"@earendil-works/pi-agent-core",
+	"@earendil-works/pi-tui",
+	"@earendil-works/pi-ai",
+	"@earendil-works/pi-ai/compat",
+	"@earendil-works/pi-ai/oauth",
+	"@earendil-works/pi-ai/providers/all",
+	"@earendil-works/pi-coding-agent",
+	"@mariozechner/pi-agent-core",
+	"@mariozechner/pi-tui",
+	"@mariozechner/pi-ai",
+	"@mariozechner/pi-ai/compat",
+	"@mariozechner/pi-ai/oauth",
+	"@mariozechner/pi-ai/providers/all",
+	"@mariozechner/pi-coding-agent",
+	"typebox",
+	"typebox/compile",
+	"typebox/value",
+	"@sinclair/typebox",
+	"@sinclair/typebox/compile",
+	"@sinclair/typebox/value",
+];
+
+const VIRTUAL_FILES = {};
+const virtualRoot = path.join(os.tmpdir(), "pi-virtual-modules");
+fs.mkdirSync(virtualRoot, { recursive: true });
+for (const name of VIRTUAL_SPECIFIERS) {
+	const file = path.join(virtualRoot, `${name.replace(/[@/]/g, "_")}.js`);
+	const source = [
+		"const exported = { __esModule: true, __piVirtual: " + JSON.stringify(name) + ", name: " + JSON.stringify(name) + ', version: "0.84.4" };',
+		"exported.default = exported;",
+		"module.exports = exported;",
+	].join("\n");
+	fs.writeFileSync(file, source);
+	VIRTUAL_FILES[name] = file;
+}
+
+const originalResolveFilename = Module._resolveFilename;
+Module._resolveFilename = function (request, parent, isMain, options) {
+	if (Object.prototype.hasOwnProperty.call(VIRTUAL_FILES, request)) {
+		return VIRTUAL_FILES[request];
+	}
+	return originalResolveFilename.call(this, request, parent, isMain, options);
+};
+
+function compileTypeScript(source, filename) {
+	try {
+		const ts = require("typescript");
+		return ts.transpileModule(source, {
+			fileName: filename,
+			compilerOptions: {
+				module: ts.ModuleKind.CommonJS,
+				target: ts.ScriptTarget.ES2020,
+				esModuleInterop: true,
+				skipLibCheck: true,
+			},
+		}).outputText;
+	} catch (_error) {
+		return stripTypeScript(source);
+	}
+}
+
+function stripTypeScript(source) {
+	let out = source.replace(/^\uFEFF/, "");
+	out = out.replace(/import\s+type\s+[\s\S]*?from\s+['"][^'"]+['"]\s*;?/g, "");
+	out = out.replace(/export\s+type\s+[\s\S]*?;/g, "");
+	out = out.replace(
+		/import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g,
+		"const $1 = require('$2');",
+	);
+	out = out.replace(
+		/import\s+(\{[^}]*\})\s+from\s+['"]([^'"]+)['"]\s*;?/g,
+		"const $1 = require('$2');",
+	);
+	out = out.replace(
+		/import\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g,
+		"const $1 = require('$2').default || require('$2');",
+	);
+	out = out.replace(/export\s+default\s+/g, "module.exports = ");
+	return out;
+}
+
+function registerTypeScriptExtension(ext) {
+	require.extensions[ext] = function compileTs(module, filename) {
+		const source = fs.readFileSync(filename, "utf8");
+		module._compile(compileTypeScript(source, filename), filename);
+	};
+}
+
+for (const ext of [".ts", ".tsx", ".mts", ".cts"]) {
+	registerTypeScriptExtension(ext);
+}
+
+async function loadWithJiti(modPath) {
+	let createJiti;
+	try {
+		({ createJiti } = require("jiti"));
+	} catch (_error) {
+		return undefined;
+	}
+	if (typeof createJiti !== "function") {
+		return undefined;
+	}
+	try {
+		const jiti = createJiti(__filename, {
+			moduleCache: false,
+			interopDefault: true,
+		});
+		return await jiti.import(modPath);
+	} catch (_error) {
+		return undefined;
+	}
+}
+
+function loadCompiledTypeScript(modPath) {
+	const source = fs.readFileSync(modPath, "utf8");
+	const compiled = compileTypeScript(source, modPath);
+	const tmp = path.join(
+		path.dirname(modPath),
+		`.pi-compiled-${path.basename(modPath)}.cjs`,
+	);
+	fs.writeFileSync(tmp, compiled);
+	try {
+		delete require.cache[require.resolve(tmp)];
+		return require(tmp);
+	} finally {
+		try {
+			fs.unlinkSync(tmp);
+		} catch (_error) {
+			// best-effort cleanup
+		}
+	}
+}
+
 async function loadModule(modPath) {
+	const ext = path.extname(modPath).toLowerCase();
+	if ([".ts", ".tsx", ".mts", ".cts"].includes(ext)) {
+		const fromJiti = await loadWithJiti(modPath);
+		if (fromJiti !== undefined) {
+			return fromJiti;
+		}
+		return loadCompiledTypeScript(modPath);
+	}
 	try {
 		return require(modPath);
 	} catch (error) {

@@ -2,6 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::args::{APP_NAME, VERSION};
+use crate::self_update::{
+    current_install_method, inferred_npm_prefix, package_dir_from_env,
+    self_update_command_for_method, self_update_unavailable_instruction, update_instruction,
+    InstallMethod, PackageTarget, PACKAGE_NAME,
+};
 use crate::settings::{load_settings, save_settings, Settings};
 
 const CANNOT_SELF_UPDATE: &str = "error: pi cannot self-update this installation.";
@@ -147,8 +152,95 @@ fn refresh_model_catalogs(agent_dir: &Path, target: Option<&str>) -> Result<Stri
     ))
 }
 
-/// Copy the running `pi` binary to `~/.pi/bin/pi` (TS `pi update --self` surface for Rust installs).
+/// TS `pi update --self`: package-manager argv when npm/pnpm/yarn/bun; copy `~/.pi/bin/pi` otherwise.
 pub fn self_update_binary(agent_dir: &Path, _force: bool) -> Result<String, String> {
+    let method = current_install_method();
+    let target = PackageTarget::new(PACKAGE_NAME, None);
+    let package_dir = package_dir_from_env();
+    let windows = cfg!(windows)
+        || package_dir
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy().contains('\\'));
+    let inferred = package_dir
+        .as_ref()
+        .and_then(|path| inferred_npm_prefix(&path.to_string_lossy(), windows));
+    let command = self_update_command_for_method(
+        method,
+        PACKAGE_NAME,
+        &target,
+        None,
+        inferred.as_deref(),
+        std::env::var("PNPM_HOME").ok().as_deref(),
+    );
+    match method {
+        InstallMethod::Npm | InstallMethod::Pnpm | InstallMethod::Yarn | InstallMethod::Bun => {
+            if let Some(command) = command.as_ref() {
+                let writable = package_dir
+                    .as_ref()
+                    .map(|path| {
+                        path.metadata()
+                            .map(|meta| !meta.permissions().readonly())
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true);
+                if !writable {
+                    return Err(self_update_unavailable_instruction(
+                        method,
+                        PACKAGE_NAME,
+                        &target,
+                        Some(command),
+                        true,
+                        false,
+                    ));
+                }
+                if std::env::var("PI_SELF_UPDATE_DRY_RUN").is_ok() {
+                    return Ok(update_instruction(method, Some(command), &command.display));
+                }
+                run_self_update_command(command)?;
+                return Ok(format!("Updated {APP_NAME} from {VERSION} to {VERSION}"));
+            }
+            Err(self_update_unavailable_instruction(
+                method,
+                PACKAGE_NAME,
+                &target,
+                None,
+                false,
+                true,
+            ))
+        }
+        InstallMethod::BunBinary => Err(self_update_unavailable_instruction(
+            method,
+            PACKAGE_NAME,
+            &target,
+            None,
+            false,
+            true,
+        )),
+        InstallMethod::Unknown => copy_native_binary(agent_dir),
+    }
+}
+
+fn run_self_update_command(command: &crate::self_update::SelfUpdateCommand) -> Result<(), String> {
+    let steps = command.steps.clone().unwrap_or_else(|| {
+        vec![crate::self_update::SelfUpdateCommandStep {
+            command: command.command.clone(),
+            args: command.args.clone(),
+            display: command.display.clone(),
+        }]
+    });
+    for step in steps {
+        let status = std::process::Command::new(&step.command)
+            .args(&step.args)
+            .status()
+            .map_err(|err| err.to_string())?;
+        if !status.success() {
+            return Err(format!("self-update failed: {}", step.display));
+        }
+    }
+    Ok(())
+}
+
+fn copy_native_binary(agent_dir: &Path) -> Result<String, String> {
     let dest_dir = managed_bin_dir(agent_dir);
     fs::create_dir_all(&dest_dir).map_err(|err| err.to_string())?;
     let dest = dest_dir.join(APP_NAME);

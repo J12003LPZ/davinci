@@ -12,6 +12,7 @@ mod mouse;
 mod overlay;
 mod render;
 mod scroll;
+mod session;
 mod settings;
 mod themes;
 mod transcript;
@@ -31,6 +32,11 @@ pub use mouse::{parse_mouse_sgr, MouseButton, MouseEvent, MouseKind, MOUSE_DISAB
 pub use overlay::Overlay;
 pub use render::{visible_width, Component, Text};
 pub use scroll::ScrollView;
+pub use session::{
+    InteractiveSession, OverlayKind, SessionAction, BRACKETED_PASTE_DISABLE,
+    BRACKETED_PASTE_ENABLE, DISABLE_AUTOWRAP, ENABLE_AUTOWRAP, KITTY_KEYBOARD_DISABLE,
+    KITTY_KEYBOARD_QUERY,
+};
 pub use settings::{SettingItem, SettingsList};
 pub use themes::{builtin_themes, Theme};
 pub use transcript::{Transcript, TranscriptLine};
@@ -95,6 +101,23 @@ impl SelectList {
             selected: 0,
             query: String::new(),
         }
+    }
+
+    pub fn filtered(&self) -> Vec<String> {
+        fuzzy_filter(&self.query, &self.items)
+    }
+
+    pub fn selected_item(&self) -> Option<String> {
+        self.filtered().get(self.selected).cloned()
+    }
+
+    pub fn move_by(&mut self, delta: isize) {
+        let filtered = self.filtered();
+        if filtered.is_empty() {
+            return;
+        }
+        let len = filtered.len() as isize;
+        self.selected = (self.selected as isize + delta).rem_euclid(len) as usize;
     }
 }
 

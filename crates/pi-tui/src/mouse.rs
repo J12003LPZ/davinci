@@ -29,8 +29,10 @@ pub struct MouseEvent {
     pub shift: bool,
 }
 
-pub const MOUSE_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-pub const MOUSE_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+/// TS `ENABLE_ALL_MOTION_MOUSE` from `tui-alt-screen.ts`.
+pub const MOUSE_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h";
+/// TS `DISABLE_MOUSE` from `tui-alt-screen.ts`.
+pub const MOUSE_DISABLE: &str = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 /// Parse an SGR mouse sequence such as `\x1b[<0;10;5M`.
 pub fn parse_mouse_sgr(input: &str) -> Option<MouseEvent> {

@@ -32,7 +32,8 @@ pub use oauth_callback::{
 };
 pub use oauth_providers::{
     authorize_request, device_status_from_error, exchange_authorization_code, generate_pkce,
-    oauth_providers, parse_authorization_input, AuthorizeRequest, Pkce,
+    oauth_providers, parse_authorization_input, token_exchange_request, AuthorizeRequest, Pkce,
+    TokenExchangeRequest,
 };
 pub use providers::{
     builtin_providers, load_models_json, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS,

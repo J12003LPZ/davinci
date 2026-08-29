@@ -462,6 +462,7 @@ version = "0.84.4"
 dependencies = [
  "base64",
  "clap",
+ "crossterm",
  "pi-agent",
  "pi-ai",
  "pi-client",
