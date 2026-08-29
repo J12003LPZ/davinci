@@ -88,7 +88,7 @@ impl Agent {
             };
             let chat = assistant_to_chat(&assistant);
             self.messages.push(chat.clone());
-            self.persist_chat(&chat);
+            self.persist_assistant(&assistant, &chat);
             new_messages.push(chat.clone());
             events.push(AgentEvent::MessageStart {
                 message: chat.clone(),
@@ -428,6 +428,39 @@ impl Agent {
         if let Some(session) = &mut self.session {
             let content = serde_json::to_value(&message.content).unwrap_or(Value::Null);
             let _ = session.append_entry(pi_session::SessionEntry::message(&message.role, content));
+        }
+    }
+
+    fn persist_assistant(&mut self, assistant: &AssistantMessage, chat: &ChatMessage) {
+        if let Some(session) = &mut self.session {
+            let timestamp = pi_session::now_ms();
+            let mut message = serde_json::json!({
+                "role": "assistant",
+                "content": chat.content,
+                "model": assistant.model,
+                "provider": self.provider,
+                "timestamp": timestamp,
+            });
+            if let Some(usage) = &assistant.usage {
+                if let Ok(value) = serde_json::to_value(usage) {
+                    message["usage"] = value;
+                }
+            }
+            if let Some(stop) = &assistant.stop_reason {
+                if let Ok(value) = serde_json::to_value(stop) {
+                    message["stopReason"] = value;
+                }
+            }
+            let _ = session.append_entry(pi_session::SessionEntry {
+                id: String::new(),
+                entry_type: "message".into(),
+                parent_id: None,
+                seq: 0,
+                timestamp,
+                message: Some(message),
+                custom_type: None,
+                extra: serde_json::Map::new(),
+            });
         }
     }
 }

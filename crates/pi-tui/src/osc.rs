@@ -10,6 +10,11 @@ pub struct RgbColor {
 
 pub const OSC_11_QUERY: &str = "\x1b]11;?\x07";
 pub const COLOR_SCHEME_QUERY: &str = "\x1b[?996n";
+/// OSC 9;4;3 — indeterminate terminal progress (TS `TERMINAL_PROGRESS_ACTIVE_SEQUENCE`).
+pub const TERMINAL_PROGRESS_ACTIVE_SEQUENCE: &str = "\x1b]9;4;3\x07";
+/// OSC 9;4;0 — clear terminal progress (TS `TERMINAL_PROGRESS_CLEAR_SEQUENCE`).
+pub const TERMINAL_PROGRESS_CLEAR_SEQUENCE: &str = "\x1b]9;4;0\x07";
+pub const TERMINAL_PROGRESS_KEEPALIVE_MS: u64 = 1000;
 
 const BASIC_ANSI: [[u8; 3]; 16] = [
     [0, 0, 0],
@@ -372,6 +377,13 @@ mod tests {
         );
         assert!(drained.contains("11;"));
         std::env::remove_var("PI_OSC_TTY");
+    }
+
+    #[test]
+    fn osc_9_4_progress_sequences_match_ts() {
+        assert_eq!(TERMINAL_PROGRESS_ACTIVE_SEQUENCE, "\x1b]9;4;3\x07");
+        assert_eq!(TERMINAL_PROGRESS_CLEAR_SEQUENCE, "\x1b]9;4;0\x07");
+        assert_eq!(TERMINAL_PROGRESS_KEEPALIVE_MS, 1000);
     }
 
     #[test]

@@ -476,6 +476,7 @@ async function main() {
 		markdownTransformers: [],
 		entryRenderers: {},
 		uiCalls: [],
+		sessionCalls: [],
 		providers: [],
 	};
 	let editorFactory;
@@ -690,16 +691,40 @@ async function main() {
 		registerEntryRenderer(customType, renderer) {
 			recorded.entryRenderers[customType] = renderer;
 		},
-		sendMessage() {},
-		sendUserMessage() {},
-		appendEntry() {},
-		setSessionName() {},
-		getSessionName() {
-			return undefined;
+		sendMessage(message, options) {
+			recorded.sessionCalls.push({ op: "sendMessage", message, options: options || {} });
 		},
-		setLabel() {},
-		exec() {
-			return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+		sendUserMessage(text) {
+			recorded.sessionCalls.push({ op: "sendUserMessage", text });
+		},
+		appendEntry(customType, data) {
+			recorded.sessionCalls.push({ op: "appendEntry", customType, data: data ?? null });
+		},
+		setSessionName(name) {
+			recorded.sessionCalls.push({ op: "setSessionName", name });
+		},
+		getSessionName() {
+			return payload.sessionName;
+		},
+		setLabel(entryId, label) {
+			recorded.sessionCalls.push({ op: "setLabel", entryId, label });
+		},
+		newSession(options) {
+			recorded.sessionCalls.push({ op: "newSession", options: options || {} });
+			return { cancelled: false };
+		},
+		fork(entryId, options) {
+			recorded.sessionCalls.push({ op: "fork", entryId, options: options || {} });
+			return { cancelled: false };
+		},
+		exec(command) {
+			recorded.sessionCalls.push({ op: "exec", command });
+			const reply = process.env.PI_EXTENSION_EXEC_REPLY;
+			return Promise.resolve({
+				code: 0,
+				stdout: reply === undefined ? "" : reply,
+				stderr: "",
+			});
 		},
 		getActiveTools() {
 			return [];
@@ -910,6 +935,15 @@ async function main() {
 		if (typeof handler === "function") {
 			const ctx = payload.ctx || { mode: "tui" };
 			ctx.ui = ctx.ui || ui;
+			ctx.sendMessage = pi.sendMessage;
+			ctx.sendUserMessage = pi.sendUserMessage;
+			ctx.appendEntry = pi.appendEntry;
+			ctx.setSessionName = pi.setSessionName;
+			ctx.getSessionName = pi.getSessionName;
+			ctx.setLabel = pi.setLabel;
+			ctx.newSession = pi.newSession;
+			ctx.fork = pi.fork;
+			ctx.exec = pi.exec;
 			try {
 				result = await handler(payload.args || "", ctx);
 			} catch (error) {
@@ -997,6 +1031,7 @@ async function main() {
 			entryRenderers: Object.keys(recorded.entryRenderers),
 			markdownTransformers: recorded.markdownTransformers.length,
 			uiCalls: recorded.uiCalls,
+			sessionCalls: recorded.sessionCalls,
 			hasEditor: typeof editorFactory === "function",
 			hasCustom: Boolean(customComponent),
 			providers: recorded.providers,
@@ -1014,6 +1049,7 @@ async function main() {
 			op = msg.op;
 			payload = msg.payload || {};
 			recorded.uiCalls = [];
+			recorded.sessionCalls = [];
 			result = null;
 			pendingCustom = undefined;
 			await runOps();

@@ -69,6 +69,7 @@ pub struct ExtensionHost {
     pub entry_renderers: std::collections::HashMap<String, String>,
     pub markdown_modules: Vec<String>,
     pub ui_calls: Vec<Value>,
+    pub session_calls: Vec<Value>,
     pub editor_modules: Vec<String>,
 }
 
@@ -84,6 +85,7 @@ impl ExtensionHost {
             entry_renderers: std::collections::HashMap::new(),
             markdown_modules: Vec::new(),
             ui_calls: Vec::new(),
+            session_calls: Vec::new(),
             editor_modules: Vec::new(),
         };
         if node_available() {
@@ -109,6 +111,7 @@ impl ExtensionHost {
                             host.markdown_modules.push(path.clone());
                         }
                         host.ui_calls.extend(loaded.ui_calls.clone());
+                        host.session_calls.extend(loaded.session_calls.clone());
                         let has_editor = loaded.has_editor
                             || loaded.handlers.iter().any(|name| name == "session_start");
                         if has_editor {
@@ -151,6 +154,7 @@ impl ExtensionHost {
                 if result.ok {
                     self.last_js_result = result.result;
                     self.ui_calls.extend(result.ui_calls);
+                    self.session_calls.extend(result.session_calls);
                 }
             }
         }
@@ -392,6 +396,7 @@ impl ExtensionHost {
                 .unwrap_or_else(|| "Shortcut handler error".into()));
         }
         self.ui_calls.extend(result.ui_calls.clone());
+        self.session_calls.extend(result.session_calls.clone());
         Ok(result.result)
     }
 
@@ -430,6 +435,7 @@ impl ExtensionHost {
                 .unwrap_or_else(|| "Command handler error".into()));
         }
         self.ui_calls.extend(result.ui_calls);
+        self.session_calls.extend(result.session_calls);
         if result
             .result
             .as_ref()
@@ -467,6 +473,7 @@ impl ExtensionHost {
                 .unwrap_or_else(|| "Command handler error".into()));
         }
         self.ui_calls.extend(result.ui_calls);
+        self.session_calls.extend(result.session_calls);
         if result
             .result
             .as_ref()

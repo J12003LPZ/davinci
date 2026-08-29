@@ -1,5 +1,6 @@
 mod args;
 mod auth_cmd;
+mod cache_stats;
 mod catalog_refresh;
 mod changelog;
 mod experimental;
@@ -40,10 +41,10 @@ use pi_session::{
 use pi_tui::{
     builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto,
     drain_osc_tty, encode_kitty, interactive_settings_list, load_themes_from_dir, parse_auto_theme,
-    parse_http_idle_timeout, ChatChrome, Component, CustomMessage, DoubleEscapeAction, FilterMode,
-    InteractiveSession, Keybindings, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction,
-    SessionItem, SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TuiMode,
-    FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
+    parse_http_idle_timeout, resolve_git_branch, ChatChrome, Component, CustomMessage,
+    DoubleEscapeAction, FilterMode, InteractiveSession, Keybindings, MermaidMode,
+    ModelSelectorItem, ScopedModel, SessionAction, SessionItem, SessionTreeEntry, SlashCommandSpec,
+    Theme, ThemeDetection, ToolCard, TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -1163,6 +1164,9 @@ fn run_interactive(
         _ => None,
     };
     session.keybindings = Keybindings::load(&default_agent_dir());
+    session.quiet_startup = stored.quiet_startup && !parsed.verbose;
+    session.chrome.quiet_startup = session.quiet_startup;
+    session.show_terminal_progress = stored.show_terminal_progress();
     session.warnings_anthropic_extra_usage = stored.warnings.anthropic_extra_usage.unwrap_or(true);
     session.branch_summary_skip_prompt = stored.branch_summary_skip_prompt();
     session.branch_summary_reserve_tokens = stored.branch_summary_reserve_tokens();
@@ -1171,7 +1175,7 @@ fn run_interactive(
     }
     let _ = session.begin_osc_query(OSC_QUERY_TIMEOUT_MS);
     let host = loaded_extension_host(parsed);
-    apply_extension_shortcuts(&mut session, &host);
+    apply_extension_shortcuts(&mut session, agent, &host);
     session.slash_commands = interactive_slash_commands(agent, parsed);
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
@@ -1181,6 +1185,13 @@ fn run_interactive(
         &stored,
         models_json_error,
         migrated_auth_providers,
+    );
+    apply_changelog_overlay(&mut session, agent, &stored, &default_agent_dir());
+    refresh_chrome_footer(&mut session, agent);
+    apply_cache_miss_notices(
+        &mut session.chrome,
+        agent,
+        stored.show_cache_miss_notices.unwrap_or(false),
     );
     if should_run_first_time_setup(&settings_path(&default_agent_dir())) {
         session.open_first_time_setup(&detect_terminal_theme(&session.chrome.theme), APP_NAME);
@@ -1417,7 +1428,7 @@ fn apply_session_action(
             Ok(true)
         }
         SessionAction::ExtensionShortcut { key, path } => {
-            match host_invoke_shortcut(parsed, &path, &key) {
+            match host_invoke_shortcut(parsed, agent, session, &path, &key) {
                 Ok(Some(value)) => {
                     session.chrome.status = format!("shortcut={key} {value}");
                 }
@@ -1457,7 +1468,7 @@ fn apply_session_action(
             handle_custom_editor_input(parsed, agent, session, &data)
         }
         SessionAction::CustomOverlayInput(data) => {
-            handle_custom_overlay_input(parsed, session, &data);
+            handle_custom_overlay_input(parsed, agent, session, &data);
             Ok(true)
         }
         SessionAction::CycleSetting => {
@@ -1537,7 +1548,7 @@ fn apply_session_action(
             };
             Ok(true)
         }
-        SessionAction::OpenFork => handle_user_line(parsed, agent, &mut session.chrome, "/fork"),
+        SessionAction::OpenFork => handle_user_line(parsed, agent, session, "/fork"),
         SessionAction::RunBash(command) => {
             match crate::js_host::execute_command_tool(&command, &agent.cwd) {
                 Ok(out) => {
@@ -1583,7 +1594,7 @@ fn apply_session_action(
             Ok(true)
         }
         SessionAction::ExpandTools => Ok(true),
-        SessionAction::NewSession => handle_user_line(parsed, agent, &mut session.chrome, "/new"),
+        SessionAction::NewSession => handle_user_line(parsed, agent, session, "/new"),
         SessionAction::OpenResume => {
             open_session_selector(parsed, agent, session)?;
             Ok(true)
@@ -1632,7 +1643,7 @@ fn apply_session_action(
             }
             SlashAction::Reload => {
                 reload_interactive_resources(parsed, agent, session);
-                handle_user_line(parsed, agent, &mut session.chrome, &text)
+                handle_user_line(parsed, agent, session, &text)
             }
             SlashAction::Llama => {
                 open_llama_ui(session)?;
@@ -1655,9 +1666,9 @@ fn apply_session_action(
                 Ok(true)
             }
             SlashAction::Import(_) | SlashAction::Share | SlashAction::Changelog => {
-                handle_user_line(parsed, agent, &mut session.chrome, &text)
+                handle_user_line(parsed, agent, session, &text)
             }
-            _ => handle_user_line(parsed, agent, &mut session.chrome, &text),
+            _ => handle_user_line(parsed, agent, session, &text),
         },
     }
 }
@@ -1665,30 +1676,39 @@ fn apply_session_action(
 fn handle_user_line(
     parsed: &Args,
     agent: &mut Agent,
-    chrome: &mut ChatChrome,
+    session: &mut InteractiveSession,
     text: &str,
 ) -> Result<bool, String> {
     match slash::parse_line(text) {
         SlashAction::Quit => Ok(false),
         SlashAction::Prompt(prompt) => {
-            chrome.transcript.push("user", &prompt);
+            session.chrome.transcript.push("user", &prompt);
             agent.prompt(&prompt);
             let (reply, events) = complete_prompt(parsed, agent);
-            apply_tool_events(chrome, &events);
+            apply_tool_events(&mut session.chrome, &events);
+            apply_progress_events(session, &events);
             let host = loaded_extension_host(parsed);
             let reply = host.transform_markdown(&reply, "assistant", false, 80);
-            chrome.transcript.push("assistant", &reply);
-            chrome.editor.handle_input("");
+            session.chrome.transcript.push("assistant", &reply);
+            apply_cache_miss_notices(
+                &mut session.chrome,
+                agent,
+                load_merged_settings(&default_agent_dir(), &agent.cwd)
+                    .show_cache_miss_notices
+                    .unwrap_or(false),
+            );
+            refresh_chrome_footer(session, agent);
+            session.chrome.editor.handle_input("");
             println!("{reply}");
             Ok(true)
         }
         SlashAction::Status(message) => {
             if let Some(name) = message.strip_prefix("Unknown command /") {
-                if try_extension_slash(parsed, chrome, name)? {
+                if try_extension_slash(parsed, agent, session, name)? {
                     return Ok(true);
                 }
             }
-            chrome.status = message.clone();
+            session.chrome.status = message.clone();
             println!("{message}");
             Ok(true)
         }
@@ -1698,18 +1718,20 @@ fn handle_user_line(
                 .map(|b| format!("{}: {}", b.action, b.keys.join(", ")))
                 .collect::<Vec<_>>()
                 .join("\n");
-            chrome.status = keys.clone();
+            session.chrome.status = keys.clone();
             println!("{keys}");
             Ok(true)
         }
         SlashAction::Settings => {
             let stored = load_settings(&default_agent_dir());
-            let list =
-                interactive_settings_list(&to_interactive_config(&stored, &chrome.theme.name));
-            chrome.settings_list = Some(list);
-            chrome.settings_submenu = None;
-            chrome.status = "Settings".into();
-            if let Some(settings) = &chrome.settings_list {
+            let list = interactive_settings_list(&to_interactive_config(
+                &stored,
+                &session.chrome.theme.name,
+            ));
+            session.chrome.settings_list = Some(list);
+            session.chrome.settings_submenu = None;
+            session.chrome.status = "Settings".into();
+            if let Some(settings) = &session.chrome.settings_list {
                 println!("{}", settings.render(80).join("\n"));
             }
             Ok(true)
@@ -1718,8 +1740,12 @@ fn handle_user_line(
             let models = load_builtin_models();
             let model = find_model(&models, &agent.provider, &agent.model_id);
             let stats = rpc::session_stats_for_agent(agent, model);
-            let info = format_session_info(&stats);
-            chrome.status = info.clone();
+            let waste = agent
+                .session
+                .as_ref()
+                .map(|store| cache_stats::compute_cache_waste(&store.entries, &0.3));
+            let info = format_session_info(&stats, waste.as_ref());
+            session.chrome.status = info.clone();
             println!("{info}");
             Ok(true)
         }
@@ -1738,14 +1764,14 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::OpenModel => {
-            chrome.selector = Some(pi_tui::SelectList::new(
+            session.chrome.selector = Some(pi_tui::SelectList::new(
                 load_builtin_models()
                     .into_iter()
                     .map(|model| format!("{}/{}", model.provider, model.id))
                     .collect(),
             ));
-            chrome.status = "Select model".into();
-            println!("{}", chrome.status);
+            session.chrome.status = "Select model".into();
+            println!("{}", session.chrome.status);
             Ok(true)
         }
         SlashAction::SetModel(value) => {
@@ -1813,17 +1839,17 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::ScopedModels => {
-            chrome.status = "Model Configuration".into();
-            println!("{}", chrome.status);
+            session.chrome.status = "Model Configuration".into();
+            println!("{}", session.chrome.status);
             Ok(true)
         }
         SlashAction::Resume => {
             let items = discover_session_items(parsed, agent)?;
             let mut selector = pi_tui::SessionSelector::new(items.clone());
             selector.set_cwd(agent.cwd.to_string_lossy().into_owned());
-            chrome.session_selector = Some(selector);
-            chrome.selector = None;
-            chrome.status = "Select session".into();
+            session.chrome.session_selector = Some(selector);
+            session.chrome.selector = None;
+            session.chrome.status = "Select session".into();
             for item in items {
                 println!(
                     "{}  {}",
@@ -1834,8 +1860,8 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Tree => {
-            chrome.status = "Session Tree".into();
-            println!("{}", chrome.status);
+            session.chrome.status = "Session Tree".into();
+            println!("{}", session.chrome.status);
             Ok(true)
         }
         SlashAction::Copy => {
@@ -1859,22 +1885,22 @@ fn handle_user_line(
             agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
             agent.context_files = load_context_files(&agent.cwd, true);
             let _host = loaded_extension_host(parsed);
-            chrome.status =
+            session.chrome.status =
                 "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
                     .into();
-            println!("{}", chrome.status);
+            println!("{}", session.chrome.status);
             Ok(true)
         }
         SlashAction::Import(path) => {
             if path.is_empty() {
-                chrome.status = "Usage: /import <path.jsonl>".into();
-                println!("{}", chrome.status);
+                session.chrome.status = "Usage: /import <path.jsonl>".into();
+                println!("{}", session.chrome.status);
                 return Ok(true);
             }
             let expanded = pi_session::expand_tilde(&path);
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
             agent.load_from_session(next);
-            chrome.status = format!(
+            session.chrome.status = format!(
                 "imported {}",
                 agent
                     .session
@@ -1882,12 +1908,12 @@ fn handle_user_line(
                     .map(|item| item.header.id.clone())
                     .unwrap_or_default()
             );
-            println!("{}", chrome.status);
+            println!("{}", session.chrome.status);
             Ok(true)
         }
         SlashAction::Share => {
-            chrome.status = share_current_session(agent)?;
-            println!("{}", chrome.status);
+            session.chrome.status = share_current_session(agent)?;
+            println!("{}", session.chrome.status);
             Ok(true)
         }
         SlashAction::Changelog => {
@@ -1897,14 +1923,14 @@ fn handle_user_line(
                 Some(since) => changelog::format_changelog_since(&entries, Some(since)),
                 None => changelog::format_changelog(&entries),
             };
-            chrome.transcript.push("changelog", &text);
-            chrome.status = "changelog".into();
+            session.chrome.transcript.push("changelog", &text);
+            session.chrome.status = "changelog".into();
             println!("{text}");
             Ok(true)
         }
         SlashAction::Llama => {
-            chrome.status = "llama.cpp is available in interactive mode".into();
-            println!("{}", chrome.status);
+            session.chrome.status = "llama.cpp is available in interactive mode".into();
+            println!("{}", session.chrome.status);
             Ok(true)
         }
     }
@@ -1922,7 +1948,7 @@ fn reload_interactive_resources(
     agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
     agent.context_files = load_context_files(&agent.cwd, true);
     let host = loaded_extension_host(parsed);
-    apply_extension_shortcuts(session, &host);
+    apply_extension_shortcuts(session, agent, &host);
     session.slash_commands = interactive_slash_commands(agent, parsed);
     replay_custom_messages(agent, session, &host);
     let current = session.chrome.theme.name.clone();
@@ -2059,6 +2085,8 @@ fn upload_radius_artifact(agent: &Agent, token: &str) -> Result<String, String> 
 fn apply_tool_events(chrome: &mut ChatChrome, events: &[AgentEvent]) {
     for event in events {
         match event {
+            AgentEvent::AgentStart => {}
+            AgentEvent::AgentEnd { .. } => {}
             AgentEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
@@ -2411,8 +2439,11 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
     commands
 }
 
-fn format_session_info(stats: &serde_json::Value) -> String {
-    format!(
+fn format_session_info(
+    stats: &serde_json::Value,
+    waste: Option<&cache_stats::CacheWasteTotals>,
+) -> String {
+    let mut info = format!(
         "Session Info\n\nFile: {}\nID: {}\n\nMessages\nTotal: {}\nUser: {}\nAssistant: {}\nTools: {} calls, {} results\n\nTokens\nInput: {}\nOutput: {}\nCache read: {}\nCache write: {}\nTotal: {}\nCost: {}",
         stats.get("sessionFile").and_then(|value| value.as_str()).unwrap_or("In-memory"),
         stats.get("sessionId").and_then(|value| value.as_str()).unwrap_or(""),
@@ -2427,13 +2458,35 @@ fn format_session_info(stats: &serde_json::Value) -> String {
         stats["tokens"]["cacheWrite"].as_u64().unwrap_or(0),
         stats["tokens"]["total"].as_u64().unwrap_or(0),
         stats.get("cost").and_then(|value| value.as_f64()).unwrap_or(0.0),
-    )
+    );
+    if let Some(waste) = waste.filter(|item| item.missed_tokens > 0) {
+        let miss_label = if waste.miss_count == 1 {
+            "1 miss".into()
+        } else {
+            format!("{} misses", waste.miss_count)
+        };
+        let detail = format!("{} tokens, {miss_label}", waste.missed_tokens);
+        if waste.missed_cost >= 0.0001 {
+            info.push_str(&format!(
+                "\nCache Re-billed: ${:.3} ({detail})",
+                waste.missed_cost
+            ));
+        } else {
+            info.push_str(&format!("\nCache Re-billed: {detail}"));
+        }
+    }
+    info
 }
 
-fn apply_extension_shortcuts(session: &mut InteractiveSession, host: &ExtensionHost) {
+fn apply_extension_shortcuts(
+    session: &mut InteractiveSession,
+    agent: &mut Agent,
+    host: &ExtensionHost,
+) {
     let (shortcuts, diagnostics) = host.resolve_shortcuts(&session.keybindings);
     session.extension_shortcuts = shortcuts;
     session.apply_extension_ui_calls(&host.ui_calls);
+    apply_session_calls(agent, &mut session.chrome, &host.session_calls);
     activate_custom_editor(session, host);
     if let Some(warning) = diagnostics.first() {
         session.chrome.status = warning.clone();
@@ -2542,17 +2595,28 @@ fn handle_custom_editor_input(
 
 fn host_invoke_shortcut(
     parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
     path: &str,
     key: &str,
 ) -> Result<Option<serde_json::Value>, String> {
     let mut host = loaded_extension_host(parsed);
-    if host.js.iter().any(|ext| ext.path == path) {
-        return host.invoke_shortcut(path, key);
-    }
-    ExtensionHost::default().invoke_shortcut(path, key)
+    let result = if host.js.iter().any(|ext| ext.path == path) {
+        host.invoke_shortcut(path, key)?
+    } else {
+        ExtensionHost::default().invoke_shortcut(path, key)?
+    };
+    session.apply_extension_ui_calls(&host.ui_calls);
+    apply_session_calls(agent, &mut session.chrome, &host.session_calls);
+    Ok(result)
 }
 
-fn try_extension_slash(parsed: &Args, chrome: &mut ChatChrome, name: &str) -> Result<bool, String> {
+fn try_extension_slash(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    name: &str,
+) -> Result<bool, String> {
     let mut host = loaded_extension_host(parsed);
     let path = host
         .js
@@ -2563,12 +2627,11 @@ fn try_extension_slash(parsed: &Args, chrome: &mut ChatChrome, name: &str) -> Re
         return Ok(false);
     };
     let result = host.invoke_command(&path, name)?;
-    for call in &host.ui_calls {
-        chrome.apply_ui_call(call);
-    }
-    apply_custom_overlay_result(chrome, &path, name, result.as_ref());
-    chrome.status = format!("/{name}");
-    println!("{}", chrome.status);
+    session.apply_extension_ui_calls(&host.ui_calls);
+    apply_session_calls(agent, &mut session.chrome, &host.session_calls);
+    apply_custom_overlay_result(&mut session.chrome, &path, name, result.as_ref());
+    session.chrome.status = format!("/{name}");
+    println!("{}", session.chrome.status);
     Ok(true)
 }
 
@@ -2612,7 +2675,12 @@ fn apply_custom_overlay_result(
         .map(pi_tui::overlay_options_from_json);
 }
 
-fn handle_custom_overlay_input(parsed: &Args, session: &mut InteractiveSession, data: &str) {
+fn handle_custom_overlay_input(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    data: &str,
+) {
     let Some(path) = session.chrome.custom_overlay_path.clone() else {
         return;
     };
@@ -2625,6 +2693,8 @@ fn handle_custom_overlay_input(parsed: &Args, session: &mut InteractiveSession, 
     let mut host = loaded_extension_host(parsed);
     match host.invoke_command_with(&path, &name, data, snapshot.as_ref(), session.width) {
         Ok(result) => {
+            session.apply_extension_ui_calls(&host.ui_calls);
+            apply_session_calls(agent, &mut session.chrome, &host.session_calls);
             apply_custom_overlay_result(&mut session.chrome, &path, &name, result.as_ref());
             if session.chrome.custom_overlay_lines.is_none() {
                 if let Some(value) = result {
@@ -2888,6 +2958,262 @@ fn apply_startup_notices(
     );
     for (kind, line) in startup::format_notices(&notices) {
         session.chrome.transcript.push(&kind, &line);
+    }
+}
+
+fn apply_changelog_overlay(
+    session: &mut InteractiveSession,
+    agent: &Agent,
+    settings: &settings::Settings,
+    agent_dir: &Path,
+) {
+    let has_messages = agent.session.as_ref().is_some_and(|store| {
+        store
+            .entries
+            .iter()
+            .any(|entry| entry.entry_type == "message")
+    });
+    let entries = changelog::parse_changelog(&changelog::changelog_path());
+    let display = changelog::changelog_for_display(
+        settings.last_changelog_version.as_deref(),
+        VERSION,
+        &entries,
+        has_messages,
+    );
+    if let Some(version) = &display.persist_version {
+        let mut stored = load_settings(agent_dir);
+        stored.last_changelog_version = Some(version.clone());
+        let _ = save_settings(agent_dir, &stored);
+    }
+    if display.report_telemetry {
+        changelog::report_install_telemetry(VERSION, settings.install_telemetry_enabled());
+    }
+    if let Some(markdown) = display.markdown {
+        let text = changelog::format_startup_changelog(
+            &markdown,
+            settings.collapse_changelog.unwrap_or(false),
+            VERSION,
+        );
+        session.chrome.transcript.push("changelog", &text);
+    }
+}
+
+fn refresh_chrome_footer(session: &mut InteractiveSession, agent: &Agent) {
+    session.chrome.footer_cwd = Some(agent.cwd.to_string_lossy().into_owned());
+    session.chrome.footer_home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok());
+    session.chrome.footer_branch = resolve_git_branch(&agent.cwd);
+    session.chrome.footer_session_name = agent
+        .session
+        .as_ref()
+        .and_then(|store| store.display_name());
+    session.chrome.footer_stats = Some(footer_stats_line(agent));
+}
+
+fn footer_stats_line(agent: &Agent) -> String {
+    let mut input = 0_u64;
+    let mut output = 0_u64;
+    let mut cache_read = 0_u64;
+    let mut cache_write = 0_u64;
+    if let Some(store) = agent.session.as_ref() {
+        for entry in &store.entries {
+            if let Some(usage) = cache_stats::assistant_usage_from_entry(entry) {
+                input += usage.input;
+                cache_read += usage.cache_read;
+                cache_write += usage.cache_write;
+            }
+            if let Some(usage) = entry.extra.get("usage") {
+                input += usage
+                    .get("input")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                output += usage
+                    .get("output")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                cache_read += usage
+                    .get("cacheRead")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                cache_write += usage
+                    .get("cacheWrite")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    if input > 0 {
+        parts.push(format!("↑{}", cache_stats::format_tokens(input as i64)));
+    }
+    if output > 0 {
+        parts.push(format!("↓{}", cache_stats::format_tokens(output as i64)));
+    }
+    if cache_read > 0 {
+        parts.push(format!(
+            "R{}",
+            cache_stats::format_tokens(cache_read as i64)
+        ));
+    }
+    if cache_write > 0 {
+        parts.push(format!(
+            "W{}",
+            cache_stats::format_tokens(cache_write as i64)
+        ));
+    }
+    if let Some(store) = agent.session.as_ref() {
+        let waste = cache_stats::compute_cache_waste(&store.entries, &0.3);
+        if waste.missed_tokens > 0 {
+            parts.push(format!(
+                "miss{}",
+                cache_stats::format_tokens(waste.missed_tokens)
+            ));
+        }
+    }
+    let model = format!("{}/{}", agent.provider, agent.model_id);
+    if parts.is_empty() {
+        model
+    } else {
+        format!("{}  {}", parts.join(" "), model)
+    }
+}
+
+fn apply_cache_miss_notices(chrome: &mut ChatChrome, agent: &Agent, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let Some(store) = agent.session.as_ref() else {
+        return;
+    };
+    for (_index, miss) in cache_stats::collect_cache_misses(&store.entries, &0.3) {
+        if let Some(text) = cache_stats::format_cache_miss_notice(&miss) {
+            if !chrome.transcript.lines.iter().any(|line| line.text == text) {
+                chrome.transcript.push("notice", &text);
+            }
+        }
+    }
+    if let Some((index, usage)) =
+        store
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| {
+                cache_stats::assistant_usage_from_entry(entry).map(|usage| (index, usage))
+            })
+    {
+        if let Some(miss) = cache_stats::detect_cache_miss(&store.entries[..index], &usage, &0.3) {
+            if let Some(text) = cache_stats::format_cache_miss_notice(&miss) {
+                if !chrome.transcript.lines.iter().any(|line| line.text == text) {
+                    chrome.transcript.push("notice", &text);
+                }
+            }
+        }
+    }
+    for entry in &store.entries {
+        if entry.entry_type != "compaction" && entry.entry_type != "branch_summary" {
+            continue;
+        }
+        let Some(usage) = entry
+            .extra
+            .get("usage")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<pi_protocol::Usage>(value).ok())
+        else {
+            continue;
+        };
+        let text = cache_stats::format_compaction_cost_notice(&entry.entry_type, &usage);
+        if !chrome.transcript.lines.iter().any(|line| line.text == text) {
+            chrome.transcript.push("notice", &text);
+        }
+    }
+}
+
+fn apply_progress_events(session: &mut InteractiveSession, events: &[AgentEvent]) {
+    for event in events {
+        match event {
+            AgentEvent::AgentStart => {
+                if let Some(sequence) = session.set_progress(true) {
+                    print!("{sequence}");
+                }
+            }
+            AgentEvent::AgentEnd { .. } => {
+                if let Some(sequence) = session.set_progress(false) {
+                    print!("{sequence}");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_session_calls(agent: &mut Agent, chrome: &mut ChatChrome, calls: &[serde_json::Value]) {
+    for call in calls {
+        match call.get("op").and_then(|value| value.as_str()) {
+            Some("sendMessage") | Some("sendUserMessage") => {
+                let text = call
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| call.get("text").and_then(|value| value.as_str()))
+                    .unwrap_or("");
+                if !text.is_empty() {
+                    chrome.transcript.push("user", text);
+                }
+            }
+            Some("appendEntry") => {
+                if let Some(store) = agent.session.as_mut() {
+                    let custom_type = call
+                        .get("customType")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("custom");
+                    let data = call.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                    let mut extra = serde_json::Map::new();
+                    extra.insert("data".into(), data);
+                    let _ = store.append_entry(SessionEntry {
+                        id: String::new(),
+                        entry_type: "custom".into(),
+                        parent_id: None,
+                        seq: 0,
+                        timestamp: now_ms(),
+                        message: None,
+                        custom_type: Some(custom_type.to_string()),
+                        extra,
+                    });
+                }
+            }
+            Some("setLabel") => {
+                if let Some(store) = agent.session.as_mut() {
+                    let id = call
+                        .get("entryId")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let label = call.get("label").and_then(|value| value.as_str());
+                    let _ = store.append_entry(SessionEntry::label_change(id, label));
+                }
+            }
+            Some("setSessionName") => {
+                if let Some(store) = agent.session.as_mut() {
+                    let name = call
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let _ = store.set_name(name);
+                }
+            }
+            Some("exec") => {
+                if let Some(command) = call.get("command").and_then(|value| value.as_str()) {
+                    chrome.status = format!("exec {command}");
+                }
+            }
+            Some("newSession") => {
+                chrome.status = "newSession".into();
+            }
+            Some("fork") => {
+                chrome.status = "fork".into();
+            }
+            _ => {}
+        }
     }
 }
 

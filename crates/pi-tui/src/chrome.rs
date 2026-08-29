@@ -5,6 +5,7 @@ use crate::extension_ui::{
     ExtensionWidget, WidgetPlacement,
 };
 use crate::first_time::FirstTimeSetup;
+use crate::footer::{format_pwd_line, truncate_to_width};
 use crate::login_dialog::LoginDialog;
 use crate::model_selector::ModelSelector;
 use crate::overlay::{composite_overlay_lines, OverlayOptions};
@@ -58,6 +59,12 @@ pub struct ChatChrome {
     pub custom_overlay_snapshot: Option<serde_json::Value>,
     pub custom_overlay_composite: bool,
     pub custom_overlay_options: Option<OverlayOptions>,
+    pub quiet_startup: bool,
+    pub footer_cwd: Option<String>,
+    pub footer_home: Option<String>,
+    pub footer_branch: Option<String>,
+    pub footer_session_name: Option<String>,
+    pub footer_stats: Option<String>,
 }
 
 impl ChatChrome {
@@ -99,6 +106,12 @@ impl ChatChrome {
             custom_overlay_snapshot: None,
             custom_overlay_composite: false,
             custom_overlay_options: None,
+            quiet_startup: false,
+            footer_cwd: None,
+            footer_home: None,
+            footer_branch: None,
+            footer_session_name: None,
+            footer_stats: None,
         }
     }
 
@@ -248,7 +261,10 @@ impl ChatChrome {
 
 impl Component for ChatChrome {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = vec![format!("{}  theme={}", self.title, self.theme.name)];
+        let mut lines = Vec::new();
+        if !self.quiet_startup || self.extension_header.is_some() {
+            lines.push(format!("{}  theme={}", self.title, self.theme.name));
+        }
         if let Some(header) = &self.extension_header {
             lines.extend(header.iter().cloned());
         }
@@ -362,6 +378,18 @@ impl Component for ChatChrome {
                         .unwrap_or_default();
                     lines.push(format!("{prefix}{}{desc}", item.label));
                 }
+            }
+        }
+        if let Some(cwd) = &self.footer_cwd {
+            let pwd = format_pwd_line(
+                cwd,
+                self.footer_home.as_deref(),
+                self.footer_branch.as_deref(),
+                self.footer_session_name.as_deref(),
+            );
+            lines.push(truncate_to_width(&pwd, width, "..."));
+            if let Some(stats) = &self.footer_stats {
+                lines.push(truncate_to_width(stats, width, "..."));
             }
         }
         if let Some(footer) = &self.extension_footer {

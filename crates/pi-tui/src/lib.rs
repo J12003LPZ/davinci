@@ -8,6 +8,7 @@ mod custom_message;
 mod editor;
 mod extension_ui;
 mod first_time;
+mod footer;
 mod fuzzy;
 mod image;
 mod keybindings;
@@ -52,6 +53,10 @@ pub use extension_ui::{
 pub use first_time::{
     detect_terminal_theme, FirstTimeAction, FirstTimeSetup, FirstTimeSetupResult, SETUP_LOGO_LINES,
 };
+pub use footer::{
+    find_git_paths, format_cwd_for_footer, format_pwd_line, resolve_git_branch, truncate_to_width,
+    GitPaths,
+};
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use image::{
     delete_all_kitty_images, delete_kitty_image, encode_kitty, iterm_image, kitty_image_chunk,
@@ -70,6 +75,8 @@ pub use osc::{
     detect_terminal_background_from_env, detect_terminal_theme_for_auto, drain_osc_tty,
     parse_osc11_background_color, parse_terminal_color_scheme_report,
     query_terminal_background_color, ThemeDetection, COLOR_SCHEME_QUERY, OSC_11_QUERY,
+    TERMINAL_PROGRESS_ACTIVE_SEQUENCE, TERMINAL_PROGRESS_CLEAR_SEQUENCE,
+    TERMINAL_PROGRESS_KEEPALIVE_MS,
 };
 pub use overlay::{
     composite_overlay_lines, composite_tui_line, overlay_options_from_json, resolve_anchor_col,

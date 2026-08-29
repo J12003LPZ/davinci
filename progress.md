@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (images on the LLM path, Codex transport, attribution headers, RPC images/`abort_retry`). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (cache-miss notices, OSC 9;4, git footer, quietStartup, changelog overlay, package persist/update/manifest, extension ctx session APIs). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -77,8 +77,9 @@ Closed this slice: edit tool accepts TS `edits[]` (JSON-string / single-object /
 
 Closed this slice: `images.blockImages` replaces image blocks with “Image reading is disabled.” (consecutive placeholders deduped) before provider calls; `images.autoResize` normalizes tool-result and RPC/user images (convert + 2000×2000 / 4.5MB). Codex `transport=sse` skips websocket connect; `auto`/`websocket` still attempt fixture/localhost connect. Provider attribution headers match TS (`HTTP-Referer` / `X-OpenRouter-*`, `X-BILLING-INVOKE-ORIGIN`, Cloudflare `User-Agent`, OpenCode session) gated by `PI_TELEMETRY` / `enableInstallTelemetry` (default on). RPC `prompt`/`steer`/`follow_up` attach `images`; `abort_retry` cancels in-flight retry.
 
+Closed this slice: interactive cache-miss notices (`showCacheMissNotices`, TS 20k / $0.10 threshold, compaction/branch cost lines, `/session` Cache Re-billed); OSC 9;4 progress (`]9;4;3` / `]9;4;0`, keepalive 1000ms, `showTerminalProgress`); git-branch footer (`~/cwd (branch) • name` + token stats); `quietStartup` hides the built-in title when no extension header; post-update changelog overlay (`getChangelogForDisplay`, install telemetry fixture/`pi.dev`); `pi config` persist (`PI_CONFIG_TOGGLE`, Spec↔Filtered autoload); `pi update --extensions` / `--all` / `--extension` reinstall (skip local + exact npm pins); `package.json` `"pi"` resource globs; extension `ctx` session APIs (`sendMessage`/`appendEntry`/`setLabel`/`setSessionName`/`newSession`/`fork`/`exec`). Assistant JSONL persist now writes usage/model/provider so cache accounting matches TS.
+
 Still not product-equivalent:
 
-- Interactive polish: cache-miss notices, OSC 9;4 terminal progress, git-branch footer, `quietStartup` banners, post-update changelog overlay
-- Packages: interactive `pi config` persist, `pi update --extensions` reinstall, `package.json` `"pi"` manifest, extension `ctx` session APIs
-- `pi-session-sqlite` is not the product session backend (JSONL-only in coding-agent)
+- `pi-session-sqlite` implements the sqlite-node backend (WAL, leases, FTS, `001_initial.sql`) but is not selected from coding-agent; TS coding-agent also stays JSONL — remaining work is TS-locked conformance against `createSessionBackendConformance` (fork/clone/label/custom, writer fence, search) rather than flipping the product default
+- Remaining TUI/editor deltas vs TS (word-nav, settings lock file) and live Codex websocket (fixture/localhost only) still need a parity pass before 100%

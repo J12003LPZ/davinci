@@ -257,34 +257,152 @@ impl From<String> for PackageSource {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PiManifest {
+    pub extensions: Option<Vec<String>>,
+    pub skills: Option<Vec<String>>,
+    pub prompts: Option<Vec<String>>,
+    pub themes: Option<Vec<String>>,
+}
+
+/// TS `readPiManifest` — `package.json` `"pi"` object with string-array resource fields.
+pub fn read_pi_manifest(package_json: &Path) -> Option<PiManifest> {
+    let raw = fs::read_to_string(package_json).ok()?;
+    let value: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok()?;
+    let pi = value.get("pi")?.as_object()?;
+    let mut manifest = PiManifest::default();
+    for (field, slot) in [
+        ("extensions", &mut manifest.extensions),
+        ("skills", &mut manifest.skills),
+        ("prompts", &mut manifest.prompts),
+        ("themes", &mut manifest.themes),
+    ] {
+        if let Some(entries) = pi.get(field).and_then(|value| value.as_array()) {
+            if entries.iter().all(|entry| entry.is_string()) {
+                *slot = Some(
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.as_str().map(str::to_string))
+                        .collect(),
+                );
+            }
+        }
+    }
+    Some(manifest)
+}
+
+fn manifest_entries<'a>(manifest: &'a PiManifest, kind: &str) -> Option<&'a [String]> {
+    match kind {
+        "extensions" => manifest.extensions.as_deref(),
+        "skills" => manifest.skills.as_deref(),
+        "prompts" => manifest.prompts.as_deref(),
+        "themes" => manifest.themes.as_deref(),
+        _ => None,
+    }
+}
+
+fn is_override_pattern(value: &str) -> bool {
+    value.starts_with('!') || value.starts_with('+') || value.starts_with('-')
+}
+
 pub fn collect_package_resources(pkg: &PackageSource, kind: &str) -> Vec<PathBuf> {
     let root = Path::new(pkg.source());
+    if let Some(manifest) = read_pi_manifest(&root.join("package.json")) {
+        if let Some(entries) = manifest_entries(&manifest, kind) {
+            return collect_manifest_resources(root, kind, entries, pkg);
+        }
+    }
     let dir = if root.join(kind).is_dir() {
         root.join(kind)
     } else {
         root.to_path_buf()
     };
-    if !dir.exists() {
-        return Vec::new();
-    }
+    collect_dir_resources(root, &dir, pkg, kind)
+}
+
+fn collect_manifest_resources(
+    root: &Path,
+    kind: &str,
+    entries: &[String],
+    pkg: &PackageSource,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(&dir) {
+    for entry in entries.iter().filter(|item| !is_override_pattern(item)) {
+        if entry.contains('*') || entry.contains('?') {
+            collect_glob_files(root, entry, &mut out);
+            continue;
+        }
+        let path = root.join(entry);
+        if path.is_dir() {
+            out.extend(collect_dir_resources(root, &path, pkg, kind));
+        } else if path.is_file() {
+            push_if_allowed(root, path, pkg, kind, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_glob_files(root: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
+    collect_glob_files_from(root, root, pattern, out);
+}
+
+fn collect_glob_files_from(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_glob_files_from(root, &path, pattern, out);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if glob_match(pattern, &relative) {
+            out.push(path);
+        }
+    }
+}
+
+fn collect_dir_resources(root: &Path, dir: &Path, pkg: &PackageSource, kind: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return out;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if pkg.allows_resource(kind, &relative) {
-                out.push(path);
+            if path.is_dir() {
+                out.extend(collect_dir_resources(root, &path, pkg, kind));
+            } else if path.is_file() {
+                push_if_allowed(root, path, pkg, kind, &mut out);
             }
         }
     }
     out
+}
+
+fn push_if_allowed(
+    root: &Path,
+    path: PathBuf,
+    pkg: &PackageSource,
+    kind: &str,
+    out: &mut Vec<PathBuf>,
+) {
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if pkg.allows_resource(kind, &relative) {
+        out.push(path);
+    }
 }
 
 fn glob_match(pattern: &str, path: &str) -> bool {
@@ -875,6 +993,33 @@ mod tests {
         assert!(!filtered.allows_resource("skills", "foo.md"));
         let spec = PackageSource::from_spec("npm:demo");
         assert!(spec.allows_resource("themes", "dark.json"));
+
+        let pkg_dir = dir.path().join("manifest-pkg");
+        std::fs::create_dir_all(pkg_dir.join("src")).ok();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{ "name": "demo", "pi": { "extensions": ["src/index.js"], "skills": ["skills/*.md"] } }"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            pkg_dir.join("src").join("index.js"),
+            "export default () => {}",
+        )
+        .ok();
+        std::fs::create_dir_all(pkg_dir.join("skills")).ok();
+        std::fs::write(pkg_dir.join("skills").join("review.md"), "# review").ok();
+        std::fs::write(pkg_dir.join("skills").join("skip.txt"), "no").ok();
+        let manifest_pkg = PackageSource::from_spec(pkg_dir.display().to_string());
+        let extensions = collect_package_resources(&manifest_pkg, "extensions");
+        assert!(extensions
+            .iter()
+            .any(|path| path.ends_with("src/index.js") || path.ends_with("src\\index.js")));
+        let skills = collect_package_resources(&manifest_pkg, "skills");
+        assert!(skills.iter().any(|path| path.ends_with("review.md")));
+        assert!(!skills.iter().any(|path| path.ends_with("skip.txt")));
+        assert!(read_pi_manifest(&pkg_dir.join("package.json"))
+            .and_then(|manifest| manifest.extensions)
+            .is_some());
 
         let nested: Settings = serde_json::from_str(
             r#"{

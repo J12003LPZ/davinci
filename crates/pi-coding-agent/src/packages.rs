@@ -7,7 +7,7 @@ use crate::self_update::{
     self_update_command_for_method, self_update_unavailable_instruction, update_instruction,
     InstallMethod, PackageTarget, PACKAGE_NAME,
 };
-use crate::settings::{load_settings, save_settings, Settings};
+use crate::settings::{load_settings, save_settings, PackageSource, Settings};
 use pi_tui::{Component, ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector};
 
 const CANNOT_SELF_UPDATE: &str = "error: pi cannot self-update this installation.";
@@ -109,29 +109,153 @@ fn parse_update_flags(args: &[String]) -> Result<UpdateFlags, String> {
 fn handle_update(args: &[String], agent_dir: &Path) -> Result<String, String> {
     let flags = parse_update_flags(args)?;
     let positional_self = matches!(flags.positional.as_deref(), Some("self") | Some("pi"));
+    let extension_source = flags.extension.clone().or_else(|| {
+        flags
+            .positional
+            .clone()
+            .filter(|value| !matches!(value.as_str(), "self" | "pi"))
+    });
     let do_self = flags.self_flag
         || positional_self
-        || (!flags.models_flag
+        || flags.all_flag
+        || !flags.models_flag
             && !flags.extensions_flag
-            && !flags.all_flag
             && flags.extension.is_none()
-            && flags.positional.is_none());
-    let do_models =
-        flags.models_flag || flags.all_flag || flags.positional.as_deref() == Some("all");
+            && flags.positional.is_none();
+    let do_models = flags.models_flag || flags.all_flag;
+    let do_extensions = flags.extensions_flag || flags.all_flag || extension_source.is_some();
     let mut parts = Vec::new();
     if do_self {
         parts.push(self_update_binary(agent_dir, flags.force)?);
     }
-    if do_models || flags.all_flag || (!do_self && flags.positional.is_none()) {
+    if do_models {
         parts.push(refresh_model_catalogs(
             agent_dir,
             flags.positional.as_deref(),
         )?);
     }
-    if flags.extensions_flag || flags.all_flag {
-        parts.push("Extensions: JS modules reload on next session when Node is present.".into());
+    if do_extensions {
+        parts.push(update_extensions(
+            agent_dir,
+            extension_source.as_deref(),
+            flags.force,
+        )?);
     }
     Ok(parts.join("\n"))
+}
+
+/// TS `packageManager.update` for `--extensions` / `--all`: reinstall unpinned npm/git packages.
+pub fn update_extensions(
+    agent_dir: &Path,
+    source: Option<&str>,
+    _force: bool,
+) -> Result<String, String> {
+    if std::env::var("PI_OFFLINE").is_ok() || std::env::var("PI_INSTALL_DRY_RUN").is_ok() {
+        return Ok(source
+            .map(|value| format!("Updated {value}"))
+            .unwrap_or_else(|| "Updated packages".into()));
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let user = load_settings(agent_dir);
+    let project = load_settings(&cwd.join(".pi"));
+    let mut targets = Vec::new();
+    for (pkg, local) in user
+        .packages
+        .iter()
+        .map(|pkg| (pkg, false))
+        .chain(project.packages.iter().map(|pkg| (pkg, true)))
+    {
+        let spec = pkg.source();
+        if let Some(filter) = source {
+            if package_identity(spec) != package_identity(filter) && spec != filter {
+                continue;
+            }
+        }
+        match parse_package_source(spec) {
+            ParsedSource::Local(_) => {}
+            ParsedSource::Npm { spec, name } => {
+                if npm_spec_version(&spec, &name)
+                    .as_deref()
+                    .is_some_and(is_exact_npm_version)
+                {
+                    continue;
+                }
+                install_remote_package(agent_dir, "npm", &name, &spec, local)?;
+                targets.push(name);
+            }
+            ParsedSource::Git(url) => {
+                let name = git_package_name(&url);
+                install_remote_package(agent_dir, "git", &name, &url, local)?;
+                targets.push(git_host_path(&url));
+            }
+        }
+    }
+    if let Some(filter) = source {
+        if targets.is_empty() {
+            return Err(format!("No matching package found for {filter}"));
+        }
+        return Ok(format!("Updated {}", source.unwrap_or("packages")));
+    }
+    Ok("Updated packages".into())
+}
+
+pub fn persist_config_toggle(
+    agent_dir: &Path,
+    local: bool,
+    source: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let dir = if local {
+        cwd.join(".pi")
+    } else {
+        agent_dir.to_path_buf()
+    };
+    let mut settings = load_settings(&dir);
+    apply_resource_enabled(&mut settings, source, enabled);
+    save_settings(&dir, &settings)
+}
+
+pub fn apply_resource_enabled(settings: &mut Settings, source: &str, enabled: bool) {
+    let mut found = false;
+    for pkg in &mut settings.packages {
+        if pkg.source() != source {
+            continue;
+        }
+        found = true;
+        *pkg = match pkg.clone() {
+            PackageSource::Spec(spec) if enabled => PackageSource::Spec(spec),
+            PackageSource::Spec(spec) => PackageSource::Filtered(crate::settings::PackageFilter {
+                source: spec,
+                autoload: Some(false),
+                ..crate::settings::PackageFilter::default()
+            }),
+            PackageSource::Filtered(mut filter) => {
+                filter.autoload = Some(enabled);
+                if enabled
+                    && filter.extensions.is_none()
+                    && filter.skills.is_none()
+                    && filter.prompts.is_none()
+                    && filter.themes.is_none()
+                {
+                    PackageSource::Spec(filter.source)
+                } else {
+                    PackageSource::Filtered(filter)
+                }
+            }
+        };
+    }
+    if !found && !source.is_empty() {
+        settings.packages.push(if enabled {
+            PackageSource::from_spec(source)
+        } else {
+            PackageSource::Filtered(crate::settings::PackageFilter {
+                source: source.to_string(),
+                autoload: Some(false),
+                ..crate::settings::PackageFilter::default()
+            })
+        });
+    }
 }
 
 fn refresh_model_catalogs(agent_dir: &Path, _target: Option<&str>) -> Result<String, String> {
@@ -897,10 +1021,17 @@ fn render_config_command(
     local: bool,
     agent_dir: &Path,
 ) -> Result<String, String> {
-    let selector = config_selector_from_settings(settings, local, agent_dir);
+    let mut selector = config_selector_from_settings(settings, local, agent_dir);
+    if let Ok(spec) = std::env::var("PI_CONFIG_TOGGLE") {
+        if let Some((source, enabled)) = spec.split_once('=') {
+            persist_config_toggle(agent_dir, local, source, enabled == "true")?;
+            selector = config_selector_from_settings(&load_settings(agent_dir), local, agent_dir);
+        }
+    }
     let rendered = selector.render(80).join("\n");
     if std::env::var("PI_CONFIG_TEXT").is_ok() {
-        return Ok(format!("{}\n{rendered}", render_config(settings, local)));
+        let stored = load_settings(agent_dir);
+        return Ok(format!("{}\n{rendered}", render_config(&stored, local)));
     }
     Ok(rendered)
 }
@@ -1042,5 +1173,17 @@ mod tests {
             npm_install_args("bun", &["demo-ext".into()], Path::new("/tmp/npm"))
                 .contains(&"--omit=peer".into())
         );
+        persist_config_toggle(&agent, false, &ext.display().to_string(), false).unwrap();
+        let toggled = load_settings(&agent);
+        assert!(!toggled
+            .packages
+            .iter()
+            .find(|item| item.source().contains("ext"))
+            .expect("pkg")
+            .autoload());
+        std::env::set_var("PI_INSTALL_DRY_RUN", "1");
+        let updated = handle_package_command("update", &["--extensions".into()], &agent).unwrap();
+        std::env::remove_var("PI_INSTALL_DRY_RUN");
+        assert!(updated.contains("Updated packages") || updated.contains("Updated "));
     }
 }

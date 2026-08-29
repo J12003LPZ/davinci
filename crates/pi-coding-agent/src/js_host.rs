@@ -34,6 +34,8 @@ pub struct JsExtensionResult {
     pub markdown_transformers: u32,
     #[serde(default, rename = "uiCalls")]
     pub ui_calls: Vec<Value>,
+    #[serde(default, rename = "sessionCalls")]
+    pub session_calls: Vec<Value>,
     #[serde(default, rename = "hasEditor")]
     pub has_editor: bool,
     #[serde(default, rename = "hasCustom")]
@@ -433,6 +435,56 @@ module.exports = (pi) => {
         std::env::remove_var("PI_EXTENSION_UI_REPLY");
         assert_eq!(command.result.as_ref().unwrap()["choice"], "a");
         assert!(command.ui_calls.iter().any(|call| call["op"] == "select"));
+    }
+
+    #[test]
+    fn records_ctx_session_apis() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerCommand("session", {
+    description: "session",
+    handler: async (_args, ctx) => {
+      ctx.sendMessage("hello");
+      ctx.appendEntry("note", { text: "hi" });
+      ctx.setLabel("e1", "keep");
+      ctx.setSessionName("work");
+      await ctx.exec("echo ok");
+      ctx.newSession();
+      ctx.fork("root");
+      return { ok: true };
+    },
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        std::env::set_var("PI_EXTENSION_EXEC_REPLY", "ok");
+        let command = run_js_extension(
+            &module,
+            "command",
+            &serde_json::json!({ "name": "session", "ctx": { "mode": "tui" } }),
+        )
+        .unwrap();
+        std::env::remove_var("PI_EXTENSION_EXEC_REPLY");
+        let ops: Vec<&str> = command
+            .session_calls
+            .iter()
+            .filter_map(|call| call.get("op").and_then(|value| value.as_str()))
+            .collect();
+        assert!(ops.contains(&"sendMessage"));
+        assert!(ops.contains(&"appendEntry"));
+        assert!(ops.contains(&"setLabel"));
+        assert!(ops.contains(&"setSessionName"));
+        assert!(ops.contains(&"exec"));
+        assert!(ops.contains(&"newSession"));
+        assert!(ops.contains(&"fork"));
     }
 
     #[test]

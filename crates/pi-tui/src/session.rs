@@ -151,6 +151,9 @@ pub struct InteractiveSession {
     last_escape: Option<Instant>,
     next_image_id: u32,
     paste_buf: Option<String>,
+    pub show_terminal_progress: bool,
+    pub quiet_startup: bool,
+    progress_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +252,9 @@ impl InteractiveSession {
             last_escape: None,
             next_image_id: 1,
             paste_buf: None,
+            show_terminal_progress: false,
+            quiet_startup: false,
+            progress_active: false,
         }
     }
 
@@ -266,8 +272,26 @@ impl InteractiveSession {
         out
     }
 
+    /// OSC 9;4 progress sequences matching TS `ProcessTerminal.setProgress`.
+    pub fn progress_sequence(active: bool) -> &'static str {
+        if active {
+            crate::osc::TERMINAL_PROGRESS_ACTIVE_SEQUENCE
+        } else {
+            crate::osc::TERMINAL_PROGRESS_CLEAR_SEQUENCE
+        }
+    }
+
+    pub fn set_progress(&mut self, active: bool) -> Option<&'static str> {
+        if !self.show_terminal_progress && active {
+            return None;
+        }
+        self.progress_active = active;
+        Some(Self::progress_sequence(active))
+    }
+
     pub fn leave_sequences(fullscreen: bool) -> String {
         let mut out = String::new();
+        out.push_str(crate::osc::TERMINAL_PROGRESS_CLEAR_SEQUENCE);
         out.push_str(KITTY_KEYBOARD_DISABLE);
         out.push_str(BRACKETED_PASTE_DISABLE);
         out.push_str(MOUSE_DISABLE);
@@ -1453,7 +1477,23 @@ mod tests {
         assert!(enter.contains(crate::osc::OSC_11_QUERY));
         assert!(enter.contains(crate::osc::COLOR_SCHEME_QUERY));
         let leave = InteractiveSession::leave_sequences(true);
+        assert!(leave.contains(crate::osc::TERMINAL_PROGRESS_CLEAR_SEQUENCE));
         assert!(leave.contains(KITTY_KEYBOARD_DISABLE));
+        assert_eq!(
+            InteractiveSession::progress_sequence(true),
+            crate::osc::TERMINAL_PROGRESS_ACTIVE_SEQUENCE
+        );
+        let mut progress = InteractiveSession::new(
+            builtin_themes().into_iter().next().expect("theme"),
+            "pi",
+            vec!["openai/gpt-4".into()],
+        );
+        assert!(progress.set_progress(true).is_none());
+        progress.show_terminal_progress = true;
+        assert_eq!(
+            progress.set_progress(true),
+            Some(crate::osc::TERMINAL_PROGRESS_ACTIVE_SEQUENCE)
+        );
         assert!(leave.contains(BRACKETED_PASTE_DISABLE));
         assert!(leave.contains(MOUSE_DISABLE));
         assert!(leave.contains(ALT_BUFFER_LEAVE));
