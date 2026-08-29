@@ -200,7 +200,10 @@ impl InteractiveMode {
                     body.push(format!(
                         "/{}  {}",
                         command.name,
-                        command.description.as_deref().unwrap_or("extension command")
+                        command
+                            .description
+                            .as_deref()
+                            .unwrap_or("extension command")
                     ));
                 }
                 self.tui.show_overlay(
@@ -219,12 +222,13 @@ impl InteractiveMode {
                     .collect();
                 for shortcut in &self.runtime.registry.shortcuts {
                     keys.push(format!(
-                        "{}  {}",
+                        "{}  {}  ({})",
                         shortcut.shortcut,
                         shortcut
                             .description
                             .as_deref()
-                            .unwrap_or("extension shortcut")
+                            .unwrap_or("extension shortcut"),
+                        shortcut.path.display()
                     ));
                 }
                 self.tui.show_overlay(

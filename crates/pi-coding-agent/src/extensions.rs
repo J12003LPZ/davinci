@@ -166,7 +166,11 @@ impl ExtensionTool {
     pub fn from_meta(meta: &RegisteredToolMeta) -> Self {
         Self {
             name: meta.name.clone(),
-            description: meta.description.clone(),
+            description: if meta.description.is_empty() {
+                meta.label.clone().unwrap_or_default()
+            } else {
+                meta.description.clone()
+            },
             parameters: meta.parameters.clone(),
             path: meta.path.clone(),
         }
@@ -211,7 +215,10 @@ fn tool_result_from_value(result: &Value) -> ToolResult {
         };
     }
     let body = result.get("result").unwrap_or(result);
-    let is_error = body.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_error = body
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let output = if let Some(text) = body.as_str() {
         text.to_string()
     } else if let Some(text) = body.get("output").and_then(|v| v.as_str()) {
@@ -591,19 +598,17 @@ fn parse_registry(value: &Value, path: &Path) -> ExtensionRegistry {
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
-        .filter_map(|shortcut| {
-            Some(RegisteredShortcutMeta {
-                shortcut: shortcut
-                    .get("shortcut")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                description: shortcut
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                path: path.to_path_buf(),
-            })
+        .map(|shortcut| RegisteredShortcutMeta {
+            shortcut: shortcut
+                .get("shortcut")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            description: shortcut
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            path: path.to_path_buf(),
         })
         .collect();
     let flags = raw
@@ -692,7 +697,11 @@ fn resolve_template(config: &str) -> Option<String> {
                     index += 3 + rel_end;
                     continue;
                 }
-                out.push_str(&chars[index..=index + 2 + rel_end].iter().collect::<String>());
+                out.push_str(
+                    &chars[index..=index + 2 + rel_end]
+                        .iter()
+                        .collect::<String>(),
+                );
                 index += 3 + rel_end;
                 continue;
             }
@@ -946,7 +955,10 @@ module.exports = function (pi) {
             resolve_config_value("pre-${PI_TEST_PROXY_KEY}-post").as_deref(),
             Some("pre-secret-key-post")
         );
-        assert_eq!(resolve_config_value("$$literal").as_deref(), Some("$literal"));
+        assert_eq!(
+            resolve_config_value("$$literal").as_deref(),
+            Some("$literal")
+        );
         assert_eq!(resolve_config_value("$!bang").as_deref(), Some("!bang"));
         assert_eq!(resolve_config_value("$MISSING_PI_ENV_VAR_XYZ"), None);
         assert_eq!(

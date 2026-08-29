@@ -148,7 +148,6 @@ pub fn run_agent(
             base_url: config.base_url.clone(),
             extra_headers: config.extra_headers.clone(),
             api: config.api.clone(),
-            ..StreamOptions::default()
         }) {
             Ok(assistant) => {
                 let text = assistant

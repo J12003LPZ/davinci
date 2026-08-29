@@ -35,4 +35,4 @@ Port TypeScript HTML `template.js` markdown/highlight/tool rendering into `pi-co
 cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Last run: pending this slice (JS `registerProvider` / `registerTool` / `registerCommand`).
+Last run: green on 1.83 after JS `registerProvider` / `registerTool` / `registerCommand`.

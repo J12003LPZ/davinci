@@ -78,18 +78,19 @@ impl SessionRuntime {
     pub fn bind_extensions(&mut self) {
         self.registry = extensions::load_extensions(&self.extensions);
         for tool in &self.registry.tools {
-            self.tools.register(Box::new(ExtensionTool::from_meta(tool)));
+            self.tools
+                .register(Box::new(ExtensionTool::from_meta(tool)));
         }
     }
 
     pub fn config(&self) -> AgentConfig {
-        let (api_key, base_url, extra_headers, api) = self.provider_request();
+        let request = self.provider_request();
         AgentConfig {
             cwd: self.cwd.clone(),
             system_prompt: self.system_prompt.clone(),
             model_provider: self.provider.clone(),
             model_id: self.model_id.clone(),
-            api_key,
+            api_key: request.api_key,
             allow_network: self.allow_network,
             auto_retry: self.auto_retry,
             max_retries: 2,
@@ -104,20 +105,13 @@ impl SessionRuntime {
                 None
             },
             session_id: Some(self.session_id.clone()),
-            base_url,
-            extra_headers,
-            api,
+            base_url: request.base_url,
+            extra_headers: request.extra_headers,
+            api: request.api,
         }
     }
 
-    fn provider_request(
-        &self,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Vec<(String, String)>,
-        Option<String>,
-    ) {
+    fn provider_request(&self) -> ProviderRequest {
         let mut api_key = self.api_key.clone();
         let mut base_url = None;
         let mut extra_headers = Vec::new();
@@ -144,7 +138,8 @@ impl SessionRuntime {
                     if let Some(raw) = value.as_str() {
                         extra_headers.push((
                             name.clone(),
-                            extensions::resolve_config_value(raw).unwrap_or_else(|| raw.to_string()),
+                            extensions::resolve_config_value(raw)
+                                .unwrap_or_else(|| raw.to_string()),
                         ));
                     }
                 }
@@ -176,7 +171,12 @@ impl SessionRuntime {
                 }
             }
         }
-        (api_key, base_url, extra_headers, api)
+        ProviderRequest {
+            api_key,
+            base_url,
+            extra_headers,
+            api,
+        }
     }
 
     pub fn invoke_registered_command(
@@ -404,6 +404,22 @@ impl SessionRuntime {
             "autoCompactionEnabled": self.auto_compact,
             "messageCount": self.messages.len(),
             "pendingMessageCount": self.steer.items.len() + self.follow_up.items.len(),
+            "extensionProviders": self.registry.providers.iter().map(|provider| {
+                json!({
+                    "name": provider.name,
+                    "native": provider.native,
+                    "path": provider.path.display().to_string(),
+                })
+            }).collect::<Vec<_>>(),
+            "extensionFlags": self.registry.flags.iter().map(|flag| {
+                json!({
+                    "name": flag.name,
+                    "type": flag.flag_type,
+                    "default": flag.default,
+                    "description": flag.description,
+                    "path": flag.path.display().to_string(),
+                })
+            }).collect::<Vec<_>>(),
         })
     }
 
@@ -535,6 +551,13 @@ impl SessionRuntime {
     }
 }
 
+struct ProviderRequest {
+    api_key: Option<String>,
+    base_url: Option<String>,
+    extra_headers: Vec<(String, String)>,
+    api: Option<String>,
+}
+
 pub fn to_json_event(event: &AgentEvent) -> Value {
     serde_json::to_value(event).unwrap_or(json!({"type":"error","message":"serialize"}))
 }
@@ -617,7 +640,10 @@ fn models_from_provider(provider: &extensions::RegisteredProviderMeta) -> Vec<Mo
                     .get("contextWindow")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(128_000),
-                max_tokens: obj.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(16_384),
+                max_tokens: obj
+                    .get("maxTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(16_384),
                 extra: obj.clone(),
             })
         })
@@ -690,7 +716,9 @@ mod tests {
     fn registered_provider_models_and_request() {
         let runtime = runtime_with_provider();
         let models = runtime.available_models();
-        assert!(models.iter().any(|m| m["provider"] == "my-proxy" && m["id"] == "proxy-sm"));
+        assert!(models
+            .iter()
+            .any(|m| m["provider"] == "my-proxy" && m["id"] == "proxy-sm"));
         let resolved = runtime.resolve_session_model("my-proxy/proxy-sm").unwrap();
         assert_eq!(resolved.base_url.as_deref(), Some("https://proxy.example"));
         let config = runtime.config();
