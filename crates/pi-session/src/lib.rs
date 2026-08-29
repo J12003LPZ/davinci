@@ -1,5 +1,13 @@
 //! JSONL session store compatible with TypeScript pi (`~/.pi` and `--session-dir`).
 
+pub mod backend;
+pub mod conformance;
+
+pub use backend::{
+    CreateOptions, EntryQuery, ForkOptions, ForkPosition, ForkScope, MemorySessionRepo, Session,
+    SessionMeta, SessionRepository,
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;

@@ -88,6 +88,9 @@ pub fn parse_sse_fixture(body: &str, provider: &str, model: &str) -> Vec<Assista
         if let Some(delta) = openai_text_delta(&value)
             .or_else(|| anthropic_text_delta(&value))
             .or_else(|| google_text_delta(&value))
+            .or_else(|| bedrock_text_delta(&value))
+            .or_else(|| mistral_text_delta(&value))
+            .or_else(|| responses_text_delta(&value))
         {
             if !text_started {
                 events.push(AssistantMessageEvent::TextStart {
@@ -225,6 +228,41 @@ pub fn parse_sse_fixture(body: &str, provider: &str, model: &str) -> Vec<Assista
         message: partial,
     });
     events
+}
+
+fn bedrock_text_delta(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/contentBlockDelta/delta/text")
+        .or_else(|| {
+            if value.get("type").and_then(|v| v.as_str()) == Some("contentBlockDelta") {
+                value.pointer("/delta/text")
+            } else {
+                None
+            }
+        })
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn mistral_text_delta(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/choices/0/delta/content")
+        .or_else(|| value.pointer("/data/choices/0/delta/content"))
+        .or_else(|| value.pointer("/output/content"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn responses_text_delta(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(|v| v.as_str()) == Some("response.output_text.delta")
+        || value.get("type").and_then(|v| v.as_str()) == Some("response.output_text.delta.delta")
+    {
+        return value
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+    }
+    None
 }
 
 fn openai_text_delta(value: &serde_json::Value) -> Option<String> {
@@ -463,6 +501,25 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, AssistantMessageEvent::TextDelta { delta, .. } if delta == "Go")));
+    }
+
+    #[test]
+    fn bedrock_mistral_codex_sse_corpora() {
+        let bedrock = r#"{"contentBlockDelta":{"delta":{"text":"Hi"},"contentBlockIndex":0}}"#;
+        let events = parse_sse_fixture(bedrock, "amazon-bedrock", "claude");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AssistantMessageEvent::TextDelta { delta, .. } if delta == "Hi")));
+        let mistral = "data: {\"choices\":[{\"delta\":{\"content\":\"Yo\"}}]}\n";
+        let events = parse_sse_fixture(mistral, "mistral", "devstral");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AssistantMessageEvent::TextDelta { delta, .. } if delta == "Yo")));
+        let codex = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Ok\"}\n";
+        let events = parse_sse_fixture(codex, "openai-codex", "gpt-5.5");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AssistantMessageEvent::TextDelta { delta, .. } if delta == "Ok")));
     }
 
     #[test]

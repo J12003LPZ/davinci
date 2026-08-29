@@ -54,3 +54,11 @@ pub fn disable_raw_input() -> io::Result<()> {
         Err(io::Error::other("stty cooked failed"))
     }
 }
+
+pub fn enter_raw_mode() -> io::Result<()> {
+    enable_raw_input()
+}
+
+pub fn leave_raw_mode() -> io::Result<()> {
+    disable_raw_input()
+}

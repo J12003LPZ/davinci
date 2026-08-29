@@ -17,7 +17,7 @@ pub mod widgets;
 pub use component::{wrap_text_with_ansi, Component, Text};
 pub use diff::{composite_tui_line, visible_width, DiffScreen};
 pub use editor::Editor;
-pub use keys::{default_keybindings, parse_key, Key, Keybinding};
+pub use keys::{default_keybindings, parse_bytes, parse_key, read_key, Key, Keybinding};
 pub use layout::{ChatView, Container, Overlay};
 pub use markdown::Markdown;
 pub use mouse::{parse_sgr_mouse, MouseEvent};
@@ -25,7 +25,7 @@ pub use screen::{OverlayHandle, OverlayOptions, Tui};
 pub use selectors::SelectList;
 pub use terminal::{
     disable_mouse, disable_raw_input, enable_mouse, enable_raw_input, enter_alt_screen,
-    leave_alt_screen, TuiMode,
+    enter_raw_mode, leave_alt_screen, leave_raw_mode, TuiMode,
 };
 pub use themes::Theme;
 pub use widgets::{BoxWidget, HStack, Input, ScrollView, SettingsList, VStack};
@@ -59,6 +59,8 @@ mod tests {
         assert_eq!(parse_key("\u{1b}[A"), Key::Up);
         assert_eq!(parse_key("ctrl+c"), Key::Ctrl('c'));
         assert_eq!(parse_key("enter"), Key::Enter);
+        assert_eq!(parse_bytes(&[0x03]), Key::Ctrl('c'));
+        assert_eq!(parse_bytes(b"\x1b[D"), Key::Left);
         let mut editor = Editor::default();
         editor.handle_key(&Key::Char('π'));
         editor.handle_key(&Key::Left);
