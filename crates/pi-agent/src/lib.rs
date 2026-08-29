@@ -37,8 +37,11 @@ pub use images::{
     parse_rpc_images, process_image_bytes, IMAGE_READING_DISABLED,
 };
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
-pub use skills::{discover_skills, Skill};
-pub use templates::{discover_prompt_templates, PromptTemplate};
+pub use skills::{discover_skills, expand_skill_command, expand_user_text, Skill};
+pub use templates::{
+    discover_prompt_templates, expand_prompt_template, parse_command_args, strip_frontmatter,
+    substitute_args, PromptTemplate,
+};
 pub use tools::{execute_tool, tool_specs, AgentTool, ToolError, ToolResult, BUILTIN_TOOLS};
 pub use turn::retry_delay_ms;
 

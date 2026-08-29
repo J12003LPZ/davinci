@@ -1689,4 +1689,40 @@ module.exports = (pi) => {
             .unwrap_or_default();
         assert_eq!(updates[0]["content"], "partial");
     }
+
+    #[test]
+    fn emit_input_chains_transform_and_handles() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.on("input", async (event) => {
+    if (event.text === "skip") return { action: "handled" };
+    return { action: "transform", text: "T:" + event.text };
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let transformed = run_js_extension(
+            &module,
+            "emit",
+            &serde_json::json!({"type":"input","text":"hello"}),
+        )
+        .unwrap();
+        assert_eq!(transformed.result.as_ref().unwrap()["action"], "transform");
+        assert_eq!(transformed.result.as_ref().unwrap()["text"], "T:hello");
+        let handled = run_js_extension(
+            &module,
+            "emit",
+            &serde_json::json!({"type":"input","text":"skip"}),
+        )
+        .unwrap();
+        assert_eq!(handled.result.as_ref().unwrap()["action"], "handled");
+    }
 }

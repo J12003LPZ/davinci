@@ -199,7 +199,12 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .map(pi_agent::parse_rpc_images)
                 .unwrap_or_default();
             if let Some(message) = &command.message {
-                runtime.agent.prompt_with(message, &images);
+                let text = pi_agent::expand_user_text(
+                    message,
+                    &runtime.agent.skills,
+                    &runtime.agent.templates,
+                );
+                runtime.agent.prompt_with(&text, &images);
             }
             if command.streaming_behavior.as_deref() == Some("followUp") {
                 runtime.agent.queues.follow_up_mode = QueueMode::All;
@@ -216,7 +221,12 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .map(pi_agent::parse_rpc_images)
                 .unwrap_or_default();
             if let Some(message) = &command.message {
-                runtime.agent.queues.enqueue_steer_with(message, images);
+                let text = pi_agent::expand_user_text(
+                    message,
+                    &runtime.agent.skills,
+                    &runtime.agent.templates,
+                );
+                runtime.agent.queues.enqueue_steer_with(&text, images);
             }
             ok(id, &kind, None)
         }
@@ -227,7 +237,12 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .map(pi_agent::parse_rpc_images)
                 .unwrap_or_default();
             if let Some(message) = &command.message {
-                runtime.agent.queues.enqueue_follow_up_with(message, images);
+                let text = pi_agent::expand_user_text(
+                    message,
+                    &runtime.agent.skills,
+                    &runtime.agent.templates,
+                );
+                runtime.agent.queues.enqueue_follow_up_with(&text, images);
             }
             ok(id, &kind, None)
         }
@@ -845,6 +860,36 @@ mod tests {
         );
         assert!(abort.success);
         assert!(runtime.agent.retry_aborted);
+    }
+
+    #[test]
+    fn prompt_expands_skill_and_template() {
+        let mut runtime = RpcRuntime::new(
+            pi_agent::Agent::new(default_system_prompt()),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        runtime.agent.templates.push(pi_agent::PromptTemplate {
+            name: "review".into(),
+            path: PathBuf::from("/virtual/review.md"),
+            body: "Review this code: $1".into(),
+            description: "Review template".into(),
+            argument_hint: None,
+        });
+        let response = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "prompt".into(),
+                message: Some("/review src/lib.rs".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(response.success);
+        let user = runtime.agent.messages.last().expect("prompt");
+        assert_eq!(
+            pi_ai::content_text(&user.content),
+            "Review this code: src/lib.rs"
+        );
     }
 
     #[test]

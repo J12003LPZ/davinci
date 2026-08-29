@@ -2,9 +2,14 @@
 
 use std::path::PathBuf;
 
-use pi_agent::{default_system_prompt, load_context_files, Agent, BUILTIN_TOOLS};
+use pi_agent::{
+    default_system_prompt, discover_prompt_templates, discover_skills, expand_user_text,
+    load_context_files, Agent, CompactionResult, BUILTIN_TOOLS,
+};
 use pi_ai::{find_model, load_builtin_models};
-use pi_session::{default_agent_dir, JsonlSession};
+use pi_session::{default_agent_dir, latest_session, JsonlSession};
+
+use crate::settings::load_merged_settings;
 
 const DEFAULT_ACTIVE_TOOLS: &[&str] = &["read", "bash", "edit", "write"];
 
@@ -21,6 +26,9 @@ pub struct CreateAgentSessionOptions {
     pub no_tools: Option<String>,
     pub session_dir: Option<PathBuf>,
     pub session_name: Option<String>,
+    /// Resume the latest JSONL session for `cwd` (TS sessionManager restore).
+    pub continue_session: bool,
+    pub session_path: Option<PathBuf>,
 }
 
 pub struct AgentSession {
@@ -31,7 +39,34 @@ pub struct AgentSession {
 
 impl AgentSession {
     pub fn prompt(&mut self, text: &str) -> pi_ai::ChatMessage {
-        self.agent.prompt(text)
+        self.prompt_with(text, &[])
+    }
+
+    pub fn prompt_with(
+        &mut self,
+        text: &str,
+        images: &[pi_ai::MessageContent],
+    ) -> pi_ai::ChatMessage {
+        let expanded = expand_user_text(text, &self.agent.skills, &self.agent.templates);
+        self.agent.prompt_with(&expanded, images)
+    }
+
+    pub fn steer(&mut self, text: &str, images: Vec<pi_ai::MessageContent>) {
+        let expanded = expand_user_text(text, &self.agent.skills, &self.agent.templates);
+        self.agent.queues.enqueue_steer_with(expanded, images);
+    }
+
+    pub fn follow_up(&mut self, text: &str, images: Vec<pi_ai::MessageContent>) {
+        let expanded = expand_user_text(text, &self.agent.skills, &self.agent.templates);
+        self.agent.queues.enqueue_follow_up_with(expanded, images);
+    }
+
+    pub fn compact(&mut self, instructions: Option<&str>) -> CompactionResult {
+        self.agent.compact(instructions)
+    }
+
+    pub fn abort(&mut self) {
+        self.agent.abort();
     }
 }
 
@@ -48,9 +83,13 @@ pub fn create_agent_session(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let agent_dir = options.agent_dir.clone().unwrap_or_else(default_agent_dir);
+    let settings = load_merged_settings(&agent_dir, &cwd);
     let mut agent = Agent::new(default_system_prompt());
     agent.cwd = cwd.clone();
     agent.context_files = load_context_files(&cwd, true);
+    agent.skills = discover_skills(&[cwd.join(".pi").join("skills"), agent_dir.join("skills")]);
+    agent.templates =
+        discover_prompt_templates(&[cwd.join(".pi").join("prompts"), agent_dir.join("prompts")]);
 
     let models = load_builtin_models();
     let mut model_fallback_message = None;
@@ -77,28 +116,50 @@ pub fn create_agent_session(
         }
     }
 
-    if let Some(level) = options.thinking_level.as_deref() {
+    let thinking = options
+        .thinking_level
+        .clone()
+        .or_else(|| settings.default_thinking_level.clone());
+    if let Some(level) = thinking.as_deref() {
         agent.thinking_level = parse_thinking(level);
     }
 
-    agent.tools = initial_tools(&options);
+    agent.tools = initial_tools(&options, settings.default_tools.as_deref());
     agent.tool_registry = BUILTIN_TOOLS
         .iter()
         .map(|name| (*name).to_string())
         .collect();
+    agent.auto_compaction = settings.compaction_enabled();
+    agent.compaction = settings.compaction_settings();
+    agent.block_images = settings.block_images();
+    agent.auto_resize_images = settings.image_auto_resize();
 
     let session_dir = options
         .session_dir
         .clone()
         .unwrap_or_else(pi_session::default_session_dir);
-    agent.session = Some(
-        JsonlSession::create(
-            &session_dir,
-            &cwd.to_string_lossy(),
-            options.session_name.as_deref(),
-        )
-        .map_err(|err| err.to_string())?,
-    );
+
+    if let Some(path) = &options.session_path {
+        let store = JsonlSession::open(path).map_err(|err| err.to_string())?;
+        agent.load_from_session(store);
+    } else if options.continue_session {
+        if let Some(summary) = latest_session(&session_dir, Some(&cwd.to_string_lossy()))
+            .map_err(|err| err.to_string())?
+        {
+            let store = JsonlSession::open(&summary.path).map_err(|err| err.to_string())?;
+            agent.load_from_session(store);
+        }
+    }
+    if agent.session.is_none() {
+        agent.session = Some(
+            JsonlSession::create(
+                &session_dir,
+                &cwd.to_string_lossy(),
+                options.session_name.as_deref(),
+            )
+            .map_err(|err| err.to_string())?,
+        );
+    }
 
     Ok(CreateAgentSessionResult {
         session: AgentSession {
@@ -110,7 +171,10 @@ pub fn create_agent_session(
     })
 }
 
-fn initial_tools(options: &CreateAgentSessionOptions) -> Vec<String> {
+fn initial_tools(
+    options: &CreateAgentSessionOptions,
+    configured: Option<&[String]>,
+) -> Vec<String> {
     let excluded = options
         .exclude_tools
         .clone()
@@ -121,6 +185,8 @@ fn initial_tools(options: &CreateAgentSessionOptions) -> Vec<String> {
         tools.clone()
     } else if matches!(options.no_tools.as_deref(), Some("all") | Some("builtin")) {
         Vec::new()
+    } else if let Some(tools) = configured {
+        tools.to_vec()
     } else {
         DEFAULT_ACTIVE_TOOLS
             .iter()
@@ -180,5 +246,70 @@ mod tests {
         })
         .unwrap();
         assert!(result.session.agent.tools.is_empty());
+    }
+
+    #[test]
+    fn prompt_expands_templates_and_continue_restores() {
+        let dir = tempdir().unwrap();
+        let prompts = dir.path().join(".pi").join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("review.md"), "Review this code: $1").unwrap();
+        let session_dir = dir.path().join("sessions");
+        let first = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(session_dir.clone()),
+            session_name: Some("one".into()),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap();
+        let mut session = first.session;
+        session.prompt("/review src/index.ts");
+        let last = pi_ai::content_text(&session.agent.messages.last().unwrap().content);
+        assert_eq!(last, "Review this code: src/index.ts");
+        session.steer("/review extra.rs", Vec::new());
+        assert_eq!(
+            session
+                .agent
+                .queues
+                .steer
+                .last()
+                .map(|item| item.text.as_str()),
+            Some("Review this code: extra.rs")
+        );
+
+        let restored = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(session_dir),
+            continue_session: true,
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap();
+        assert!(!restored.session.agent.messages.is_empty());
+        assert_eq!(
+            pi_ai::content_text(&restored.session.agent.messages.last().unwrap().content),
+            "Review this code: src/index.ts"
+        );
+    }
+
+    #[test]
+    fn settings_default_tools_apply_when_unspecified() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultTools":["read"]}"#,
+        )
+        .unwrap();
+        let result = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(agent_dir),
+            session_dir: Some(dir.path().join("sessions")),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap();
+        assert_eq!(result.session.agent.tools, vec!["read".to_string()]);
     }
 }

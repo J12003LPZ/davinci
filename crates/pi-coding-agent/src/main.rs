@@ -1175,20 +1175,30 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     let mut last_events = Vec::new();
     if let Some(prompt) = &prepared.text {
         if !prompt.trim().is_empty() || !prepared.images.is_empty() {
-            agent.prompt_with(prompt, &prepared.images);
-            let (reply, events) = complete_prompt(parsed, agent);
-            last_reply = reply;
-            last_events = events;
+            match prepare_user_input(parsed, agent, prompt, &prepared.images, "print", None)? {
+                PreparedInput::Handled => {}
+                PreparedInput::Ready { text, images } => {
+                    agent.prompt_with(&text, &images);
+                    let (reply, events) = complete_prompt(parsed, agent);
+                    last_reply = reply;
+                    last_events = events;
+                }
+            }
         }
     }
     for extra in &prepared.remaining_messages {
         if extra.trim().is_empty() {
             continue;
         }
-        agent.prompt(extra);
-        let (reply, events) = complete_prompt(parsed, agent);
-        last_reply = reply;
-        last_events = events;
+        match prepare_user_input(parsed, agent, extra, &[], "print", None)? {
+            PreparedInput::Handled => {}
+            PreparedInput::Ready { text, images } => {
+                agent.prompt_with(&text, &images);
+                let (reply, events) = complete_prompt(parsed, agent);
+                last_reply = reply;
+                last_events = events;
+            }
+        }
     }
     if last_reply.is_empty() && last_events.is_empty() {
         return Ok(0);
@@ -1945,6 +1955,71 @@ fn apply_thinking_level(
     Ok(true)
 }
 
+enum PreparedInput {
+    Handled,
+    Ready {
+        text: String,
+        images: Vec<pi_ai::MessageContent>,
+    },
+}
+
+/// TS AgentSession.prompt preflight: extension command, input transform/handled, skill/template expand.
+fn prepare_user_input(
+    parsed: &Args,
+    agent: &mut Agent,
+    prompt: &str,
+    images: &[pi_ai::MessageContent],
+    source: &str,
+    mut session: Option<&mut InteractiveSession>,
+) -> Result<PreparedInput, String> {
+    let mut text = prompt.to_string();
+    let mut images = images.to_vec();
+    if text.starts_with('/') {
+        let name = text
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if let Some(session) = session.as_mut() {
+            if try_extension_slash(parsed, agent, session, &name)? {
+                return Ok(PreparedInput::Handled);
+            }
+        } else {
+            let mut host = loaded_extension_host(parsed);
+            if let Some(path) = host
+                .js
+                .iter()
+                .find(|ext| ext.commands.iter().any(|command| command == &name))
+                .map(|ext| ext.path.clone())
+            {
+                host.runtime_flag_values = flag_values_json(parsed);
+                let _ = host.invoke_command(&path, &name);
+                return Ok(PreparedInput::Handled);
+            }
+        }
+    }
+    let mut host = loaded_extension_host(parsed);
+    host.runtime_flag_values = flag_values_json(parsed);
+    if let Some(session) = session.as_ref() {
+        host.editor_text = session.chrome.editor.get_text().to_string();
+    }
+    let input = host.emit_input(&text, &images, source);
+    if let Some(session) = session.as_mut() {
+        session.apply_extension_ui_calls(&host.ui_calls);
+        apply_host_session_calls(parsed, agent, session, &host.session_calls, true);
+    }
+    if input.action == "handled" {
+        return Ok(PreparedInput::Handled);
+    }
+    if input.action == "transform" {
+        text = input.text;
+        images = input.images;
+    }
+    text = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
+    Ok(PreparedInput::Ready { text, images })
+}
+
 fn submit_user_message(
     parsed: &Args,
     agent: &mut Agent,
@@ -1952,15 +2027,12 @@ fn submit_user_message(
     prompt: &str,
     images: &[pi_ai::MessageContent],
 ) -> Result<bool, String> {
-    let mut host = loaded_extension_host(parsed);
-    host.runtime_flag_values = flag_values_json(parsed);
-    host.editor_text = session.chrome.editor.get_text().to_string();
-    host.emit(ExtensionEvent::Input {
-        text: prompt.to_string(),
-    });
-    session.apply_extension_ui_calls(&host.ui_calls);
-    session.chrome.transcript.push("user", prompt);
-    agent.prompt_with(prompt, images);
+    let prepared = prepare_user_input(parsed, agent, prompt, images, "interactive", Some(session))?;
+    let PreparedInput::Ready { text, images } = prepared else {
+        return Ok(true);
+    };
+    session.chrome.transcript.push("user", &text);
+    agent.prompt_with(&text, &images);
     let (reply, events) = complete_prompt(parsed, agent);
     let host = loaded_extension_host(parsed);
     apply_tool_events(&mut session.chrome, &events, Some(&host), session.width);
@@ -2848,6 +2920,14 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
             argument_items: Vec::new(),
         })
         .collect();
+    let enable_skill_commands = load_settings(&default_agent_dir())
+        .enable_skill_commands
+        .unwrap_or(true);
+    let skills = if enable_skill_commands {
+        agent.skills.as_slice()
+    } else {
+        &[]
+    };
     for spec in slash::invocable_commands(
         &host
             .js
@@ -2859,7 +2939,7 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
             })
             .collect::<Vec<_>>(),
         &agent.templates,
-        &agent.skills,
+        skills,
     ) {
         let Some(name) = spec.get("name").and_then(|value| value.as_str()) else {
             continue;
@@ -5112,6 +5192,14 @@ mod tests {
             .iter()
             .any(|command| command.name == "llama"
                 && command.description == "Manage llama.cpp router models"));
+        assert_eq!(
+            slash::parse_line("/review src/index.ts"),
+            slash::SlashAction::Prompt("/review src/index.ts".into())
+        );
+        assert_eq!(
+            slash::parse_line("/skill:test explain this"),
+            slash::SlashAction::Prompt("/skill:test explain this".into())
+        );
     }
 
     #[test]

@@ -182,7 +182,8 @@ pub fn parse_line(line: &str) -> SlashAction {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
-        other => SlashAction::Status(format!("Unknown command /{other}")),
+        // TS sends unknown slashes (skills, templates, extension commands) to prompt().
+        _ => SlashAction::Prompt(trimmed.to_string()),
     }
 }
 

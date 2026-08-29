@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (JS header/footer/widget factories, extension tool UI, live `pi server` runtime, experimental tool sampling, Ctrl+Z suspend, markdown OSC-8, `create_agent_session` embed API, sqlite session backend selection). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (skill + prompt-template slash expansion, `pi.on("input")` transform/handled, `generateImages` OpenRouter API, deeper `createAgentSession` restore/steer/follow-up). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -111,8 +111,15 @@ Closed this slice: `@file` CLI arguments match TS `processFileArguments` / `buil
 
 Closed this slice: JS `setHeader`/`setFooter`/`setWidget` function factories evaluate virtual TUI `Text`/`Container` and persist rendered `lines`. `registerTool` records `executionMode` / `renderShell` / `renderCall` / `renderResult`; `onUpdate` becomes `_piUpdates` and emits `ToolExecutionUpdate`; tool cards prefer factory lines. `PI_EXPERIMENTAL=1` attaches `{type:json_schema,strict:prefer}` and OpenAI function tools get `strict: true`. Ctrl+Z `app.suspend` restores the TUI after `kill -TSTP 0` (`PI_SUSPEND_DRY_RUN` records `Suspended`; Windows status matches TS). Markdown links emit OSC-8 when `PI_HYPERLINKS`/`PI_TERMINAL_HYPERLINKS` is on, otherwise `text (href)`. `pi server` keeps a live runtime (phase, transcript, queued steer, Busy errors, builtin `models`). `pi_coding_agent::create_agent_session` is the TS `createAgentSession` embed API. `settings.sessionBackend` / `PI_SESSION_BACKEND=sqlite` upserts JSONL sessions into `sessions.db`.
 
+Closed this slice: interactive/print/RPC/SDK expand `/skill:name` (TS XML block + args) and prompt templates (`parseCommandArgs` / `substituteArgs` / `$1` `$@` `$ARGUMENTS` `${N:-default}` `${@:N}` `${@:N:L}`) before the agent turn. Unknown slashes are sent to `prompt()` like TS (not “Unknown command”). `enableSkillCommands` gates `/skill:` autocomplete listing only. `pi.on("input")` chains `transform` and short-circuits `handled`. `generateImages` ports the openrouter-images library API (fixture `PI_OPENROUTER_IMAGES_REPLY` / abort). `create_agent_session` restores latest/path sessions, loads skills/templates/settings defaults, and exposes `prompt`/`steer`/`follow_up`/`compact`/`abort` with the same expansion.
+
 Still not product-equivalent:
 
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
 - TypeScript under `vendor/pi` remains the behavioral spec.
-- Image-generation UX (openrouter-images API is ported; TS coding-agent has no generate-images product path).
+- `pi-server` is not yet a full TS session server (no agent loop, subscribe/event stream, or authenticated session service).
+- `pi-client` is helpers, not a persistent reconnecting `SessionHandle`.
+- Embed `AgentSession` is still thinner than TS (no ModelRuntime/extensionsResult/scopedModels/customTools/subscribe).
+- Project trust is a flat `/trust` append, not the TS TrustSelector (parent-folder / session-only).
+- `pi-ai` deferred responses (`fetchDeferred`/`cancelDeferred`) and agent `message_update` streaming are not ported.
+- Help text still lacks TS Examples + Environment Variables; managed-install self-update prints manual instructions.

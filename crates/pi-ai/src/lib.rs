@@ -6,6 +6,7 @@ mod catalog;
 mod codex;
 mod codex_ws;
 mod http_proxy;
+mod images;
 mod model_config;
 mod model_runtime;
 mod models_store;
@@ -51,6 +52,10 @@ pub use codex::{
 pub use http_proxy::{
     resolve_http_proxy_url_for_target, tcp_connect_via_http_proxy,
     UNSUPPORTED_PROXY_PROTOCOL_MESSAGE,
+};
+pub use images::{
+    generate_images, image_content, images_request_body, AssistantImages, GenerateImagesOptions,
+    ImagesContext,
 };
 pub use model_config::{
     apply_config_auth, apply_config_auth_with_shell, apply_models_config,

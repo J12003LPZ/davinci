@@ -4,12 +4,16 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use crate::templates::strip_frontmatter;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
     pub name: String,
     pub path: PathBuf,
     pub description: String,
     pub body: String,
+    #[serde(default)]
+    pub base_dir: PathBuf,
 }
 
 pub fn discover_skills(roots: &[PathBuf]) -> Vec<Skill> {
@@ -39,21 +43,139 @@ pub fn discover_skills(roots: &[PathBuf]) -> Vec<Skill> {
 }
 
 fn load_skill(path: &Path) -> Option<Skill> {
-    let body = fs::read_to_string(path).ok()?;
-    let name = path
+    let raw = fs::read_to_string(path).ok()?;
+    let (frontmatter, body) = crate::templates::parse_frontmatter(&raw);
+    let parent_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill");
+    let file_stem = path
         .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("skill")
-        .to_string();
-    let description = body
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill");
+    let is_declared = path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md");
+    let name = frontmatter
+        .get("name")
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if is_declared {
+                parent_name.to_string()
+            } else {
+                file_stem.to_string()
+            }
+        });
+    let description = frontmatter
+        .get("description")
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            body.lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .to_string()
+        });
     Some(Skill {
         name,
         path: path.to_path_buf(),
         description,
-        body,
+        body: raw,
+        base_dir: path.parent().unwrap_or(path).to_path_buf(),
     })
+}
+
+/// TS `_expandSkillCommand` (`/skill:name args` → XML skill block).
+pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
+    if !text.starts_with("/skill:") {
+        return text.to_string();
+    }
+    let rest = &text["/skill:".len()..];
+    let (skill_name, args) = match rest.find(' ') {
+        Some(index) => (&rest[..index], rest[index + 1..].trim()),
+        None => (rest, ""),
+    };
+    let Some(skill) = skills.iter().find(|item| item.name == skill_name) else {
+        return text.to_string();
+    };
+    let raw = fs::read_to_string(&skill.path).unwrap_or_else(|_| skill.body.clone());
+    let body = strip_frontmatter(&raw).trim().to_string();
+    let location = skill.path.display();
+    let base = if skill.base_dir.as_os_str().is_empty() {
+        skill
+            .path
+            .parent()
+            .unwrap_or(skill.path.as_path())
+            .display()
+            .to_string()
+    } else {
+        skill.base_dir.display().to_string()
+    };
+    let skill_block = format!(
+        "<skill name=\"{name}\" location=\"{location}\">\nReferences are relative to {base}.\n\n{body}\n</skill>",
+        name = skill.name
+    );
+    if args.is_empty() {
+        skill_block
+    } else {
+        format!("{skill_block}\n\n{args}")
+    }
+}
+
+/// Expand `/skill:name` then prompt templates. Used by AgentSession.prompt.
+pub fn expand_user_text(
+    text: &str,
+    skills: &[Skill],
+    templates: &[crate::PromptTemplate],
+) -> String {
+    crate::expand_prompt_template(&expand_skill_command(text, skills), templates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn expand_skill_command_wraps_body_and_args() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: test\ndescription: Test skill\n---\n\nUse the skill body.\n",
+        )
+        .unwrap();
+        let skills = discover_skills(&[skill_dir.clone()]);
+        assert_eq!(skills[0].name, "test");
+        let expanded = expand_skill_command("/skill:test explain this", &skills);
+        assert!(expanded.contains("<skill name=\"test\" location=\""));
+        assert!(expanded.contains("Use the skill body."));
+        assert!(expanded.contains("explain this"));
+        assert!(expanded.contains(&format!(
+            "References are relative to {}",
+            skill_dir.display()
+        )));
+        assert_eq!(
+            expand_skill_command("/skill:missing hi", &skills),
+            "/skill:missing hi"
+        );
+        assert_eq!(expand_skill_command("plain", &skills), "plain");
+    }
+
+    #[test]
+    fn expand_user_text_runs_skill_then_template() {
+        let templates = vec![crate::PromptTemplate {
+            name: "review".into(),
+            path: PathBuf::from("/virtual/review.md"),
+            body: "Review this code: $1".into(),
+            description: "Review template".into(),
+            argument_hint: None,
+        }];
+        assert_eq!(
+            expand_user_text("/review src/index.ts", &[], &templates),
+            "Review this code: src/index.ts"
+        );
+    }
 }

@@ -1048,10 +1048,22 @@ async function main() {
 		const eventName = payload.type || payload.event;
 		const ctx = Object.assign({ ui, mode: "tui" }, payload.ctx || {});
 		ctx.ui = ui;
+		let current = payload;
 		for (const handler of recorded.handlers[eventName] || []) {
-			result = await handler(payload, ctx);
+			result = await handler(current, ctx);
 			if (result && (result.block || result.cancel || result.action === "handled")) {
 				break;
+			}
+			if (result && result.action === "transform" && eventName === "input") {
+				current = Object.assign({}, current, {
+					text: result.text,
+					images: result.images !== undefined ? result.images : current.images,
+				});
+				result = {
+					action: "transform",
+					text: current.text,
+					images: current.images,
+				};
 			}
 		}
 	} else if (op === "renderMessage") {

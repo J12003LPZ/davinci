@@ -75,7 +75,13 @@ pub enum ExtensionEvent {
         is_error: bool,
     },
     #[serde(rename = "input")]
-    Input { text: String },
+    Input {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<pi_ai::MessageContent>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     #[serde(rename = "user_bash")]
     UserBash {
         command: String,
@@ -105,6 +111,13 @@ pub struct LoadedJsExtension {
     pub has_editor: bool,
     pub providers: Vec<JsRegisteredProvider>,
     pub flags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InputEventResult {
+    pub action: String,
+    pub text: String,
+    pub images: Vec<pi_ai::MessageContent>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -209,6 +222,84 @@ impl ExtensionHost {
     pub fn emit(&mut self, event: ExtensionEvent) {
         self.dispatch_js(&event);
         self.events.push(event);
+    }
+
+    /// TS `emitInput`: transforms chain across extensions; `handled` short-circuits.
+    pub fn emit_input(
+        &mut self,
+        text: &str,
+        images: &[pi_ai::MessageContent],
+        source: &str,
+    ) -> InputEventResult {
+        let mut current_text = text.to_string();
+        let mut current_images = images.to_vec();
+        let mut transformed = false;
+        for ext in &self.js {
+            let payload = serde_json::json!({
+                "type": "input",
+                "text": current_text,
+                "images": current_images,
+                "source": source,
+                "flagValues": self.runtime_flag_values,
+                "activeTools": self.runtime_active_tools,
+                "thinkingLevel": self.runtime_thinking_level,
+                "editorText": self.editor_text,
+                "systemPrompt": self.runtime_system_prompt,
+            });
+            if let Ok(result) = run_js_extension(Path::new(&ext.path), "emit", &payload) {
+                if result.ok {
+                    self.last_js_result = result.result.clone();
+                    self.ui_calls.extend(result.ui_calls);
+                    self.session_calls.extend(result.session_calls);
+                    if let Some(value) = &result.result {
+                        match value.get("action").and_then(Value::as_str) {
+                            Some("handled") => {
+                                self.events.push(ExtensionEvent::Input {
+                                    text: current_text.clone(),
+                                    images: Some(current_images.clone()),
+                                    source: Some(source.to_string()),
+                                });
+                                return InputEventResult {
+                                    action: "handled".into(),
+                                    text: current_text,
+                                    images: current_images,
+                                };
+                            }
+                            Some("transform") => {
+                                if let Some(next) = value.get("text").and_then(Value::as_str) {
+                                    current_text = next.to_string();
+                                    transformed = true;
+                                }
+                                if let Some(next_images) = value.get("images") {
+                                    if let Ok(parsed) =
+                                        serde_json::from_value::<Vec<pi_ai::MessageContent>>(
+                                            next_images.clone(),
+                                        )
+                                    {
+                                        current_images = parsed;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        self.events.push(ExtensionEvent::Input {
+            text: current_text.clone(),
+            images: Some(current_images.clone()),
+            source: Some(source.to_string()),
+        });
+        InputEventResult {
+            action: if transformed {
+                "transform".into()
+            } else {
+                "continue".into()
+            },
+            text: current_text,
+            images: current_images,
+        }
     }
 
     fn dispatch_js(&mut self, event: &ExtensionEvent) {
