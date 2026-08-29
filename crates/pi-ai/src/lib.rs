@@ -148,9 +148,10 @@ pub enum MessageContent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default)]
     pub content: Vec<MessageContent>,
     #[serde(rename = "toolCallId", skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -158,6 +159,9 @@ pub struct ChatMessage {
     pub tool_name: Option<String>,
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    /// TS custom fields (`command`, `output`, `excludeFromContext`, `customType`, …).
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ChatMessage {
@@ -165,9 +169,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: vec![MessageContent::Text { text: text.into() }],
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
+            ..Self::default()
         }
     }
 
@@ -185,7 +187,19 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             tool_name: Some(tool_name.into()),
             is_error: Some(is_error),
+            ..Self::default()
         }
+    }
+
+    pub fn extra_bool(&self, key: &str) -> bool {
+        self.extra
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn extra_str(&self, key: &str) -> Option<&str> {
+        self.extra.get(key).and_then(serde_json::Value::as_str)
     }
 }
 

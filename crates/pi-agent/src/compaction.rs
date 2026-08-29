@@ -689,9 +689,7 @@ pub fn convert_to_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             "custom" => ChatMessage {
                 role: "user".into(),
                 content: message.content.clone(),
-                tool_call_id: None,
-                tool_name: None,
-                is_error: None,
+                ..ChatMessage::default()
             },
             "branchSummary" => {
                 let summary = content_text(&message.content);
@@ -877,9 +875,7 @@ mod tests {
                     arguments: serde_json::json!({"path": "b.rs"}),
                 },
             ],
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
+            ..ChatMessage::default()
         };
         let details = compute_file_lists(&extract_file_ops(&[assistant]));
         assert_eq!(details.read_files, vec!["b.rs"]);

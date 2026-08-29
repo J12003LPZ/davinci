@@ -223,9 +223,7 @@ impl Agent {
         let message = ChatMessage {
             role: "user".into(),
             content,
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
+            ..ChatMessage::default()
         };
         self.messages.push(message.clone());
         if let Some(session) = &mut self.session {

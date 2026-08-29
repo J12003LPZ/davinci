@@ -1,6 +1,8 @@
 # pi Rust rewrite progress
 
-**Complete: 100% after managed fd/rg, OSC title, RPC available snapshot, and autocomplete default 5.** TypeScript under `vendor/pi` stays as the behavioral reference (desired end state, not a gap).
+**Integration branch: `rust-rewrite`.** TypeScript under `vendor/pi` stays as the behavioral reference.
+
+**Complete: ChatMessage extras landed; bashExecution persist, `before_agent_start` custom messages, and fd/rg find/grep still open.** Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -153,9 +155,15 @@ Closed this slice: `autocompleteMaxVisible` default **5** (TS `settings-manager`
 
 Closed this slice: RPC `prompt` preflight matches TS — compaction-in-progress and streaming-without-`streamingBehavior` fail before a turn; missing model/API key use TS `auth-guidance` strings; extension command / `input` handled count as success without starting a turn; `streamingBehavior` queues steer/follow-up. RPC `bash` emits `user_bash` and honors an extension `result` override.
 
+Closed this slice: `ChatMessage` now flattens TS extra fields (`command`, `output`, `excludeFromContext`, `customType`, …) with `#[serde(default)]` content so JSONL `bashExecution` / `custom` messages deserialize. `ChatMessage::extra_bool` / `extra_str` read those keys. Constructors use `Default`.
+
 ## Remaining product gaps
 
-None. A `pi eval` runner binary is not a shipped TS CLI (`run-evals.mjs` is a package script; the harness is library-only in both trees).
+- Interactive `!` / `!!` bash: honor `user_bash` result override, persist `role: "bashExecution"` into agent messages + JSONL, `excludeFromContext` for `!!`, and flush `_pendingBashMessages` on `agent_end` / before the next prompt (TS `recordBashResult`).
+- `before_agent_start` handlers can return `{ message, systemPrompt }`; Rust applies `systemPrompt` only and drops injected custom messages.
+- find/grep still native-walk when `fd`/`rg` are on PATH or in `{agentDir}/bin`. TS `ensureTool` then spawns `fd`/`rg` with the TypeScript argv (`--glob --hidden`, `--json --line-number`, git-aware `--no-require-git`). Native walk remains a fallback when the binaries are missing.
+
+A `pi eval` runner binary is not a shipped TS CLI (`run-evals.mjs` is a package script; the harness is library-only in both trees).
 
 Native Darwin/Win32 `.node` addons are optional in TypeScript (load fails → `false` / env). Rust matches that fallback: crossterm Shift, `PI_TUI_SHIFT`, `PI_TUI_NATIVE_MODIFIER_*`, and the TS rewrite helpers. Not shipping `.node` binaries is not a product-feature gap.
 

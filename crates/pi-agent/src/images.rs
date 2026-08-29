@@ -295,9 +295,7 @@ mod tests {
                     text: "caption".into(),
                 },
             ],
-            tool_call_id: None,
-            tool_name: None,
-            is_error: None,
+            ..ChatMessage::default()
         }];
         let blocked = apply_block_images(&messages);
         assert_eq!(

@@ -308,9 +308,7 @@ pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
                 },
             })
             .collect(),
-        tool_call_id: None,
-        tool_name: None,
-        is_error: None,
+        ..ChatMessage::default()
     }
 }
 

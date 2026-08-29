@@ -617,6 +617,7 @@ fn tool_result_message(
         tool_call_id: Some(id.to_string()),
         tool_name: Some(name.to_string()),
         is_error: Some(result.is_error),
+        ..ChatMessage::default()
     }
 }
 
