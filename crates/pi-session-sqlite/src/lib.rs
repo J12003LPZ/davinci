@@ -1,457 +1,270 @@
-use async_trait::async_trait;
-use pi_core::{Message, Role, SessionMetadata, ToolCall, WriterLease};
-use rusqlite::{params, Connection, OptionalExtension};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use thiserror::Error;
+//! SQLite session backend with official fenced writer-lease semantics.
 
-#[derive(Debug, Error)]
-pub enum SessionStoreError {
-    #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-    #[error("Session not found: {0}")]
-    SessionNotFound(String),
-    #[error("Writer lease conflict for session: {0}")]
-    LeaseConflict(String),
-}
+pub mod leases;
+pub mod repo;
+pub mod schema;
 
-pub type Result<T> = std::result::Result<T, SessionStoreError>;
-
-#[async_trait]
-pub trait SessionStore: Send + Sync {
-    async fn create_session(
-        &self,
-        id: &str,
-        title: &str,
-        tags: &[String],
-    ) -> Result<SessionMetadata>;
-    async fn get_session(&self, id: &str) -> Result<Option<SessionMetadata>>;
-    async fn list_sessions(&self) -> Result<Vec<SessionMetadata>>;
-    async fn delete_session(&self, id: &str) -> Result<bool>;
-
-    async fn append_message(&self, message: &Message) -> Result<()>;
-    async fn get_messages(&self, session_id: &str) -> Result<Vec<Message>>;
-
-    async fn acquire_writer_lease(
-        &self,
-        session_id: &str,
-        holder_id: &str,
-        ttl_ms: i64,
-    ) -> Result<bool>;
-    async fn renew_writer_lease(
-        &self,
-        session_id: &str,
-        holder_id: &str,
-        ttl_ms: i64,
-    ) -> Result<bool>;
-    async fn release_writer_lease(&self, session_id: &str, holder_id: &str) -> Result<bool>;
-    async fn get_current_lease(&self, session_id: &str) -> Result<Option<WriterLease>>;
-}
-
-#[derive(Clone)]
-pub struct SqliteSessionStore {
-    conn: Arc<Mutex<Connection>>,
-    _db_path: Option<PathBuf>,
-}
-
-impl SqliteSessionStore {
-    pub fn new_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
-            _db_path: None,
-        };
-        store.init_schema()?;
-        Ok(store)
-    }
-
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(&path)?;
-        let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
-            _db_path: Some(path.as_ref().to_path_buf()),
-        };
-        store.init_schema()?;
-        Ok(store)
-    }
-
-    fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                tags_json TEXT NOT NULL DEFAULT '[]'
-            );
-
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                tool_calls_json TEXT,
-                tool_call_id TEXT,
-                timestamp INTEGER NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
-
-            CREATE TABLE IF NOT EXISTS writer_leases (
-                session_id TEXT PRIMARY KEY,
-                holder_id TEXT NOT NULL,
-                acquired_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            ",
-        )?;
-        Ok(())
-    }
-
-    fn now_ms() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64
-    }
-}
-
-#[async_trait]
-impl SessionStore for SqliteSessionStore {
-    async fn create_session(
-        &self,
-        id: &str,
-        title: &str,
-        tags: &[String],
-    ) -> Result<SessionMetadata> {
-        let now = Self::now_ms();
-        let tags_json = serde_json::to_string(tags)?;
-        let conn = self.conn.lock().unwrap();
-
-        conn.execute(
-            "INSERT INTO sessions (id, title, created_at, updated_at, tags_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, title, now, now, tags_json],
-        )?;
-
-        Ok(SessionMetadata {
-            id: id.to_string(),
-            title: title.to_string(),
-            created_at: now,
-            updated_at: now,
-            tags: tags.to_vec(),
-        })
-    }
-
-    async fn get_session(&self, id: &str) -> Result<Option<SessionMetadata>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, created_at, updated_at, tags_json FROM sessions WHERE id = ?1",
-        )?;
-
-        let res = stmt
-            .query_row(params![id], |row| {
-                let tags_json: String = row.get(4)?;
-                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-                Ok(SessionMetadata {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    tags,
-                })
-            })
-            .optional()?;
-
-        Ok(res)
-    }
-
-    async fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, created_at, updated_at, tags_json FROM sessions ORDER BY updated_at DESC",
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            let tags_json: String = row.get(4)?;
-            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-            Ok(SessionMetadata {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                created_at: row.get(2)?,
-                updated_at: row.get(3)?,
-                tags,
-            })
-        })?;
-
-        let mut list = Vec::new();
-        for r in rows {
-            list.push(r?);
-        }
-        Ok(list)
-    }
-
-    async fn delete_session(&self, id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let changes = conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
-        Ok(changes > 0)
-    }
-
-    async fn append_message(&self, message: &Message) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let tool_calls_json = match &message.tool_calls {
-            Some(tc) => Some(serde_json::to_string(tc)?),
-            None => None,
-        };
-
-        let role_str = match message.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
-        };
-
-        conn.execute(
-            "INSERT INTO messages (id, session_id, role, content, tool_calls_json, tool_call_id, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                message.id,
-                message.session_id,
-                role_str,
-                message.content,
-                tool_calls_json,
-                message.tool_call_id,
-                message.timestamp
-            ],
-        )?;
-
-        conn.execute(
-            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
-            params![message.timestamp, message.session_id],
-        )?;
-
-        Ok(())
-    }
-
-    async fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, content, tool_calls_json, tool_call_id, timestamp
-             FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC",
-        )?;
-
-        let rows = stmt.query_map(params![session_id], |row| {
-            let role_str: String = row.get(2)?;
-            let role = match role_str.as_str() {
-                "system" => Role::System,
-                "user" => Role::User,
-                "assistant" => Role::Assistant,
-                "tool" => Role::Tool,
-                _ => Role::User,
-            };
-
-            let tool_calls_json: Option<String> = row.get(4)?;
-            let tool_calls: Option<Vec<ToolCall>> = match tool_calls_json {
-                Some(json_str) => serde_json::from_str(&json_str).ok(),
-                None => None,
-            };
-
-            Ok(Message {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                role,
-                content: row.get(3)?,
-                tool_calls,
-                tool_call_id: row.get(5)?,
-                timestamp: row.get(6)?,
-            })
-        })?;
-
-        let mut list = Vec::new();
-        for r in rows {
-            list.push(r?);
-        }
-        Ok(list)
-    }
-
-    async fn acquire_writer_lease(
-        &self,
-        session_id: &str,
-        holder_id: &str,
-        ttl_ms: i64,
-    ) -> Result<bool> {
-        let now = Self::now_ms();
-        let expires_at = now + ttl_ms;
-        let conn = self.conn.lock().unwrap();
-
-        // Check if lease is currently active by someone else
-        let mut stmt =
-            conn.prepare("SELECT holder_id, expires_at FROM writer_leases WHERE session_id = ?1")?;
-        let active_lease = stmt
-            .query_row(params![session_id], |row| {
-                let h: String = row.get(0)?;
-                let exp: i64 = row.get(1)?;
-                Ok((h, exp))
-            })
-            .optional()?;
-
-        if let Some((existing_holder, current_expires_at)) = active_lease {
-            if current_expires_at > now && existing_holder != holder_id {
-                return Ok(false);
-            }
-        }
-
-        conn.execute(
-            "INSERT INTO writer_leases (session_id, holder_id, acquired_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(session_id) DO UPDATE SET
-                holder_id = excluded.holder_id,
-                acquired_at = excluded.acquired_at,
-                expires_at = excluded.expires_at",
-            params![session_id, holder_id, now, expires_at],
-        )?;
-
-        Ok(true)
-    }
-
-    async fn renew_writer_lease(
-        &self,
-        session_id: &str,
-        holder_id: &str,
-        ttl_ms: i64,
-    ) -> Result<bool> {
-        let now = Self::now_ms();
-        let new_expires_at = now + ttl_ms;
-        let conn = self.conn.lock().unwrap();
-
-        let changes = conn.execute(
-            "UPDATE writer_leases SET expires_at = ?1
-             WHERE session_id = ?2 AND holder_id = ?3 AND expires_at > ?4",
-            params![new_expires_at, session_id, holder_id, now],
-        )?;
-
-        Ok(changes > 0)
-    }
-
-    async fn release_writer_lease(&self, session_id: &str, holder_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let changes = conn.execute(
-            "DELETE FROM writer_leases WHERE session_id = ?1 AND holder_id = ?2",
-            params![session_id, holder_id],
-        )?;
-        Ok(changes > 0)
-    }
-
-    async fn get_current_lease(&self, session_id: &str) -> Result<Option<WriterLease>> {
-        let now = Self::now_ms();
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT session_id, holder_id, acquired_at, expires_at FROM writer_leases
-             WHERE session_id = ?1 AND expires_at > ?2",
-        )?;
-
-        let res = stmt
-            .query_row(params![session_id, now], |row| {
-                Ok(WriterLease {
-                    session_id: row.get(0)?,
-                    holder_id: row.get(1)?,
-                    acquired_at: row.get(2)?,
-                    expires_at: row.get(3)?,
-                })
-            })
-            .optional()?;
-
-        Ok(res)
-    }
-}
+pub use leases::{
+    acquire_writer_lease, delete_writer_lease, read_writer_lease, release_writer_lease,
+    renew_writer_lease,
+};
+pub use repo::{SessionHandle, SqliteSessionRepository, StoreError};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_core::{Role, SessionErrorCode, WriterLease, WriterLeaseOptions};
 
-    #[tokio::test]
-    async fn test_session_lifecycle() {
-        let store = SqliteSessionStore::new_in_memory().unwrap();
-        let session = store
-            .create_session("sess-1", "Test Session", &["ai".to_string()])
-            .await
-            .unwrap();
-
-        assert_eq!(session.id, "sess-1");
-        assert_eq!(session.title, "Test Session");
-
-        let fetched = store.get_session("sess-1").await.unwrap().unwrap();
-        assert_eq!(fetched.id, "sess-1");
-        assert_eq!(fetched.tags, vec!["ai".to_string()]);
-
-        let sessions = store.list_sessions().await.unwrap();
-        assert_eq!(sessions.len(), 1);
-
-        let deleted = store.delete_session("sess-1").await.unwrap();
-        assert!(deleted);
-        assert!(store.get_session("sess-1").await.unwrap().is_none());
+    fn repo() -> SqliteSessionRepository {
+        SqliteSessionRepository::open_in_memory(WriterLeaseOptions::default()).unwrap()
     }
 
-    #[tokio::test]
-    async fn test_writer_lease_semantics() {
-        let store = SqliteSessionStore::new_in_memory().unwrap();
-        store
-            .create_session("sess-lease", "Lease Test", &[])
-            .await
-            .unwrap();
+    #[test]
+    fn rejects_invalid_lease_timing() {
+        let bad = WriterLeaseOptions {
+            ttl_ms: 0,
+            heartbeat_interval_ms: 10,
+        };
+        assert!(SqliteSessionRepository::open_in_memory(bad).is_err());
+        let bad = WriterLeaseOptions {
+            ttl_ms: 10,
+            heartbeat_interval_ms: 10,
+        };
+        assert!(SqliteSessionRepository::open_in_memory(bad).is_err());
+    }
 
-        // Acquire lease
-        let ok = store
-            .acquire_writer_lease("sess-lease", "worker-1", 10000)
-            .await
+    #[test]
+    fn create_list_open_without_second_writer() {
+        let repo = repo();
+        let created = repo
+            .create(
+                Some("session-1"),
+                "/tmp/work",
+                None,
+                Some(&serde_json::json!({"profile":"reviewer"})),
+            )
             .unwrap();
-        assert!(ok);
+        assert_eq!(created.metadata.id, "session-1");
+        assert_eq!(
+            created.metadata.metadata,
+            Some(serde_json::json!({"profile":"reviewer"}))
+        );
 
-        // Same worker re-acquire/renew succeeds
-        let renew_ok = store
-            .renew_writer_lease("sess-lease", "worker-1", 20000)
-            .await
-            .unwrap();
-        assert!(renew_ok);
+        let listed = repo.list(Some("/tmp/work")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].metadata,
+            Some(serde_json::json!({"profile":"reviewer"}))
+        );
 
-        // Competing worker fails
-        let conflict = store
-            .acquire_writer_lease("sess-lease", "worker-2", 10000)
-            .await
-            .unwrap();
-        assert!(!conflict);
+        // Same-process reopen reuses the storage (no second lease).
+        let reopened = repo.open("session-1").unwrap();
+        assert_eq!(reopened.metadata.id, "session-1");
+    }
 
-        // Current lease check
-        let lease = store
-            .get_current_lease("sess-lease")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(lease.holder_id, "worker-1");
+    #[test]
+    fn lists_without_acquiring_leases() {
+        let a = repo();
+        a.create(Some("s1"), "/tmp", None, None).unwrap();
+        let listed = a.list(None).unwrap();
+        assert_eq!(listed.len(), 1);
+        // A second repository on a distinct in-memory db cannot see it;
+        // list on the same repo must not take the lease away.
+        let lease = a.current_lease("s1").unwrap().unwrap();
+        assert_eq!(lease.fence, 1);
+    }
 
-        // Release lease
-        let released = store
-            .release_writer_lease("sess-lease", "worker-1")
-            .await
-            .unwrap();
-        assert!(released);
+    #[test]
+    fn rejects_second_writer_until_release() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let path = path.path().to_path_buf();
+        let first =
+            SqliteSessionRepository::open_path(&path, WriterLeaseOptions::default()).unwrap();
+        first.create(Some("shared"), "/tmp", None, None).unwrap();
+        let second =
+            SqliteSessionRepository::open_path(&path, WriterLeaseOptions::default()).unwrap();
+        let err = second.open("shared").unwrap_err();
+        match err {
+            StoreError::Session(e) => {
+                assert_eq!(e.code, SessionErrorCode::Storage);
+                assert!(e.message.contains("already has an active writer"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        first.release("shared").unwrap();
+        assert!(second.open("shared").is_ok());
+    }
 
-        // Competing worker can now acquire
-        let ok2 = store
-            .acquire_writer_lease("sess-lease", "worker-2", 10000)
-            .await
+    #[test]
+    fn fences_stale_owner_after_expiry() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let path = path.path().to_path_buf();
+        let first =
+            SqliteSessionRepository::open_path(&path, WriterLeaseOptions::default()).unwrap();
+        first.create(Some("lease"), "/tmp", None, None).unwrap();
+        first.force_expire_lease("lease", 1).unwrap();
+
+        let second =
+            SqliteSessionRepository::open_path(&path, WriterLeaseOptions::default()).unwrap();
+        second.open("lease").unwrap();
+        let lease = second.current_lease("lease").unwrap().unwrap();
+        assert_eq!(lease.fence, 2);
+
+        let err = first
+            .append_message("lease", "main", "e1", Role::User, "stale")
+            .unwrap_err();
+        match err {
+            StoreError::Session(e) => {
+                assert!(e.message.contains("writer lease was lost"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        first.release("lease").unwrap();
+        let still = second.current_lease("lease").unwrap().unwrap();
+        assert_eq!(still.fence, 2);
+        assert_eq!(still.owner_id, lease.owner_id);
+    }
+
+    #[test]
+    fn assigns_parents_and_one_sequence() {
+        let repo = repo();
+        repo.create(Some("s"), "/tmp", None, None).unwrap();
+        let a = repo
+            .append_message("s", "main", "m1", Role::User, "one")
             .unwrap();
-        assert!(ok2);
+        let b = repo
+            .append_message("s", "main", "m2", Role::Assistant, "two")
+            .unwrap();
+        match (a, b) {
+            (
+                pi_core::Entry::Message {
+                    seq: 1,
+                    parent_id: None,
+                    ..
+                },
+                pi_core::Entry::Message {
+                    seq: 2,
+                    parent_id: Some(p),
+                    ..
+                },
+            ) => assert_eq!(p, "m1"),
+            other => panic!("unexpected {other:?}"),
+        }
+        repo.create_lane("s", "review").unwrap();
+        let c = repo
+            .append_message("s", "review", "m3", Role::User, "side")
+            .unwrap();
+        match c {
+            pi_core::Entry::Message {
+                seq: 4,
+                parent_id: None,
+                ..
+            } => {}
+            other => panic!(
+                "lane should start empty and consume seq 4 after lane_move seq 3, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_ids() {
+        let repo = repo();
+        repo.create(Some("s"), "/tmp", None, None).unwrap();
+        repo.append_message("s", "main", "m1", Role::User, "one")
+            .unwrap();
+        let err = repo
+            .append_message("s", "main", "m1", Role::User, "dup")
+            .unwrap_err();
+        match err {
+            StoreError::Session(e) => assert_eq!(e.code, SessionErrorCode::AlreadyExists),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(repo.entries("s").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn name_facts_latest_wins_and_clear() {
+        let repo = repo();
+        repo.create(Some("s"), "/tmp", None, None).unwrap();
+        repo.set_name("s", Some("alpha")).unwrap();
+        repo.set_name("s", Some("beta")).unwrap();
+        let listed = repo.list(None).unwrap();
+        assert_eq!(listed[0].session_name.as_deref(), Some("beta"));
+        repo.set_name("s", None).unwrap();
+        let listed = repo.list(None).unwrap();
+        assert!(listed[0].session_name.is_none());
+    }
+
+    #[test]
+    fn delete_is_idempotent() {
+        let repo = repo();
+        repo.create(Some("s"), "/tmp", None, None).unwrap();
+        repo.delete("s").unwrap();
+        repo.delete("s").unwrap();
+        assert!(repo.list(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fork_copies_tree() {
+        let repo = repo();
+        repo.create(Some("src"), "/tmp", None, None).unwrap();
+        repo.append_message("src", "main", "m1", Role::User, "one")
+            .unwrap();
+        repo.append_message("src", "main", "m2", Role::Assistant, "two")
+            .unwrap();
+        repo.fork("src", "dst", "/tmp", true).unwrap();
+        assert_eq!(repo.entries("dst").unwrap().len(), 2);
+        assert_eq!(repo.entries("src").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn acquire_sql_matches_official_fence_rules() {
+        let repo = repo();
+        repo.create(Some("s"), "/tmp", None, None).unwrap();
+        let first = repo.current_lease("s").unwrap().unwrap();
+        assert_eq!(first.fence, 1);
+
+        // Direct SQL acquire while active must fail.
+        let inner_lease = {
+            let path = tempfile::NamedTempFile::new().unwrap();
+            let db = rusqlite::Connection::open(path.path()).unwrap();
+            db.execute_batch(crate::schema::INITIAL_SCHEMA).unwrap();
+            let now = 1_000i64;
+            let first = acquire_writer_lease(&db, "s", "a", now, now + 30_000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.fence, 1);
+            assert!(acquire_writer_lease(&db, "s", "b", now + 1, now + 31_000)
+                .unwrap()
+                .is_none());
+            let taken = acquire_writer_lease(&db, "s", "b", now + 40_000, now + 70_000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(taken.fence, 2);
+            assert_eq!(taken.owner_id, "b");
+
+            let mut stale = WriterLease {
+                owner_id: "a".into(),
+                fence: 1,
+                expires_at_ms: now + 30_000,
+            };
+            assert!(!renew_writer_lease(&db, "s", &mut stale, now + 40_000, now + 80_000).unwrap());
+            first
+        };
+        assert_eq!(inner_lease.owner_id, "a");
+    }
+
+    #[test]
+    fn heartbeat_renews_idle_lease() {
+        let repo = repo();
+        repo.create(Some("s"), "/tmp", None, None).unwrap();
+        let before = repo.current_lease("s").unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(repo.heartbeat("s").unwrap());
+        let after = repo.current_lease("s").unwrap().unwrap();
+        assert_eq!(after.owner_id, before.owner_id);
+        assert_eq!(after.fence, before.fence);
+        assert!(after.expires_at_ms >= before.expires_at_ms);
     }
 }

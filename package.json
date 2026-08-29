@@ -1,13 +1,8 @@
 {
-  "name": "pi-monorepo",
+  "name": "pi",
   "private": true,
-  "type": "module",
-  "scripts": {
-    "build": "pnpm -r run build",
-    "test": "pnpm -r run test",
-    "lint": "pnpm -r run lint"
-  },
-  "devDependencies": {
-    "typescript": "^5.6.0"
-  }
+  "description": "Pi agent harness. TypeScript packages remain authoritative until the Phase 8 Rust gate.",
+  "workspaces": [
+    "packages/*"
+  ]
 }

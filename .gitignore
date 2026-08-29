@@ -5,3 +5,5 @@ dist/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+agent-tools/
+.pi/

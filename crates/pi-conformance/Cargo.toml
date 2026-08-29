@@ -12,10 +12,13 @@ pi-ai = { path = "../pi-ai" }
 pi-agent = { path = "../pi-agent" }
 pi-client = { path = "../pi-client" }
 pi-server = { path = "../pi-server" }
-pi-coding-agent = { path = "../pi-coding-agent" }
 pi-tui = { path = "../pi-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tempfile = { workspace = true }
 async-trait = { workspace = true }
+hex = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

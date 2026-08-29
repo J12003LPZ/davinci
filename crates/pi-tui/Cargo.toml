@@ -7,9 +7,4 @@ authors.workspace = true
 
 [dependencies]
 pi-core = { path = "../pi-core" }
-pi-client = { path = "../pi-client" }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
-tokio = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
+unicode-width = { workspace = true }

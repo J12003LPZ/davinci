@@ -2,37 +2,26 @@
 
 ## Executive Summary
 
-This program governs the complete, phase-gated migration of the `pi` AI agent monorepo from TypeScript to idiomatic Rust. The goal is to achieve production-grade performance, strict concurrency safety (e.g. SQLite writer leases, session isolation), robust protocol conformance (`pi-client`, `pi-server`, `pi-ai`, `pi-agent`, `pi-tui`), and differential fixture parity across all subsystems.
+This program governs the phase-gated migration of the Pi agent harness from TypeScript to idiomatic Rust. The TypeScript tree under `packages/` is the authority for wire formats, session semantics, and golden fixtures until the Phase 8 gate is proven. Rust crates under `crates/` must match those contracts, not invent a parallel product.
+
+Authority source for contracts: the earendil-works/pi TypeScript implementation (packages `telemetry`, `ai`, `agent`, `protocol`, `client`, `server`, `session-backends/sqlite-node`, `tui`, `coding-agent`).
 
 ## Phase Architecture
 
-- **Phase 0: Architecture, Tooling, and Workspace Setup**
-  - Cargo workspace configuration (`crates/`)
-  - TypeScript workspace (`packages/`)
-  - Shared schemas and protocol definitions
-- **Phase 1: Foundation and Shared Types (`pi-core`)**
-  - Protocol message formats, event streams, RPC contracts
-  - Serialization / deserialization parity with TypeScript
-- **Phase 2: Storage & Session Engine (`pi-session-sqlite`)**
-  - High-performance SQLite session storage
-  - Writer-lease semantics (exclusive acquire, heartbeats, automatic lease expiry)
-  - Differential snapshot and event playback conformance
-- **Phase 3: AI Provider Subsystem (`pi-ai`)**
-  - Multi-provider AI abstractions (OpenAI, Anthropic, Gemini, Ollama, custom LLMs)
-  - Streaming completions, token counting, tool calling
-- **Phase 4: Agent Core Execution Loop (`pi-agent`)**
-  - State machine, thought-action-observation cycles, subagent delegation
-  - Cancellation tokens, timeout management, middleware pipelines
-- **Phase 5: Networking & Protocol Layer (`pi-client`, `pi-server`)**
-  - JSON-RPC over WebSockets / HTTP / stdio
-  - Real-time event streaming and duplex communication
-- **Phase 6: Coding Agent & TUI (`pi-coding-agent`, `pi-tui`)**
-  - Terminal User Interface with ratatui / crossterm
-  - Interactive tool approval, diff viewer, multi-session management
-- **Phase 7: Differential Conformance & Golden Fixture Validation**
-  - Dual-run fixture evaluation verifying 100% output parity between TypeScript and Rust
-- **Phase 8: Transition, Cutover, and Parity Sign-off**
-  - Final phase gate validation: `cargo test`, `cargo clippy`, `cargo fmt` clean.
+- **Phase 0 — Workspace.** Cargo workspace, TypeScript reference packages, shared fixture directory.
+- **Phase 1 — `pi-core`.** Shared types, CBOR subset, length-prefixed framing, protocol messages, session error codes.
+- **Phase 2 — `pi-session-sqlite`.** Official schema, fenced writer leases, repository create/open/list/delete/fork, entry/lane/fact storage, conformance cases.
+- **Phase 3 — `pi-ai`.** Message/content model, stream events that never throw, faux provider, tool-argument validation.
+- **Phase 4 — `pi-agent`.** Agent loop, sequential/parallel tools, length-stop fail-all, steering/follow-up queues.
+- **Phase 5 — `pi-client` / `pi-server`.** Hello handshake, framed CBOR commands, exclusive/shared session leases, in-memory transport.
+- **Phase 6 — `pi-coding-agent` / `pi-tui`.** Print-mode CLI, built-in tools, JSONL session subset, differential TUI renderer.
+- **Phase 7 — Differential fixtures.** Golden CBOR vectors, writer-lease traces, protocol envelopes, agent-loop transcripts.
+- **Phase 8 — Gate.** `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`. TypeScript remains the product authority.
 
-## Parity and Authority Rule
-TypeScript remains authoritative for protocol schemas and golden fixtures until Phase 8 gate criteria are completely verified.
+## End State
+
+The Rust port is complete for the program's defined slices: session-sqlite writer leases with fence takeover, protocol/client/server handshake and commands, pi-ai stream protocol, pi-agent loop, coding-agent print path and TUI differential render. TypeScript remains authoritative until a later product cutover that is *not* this gate.
+
+## Authority Rule
+
+TypeScript remains authoritative for protocol schemas and golden fixtures until Phase 8 gate criteria are completely verified. Rust must not redefine success around a simpler session or RPC model.

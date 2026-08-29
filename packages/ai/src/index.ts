@@ -1,53 +1,28 @@
-import { Message, ToolCall } from '@pi/core';
+import type { Message, ToolCall } from '@pi/core';
 
-export interface CompletionOptions {
-  model: string;
-  temperature?: number;
-  maxTokens?: number;
-  tools?: Array<{
-    name: string;
-    description: string;
-    parameters: Record<string, unknown>;
-  }>;
+export type StopReason = 'stop' | 'length' | 'toolUse' | 'error' | 'aborted';
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters: unknown;
 }
 
 export interface CompletionResponse {
   content: string;
   toolCalls?: ToolCall[];
-  finishReason: 'stop' | 'tool_calls' | 'length' | 'error';
+  stopReason: StopReason;
 }
 
-export interface ILanguageModel {
-  generate(messages: Message[], options: CompletionOptions): Promise<CompletionResponse>;
-  stream(
-    messages: Message[],
-    options: CompletionOptions,
-    onChunk: (chunk: string) => void
-  ): Promise<CompletionResponse>;
-}
+export type AssistantMessageEvent =
+  | { type: 'start'; messageId: string }
+  | { type: 'text_delta'; messageId: string; delta: string }
+  | { type: 'done'; stopReason: StopReason }
+  | { type: 'error'; message: string };
 
-export class MockLanguageModel implements ILanguageModel {
-  async generate(messages: Message[], options: CompletionOptions): Promise<CompletionResponse> {
-    const last = messages[messages.length - 1];
-    return {
-      content: `Echo: ${last?.content || ''}`,
-      finishReason: 'stop',
-    };
+export function lastUserText(messages: Message[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') return messages[i].content;
   }
-
-  async stream(
-    messages: Message[],
-    options: CompletionOptions,
-    onChunk: (chunk: string) => void
-  ): Promise<CompletionResponse> {
-    const last = messages[messages.length - 1];
-    const text = `Echo: ${last?.content || ''}`;
-    for (const char of text) {
-      onChunk(char);
-    }
-    return {
-      content: text,
-      finishReason: 'stop',
-    };
-  }
+  return '';
 }

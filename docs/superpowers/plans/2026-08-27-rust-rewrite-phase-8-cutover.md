@@ -1,8 +1,11 @@
-# Phase 8: Final Cutover and Production Sign-off
+# Phase 8: Gate and Sign-off
 
-## Overview
-Phase 8 defines the formal cutover checklist:
-1. `cargo test --workspace` 100% pass.
-2. `cargo clippy --workspace --all-targets -- -D warnings` zero errors/warnings.
-3. `cargo fmt --check` cleanly formatted.
-4. Parity fixtures green.
+## Checklist
+
+1. `cargo test --workspace` passes.
+2. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+3. `cargo fmt --check` is clean.
+4. Phase 7 fixtures are green.
+5. TypeScript packages still compile as the authority; Rust is the port, not the product cutover.
+
+This gate does **not** remove the TypeScript runtime. Product cutover is a later decision.

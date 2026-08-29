@@ -1,40 +1,21 @@
-import { RpcRequest, RpcResponse, AgentEvent, SessionMetadata, Message } from '@pi/core';
+import type { ClientMessage, SessionMetadata } from '@pi/core';
+
+export type SessionLeaseMode = 'shared' | 'exclusive';
 
 export interface ClientTransport {
-  send(request: RpcRequest): Promise<RpcResponse>;
-  onEvent(handler: (event: AgentEvent) => void): void;
+  send(message: ClientMessage): Promise<unknown>;
 }
 
-export class PiClient {
-  constructor(private transport: ClientTransport) {}
+export interface SessionLease {
+  id: string;
+  mode: SessionLeaseMode;
+  prompt(text: string): Promise<unknown>;
+  detach(): Promise<void>;
+}
 
-  async createSession(title: string, tags: string[] = []): Promise<SessionMetadata> {
-    const res = await this.transport.send({
-      id: `req-${Date.now()}`,
-      method: 'session.create',
-      params: { title, tags },
-    });
-    if (res.error) throw new Error(res.error.message);
-    return res.result as SessionMetadata;
-  }
-
-  async runPrompt(sessionId: string, prompt: string): Promise<string> {
-    const res = await this.transport.send({
-      id: `req-${Date.now()}`,
-      method: 'agent.run',
-      params: { sessionId, prompt },
-    });
-    if (res.error) throw new Error(res.error.message);
-    return (res.result as { response: string }).response;
-  }
-
-  async getMessages(sessionId: string): Promise<Message[]> {
-    const res = await this.transport.send({
-      id: `req-${Date.now()}`,
-      method: 'session.getMessages',
-      params: { sessionId },
-    });
-    if (res.error) throw new Error(res.error.message);
-    return res.result as Message[];
-  }
+export interface PiClient {
+  connect(): Promise<unknown>;
+  listSessions(): Promise<SessionMetadata[]>;
+  createSession(cwd?: string, name?: string): Promise<SessionLease>;
+  attachSession(sessionId: string): Promise<SessionLease>;
 }

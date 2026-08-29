@@ -1,37 +1,28 @@
-# Pi Monorepo: TypeScript to Rust High-Performance Agent Architecture
+# Pi
 
-This monorepo contains both the TypeScript reference implementation (`packages/*`) and the high-performance idiomatic Rust implementation (`crates/*`) of the Pi AI Agent system.
+TypeScript-to-Rust migration of the Pi agent harness. TypeScript packages under `packages/` remain the schema and fixture authority until the Phase 8 gate. Rust crates under `crates/` are the port.
 
-## Architecture
+Program and phase plans: `docs/superpowers/plans/2026-08-27-rust-rewrite-*.md`.
 
-### Rust Workspace (`crates/`)
-- `pi-core`: Shared protocols, types, RPC envelopes, event schemas.
-- `pi-session-sqlite`: SQLite session store with strict writer leases and TTL heartbeats.
-- `pi-ai`: Multi-provider AI streaming, embeddings, and tool execution.
-- `pi-agent`: Agent state machine, execution loop, subagent delegation.
-- `pi-client`: Client SDK and WebSocket/stdio RPC transport.
-- `pi-server`: Daemon server exposing agent services and sessions.
-- `pi-coding-agent`: Specialized programming agent with AST and tool integration.
-- `pi-tui`: Interactive terminal user interface built with Ratatui.
-- `pi-conformance`: Differential test harness validating TS vs Rust parity.
+## Rust workspace
 
-### TypeScript Reference Packages (`packages/`)
-- `@pi/core`: Core protocol definitions.
-- `@pi/session-sqlite`: TypeScript SQLite storage with writer-lease semantics.
-- `@pi/ai`: TypeScript AI provider integrations.
-- `@pi/agent`: TypeScript agent execution loop.
-- `@pi/client`: TypeScript client library.
-- `@pi/server`: TypeScript server daemon.
+| Crate | Phase | What it ports |
+| --- | --- | --- |
+| `pi-core` | 1 | Shared types, RFC 8949 CBOR subset, length-prefixed framing, protocol messages |
+| `pi-session-sqlite` | 2 | Official SQLite schema, fenced writer leases, repository/entry/lane/fact storage |
+| `pi-ai` | 3 | Stream protocol, faux/mock providers, tool-argument validation |
+| `pi-agent` | 4 | Agent loop, tool dispatch, length-stop fail-all |
+| `pi-client` / `pi-server` | 5 | Hello handshake, commands, exclusive/shared leases |
+| `pi-coding-agent` / `pi-tui` | 6 | Print-mode CLI, built-in tools, differential renderer |
+| `pi-conformance` | 7 | Golden CBOR, writer-lease, protocol, and loopback fixtures |
 
-## Building and Testing
+## Run
 
 ```bash
-# Build & test Rust crates
-cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
-
-# Test Conformance
-cargo test -p pi-conformance
+cargo run -p pi-coding-agent -- -p "hello from the rust port"
 ```
+
+TypeScript remains the shipping product path. The Rust `pi` binary is the print-mode port used for parity work.

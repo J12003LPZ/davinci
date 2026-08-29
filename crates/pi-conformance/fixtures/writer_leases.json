@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "name": "acquire_inserts_fence_one",
+      "steps": [
+        { "op": "acquire", "ownerId": "a", "now": 1000, "expiresAtMs": 31000, "expectFence": 1 }
+      ]
+    },
+    {
+      "name": "active_writer_rejected",
+      "steps": [
+        { "op": "acquire", "ownerId": "a", "now": 1000, "expiresAtMs": 31000, "expectFence": 1 },
+        { "op": "acquire", "ownerId": "b", "now": 2000, "expiresAtMs": 32000, "expectNone": true }
+      ]
+    },
+    {
+      "name": "expired_takeover_increments_fence",
+      "steps": [
+        { "op": "acquire", "ownerId": "a", "now": 1000, "expiresAtMs": 31000, "expectFence": 1 },
+        { "op": "acquire", "ownerId": "b", "now": 31000, "expiresAtMs": 61000, "expectFence": 2 },
+        { "op": "renew", "ownerId": "a", "fence": 1, "now": 32000, "expiresAtMs": 62000, "expect": false }
+      ]
+    },
+    {
+      "name": "renew_and_release_matching_owner_and_fence",
+      "steps": [
+        { "op": "acquire", "ownerId": "a", "now": 1000, "expiresAtMs": 31000, "expectFence": 1 },
+        { "op": "renew", "ownerId": "a", "fence": 1, "now": 2000, "expiresAtMs": 32000, "expect": true },
+        { "op": "release", "ownerId": "a", "fence": 1 },
+        { "op": "acquire", "ownerId": "b", "now": 3000, "expiresAtMs": 33000, "expectFence": 1 }
+      ]
+    }
+  ]
+}
