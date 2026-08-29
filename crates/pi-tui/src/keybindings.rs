@@ -67,6 +67,12 @@ impl Keybindings {
             .iter()
             .any(|key| key_to_bytes(key) == data)
     }
+
+    pub fn bindings(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.bindings
+            .iter()
+            .map(|(action, keys)| (action.as_str(), keys.as_slice()))
+    }
 }
 
 fn migrate_keybinding_name(name: &str) -> String {
@@ -143,6 +149,7 @@ pub fn key_to_bytes(key: &str) -> String {
         "ctrl+e" => "\x05".into(),
         "ctrl+f" => "\x06".into(),
         "ctrl+g" => "\x07".into(),
+        "ctrl+k" => "\x0b".into(),
         "ctrl+l" => "\x0c".into(),
         "ctrl+n" => "\x0e".into(),
         "ctrl+o" => "\x0f".into(),

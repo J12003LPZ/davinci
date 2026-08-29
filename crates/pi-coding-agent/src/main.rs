@@ -624,6 +624,7 @@ fn run_interactive(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     }
     let _ = session.begin_osc_query(OSC_QUERY_TIMEOUT_MS);
     let host = loaded_extension_host(parsed);
+    apply_extension_shortcuts(&mut session, &host);
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
     if should_run_first_time_setup(&settings_path(&default_agent_dir())) {
@@ -844,6 +845,20 @@ fn apply_session_action(
             paste_clipboard(session);
             Ok(true)
         }
+        SessionAction::ExtensionShortcut { key, path } => {
+            match host_invoke_shortcut(parsed, &path, &key) {
+                Ok(Some(value)) => {
+                    session.chrome.status = format!("shortcut={key} {value}");
+                }
+                Ok(None) => {
+                    session.chrome.status = format!("shortcut={key}");
+                }
+                Err(err) => {
+                    session.chrome.status = format!("Shortcut handler error: {err}");
+                }
+            }
+            Ok(true)
+        }
         SessionAction::RenameSession { id, name } => {
             rename_discovered_session(parsed, agent, session, &id, &name)?;
             Ok(true)
@@ -1015,6 +1030,22 @@ fn apply_session_action(
             SlashAction::Reload => {
                 reload_interactive_resources(parsed, agent, session);
                 handle_user_line(parsed, agent, &mut session.chrome, &text)
+            }
+            SlashAction::Hotkeys => {
+                let mut keys = pi_tui::get_keybindings()
+                    .into_iter()
+                    .map(|b| format!("{}: {}", b.action, b.keys.join(", ")))
+                    .collect::<Vec<_>>();
+                keys.extend(
+                    session
+                        .extension_shortcuts
+                        .iter()
+                        .map(|(key, path)| format!("extension.{key}: {key} ({path})")),
+                );
+                let keys = keys.join("\n");
+                session.chrome.status = keys.clone();
+                println!("{keys}");
+                Ok(true)
             }
             SlashAction::Import(_) | SlashAction::Share | SlashAction::Changelog => {
                 handle_user_line(parsed, agent, &mut session.chrome, &text)
@@ -1274,6 +1305,7 @@ fn reload_interactive_resources(
     agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
     agent.context_files = load_context_files(&agent.cwd, true);
     let host = loaded_extension_host(parsed);
+    apply_extension_shortcuts(session, &host);
     replay_custom_messages(agent, session, &host);
     let current = session.chrome.theme.name.clone();
     apply_theme_value(session, &current);
@@ -1633,6 +1665,26 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     }
     println!("Usage: /login <provider> <api-key>");
     Ok(())
+}
+
+fn apply_extension_shortcuts(session: &mut InteractiveSession, host: &ExtensionHost) {
+    let (shortcuts, diagnostics) = host.resolve_shortcuts(&session.keybindings);
+    session.extension_shortcuts = shortcuts;
+    if let Some(warning) = diagnostics.first() {
+        session.chrome.status = warning.clone();
+    }
+}
+
+fn host_invoke_shortcut(
+    parsed: &Args,
+    path: &str,
+    key: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let host = loaded_extension_host(parsed);
+    if host.js.iter().any(|ext| ext.path == path) {
+        return host.invoke_shortcut(path, key);
+    }
+    ExtensionHost::default().invoke_shortcut(path, key)
 }
 
 fn loaded_extension_host(parsed: &Args) -> ExtensionHost {

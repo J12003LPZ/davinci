@@ -176,6 +176,7 @@ async function main() {
 		commands: [],
 		flags: [],
 		shortcuts: [],
+		shortcutHandlers: {},
 		messageRenderers: {},
 		markdownTransformers: [],
 		entryRenderers: {},
@@ -194,8 +195,11 @@ async function main() {
 		registerFlag(name) {
 			recorded.flags.push(name);
 		},
-		registerShortcut(key) {
+		registerShortcut(key, options) {
 			recorded.shortcuts.push(key);
+			if (options && typeof options.handler === "function") {
+				recorded.shortcutHandlers[String(key).toLowerCase()] = options.handler;
+			}
 		},
 		registerMessageRenderer(customType, renderer) {
 			recorded.messageRenderers[customType] = renderer;
@@ -344,6 +348,12 @@ async function main() {
 			}
 		}
 		result = { markdown: text };
+	} else if (op === "shortcut") {
+		const key = String(payload.key || "").toLowerCase();
+		const handler = recorded.shortcutHandlers[key];
+		if (typeof handler === "function") {
+			result = await handler(payload.ctx || {});
+		}
 	}
 	process.stdout.write(
 		JSON.stringify({

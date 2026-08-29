@@ -7,6 +7,7 @@ use crate::js_host::{
     execute_command_tool, node_available, resolve_extension_module, run_js_extension,
     JsExtensionResult,
 };
+use pi_tui::Keybindings;
 
 /// Extension event bus matching `vendor/pi/packages/coding-agent/src/core/extensions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +53,7 @@ pub struct LoadedJsExtension {
     pub message_renderers: Vec<String>,
     pub entry_renderers: Vec<String>,
     pub markdown_transformers: u32,
+    pub shortcuts: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +113,7 @@ impl ExtensionHost {
                             message_renderers: loaded.message_renderers,
                             entry_renderers: loaded.entry_renderers,
                             markdown_transformers: loaded.markdown_transformers,
+                            shortcuts: loaded.shortcuts,
                         });
                     }
                 }
@@ -297,6 +300,34 @@ impl ExtensionHost {
         )
     }
 
+    pub fn registered_shortcuts(&self) -> Vec<(String, Vec<String>)> {
+        self.js
+            .iter()
+            .map(|ext| (ext.path.clone(), ext.shortcuts.clone()))
+            .collect()
+    }
+
+    pub fn resolve_shortcuts(
+        &self,
+        keybindings: &Keybindings,
+    ) -> (Vec<(String, String)>, Vec<String>) {
+        resolve_extension_shortcuts(&self.registered_shortcuts(), keybindings)
+    }
+
+    pub fn invoke_shortcut(&self, path: &str, key: &str) -> Result<Option<Value>, String> {
+        let result = run_js_extension(
+            Path::new(path),
+            "shortcut",
+            &serde_json::json!({ "key": key }),
+        )?;
+        if !result.ok {
+            return Err(result
+                .error
+                .unwrap_or_else(|| "Shortcut handler error".into()));
+        }
+        Ok(result.result)
+    }
+
     pub fn describe_js(&self) -> String {
         self.js
             .iter()
@@ -316,6 +347,73 @@ impl ExtensionHost {
     }
 }
 
+const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS: &[&str] = &[
+    "app.interrupt",
+    "app.clear",
+    "app.exit",
+    "app.suspend",
+    "app.thinking.cycle",
+    "app.model.cycleForward",
+    "app.model.cycleBackward",
+    "app.model.select",
+    "app.tools.expand",
+    "app.thinking.toggle",
+    "app.editor.external",
+    "app.message.copy",
+    "app.message.followUp",
+    "tui.input.submit",
+    "tui.select.confirm",
+    "tui.select.cancel",
+    "tui.input.copy",
+    "tui.editor.deleteToLineEnd",
+];
+
+fn resolve_extension_shortcuts(
+    registered: &[(String, Vec<String>)],
+    keybindings: &Keybindings,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut builtin: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
+    for (action, keys) in keybindings.bindings() {
+        let restrict = RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS.contains(&action);
+        for key in keys {
+            let normalized = key.to_ascii_lowercase();
+            if let Some((_, existing_restrict)) = builtin.get(&normalized) {
+                if *existing_restrict && !restrict {
+                    continue;
+                }
+            }
+            builtin.insert(normalized, (action.to_string(), restrict));
+        }
+    }
+    let mut resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut diagnostics = Vec::new();
+    for (path, keys) in registered {
+        for key in keys {
+            let normalized = key.to_ascii_lowercase();
+            if let Some((action, restrict)) = builtin.get(&normalized) {
+                if *restrict {
+                    diagnostics.push(format!(
+                        "Extension shortcut '{key}' from {path} conflicts with built-in shortcut. Skipping."
+                    ));
+                    continue;
+                }
+                diagnostics.push(format!(
+                    "Extension shortcut conflict: '{key}' is built-in shortcut for {action} and {path}. Using {path}."
+                ));
+            }
+            if let Some(existing) = resolved.get(&normalized) {
+                diagnostics.push(format!(
+                    "Extension shortcut conflict: '{key}' registered by both {existing} and {path}. Using {path}."
+                ));
+            }
+            resolved.insert(normalized, path.clone());
+        }
+    }
+    let shortcuts = resolved.into_iter().collect();
+    (shortcuts, diagnostics)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +431,34 @@ mod tests {
             host.kinds(),
             ["before_agent_start", "tool_call", "session_start"]
         );
+    }
+
+    #[test]
+    fn extension_shortcuts_skip_reserved_and_last_wins() {
+        let bindings = Keybindings::defaults();
+        let (shortcuts, diagnostics) = resolve_extension_shortcuts(
+            &[
+                ("/one.js".into(), vec!["ctrl+c".into(), "ctrl+k".into()]),
+                ("/two.js".into(), vec!["ctrl+k".into(), "ctrl+y".into()]),
+            ],
+            &bindings,
+        );
+        assert!(diagnostics
+            .iter()
+            .any(|line| line.contains("conflicts with built-in shortcut")));
+        assert!(diagnostics
+            .iter()
+            .any(|line| line.contains("registered by both")));
+        assert!(!shortcuts.iter().any(|(key, _)| key == "ctrl+c"));
+        assert_eq!(
+            shortcuts
+                .iter()
+                .find(|(key, _)| key == "ctrl+k")
+                .map(|item| item.1.as_str()),
+            Some("/two.js")
+        );
+        assert!(shortcuts
+            .iter()
+            .any(|(key, path)| key == "ctrl+y" && path == "/two.js"));
     }
 }

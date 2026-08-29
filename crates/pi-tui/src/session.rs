@@ -90,6 +90,10 @@ pub enum SessionAction {
     Dequeue,
     ExternalEditor,
     PasteClipboard,
+    ExtensionShortcut {
+        key: String,
+        path: String,
+    },
     RenameSession {
         id: String,
         name: String,
@@ -119,6 +123,7 @@ pub struct InteractiveSession {
     pub mermaid_mode: MermaidMode,
     pub enabled_model_ids: EnabledIds,
     pub keybindings: Keybindings,
+    pub extension_shortcuts: Vec<(String, String)>,
     pub follow_up_queue: Vec<String>,
     pub model_thinking_levels: BTreeMap<String, String>,
     pub warnings_anthropic_extra_usage: bool,
@@ -201,6 +206,7 @@ impl InteractiveSession {
             mermaid_mode: MermaidMode::Streaming,
             enabled_model_ids: None,
             keybindings: Keybindings::defaults(),
+            extension_shortcuts: Vec::new(),
             follow_up_queue: Vec::new(),
             model_thinking_levels: BTreeMap::new(),
             warnings_anthropic_extra_usage: true,
@@ -605,6 +611,9 @@ impl InteractiveSession {
             return action;
         }
         if !self.overlay_open() {
+            if let Some((key, path)) = self.matching_extension_shortcut(data) {
+                return SessionAction::ExtensionShortcut { key, path };
+            }
             if self.keybindings.matches(data, "app.editor.external") {
                 return SessionAction::ExternalEditor;
             }
@@ -1112,6 +1121,12 @@ impl InteractiveSession {
     pub fn osc_query_pending(&self) -> bool {
         self.osc_query.as_ref().is_some_and(|query| !query.finished)
     }
+
+    fn matching_extension_shortcut(&self, data: &str) -> Option<(String, String)> {
+        self.extension_shortcuts.iter().find_map(|(key, path)| {
+            (crate::keybindings::key_to_bytes(key) == data).then(|| (key.clone(), path.clone()))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1360,6 +1375,14 @@ mod tests {
         assert_eq!(session.chrome.editor.buffer, "later");
         assert_eq!(session.handle_bytes("\x07"), SessionAction::ExternalEditor);
         assert_eq!(session.handle_bytes("\x16"), SessionAction::PasteClipboard);
+        session.extension_shortcuts = vec![("ctrl+k".into(), "/ext/index.js".into())];
+        assert_eq!(
+            session.handle_bytes("\x0b"),
+            SessionAction::ExtensionShortcut {
+                key: "ctrl+k".into(),
+                path: "/ext/index.js".into(),
+            }
+        );
 
         let _ = session.begin_osc_query(0);
         let timeout = session

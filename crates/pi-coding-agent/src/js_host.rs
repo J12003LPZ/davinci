@@ -209,6 +209,32 @@ module.exports = (pi) => {
     }
 
     #[test]
+    fn registers_and_invokes_shortcut_handler() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.registerShortcut("ctrl+k", {
+    description: "ping",
+    handler: () => ({ handled: true }),
+  });
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+        let loaded = run_js_extension(&module, "load", &serde_json::json!({})).unwrap();
+        assert!(loaded.shortcuts.iter().any(|key| key == "ctrl+k"));
+        let invoked =
+            run_js_extension(&module, "shortcut", &serde_json::json!({ "key": "ctrl+k" })).unwrap();
+        assert_eq!(invoked.result.as_ref().unwrap()["handled"], true);
+    }
+
+    #[test]
     fn loads_typescript_factory_with_virtual_packages() {
         let Some(_) = find_node() else {
             return;
