@@ -23,6 +23,8 @@ impl Theme {
     pub fn fg(&self, role: &str, text: &str) -> String {
         match role {
             "accent" => format!("\x1b[36m{text}\x1b[39m"),
+            "mdHeading" => format!("\x1b[1m{text}\x1b[22m"),
+            "mdLink" => format!("\x1b[4;36m{text}\x1b[39;24m"),
             "muted" | "dim" => format!("\x1b[2m{text}\x1b[22m"),
             "warning" => format!("\x1b[33m{text}\x1b[39m"),
             "success" => format!("\x1b[32m{text}\x1b[39m"),

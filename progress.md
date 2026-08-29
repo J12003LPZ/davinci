@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: 100% after Ctrl+O / live print JSON / print-mode rebind slice.** TypeScript under `vendor/pi` stays as the behavioral reference (desired end state, not a gap).
+**Complete: 100% after interactive loaded-resources listing slice.** TypeScript under `vendor/pi` stays as the behavioral reference (desired end state, not a gap).
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -144,6 +144,8 @@ Closed this slice: print mode matches TS `runPrintMode` — session header then 
 Closed this slice: TS `model-resolver` in Rust (`resolveCliModel` / `parseModelPattern` / `resolveModelScopeFromModels`) so `--model sonnet`, `provider/id`, globs, and `--model …:<thinking>` resolve and apply. `--models` scopes interactive Ctrl+P and RPC `cycle_model`; cycling restores scoped `:level` then per-model then settings default. `--resume` opens the SessionSelector (TTY) or `PI_RESUME_SESSION` fixture; cancel prints dim `No session selected` and exits 0. RPC extension `ctx.ui.select/confirm/input` emit `extension_ui_request`, block for `extension_ui_response`, and honor `timeout` (default on expiry).
 
 Closed this slice: Ctrl+O / `app.tools.expand` / `setToolsExpanded` toggles every tool card and custom-message body (`Tool output: expanded|collapsed`). Print `--mode json` subscribes via `Agent.event_sink` and writes `toJsonEvent` lines as the agent loop emits them. Print/RPC `rebind_print_extensions` rediscovers skills/prompts/context, reloads the JS host, reattaches extension tools, and emits `session_start` after `reload` / `newSession` / `fork` / `switchSession`.
+
+Closed this slice: interactive `showLoadedResources` — `[Context]` / `[Skills]` / `[Prompts]` / `[Extensions]` / `[Themes]` expandable sections (compact comma list vs project/user/path + npm/git groups), skill/prompt collision diagnostics, `quietStartup` hides the listing, Ctrl+O expands the sections. `/reload` and print rebind discover user `{agentDir}/skills|prompts` plus project `.pi` and package roots.
 
 ## Remaining product gaps
 

@@ -48,14 +48,16 @@ use pi_session::{
     resolve_session_dir_from, resolve_session_ref, JsonlSession, SessionEntry,
 };
 use pi_tui::{
-    builtin_themes, copy_text, detect_terminal_theme, detect_terminal_theme_for_auto,
-    drain_osc_tty, encode_kitty, interactive_settings_list, load_themes_from_dir, parse_auto_theme,
-    parse_http_idle_timeout, resolve_git_branch, AuthSelectorMode, AuthSelectorProvider,
-    AutocompleteItem, ChatChrome, Component, CustomMessage, DoubleEscapeAction,
-    ExtraAutocompleteProvider, FilterMode, InteractiveSession, Keybindings, LiveAutocompleteQuery,
-    MermaidMode, ModelSelectorItem, ScopedModel, SessionAction, SessionItem, SessionTreeEntry,
-    SlashCommandSpec, Theme, ThemeDetection, ToolCard, TrustOption, TrustSavedDecision,
-    TrustSelector, TrustUpdate, TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
+    builtin_themes, collect_name_collisions, copy_text, detect_terminal_theme,
+    detect_terminal_theme_for_auto, drain_osc_tty, encode_kitty, format_collision_diagnostic,
+    format_context_path, format_display_path, infer_source_info, interactive_settings_list,
+    load_themes_from_dir, parse_auto_theme, parse_http_idle_timeout, resolve_git_branch,
+    theme_files_from_dir, AuthSelectorMode, AuthSelectorProvider, AutocompleteItem, ChatChrome,
+    Component, CustomMessage, DoubleEscapeAction, ExtraAutocompleteProvider, FilterMode,
+    InteractiveSession, Keybindings, LiveAutocompleteQuery, LoadedResourceItem, MermaidMode,
+    ModelSelectorItem, ScopedModel, SessionAction, SessionItem, SessionTreeEntry, SlashCommandSpec,
+    Theme, ThemeDetection, ToolCard, TrustOption, TrustSavedDecision, TrustSelector, TrustUpdate,
+    TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -1908,6 +1910,7 @@ fn run_interactive(
         models_json_error,
         migrated_auth_providers,
     );
+    show_loaded_resources(&mut session, agent, &host, parsed);
     apply_project_trust_warning(&mut session, parsed, agent);
     apply_changelog_overlay(&mut session, agent, &stored, &default_agent_dir());
     refresh_chrome_footer(&mut session, agent);
@@ -3014,9 +3017,7 @@ fn reload_interactive_resources(
     session: &mut InteractiveSession,
 ) {
     session.keybindings = Keybindings::load(&default_agent_dir());
-    agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
-    agent.templates = discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
-    agent.context_files = load_context_files(&agent.cwd, true);
+    apply_discovered_resources(parsed, agent);
     let mut host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
     host.emit(ExtensionEvent::SessionStart);
@@ -3026,6 +3027,7 @@ fn reload_interactive_resources(
     replay_custom_messages(agent, session, &host);
     let current = session.chrome.theme.name.clone();
     apply_theme_value(session, &current);
+    show_loaded_resources(session, agent, &host, parsed);
 }
 
 fn available_themes() -> Vec<Theme> {
@@ -4004,10 +4006,13 @@ fn handle_custom_overlay_input(
     }
 }
 
-fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut ExtensionHost) {
+fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
     let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
     if !parsed.no_skills {
-        let mut roots = vec![agent.cwd.join(".pi").join("skills")];
+        let mut roots = vec![
+            default_agent_dir().join("skills"),
+            agent.cwd.join(".pi").join("skills"),
+        ];
         if let Some(extra) = &settings.skills {
             roots.extend(extra.iter().map(PathBuf::from));
         }
@@ -4017,7 +4022,10 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
         agent.skills = discover_skills(&roots);
     }
     if !parsed.no_prompt_templates {
-        let mut roots = vec![agent.cwd.join(".pi").join("prompts")];
+        let mut roots = vec![
+            default_agent_dir().join("prompts"),
+            agent.cwd.join(".pi").join("prompts"),
+        ];
         if let Some(extra) = &settings.prompts {
             roots.extend(extra.iter().map(PathBuf::from));
         }
@@ -4027,6 +4035,10 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
         agent.templates = discover_prompt_templates(&roots);
     }
     agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
+}
+
+fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut ExtensionHost) {
+    apply_discovered_resources(parsed, agent);
     *host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
     let mut names = parsed.extensions.clone();
@@ -4038,6 +4050,202 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
     agent.apply_extension_tools(&names);
     attach_tool_executor(agent, host);
     host.emit(ExtensionEvent::SessionStart);
+}
+
+fn show_loaded_resources(
+    session: &mut InteractiveSession,
+    agent: &Agent,
+    host: &ExtensionHost,
+    parsed: &Args,
+) {
+    let show_listing = !session.quiet_startup;
+    let expanded = parsed.verbose || session.chrome.tools_expanded;
+    let theme = session.chrome.theme.clone();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cwd = agent.cwd.display().to_string();
+    let agent_dir = default_agent_dir().display().to_string();
+    let mut loaded = pi_tui::LoadedResources::default();
+    if show_listing {
+        if !agent.context_files.is_empty() {
+            let compact = theme.fg(
+                "dim",
+                &pi_tui::format_compact_list(
+                    agent
+                        .context_files
+                        .iter()
+                        .map(|file| {
+                            format_context_path(&file.path.display().to_string(), &cwd, &home)
+                        })
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .map(String::as_str),
+                    false,
+                ),
+            );
+            let expanded_body = agent
+                .context_files
+                .iter()
+                .map(|file| {
+                    theme.fg(
+                        "dim",
+                        &format!(
+                            "  {}",
+                            format_display_path(&file.path.display().to_string(), &home)
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            loaded.add_section(&theme, "Context", &compact, &expanded_body, expanded);
+        }
+        let skills: Vec<LoadedResourceItem> = agent
+            .skills
+            .iter()
+            .map(|skill| {
+                let path = skill.path.display().to_string();
+                LoadedResourceItem {
+                    compact_label: skill.name.clone(),
+                    expanded_label: format_display_path(&path, &home),
+                    source: infer_source_info(&path, &cwd, &agent_dir),
+                    path,
+                }
+            })
+            .collect();
+        loaded.add_named_section(&theme, "Skills", &skills, expanded);
+        let prompts: Vec<LoadedResourceItem> = agent
+            .templates
+            .iter()
+            .map(|template| {
+                let path = template.path.display().to_string();
+                LoadedResourceItem {
+                    compact_label: format!("/{}", template.name),
+                    expanded_label: format!("/{}", template.name),
+                    source: infer_source_info(&path, &cwd, &agent_dir),
+                    path,
+                }
+            })
+            .collect();
+        loaded.add_named_section(&theme, "Prompts", &prompts, expanded);
+        let mut extensions = Vec::new();
+        for path in host
+            .manifests
+            .iter()
+            .filter_map(|manifest| manifest.path.clone())
+            .chain(host.js.iter().map(|ext| ext.path.clone()))
+            .chain(parsed.extensions.iter().cloned())
+        {
+            if extensions
+                .iter()
+                .any(|item: &LoadedResourceItem| item.path == path)
+            {
+                continue;
+            }
+            let display = format_extension_display_path(&path, &home);
+            extensions.push(LoadedResourceItem {
+                compact_label: compact_extension_label(&display),
+                expanded_label: display,
+                source: infer_source_info(&path, &cwd, &agent_dir),
+                path,
+            });
+        }
+        loaded.add_named_section(&theme, "Extensions", &extensions, expanded);
+        let themes: Vec<LoadedResourceItem> = collect_custom_theme_files()
+            .into_iter()
+            .map(|(name, path)| {
+                let path = path.display().to_string();
+                LoadedResourceItem {
+                    compact_label: name,
+                    expanded_label: format_display_path(&path, &home),
+                    source: infer_source_info(&path, &cwd, &agent_dir),
+                    path,
+                }
+            })
+            .collect();
+        loaded.add_named_section(&theme, "Themes", &themes, expanded);
+    }
+    add_resource_collisions(
+        &mut loaded,
+        &theme,
+        "Skill conflicts",
+        &agent
+            .skills
+            .iter()
+            .map(|skill| (skill.name.clone(), skill.path.display().to_string()))
+            .collect::<Vec<_>>(),
+    );
+    add_resource_collisions(
+        &mut loaded,
+        &theme,
+        "Prompt conflicts",
+        &agent
+            .templates
+            .iter()
+            .map(|template| (template.name.clone(), template.path.display().to_string()))
+            .collect::<Vec<_>>(),
+    );
+    session.chrome.loaded_resources = loaded;
+}
+
+fn add_resource_collisions(
+    loaded: &mut pi_tui::LoadedResources,
+    theme: &Theme,
+    title: &str,
+    items: &[(String, String)],
+) {
+    let collisions = collect_name_collisions(items);
+    if collisions.is_empty() {
+        return;
+    }
+    let body = collisions
+        .iter()
+        .map(|(name, winner, losers)| {
+            format_collision_diagnostic(theme, name, winner, losers.as_slice())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    loaded.add_diagnostic(theme, title, &body);
+}
+
+fn format_extension_display_path(path: &str, home: &str) -> String {
+    let trimmed = path
+        .trim_end_matches("/index.ts")
+        .trim_end_matches("/index.js");
+    format_display_path(trimmed, home)
+}
+
+fn compact_extension_label(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let mut segments: Vec<&str> = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "~")
+        .collect();
+    if matches!(
+        segments.last().copied(),
+        Some("index.ts") | Some("index.js")
+    ) {
+        segments.pop();
+    }
+    segments.last().copied().unwrap_or(path).to_string()
+}
+
+fn collect_custom_theme_files() -> Vec<(String, PathBuf)> {
+    let mut files = theme_files_from_dir(&default_agent_dir().join("themes"));
+    let settings = load_settings(&default_agent_dir());
+    if let Some(paths) = &settings.themes {
+        for path in paths {
+            files.extend(theme_files_from_dir(Path::new(path)));
+        }
+    }
+    for pkg in &settings.packages {
+        for path in settings::collect_package_resources(pkg, "themes") {
+            if path.is_dir() {
+                files.extend(theme_files_from_dir(&path));
+            } else if let Some(parent) = path.parent() {
+                files.extend(theme_files_from_dir(parent));
+            }
+        }
+    }
+    files
 }
 
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
@@ -6517,6 +6725,8 @@ mod tests {
     #[test]
     fn rebind_print_extensions_rediscovers_skills_and_emits_session_start() {
         let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
         let skill_dir = dir.path().join(".pi").join("skills").join("demo");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
@@ -6529,6 +6739,10 @@ mod tests {
         let parsed = Args::default();
         let mut host = ExtensionHost::default();
         rebind_print_extensions(&parsed, &mut agent, &mut host);
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
         assert!(
             agent.skills.iter().any(|skill| skill.name == "demo"),
             "print-mode rebind should rediscover project skills: {:?}",
@@ -6542,6 +6756,59 @@ mod tests {
             .events
             .iter()
             .any(|event| { matches!(event, crate::extension_host::ExtensionEvent::SessionStart) }));
+    }
+
+    #[test]
+    fn show_loaded_resources_lists_context_skills_and_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let skill_dir = dir.path().join(".pi").join("skills").join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo skill\n---\n# Demo\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# agents\n").unwrap();
+        let mut agent = Agent::new("x");
+        agent.cwd = dir.path().to_path_buf();
+        apply_discovered_resources(&Args::default(), &mut agent);
+        let mut session = InteractiveSession::new(
+            builtin_themes()[0].clone(),
+            "pi",
+            vec!["google/gemini".into()],
+        );
+        show_loaded_resources(
+            &mut session,
+            &agent,
+            &ExtensionHost::default(),
+            &Args::default(),
+        );
+        let collapsed = session.chrome.render_document(80).join("\n");
+        assert!(collapsed.contains("[Skills]"), "{collapsed}");
+        assert!(collapsed.contains("demo"), "{collapsed}");
+        assert!(collapsed.contains("[Context]"), "{collapsed}");
+        assert!(collapsed.contains("AGENTS.md"), "{collapsed}");
+        session.chrome.set_tools_expanded(true);
+        let expanded = session.chrome.render_document(80).join("\n");
+        assert!(
+            expanded.contains("SKILL.md") || expanded.contains("demo"),
+            "{expanded}"
+        );
+        session.quiet_startup = true;
+        show_loaded_resources(
+            &mut session,
+            &agent,
+            &ExtensionHost::default(),
+            &Args::default(),
+        );
+        let quiet = session.chrome.render_document(80).join("\n");
+        assert!(!quiet.contains("[Skills]"), "{quiet}");
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
     }
 
     #[test]

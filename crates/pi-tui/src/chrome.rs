@@ -6,6 +6,7 @@ use crate::extension_ui::{
 };
 use crate::first_time::FirstTimeSetup;
 use crate::footer::{format_pwd_line, truncate_to_width};
+use crate::loaded_resources::LoadedResources;
 use crate::login_dialog::LoginDialog;
 use crate::model_selector::ModelSelector;
 use crate::oauth_selector::OAuthSelector;
@@ -75,6 +76,7 @@ pub struct ChatChrome {
     pub footer_session_name: Option<String>,
     pub footer_stats: Option<String>,
     pub tools_expanded: bool,
+    pub loaded_resources: LoadedResources,
     pub available_themes: Vec<Theme>,
     pub terminal_input_registered: bool,
 }
@@ -131,6 +133,7 @@ impl ChatChrome {
             footer_session_name: None,
             footer_stats: None,
             tools_expanded: false,
+            loaded_resources: LoadedResources::default(),
             available_themes: builtin_themes(),
             terminal_input_registered: false,
         }
@@ -182,6 +185,7 @@ impl ChatChrome {
     pub fn set_tools_expanded(&mut self, expanded: bool) {
         self.tools_expanded = expanded;
         self.transcript.tools_expanded = expanded;
+        self.loaded_resources.set_expanded(expanded);
         for card in &mut self.tool_cards {
             card.expanded = expanded;
         }
@@ -392,6 +396,7 @@ impl ChatChrome {
         if let Some(header) = &self.extension_header {
             lines.extend(header.iter().cloned());
         }
+        lines.extend(self.loaded_resources.render(width));
         lines.extend(self.transcript.render(width));
         for card in &self.tool_cards {
             lines.extend(card.render(width));

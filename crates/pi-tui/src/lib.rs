@@ -22,6 +22,7 @@ mod keys;
 mod kill_ring;
 mod latex;
 mod layout;
+mod loaded_resources;
 mod loader;
 mod login_dialog;
 mod markdown;
@@ -116,6 +117,12 @@ pub use latex::render_latex;
 pub use layout::{
     get_scroll_view_box, get_scroll_views_at, get_scrollbar_geometry, render_layout_frame,
     LayoutBox, LayoutFrame, LayoutRect, ScrollbarGeometry,
+};
+pub use loaded_resources::{
+    collect_name_collisions, format_collision_diagnostic, format_compact_list, format_context_path,
+    format_display_path, format_scope_groups, infer_source_info, section_header,
+    theme_files_from_dir, ExpandableText, LoadedResourceItem, LoadedResources, ResourceScope,
+    ResourceSourceInfo,
 };
 pub use loader::{
     CancellableLoader, Loader, LoaderIndicatorOptions, DEFAULT_LOADER_FRAMES,
