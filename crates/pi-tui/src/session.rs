@@ -610,6 +610,9 @@ impl InteractiveSession {
     }
 
     pub fn place_kitty_image(&mut self, base64_data: &str, rows: Option<u32>) -> u32 {
+        if std::env::var("PI_TERMINAL_IMAGES").ok().as_deref() == Some("off") {
+            return 0;
+        }
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.saturating_add(1);
         let sequence = encode_kitty(

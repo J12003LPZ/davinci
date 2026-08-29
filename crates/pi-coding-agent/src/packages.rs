@@ -48,7 +48,7 @@ pub fn handle_package_command(
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
             settings.extensions.retain(|item| item != &source);
-            settings.packages.retain(|item| item != &source);
+            settings.packages.retain(|item| item.source() != source);
             save_settings(agent_dir, &settings)?;
             Ok(format!("Removed {source}{}", scope(local)))
         }
@@ -400,8 +400,8 @@ fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<St
     if !settings.extensions.contains(&source.to_string()) {
         settings.extensions.push(source.to_string());
     }
-    if !settings.packages.contains(&source.to_string()) {
-        settings.packages.push(source.to_string());
+    if !settings.packages.iter().any(|item| item.source() == source) {
+        settings.packages.push(source.into());
     }
     save_settings(agent_dir, &settings)?;
     Ok(source.to_string())
@@ -586,10 +586,10 @@ pub fn check_for_available_updates(
     let mut sources = Vec::new();
     let project = load_settings(&cwd.join(".pi"));
     for pkg in &project.packages {
-        sources.push((pkg.clone(), true));
+        sources.push((pkg.source().to_string(), true));
     }
     for pkg in &settings.packages {
-        sources.push((pkg.clone(), false));
+        sources.push((pkg.source().to_string(), false));
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut updates = Vec::new();
@@ -882,7 +882,12 @@ fn render_config(settings: &Settings, local: bool) -> String {
         "scope: {}\nextensions: {}\npackages: {}\ntheme: {}\n",
         if local { "local" } else { "user" },
         settings.extensions.join(", "),
-        settings.packages.join(", "),
+        settings
+            .packages
+            .iter()
+            .map(crate::settings::PackageSource::source)
+            .collect::<Vec<_>>()
+            .join(", "),
         settings.theme.clone().unwrap_or_else(|| "dark".into())
     )
 }
@@ -911,7 +916,12 @@ pub fn config_selector_from_settings(
         ConfigScope::User
     };
     let mut items = Vec::new();
-    for source in settings.extensions.iter().chain(settings.packages.iter()) {
+    let package_sources: Vec<String> = settings
+        .packages
+        .iter()
+        .map(|item| item.source().to_string())
+        .collect();
+    for source in settings.extensions.iter().chain(package_sources.iter()) {
         let name = Path::new(source)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -922,11 +932,17 @@ pub fn config_selector_from_settings(
         {
             continue;
         }
+        let enabled = settings
+            .packages
+            .iter()
+            .find(|item| item.source() == source)
+            .map(|item| item.autoload())
+            .unwrap_or(true);
         items.push(ConfigResource {
             kind: ConfigResourceKind::Extensions,
             name,
             source: source.clone(),
-            enabled: true,
+            enabled,
             scope,
         });
     }
@@ -983,7 +999,10 @@ mod tests {
             handle_package_command("install", &[ext.display().to_string()], &agent).unwrap();
         assert!(installed.starts_with("Installed "));
         let settings = load_settings(&agent);
-        assert!(settings.packages.iter().any(|item| item.contains("ext")));
+        assert!(settings
+            .packages
+            .iter()
+            .any(|item| item.source().contains("ext")));
         let err = handle_package_command(
             "install",
             &[dir.path().join("missing").display().to_string()],

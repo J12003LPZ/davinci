@@ -156,7 +156,8 @@ pub fn execute_config_command(command: &str, options: &ResolveCommandOptions) ->
     }
     if cfg!(windows) {
         if let Ok(config) = resolve_shell_config(options.shell_path.as_deref()) {
-            if let ShellRun::Executed(value) = run_shell_command(&config, command, options.timeout) {
+            if let ShellRun::Executed(value) = run_shell_command(&config, command, options.timeout)
+            {
                 return value;
             }
         }

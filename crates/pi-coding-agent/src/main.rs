@@ -249,6 +249,16 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(ms) = settings.websocket_connect_timeout_ms {
         std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", ms.to_string());
     }
+    let (images, true_color, hyperlinks) = settings.terminal_capability_overrides();
+    if let Some(kind) = images {
+        std::env::set_var("PI_TERMINAL_IMAGES", kind);
+    }
+    if let Some(value) = true_color {
+        std::env::set_var("PI_TERMINAL_TRUECOLOR", if value { "1" } else { "0" });
+    }
+    if let Some(value) = hyperlinks {
+        std::env::set_var("PI_TERMINAL_HYPERLINKS", if value { "1" } else { "0" });
+    }
     if let Some(path) = settings.shell_path.as_deref() {
         std::env::set_var("PI_SHELL", path);
     }
@@ -258,6 +268,25 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     let _trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     let mut extensions = settings.extensions.clone();
     extensions.extend(parsed.extensions.clone());
+    for pkg in &settings.packages {
+        if !parsed.no_extensions {
+            for path in settings::collect_package_resources(pkg, "extensions") {
+                extensions.push(path.to_string_lossy().into_owned());
+            }
+        }
+        if !parsed.no_skills {
+            agent
+                .skills
+                .extend(discover_skills(&settings::collect_package_resources(
+                    pkg, "skills",
+                )));
+        }
+        if !parsed.no_prompt_templates {
+            agent.templates.extend(discover_prompt_templates(
+                &settings::collect_package_resources(pkg, "prompts"),
+            ));
+        }
+    }
     if !parsed.no_extensions && !extensions.is_empty() {
         let host = ExtensionHost::load(&default_agent_dir(), &extensions);
         let mut names = extensions.clone();
@@ -1766,6 +1795,15 @@ fn available_themes() -> Vec<Theme> {
     if let Some(paths) = &settings.themes {
         for path in paths {
             themes.extend(load_themes_from_dir(Path::new(path)));
+        }
+    }
+    for pkg in &settings.packages {
+        for path in settings::collect_package_resources(pkg, "themes") {
+            if path.is_dir() {
+                themes.extend(load_themes_from_dir(&path));
+            } else if let Some(parent) = path.parent() {
+                themes.extend(load_themes_from_dir(parent));
+            }
         }
     }
     themes

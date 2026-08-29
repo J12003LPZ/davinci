@@ -63,9 +63,9 @@ Closed this slice: GitHub Copilot OAuth login/refresh GETs `{base}/models` (toke
 
 Closed this slice: nested settings wired to product paths — `compaction` (`enabled`/`reserveTokens`/`keepRecentTokens`, token `shouldCompact` + `findCutPoint`), `retry` (`enabled`/`maxRetries`/`baseDelayMs` + provider timeout/retries/`maxDelayMs` migrate), `thinkingBudgets` on Anthropic/Google/OpenAI request bodies, `branchSummary.skipPrompt` (“Summarize branch?”), `httpProxy` → `HTTP_PROXY`/`HTTPS_PROXY` without override, `sessionDir` after CLI/env. Global+project `.pi/settings.json` deep-merge (TS #7572).
 
+Closed this slice: `packages` object form (`source`/`autoload`/resource globs) plus nested `terminal`/`images` with flat fallback; capability overrides (`images`/`trueColor`/`hyperlinks`) applied to Kitty/env.
+
 Still not product-equivalent:
 
 - LLM compaction summarization still local (no `completeSimple` checkpoint prompt / file-ops details)
 - Provider SDK retries (`maxRetries`/`maxRetryDelayMs` on the HTTP client) are stored and timeout is applied; undici-style retry-after is not
-- `terminal.*` / `images.*` still flattened rather than nested settings objects
-- Package object-form filters (`autoload` / resource globs) still string-only

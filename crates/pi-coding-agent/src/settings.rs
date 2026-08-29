@@ -9,7 +9,7 @@ pub struct Settings {
     #[serde(default)]
     pub extensions: Vec<String>,
     #[serde(default)]
-    pub packages: Vec<String>,
+    pub packages: Vec<PackageSource>,
     #[serde(default)]
     pub theme: Option<String>,
     #[serde(default)]
@@ -92,6 +92,10 @@ pub struct Settings {
     pub auto_resize_images: Option<bool>,
     #[serde(default, rename = "blockImages")]
     pub block_images: Option<bool>,
+    #[serde(default)]
+    pub terminal: Option<TerminalSettings>,
+    #[serde(default)]
+    pub images: Option<ImageBlockSettings>,
     #[serde(default, rename = "enableSkillCommands")]
     pub enable_skill_commands: Option<bool>,
     #[serde(default, rename = "showHardwareCursor")]
@@ -174,6 +178,159 @@ pub struct BranchSummarySettings {
     pub reserve_tokens: Option<u64>,
     #[serde(default, rename = "skipPrompt")]
     pub skip_prompt: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PackageSource {
+    Spec(String),
+    Filtered(PackageFilter),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PackageFilter {
+    pub source: String,
+    #[serde(default)]
+    pub autoload: Option<bool>,
+    #[serde(default)]
+    pub extensions: Option<Vec<String>>,
+    #[serde(default)]
+    pub skills: Option<Vec<String>>,
+    #[serde(default)]
+    pub prompts: Option<Vec<String>>,
+    #[serde(default)]
+    pub themes: Option<Vec<String>>,
+}
+
+impl PackageSource {
+    pub fn from_spec(source: impl Into<String>) -> Self {
+        Self::Spec(source.into())
+    }
+
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Spec(source) => source,
+            Self::Filtered(filter) => &filter.source,
+        }
+    }
+
+    pub fn autoload(&self) -> bool {
+        match self {
+            Self::Spec(_) => true,
+            Self::Filtered(filter) => filter.autoload.unwrap_or(true),
+        }
+    }
+
+    pub fn resource_patterns(&self, kind: &str) -> Option<&[String]> {
+        let Self::Filtered(filter) = self else {
+            return None;
+        };
+        match kind {
+            "extensions" => filter.extensions.as_deref(),
+            "skills" => filter.skills.as_deref(),
+            "prompts" => filter.prompts.as_deref(),
+            "themes" => filter.themes.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// TS `collectPackageResources` filter: autoload=false starts empty; patterns glob-match.
+    pub fn allows_resource(&self, kind: &str, relative: &str) -> bool {
+        match (self.autoload(), self.resource_patterns(kind)) {
+            (false, None) => false,
+            (false, Some(patterns)) => patterns.iter().any(|pattern| glob_match(pattern, relative)),
+            (true, None) => true,
+            (true, Some(patterns)) => patterns.iter().any(|pattern| glob_match(pattern, relative)),
+        }
+    }
+}
+
+impl From<&str> for PackageSource {
+    fn from(value: &str) -> Self {
+        Self::from_spec(value)
+    }
+}
+
+impl From<String> for PackageSource {
+    fn from(value: String) -> Self {
+        Self::from_spec(value)
+    }
+}
+
+pub fn collect_package_resources(pkg: &PackageSource, kind: &str) -> Vec<PathBuf> {
+    let root = Path::new(pkg.source());
+    let dir = if root.join(kind).is_dir() {
+        root.join(kind)
+    } else {
+        root.to_path_buf()
+    };
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if pkg.allows_resource(kind, &relative) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    let pattern = pattern.replace('\\', "/");
+    if pattern == "*" || pattern == "**" || pattern == "**/*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        return path == suffix
+            || path.ends_with(&format!("/{suffix}"))
+            || glob_match(suffix, &path);
+    }
+    if let Some((head, tail)) = pattern.split_once('*') {
+        return path.starts_with(head)
+            && path[head.len()..].find(tail).is_some_and(|index| {
+                path[head.len() + index..].ends_with(tail) || tail.is_empty()
+            });
+    }
+    path == pattern || path.ends_with(&format!("/{pattern}"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TerminalSettings {
+    #[serde(default, rename = "showImages")]
+    pub show_images: Option<bool>,
+    #[serde(default, rename = "imageWidthCells")]
+    pub image_width_cells: Option<u32>,
+    #[serde(default, rename = "clearOnShrink")]
+    pub clear_on_shrink: Option<bool>,
+    #[serde(default, rename = "showTerminalProgress")]
+    pub show_terminal_progress: Option<bool>,
+    #[serde(default)]
+    pub hyperlinks: Option<serde_json::Value>,
+    #[serde(default)]
+    pub images: Option<serde_json::Value>,
+    #[serde(default, rename = "trueColor")]
+    pub true_color: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ImageBlockSettings {
+    #[serde(default, rename = "autoResize")]
+    pub auto_resize: Option<bool>,
+    #[serde(default, rename = "blockImages")]
+    pub block_images: Option<bool>,
 }
 
 pub const CONFIG_DIR_NAME: &str = ".pi";
@@ -372,6 +529,78 @@ impl Settings {
             .unwrap_or(pi_agent::DEFAULT_RESERVE_TOKENS)
     }
 
+    pub fn show_images(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.show_images)
+            .or(self.show_images)
+            .unwrap_or(true)
+    }
+
+    pub fn image_width_cells(&self) -> u32 {
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.image_width_cells)
+            .or(self.image_width_cells)
+            .map(|width| width.max(1))
+            .unwrap_or(60)
+    }
+
+    pub fn clear_on_shrink(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.clear_on_shrink)
+            .or(self.clear_on_shrink)
+            .unwrap_or(false)
+    }
+
+    pub fn show_terminal_progress(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.show_terminal_progress)
+            .or(self.show_terminal_progress)
+            .unwrap_or(false)
+    }
+
+    pub fn image_auto_resize(&self) -> bool {
+        self.images
+            .as_ref()
+            .and_then(|images| images.auto_resize)
+            .or(self.auto_resize_images)
+            .unwrap_or(true)
+    }
+
+    pub fn block_images(&self) -> bool {
+        self.images
+            .as_ref()
+            .and_then(|images| images.block_images)
+            .or(self.block_images)
+            .unwrap_or(false)
+    }
+
+    pub fn terminal_capability_overrides(&self) -> (Option<String>, Option<bool>, Option<bool>) {
+        let terminal = self.terminal.as_ref();
+        let images = terminal.and_then(|item| item.images.as_ref());
+        let image_kind = match images {
+            Some(serde_json::Value::String(kind)) if kind == "kitty" || kind == "iterm2" => {
+                Some(kind.clone())
+            }
+            Some(serde_json::Value::Bool(false)) => Some("off".into()),
+            _ => None,
+        };
+        let true_color = terminal.and_then(|item| {
+            item.true_color
+                .as_ref()
+                .and_then(serde_json::Value::as_bool)
+        });
+        let hyperlinks = terminal.and_then(|item| {
+            item.hyperlinks
+                .as_ref()
+                .and_then(serde_json::Value::as_bool)
+        });
+        (image_kind, true_color, hyperlinks)
+    }
+
     pub fn code_block_indent(&self) -> &str {
         self.markdown.code_block_indent.as_deref().unwrap_or("  ")
     }
@@ -480,16 +709,16 @@ pub fn to_interactive_config(
             .clone()
             .unwrap_or_else(|| "auto".into()),
         fullscreen_copy_on_select: settings.fullscreen_copy_on_select.unwrap_or(true),
-        show_images: settings.show_images.unwrap_or(true),
-        image_width_cells: settings.image_width_cells.unwrap_or(80),
-        auto_resize_images: settings.auto_resize_images.unwrap_or(true),
-        block_images: settings.block_images.unwrap_or(false),
+        show_images: settings.show_images(),
+        image_width_cells: settings.image_width_cells(),
+        auto_resize_images: settings.image_auto_resize(),
+        block_images: settings.block_images(),
         skill_commands: settings.enable_skill_commands.unwrap_or(true),
         show_hardware_cursor: settings.show_hardware_cursor.unwrap_or(false),
         editor_padding: settings.editor_padding_x.unwrap_or(0),
         output_padding: settings.output_pad.unwrap_or(1),
-        clear_on_shrink: settings.clear_on_shrink.unwrap_or(false),
-        terminal_progress: settings.show_terminal_progress.unwrap_or(true),
+        clear_on_shrink: settings.clear_on_shrink(),
+        terminal_progress: settings.show_terminal_progress(),
         warnings_anthropic_extra_usage: settings.warnings.anthropic_extra_usage.unwrap_or(true),
         model_thinking_summary: match &settings.model_thinking_levels {
             Some(levels) if !levels.is_empty() => format!("{} overrides", levels.len()),
@@ -630,6 +859,34 @@ mod tests {
             Some(true)
         );
         assert_eq!(Settings::default().code_block_indent(), "  ");
+
+        let filtered: PackageSource = serde_json::from_str(
+            r#"{"source":"/tmp/pkg","autoload":false,"extensions":["index.js"]}"#,
+        )
+        .expect("package object");
+        assert_eq!(filtered.source(), "/tmp/pkg");
+        assert!(!filtered.autoload());
+        assert!(filtered.allows_resource("extensions", "index.js"));
+        assert!(!filtered.allows_resource("extensions", "other.js"));
+        assert!(!filtered.allows_resource("skills", "foo.md"));
+        let spec = PackageSource::from_spec("npm:demo");
+        assert!(spec.allows_resource("themes", "dark.json"));
+
+        let nested: Settings = serde_json::from_str(
+            r#"{
+                "terminal": { "showImages": false, "imageWidthCells": 40, "images": false },
+                "images": { "autoResize": false, "blockImages": true }
+            }"#,
+        )
+        .expect("nested terminal");
+        assert!(!nested.show_images());
+        assert_eq!(nested.image_width_cells(), 40);
+        assert!(!nested.image_auto_resize());
+        assert!(nested.block_images());
+        assert_eq!(
+            nested.terminal_capability_overrides().0.as_deref(),
+            Some("off")
+        );
         assert_eq!(merged.provider_timeout_ms(), Some(30_000));
         assert_eq!(merged.provider_max_retries(), Some(2));
         assert_eq!(merged.provider_max_retry_delay_ms(), 12_000);
