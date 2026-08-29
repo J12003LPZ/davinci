@@ -354,4 +354,61 @@ mod tests {
             .unwrap();
         assert!(again.is_some());
     }
+
+    #[test]
+    fn expired_lease_fence_and_cwd_list_match_ts_backend() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        let mut first = JsonlSession::create(dir.path(), "/tmp/one", Some("alpha")).unwrap();
+        first
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"search-alpha"}]),
+            ))
+            .unwrap();
+        first
+            .append_entry(SessionEntry::label_change(
+                &first.entries[0].id,
+                Some("keep"),
+            ))
+            .unwrap();
+        store.import_jsonl(&first).unwrap();
+
+        let mut second = JsonlSession::create(dir.path(), "/tmp/two", Some("beta")).unwrap();
+        second
+            .append_entry(SessionEntry::message(
+                "assistant",
+                serde_json::json!([{"type":"text","text":"search-beta"}]),
+            ))
+            .unwrap();
+        store.import_jsonl(&second).unwrap();
+
+        let listed = store.list_sessions(Some("/tmp/one")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, first.header.id);
+        assert_eq!(listed[0].name.as_deref(), Some("alpha"));
+
+        let hits = store.search("search-alpha").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, first.header.id);
+
+        let now = now_ms_i64();
+        let lease = store
+            .acquire_writer_lease(&first.header.id, "owner-a", now, now + 5)
+            .unwrap()
+            .expect("lease");
+        assert_eq!(lease.fence, 1);
+        let stolen = store
+            .acquire_writer_lease(&first.header.id, "owner-b", now + 10, now + 20)
+            .unwrap()
+            .expect("expired lease is stealable");
+        assert_eq!(stolen.owner_id, "owner-b");
+        assert_eq!(stolen.fence, 2);
+        assert!(!store
+            .renew_writer_lease(&first.header.id, &mut lease.clone(), now + 11, now + 30)
+            .unwrap());
+        assert!(store
+            .renew_writer_lease(&first.header.id, &mut stolen.clone(), now + 11, now + 30)
+            .unwrap());
+    }
 }

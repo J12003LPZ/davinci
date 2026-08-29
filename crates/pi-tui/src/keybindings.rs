@@ -138,12 +138,35 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("tui.select.down", &["down"]),
         ("tui.select.confirm", &["enter"]),
         ("tui.select.cancel", &["escape"]),
+        ("tui.editor.cursorLeft", &["left", "ctrl+b"]),
+        ("tui.editor.cursorRight", &["right", "ctrl+f"]),
+        (
+            "tui.editor.cursorWordLeft",
+            &["alt+left", "ctrl+left", "alt+b"],
+        ),
+        (
+            "tui.editor.cursorWordRight",
+            &["alt+right", "ctrl+right", "alt+f"],
+        ),
+        (
+            "tui.editor.cursorLineStart",
+            &["home", "ctrl+home", "ctrl+a"],
+        ),
+        ("tui.editor.cursorLineEnd", &["end", "ctrl+end", "ctrl+e"]),
+        ("tui.editor.deleteCharBackward", &["backspace"]),
+        ("tui.editor.deleteCharForward", &["delete", "ctrl+d"]),
+        (
+            "tui.editor.deleteWordBackward",
+            &["ctrl+w", "alt+backspace"],
+        ),
+        ("tui.editor.deleteWordForward", &["alt+d", "alt+delete"]),
     ]
 }
 
 pub fn key_to_bytes(key: &str) -> String {
     match key {
         "ctrl+a" => "\x01".into(),
+        "ctrl+b" => "\x02".into(),
         "ctrl+c" => "\x03".into(),
         "ctrl+d" => "\x04".into(),
         "ctrl+e" => "\x05".into(),
@@ -160,6 +183,7 @@ pub fn key_to_bytes(key: &str) -> String {
         "ctrl+t" => "\x14".into(),
         "ctrl+u" => "\x15".into(),
         "ctrl+v" => "\x16".into(),
+        "ctrl+w" => "\x17".into(),
         "ctrl+x" => "\x18".into(),
         "ctrl+z" => "\x1a".into(),
         "ctrl+backspace" => "\x1b[3;5~".into(),
@@ -172,6 +196,19 @@ pub fn key_to_bytes(key: &str) -> String {
         "alt+p" => "\x1bp".into(),
         "alt+q" => "\x1bq".into(),
         "alt+v" => "\x1bv".into(),
+        "alt+b" => "\x1bb".into(),
+        "alt+f" => "\x1bf".into(),
+        "alt+d" => "\x1bd".into(),
+        "alt+backspace" => "\x1b\x7f".into(),
+        "alt+delete" => "\x1b[3;3~".into(),
+        "left" => "\x1b[D".into(),
+        "right" => "\x1b[C".into(),
+        "home" => "\x1b[H".into(),
+        "end" => "\x1b[F".into(),
+        "delete" => "\x1b[3~".into(),
+        "backspace" => "\x7f".into(),
+        "ctrl+home" => "\x1b[1;5H".into(),
+        "ctrl+end" => "\x1b[1;5F".into(),
         "ctrl+left" => "\x1b[1;5D".into(),
         "alt+left" => "\x1b[1;3D".into(),
         "ctrl+right" => "\x1b[1;5C".into(),
@@ -206,6 +243,9 @@ mod tests {
         assert!(Keybindings::defaults().matches("\x0c", "app.model.select"));
         assert!(Keybindings::defaults().matches("\x0f", "app.tools.expand"));
         assert!(Keybindings::defaults().matches("\x1b[Z", "app.thinking.cycle"));
+        assert!(Keybindings::defaults().matches("\x1b[1;5D", "tui.editor.cursorWordLeft"));
+        assert!(Keybindings::defaults().matches("\x17", "tui.editor.deleteWordBackward"));
+        assert!(Keybindings::defaults().matches("\x7f", "tui.editor.deleteCharBackward"));
         let migrated = Keybindings::from_json(r#"{"clear":"ctrl+u"}"#);
         assert!(migrated.matches("\x15", "app.clear"));
     }

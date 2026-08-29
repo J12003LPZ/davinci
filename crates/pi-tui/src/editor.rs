@@ -40,6 +40,75 @@ impl Editor {
         self.buffer.drain(self.cursor..self.cursor + prev);
     }
 
+    pub fn delete_forward(&mut self) {
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        let next = self.buffer[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        self.buffer.drain(self.cursor..self.cursor + next);
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= self.buffer[..self.cursor]
+            .chars()
+            .next_back()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+    }
+
+    pub fn move_right(&mut self) {
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        self.cursor += self.buffer[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+    }
+
+    pub fn move_line_start(&mut self) {
+        let line_start = self.buffer[..self.cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.cursor = line_start;
+    }
+
+    pub fn move_line_end(&mut self) {
+        let line_end = self.buffer[self.cursor..]
+            .find('\n')
+            .map(|index| self.cursor + index)
+            .unwrap_or(self.buffer.len());
+        self.cursor = line_end;
+    }
+
+    pub fn move_word_backwards(&mut self) {
+        self.cursor = crate::word_nav::find_word_backward_default(&self.buffer, self.cursor);
+    }
+
+    pub fn move_word_forwards(&mut self) {
+        self.cursor = crate::word_nav::find_word_forward_default(&self.buffer, self.cursor);
+    }
+
+    pub fn delete_word_backwards(&mut self) {
+        let start = crate::word_nav::find_word_backward_default(&self.buffer, self.cursor);
+        self.buffer.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    pub fn delete_word_forwards(&mut self) {
+        let end = crate::word_nav::find_word_forward_default(&self.buffer, self.cursor);
+        self.buffer.drain(self.cursor..end);
+    }
+
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.buffer = text.into();
         self.cursor = self.buffer.len();
@@ -96,5 +165,27 @@ mod tests {
         assert_eq!(editor.history, ["hi"]);
         let line = editor.render(20);
         assert!(line[0].contains(CURSOR_MARKER));
+    }
+
+    #[test]
+    fn word_nav_and_delete_match_ts_boundaries() {
+        let mut editor = Editor::new();
+        editor.set_text("hello world");
+        editor.move_word_backwards();
+        assert_eq!(editor.cursor, 6);
+        editor.delete_word_forwards();
+        assert_eq!(editor.buffer, "hello ");
+        editor.move_line_start();
+        editor.delete_word_forwards();
+        assert_eq!(editor.buffer, " ");
+        editor.set_text("foo.bar");
+        editor.cursor = 7;
+        editor.move_word_backwards();
+        assert_eq!(&editor.buffer[editor.cursor..], "bar");
+        editor.delete_word_backwards();
+        assert_eq!(editor.buffer, "foobar");
+        editor.move_left();
+        editor.delete_forward();
+        assert_eq!(editor.buffer, "fobar");
     }
 }

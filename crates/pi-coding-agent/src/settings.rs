@@ -736,11 +736,67 @@ impl Settings {
 
 pub fn save_settings(agent_dir: &Path, settings: &Settings) -> Result<(), String> {
     fs::create_dir_all(agent_dir).map_err(|err| err.to_string())?;
-    fs::write(
-        settings_path(agent_dir),
-        serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?,
-    )
-    .map_err(|err| err.to_string())
+    let path = settings_path(agent_dir);
+    with_settings_lock(&path, || {
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?,
+        )
+        .map_err(|err| err.to_string())
+    })
+}
+
+/// TS `proper-lockfile` / `lockfile.lockSync` sibling lock (`settings.json.lock`).
+pub fn settings_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+pub fn with_settings_lock<T>(
+    path: &Path,
+    write: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = settings_lock_path(path);
+    let _guard = acquire_settings_lock(&lock_path)?;
+    write()
+}
+
+struct SettingsLock(PathBuf);
+
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn acquire_settings_lock(lock_path: &Path) -> Result<SettingsLock, String> {
+    const MAX_ATTEMPTS: u32 = 10;
+    const DELAY_MS: u64 = 20;
+    let mut last_error = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(_) => return Ok(SettingsLock(lock_path.to_path_buf())),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < MAX_ATTEMPTS =>
+            {
+                last_error = Some(err.to_string());
+                std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
+            }
+            Err(err) => {
+                return Err(if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    "Failed to acquire settings lock".into()
+                } else {
+                    err.to_string()
+                });
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "Failed to acquire settings lock".into()))
 }
 
 pub fn should_run_first_time_setup(settings_path: &Path) -> bool {
@@ -877,6 +933,30 @@ mod tests {
         std::fs::write(&path, "{}").expect("write");
         assert!(!should_run_first_time_setup(&path));
         std::env::remove_var("PI_EXPERIMENTAL");
+    }
+
+    #[test]
+    fn settings_lock_writes_and_releases() {
+        let dir = tempfile::tempdir().expect("temp");
+        let agent = dir.path();
+        let dark = Settings {
+            theme: Some("dark".into()),
+            ..Settings::default()
+        };
+        save_settings(agent, &dark).unwrap();
+        assert_eq!(load_settings(agent).theme.as_deref(), Some("dark"));
+        assert!(!settings_lock_path(&settings_path(agent)).exists());
+        let lock = settings_lock_path(&settings_path(agent));
+        std::fs::write(&lock, "held").unwrap();
+        let err = save_settings(agent, &dark).unwrap_err();
+        assert_eq!(err, "Failed to acquire settings lock");
+        std::fs::remove_file(&lock).unwrap();
+        let light = Settings {
+            theme: Some("light".into()),
+            ..Settings::default()
+        };
+        save_settings(agent, &light).unwrap();
+        assert_eq!(load_settings(agent).theme.as_deref(), Some("light"));
     }
 
     #[test]

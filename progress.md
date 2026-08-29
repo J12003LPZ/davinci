@@ -79,7 +79,9 @@ Closed this slice: `images.blockImages` replaces image blocks with “Image read
 
 Closed this slice: interactive cache-miss notices (`showCacheMissNotices`, TS 20k / $0.10 threshold, compaction/branch cost lines, `/session` Cache Re-billed); OSC 9;4 progress (`]9;4;3` / `]9;4;0`, keepalive 1000ms, `showTerminalProgress`); git-branch footer (`~/cwd (branch) • name` + token stats); `quietStartup` hides the built-in title when no extension header; post-update changelog overlay (`getChangelogForDisplay`, install telemetry fixture/`pi.dev`); `pi config` persist (`PI_CONFIG_TOGGLE`, Spec↔Filtered autoload); `pi update --extensions` / `--all` / `--extension` reinstall (skip local + exact npm pins); `package.json` `"pi"` resource globs; extension `ctx` session APIs (`sendMessage`/`appendEntry`/`setLabel`/`setSessionName`/`newSession`/`fork`/`exec`). Assistant JSONL persist now writes usage/model/provider so cache accounting matches TS.
 
+Closed this slice: TUI editor word-nav (`findWordBackward`/`findWordForward` ASCII fixtures, atomic paste markers, `tui.editor.cursor*` / `delete*` keybindings wired in InteractiveSession); settings writes use `settings.json.lock` (10×20ms, TS `ELOCKED` retry); sqlite backend tests cover expired-lease fence steal, cwd list, FTS, and label import.
+
 Still not product-equivalent:
 
-- `pi-session-sqlite` implements the sqlite-node backend (WAL, leases, FTS, `001_initial.sql`) but is not selected from coding-agent; TS coding-agent also stays JSONL — remaining work is TS-locked conformance against `createSessionBackendConformance` (fork/clone/label/custom, writer fence, search) rather than flipping the product default
-- Remaining TUI/editor deltas vs TS (word-nav, settings lock file) and live Codex websocket (fixture/localhost only) still need a parity pass before 100%
+- `pi-session-sqlite` is the sqlite-node crate (WAL, leases, FTS, `001_initial.sql`) and is not the coding-agent default (TS coding-agent is JSONL too). Full `createSessionBackendConformance` SessionRepo (lanes, records, facts, fork/clone as first-class mutations) is still a library gap
+- Live Codex websocket remains fixture/localhost; TUI kill-ring/yank/jump-to-char and Intl.Segmenter CJK dictionary grouping are still thinner than TS

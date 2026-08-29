@@ -33,6 +33,7 @@ mod themes;
 mod tool_card;
 mod transcript;
 mod tree;
+mod word_nav;
 
 pub use autocomplete::{
     apply_completion, suggestions, AutocompleteItem, AutocompleteSuggestions, SlashCommandSpec,

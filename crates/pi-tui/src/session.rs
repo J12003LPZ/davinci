@@ -890,6 +890,9 @@ impl InteractiveSession {
             if self.keybindings.matches(data, "app.exit") && self.chrome.editor.buffer.is_empty() {
                 return SessionAction::Quit;
             }
+            if self.apply_editor_key(data) {
+                return SessionAction::None;
+            }
         }
         match data {
             "\x03" => SessionAction::Quit,
@@ -1362,6 +1365,64 @@ impl InteractiveSession {
         } else {
             SessionAction::Submit(submitted)
         }
+    }
+
+    fn apply_editor_key(&mut self, data: &str) -> bool {
+        let editor = &mut self.chrome.editor;
+        if self.keybindings.matches(data, "tui.editor.cursorWordLeft") {
+            editor.move_word_backwards();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorWordRight") {
+            editor.move_word_forwards();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorLeft") {
+            editor.move_left();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorRight") {
+            editor.move_right();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorLineStart") {
+            editor.move_line_start();
+            return true;
+        }
+        if self.keybindings.matches(data, "tui.editor.cursorLineEnd") {
+            editor.move_line_end();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteWordBackward")
+        {
+            editor.delete_word_backwards();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteWordForward")
+        {
+            editor.delete_word_forwards();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteCharForward")
+            && !editor.buffer.is_empty()
+        {
+            editor.delete_forward();
+            return true;
+        }
+        if self
+            .keybindings
+            .matches(data, "tui.editor.deleteCharBackward")
+        {
+            editor.backspace();
+            return true;
+        }
+        false
     }
 
     fn handle_printable(&mut self, data: &str) -> SessionAction {
@@ -1849,5 +1910,20 @@ mod tests {
         );
         assert_eq!(session.handle_bytes("\x03"), SessionAction::CloseOverlay);
         assert!(session.chrome.custom_overlay_path.is_none());
+    }
+
+    #[test]
+    fn editor_word_keys_move_and_delete() {
+        let mut session =
+            InteractiveSession::new(crate::themes::builtin_themes()[0].clone(), "pi", vec![]);
+        session.chrome.editor.set_text("hello world");
+        assert_eq!(session.handle_bytes("\x1b[1;5D"), SessionAction::None);
+        assert_eq!(session.chrome.editor.cursor, 6);
+        assert_eq!(session.handle_bytes("\x17"), SessionAction::None);
+        assert_eq!(session.chrome.editor.buffer, "world");
+        assert_eq!(session.handle_bytes("\x1b[1;5C"), SessionAction::None);
+        assert_eq!(session.chrome.editor.cursor, 5);
+        assert_eq!(session.handle_bytes("\x01"), SessionAction::None);
+        assert_eq!(session.chrome.editor.cursor, 0);
     }
 }
