@@ -135,7 +135,7 @@ pub fn execute_tool(
                 details: None,
             })
         }
-        "bash" => shell_tool(cwd, required_str(input, "command")?, "bash", &["-lc"]),
+        "bash" => shell_tool(cwd, required_str(input, "command")?),
         "powershell" => powershell_tool(cwd, required_str(input, "command")?),
         "ls" => ls_tool(cwd, input),
         "grep" => grep_tool(cwd, input),
@@ -258,18 +258,43 @@ fn detect_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn shell_tool(
-    cwd: &Path,
-    command: &str,
-    program: &str,
-    args: &[&str],
-) -> Result<ToolResult, ToolError> {
-    let output = Command::new(program)
-        .args(args)
-        .arg(command)
+fn shell_tool(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {
+    let command = match std::env::var("PI_SHELL_COMMAND_PREFIX") {
+        Ok(prefix) if !prefix.is_empty() => format!("{prefix}; {command}"),
+        _ => command.to_string(),
+    };
+    let custom = std::env::var("PI_SHELL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let config = pi_ai::resolve_shell_config(custom.as_deref()).map_err(ToolError::Failed)?;
+    let mut process = Command::new(&config.shell);
+    process
+        .args(&config.args)
         .current_dir(cwd)
-        .output()
-        .map_err(|err| ToolError::Failed(err.to_string()))?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = match config.command_transport {
+        pi_ai::CommandTransport::Argv => process
+            .arg(&command)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|err| ToolError::Failed(err.to_string()))?,
+        pi_ai::CommandTransport::Stdin => {
+            process.stdin(std::process::Stdio::piped());
+            let mut child = process
+                .spawn()
+                .map_err(|err| ToolError::Failed(err.to_string()))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                stdin
+                    .write_all(command.as_bytes())
+                    .map_err(|err| ToolError::Failed(err.to_string()))?;
+            }
+            child
+                .wait_with_output()
+                .map_err(|err| ToolError::Failed(err.to_string()))?
+        }
+    };
     let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
         if !content.is_empty() {

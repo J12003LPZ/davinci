@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (`checkAuth`/`getAvailable` TS algorithm, Copilot `availableModelIds` filter, models.json `!`/`$ENV` resolve, Bedrock/Vertex/Cloudflare ambient auth, TypeBox OpenRouter/Vercel routing). Not 100% — leftover deltas listed below.**
+**Complete: remaining product gaps reduced this slice (Copilot `/models` on OAuth, `!command` 10s timeout + Windows shell, `settings.shellPath` / `shellCommandPrefix`). Not 100% — leftover deltas listed below.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -59,7 +59,8 @@ Closed this slice: `--list-models` TS column table (`provider`/`model`/`context`
 
 Closed this slice: `checkAuth`/`getAvailable` lock TS `AuthCheck` (`type: api_key|oauth`, `source: OAuth` without OAuth refresh); GitHub Copilot `availableModelIds` filter; models.json `!command` configured without exec and `$ENV` templates; `resolveConfigValue` on `apply_config_auth`; Bedrock ambient sources (bearer/profile/access-key pair/ECS/IRSA); Vertex ADC + project + location; Cloudflare API key + account (+ gateway); xAI/Kimi OAuth flags; TypeBox `openRouterRouting` / `vercelGatewayRouting` / `chatTemplateKwargs` / remaining compat bools / `thinkingLevelMap`.
 
+Closed this slice: GitHub Copilot OAuth login/refresh GETs `{base}/models` (token `proxy-ep`, Copilot headers, skip `tool_calls: false`; fixtures `PI_COPILOT_MODELS_REPLY` / `PI_COPILOT_MODELS_URL`; tests never hit GitHub). models.json `!command` uses TS shell resolution (Unix `/bin/sh -c`, Windows Git Bash then `cmd.exe /d /s /c`, WSL `bash.exe -s` stdin, 10s timeout, `settings.shellPath` `~` expand). bash tool honors `shellPath` / `shellCommandPrefix`.
+
 Still not product-equivalent:
 
-- GitHub Copilot OAuth login does not live-fetch `/models` (fixture `PI_COPILOT_MODELS_REPLY` only)
-- models.json `!command` resolve has no 10s timeout or Windows shell fallback (Unix `sh -c`; tests never execute)
+- Nested settings still not wired: `compaction`, `retry`, `thinkingBudgets`, `branchSummary`, `httpProxy`, `sessionDir`

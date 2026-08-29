@@ -26,7 +26,7 @@ use pi_agent::{
     AgentEvent, CustomToolExecutor,
 };
 use pi_ai::{
-    apply_config_auth, apply_models_config, content_text, find_model,
+    apply_config_auth_with_shell, apply_models_config, content_text, find_model,
     format_no_models_available_message, fuzzy_models, live_complete, load_builtin_models,
     models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
     ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
@@ -206,6 +206,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.session = Some(resolve_or_create_session(parsed, session_dir, cwd)?);
     }
     let settings = load_settings(&default_agent_dir());
+    if let Some(path) = settings.shell_path.as_deref() {
+        std::env::set_var("PI_SHELL", path);
+    }
+    if let Some(prefix) = settings.shell_command_prefix.as_deref() {
+        std::env::set_var("PI_SHELL_COMMAND_PREFIX", prefix);
+    }
     let _trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     let mut extensions = settings.extensions.clone();
     extensions.extend(parsed.extensions.clone());
@@ -570,7 +576,8 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
     let mut resolved = resolve_provider_auth(&provider, &storage, &env, true);
     if let Some(auth) = resolved.as_mut() {
         let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
-        apply_config_auth(auth, &config, &provider, None, &env);
+        let shell_path = load_settings(&default_agent_dir()).shell_path;
+        apply_config_auth_with_shell(auth, &config, &provider, None, &env, shell_path.as_deref());
     }
     match command.kind {
         AuthCommandKind::Check => {
@@ -650,7 +657,15 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
     if let Some(auth) = auth.as_mut() {
         let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
         let model = find_model(&models, &agent.provider, &agent.model_id);
-        apply_config_auth(auth, &config, &agent.provider, model, &env);
+        let shell_path = load_settings(&default_agent_dir()).shell_path;
+        apply_config_auth_with_shell(
+            auth,
+            &config,
+            &agent.provider,
+            model,
+            &env,
+            shell_path.as_deref(),
+        );
     }
     if auth.as_ref().is_some_and(|item| {
         item.api_key.is_none() && item.headers.is_empty() && item.source == "none"

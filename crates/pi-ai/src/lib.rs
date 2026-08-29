@@ -10,10 +10,12 @@ mod oauth;
 mod oauth_callback;
 mod oauth_providers;
 mod providers;
+mod shell;
 mod stream;
 
 pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
+    copilot_base_url_from_token, fetch_github_copilot_available_model_ids,
     parse_copilot_available_model_ids, resolve_provider_auth, vertex_ambient_auth, AuthStorage,
     AuthStorageError, Credential, CredentialKind, ResolvedAuth,
 };
@@ -31,8 +33,9 @@ pub use codex::{
     WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
 };
 pub use model_config::{
-    apply_config_auth, apply_models_config, config_value_env_var_names, is_command_config_value,
-    load_models_json, merge_headers, models_json_path, resolve_config_value, ModelConfig,
+    apply_config_auth, apply_config_auth_with_shell, apply_models_config,
+    config_value_env_var_names, is_command_config_value, load_models_json, merge_headers,
+    models_json_path, resolve_config_value, resolve_config_value_with_shell, ModelConfig,
     ModelsJsonProvider, NO_MODELS_AVAILABLE,
 };
 pub use model_runtime::{
@@ -56,6 +59,10 @@ pub use oauth_providers::{
     TokenExchangeRequest,
 };
 pub use providers::{builtin_providers, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS};
+pub use shell::{
+    command_timeout_from_env, execute_config_command, is_legacy_wsl_bash_path,
+    resolve_shell_config, CommandTransport, ResolveCommandOptions, ShellConfig,
+};
 pub use stream::{
     assistant_to_chat, complete_from_events, events_from_complete, fixture_complete, live_complete,
     live_stream, parse_sse_block, replay_sse_events, request_body, request_url, AssistantMessage,

@@ -90,6 +90,10 @@ pub struct Settings {
     pub default_model: Option<String>,
     #[serde(default, rename = "defaultProvider")]
     pub default_provider: Option<String>,
+    #[serde(default, rename = "shellPath")]
+    pub shell_path: Option<String>,
+    #[serde(default, rename = "shellCommandPrefix")]
+    pub shell_command_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

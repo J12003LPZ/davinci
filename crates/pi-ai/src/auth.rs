@@ -151,16 +151,22 @@ impl AuthStorage {
         refresh: Option<String>,
         expires: Option<u64>,
     ) -> Result<(), AuthStorageError> {
+        let access = access.into();
+        let available_model_ids = if provider == "github-copilot" {
+            fetch_github_copilot_available_model_ids(&access)
+        } else {
+            Vec::new()
+        };
         self.set(
             provider,
             Credential {
                 kind: CredentialKind::Oauth,
                 key: None,
-                access: Some(access.into()),
+                access: Some(access),
                 refresh,
                 expires,
                 env: HashMap::new(),
-                available_model_ids: copilot_available_model_ids(provider),
+                available_model_ids,
             },
         )
     }
@@ -527,21 +533,76 @@ pub fn bedrock_ambient_source(env: &HashMap<String, String>) -> Option<String> {
     None
 }
 
-/// GitHub Copilot `availableModelIds` from `PI_COPILOT_MODELS_REPLY` (file or JSON).
-/// Tests never hit the network; production login also stays fixture-only here.
+const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.35.0";
+const COPILOT_EDITOR_VERSION: &str = "vscode/1.107.0";
+const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
+const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
+const COPILOT_API_VERSION: &str = "2026-06-01";
+const COPILOT_DEFAULT_BASE: &str = "https://api.individual.githubcopilot.com";
+
+/// GitHub Copilot `availableModelIds` after OAuth login/refresh.
+/// Fixture `PI_COPILOT_MODELS_REPLY` / `PI_COPILOT_MODELS_URL` first.
+/// Tests never hit GitHub; production GETs `{base}/models`.
 pub fn copilot_available_model_ids(provider: &str) -> Vec<String> {
     if provider != "github-copilot" {
         return Vec::new();
     }
-    let Ok(reply) = std::env::var("PI_COPILOT_MODELS_REPLY") else {
+    fetch_github_copilot_available_model_ids("")
+}
+
+pub fn copilot_base_url_from_token(token: &str) -> String {
+    if let Some(host) = token
+        .split(';')
+        .find_map(|part| part.strip_prefix("proxy-ep="))
+    {
+        let api_host = host.replacen("proxy.", "api.", 1);
+        return format!("https://{api_host}");
+    }
+    if let Ok(base) = std::env::var("PI_COPILOT_BASE_URL") {
+        if !base.is_empty() {
+            return base;
+        }
+    }
+    COPILOT_DEFAULT_BASE.into()
+}
+
+pub fn fetch_github_copilot_available_model_ids(access: &str) -> Vec<String> {
+    if let Ok(reply) = std::env::var("PI_COPILOT_MODELS_REPLY") {
+        let raw = if Path::new(&reply).is_file() {
+            fs::read_to_string(&reply).unwrap_or_default()
+        } else {
+            reply
+        };
+        return parse_copilot_available_model_ids(&raw);
+    }
+    let url = std::env::var("PI_COPILOT_MODELS_URL").unwrap_or_else(|_| {
+        format!(
+            "{}/models",
+            copilot_base_url_from_token(access).trim_end_matches('/')
+        )
+    });
+    if cfg!(test) && !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") {
         return Vec::new();
+    }
+    if url.is_empty() {
+        return Vec::new();
+    }
+    let response = match ureq::get(&url)
+        .set("accept", "application/json")
+        .set("authorization", &format!("Bearer {access}"))
+        .set("user-agent", COPILOT_USER_AGENT)
+        .set("editor-version", COPILOT_EDITOR_VERSION)
+        .set("editor-plugin-version", COPILOT_PLUGIN_VERSION)
+        .set("copilot-integration-id", COPILOT_INTEGRATION_ID)
+        .set("x-github-api-version", COPILOT_API_VERSION)
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+    {
+        Ok(response) => response,
+        Err(_) => return Vec::new(),
     };
-    let raw = if Path::new(&reply).is_file() {
-        fs::read_to_string(&reply).unwrap_or_default()
-    } else {
-        reply
-    };
-    parse_copilot_available_model_ids(&raw)
+    let text = response.into_string().unwrap_or_default();
+    parse_copilot_available_model_ids(&text)
 }
 
 pub fn parse_copilot_available_model_ids(raw: &str) -> Vec<String> {
@@ -565,6 +626,13 @@ pub fn parse_copilot_available_model_ids(raw: &str) -> Vec<String> {
         let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
+        if item
+            .pointer("/capabilities/supports/tool_calls")
+            .and_then(|v| v.as_bool())
+            == Some(false)
+        {
+            continue;
+        }
         let picker_enabled = item
             .get("model_picker_enabled")
             .and_then(|v| v.as_bool())
@@ -638,5 +706,48 @@ mod tests {
         assert_eq!(cred.access.as_deref(), Some("pi-fixture-refresh-access"));
         assert!(cred.expires.unwrap() > 10_000);
         assert!(!storage.maybe_refresh("anthropic", 10_000, 0, true).unwrap());
+    }
+
+    #[test]
+    fn copilot_base_url_uses_proxy_ep() {
+        assert_eq!(
+            copilot_base_url_from_token(
+                "tid=test;exp=1;proxy-ep=proxy.individual.githubcopilot.com;"
+            ),
+            "https://api.individual.githubcopilot.com"
+        );
+    }
+
+    #[test]
+    fn copilot_parse_skips_models_without_tool_calls() {
+        let ids = parse_copilot_available_model_ids(
+            r#"{"data":[{"id":"gpt-4.1","model_picker_enabled":true,"policy":{"state":"enabled"}},{"id":"no-tools","model_picker_enabled":true,"policy":{"state":"enabled"},"capabilities":{"supports":{"tool_calls":false}}}]}"#,
+        );
+        assert_eq!(ids, vec!["gpt-4.1".to_string()]);
+    }
+
+    #[test]
+    fn copilot_models_fetch_uses_localhost_override() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"data":[{"id":"gpt-4.1","model_picker_enabled":true,"policy":{"state":"enabled"}}]}"#;
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        std::env::set_var("PI_COPILOT_MODELS_URL", format!("http://{addr}/models"));
+        let ids = fetch_github_copilot_available_model_ids(
+            "tid=test;proxy-ep=proxy.individual.githubcopilot.com;",
+        );
+        std::env::remove_var("PI_COPILOT_MODELS_URL");
+        assert_eq!(ids, vec!["gpt-4.1".to_string()]);
     }
 }

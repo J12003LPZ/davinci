@@ -40,8 +40,16 @@ pub fn config_value_env_var_names(config: &str) -> Vec<String> {
 
 /// TS `resolveConfigValue`: expand `$ENV` / `${ENV}` and (outside tests) `!command`.
 pub fn resolve_config_value(config: &str, env: &HashMap<String, String>) -> Option<String> {
+    resolve_config_value_with_shell(config, env, None)
+}
+
+pub fn resolve_config_value_with_shell(
+    config: &str,
+    env: &HashMap<String, String>,
+    shell_path: Option<&str>,
+) -> Option<String> {
     if is_command_config_value(config) {
-        return resolve_command_config_value(config);
+        return resolve_command_config_value(config, shell_path);
     }
     resolve_template_value(&parse_config_value_template(config), env)
 }
@@ -113,12 +121,9 @@ fn resolve_template_value(parts: &[TemplatePart], env: &HashMap<String, String>)
     Some(resolved)
 }
 
-fn resolve_command_config_value(config: &str) -> Option<String> {
+fn resolve_command_config_value(config: &str, shell_path: Option<&str>) -> Option<String> {
     if let Ok(reply) = std::env::var("PI_CONFIG_VALUE_REPLY") {
         return if reply.is_empty() { None } else { Some(reply) };
-    }
-    if cfg!(test) {
-        return None;
     }
     let cache = command_result_cache();
     if let Ok(guard) = cache.lock() {
@@ -126,26 +131,14 @@ fn resolve_command_config_value(config: &str) -> Option<String> {
             return cached.clone();
         }
     }
-    let command = &config[1..];
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok();
-    let value = output.and_then(|result| {
-        if !result.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&result.stdout).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    });
+    let value = crate::shell::execute_config_command(
+        &config[1..],
+        &crate::shell::ResolveCommandOptions {
+            shell_path: shell_path.map(str::to_string),
+            timeout: crate::shell::command_timeout_from_env(),
+            allow_command: !cfg!(test),
+        },
+    );
     if let Ok(mut guard) = cache.lock() {
         guard.insert(config.to_string(), value.clone());
     }
@@ -323,6 +316,17 @@ pub fn apply_config_auth(
     model: Option<&Model>,
     env: &HashMap<String, String>,
 ) {
+    apply_config_auth_with_shell(auth, config, provider, model, env, None)
+}
+
+pub fn apply_config_auth_with_shell(
+    auth: &mut crate::ResolvedAuth,
+    config: &ModelConfig,
+    provider: &str,
+    model: Option<&Model>,
+    env: &HashMap<String, String>,
+    shell_path: Option<&str>,
+) {
     let Some(provider_config) = config.get_provider(provider) else {
         if let Some(model) = model {
             for (key, value) in &model.headers {
@@ -333,7 +337,7 @@ pub fn apply_config_auth(
     };
     if auth.api_key.is_none() {
         if let Some(key) = &provider_config.api_key {
-            if let Some(resolved) = resolve_config_value(key, env) {
+            if let Some(resolved) = resolve_config_value_with_shell(key, env, shell_path) {
                 auth.api_key = Some(resolved);
                 auth.source = "configured API key".into();
             }
@@ -343,7 +347,7 @@ pub fn apply_config_auth(
         let lower = key.to_ascii_lowercase();
         auth.headers
             .retain(|existing, _| existing.to_ascii_lowercase() != lower);
-        if let Some(resolved) = resolve_config_value(value, env) {
+        if let Some(resolved) = resolve_config_value_with_shell(value, env, shell_path) {
             auth.headers.insert(key.clone(), resolved);
         }
     }
