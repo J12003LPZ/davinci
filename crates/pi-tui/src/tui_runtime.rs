@@ -343,7 +343,7 @@ impl TuiBase {
             }
             None => {
                 if let Some(child) = self.children.children.last_mut() {
-                    if !(is_key_release(data) && !child.wants_key_release()) {
+                    if !is_key_release(data) || child.wants_key_release() {
                         child.handle_input(data);
                     }
                 }
@@ -580,10 +580,14 @@ impl TuiMainScreen {
             self.base.terminal.write(" ");
             let target_row = self.previous_lines.len();
             let line_diff = target_row as isize - self.hardware_cursor_row as isize;
-            if line_diff > 0 {
-                self.base.terminal.write(&format!("\x1b[{line_diff}B"));
-            } else if line_diff < 0 {
-                self.base.terminal.write(&format!("\x1b[{}A", -line_diff));
+            match line_diff.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    self.base.terminal.write(&format!("\x1b[{line_diff}B"));
+                }
+                std::cmp::Ordering::Less => {
+                    self.base.terminal.write(&format!("\x1b[{}A", -line_diff));
+                }
+                std::cmp::Ordering::Equal => {}
             }
             self.base.terminal.write("\r\n");
         }
@@ -925,10 +929,10 @@ impl TuiMainScreen {
                 let current_screen_row = hardware_cursor_row.saturating_sub(prev_viewport_top);
                 let target_screen_row = target_row.saturating_sub(viewport_top);
                 let line_diff = target_screen_row as isize - current_screen_row as isize;
-                if line_diff > 0 {
-                    output.append(&format!("\x1b[{line_diff}B"));
-                } else if line_diff < 0 {
-                    output.append(&format!("\x1b[{}A", -line_diff));
+                match line_diff.cmp(&0) {
+                    std::cmp::Ordering::Greater => output.append(&format!("\x1b[{line_diff}B")),
+                    std::cmp::Ordering::Less => output.append(&format!("\x1b[{}A", -line_diff)),
+                    std::cmp::Ordering::Equal => {}
                 }
                 output.append("\r");
                 let extra_lines = self.previous_lines.len() - new_lines.len();
@@ -997,10 +1001,10 @@ impl TuiMainScreen {
         let current_screen_row = hardware_cursor_row.saturating_sub(prev_viewport_top);
         let target_screen_row = move_target_row.saturating_sub(viewport_top);
         let line_diff = target_screen_row as isize - current_screen_row as isize;
-        if line_diff > 0 {
-            output.append(&format!("\x1b[{line_diff}B"));
-        } else if line_diff < 0 {
-            output.append(&format!("\x1b[{}A", -line_diff));
+        match line_diff.cmp(&0) {
+            std::cmp::Ordering::Greater => output.append(&format!("\x1b[{line_diff}B")),
+            std::cmp::Ordering::Less => output.append(&format!("\x1b[{}A", -line_diff)),
+            std::cmp::Ordering::Equal => {}
         }
         output.append(if append_start { "\r\n" } else { "\r" });
 
@@ -1102,10 +1106,10 @@ impl TuiMainScreen {
         let target_col = col;
         let row_delta = target_row as isize - self.hardware_cursor_row as isize;
         let mut buffer = String::new();
-        if row_delta > 0 {
-            buffer.push_str(&format!("\x1b[{row_delta}B"));
-        } else if row_delta < 0 {
-            buffer.push_str(&format!("\x1b[{}A", -row_delta));
+        match row_delta.cmp(&0) {
+            std::cmp::Ordering::Greater => buffer.push_str(&format!("\x1b[{row_delta}B")),
+            std::cmp::Ordering::Less => buffer.push_str(&format!("\x1b[{}A", -row_delta)),
+            std::cmp::Ordering::Equal => {}
         }
         buffer.push_str(&format!("\x1b[{}G", target_col + 1));
         if !buffer.is_empty() {
@@ -1508,7 +1512,7 @@ mod tests {
         };
         tui.add_child(Box::new(component));
         tui.render_now(false);
-        let writes = (&*tui.base.terminal)
+        let writes = (*tui.base.terminal)
             .as_any()
             .downcast_ref::<MemoryTerminal>()
             .expect("memory")
@@ -1530,7 +1534,7 @@ mod tests {
             renders: Rc::new(RefCell::new(0)),
         }));
         tui.render_now(false);
-        (&mut *tui.base.terminal)
+        (*tui.base.terminal)
             .as_any_mut()
             .downcast_mut::<MemoryTerminal>()
             .expect("memory")
@@ -1538,7 +1542,7 @@ mod tests {
         let kitty = format!("\x1b_Ga=T,f=100;{}\x1b\\", "A".repeat(1_200_000));
         *lines.borrow_mut() = vec!["before".into(), kitty.clone(), kitty];
         tui.render_now(false);
-        let writes = &(&*tui.base.terminal)
+        let writes = &(*tui.base.terminal)
             .as_any()
             .downcast_ref::<MemoryTerminal>()
             .expect("memory")
@@ -1575,7 +1579,7 @@ mod tests {
             value: "1\n2\n3\n4\n5\n6".into(),
         }));
         tui.start();
-        let output = (&*tui.base.terminal)
+        let output = (*tui.base.terminal)
             .as_any()
             .downcast_ref::<MemoryTerminal>()
             .expect("memory")
@@ -1588,7 +1592,7 @@ mod tests {
         tui.scroll_to_bottom();
         assert!(tui.is_following_output());
         tui.stop(TuiStopOptions::default());
-        let output = (&*tui.base.terminal)
+        let output = (*tui.base.terminal)
             .as_any()
             .downcast_ref::<MemoryTerminal>()
             .expect("memory")

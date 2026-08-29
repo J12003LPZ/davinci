@@ -43,20 +43,13 @@ pub struct SelectListTruncatePrimaryContext<'a> {
     pub is_selected: bool,
 }
 
+type TruncatePrimaryFn = Box<dyn Fn(SelectListTruncatePrimaryContext<'_>) -> String>;
+
+#[derive(Default)]
 pub struct SelectListLayoutOptions {
     pub min_primary_column_width: Option<usize>,
     pub max_primary_column_width: Option<usize>,
-    pub truncate_primary: Option<Box<dyn Fn(SelectListTruncatePrimaryContext<'_>) -> String>>,
-}
-
-impl Default for SelectListLayoutOptions {
-    fn default() -> Self {
-        Self {
-            min_primary_column_width: None,
-            max_primary_column_width: None,
-            truncate_primary: None,
-        }
-    }
+    pub truncate_primary: Option<TruncatePrimaryFn>,
 }
 
 pub struct ItemSelectList {

@@ -174,10 +174,10 @@ pub trait TerminalIo: AsAny {
         }
     }
     fn move_by(&mut self, lines: i32) {
-        if lines > 0 {
-            self.write(&format!("\x1b[{lines}B"));
-        } else if lines < 0 {
-            self.write(&format!("\x1b[{}A", -lines));
+        match lines.cmp(&0) {
+            std::cmp::Ordering::Greater => self.write(&format!("\x1b[{lines}B")),
+            std::cmp::Ordering::Less => self.write(&format!("\x1b[{}A", -lines)),
+            std::cmp::Ordering::Equal => {}
         }
     }
 }
@@ -231,6 +231,8 @@ impl TerminalIo for MemoryTerminal {
     fn show_cursor(&mut self) {}
 }
 
+type InputHandler = Box<dyn FnMut(&str)>;
+
 /// Real / fixture terminal matching TS `ProcessTerminal`.
 pub struct ProcessTerminal {
     writes: Vec<String>,
@@ -246,7 +248,7 @@ pub struct ProcessTerminal {
     stdin_buffer: Option<StdinBuffer>,
     progress_active: bool,
     progress_next_ms: Option<u64>,
-    input_handler: Option<Box<dyn FnMut(&str)>>,
+    input_handler: Option<InputHandler>,
     write_log_path: Option<String>,
     started: bool,
 }
