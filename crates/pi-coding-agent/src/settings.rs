@@ -473,9 +473,28 @@ pub fn load_settings_file(path: &Path) -> Settings {
 }
 
 pub fn load_merged_settings(agent_dir: &Path, cwd: &Path) -> Settings {
-    let global = load_settings_value(&settings_path(agent_dir));
+    load_merged_settings_with_override(agent_dir, cwd, None)
+}
+
+pub fn load_merged_settings_with_override(
+    agent_dir: &Path,
+    cwd: &Path,
+    override_trust: Option<bool>,
+) -> Settings {
+    let global_value = load_settings_value(&settings_path(agent_dir));
+    let global: Settings =
+        serde_json::from_value(migrate_settings(global_value.clone())).unwrap_or_default();
+    if !crate::trust::resolve_project_trusted(
+        agent_dir,
+        cwd,
+        override_trust,
+        global.default_project_trust.as_deref(),
+        &global.trusted_projects,
+    ) {
+        return global;
+    }
     let project = load_settings_value(&cwd.join(CONFIG_DIR_NAME).join("settings.json"));
-    let merged = deep_merge_json(global, project);
+    let merged = deep_merge_json(global_value, project);
     serde_json::from_value(migrate_settings(merged)).unwrap_or_default()
 }
 
@@ -916,11 +935,13 @@ pub fn to_interactive_config(
 }
 
 pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>) -> bool {
-    if let Some(value) = override_trust {
-        return value;
-    }
-    let canonical = cwd.to_string_lossy().into_owned();
-    settings.trusted_projects.iter().any(|p| p == &canonical)
+    crate::trust::resolve_project_trusted(
+        &pi_session::default_agent_dir(),
+        cwd,
+        override_trust,
+        settings.default_project_trust.as_deref(),
+        &settings.trusted_projects,
+    )
 }
 
 #[cfg(test)]
@@ -1049,7 +1070,8 @@ mod tests {
                 "compaction": { "enabled": true, "reserveTokens": 10 },
                 "retry": { "maxDelayMs": 12000, "provider": { "timeoutMs": 30000 } },
                 "branchSummary": { "skipPrompt": true, "reserveTokens": 99 },
-                "thinkingBudgets": { "medium": 4096 }
+                "thinkingBudgets": { "medium": 4096 },
+                "defaultProjectTrust": "always"
             }"#,
         )
         .expect("write");
@@ -1173,5 +1195,24 @@ mod tests {
             Some(value) => std::env::set_var("HTTPS_PROXY", value),
             None => std::env::remove_var("HTTPS_PROXY"),
         }
+    }
+
+    #[test]
+    fn untrusted_project_settings_are_not_merged() {
+        let dir = tempfile::tempdir().expect("temp");
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&agent_dir).ok();
+        std::fs::create_dir_all(project.join(".pi")).ok();
+        std::fs::write(agent_dir.join("settings.json"), r#"{ "theme": "dark" }"#).unwrap();
+        std::fs::write(
+            project.join(".pi").join("settings.json"),
+            r#"{ "theme": "light" }"#,
+        )
+        .unwrap();
+        let skipped = load_merged_settings(&agent_dir, &project);
+        assert_eq!(skipped.theme.as_deref(), Some("dark"));
+        let forced = load_merged_settings_with_override(&agent_dir, &project, Some(true));
+        assert_eq!(forced.theme.as_deref(), Some("light"));
     }
 }

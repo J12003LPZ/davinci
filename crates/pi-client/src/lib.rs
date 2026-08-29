@@ -1,5 +1,9 @@
 //! Protocol client matching `@earendil-works/pi-client`.
 
+mod state;
+
+pub use state::{ClientState, Unsubscribe};
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;

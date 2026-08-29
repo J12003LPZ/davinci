@@ -10,8 +10,8 @@ use std::time::Duration;
 use pi_protocol::{
     encode_server_message, AssistantContent, ClientMessage, ClientMessageDecoder, Command,
     CommandResult, ModelCost, ModelMetadata, ModelRef, ProtocolError, ProtocolErrorCode,
-    ServerMessage, ServerSnapshot, SessionPhase, SessionSnapshot, TextOrImage, ThinkingLevel,
-    TranscriptItem, PROTOCOL_VERSION,
+    ServerEvent, ServerMessage, ServerSnapshot, SessionPhase, SessionSnapshot, TextOrImage,
+    ThinkingLevel, TranscriptItem, PROTOCOL_VERSION,
 };
 use pi_session::{discover_sessions, JsonlSession};
 use serde_json::Value;
@@ -42,6 +42,7 @@ pub struct PiServer {
     pub revision: u64,
     attachments: HashMap<String, String>,
     live: HashMap<String, LiveSession>,
+    pending_events: Vec<ServerEvent>,
 }
 
 impl PiServer {
@@ -53,6 +54,45 @@ impl PiServer {
             revision: 0,
             attachments: HashMap::new(),
             live: HashMap::new(),
+            pending_events: Vec::new(),
+        }
+    }
+
+    pub fn take_events(&mut self) -> Vec<ServerEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    fn emit_session_snapshot(&mut self, session_id: &str) {
+        if let Ok(snapshot) = self.live_snapshot(session_id) {
+            self.pending_events
+                .push(ServerEvent::SessionSnapshot { snapshot });
+        }
+    }
+
+    fn emit_server_snapshot(&mut self) {
+        self.pending_events.push(ServerEvent::ServerSnapshot {
+            snapshot: self.snapshot(),
+        });
+    }
+
+    fn queue_result_events(&mut self, result: &CommandResult) {
+        let session_id = match result {
+            CommandResult::List { .. } => return,
+            CommandResult::Detach { session_id } => session_id.clone(),
+            CommandResult::Create { session }
+            | CommandResult::Attach { session }
+            | CommandResult::Prompt { session }
+            | CommandResult::Steer { session }
+            | CommandResult::Abort { session }
+            | CommandResult::SetModel { session }
+            | CommandResult::SetThinking { session } => session.id.clone(),
+        };
+        self.emit_session_snapshot(&session_id);
+        if matches!(
+            result,
+            CommandResult::Create { .. } | CommandResult::Detach { .. }
+        ) {
+            self.emit_server_snapshot();
         }
     }
 
@@ -97,12 +137,15 @@ impl PiServer {
                 }
             }
             ClientMessage::Request { id, request } => match self.dispatch(request) {
-                Ok(result) => ServerMessage::Response {
-                    id,
-                    ok: true,
-                    result: Some(result),
-                    error: None,
-                },
+                Ok(result) => {
+                    self.queue_result_events(&result);
+                    ServerMessage::Response {
+                        id,
+                        ok: true,
+                        result: Some(result),
+                        error: None,
+                    }
+                }
                 Err(error) => ServerMessage::Response {
                     id,
                     ok: false,
@@ -504,11 +547,20 @@ pub fn serve_stream<S: Read + Write>(
             .map_err(|err| ServerError::Protocol(err.to_string()))?
         {
             let response = server.handle(message);
-            let bytes = encode_server_message(&response, None)
-                .map_err(|err| ServerError::Protocol(err.to_string()))?;
-            stream
-                .write_all(&bytes)
-                .map_err(|err| ServerError::Io(err.to_string()))?;
+            let mut outgoing = vec![response];
+            outgoing.extend(
+                server
+                    .take_events()
+                    .into_iter()
+                    .map(|event| ServerMessage::Event { event }),
+            );
+            for message in outgoing {
+                let bytes = encode_server_message(&message, None)
+                    .map_err(|err| ServerError::Protocol(err.to_string()))?;
+                stream
+                    .write_all(&bytes)
+                    .map_err(|err| ServerError::Io(err.to_string()))?;
+            }
         }
     }
     Ok(())
@@ -685,5 +737,34 @@ mod tests {
         std::env::remove_var("PI_SERVER_KEEP_TURN");
         assert_eq!(aborted.phase, SessionPhase::Idle);
         assert_eq!(aborted.queued_steer_count, 0);
+    }
+
+    #[test]
+    fn mutating_commands_emit_session_and_server_snapshots() {
+        let dir = tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let created = create_session(&mut server);
+        let events = server.take_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ServerEvent::SessionSnapshot { snapshot } if snapshot.id == created.id
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::ServerSnapshot { .. })));
+        let _ = memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "a1".into(),
+                request: Command::Attach {
+                    session_id: created.id.clone(),
+                },
+            },
+        );
+        let attach_events = server.take_events();
+        assert!(attach_events.iter().any(|event| matches!(
+            event,
+            ServerEvent::SessionSnapshot { snapshot } if snapshot.id == created.id && snapshot.attached
+        )));
     }
 }

@@ -32,6 +32,7 @@ use crate::themes::Theme;
 use crate::thinking_selector::{ThinkingSelector, ThinkingSelectorAction};
 use crate::tool_card::ToolCard;
 use crate::tree::{FilterMode, SessionTreeNode, TreeAction, TreeSelector};
+use crate::trust_selector::{TrustSelector, TrustSelectorAction, TrustUpdate};
 use crate::{SelectList, ALT_BUFFER_ENTER, ALT_BUFFER_LEAVE};
 
 pub const DOUBLE_ESCAPE_MS: u64 = 500;
@@ -120,6 +121,10 @@ pub enum SessionAction {
     CustomEditorInput(String),
     CustomOverlayInput(String),
     Suspend,
+    SelectTrust {
+        trusted: bool,
+        updates: Vec<TrustUpdate>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +219,7 @@ pub enum OverlayKind {
     ExtensionEditor,
     ExtensionConfirm,
     ExtensionProgress,
+    Trust,
 }
 
 impl InteractiveSession {
@@ -359,6 +365,12 @@ impl InteractiveSession {
         self.chrome.status = "Select model".into();
     }
 
+    pub fn open_trust_selector(&mut self, selector: TrustSelector) {
+        self.overlay_kind = OverlayKind::Trust;
+        self.chrome.trust_selector = Some(selector);
+        self.chrome.status = "Project trust".into();
+    }
+
     pub fn open_thinking_selector(&mut self, default_level: Option<&str>) {
         self.overlay_kind = OverlayKind::Thinking;
         self.chrome.thinking_selector = Some(
@@ -457,6 +469,7 @@ impl InteractiveSession {
         self.chrome.selector = None;
         self.chrome.model_selector = None;
         self.chrome.thinking_selector = None;
+        self.chrome.trust_selector = None;
         self.chrome.settings_list = None;
         self.chrome.settings_submenu = None;
         self.chrome.session_selector = None;
@@ -487,6 +500,7 @@ impl InteractiveSession {
             || self.chrome.selector.is_some()
             || self.chrome.model_selector.is_some()
             || self.chrome.thinking_selector.is_some()
+            || self.chrome.trust_selector.is_some()
             || self.chrome.settings_list.is_some()
             || self.chrome.settings_submenu.is_some()
             || self.chrome.session_selector.is_some()
@@ -1003,6 +1017,19 @@ impl InteractiveSession {
     }
 
     fn handle_special_overlay(&mut self, data: &str) -> Option<SessionAction> {
+        if let Some(selector) = &mut self.chrome.trust_selector {
+            return Some(match selector.handle_key(data) {
+                TrustSelectorAction::None => SessionAction::None,
+                TrustSelectorAction::Select { trusted, updates } => {
+                    self.close_overlays();
+                    SessionAction::SelectTrust { trusted, updates }
+                }
+                TrustSelectorAction::Cancel => {
+                    self.close_overlays();
+                    SessionAction::CloseOverlay
+                }
+            });
+        }
         if let Some(selector) = &mut self.chrome.thinking_selector {
             return Some(match selector.handle_key(data) {
                 ThinkingSelectorAction::None => SessionAction::None,
@@ -1285,6 +1312,9 @@ impl InteractiveSession {
         } else if let Some(selector) = &mut self.chrome.thinking_selector {
             let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
             let _ = selector.handle_key(key);
+        } else if let Some(selector) = &mut self.chrome.trust_selector {
+            let key = if delta < 0 { "\x1b[A" } else { "\x1b[B" };
+            let _ = selector.handle_key(key);
         } else if let Some(selector) = &mut self.chrome.selector {
             selector.move_by(delta);
         } else if let Some(suggestions) = &self.chrome.autocomplete {
@@ -1331,6 +1361,11 @@ impl InteractiveSession {
             return SessionAction::None;
         }
         if self.chrome.thinking_selector.is_some() {
+            return self
+                .handle_special_overlay("\r")
+                .unwrap_or(SessionAction::None);
+        }
+        if self.chrome.trust_selector.is_some() {
             return self
                 .handle_special_overlay("\r")
                 .unwrap_or(SessionAction::None);
@@ -1410,7 +1445,8 @@ impl InteractiveSession {
                     | OverlayKind::ExtensionEditor
                     | OverlayKind::ExtensionConfirm
                     | OverlayKind::ExtensionProgress
-                    | OverlayKind::Thinking => SessionAction::CloseOverlay,
+                    | OverlayKind::Thinking
+                    | OverlayKind::Trust => SessionAction::CloseOverlay,
                 };
             }
             self.chrome.selector = None;
@@ -1578,6 +1614,7 @@ impl InteractiveSession {
     fn handle_printable(&mut self, data: &str) -> SessionAction {
         if self.chrome.selector.is_some()
             || self.chrome.thinking_selector.is_some()
+            || self.chrome.trust_selector.is_some()
             || self.chrome.model_selector.is_some()
         {
             if let Some(action) = self.handle_special_overlay(data) {
@@ -1776,6 +1813,32 @@ mod tests {
             session.handle_line("/thinking high"),
             SessionAction::SelectThinking("high".into())
         );
+        session.open_trust_selector(crate::TrustSelector::new(
+            "/project",
+            vec![crate::TrustOption {
+                label: "Trust".into(),
+                trusted: true,
+                updates: vec![crate::TrustUpdate {
+                    path: "/project".into(),
+                    decision: Some(true),
+                }],
+                saved_path: Some("/project".into()),
+            }],
+            None,
+            false,
+        ));
+        assert!(session.chrome.trust_selector.is_some());
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::SelectTrust {
+                trusted: true,
+                updates: vec![crate::TrustUpdate {
+                    path: "/project".into(),
+                    decision: Some(true),
+                }],
+            }
+        );
+        assert!(session.chrome.trust_selector.is_none());
         assert_eq!(session.handle_line("/model"), SessionAction::OpenModel);
         assert!(session.chrome.model_selector.is_some());
         assert!(session.render_frame().contains('┌'));

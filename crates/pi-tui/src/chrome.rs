@@ -19,6 +19,7 @@ use crate::thinking_selector::ThinkingSelector;
 use crate::tool_card::ToolCard;
 use crate::transcript::Transcript;
 use crate::tree::TreeSelector;
+use crate::trust_selector::TrustSelector;
 use crate::SelectList;
 
 /// Fullscreen / regular chat chrome used by interactive mode.
@@ -29,6 +30,7 @@ pub struct ChatChrome {
     pub selector: Option<SelectList>,
     pub model_selector: Option<ModelSelector>,
     pub thinking_selector: Option<ThinkingSelector>,
+    pub trust_selector: Option<TrustSelector>,
     pub settings_list: Option<SettingsList>,
     pub settings_submenu: Option<SettingsSubmenu>,
     pub session_selector: Option<SessionSelector>,
@@ -80,6 +82,7 @@ impl ChatChrome {
             selector: None,
             model_selector: None,
             thinking_selector: None,
+            trust_selector: None,
             settings_list: None,
             settings_submenu: None,
             session_selector: None,
@@ -359,6 +362,9 @@ impl Component for ChatChrome {
         } else if let Some(selector) = &self.thinking_selector {
             lines.push(String::new());
             lines.extend(selector.render(width));
+        } else if let Some(selector) = &self.trust_selector {
+            lines.push(String::new());
+            lines.extend(selector.render(width));
         } else if let Some(selector) = &self.selector {
             lines.push(String::new());
             lines.extend(selector.render(width));
@@ -464,6 +470,8 @@ impl Component for ChatChrome {
         } else if let Some(selector) = &mut self.model_selector {
             let _ = selector.handle_key(data);
         } else if let Some(selector) = &mut self.thinking_selector {
+            let _ = selector.handle_key(data);
+        } else if let Some(selector) = &mut self.trust_selector {
             let _ = selector.handle_key(data);
         } else if let Some(selector) = &mut self.selector {
             selector.query.push_str(data);

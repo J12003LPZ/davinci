@@ -1,6 +1,6 @@
 # pi Rust rewrite progress
 
-**Complete: remaining product gaps reduced this slice (skill + prompt-template slash expansion, `pi.on("input")` transform/handled, `generateImages` OpenRouter API, deeper `createAgentSession` restore/steer/follow-up). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
+**Complete: remaining product gaps reduced this slice (project `trust.json` + TrustSelector `/trust`, `--help` Examples/Environment Variables, `ClientState` subscribe, server snapshot events). Not marked 100% — TypeScript stays in `vendor/pi` as the reference spec.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
@@ -113,13 +113,14 @@ Closed this slice: JS `setHeader`/`setFooter`/`setWidget` function factories eva
 
 Closed this slice: interactive/print/RPC/SDK expand `/skill:name` (TS XML block + args) and prompt templates (`parseCommandArgs` / `substituteArgs` / `$1` `$@` `$ARGUMENTS` `${N:-default}` `${@:N}` `${@:N:L}`) before the agent turn. Unknown slashes are sent to `prompt()` like TS (not “Unknown command”). `enableSkillCommands` gates `/skill:` autocomplete listing only. `pi.on("input")` chains `transform` and short-circuits `handled`. `generateImages` ports the openrouter-images library API (fixture `PI_OPENROUTER_IMAGES_REPLY` / abort). `create_agent_session` restores latest/path sessions, loads skills/templates/settings defaults, and exposes `prompt`/`steer`/`follow_up`/`compact`/`abort` with the same expansion.
 
+Closed this slice: project trust store at `{agentDir}/trust.json` with parent inheritance, `/trust` TrustSelector (Trust / Trust parent folder / Do not trust), `defaultProjectTrust` always/never/ask, `--approve`/`--no-approve`, untrusted projects skip `.pi/settings.json` and project skills/prompts, startup warning matching TS. `--help` includes TS Examples and Environment Variables. `pi-client` `ClientState` applies results/events with revision checks and subscribe/onEvent/subscribeSession. `pi-server` emits `session_snapshot` / `server_snapshot` after mutating commands.
+
 Still not product-equivalent:
 
 - Native TUI addons (`tui/native/darwin`, `tui/native/win32`) — optional; Rust uses crossterm.
 - TypeScript under `vendor/pi` remains the behavioral spec.
-- `pi-server` is not yet a full TS session server (no agent loop, subscribe/event stream, or authenticated session service).
-- `pi-client` is helpers, not a persistent reconnecting `SessionHandle`.
+- `pi-server` is not yet a full TS session server (no live agent loop, `session_progress` from a runtime, or authenticated session service).
+- `pi-client` has `ClientState` but is not a persistent reconnecting `SessionHandle`.
 - Embed `AgentSession` is still thinner than TS (no ModelRuntime/extensionsResult/scopedModels/customTools/subscribe).
-- Project trust is a flat `/trust` append, not the TS TrustSelector (parent-folder / session-only).
 - `pi-ai` deferred responses (`fetchDeferred`/`cancelDeferred`) and agent `message_update` streaming are not ported.
-- Help text still lacks TS Examples + Environment Variables; managed-install self-update prints manual instructions.
+- Managed-install self-update prints manual instructions.

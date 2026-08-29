@@ -36,6 +36,7 @@ mod thinking_selector;
 mod tool_card;
 mod transcript;
 mod tree;
+mod trust_selector;
 mod undo_stack;
 mod word_nav;
 mod word_wrap;
@@ -129,6 +130,9 @@ pub use transcript::{Transcript, TranscriptLine};
 pub use tree::{
     build_session_tree, FilterMode, SessionTreeEntry, SessionTreeNode, TreeAction, TreeSelector,
     FILTER_MODES,
+};
+pub use trust_selector::{
+    TrustOption, TrustSavedDecision, TrustSelector, TrustSelectorAction, TrustUpdate,
 };
 
 pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";

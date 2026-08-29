@@ -19,6 +19,7 @@ mod self_update;
 mod settings;
 mod slash;
 mod startup;
+mod trust;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -46,8 +47,9 @@ use pi_tui::{
     parse_http_idle_timeout, resolve_git_branch, AutocompleteItem, ChatChrome, Component,
     CustomMessage, DoubleEscapeAction, ExtraAutocompleteProvider, FilterMode, InteractiveSession,
     Keybindings, LiveAutocompleteQuery, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction,
-    SessionItem, SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TuiMode,
-    FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
+    SessionItem, SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TrustOption,
+    TrustSavedDecision, TrustSelector, TrustUpdate, TuiMode, FALLBACK_PREVIEW_LINES,
+    OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION};
@@ -62,10 +64,14 @@ use packages::handle_package_command;
 use rpc::{handle_rpc, RpcCommand, RpcRuntime};
 use settings::{
     apply_http_proxy_settings, default_project_trust_value, is_trusted, load_merged_settings,
-    load_settings, save_settings, set_enable_analytics, settings_path, should_run_first_time_setup,
-    to_interactive_config,
+    load_merged_settings_with_override, load_settings, save_settings, set_enable_analytics,
+    settings_path, should_run_first_time_setup, to_interactive_config,
 };
 use slash::SlashAction;
+use trust::{
+    get_project_trust_options, has_trust_requiring_project_resources, ProjectTrustStore,
+    ProjectTrustUpdate,
+};
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -207,7 +213,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         prompt.push_str(&text);
     }
     let mut agent = Agent::new(prompt);
-    let settings = load_merged_settings(&default_agent_dir(), cwd);
+    let settings = load_merged_settings_with_override(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+    );
+    let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     apply_http_proxy_settings(settings.http_proxy.as_deref());
     if let Some(level) = parsed.thinking {
         agent.thinking_level = level;
@@ -233,7 +244,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         .retain(|tool| !parsed.exclude_tools.contains(tool));
     if !parsed.no_skills {
         let mut roots: Vec<PathBuf> = parsed.skills.iter().map(PathBuf::from).collect();
-        roots.push(cwd.join(".pi").join("skills"));
+        if trusted {
+            roots.push(cwd.join(".pi").join("skills"));
+        }
         if let Some(extra) = &settings.skills {
             roots.extend(extra.iter().map(PathBuf::from));
         }
@@ -241,7 +254,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     if !parsed.no_prompt_templates {
         let mut roots: Vec<PathBuf> = parsed.prompt_templates.iter().map(PathBuf::from).collect();
-        roots.push(cwd.join(".pi").join("prompts"));
+        if trusted {
+            roots.push(cwd.join(".pi").join("prompts"));
+        }
         if let Some(extra) = &settings.prompts {
             roots.extend(extra.iter().map(PathBuf::from));
         }
@@ -283,7 +298,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(prefix) = settings.shell_command_prefix.as_deref() {
         std::env::set_var("PI_SHELL_COMMAND_PREFIX", prefix);
     }
-    let _trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     let mut extensions = if parsed.no_extensions {
         parsed.extensions.clone()
     } else {
@@ -1388,6 +1402,7 @@ fn run_interactive(
         models_json_error,
         migrated_auth_providers,
     );
+    apply_project_trust_warning(&mut session, parsed, agent);
     apply_changelog_overlay(&mut session, agent, &stored, &default_agent_dir());
     refresh_chrome_footer(&mut session, agent);
     apply_cache_miss_notices(
@@ -1817,6 +1832,10 @@ fn apply_session_action(
                     .default_thinking_level
                     .as_deref(),
             );
+            Ok(true)
+        }
+        SessionAction::SelectTrust { trusted, updates } => {
+            apply_trust_decision(session, trusted, &updates)?;
             Ok(true)
         }
         SessionAction::SelectThinking(level) => apply_thinking_level(agent, session, &level, false),
@@ -2258,13 +2277,7 @@ fn handle_user_line(
             Ok(true)
         }
         SlashAction::Trust => {
-            let mut settings = load_settings(&default_agent_dir());
-            let cwd = agent.cwd.display().to_string();
-            if !settings.trusted_projects.contains(&cwd) {
-                settings.trusted_projects.push(cwd);
-            }
-            save_settings(&default_agent_dir(), &settings)?;
-            println!("trusted");
+            open_trust_selector(agent, session);
             Ok(true)
         }
         SlashAction::Reload => {
@@ -3550,6 +3563,72 @@ fn paste_clipboard(session: &mut InteractiveSession) {
     } else {
         session.chrome.status = "clipboard empty".into();
     }
+}
+
+fn open_trust_selector(agent: &Agent, session: &mut InteractiveSession) {
+    let cwd = agent.cwd.clone();
+    let store = ProjectTrustStore::open(&default_agent_dir());
+    let saved = store.get_entry(&cwd).map(|entry| TrustSavedDecision {
+        path: entry.path,
+        decision: entry.decision,
+    });
+    let settings = load_settings(&default_agent_dir());
+    let project_trusted = is_trusted(&settings, &cwd, None);
+    let options = get_project_trust_options(&cwd, false)
+        .into_iter()
+        .map(|option| TrustOption {
+            label: option.label,
+            trusted: option.trusted,
+            updates: option
+                .updates
+                .into_iter()
+                .map(|update| TrustUpdate {
+                    path: update.path,
+                    decision: update.decision,
+                })
+                .collect(),
+            saved_path: option.saved_path,
+        })
+        .collect();
+    session.open_trust_selector(
+        TrustSelector::new(cwd.display().to_string(), options, saved, project_trusted)
+            .with_theme(session.chrome.theme.clone()),
+    );
+}
+
+fn apply_trust_decision(
+    session: &mut InteractiveSession,
+    trusted: bool,
+    updates: &[TrustUpdate],
+) -> Result<(), String> {
+    let store = ProjectTrustStore::open(&default_agent_dir());
+    let mapped: Vec<ProjectTrustUpdate> = updates
+        .iter()
+        .map(|update| ProjectTrustUpdate {
+            path: update.path.clone(),
+            decision: update.decision,
+        })
+        .collect();
+    store.set_many(&mapped)?;
+    session.chrome.status = format!(
+        "Saved trust decision: {}. Restart pi for this to take effect.",
+        if trusted { "trusted" } else { "untrusted" }
+    );
+    println!("{}", session.chrome.status);
+    Ok(())
+}
+
+fn apply_project_trust_warning(session: &mut InteractiveSession, parsed: &Args, agent: &Agent) {
+    let settings = load_settings(&default_agent_dir());
+    if is_trusted(&settings, &agent.cwd, parsed.project_trust_override)
+        || !has_trust_requiring_project_resources(&agent.cwd)
+    {
+        return;
+    }
+    session.chrome.transcript.push(
+        "warning",
+        "This project is not trusted. Project .pi resources and packages are ignored. Use /trust to save a trust decision, then restart pi.",
+    );
 }
 
 fn apply_startup_notices(
@@ -5118,6 +5197,10 @@ mod tests {
             assert!(help.contains(needle), "missing {needle}");
         }
         assert!(help.contains("Extensions can register additional flags"));
+        assert!(help.contains("Examples:"));
+        assert!(help.contains("Environment Variables:"));
+        assert!(help.contains("PI_CODING_AGENT_DIR"));
+        assert!(help.contains("PI_SESSION_DIR"));
         let with_flags =
             args::print_help_with_extension_flags(&[("plan".into(), "/tmp/plan.js".into())]);
         assert!(with_flags.contains("Extension CLI Flags:"));
