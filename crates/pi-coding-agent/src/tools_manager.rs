@@ -637,14 +637,12 @@ mod tests {
     fn path_prepend_matches_ts_get_shell_env() {
         let bin = PathBuf::from("/tmp/agent/bin");
         assert_eq!(path_with_tools_bin(None, &bin), "/tmp/agent/bin");
-        assert_eq!(
-            path_with_tools_bin(Some("/usr/bin"), &bin),
-            "/tmp/agent/bin:/usr/bin"
-        );
-        assert_eq!(
-            path_with_tools_bin(Some("/tmp/agent/bin:/usr/bin"), &bin),
-            "/tmp/agent/bin:/usr/bin"
-        );
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let current = format!("/usr/bin{separator}other");
+        let expected = format!("/tmp/agent/bin{separator}/usr/bin{separator}other");
+        assert_eq!(path_with_tools_bin(Some(&current), &bin), expected);
+        let already = format!("/tmp/agent/bin{separator}/usr/bin");
+        assert_eq!(path_with_tools_bin(Some(&already), &bin), already);
     }
 
     fn isolate_path() -> Option<String> {
@@ -693,7 +691,7 @@ mod tests {
         let (installed, statuses) = ensure_tool_in(dir.path(), ManagedTool::Fd);
         std::env::remove_var("PI_ENSURE_TOOL_FD_REPLY");
         restore_path(previous_path);
-        let dest = dir.path().join("fd");
+        let dest = dir.path().join(binary_file_name(ManagedTool::Fd));
         assert_eq!(installed.as_deref(), Some(dest.to_string_lossy().as_ref()));
         assert!(dest.is_file());
         assert_eq!(
@@ -709,7 +707,7 @@ mod tests {
     #[test]
     fn prefers_existing_local_binary() {
         let dir = tempdir().unwrap();
-        let local = dir.path().join("fd");
+        let local = dir.path().join(binary_file_name(ManagedTool::Fd));
         fs::write(&local, "fd").unwrap();
         assert_eq!(
             get_tool_path_in(dir.path(), ManagedTool::Fd).as_deref(),

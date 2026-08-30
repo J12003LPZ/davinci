@@ -422,21 +422,6 @@ pub fn extract_chunks(messages: &[MemoryMessage], max_chunk_chars: usize) -> Vec
     chunks
 }
 
-pub fn build_query_text(messages: &[MemoryMessage]) -> String {
-    messages
-        .iter()
-        .rev()
-        .filter(|message| message.role == "user" || message.role == "assistant")
-        .take(4)
-        .map(|message| message.content.trim())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 pub fn lexical_score(query: &str, text: &str) -> f32 {
     let query_terms = query
         .split(|ch: char| !ch.is_alphanumeric())

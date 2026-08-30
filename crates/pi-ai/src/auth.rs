@@ -259,12 +259,23 @@ impl AuthStorage {
     }
 }
 
+/// TS `os.homedir()`: `USERPROFILE` on Windows, `HOME` on POSIX (kept as a
+/// Windows fallback for MSYS/Git Bash shells).
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Some(std::path::PathBuf::from(profile));
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 pub fn default_auth_path() -> PathBuf {
     if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
         return PathBuf::from(dir).join("auth.json");
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".pi")
         .join("agent")
@@ -502,8 +513,8 @@ fn default_vertex_adc_path() -> String {
 
 fn expand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest).display().to_string();
+        if let Some(home) = home_dir() {
+            return home.join(rest).display().to_string();
         }
     }
     path.to_string()

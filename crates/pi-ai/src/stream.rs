@@ -1345,8 +1345,33 @@ mod tests {
         std::thread::spawn(move || {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
+                // Drain the full request (headers + Content-Length body) before
+                // responding; closing with unread data pending RSTs the socket
+                // on Windows and the client sees 10054 instead of the status.
+                let mut request = Vec::new();
                 let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                let header_end = loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break request.len(),
+                        Ok(n) => n,
+                    };
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let content_length = String::from_utf8_lossy(&request[..header_end])
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
                 let n = server_hits.fetch_add(1, Ordering::SeqCst);
                 let (status, body) = if n == 0 {
                     ("429 Too Many Requests", r#"{"error":"rate limited"}"#)

@@ -136,13 +136,8 @@ pub fn find_hugging_face_token() -> Option<String> {
                 .join("token"),
         );
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(
-            std::path::PathBuf::from(home)
-                .join(".cache")
-                .join("huggingface")
-                .join("token"),
-        );
+    if let Some(home) = pi_session::home_dir() {
+        paths.push(home.join(".cache").join("huggingface").join("token"));
     }
     for path in paths {
         if let Ok(raw) = std::fs::read_to_string(path) {

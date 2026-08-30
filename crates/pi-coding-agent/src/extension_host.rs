@@ -343,6 +343,7 @@ impl ExtensionHost {
                 ExtensionEvent::SessionBeforeCompact | ExtensionEvent::SessionCompact => {
                     native.session_compact()
                 }
+                ExtensionEvent::SessionShutdown { .. } => native.session_shutdown(),
                 _ => {}
             }
         }
@@ -350,21 +351,29 @@ impl ExtensionHost {
     }
 
     pub fn native_tool_names(&self) -> Vec<String> {
-        NATIVE_TOOLS
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect()
-    }
-
-    pub fn native_command_names(&self) -> Vec<String> {
-        NATIVE_COMMANDS
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect()
+        self.native
+            .lock()
+            .map(|native| native.tool_names())
+            .unwrap_or_default()
     }
 
     pub fn native_tool_specs(&self) -> Vec<pi_ai::ToolSpec> {
         NativeExtensionHost::tool_specs()
+    }
+
+    /// Graph workers inherit the session's model, thinking level, and trust
+    /// decision unless the project pins a per-role model in `.pi/graph.json`.
+    pub fn set_graph_session_context(
+        &self,
+        model: Option<String>,
+        thinking: Option<String>,
+        project_trusted: bool,
+    ) {
+        if let Ok(mut native) = self.native.lock() {
+            native
+                .graph
+                .set_session_context(model, thinking, project_trusted);
+        }
     }
 
     pub fn native_before_tool(&self, name: &str, args: &Value, state_hash: &str) -> Option<String> {
@@ -415,7 +424,9 @@ impl ExtensionHost {
         name: &str,
         args: &Value,
     ) -> Option<Result<pi_agent::ToolResult, pi_agent::ToolError>> {
-        if !NATIVE_TOOLS.iter().any(|tool| *tool == name) {
+        let is_worker_submit = name == crate::native_extensions::GRAPH_SUBMIT_TOOL
+            && crate::native_extensions::graph_worker_context().is_some();
+        if !is_worker_submit && !NATIVE_TOOLS.iter().any(|tool| *tool == name) {
             return None;
         }
         Some(

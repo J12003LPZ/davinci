@@ -61,8 +61,16 @@ impl ModelRuntimeSnapshot {
 fn provider_login_help(docs_dir: &Path) -> String {
     format!(
         "Use /login to log into a provider via OAuth or API key. See:\n  {}\n  {}",
-        docs_dir.join("providers.md").display(),
-        docs_dir.join("models.md").display()
+        docs_dir
+            .join("providers.md")
+            .display()
+            .to_string()
+            .replace('\\', "/"),
+        docs_dir
+            .join("models.md")
+            .display()
+            .to_string()
+            .replace('\\', "/")
     )
 }
 

@@ -181,6 +181,7 @@ impl SecurityArtifactStore {
         Ok(Self { root })
     }
 
+    #[cfg(test)]
     pub fn root(&self) -> &Path {
         &self.root
     }

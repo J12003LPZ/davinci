@@ -4,11 +4,44 @@ use crate::mermaid::{transform_mermaid, MermaidContext, MermaidMode};
 use crate::render::{visible_width, Component};
 use crate::themes::Theme;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TranscriptLine {
     pub role: String,
     pub text: String,
     pub custom_lines: Option<Vec<String>>,
+    /// Rendered-lines memo. Line text is immutable after push, so a cached
+    /// render stays valid until width or a display setting changes.
+    cache: std::sync::Mutex<Option<CachedLineRender>>,
+}
+
+impl TranscriptLine {
+    fn new(role: String, text: String, custom_lines: Option<Vec<String>>) -> Self {
+        Self {
+            role,
+            text,
+            custom_lines,
+            cache: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl Clone for TranscriptLine {
+    fn clone(&self) -> Self {
+        Self::new(
+            self.role.clone(),
+            self.text.clone(),
+            self.custom_lines.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedLineRender {
+    width: usize,
+    tools_expanded: bool,
+    mermaid_mode: MermaidMode,
+    code_block_indent: String,
+    rendered: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,11 +73,8 @@ impl Default for Transcript {
 
 impl Transcript {
     pub fn push(&mut self, role: impl Into<String>, text: impl Into<String>) {
-        self.lines.push(TranscriptLine {
-            role: role.into(),
-            text: text.into(),
-            custom_lines: None,
-        });
+        self.lines
+            .push(TranscriptLine::new(role.into(), text.into(), None));
     }
 
     pub fn push_custom(
@@ -55,11 +85,11 @@ impl Transcript {
     ) {
         let custom_type = custom_type.into();
         let content = content.into();
-        self.lines.push(TranscriptLine {
-            role: "custom".into(),
-            text: format!("{custom_type}\n{content}"),
+        self.lines.push(TranscriptLine::new(
+            "custom".into(),
+            format!("{custom_type}\n{content}"),
             custom_lines,
-        });
+        ));
     }
 
     pub fn scroll_by(&mut self, delta: i32, viewport: usize) {
@@ -81,6 +111,25 @@ impl Component for Transcript {
             {
                 continue;
             }
+            // Re-rendering the whole history each frame made every keystroke
+            // pay for a full markdown parse and re-wrap of the session; a
+            // line's text never changes after push, so its render is memoized
+            // per (width, display settings). `extra_transformers` are fn
+            // pointers registered once at startup, so they stay out of the key.
+            {
+                let cached = line.cache.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(entry) = cached.as_ref() {
+                    if entry.width == width
+                        && entry.tools_expanded == self.tools_expanded
+                        && entry.mermaid_mode == self.mermaid_mode
+                        && entry.code_block_indent == self.code_block_indent
+                    {
+                        out.extend(entry.rendered.iter().cloned());
+                        continue;
+                    }
+                }
+            }
+            let block_start = out.len();
             let heading = format!("{}:", line.role);
             out.push(truncate(&heading, width));
             if line.role == "image" {
@@ -135,6 +184,14 @@ impl Component for Transcript {
                 out.extend(crate::render::wrap_text(&line.text, width));
             }
             out.push(String::new());
+            *line.cache.lock().unwrap_or_else(|error| error.into_inner()) =
+                Some(CachedLineRender {
+                    width,
+                    tools_expanded: self.tools_expanded,
+                    mermaid_mode: self.mermaid_mode,
+                    code_block_indent: self.code_block_indent.clone(),
+                    rendered: out[block_start..].to_vec(),
+                });
         }
         out
     }
@@ -170,5 +227,29 @@ fn truncate(line: &str, width: usize) -> String {
         }
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_render_tracks_width_and_setting_changes() {
+        let mut transcript = Transcript::default();
+        transcript.push(
+            "assistant",
+            "# title\n\none two three four five six seven eight nine ten eleven twelve",
+        );
+        let first = transcript.render(40);
+        // Second render is served from the memo and must be identical.
+        assert_eq!(first, transcript.render(40));
+        // A width change misses the memo and produces a different wrap.
+        assert_ne!(first, transcript.render(20));
+        // …and going back to the original width matches the first render.
+        assert_eq!(first, transcript.render(40));
+        // A clone starts with a cold cache and still renders the same lines.
+        let cloned = transcript.clone();
+        assert_eq!(transcript.render(40), cloned.render(40));
     }
 }

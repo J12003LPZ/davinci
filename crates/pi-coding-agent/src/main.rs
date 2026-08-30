@@ -3,7 +3,73 @@ mod auth_cmd;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
+#[cfg(unix)]
 mod experimental;
+#[cfg(not(unix))]
+#[allow(dead_code)]
+mod experimental {
+    use crate::args::{parse_args, Args};
+    pub fn is_experimental_command(_: Option<&str>) -> bool {
+        false
+    }
+    pub fn experimental_features_enabled() -> bool {
+        false
+    }
+    pub fn experimental_tool_sampling() -> Option<serde_json::Value> {
+        None
+    }
+    pub enum ExperimentalCli {
+        Pi {
+            options: Args,
+            listen: Vec<UnixAddress>,
+        },
+        Server {
+            listen: Vec<UnixAddress>,
+            auth: Option<ExperimentalAuth>,
+        },
+        Client {
+            connect: Option<UnixAddress>,
+            auth: Option<ExperimentalAuth>,
+        },
+    }
+    #[derive(Clone)]
+    pub struct UnixAddress {
+        pub path: String,
+    }
+    pub enum ExperimentalAuth {
+        Token { token: String },
+        File { path: String },
+    }
+    pub struct ServerCommand {
+        pub listen: Vec<UnixAddress>,
+        pub auth_token: Option<String>,
+    }
+    pub struct ClientCommand {
+        pub connect: Option<UnixAddress>,
+        pub auth_token: Option<String>,
+    }
+    pub fn resolve_experimental_auth(
+        _: Option<ExperimentalAuth>,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    pub fn bind_listen_addresses(_: &[UnixAddress]) -> Result<String, String> {
+        Ok(String::new())
+    }
+    pub fn run_server(_: ServerCommand) -> Result<String, String> {
+        Err("Unix server is unavailable on this platform".into())
+    }
+    pub fn run_client(_: ClientCommand) -> Result<String, String> {
+        Err("Unix client is unavailable on this platform".into())
+    }
+    pub fn parse_experimental_cli(raw: &[String]) -> Result<ExperimentalCli, Vec<String>> {
+        Ok(ExperimentalCli::Pi {
+            options: parse_args(raw),
+            listen: vec![],
+        })
+    }
+}
+
 mod export;
 mod extension_host;
 mod extensions;
@@ -1505,8 +1571,69 @@ fn to_json_print_event(event: &AgentEvent) -> Result<serde_json::Value, String> 
             if message.role != "assistant" {
                 return Err("message_update message is not an assistant message".into());
             }
-            let mut assistant =
-                serde_json::to_value(assistant_message_event).map_err(|err| err.to_string())?;
+            // The cumulative `partial` snapshot never reaches the wire, so the
+            // delta-bearing variants are built directly; serializing the whole
+            // partial message first just to remove it made every stream event
+            // O(message length). Done/error still serialize fully.
+            use pi_ai::AssistantMessageEvent as Ev;
+            let mut assistant = match assistant_message_event {
+                Ev::Start { .. } => serde_json::json!({"type": "start"}),
+                Ev::TextStart { content_index, .. } => {
+                    serde_json::json!({"type": "text_start", "contentIndex": content_index})
+                }
+                Ev::TextDelta {
+                    content_index,
+                    delta,
+                    ..
+                } => serde_json::json!(
+                    {"type": "text_delta", "contentIndex": content_index, "delta": delta}
+                ),
+                Ev::TextEnd {
+                    content_index,
+                    content,
+                    ..
+                } => serde_json::json!(
+                    {"type": "text_end", "contentIndex": content_index, "content": content}
+                ),
+                Ev::ThinkingStart { content_index, .. } => {
+                    serde_json::json!({"type": "thinking_start", "contentIndex": content_index})
+                }
+                Ev::ThinkingDelta {
+                    content_index,
+                    delta,
+                    ..
+                } => serde_json::json!(
+                    {"type": "thinking_delta", "contentIndex": content_index, "delta": delta}
+                ),
+                Ev::ThinkingEnd {
+                    content_index,
+                    content,
+                    ..
+                } => serde_json::json!(
+                    {"type": "thinking_end", "contentIndex": content_index, "content": content}
+                ),
+                Ev::ToolcallStart { content_index, .. } => {
+                    serde_json::json!({"type": "toolcall_start", "contentIndex": content_index})
+                }
+                Ev::ToolcallDelta {
+                    content_index,
+                    delta,
+                    ..
+                } => serde_json::json!(
+                    {"type": "toolcall_delta", "contentIndex": content_index, "delta": delta}
+                ),
+                Ev::ToolcallEnd {
+                    content_index,
+                    tool_call,
+                    ..
+                } => serde_json::json!(
+                    {"type": "toolcall_end", "contentIndex": content_index,
+                     "toolCall": serde_json::to_value(tool_call).map_err(|err| err.to_string())?}
+                ),
+                Ev::Done { .. } | Ev::Error { .. } => {
+                    serde_json::to_value(assistant_message_event).map_err(|err| err.to_string())?
+                }
+            };
             if let Some(object) = assistant.as_object_mut() {
                 if object.get("type").and_then(serde_json::Value::as_str) == Some("toolcall_start")
                 {
@@ -2429,6 +2556,12 @@ fn run_raw_session(
 ) -> Result<i32, String> {
     let _raw = RawModeGuard::enter()?;
     let mut stored = stored.clone();
+    // Gate reloads on the settings file's mtime; a full read+parse on every
+    // input event is wasted work per keystroke (worse on network home dirs).
+    let settings_path = default_agent_dir().join("settings.json");
+    let mut settings_stamp = std::fs::metadata(&settings_path)
+        .and_then(|meta| meta.modified())
+        .ok();
     loop {
         if session.osc_query_pending() {
             if let Some(reply) = drain_osc_tty(OSC_QUERY_TIMEOUT_MS) {
@@ -2504,7 +2637,13 @@ fn run_raw_session(
             }
             _ => {}
         }
-        stored = load_settings(&default_agent_dir());
+        let stamp = std::fs::metadata(&settings_path)
+            .and_then(|meta| meta.modified())
+            .ok();
+        if stamp != settings_stamp {
+            settings_stamp = stamp;
+            stored = load_settings(&default_agent_dir());
+        }
         let desired = TuiMode::parse(stored.tui_mode.as_deref().unwrap_or("regular"))
             .unwrap_or(TuiMode::Regular);
         if desired != tui.product_mode() {
@@ -3022,6 +3161,7 @@ fn prepare_user_input(
             }
         } else {
             let mut host = loaded_extension_host(parsed);
+            apply_graph_session_context(parsed, agent, &host);
             if let Some(result) = host.execute_native_command(&name, &args)? {
                 println!("/{name}: {}", format_extension_command_result(result));
                 return Ok(PreparedInput::Handled);
@@ -4346,6 +4486,7 @@ fn try_extension_slash(
     args: &str,
 ) -> Result<bool, String> {
     let mut host = loaded_extension_host(parsed);
+    apply_graph_session_context(parsed, agent, &host);
     if let Some(result) = host.execute_native_command(name, args)? {
         let message = format!("/{name}: {}", format_extension_command_result(result));
         session.chrome.status = message.clone();
@@ -4529,7 +4670,9 @@ fn show_loaded_resources(
     let show_listing = !session.quiet_startup;
     let expanded = parsed.verbose || session.chrome.tools_expanded;
     let theme = session.chrome.theme.clone();
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = pi_session::home_dir()
+        .map(|home| home.display().to_string())
+        .unwrap_or_default();
     let cwd = agent.cwd.display().to_string();
     let agent_dir = default_agent_dir().display().to_string();
     let mut loaded = pi_tui::LoadedResources::default();
@@ -4733,6 +4876,26 @@ fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>
             .map_err(|error| pi_agent::ToolError::Failed(error.to_string()))?;
         host.execute_js_or_manifest_tool(cwd, name, args)
     }));
+}
+
+/// Hand the graph controller the session's model, thinking level, and trust
+/// decision so the workers it spawns inherit them.
+fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHost) {
+    let settings = load_merged_settings_with_override(
+        &default_agent_dir(),
+        &agent.cwd,
+        parsed.project_trust_override,
+    );
+    let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    let thinking = match agent.thinking_level {
+        pi_protocol::ThinkingLevel::Off => None,
+        level => Some(level.as_str().to_string()),
+    };
+    host.set_graph_session_context(
+        Some(format!("{}/{}", agent.provider, agent.model_id)),
+        thinking,
+        trusted,
+    );
 }
 
 fn loaded_extension_host(parsed: &Args) -> ExtensionHost {
@@ -5090,9 +5253,7 @@ fn apply_changelog_overlay(
 
 fn refresh_chrome_footer(session: &mut InteractiveSession, agent: &Agent) {
     session.chrome.footer_cwd = Some(agent.cwd.to_string_lossy().into_owned());
-    session.chrome.footer_home = std::env::var("HOME")
-        .ok()
-        .or_else(|| std::env::var("USERPROFILE").ok());
+    session.chrome.footer_home = pi_session::home_dir().map(|home| home.display().to_string());
     session.chrome.footer_branch = resolve_git_branch(&agent.cwd);
     session.chrome.footer_session_name = agent
         .session
@@ -7429,7 +7590,14 @@ mod tests {
         std::env::set_var("PI_SUSPEND_DRY_RUN", "1");
         apply_suspend(&mut session, false);
         std::env::remove_var("PI_SUSPEND_DRY_RUN");
-        assert_eq!(session.chrome.status, "Suspended");
+        if cfg!(windows) {
+            assert_eq!(
+                session.chrome.status,
+                "Suspend to background is not supported on Windows"
+            );
+        } else {
+            assert_eq!(session.chrome.status, "Suspended");
+        }
     }
 
     #[test]
@@ -7555,7 +7723,7 @@ mod tests {
             error_message: Some("provider failure".into()),
         };
         let events = vec![AgentEvent::MessageUpdate {
-            message: pi_ai::ChatMessage::text("assistant", ""),
+            message: std::sync::Arc::new(pi_ai::ChatMessage::text("assistant", "")),
             assistant_message_event: pi_ai::AssistantMessageEvent::Error {
                 reason: StopReason::Error,
                 error: message,
@@ -7575,7 +7743,7 @@ mod tests {
             error_message: None,
         };
         let events = vec![AgentEvent::MessageUpdate {
-            message: pi_ai::ChatMessage::text("assistant", ""),
+            message: std::sync::Arc::new(pi_ai::ChatMessage::text("assistant", "")),
             assistant_message_event: pi_ai::AssistantMessageEvent::Error {
                 reason: StopReason::Aborted,
                 error: aborted,
@@ -7603,7 +7771,7 @@ mod tests {
             error_message: None,
         };
         let json = to_json_print_event(&AgentEvent::MessageUpdate {
-            message: pi_ai::ChatMessage::text("assistant", ""),
+            message: std::sync::Arc::new(pi_ai::ChatMessage::text("assistant", "")),
             assistant_message_event: pi_ai::AssistantMessageEvent::ToolcallStart {
                 content_index: 0,
                 partial: message,
@@ -7615,6 +7783,81 @@ mod tests {
         assert_eq!(json["assistantMessageEvent"]["id"], "call-1");
         assert_eq!(json["assistantMessageEvent"]["toolName"], "bash");
         assert_eq!(json["assistantMessageEvent"]["type"], "toolcall_start");
+    }
+
+    #[test]
+    fn print_json_fast_path_matches_full_serialization_minus_partial() {
+        use pi_ai::AssistantMessageEvent as Ev;
+        let partial = AssistantMessage {
+            id: "m1".into(),
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text { text: "big".into() }],
+            model: "x".into(),
+            usage: None,
+            stop_reason: None,
+            error_message: None,
+        };
+        let tool_call = ContentBlock::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "a"}),
+        };
+        let events = vec![
+            Ev::Start {
+                partial: partial.clone(),
+            },
+            Ev::TextStart {
+                content_index: 0,
+                partial: partial.clone(),
+            },
+            Ev::TextDelta {
+                content_index: 0,
+                delta: "d".into(),
+                partial: partial.clone(),
+            },
+            Ev::TextEnd {
+                content_index: 0,
+                content: "c".into(),
+                partial: partial.clone(),
+            },
+            Ev::ThinkingStart {
+                content_index: 1,
+                partial: partial.clone(),
+            },
+            Ev::ThinkingDelta {
+                content_index: 1,
+                delta: "d".into(),
+                partial: partial.clone(),
+            },
+            Ev::ThinkingEnd {
+                content_index: 1,
+                content: "c".into(),
+                partial: partial.clone(),
+            },
+            Ev::ToolcallDelta {
+                content_index: 2,
+                delta: "{".into(),
+                partial: partial.clone(),
+            },
+            Ev::ToolcallEnd {
+                content_index: 2,
+                tool_call,
+                partial: partial.clone(),
+            },
+        ];
+        for event in events {
+            let fast = to_json_print_event(&AgentEvent::MessageUpdate {
+                message: std::sync::Arc::new(pi_ai::ChatMessage::text("assistant", "")),
+                assistant_message_event: event.clone(),
+            })
+            .unwrap();
+            let mut reference = serde_json::to_value(&event).unwrap();
+            reference.as_object_mut().unwrap().remove("partial");
+            assert_eq!(
+                fast["assistantMessageEvent"], reference,
+                "fast path diverged for {reference:?}"
+            );
+        }
     }
 
     #[test]

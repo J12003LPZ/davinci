@@ -324,6 +324,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn detects_trust_requiring_project_resources() {
         let dir = tempdir().unwrap();
         let previous = std::env::var("HOME").ok();

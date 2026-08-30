@@ -34,8 +34,16 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// TS `os.homedir()`: libuv reads `USERPROFILE` on Windows and `HOME` on
+/// POSIX. `HOME` stays as a Windows fallback for MSYS/Git Bash shells.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(profile));
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 pub fn default_agent_dir() -> PathBuf {
@@ -76,7 +84,19 @@ pub fn resolve_session_dir_from(explicit: Option<&str>, settings_dir: Option<&st
     default_agent_dir().join("sessions")
 }
 
+/// TS `getDefaultSessionDirPath` safePath: strip ONE leading `/` or `\`,
+/// replace every `/`, `\`, `:` with `-`, wrap in `--..--`. Replacing `:`
+/// matters beyond parity: keeping `C:` produced a drive-relative component
+/// that made `Path::join` discard the sessions root on Windows.
 pub fn encode_cwd_component(cwd: &str) -> String {
+    let stripped = cwd.strip_prefix(['/', '\\']).unwrap_or(cwd);
+    let replaced = stripped.replace(['/', '\\', ':'], "-");
+    format!("--{replaced}--")
+}
+
+/// Directory name produced by Rust builds that predate the TS-format
+/// alignment above; still scanned so their sessions stay discoverable.
+fn legacy_encode_cwd_component(cwd: &str) -> String {
     let normalized = cwd.replace('\\', "/");
     let trimmed = normalized.trim_end_matches('/');
     if trimmed.starts_with('/') {
@@ -100,32 +120,36 @@ fn modified_at(path: &Path) -> u64 {
 }
 
 fn summarize_file(path: &Path) -> Option<SessionSummary> {
-    let first = fs::read_to_string(path).ok()?;
-    let first_line = first.lines().next()?;
-    let mut summary = if let Ok(header) = parse_header(first_line) {
-        crate::codec::metadata_from_header(&header, path, modified_at(path))
-    } else {
-        let session = JsonlSession::open(path).ok()?;
-        SessionSummary {
-            id: session.header.id,
-            path: path.to_path_buf(),
-            cwd: session.header.cwd,
-            created_at: session.header.created_at,
-            modified_at: modified_at(path),
-            name: session
-                .header
-                .metadata
-                .as_ref()
-                .and_then(|value| value.get("name"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-            parent_session_id: session.header.parent_session_id,
-            source_format: 3,
-            all_messages_text: String::new(),
-        }
-    };
-    summary.all_messages_text = extract_all_messages_text(path);
-    Some(summary)
+    // One read serves both the header and the message-text digest; reading the
+    // file for the header and re-opening it through `JsonlSession::open` for
+    // the text doubled I/O and parsing across every session in a listing.
+    let content = fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    let first_line = lines.next()?;
+    if let Ok(header) = parse_header(first_line) {
+        let mut summary = crate::codec::metadata_from_header(&header, path, modified_at(path));
+        summary.all_messages_text = messages_text_from_lines(lines);
+        return Some(summary);
+    }
+    // Legacy v3 file: a full open performs the migration.
+    let session = JsonlSession::open(path).ok()?;
+    Some(SessionSummary {
+        id: session.header.id,
+        path: path.to_path_buf(),
+        cwd: session.header.cwd,
+        created_at: session.header.created_at,
+        modified_at: modified_at(path),
+        name: session
+            .header
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        parent_session_id: session.header.parent_session_id,
+        source_format: 3,
+        all_messages_text: messages_text_from_entries(&session.entries),
+    })
 }
 
 fn extract_text_content(content: &serde_json::Value) -> String {
@@ -145,30 +169,49 @@ fn extract_text_content(content: &serde_json::Value) -> String {
     }
 }
 
-fn extract_all_messages_text(path: &Path) -> String {
-    let Ok(session) = JsonlSession::open(path) else {
-        return String::new();
-    };
+fn message_text(message: &serde_json::Value) -> Option<String> {
+    let role = message
+        .get("role")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    let text = extract_text_content(message.get("content")?);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Digest a v4 file's already-read lines without building a full session.
+fn messages_text_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String {
     let mut parts = Vec::new();
-    for entry in &session.entries {
+    for line in lines {
+        let line = line.trim();
+        // Cheap pre-filter: only message entries can contribute text.
+        if line.is_empty() || !line.contains("\"message\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("kind").and_then(|v| v.as_str()) != Some("entry")
+            || value.get("type").and_then(|v| v.as_str()) != Some("message")
+        {
+            continue;
+        }
+        if let Some(text) = value.get("message").and_then(message_text) {
+            parts.push(text);
+        }
+    }
+    parts.join(" ")
+}
+
+fn messages_text_from_entries(entries: &[crate::SessionEntry]) -> String {
+    let mut parts = Vec::new();
+    for entry in entries {
         if entry.entry_type != "message" {
             continue;
         }
-        let Some(message) = &entry.message else {
-            continue;
-        };
-        let role = message
-            .get("role")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-        let Some(content) = message.get("content") else {
-            continue;
-        };
-        let text = extract_text_content(content);
-        if !text.is_empty() {
+        if let Some(text) = entry.message.as_ref().and_then(message_text) {
             parts.push(text);
         }
     }
@@ -184,7 +227,13 @@ pub fn discover_sessions(
         return Ok(sessions);
     }
     let scan_roots: Vec<PathBuf> = if let Some(cwd) = cwd {
-        vec![cwd_encoded_dir(session_dir, cwd)]
+        let primary = cwd_encoded_dir(session_dir, cwd);
+        let legacy = session_dir.join(legacy_encode_cwd_component(cwd));
+        if legacy == primary {
+            vec![primary]
+        } else {
+            vec![primary, legacy]
+        }
     } else {
         fs::read_dir(session_dir)
             .map_err(|err| {
@@ -264,11 +313,17 @@ mod tests {
     fn cwd_encoding_matches_ts_style() {
         assert_eq!(
             encode_cwd_component("/home/user/proj"),
-            "--home--user--proj"
+            "--home-user-proj--"
         );
         assert_eq!(
-            cwd_encoded_dir(Path::new("/tmp/sessions"), "/tmp/work").as_os_str(),
-            Path::new("/tmp/sessions/--tmp--work").as_os_str()
+            encode_cwd_component("C:\\Users\\sergi\\Desktop\\pi-rust"),
+            "--C--Users-sergi-Desktop-pi-rust--"
+        );
+        // Build the expectation with join: the platform separator between root
+        // and encoded component matches TS `path.join` behavior on each OS.
+        assert_eq!(
+            cwd_encoded_dir(Path::new("/tmp/sessions"), "/tmp/work"),
+            Path::new("/tmp/sessions").join("--tmp-work--")
         );
     }
 

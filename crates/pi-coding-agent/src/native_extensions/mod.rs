@@ -85,19 +85,19 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         ),
         (
             "graph",
-            "Start a bounded graph-engineer run.",
-            Some("<goal>"),
+            "Run a coding task as an execution graph of isolated workers.",
+            Some("<goal> [--simple|--complex] [--dry-run]"),
         ),
         (
             "graph-resume",
-            "Resume the latest persisted graph run.",
-            None,
+            "Resume an unfinished graph run, reusing its completed workers.",
+            Some("[runId]"),
         ),
-        ("graph-status", "Show graph-engineer run status.", None),
+        ("graph-status", "Show active and recent graph runs.", None),
         (
             "graph-view",
-            "Show graph-engineer artifacts and task state.",
-            None,
+            "Tail a graph worker's live transcript.",
+            Some("[taskId]"),
         ),
         ("graph-abort", "Abort the active graph-engineer run.", None),
         ("sec-status", "Show the active security scan status.", None),
@@ -124,6 +124,12 @@ pub fn native_invocable_commands() -> Vec<Value> {
         .collect()
 }
 
+/// Set inside a graph worker child process, absent in an ordinary session.
+/// It gates the `graph_submit` tool and the per-role tool and shell policy.
+pub fn graph_worker_context() -> Option<GraphWorkerContext> {
+    GraphWorkerContext::from_env()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
     pub governor: TokenGovernor,
@@ -133,10 +139,6 @@ pub struct NativeExtensionHost {
 }
 
 impl NativeExtensionHost {
-    pub fn new(session_key: impl Into<String>, cwd: &Path) -> Self {
-        Self::new_with_agent_dir(session_key, cwd, None)
-    }
-
     pub fn new_with_agent_dir(
         session_key: impl Into<String>,
         cwd: &Path,
@@ -158,20 +160,25 @@ impl NativeExtensionHost {
     }
 
     pub fn tool_names(&self) -> Vec<String> {
-        NATIVE_TOOLS
+        let mut names: Vec<String> = NATIVE_TOOLS
             .iter()
             .map(|name| (*name).to_string())
-            .collect()
-    }
-
-    pub fn command_names(&self) -> Vec<String> {
-        NATIVE_COMMANDS
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect()
+            .collect();
+        if graph_worker_context().is_some() {
+            names.push(GRAPH_SUBMIT_TOOL.to_string());
+        }
+        names
     }
 
     pub fn before_tool(&mut self, name: &str, args: &Value, state_hash: &str) -> Option<String> {
+        // Inside a graph worker, least privilege is enforced here as well as by
+        // the child's --tools allowlist: "bash" is one tool whose danger lives
+        // in its command text.
+        if let Some(context) = graph_worker_context() {
+            if let Some(reason) = context.block_reason(name, args) {
+                return Some(reason);
+            }
+        }
         self.governor.before_tool(name, args, state_hash)
     }
 
@@ -200,6 +207,11 @@ impl NativeExtensionHost {
         self.memory.session_compact();
     }
 
+    /// A background graph run must not outlive the session that started it.
+    pub fn session_shutdown(&mut self) {
+        graph::abort_all_runs();
+    }
+
     pub fn execute_tool(
         &mut self,
         _cwd: &Path,
@@ -210,7 +222,7 @@ impl NativeExtensionHost {
             "memory_search" => self.memory.search_tool(args),
             "retrieve_output" => self.governor.retrieve(args),
             name if name.starts_with("sec_") => self.security.execute_tool(name, args),
-            "graph_status" | "graph_run" => self.graph.execute_tool(name, args),
+            "graph_status" | "graph_run" | GRAPH_SUBMIT_TOOL => self.graph.execute_tool(name, args),
             _ => Err(ToolError::Unknown(name.to_string())),
         }
     }
@@ -243,14 +255,26 @@ impl NativeExtensionHost {
                 json!({"type":"object","properties":{"id":{"type":"string","pattern":"^out-[0-9a-f]{12}$"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1},"grep":{"type":"string"}},"required":["id"]}),
             ),
             "graph_status" => (
-                "Inspect the current graph run status.",
+                "Inspect the active and recent graph runs in this project.",
                 json!({"type":"object","properties":{"runId":{"type":"string"}}}),
             ),
             "graph_run" => (
-                "Create or resume a bounded, dependency-validated graph run.",
+                "Solve a coding task as an execution graph of isolated, least-privileged worker processes (classify, research, plan, implement, verify, review) and return the outcome. Runs to completion, which can take a long time.",
                 json!({"type":"object","properties":{"goal":{"type":"string","minLength":1},"mode":{"type":"string","enum":["simple","complex"]},"dryRun":{"type":"boolean"}},"required":["goal"]}),
             ),
             name if name.starts_with("sec_") => security_scan::tool_spec(name),
+            // Only a graph worker child sees this tool; it is the worker's one
+            // exit door and its schema names the artifact that node owes.
+            GRAPH_SUBMIT_TOOL => {
+                let context = graph_worker_context()?;
+                let (description, parameters) = context.tool_spec();
+                return Some(pi_ai::ToolSpec {
+                    name: name.to_string(),
+                    description,
+                    parameters,
+                    constrained_sampling: None,
+                });
+            }
             _ => return None,
         };
         Some(pi_ai::ToolSpec {
@@ -264,7 +288,9 @@ impl NativeExtensionHost {
     pub fn tool_specs() -> Vec<pi_ai::ToolSpec> {
         NATIVE_TOOLS
             .iter()
-            .filter_map(|name| Self::describe_tool(name))
+            .copied()
+            .chain(graph_worker_context().map(|_| GRAPH_SUBMIT_TOOL))
+            .filter_map(Self::describe_tool)
             .collect()
     }
 }
@@ -272,6 +298,104 @@ impl NativeExtensionHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// PI_GRAPH_* is process-global, so the tests that toggle it run one at a time.
+    static GRAPH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct WorkerEnv;
+
+    impl WorkerEnv {
+        fn set(artifact_path: &Path) -> Self {
+            std::env::set_var("PI_GRAPH_ROLE", "reviewer");
+            std::env::set_var("PI_GRAPH_EXPECT", "review");
+            std::env::set_var("PI_GRAPH_ARTIFACT_PATH", artifact_path);
+            std::env::set_var("PI_GRAPH_EXTRA_TOOLS", "read,graph_submit");
+            Self
+        }
+    }
+
+    impl Drop for WorkerEnv {
+        fn drop(&mut self) {
+            for key in [
+                "PI_GRAPH_ROLE",
+                "PI_GRAPH_EXPECT",
+                "PI_GRAPH_ARTIFACT_PATH",
+                "PI_GRAPH_EXTRA_TOOLS",
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn graph_submit_exists_only_inside_a_worker_process() {
+        let _lock = GRAPH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("artifact.json");
+
+        let host = NativeExtensionHost::default();
+        assert!(!host
+            .tool_names()
+            .iter()
+            .any(|name| name == GRAPH_SUBMIT_TOOL));
+        assert!(!NativeExtensionHost::tool_specs()
+            .iter()
+            .any(|spec| spec.name == GRAPH_SUBMIT_TOOL));
+
+        let _env = WorkerEnv::set(&artifact);
+        let host = NativeExtensionHost::default();
+        assert!(host
+            .tool_names()
+            .iter()
+            .any(|name| name == GRAPH_SUBMIT_TOOL));
+        let spec = NativeExtensionHost::tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == GRAPH_SUBMIT_TOOL)
+            .expect("graph_submit is offered to a worker");
+        assert!(spec.description.contains("final review artifact"));
+    }
+
+    #[test]
+    fn a_worker_submits_and_is_policed_through_the_native_host() {
+        let _lock = GRAPH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _submit = graph::worker_hooks::submit_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("artifact.json");
+        let _env = WorkerEnv::set(&artifact);
+        let mut host = NativeExtensionHost::default();
+
+        // The reviewer may run tests but never mutate the repository.
+        assert_eq!(
+            host.before_tool("bash", &json!({"command": "cargo test"}), "hash"),
+            None
+        );
+        assert!(host
+            .before_tool("write", &json!({"path": "src/lib.rs"}), "hash")
+            .is_some());
+        assert!(host
+            .before_tool("bash", &json!({"command": "rm -rf src"}), "hash")
+            .is_some());
+
+        let result = host
+            .execute_tool(
+                dir.path(),
+                GRAPH_SUBMIT_TOOL,
+                &json!({"artifact": {"verdict": "approve", "issues": [], "notes": "ok"}}),
+            )
+            .expect("submit accepted");
+        assert!(!result.is_error);
+        assert!(artifact.is_file(), "the artifact reached disk");
+
+        // Once the artifact is in, the node is done: no more work is accepted.
+        assert!(host
+            .before_tool("bash", &json!({"command": "cargo test"}), "hash")
+            .is_some());
+    }
 
     #[test]
     fn every_native_command_has_discoverable_metadata() {

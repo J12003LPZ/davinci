@@ -1,5 +1,6 @@
 //! Protocol server matching `@earendil-works/pi-server`.
 
+#[cfg(unix)]
 mod unix;
 
 use std::collections::{HashMap, HashSet};
@@ -23,6 +24,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(unix)]
 pub use unix::{
     bind_unix, bind_unix_with, max_unix_socket_path_bytes, owned_bind_path,
     resolve_unix_listener_options, validate_unix_socket_path, BoundUnixListener,
@@ -1221,6 +1223,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unix_listener_validates_path_and_binds_private_link() {
         assert_eq!(

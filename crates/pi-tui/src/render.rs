@@ -173,12 +173,19 @@ pub fn visible_width(text: &str) -> usize {
 
 /// TS `visibleWidth`: strip ANSI/OSC/APC then measure columns.
 pub fn visible_width_stripped(text: &str) -> usize {
+    // Most lines carry no escape sequences; skip the stripped copy for them.
+    if !text.contains('\x1b') {
+        return visible_width(text);
+    }
     visible_width(&strip_terminal_sequences(text))
 }
 
 pub fn strip_terminal_sequences(text: &str) -> String {
+    if !text.contains('\x1b') {
+        return text.to_string();
+    }
     let bytes = text.as_bytes();
-    let mut out = String::new();
+    let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == 0x1b {
@@ -229,17 +236,24 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
             continue;
         }
         let mut current = String::new();
+        // Running accumulator: recomputing `visible_width(&current)` per word
+        // made wrapping quadratic in line length.
+        let mut current_width = 0usize;
         for word in raw.split(' ') {
+            let word_width = visible_width(word);
             if current.is_empty() {
                 current = word.to_string();
+                current_width = word_width;
                 continue;
             }
-            if visible_width(&current) + 1 + visible_width(word) <= width {
+            if current_width + 1 + word_width <= width {
                 current.push(' ');
                 current.push_str(word);
+                current_width += 1 + word_width;
             } else {
                 lines.push(current);
                 current = word.to_string();
+                current_width = word_width;
             }
         }
         if !current.is_empty() {

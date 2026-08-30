@@ -230,7 +230,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct BoundedSet {
     values: HashSet<String>,
     order: VecDeque<String>,
@@ -257,15 +257,6 @@ impl BoundedSet {
     fn clear(&mut self) {
         self.values.clear();
         self.order.clear();
-    }
-}
-
-impl Default for BoundedSet {
-    fn default() -> Self {
-        Self {
-            values: HashSet::new(),
-            order: VecDeque::new(),
-        }
     }
 }
 
@@ -344,10 +335,6 @@ impl OutputStore {
         }
         fs::read_to_string(self.root.join(format!("{id}.txt")))
             .map_err(|err| ToolError::Failed(err.to_string()))
-    }
-
-    pub fn path(&self, id: &str) -> Option<PathBuf> {
-        is_valid_output_id(id).then(|| self.root.join(format!("{id}.txt")))
     }
 }
 
@@ -512,6 +499,7 @@ impl TokenGovernor {
         }
     }
 
+    #[cfg(test)]
     pub fn with_store(
         session_key: impl Into<String>,
         config: TokenGovernorConfig,

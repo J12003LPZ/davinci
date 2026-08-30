@@ -122,11 +122,13 @@ fn windows_shell_config() -> Result<ShellConfig, String> {
 
 fn expand_shell_home(path: &str) -> String {
     if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.into());
+        return crate::auth::home_dir()
+            .map(|home| home.display().to_string())
+            .unwrap_or_else(|| path.into());
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
+        if let Some(home) = crate::auth::home_dir() {
+            return format!("{}/{rest}", home.display());
         }
     }
     path.to_string()

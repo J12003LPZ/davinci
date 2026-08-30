@@ -336,14 +336,18 @@ impl SessionSelector {
             SortMode::Recent => {}
             SortMode::Relevance | SortMode::Threaded if parsed.is_some() => {
                 let parsed = parsed.as_ref().expect("parsed query");
-                items.sort_by(|a, b| {
-                    let a_score = match_session(a, parsed).score;
-                    let b_score = match_session(b, parsed).score;
-                    a_score
-                        .partial_cmp(&b_score)
+                // Score once per item; running the matcher inside the
+                // comparator re-matched every session O(n log n) times.
+                let mut scored: Vec<(f64, SessionItem)> = items
+                    .into_iter()
+                    .map(|item| (match_session(&item, parsed).score, item))
+                    .collect();
+                scored.sort_by(|a, b| {
+                    a.0.partial_cmp(&b.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| b.modified_at.cmp(&a.modified_at))
+                        .then_with(|| b.1.modified_at.cmp(&a.1.modified_at))
                 });
+                items = scored.into_iter().map(|(_, item)| item).collect();
             }
             SortMode::Threaded | SortMode::Relevance => {
                 items.sort_by(|a, b| match (&a.parent_id, &b.parent_id) {
@@ -580,7 +584,23 @@ fn js_regex(pattern: &str) -> Result<fancy_regex::Regex, String> {
 }
 
 fn compiled_regex(pattern: &str) -> Option<fancy_regex::Regex> {
-    js_regex(pattern).ok()
+    // One query is matched against every listed session; memoize the last
+    // pattern so the regex is compiled once per keystroke, not once per item.
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(String, Option<fancy_regex::Regex>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    LAST.with(|cell| {
+        let mut cached = cell.borrow_mut();
+        if let Some((key, regex)) = cached.as_ref() {
+            if key == pattern {
+                return regex.clone();
+            }
+        }
+        let regex = js_regex(pattern).ok();
+        *cached = Some((pattern.to_string(), regex.clone()));
+        regex
+    })
 }
 
 /// TS `matchSession`.

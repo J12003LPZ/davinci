@@ -4,3 +4,7 @@
 *.log
 .idea/
 .vscode/
+node_modules/
+.pi/
+.serena/
+--Users--*/

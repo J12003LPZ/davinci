@@ -121,11 +121,12 @@ impl Agent {
                 },
             );
             let updates = stream_events.unwrap_or_else(|| pi_ai::events_from_complete(&assistant));
+            let shared_chat = std::sync::Arc::new(chat.clone());
             for assistant_message_event in updates {
                 self.push_event(
                     &mut events,
                     AgentEvent::MessageUpdate {
-                        message: chat.clone(),
+                        message: std::sync::Arc::clone(&shared_chat),
                         assistant_message_event,
                     },
                 );

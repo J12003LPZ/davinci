@@ -120,18 +120,37 @@ pub struct JsRegisteredCommand {
 }
 
 pub fn find_node() -> Option<PathBuf> {
+    // `PI_NODE` stays uncached so tests and operators can retarget node
+    // mid-process; the PATH probe below spawns `where`/`which` (~20-50ms on
+    // Windows) and is resolved once per process.
     if let Ok(explicit) = std::env::var("PI_NODE") {
         let path = PathBuf::from(explicit);
         if path.exists() {
             return Some(path);
         }
     }
+    static RESOLVED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(find_node_uncached).clone()
+}
+
+fn find_node_uncached() -> Option<PathBuf> {
+    // `where` on Windows, `which` elsewhere. Git for Windows ships a `which`
+    // that answers with POSIX-style paths (/c/...) the OS cannot spawn, so the
+    // resolved path is also verified with `exists()` before being trusted.
+    let locator = if cfg!(windows) { "where" } else { "which" };
     for name in ["node", "nodejs"] {
-        if let Ok(output) = Command::new("which").arg(name).output() {
+        if let Ok(output) = Command::new(locator).arg(name).output() {
             if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Some(PathBuf::from(path));
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let path = PathBuf::from(line);
+                    if path.exists() {
+                        return Some(path);
+                    }
                 }
             }
         }
@@ -716,6 +735,17 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// PERSISTENT_JS is one process-wide slot keyed by module path; parallel
+    /// tests with different modules evict each other's live session mid-test.
+    /// Every test that touches the persistent host must hold this lock.
+    static PERSISTENT_HOST_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn persistent_host_guard() -> std::sync::MutexGuard<'static, ()> {
+        PERSISTENT_HOST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn loads_js_factory_when_node_is_present() {
         let Some(_) = find_node() else {
@@ -903,6 +933,7 @@ module.exports = (pi) => {
         let Some(_) = find_node() else {
             return;
         };
+        let _persistent = persistent_host_guard();
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("index.js"),
@@ -966,6 +997,7 @@ module.exports = (pi) => {
 
     #[test]
     fn stream_simple_handler_returns_assistant_text() {
+        let _persistent = persistent_host_guard();
         let Some(_) = find_node() else {
             return;
         };
@@ -1031,6 +1063,7 @@ module.exports = (pi) => {
 
     #[test]
     fn refresh_models_and_oauth_handlers_run_from_js() {
+        let _persistent = persistent_host_guard();
         let Some(_) = find_node() else {
             return;
         };
@@ -1428,8 +1461,13 @@ module.exports = (pi) => {
     #[test]
     fn runs_manifest_command_tool() {
         let dir = tempdir().unwrap();
-        let out = execute_command_tool("printf fixture-ok", dir.path()).unwrap();
-        assert_eq!(out, "fixture-ok");
+        let command = if cfg!(windows) {
+            "echo fixture-ok"
+        } else {
+            "printf fixture-ok"
+        };
+        let out = execute_command_tool(command, dir.path()).unwrap();
+        assert_eq!(out.trim_end_matches(['\r', '\n']), "fixture-ok");
     }
 
     #[test]
@@ -1710,6 +1748,7 @@ module.exports = (pi) => {
         let Some(_) = find_node() else {
             return;
         };
+        let _persistent = persistent_host_guard();
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("index.js"),
@@ -1763,6 +1802,7 @@ module.exports = (pi) => {
 
     #[test]
     fn overlay_visible_callback_uses_terminal_size() {
+        let _persistent = persistent_host_guard();
         let Some(_) = find_node() else {
             return;
         };

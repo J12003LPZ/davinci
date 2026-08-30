@@ -32,13 +32,13 @@ pub struct InitialMessage {
 
 pub fn expand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest).display().to_string();
+        if let Some(home) = pi_session::home_dir() {
+            return home.join(rest).display().to_string();
         }
     }
     if path == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).display().to_string();
+        if let Some(home) = pi_session::home_dir() {
+            return home.display().to_string();
         }
     }
     path.to_string()

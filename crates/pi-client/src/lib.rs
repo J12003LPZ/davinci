@@ -3,6 +3,7 @@
 mod connection;
 mod session;
 mod state;
+#[cfg(unix)]
 mod unix;
 
 pub use connection::{
@@ -11,6 +12,7 @@ pub use connection::{
 };
 pub use session::{SessionClient, SessionHandle, SessionLeaseMode};
 pub use state::{ClientState, Unsubscribe};
+#[cfg(unix)]
 pub use unix::{
     connect_unix_transport, create_unix_transport_factory, max_unix_socket_path_bytes,
     resolve_unix_transport_options, UnixByteTransport, UnixTransportOptions,
@@ -19,6 +21,7 @@ pub use unix::{
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -40,6 +43,7 @@ pub enum ClientError {
 }
 
 pub enum Transport {
+    #[cfg(unix)]
     Unix(UnixStream),
     Tcp(TcpStream),
     Memory(MemoryPipe),
@@ -118,6 +122,7 @@ impl PiClient {
     }
 }
 
+#[cfg(unix)]
 pub fn connect_unix(path: &str) -> Result<UnixStream, ClientError> {
     UnixStream::connect(path).map_err(|err| ClientError::Io(err.to_string()))
 }

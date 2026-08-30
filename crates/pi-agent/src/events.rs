@@ -26,7 +26,10 @@ pub enum AgentEvent {
     MessageStart { message: ChatMessage },
     #[serde(rename = "message_update")]
     MessageUpdate {
-        message: ChatMessage,
+        // Arc, not a value: one update fires per stream delta and all of them
+        // share the same final message; a value clone per delta made a long
+        // response O(n^2) in retained memory.
+        message: std::sync::Arc<ChatMessage>,
         #[serde(rename = "assistantMessageEvent")]
         assistant_message_event: AssistantMessageEvent,
     },

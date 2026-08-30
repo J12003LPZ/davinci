@@ -119,7 +119,14 @@ mod tests {
         let target = dir.path().join("target.txt");
         let alias = dir.path().join("alias.txt");
         std::fs::write(&target, "hello\n").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &alias).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&target, &alias).is_err() {
+            // Creating symlinks requires a privilege that is commonly unavailable
+            // in Windows CI and developer environments; skip this capability test.
+            return;
+        }
         assert_eq!(mutation_queue_key(&target), mutation_queue_key(&alias));
         let order = Arc::new(Mutex::new(Vec::new()));
         let first_order = order.clone();

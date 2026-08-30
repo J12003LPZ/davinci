@@ -13,10 +13,12 @@ use crate::JsonlSession;
 fn parse_object(line: &str) -> Result<serde_json::Map<String, Value>, JsonlDecodeError> {
     let value: Value =
         serde_json::from_str(line).map_err(|_| JsonlDecodeError::syntax("is not valid JSON"))?;
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| JsonlDecodeError::schema("is not a JSON object"))
+    // Move the map out instead of cloning it; large message payloads make the
+    // clone the dominant cost of a session load.
+    match value {
+        Value::Object(map) => Ok(map),
+        _ => Err(JsonlDecodeError::schema("is not a JSON object")),
+    }
 }
 
 fn require_string(value: Option<&Value>, field: &str) -> Result<String, JsonlDecodeError> {
@@ -206,37 +208,48 @@ fn parse_entry(
         .map(|v| require_sequence(Some(v)))
         .transpose()?
         .unwrap_or(seq);
-    let mut extra = value.clone();
-    extra.remove("id");
-    extra.remove("type");
-    extra.remove("parentId");
-    extra.remove("seq");
-    extra.remove("timestamp");
-    extra.remove("message");
-    extra.remove("customType");
-    extra.remove("kind");
-    extra.remove("lane");
+    let id = require_string(value.get("id"), "id")?;
+    let parent_id = match value.get("parentId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(id.clone()),
+        _ => return Err(JsonlDecodeError::schema("has invalid parentId")),
+    };
+    let timestamp = require_timestamp(value.get("timestamp"))?;
+    let custom_type = value
+        .get("customType")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let lane = value
+        .get("lane")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // Move the message out and reuse the remaining map as `extra` — cloning
+    // the whole object per line dominated large session loads.
+    let mut value = value;
+    let message = value.remove("message");
+    for key in [
+        "id",
+        "type",
+        "parentId",
+        "seq",
+        "timestamp",
+        "customType",
+        "kind",
+        "lane",
+    ] {
+        value.remove(key);
+    }
     Ok(SessionMutation::Entry {
-        lane: value
-            .get("lane")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        lane,
         entry: SessionEntry {
-            id: require_string(value.get("id"), "id")?,
+            id,
             entry_type,
-            parent_id: match value.get("parentId") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(id)) => Some(id.clone()),
-                _ => return Err(JsonlDecodeError::schema("has invalid parentId")),
-            },
+            parent_id,
             seq,
-            timestamp: require_timestamp(value.get("timestamp"))?,
-            message: value.get("message").cloned(),
-            custom_type: value
-                .get("customType")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            extra,
+            timestamp,
+            message,
+            custom_type,
+            extra: value,
         },
     })
 }
@@ -251,32 +264,31 @@ fn parse_record(
             "has unknown record type {record_type}"
         )));
     }
-    let mut extra = value.clone();
-    extra.remove("id");
-    extra.remove("type");
-    extra.remove("seq");
-    extra.remove("timestamp");
-    extra.remove("lane");
-    extra.remove("kind");
+    let id = require_string(value.get("id"), "id")?;
+    let seq = value
+        .get("seq")
+        .map(|v| require_sequence(Some(v)))
+        .transpose()?
+        .unwrap_or(seq);
+    let timestamp = require_timestamp(value.get("timestamp"))?;
+    let lane = value
+        .get("lane")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // Reuse the map as `extra` instead of deep-cloning it per record.
+    let mut value = value;
+    for key in ["id", "type", "seq", "timestamp", "lane", "kind"] {
+        value.remove(key);
+    }
     Ok(SessionMutation::Record {
-        lane: value
-            .get("lane")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        lane: lane.clone(),
         record: LaneRecord {
-            id: require_string(value.get("id"), "id")?,
+            id,
             record_type,
-            seq: value
-                .get("seq")
-                .map(|v| require_sequence(Some(v)))
-                .transpose()?
-                .unwrap_or(seq),
-            timestamp: require_timestamp(value.get("timestamp"))?,
-            lane: value
-                .get("lane")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            extra,
+            seq,
+            timestamp,
+            lane,
+            extra: value,
         },
     })
 }
@@ -343,8 +355,16 @@ pub fn migrate_v3_to_v4<R: BufRead>(
     first_line: &str,
     rest: std::io::Lines<R>,
 ) -> Result<JsonlSession, SessionError> {
-    let first = parse_v3_line(first_line, 1)?;
-    let mut entries = vec![first];
+    // TS v3 files begin with a `{"type":"session",...}` header carrying the
+    // authoritative id, ISO timestamp, cwd, and optional parent session path.
+    let v3_header = serde_json::from_str::<Value>(first_line.trim())
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .filter(|object| object.get("type").and_then(Value::as_str) == Some("session"));
+    let mut entries = Vec::new();
+    if v3_header.is_none() {
+        entries.push(parse_v3_line(first_line, 1)?);
+    }
     for (index, line) in rest.enumerate() {
         let line = line
             .map_err(|err| SessionError::storage(format!("Unable to read session file: {err}")))?;
@@ -353,24 +373,45 @@ pub fn migrate_v3_to_v4<R: BufRead>(
         }
         entries.push(parse_v3_line(&line, index + 2)?);
     }
-    let cwd = path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .map(decode_cwd_component)
-        .unwrap_or_else(|| ".".into());
+    let header_text = |key: &str| {
+        v3_header
+            .as_ref()
+            .and_then(|header| header.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let cwd = header_text("cwd").unwrap_or_else(|| {
+        path.parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .map(decode_cwd_component)
+            .unwrap_or_else(|| ".".into())
+    });
+    // TS names files `<fileTimestamp>_<id>.jsonl`; the id after the last `_`
+    // is the fallback when the header is missing.
+    let id = header_text("id").unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| stem.rsplit('_').next().unwrap_or(stem).to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string())
+    });
+    let created_at = header_text("timestamp")
+        .as_deref()
+        .and_then(parse_iso_ms)
+        .or_else(|| entries.first().map(|entry| entry.timestamp))
+        .unwrap_or(0);
     let header = JsonlV4Header {
         kind: "header".into(),
         version: 4,
-        id: path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&Uuid::new_v4().to_string())
-            .to_string(),
-        created_at: entries.first().map(|e| e.timestamp).unwrap_or(0),
+        id,
+        created_at,
         cwd,
         parent_session_id: None,
-        legacy_parent_session_path: Some(path.display().to_string()),
+        // The v3 header's parent path when present; otherwise the file's own
+        // path, which `source_format_hint` relies on as the migrated-from-v3
+        // marker (nothing ever traverses this field as a link).
+        legacy_parent_session_path: header_text("parentSession")
+            .or_else(|| Some(path.display().to_string())),
         metadata: None,
     };
     let leaf_id = entries.last().map(|e| e.id.clone());
@@ -410,7 +451,7 @@ fn parse_v3_line(line: &str, line_no: usize) -> Result<SessionEntry, SessionErro
             .and_then(Value::as_str)
             .map(str::to_string),
         seq: line_no as u64,
-        timestamp: object.get("timestamp").and_then(Value::as_u64).unwrap_or(0),
+        timestamp: object.get("timestamp").map(v3_timestamp_ms).unwrap_or(0),
         message: object.get("message").cloned(),
         custom_type: object
             .get("customType")
@@ -429,7 +470,83 @@ fn parse_v3_line(line: &str, line_no: usize) -> Result<SessionEntry, SessionErro
     })
 }
 
+/// TS v3 wrote entry timestamps as `Date.toISOString()` strings; numeric
+/// milliseconds are accepted for robustness.
+fn v3_timestamp_ms(value: &Value) -> u64 {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(parse_iso_ms))
+        .unwrap_or(0)
+}
+
+/// Parse the strict `Date.toISOString()` shape (`YYYY-MM-DDTHH:MM:SS[.fff]Z`)
+/// into Unix milliseconds without a date-time dependency.
+fn parse_iso_ms(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u64> {
+        let slice = text.get(range)?;
+        if !slice.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        slice.parse().ok()
+    };
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    let (millis, timezone_start) = if bytes[19] == b'.' {
+        let fraction_end = 20 + text[20..].bytes().take_while(u8::is_ascii_digit).count();
+        let mut padded = text[20..fraction_end].to_string();
+        while padded.len() < 3 {
+            padded.push('0');
+        }
+        (padded[..3].parse::<u64>().ok()?, fraction_end)
+    } else {
+        (0, 19)
+    };
+    if text.get(timezone_start..) != Some("Z") {
+        return None;
+    }
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil.
+    let year = year as i64 - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = (year - era * 400) as u64;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era as i64 - 719_468;
+    let seconds = days * 86_400 + (hour * 3_600 + minute * 60 + second) as i64;
+    u64::try_from(seconds * 1_000 + millis as i64).ok()
+}
+
 fn decode_cwd_component(encoded: &str) -> String {
+    // Only a last resort when a v3 header lacks a cwd. TS-format names
+    // (`--..--`) are lossy — `-` may be a separator or a literal dash — so the
+    // decoded path is best-effort.
+    if let Some(inner) = encoded
+        .strip_prefix("--")
+        .and_then(|rest| rest.strip_suffix("--"))
+    {
+        return format!("/{}", inner.replace("--", "/"));
+    }
     if let Some(rest) = encoded.strip_prefix("--") {
         format!("/{}", rest.replace("--", "/"))
     } else {

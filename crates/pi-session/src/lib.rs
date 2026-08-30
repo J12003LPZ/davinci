@@ -14,7 +14,7 @@ pub use codec::{
 };
 pub use discovery::{
     cwd_encoded_dir, default_agent_dir, default_session_dir, discover_sessions,
-    encode_cwd_component, expand_tilde, latest_session, resolve_session_dir,
+    encode_cwd_component, expand_tilde, home_dir, latest_session, resolve_session_dir,
     resolve_session_dir_from, resolve_session_ref, SessionSummary,
 };
 pub use errors::{JsonlDecodeError, SessionError};
@@ -363,6 +363,35 @@ mod tests {
         assert_eq!(session.header.version, 4);
         assert_eq!(session.entries.len(), 1);
         assert_eq!(session.header.source_format_hint(), 3);
+    }
+
+    #[test]
+    fn migrate_v3_uses_ts_header_and_iso_timestamps() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("2026-01-02T03-04-05-678Z_abc-123.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","version":3,"id":"abc-123","timestamp":"2020-01-01T00:00:00.000Z","cwd":"C:\\work\\proj","parentSession":"C:\\old\\parent.jsonl"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2020-01-01T00:00:01.500Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let session = JsonlSession::open(&path).unwrap();
+        assert_eq!(session.header.version, 4);
+        assert_eq!(session.header.id, "abc-123");
+        assert_eq!(session.header.cwd, "C:\\work\\proj");
+        assert_eq!(session.header.created_at, 1_577_836_800_000);
+        assert_eq!(
+            session.header.legacy_parent_session_path.as_deref(),
+            Some("C:\\old\\parent.jsonl")
+        );
+        assert_eq!(session.header.source_format_hint(), 3);
+        // The v3 header line must not surface as a session entry.
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(session.entries[0].timestamp, 1_577_836_801_500);
     }
 
     #[test]
