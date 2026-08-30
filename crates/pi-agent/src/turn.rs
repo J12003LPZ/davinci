@@ -47,22 +47,33 @@ impl Agent {
         self.is_streaming = true;
         self.retry_aborted = false;
         let mut events = Vec::new();
-        let mut new_messages: Vec<ChatMessage> = Vec::new();
+        let prompt_messages = if emit_prompt_messages {
+            let pending = std::mem::take(&mut self.pending_prompt_messages);
+            if pending.is_empty() {
+                self.messages
+                    .last()
+                    .filter(|message| message.role == "user")
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            } else {
+                pending
+            }
+        } else {
+            Vec::new()
+        };
+        let mut new_messages = prompt_messages.clone();
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
 
-        if emit_prompt_messages {
-            if let Some(prompt) = self.messages.last().cloned() {
-                if prompt.role == "user" {
-                    self.push_event(
-                        &mut events,
-                        AgentEvent::MessageStart {
-                            message: prompt.clone(),
-                        },
-                    );
-                    self.push_event(&mut events, AgentEvent::MessageEnd { message: prompt });
-                }
-            }
+        for prompt in prompt_messages {
+            self.push_event(
+                &mut events,
+                AgentEvent::MessageStart {
+                    message: prompt.clone(),
+                },
+            );
+            self.push_event(&mut events, AgentEvent::MessageEnd { message: prompt });
         }
 
         loop {
@@ -75,6 +86,7 @@ impl Agent {
                     },
                 );
                 self.is_streaming = false;
+                self.flush_pending_bash_messages();
                 return Ok(events);
             }
 
@@ -94,6 +106,7 @@ impl Agent {
                     Ok(output) => output,
                     Err(err) => {
                         self.is_streaming = false;
+                        self.flush_pending_bash_messages();
                         return Err(err);
                     }
                 };
@@ -143,6 +156,7 @@ impl Agent {
                     },
                 );
                 self.is_streaming = false;
+                self.flush_pending_bash_messages();
                 return Ok(events);
             }
 
@@ -304,6 +318,7 @@ impl Agent {
             },
         );
         self.is_streaming = false;
+        self.flush_pending_bash_messages();
         Ok(events)
     }
 
@@ -322,6 +337,7 @@ impl Agent {
         };
         for queued in drained {
             let message = self.prompt_with(&queued.text, &queued.images);
+            let _ = self.pending_prompt_messages.pop();
             new_messages.push(message.clone());
             self.push_event(
                 events,

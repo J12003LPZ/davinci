@@ -86,7 +86,10 @@ pub enum SessionAction {
         auth_type: String,
     },
     SelectTreeEntry(String),
-    RunBash(String),
+    RunBash {
+        command: String,
+        exclude_from_context: bool,
+    },
     CloseOverlay,
     FirstTimeSubmit {
         theme: String,
@@ -1590,8 +1593,18 @@ impl InteractiveSession {
             return SessionAction::None;
         }
         let submitted = self.chrome.editor.submit();
-        if let Some(command) = submitted.trim_start().strip_prefix('!') {
-            return SessionAction::RunBash(command.trim().to_string());
+        let trimmed = submitted.trim_start();
+        if let Some(stripped) = trimmed.strip_prefix('!') {
+            let exclude_from_context = trimmed.starts_with("!!");
+            let command = if exclude_from_context {
+                stripped.strip_prefix('!').unwrap_or(stripped).trim()
+            } else {
+                stripped.trim()
+            };
+            return SessionAction::RunBash {
+                command: command.to_string(),
+                exclude_from_context,
+            };
         }
         if submitted == "/scoped-models" {
             return SessionAction::OpenScopedModels;
@@ -2102,7 +2115,18 @@ mod tests {
         session.chrome.editor.buffer = "!echo ok".into();
         assert_eq!(
             session.handle_bytes("\r"),
-            SessionAction::RunBash("echo ok".into())
+            SessionAction::RunBash {
+                command: "echo ok".into(),
+                exclude_from_context: false,
+            }
+        );
+        session.chrome.editor.buffer = "!!echo secret".into();
+        assert_eq!(
+            session.handle_bytes("\r"),
+            SessionAction::RunBash {
+                command: "echo secret".into(),
+                exclude_from_context: true,
+            }
         );
         session.chrome.editor.buffer = "hi".into();
         session.chrome.editor.cursor = 2;

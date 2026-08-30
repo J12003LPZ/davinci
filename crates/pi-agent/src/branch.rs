@@ -79,19 +79,7 @@ pub fn message_from_branch_entry(entry: &SessionEntry) -> Option<ChatMessage> {
             }
             serde_json::from_value(message.clone()).ok()
         }
-        "custom_message" => {
-            let content = entry
-                .extra
-                .get("content")
-                .cloned()
-                .or_else(|| entry.message.clone())
-                .unwrap_or(serde_json::Value::Null);
-            let text = match &content {
-                serde_json::Value::String(value) => value.clone(),
-                other => content_text_from_value(other),
-            };
-            Some(ChatMessage::text("custom", text))
-        }
+        "custom_message" => crate::custom_message_from_session_entry(entry),
         "branch_summary" => {
             let summary = entry.extra.get("summary")?.as_str()?;
             Some(ChatMessage::text("branchSummary", summary))

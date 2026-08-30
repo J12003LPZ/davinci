@@ -1132,22 +1132,46 @@ async function main() {
 		const eventName = payload.type || payload.event;
 		const ctx = Object.assign({ ui, mode: "tui" }, payload.ctx || {});
 		ctx.ui = ui;
-		let current = payload;
-		for (const handler of recorded.handlers[eventName] || []) {
-			result = await handler(current, ctx);
-			if (result && (result.block || result.cancel || result.action === "handled")) {
-				break;
+		if (eventName === "before_agent_start") {
+			let currentSystemPrompt = payload.systemPrompt;
+			let systemPromptModified = false;
+			const messages = [];
+			ctx.getSystemPrompt = () => currentSystemPrompt;
+			for (const handler of recorded.handlers[eventName] || []) {
+				const event = Object.assign({}, payload, { systemPrompt: currentSystemPrompt });
+				const handlerResult = await handler(event, ctx);
+				if (!handlerResult) continue;
+				if (handlerResult.message) messages.push(handlerResult.message);
+				if (handlerResult.systemPrompt !== undefined) {
+					currentSystemPrompt = handlerResult.systemPrompt;
+					systemPromptModified = true;
+				}
 			}
-			if (result && result.action === "transform" && eventName === "input") {
-				current = Object.assign({}, current, {
-					text: result.text,
-					images: result.images !== undefined ? result.images : current.images,
-				});
-				result = {
-					action: "transform",
-					text: current.text,
-					images: current.images,
-				};
+			if (messages.length > 0 || systemPromptModified) {
+				result = {};
+				if (messages.length > 0) result.messages = messages;
+				if (systemPromptModified) result.systemPrompt = currentSystemPrompt;
+			} else {
+				result = null;
+			}
+		} else {
+			let current = payload;
+			for (const handler of recorded.handlers[eventName] || []) {
+				result = await handler(current, ctx);
+				if (result && (eventName === "user_bash" || result.block || result.cancel || result.action === "handled")) {
+					break;
+				}
+				if (result && result.action === "transform" && eventName === "input") {
+					current = Object.assign({}, current, {
+						text: result.text,
+						images: result.images !== undefined ? result.images : current.images,
+					});
+					result = {
+						action: "transform",
+						text: current.text,
+						images: current.images,
+					};
+				}
 			}
 		}
 	} else if (op === "renderMessage") {

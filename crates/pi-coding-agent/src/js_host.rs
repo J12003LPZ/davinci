@@ -752,6 +752,62 @@ module.exports = (pi) => {
     }
 
     #[test]
+    fn event_handler_order_matches_ts_for_bash_and_before_agent_start() {
+        let Some(_) = find_node() else {
+            return;
+        };
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            r#"
+module.exports = (pi) => {
+  pi.on("user_bash", () => ({ content: "first" }));
+  pi.on("user_bash", () => ({ content: "second" }));
+  pi.on("before_agent_start", (event) => ({
+    message: { customType: "one", content: event.prompt },
+    systemPrompt: event.systemPrompt + " -> one",
+  }));
+  pi.on("before_agent_start", (event) => ({
+    message: { customType: "two", content: event.systemPrompt },
+    systemPrompt: event.systemPrompt + " -> two",
+  }));
+};
+"#,
+        )
+        .unwrap();
+        let module = resolve_extension_module(dir.path()).unwrap();
+
+        let bash = run_js_extension(
+            &module,
+            "emit",
+            &serde_json::json!({
+                "type": "user_bash",
+                "command": "echo hi",
+                "excludeFromContext": false,
+                "cwd": "."
+            }),
+        )
+        .unwrap();
+        assert_eq!(bash.result.as_ref().unwrap()["content"], "first");
+
+        let before = run_js_extension(
+            &module,
+            "emit",
+            &serde_json::json!({
+                "type": "before_agent_start",
+                "prompt": "hello",
+                "images": [],
+                "systemPrompt": "base"
+            }),
+        )
+        .unwrap();
+        let result = before.result.as_ref().unwrap();
+        assert_eq!(result["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(result["messages"][1]["content"], "base -> one");
+        assert_eq!(result["systemPrompt"], "base -> one -> two");
+    }
+
+    #[test]
     fn records_set_model_get_flag_and_session_ops() {
         let Some(_) = find_node() else {
             return;

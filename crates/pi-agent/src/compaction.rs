@@ -681,41 +681,85 @@ pub fn format_file_operations(read_files: &[String], modified_files: &[String]) 
 pub fn convert_to_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
-        .map(|message| match message.role.as_str() {
+        .filter_map(|message| match message.role.as_str() {
             "bashExecution" => {
-                let text = content_text(&message.content);
-                ChatMessage::text("user", bash_execution_to_text(&text))
+                if message.extra_bool("excludeFromContext") {
+                    None
+                } else {
+                    Some(with_source_timestamp(
+                        ChatMessage::text("user", bash_execution_to_text(message)),
+                        message,
+                    ))
+                }
             }
-            "custom" => ChatMessage {
-                role: "user".into(),
-                content: message.content.clone(),
-                ..ChatMessage::default()
-            },
+            "custom" => Some(with_source_timestamp(
+                ChatMessage {
+                    role: "user".into(),
+                    content: message.content.clone(),
+                    ..ChatMessage::default()
+                },
+                message,
+            )),
             "branchSummary" => {
                 let summary = content_text(&message.content);
-                ChatMessage::text(
-                    "user",
-                    format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"),
-                )
+                Some(with_source_timestamp(
+                    ChatMessage::text(
+                        "user",
+                        format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"),
+                    ),
+                    message,
+                ))
             }
             "compactionSummary" => {
                 let summary = content_text(&message.content);
-                ChatMessage::text(
-                    "user",
-                    format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"),
-                )
+                Some(with_source_timestamp(
+                    ChatMessage::text(
+                        "user",
+                        format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"),
+                    ),
+                    message,
+                ))
             }
-            _ => message.clone(),
+            _ => Some(message.clone()),
         })
         .collect()
 }
 
-fn bash_execution_to_text(content: &str) -> String {
-    if content.is_empty() {
-        "Ran ``\n(no output)".into()
+fn bash_execution_to_text(message: &ChatMessage) -> String {
+    let command = message.extra_str("command").unwrap_or("");
+    let output = message.extra_str("output").unwrap_or("");
+    let mut text = format!("Ran `{command}`\n");
+    if output.is_empty() {
+        text.push_str("(no output)");
     } else {
-        content.to_string()
+        text.push_str("```\n");
+        text.push_str(output);
+        text.push_str("\n```");
     }
+    if message.extra_bool("cancelled") {
+        text.push_str("\n\n(command cancelled)");
+    } else if let Some(code) = message
+        .extra
+        .get("exitCode")
+        .and_then(serde_json::Value::as_i64)
+    {
+        if code != 0 {
+            text.push_str(&format!("\n\nCommand exited with code {code}"));
+        }
+    }
+    if message.extra_bool("truncated") {
+        if let Some(path) = message.extra_str("fullOutputPath") {
+            text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
+        }
+    }
+    text
+}
+
+fn with_source_timestamp(mut message: ChatMessage, source: &ChatMessage) -> ChatMessage {
+    if let Some(timestamp) = source.extra.get("timestamp") {
+        message.extra.insert("timestamp".into(), timestamp.clone());
+    }
+    message
 }
 
 /// TS `serializeConversation`.
@@ -883,6 +927,35 @@ mod tests {
         let xml = format_file_operations(&details.read_files, &details.modified_files);
         assert!(xml.contains("<read-files>\nb.rs\n</read-files>"));
         assert!(xml.contains("<modified-files>\na.rs\n</modified-files>"));
+    }
+
+    #[test]
+    fn convert_to_llm_preserves_generated_metadata_and_truncation_details() {
+        let mut bash = ChatMessage {
+            role: "bashExecution".into(),
+            ..ChatMessage::default()
+        };
+        bash.extra.insert("command".into(), serde_json::json!("ls"));
+        bash.extra
+            .insert("output".into(), serde_json::json!("listing"));
+        bash.extra
+            .insert("truncated".into(), serde_json::json!(true));
+        bash.extra.insert(
+            "fullOutputPath".into(),
+            serde_json::json!("C:/tmp/full-output.txt"),
+        );
+        bash.extra.insert("timestamp".into(), serde_json::json!(42));
+
+        let converted = convert_to_llm(&[bash]);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert_eq!(
+            converted[0].extra.get("timestamp"),
+            Some(&serde_json::json!(42))
+        );
+        let text = content_text(&converted[0].content);
+        assert!(text.contains("Ran `ls`"));
+        assert!(text.contains("[Output truncated. Full output: C:/tmp/full-output.txt]"));
     }
 
     #[test]

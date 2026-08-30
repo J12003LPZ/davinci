@@ -579,7 +579,253 @@ fn ls_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolErro
     })
 }
 
+fn path_is_inside_git_repo(search_path: &Path) -> bool {
+    let mut current = if search_path.is_file() {
+        search_path.parent().unwrap_or(search_path).to_path_buf()
+    } else {
+        search_path.to_path_buf()
+    };
+    loop {
+        if current.join(".git").exists() {
+            return true;
+        }
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if parent == current {
+            return false;
+        }
+        current = parent.to_path_buf();
+    }
+}
+
+fn build_fd_args(pattern: &str, search_path: &Path, limit: usize) -> Vec<String> {
+    let mut args = vec!["--glob".into(), "--color=never".into(), "--hidden".into()];
+    if !path_is_inside_git_repo(search_path) {
+        args.push("--no-require-git".into());
+    }
+    args.push("--max-results".into());
+    args.push(limit.to_string());
+    let mut effective_pattern = pattern.to_string();
+    if pattern.contains('/') {
+        args.push("--full-path".into());
+        if !pattern.starts_with('/') && !pattern.starts_with("**/") && pattern != "**" {
+            effective_pattern = format!("**/{pattern}");
+        }
+        if cfg!(windows) {
+            effective_pattern = effective_pattern.replace('/', "[/\\\\]");
+        }
+    }
+    args.push("--".into());
+    args.push(effective_pattern);
+    args.push(search_path.to_string_lossy().into_owned());
+    args
+}
+
+fn build_rg_args(
+    pattern: &str,
+    search_path: &Path,
+    glob: Option<&str>,
+    ignore_case: bool,
+    literal: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "--json".into(),
+        "--line-number".into(),
+        "--color=never".into(),
+        "--hidden".into(),
+    ];
+    if ignore_case {
+        args.push("--ignore-case".into());
+    }
+    if literal {
+        args.push("--fixed-strings".into());
+    }
+    if let Some(glob) = glob {
+        args.push("--glob".into());
+        args.push(glob.to_string());
+    }
+    args.push("--".into());
+    args.push(pattern.to_string());
+    args.push(search_path.to_string_lossy().into_owned());
+    args
+}
+
+fn run_managed_tool(
+    env_name: &str,
+    default_name: &str,
+    args: &[String],
+) -> Result<Option<std::process::Output>, ToolError> {
+    let program = std::env::var(env_name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_name.to_string());
+    match Command::new(&program).args(args).output() {
+        Ok(output) => Ok(Some(output)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ToolError::Failed(format!(
+            "Failed to run {default_name}: {err}"
+        ))),
+    }
+}
+
 fn grep_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let pattern = required_str(input, "pattern")?;
+    let search_path = resolve(
+        cwd,
+        input.get("path").and_then(Value::as_str).unwrap_or("."),
+    )?;
+    if !search_path.exists() {
+        return Err(ToolError::Failed(format!(
+            "Path not found: {}",
+            search_path.display()
+        )));
+    }
+    let glob = input.get("glob").and_then(Value::as_str);
+    let ignore_case = input
+        .get("ignoreCase")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let literal = input
+        .get("literal")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let context = input.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(GREP_DEFAULT_LIMIT)
+        .max(1);
+    let args = build_rg_args(pattern, &search_path, glob, ignore_case, literal);
+    let Some(output) = run_managed_tool("PI_RG_PATH", "rg", &args)? else {
+        return grep_tool_native(cwd, input);
+    };
+    let code = output.status.code().unwrap_or(-1);
+    if code != 0 && code != 1 {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ToolError::Failed(if stderr.is_empty() {
+            format!("ripgrep exited with code {code}")
+        } else {
+            stderr
+        }));
+    }
+    let is_dir = search_path.is_dir();
+    let mut raw_matches = Vec::<(PathBuf, usize, Option<String>)>::new();
+    let mut match_limit_reached = false;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("match") {
+            continue;
+        }
+        if raw_matches.len() >= limit {
+            match_limit_reached = true;
+            break;
+        }
+        let Some(file) = event
+            .get("data")
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(line_number) = event
+            .get("data")
+            .and_then(|value| value.get("line_number"))
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let line_text = event
+            .get("data")
+            .and_then(|value| value.get("lines"))
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        raw_matches.push((PathBuf::from(file), line_number as usize, line_text));
+        if raw_matches.len() >= limit {
+            match_limit_reached = true;
+        }
+    }
+    if raw_matches.is_empty() {
+        return Ok(ToolResult {
+            content: "No matches found".into(),
+            is_error: false,
+            details: None,
+        });
+    }
+    let mut lines_truncated = false;
+    let mut matches = Vec::new();
+    for (file, line_number, line_text) in raw_matches {
+        let display = format_grep_path(&file, &search_path, is_dir);
+        if context == 0 {
+            let text = line_text
+                .as_deref()
+                .unwrap_or("")
+                .replace("\r\n", "\n")
+                .replace('\r', "")
+                .trim_end_matches('\n')
+                .to_string();
+            let (text, truncated) = truncate_line(&text);
+            lines_truncated |= truncated;
+            matches.push(format!("{display}:{line_number}: {text}"));
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&file) else {
+            matches.push(format!("{display}:{line_number}: (unable to read file)"));
+            continue;
+        };
+        let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+        let file_lines: Vec<&str> = normalized.split('\n').collect();
+        let start = line_number.saturating_sub(context).max(1);
+        let end = (line_number + context).min(file_lines.len());
+        for current in start..=end {
+            let (text, truncated) =
+                truncate_line(file_lines.get(current - 1).copied().unwrap_or(""));
+            lines_truncated |= truncated;
+            if current == line_number {
+                matches.push(format!("{display}:{current}: {text}"));
+            } else {
+                matches.push(format!("{display}-{current}- {text}"));
+            }
+        }
+    }
+    let mut output_text = matches.join("\n");
+    let mut details = serde_json::Map::new();
+    let mut notices = Vec::new();
+    if match_limit_reached {
+        notices.push(format!(
+            "{limit} matches limit reached. Use limit={} for more, or refine pattern",
+            limit.saturating_mul(2)
+        ));
+        details.insert("matchLimitReached".into(), serde_json::json!(limit));
+    }
+    if lines_truncated {
+        notices.push(format!(
+            "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+        ));
+        details.insert("linesTruncated".into(), Value::Bool(true));
+    }
+    if !notices.is_empty() {
+        output_text.push_str("\n\n[");
+        output_text.push_str(&notices.join(". "));
+        output_text.push(']');
+    }
+    Ok(ToolResult {
+        content: output_text,
+        is_error: false,
+        details: if details.is_empty() {
+            None
+        } else {
+            Some(Value::Object(details))
+        },
+    })
+}
+
+fn grep_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     let pattern = required_str(input, "pattern")?;
     let search_path = resolve(
         cwd,
@@ -696,6 +942,70 @@ fn find_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
     let pattern = required_str(input, "pattern")?;
     let search_path = resolve(
         cwd,
+        input.get("path").and_then(Value::as_str).unwrap_or("."),
+    )?;
+    if !search_path.exists() {
+        return Err(ToolError::Failed(format!(
+            "Path not found: {}",
+            search_path.display()
+        )));
+    }
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(FIND_DEFAULT_LIMIT)
+        .max(1);
+    let args = build_fd_args(pattern, &search_path, limit);
+    let Some(output) = run_managed_tool("PI_FD_PATH", "fd", &args)? else {
+        return find_tool_native(cwd, input);
+    };
+    if !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ToolError::Failed(if stderr.is_empty() {
+            format!("fd exited with code {}", output.status.code().unwrap_or(-1))
+        } else {
+            stderr
+        }));
+    }
+    let mut hits = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let path = PathBuf::from(line);
+            relativize_find_result_path(&path, &search_path)
+        })
+        .collect::<Vec<_>>();
+    if hits.is_empty() {
+        return Ok(ToolResult {
+            content: "No files found matching pattern".into(),
+            is_error: false,
+            details: None,
+        });
+    }
+    let result_limit_reached = hits.len() >= limit;
+    hits.truncate(limit);
+    let mut output_text = hits.join("\n");
+    let mut details = serde_json::Map::new();
+    if result_limit_reached {
+        output_text.push_str(&format!("\n\n[{limit} results limit reached]"));
+        details.insert("resultLimitReached".into(), serde_json::json!(limit));
+    }
+    Ok(ToolResult {
+        content: output_text,
+        is_error: false,
+        details: if details.is_empty() {
+            None
+        } else {
+            Some(Value::Object(details))
+        },
+    })
+}
+
+fn find_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let pattern = required_str(input, "pattern")?;
+    let search_path = resolve(
+        cwd,
         input.get("path").and_then(|v| v.as_str()).unwrap_or("."),
     )?;
     if !search_path.exists() {
@@ -753,11 +1063,19 @@ fn find_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
 pub fn relativize_find_result_path(result_path: &Path, search_path: &Path) -> String {
     let display = result_path.to_string_lossy();
     let had_trailing = display.ends_with('/') || display.ends_with('\\');
-    let relative = if result_path.is_absolute() {
-        result_path
-            .strip_prefix(search_path)
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| display.into_owned())
+    let relative = if result_path.is_absolute() || display.starts_with('/') {
+        match result_path.strip_prefix(search_path) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => {
+                // Keep the TypeScript-style root relativization even when a
+                // fixture uses POSIX paths on Windows.
+                let root = search_path.to_string_lossy();
+                display
+                    .strip_prefix(root.as_ref())
+                    .map(|path| path.trim_start_matches(['/', '\\']).to_owned())
+                    .unwrap_or_else(|| display.into_owned())
+            }
+        }
     } else {
         display.into_owned()
     };
@@ -1220,6 +1538,56 @@ mod tests {
             execute_tool(dir.path(), "read", &serde_json::json!({"path":"dot.png"})).unwrap();
         assert!(read.content.starts_with("Read image file [image/png]"));
         assert!(read.details.as_ref().unwrap()["image"]["data"].is_string());
+    }
+
+    #[test]
+    fn fd_and_rg_argv_match_typescript_tools() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let fd = build_fd_args("src/*.rs", dir.path(), 25);
+        let expected_pattern = if cfg!(windows) {
+            "**[/\\\\]src[/\\\\]*.rs"
+        } else {
+            "**/src/*.rs"
+        };
+        assert_eq!(
+            fd,
+            vec![
+                "--glob",
+                "--color=never",
+                "--hidden",
+                "--max-results",
+                "25",
+                "--full-path",
+                "--",
+                expected_pattern,
+                dir.path().to_string_lossy().as_ref(),
+            ]
+        );
+        let rg = build_rg_args("Needle", dir.path(), Some("*.rs"), true, true);
+        assert_eq!(
+            rg,
+            vec![
+                "--json",
+                "--line-number",
+                "--color=never",
+                "--hidden",
+                "--ignore-case",
+                "--fixed-strings",
+                "--glob",
+                "*.rs",
+                "--",
+                "Needle",
+                dir.path().to_string_lossy().as_ref(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fd_argv_disables_git_requirement_outside_a_repo() {
+        let dir = tempdir().unwrap();
+        let args = build_fd_args("*.rs", dir.path(), 10);
+        assert!(args.iter().any(|arg| arg == "--no-require-git"));
     }
 
     #[test]

@@ -453,19 +453,32 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 return ok(id, &kind, Some(serde_json::json!({ "cancelled": true })));
             }
             let exclude = command.exclude_from_context.unwrap_or(false);
+            let bash_command = command.command.unwrap_or_default();
             match pi_agent::execute_tool(
                 &runtime.cwd,
                 "bash",
                 &serde_json::json!({
-                    "command": command.command.unwrap_or_default(),
+                    "command": bash_command,
                     "excludeFromContext": exclude
                 }),
             ) {
-                Ok(result) => ok(
-                    id,
-                    &kind,
-                    Some(serde_json::to_value(result).unwrap_or(Value::Null)),
-                ),
+                Ok(result) => {
+                    let bash_result = serde_json::json!({
+                        "output": result.content,
+                        "exitCode": result
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("exitCode"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        "cancelled": false,
+                        "truncated": false,
+                    });
+                    runtime
+                        .agent
+                        .record_bash_result(&bash_command, &bash_result, exclude);
+                    ok(id, &kind, Some(bash_result))
+                }
                 Err(err) => fail(id, &kind, err.to_string()),
             }
         }

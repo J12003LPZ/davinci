@@ -212,6 +212,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     };
 
     if parsed.mode == Some(Mode::Rpc) {
+        let _ = tools_manager::ensure_managed_tools();
         if !parsed.file_args.is_empty() {
             eprintln!("{RPC_FILE_ARGS_ERROR}");
             return Ok(1);
@@ -222,6 +223,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     let stdin_tty = io::stdin().is_terminal();
     let stdout_tty = io::stdout().is_terminal();
     if parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty {
+        let _ = tools_manager::ensure_managed_tools();
         return run_print(&parsed, &mut agent);
     }
     if !migrations.deprecation_warnings.is_empty() {
@@ -1013,6 +1015,24 @@ fn run_auth(command: auth_cmd::AuthCommand) -> Result<i32, String> {
     }
 }
 
+fn latest_user_prompt(agent: &Agent) -> (String, Vec<pi_ai::MessageContent>) {
+    let Some(message) = agent
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return (String::new(), Vec::new());
+    };
+    let images = message
+        .content
+        .iter()
+        .filter(|block| matches!(block, pi_ai::MessageContent::Image { .. }))
+        .cloned()
+        .collect();
+    (content_text(&message.content), images)
+}
+
 fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>) {
     complete_prompt_with_host(parsed, agent, None, false)
 }
@@ -1092,10 +1112,16 @@ fn complete_prompt_with_host(
         host.runtime_all_tools = agent.tool_registry.clone();
         host.runtime_thinking_level = agent.thinking_level.as_str().to_string();
         host.runtime_flag_values = flag_values_json(parsed);
+        agent.reset_system_prompt_to_base();
         host.runtime_system_prompt = agent.system_prompt.clone();
-        host.emit(ExtensionEvent::BeforeAgentStart);
+        let (prompt, images) = latest_user_prompt(agent);
+        host.emit_before_agent_start(&prompt, &images);
         if let Some(prompt) = host.last_result_system_prompt() {
-            agent.system_prompt = prompt;
+            agent.system_prompt = prompt.clone();
+            host.runtime_system_prompt = prompt;
+        }
+        for message in host.take_before_agent_start_messages() {
+            agent.record_custom_message(&message);
         }
         host.emit(ExtensionEvent::AgentStart);
         host.emit(ExtensionEvent::TurnStart);
@@ -1639,6 +1665,11 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             });
             emit_extension_ui_requests(&std::mem::take(&mut locked.ui_calls))?;
             if let Some(result) = locked.last_user_bash_result() {
+                runtime.agent.record_bash_result(
+                    command.command.as_deref().unwrap_or(""),
+                    &result,
+                    command.exclude_from_context.unwrap_or(false),
+                );
                 let response = rpc::ok_response(command.id.clone(), "bash", Some(result));
                 output::write_raw_stdout_line(
                     &serde_json::to_string(&response).map_err(|err| err.to_string())?,
@@ -2655,24 +2686,55 @@ fn apply_session_action(
             Ok(true)
         }
         SessionAction::OpenFork => handle_user_line(parsed, agent, session, "/fork", tui),
-        SessionAction::RunBash(command) => {
+        SessionAction::RunBash {
+            command,
+            exclude_from_context,
+        } => {
             let mut host = loaded_extension_host(parsed);
             host.runtime_flag_values = flag_values_json(parsed);
             host.emit(ExtensionEvent::UserBash {
                 command: command.clone(),
-                exclude_from_context: command.starts_with('!'),
+                exclude_from_context,
                 cwd: agent.cwd.display().to_string(),
             });
             session.apply_extension_ui_calls(&host.ui_calls);
             apply_host_session_calls(parsed, agent, session, &host.session_calls, true);
-            match crate::js_host::execute_command_tool(&command, &agent.cwd) {
-                Ok(out) => {
-                    session.chrome.transcript.push("bash", &out);
-                    session.chrome.status = "bash done".into();
-                    println!("{out}");
+            if let Some(result) = host.last_user_bash_result() {
+                agent.record_bash_result(&command, &result, exclude_from_context);
+                let output = result
+                    .get("output")
+                    .or_else(|| result.get("content"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                session.chrome.transcript.push("bash", output);
+                session.chrome.status = "bash done".into();
+                if !output.is_empty() {
+                    println!("{output}");
+                }
+                return Ok(true);
+            }
+            match pi_agent::execute_tool(
+                &agent.cwd,
+                "bash",
+                &serde_json::json!({ "command": command }),
+            ) {
+                Ok(result) => {
+                    let value = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+                    agent.record_bash_result(&command, &value, exclude_from_context);
+                    session.chrome.transcript.push("bash", &result.content);
+                    session.chrome.status = if result.is_error {
+                        "bash error".into()
+                    } else {
+                        "bash done".into()
+                    };
+                    if result.is_error {
+                        eprintln!("{}", result.content);
+                    } else {
+                        println!("{}", result.content);
+                    }
                 }
                 Err(err) => {
-                    session.chrome.transcript.push("bash", &err);
+                    session.chrome.transcript.push("bash", err.to_string());
                     session.chrome.status = "bash error".into();
                     eprintln!("{err}");
                 }

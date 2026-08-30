@@ -47,7 +47,10 @@ pub use templates::{
 pub use tools::{execute_tool, tool_specs, AgentTool, ToolError, ToolResult, BUILTIN_TOOLS};
 pub use turn::retry_delay_ms;
 
-use pi_ai::{content_text, AssistantMessage, AssistantMessageEvent, ChatMessage, ThinkingBudgets};
+use pi_ai::{
+    content_text, AssistantMessage, AssistantMessageEvent, ChatMessage, MessageContent,
+    ThinkingBudgets,
+};
 use pi_protocol::ThinkingLevel;
 use pi_session::{JsonlSession, SessionEntry};
 use serde::{Deserialize, Serialize};
@@ -150,12 +153,16 @@ pub struct Agent {
     pub install_telemetry: bool,
     pub reload_count: u32,
     pub event_sink: Option<EventSink>,
+    base_system_prompt: String,
+    pending_bash_messages: Vec<ChatMessage>,
+    pending_prompt_messages: Vec<ChatMessage>,
 }
 
 impl Agent {
     pub fn new(system_prompt: impl Into<String>) -> Self {
+        let system_prompt = system_prompt.into();
         Self {
-            system_prompt: system_prompt.into(),
+            system_prompt: system_prompt.clone(),
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             auto_compaction: true,
@@ -192,7 +199,15 @@ impl Agent {
             install_telemetry: true,
             reload_count: 0,
             event_sink: None,
+            base_system_prompt: system_prompt,
+            pending_bash_messages: Vec::new(),
+            pending_prompt_messages: Vec::new(),
         }
+    }
+
+    /// Restore the base prompt before each extension-aware prompt turn.
+    pub fn reset_system_prompt_to_base(&mut self) {
+        self.system_prompt = self.base_system_prompt.clone();
     }
 
     pub fn push_event(&self, events: &mut Vec<AgentEvent>, event: AgentEvent) {
@@ -213,6 +228,7 @@ impl Agent {
     }
 
     pub fn prompt_with(&mut self, text: &str, images: &[pi_ai::MessageContent]) -> ChatMessage {
+        self.flush_pending_bash_messages();
         let mut content = vec![pi_ai::MessageContent::Text {
             text: text.to_string(),
         }];
@@ -232,11 +248,159 @@ impl Agent {
                 serde_json::to_value(&message.content).unwrap_or(Value::Null),
             ));
         }
+        self.pending_prompt_messages.push(message.clone());
         message
     }
 
     pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
         convert_to_llm_for_provider(&self.messages, self.block_images)
+    }
+
+    fn persist_full_message(&mut self, message: &ChatMessage) {
+        if let Some(session) = &mut self.session {
+            let mut entry = SessionEntry::message(
+                &message.role,
+                serde_json::to_value(&message.content).unwrap_or(Value::Null),
+            );
+            entry.message = Some(serde_json::to_value(message).unwrap_or(Value::Null));
+            let _ = session.append_entry(entry);
+        }
+    }
+
+    fn commit_bash_message(&mut self, message: ChatMessage) {
+        self.persist_full_message(&message);
+        self.messages.push(message);
+    }
+
+    /// TypeScript `AgentSession.recordBashResult`.
+    pub fn record_bash_result(
+        &mut self,
+        command: &str,
+        result: &Value,
+        exclude_from_context: bool,
+    ) {
+        let output = result
+            .get("output")
+            .or_else(|| result.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let exit_code = result
+            .get("exitCode")
+            .cloned()
+            .or_else(|| {
+                result
+                    .get("details")
+                    .and_then(|value| value.get("exitCode"))
+                    .cloned()
+            })
+            .unwrap_or(Value::Null);
+        let cancelled = result
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let truncated = result
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                result
+                    .get("details")
+                    .and_then(|value| value.get("truncation"))
+                    .map(|_| true)
+            })
+            .unwrap_or(false);
+        let mut extra = serde_json::Map::new();
+        extra.insert("command".into(), Value::String(command.to_string()));
+        extra.insert("output".into(), Value::String(output));
+        extra.insert("exitCode".into(), exit_code);
+        extra.insert("cancelled".into(), Value::Bool(cancelled));
+        extra.insert("truncated".into(), Value::Bool(truncated));
+        extra.insert("timestamp".into(), serde_json::json!(pi_session::now_ms()));
+        extra.insert(
+            "excludeFromContext".into(),
+            Value::Bool(exclude_from_context),
+        );
+        if let Some(path) = result.get("fullOutputPath").and_then(Value::as_str) {
+            extra.insert("fullOutputPath".into(), Value::String(path.to_string()));
+        }
+        let message = ChatMessage {
+            role: "bashExecution".into(),
+            content: Vec::new(),
+            extra,
+            ..ChatMessage::default()
+        };
+        if self.is_streaming {
+            self.pending_bash_messages.push(message);
+        } else {
+            self.commit_bash_message(message);
+        }
+    }
+
+    pub fn flush_pending_bash_messages(&mut self) {
+        let pending = std::mem::take(&mut self.pending_bash_messages);
+        for message in pending {
+            self.commit_bash_message(message);
+        }
+    }
+
+    /// Persist and append a TypeScript extension `CustomMessage`.
+    pub fn record_custom_message(&mut self, raw: &Value) -> ChatMessage {
+        let content = match raw.get("content") {
+            Some(Value::String(text)) => vec![pi_ai::MessageContent::Text { text: text.clone() }],
+            Some(Value::Array(_)) => {
+                serde_json::from_value(raw["content"].clone()).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let session_content = match raw.get("content") {
+            Some(Value::String(text)) => Value::String(text.clone()),
+            Some(Value::Array(value))
+                if serde_json::from_value::<Vec<MessageContent>>(Value::Array(value.clone()))
+                    .is_ok() =>
+            {
+                Value::Array(value.clone())
+            }
+            _ => serde_json::json!([]),
+        };
+        let timestamp = pi_session::now_ms();
+        let mut extra = serde_json::Map::new();
+        for key in ["customType", "display", "details"] {
+            if let Some(value) = raw.get(key) {
+                extra.insert(key.to_string(), value.clone());
+            }
+        }
+        extra.insert("timestamp".into(), serde_json::json!(timestamp));
+        let message = ChatMessage {
+            role: "custom".into(),
+            content,
+            extra,
+            ..ChatMessage::default()
+        };
+        if let Some(session) = &mut self.session {
+            let mut extra = serde_json::Map::new();
+            extra.insert("content".into(), session_content);
+            for key in ["display", "details"] {
+                if let Some(value) = raw.get(key) {
+                    extra.insert(key.to_string(), value.clone());
+                }
+            }
+            let _ = session.append_entry(SessionEntry {
+                id: String::new(),
+                entry_type: "custom_message".into(),
+                parent_id: None,
+                seq: 0,
+                timestamp,
+                message: None,
+                custom_type: raw
+                    .get("customType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                extra,
+            });
+        }
+        self.messages.push(message.clone());
+        self.pending_prompt_messages.push(message.clone());
+        message
     }
 
     pub fn abort_retry(&mut self) {
@@ -365,6 +529,7 @@ impl Agent {
 
     pub fn load_from_session(&mut self, session: JsonlSession) {
         self.messages = messages_from_session(&session);
+        self.pending_prompt_messages.clear();
         self.session = Some(session);
     }
 
@@ -495,6 +660,36 @@ pub struct TreeNavigateResult {
     pub summary: Option<String>,
 }
 
+pub(crate) fn custom_message_from_session_entry(entry: &SessionEntry) -> Option<ChatMessage> {
+    let content = entry
+        .extra
+        .get("content")
+        .cloned()
+        .or_else(|| entry.message.clone())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let content = match &content {
+        Value::String(text) => vec![MessageContent::Text { text: text.clone() }],
+        Value::Array(_) => serde_json::from_value(content).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut extra = serde_json::Map::new();
+    if let Some(custom_type) = &entry.custom_type {
+        extra.insert("customType".into(), Value::String(custom_type.clone()));
+    }
+    for key in ["display", "details"] {
+        if let Some(value) = entry.extra.get(key) {
+            extra.insert(key.to_string(), value.clone());
+        }
+    }
+    extra.insert("timestamp".into(), serde_json::json!(entry.timestamp));
+    Some(ChatMessage {
+        role: "custom".into(),
+        content,
+        extra,
+        ..ChatMessage::default()
+    })
+}
+
 fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     match entry.entry_type.as_str() {
         "compaction" => {
@@ -505,28 +700,7 @@ fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
             let summary = entry.extra.get("summary")?.as_str()?;
             Some(branch_summary_context_message(summary))
         }
-        "custom_message" => {
-            let content = entry
-                .extra
-                .get("content")
-                .cloned()
-                .or_else(|| entry.message.clone())
-                .unwrap_or(Value::Null);
-            let text = match &content {
-                Value::String(value) => value.clone(),
-                other => other
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| item.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                    .unwrap_or_default(),
-            };
-            Some(ChatMessage::text("custom", text))
-        }
+        "custom_message" => custom_message_from_session_entry(entry),
         "message" => {
             let message = entry.message.as_ref()?;
             serde_json::from_value(message.clone()).ok()
@@ -610,6 +784,16 @@ mod tests {
         let compacted = agent.compact(Some("keep decisions"));
         assert!(compacted.summary.contains("keep decisions"));
         assert!(!agent.messages.is_empty());
+    }
+
+    #[test]
+    fn system_prompt_reset_restores_the_base_prompt() {
+        let mut agent = Agent::new("base prompt");
+        agent.system_prompt = "extension override".into();
+
+        agent.reset_system_prompt_to_base();
+
+        assert_eq!(agent.system_prompt, "base prompt");
     }
 
     #[test]
@@ -1007,6 +1191,264 @@ mod tests {
             .map(|message| content_text(&message.content))
             .unwrap_or_default();
         assert!(result.contains("blocked by extension"));
+    }
+
+    #[test]
+    fn record_bash_result_persists_ts_message_and_excludes_double_bang_from_llm() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "/tmp/project", Some("bash")).unwrap();
+        let mut agent = Agent::new("x");
+        agent.session = Some(session);
+
+        agent.record_bash_result(
+            "printf hi",
+            &serde_json::json!({
+                "output": "hi",
+                "exitCode": 0,
+                "cancelled": false,
+                "truncated": false
+            }),
+            false,
+        );
+
+        let bash = agent.messages.last().expect("bash message");
+        assert_eq!(bash.role, "bashExecution");
+        assert_eq!(
+            bash.extra.get("command"),
+            Some(&serde_json::json!("printf hi"))
+        );
+        assert_eq!(bash.extra.get("output"), Some(&serde_json::json!("hi")));
+        assert_eq!(bash.extra.get("exitCode"), Some(&serde_json::json!(0)));
+        assert_eq!(bash.extra.get("cancelled"), Some(&serde_json::json!(false)));
+        assert_eq!(bash.extra.get("truncated"), Some(&serde_json::json!(false)));
+
+        let stored = agent.session.as_ref().unwrap().entries.last().unwrap();
+        let stored_message = stored.message.as_ref().unwrap();
+        assert_eq!(
+            stored_message.get("role").and_then(Value::as_str),
+            Some("bashExecution")
+        );
+        assert_eq!(
+            stored_message.get("command").and_then(Value::as_str),
+            Some("printf hi")
+        );
+        assert_eq!(
+            stored_message.get("output").and_then(Value::as_str),
+            Some("hi")
+        );
+
+        let llm = agent.messages_for_provider();
+        assert_eq!(llm.last().unwrap().role, "user");
+        assert_eq!(
+            content_text(&llm.last().unwrap().content),
+            "Ran `printf hi`\n```\nhi\n```"
+        );
+
+        agent.record_bash_result(
+            "secret",
+            &serde_json::json!({
+                "output": "hidden",
+                "exitCode": 0,
+                "cancelled": false,
+                "truncated": false
+            }),
+            true,
+        );
+        assert_eq!(
+            agent
+                .messages
+                .last()
+                .unwrap()
+                .extra
+                .get("excludeFromContext")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(!agent
+            .messages_for_provider()
+            .iter()
+            .any(|message| content_text(&message.content).contains("secret")));
+    }
+
+    #[test]
+    fn pending_bash_results_flush_before_the_next_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            JsonlSession::create(dir.path(), "/tmp/project", Some("bash-pending")).unwrap();
+        let mut agent = Agent::new("x");
+        agent.session = Some(session);
+        agent.is_streaming = true;
+
+        agent.record_bash_result(
+            "echo queued",
+            &serde_json::json!({
+                "output": "queued",
+                "exitCode": 0,
+                "cancelled": false,
+                "truncated": false
+            }),
+            false,
+        );
+        assert!(agent.messages.is_empty());
+        assert!(agent.session.as_ref().unwrap().entries.is_empty());
+
+        agent.is_streaming = false;
+        agent.prompt("next");
+        assert_eq!(agent.messages[0].role, "bashExecution");
+        assert_eq!(agent.messages[1].role, "user");
+        let entries = &agent.session.as_ref().unwrap().entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0]
+                .message
+                .as_ref()
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str),
+            Some("bashExecution")
+        );
+    }
+
+    #[test]
+    fn record_custom_message_persists_before_agent_start_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "/tmp/project", Some("custom")).unwrap();
+        let mut agent = Agent::new("x");
+        agent.session = Some(session);
+
+        agent.record_custom_message(&serde_json::json!({
+            "customType": "hint",
+            "content": [{"type":"text","text":"extension context"}],
+            "display": false,
+            "details": {"source":"before_agent_start"}
+        }));
+
+        let message = agent.messages.last().unwrap();
+        assert_eq!(message.role, "custom");
+        assert_eq!(content_text(&message.content), "extension context");
+        assert_eq!(
+            message.extra.get("customType").and_then(Value::as_str),
+            Some("hint")
+        );
+        assert_eq!(
+            message.extra.get("display").and_then(Value::as_bool),
+            Some(false)
+        );
+        let stored = agent.session.as_ref().unwrap().entries.last().unwrap();
+        assert_eq!(stored.entry_type, "custom_message");
+        assert_eq!(stored.custom_type.as_deref(), Some("hint"));
+        assert_eq!(
+            stored.extra.get("content"),
+            Some(&serde_json::json!([{"type":"text","text":"extension context"}]))
+        );
+        assert_eq!(stored.extra.get("display"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            stored.extra.get("details"),
+            Some(&serde_json::json!({"source":"before_agent_start"}))
+        );
+    }
+
+    #[test]
+    fn before_agent_start_custom_messages_are_emitted_in_current_turn_and_reload() {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "/tmp/project", Some("prompt")).unwrap();
+        let mut agent = Agent::new("x");
+        agent.session = Some(session);
+        agent.prompt("hello");
+        agent.record_custom_message(&serde_json::json!({
+            "customType": "hint",
+            "content": [
+                {"type":"text","text":"extension context"},
+                {"type":"image","data":"e30=","mimeType":"image/png"}
+            ],
+            "display": false,
+            "details": {"source":"before_agent_start"}
+        }));
+
+        let events = agent
+            .run_loop(|_| {
+                Ok(AssistantMessage {
+                    id: "assistant-1".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        let message_starts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageStart { message } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            message_starts
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "custom", "assistant"]
+        );
+        assert_eq!(
+            message_starts[1].extra.get("customType"),
+            Some(&serde_json::json!("hint"))
+        );
+        assert!(matches!(
+            message_starts[1].content.get(1),
+            Some(pi_ai::MessageContent::Image { .. })
+        ));
+
+        let agent_end = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::AgentEnd { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            agent_end
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "custom", "assistant"]
+        );
+
+        let session = agent.session.as_ref().unwrap();
+        let custom_entry = session
+            .entries
+            .iter()
+            .find(|entry| entry.entry_type == "custom_message")
+            .unwrap();
+        assert_eq!(custom_entry.custom_type.as_deref(), Some("hint"));
+        assert_eq!(
+            custom_entry.extra.get("content"),
+            Some(&serde_json::json!([
+                {"type":"text","text":"extension context"},
+                {"type":"image","data":"e30=","mimeType":"image/png"}
+            ]))
+        );
+
+        let reloaded = messages_from_session(session);
+        let reloaded_custom = reloaded
+            .iter()
+            .find(|message| message.role == "custom")
+            .unwrap();
+        assert_eq!(content_text(&reloaded_custom.content), "extension context");
+        assert_eq!(
+            reloaded_custom.extra.get("customType"),
+            Some(&serde_json::json!("hint"))
+        );
+        assert!(matches!(
+            reloaded_custom.content.get(1),
+            Some(pi_ai::MessageContent::Image { .. })
+        ));
     }
 
     #[test]

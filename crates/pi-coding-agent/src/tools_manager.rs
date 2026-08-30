@@ -580,12 +580,13 @@ pub fn ensure_tool_in(bin_dir: &Path, tool: ManagedTool) -> (Option<String>, Vec
 
 pub fn ensure_managed_tools() -> Vec<ToolStatus> {
     let (fd_path, mut statuses) = ensure_tool(ManagedTool::Fd);
-    let (_rg_path, rg_statuses) = ensure_tool(ManagedTool::Rg);
+    let (rg_path, rg_statuses) = ensure_tool(ManagedTool::Rg);
     statuses.extend(rg_statuses);
     if let Some(path) = fd_path {
-        if path.contains('/') || path.contains('\\') {
-            std::env::set_var("PI_FD_PATH", path);
-        }
+        std::env::set_var("PI_FD_PATH", path);
+    }
+    if let Some(path) = rg_path {
+        std::env::set_var("PI_RG_PATH", path);
     }
     statuses
 }

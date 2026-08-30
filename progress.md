@@ -2,7 +2,7 @@
 
 **Integration branch: `rust-rewrite`.** TypeScript under `vendor/pi` stays as the behavioral reference.
 
-**Complete: ChatMessage extras landed; bashExecution persist, `before_agent_start` custom messages, and fd/rg find/grep still open.**
+**Complete: bashExecution persistence, `before_agent_start` custom messages, and managed fd/rg find/grep parity.**
 
 Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`. Merged `main` (96 product commits + ChatMessage extras) into `rust-rewrite`, keeping rust-rewrite-only vendor/LICENSE files. Overlapping crates use the `main` tree.
 
@@ -45,7 +45,7 @@ Pinned spec: `vendor/pi` @ `853a80d26c90a14c1886f0ebb8ffaae133ca2185`. Merged `m
 
 Gates on this slice: `cargo test --workspace`, `cargo fmt --check`, `clippy --workspace --all-targets -- -D warnings` green on 1.83.
 
-## Remaining product gaps
+## Completed parity audit
 
 Closed this slice: `/export` `.jsonl` (TS branch rewrite), `/session` + `get_session_stats` token/cost shape, RPC `get_tree`/`get_entries`/`get_fork_messages`/`get_state` streaming flags, `get_commands` + slash autocomplete for extension/prompt/skill commands, `read` offset/limit + 2000-line/50KB truncation, RPC `images`/`streamingBehavior`/`excludeFromContext` fields.
 
@@ -157,11 +157,11 @@ Closed this slice: RPC `prompt` preflight matches TS — compaction-in-progress 
 
 Closed this slice: `ChatMessage` now flattens TS extra fields (`command`, `output`, `excludeFromContext`, `customType`, …) with `#[serde(default)]` content so JSONL `bashExecution` / `custom` messages deserialize. `ChatMessage::extra_bool` / `extra_str` read those keys. Constructors use `Default`.
 
-## Remaining product gaps
+## Completed parity audit
 
-- Interactive `!` / `!!` bash: honor `user_bash` result override, persist `role: "bashExecution"` into agent messages + JSONL, `excludeFromContext` for `!!`, and flush `_pendingBashMessages` on `agent_end` / before the next prompt (TS `recordBashResult`).
-- `before_agent_start` handlers can return `{ message, systemPrompt }`; Rust applies `systemPrompt` only and drops injected custom messages.
-- find/grep still native-walk when `fd`/`rg` are on PATH or in `{agentDir}/bin`. TS `ensureTool` then spawns `fd`/`rg` with the TypeScript argv (`--glob --hidden`, `--json --line-number`, git-aware `--no-require-git`). Native walk remains a fallback when the binaries are missing.
+- Interactive `!` / `!!` bash: the `user_bash` result override is honored; every result is persisted as `role: "bashExecution"` in agent state and session JSONL; `!!` sets `excludeFromContext`; and queued results flush at agent-run cleanup and before the next prompt (TS `recordBashResult`).
+- `before_agent_start`: handlers chain `systemPrompt` overrides and return ordered custom messages; Rust emits those messages in the current prompt turn and persists/reloads them as `custom_message` session entries.
+- find/grep: startup uses the Rust port of TS `ensureTool` for `fd`/`rg`, managed binaries receive the TypeScript argument vectors, and native filesystem walking is used only after binary unavailability.
 
 A `pi eval` runner binary is not a shipped TS CLI (`run-evals.mjs` is a package script; the harness is library-only in both trees).
 

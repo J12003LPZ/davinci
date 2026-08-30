@@ -170,6 +170,8 @@ pub struct ExtensionHost {
     pub editor_text: String,
     pub runtime_system_prompt: String,
     pub unregistered_providers: Vec<String>,
+    before_agent_start_messages: Vec<Value>,
+    before_agent_start_system_prompt: Option<String>,
 }
 
 impl ExtensionHost {
@@ -194,6 +196,8 @@ impl ExtensionHost {
             editor_text: String::new(),
             runtime_system_prompt: String::new(),
             unregistered_providers: Vec::new(),
+            before_agent_start_messages: Vec::new(),
+            before_agent_start_system_prompt: None,
         };
         if node_available() {
             for manifest in &host.manifests {
@@ -323,6 +327,17 @@ impl ExtensionHost {
         self.events.push(event);
     }
 
+    pub fn emit_before_agent_start(&mut self, prompt: &str, images: &[pi_ai::MessageContent]) {
+        self.dispatch_js_with_payload(
+            &ExtensionEvent::BeforeAgentStart,
+            Some(serde_json::json!({
+                "prompt": prompt,
+                "images": images,
+            })),
+        );
+        self.events.push(ExtensionEvent::BeforeAgentStart);
+    }
+
     /// TS `emitInput`: transforms chain across extensions; `handled` short-circuits.
     pub fn emit_input(
         &mut self,
@@ -404,6 +419,11 @@ impl ExtensionHost {
     }
 
     fn dispatch_js(&mut self, event: &ExtensionEvent) {
+        self.dispatch_js_with_payload(event, None);
+    }
+
+    fn dispatch_js_with_payload(&mut self, event: &ExtensionEvent, extra: Option<Value>) {
+        self.last_js_result = None;
         let Ok(mut payload) = serde_json::to_value(event) else {
             return;
         };
@@ -427,17 +447,57 @@ impl ExtensionHost {
                 "systemPrompt".into(),
                 Value::String(self.runtime_system_prompt.clone()),
             );
+            if let Some(extra) = extra.and_then(|value| value.as_object().cloned()) {
+                object.extend(extra);
+            }
         }
+        let before_agent_start = matches!(event, ExtensionEvent::BeforeAgentStart);
+        let user_bash = matches!(event, ExtensionEvent::UserBash { .. });
+        if before_agent_start {
+            self.before_agent_start_messages.clear();
+            self.before_agent_start_system_prompt = None;
+        }
+        let mut current_system_prompt = self.runtime_system_prompt.clone();
         let mut emits = Vec::new();
         for ext in &self.js {
+            if before_agent_start {
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert(
+                        "systemPrompt".into(),
+                        Value::String(current_system_prompt.clone()),
+                    );
+                }
+            }
             if let Ok(result) = run_js_extension(Path::new(&ext.path), "emit", &payload) {
                 if result.ok {
-                    self.last_js_result = result.result;
+                    let result_value = result.result.clone();
+                    if before_agent_start {
+                        if let Some(value) = result_value.as_ref() {
+                            if let Some(messages) = value.get("messages").and_then(Value::as_array)
+                            {
+                                self.before_agent_start_messages
+                                    .extend(messages.iter().cloned());
+                            } else if let Some(message) = value.get("message") {
+                                self.before_agent_start_messages.push(message.clone());
+                            }
+                            if let Some(system_prompt) =
+                                value.get("systemPrompt").and_then(Value::as_str)
+                            {
+                                current_system_prompt = system_prompt.to_string();
+                                self.before_agent_start_system_prompt =
+                                    Some(current_system_prompt.clone());
+                            }
+                        }
+                    }
+                    self.last_js_result = result_value.clone();
                     self.unregistered_providers
                         .extend(result.unregistered_providers.clone());
                     self.ui_calls.extend(result.ui_calls);
                     self.session_calls.extend(result.session_calls);
                     emits.extend(result.event_emits);
+                    if user_bash && result_value.as_ref().map(is_js_truthy).unwrap_or(false) {
+                        break;
+                    }
                 }
             }
         }
@@ -528,16 +588,16 @@ impl ExtensionHost {
     pub fn last_user_bash_result(&self) -> Option<Value> {
         self.last_js_result
             .as_ref()
-            .and_then(|value| value.get("result"))
+            .filter(|value| is_js_truthy(value))
             .cloned()
     }
 
     pub fn last_result_system_prompt(&self) -> Option<String> {
-        self.last_js_result
-            .as_ref()
-            .and_then(|value| value.get("systemPrompt"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        self.before_agent_start_system_prompt.clone()
+    }
+
+    pub fn take_before_agent_start_messages(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.before_agent_start_messages)
     }
 
     pub fn get_message_renderer(&self, custom_type: &str) -> Option<&str> {
@@ -996,6 +1056,16 @@ impl ExtensionHost {
     }
 }
 
+fn is_js_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().map(|number| number != 0.0).unwrap_or(false),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
 const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS: &[&str] = &[
     "app.interrupt",
     "app.clear",
@@ -1083,7 +1153,8 @@ mod tests {
             cwd: "/tmp".into(),
         });
         host.last_js_result = Some(serde_json::json!({
-            "result": { "content": "overridden", "exitCode": 0 }
+            "content": "overridden",
+            "exitCode": 0
         }));
         assert_eq!(
             host.last_user_bash_result()
@@ -1112,6 +1183,32 @@ mod tests {
                 "before_provider_headers"
             ]
         );
+    }
+
+    #[test]
+    fn user_bash_without_an_override_does_not_reuse_a_previous_result() {
+        let mut host = ExtensionHost {
+            last_js_result: Some(serde_json::json!({ "content": "stale", "exitCode": 0 })),
+            ..ExtensionHost::default()
+        };
+
+        host.emit(ExtensionEvent::UserBash {
+            command: "echo current".into(),
+            exclude_from_context: false,
+            cwd: "/tmp".into(),
+        });
+
+        assert_eq!(host.last_user_bash_result(), None);
+    }
+
+    #[test]
+    fn null_user_bash_result_is_not_an_override() {
+        let host = ExtensionHost {
+            last_js_result: Some(serde_json::Value::Null),
+            ..ExtensionHost::default()
+        };
+
+        assert_eq!(host.last_user_bash_result(), None);
     }
 
     #[test]
