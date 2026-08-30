@@ -111,6 +111,7 @@ pub struct InteractiveSettingsConfig {
     pub mermaid_mode: String,
     pub enable_analytics: bool,
     pub auto_compact: bool,
+    pub auto_compact_threshold: String,
     pub steering_mode: String,
     pub follow_up_mode: String,
     pub transport: String,
@@ -149,6 +150,7 @@ impl Default for InteractiveSettingsConfig {
             mermaid_mode: "streaming".into(),
             enable_analytics: false,
             auto_compact: true,
+            auto_compact_threshold: "default".into(),
             steering_mode: "one-at-a-time".into(),
             follow_up_mode: "one-at-a-time".into(),
             transport: "auto".into(),
@@ -219,6 +221,22 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 "Automatically compact context when it gets too large",
                 config.auto_compact,
             ),
+            SettingItem {
+                id: "autocompact-threshold".into(),
+                label: "Auto-compact threshold".into(),
+                description: Some(
+                    "When auto-compaction triggers: a context percentage or absolute token count"
+                        .into(),
+                ),
+                current_value: config.auto_compact_threshold.clone(),
+                values: vec![
+                    "default".into(),
+                    "90%".into(),
+                    "75%".into(),
+                    "50%".into(),
+                    "25%".into(),
+                ],
+            },
             bool_item(
                 "show-images",
                 "Show images",

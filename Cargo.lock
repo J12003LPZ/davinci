@@ -750,12 +750,14 @@ dependencies = [
  "pi-tui",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
  "thiserror",
  "ureq",
  "url",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

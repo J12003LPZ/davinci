@@ -14,6 +14,7 @@ mod js_host;
 mod llama;
 mod migrations;
 mod model_resolver;
+mod native_extensions;
 mod output;
 mod packages;
 mod rpc;
@@ -75,12 +76,14 @@ use auth_cmd::{
 use extension_host::{ExtensionEvent, ExtensionHost};
 use external_editor::{clipboard_image_png, clipboard_text, ExternalEditor};
 use file_processor::{prepare_initial_message, RPC_FILE_ARGS_ERROR};
+use native_extensions::{command_specs, native_invocable_commands};
 use packages::handle_package_command;
 use rpc::{handle_rpc, RpcCommand, RpcRuntime};
 use settings::{
-    apply_http_proxy_settings, default_project_trust_value, is_trusted, load_merged_settings,
-    load_merged_settings_with_override, load_settings, save_settings, set_enable_analytics,
-    settings_path, should_run_first_time_setup, to_interactive_config,
+    apply_http_proxy_settings, clear_compaction_threshold, default_project_trust_value, is_trusted,
+    load_merged_settings, load_merged_settings_with_override, load_settings, save_settings,
+    set_compaction_threshold, set_enable_analytics, settings_path, should_run_first_time_setup,
+    to_interactive_config,
 };
 use slash::SlashAction;
 use trust::{
@@ -341,19 +344,19 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             }
         }
     }
-    if !extensions.is_empty() {
-        let host = ExtensionHost::load(&default_agent_dir(), &extensions);
-        let mut names = extensions.clone();
-        names.extend(extensions::extension_tool_names(&host.manifests));
-        for ext in &host.js {
-            names.extend(ext.tools.iter().cloned());
-            names.extend(ext.commands.iter().cloned());
-            let _ = ext.handlers.as_slice();
-        }
-        agent.apply_extension_tools(&names);
-        attach_tool_executor(&mut agent, &host);
-        let _ = host.describe_js();
+    let mut host = ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd);
+    let mut names = host.native_tool_names();
+    names.extend(extensions.clone());
+    names.extend(extensions::extension_tool_names(&host.manifests));
+    for ext in &host.js {
+        names.extend(ext.tools.iter().cloned());
+        names.extend(ext.commands.iter().cloned());
+        let _ = ext.handlers.as_slice();
     }
+    agent.apply_extension_tools(&names);
+    attach_tool_executor(&mut agent, &host);
+    host.emit(ExtensionEvent::SessionStart);
+    let _ = host.describe_js();
     apply_resolved_models(parsed, &mut agent)?;
     if let Some(key) = &parsed.api_key {
         if let Ok(mut storage) = AuthStorage::create() {
@@ -1033,6 +1036,32 @@ fn latest_user_prompt(agent: &Agent) -> (String, Vec<pi_ai::MessageContent>) {
     (content_text(&message.content), images)
 }
 
+fn agent_memory_messages(agent: &Agent) -> Vec<crate::native_extensions::MemoryMessage> {
+    agent
+        .messages
+        .iter()
+        .filter_map(|message| {
+            let mut content = content_text(&message.content);
+            if content.is_empty() && message.role == "bashExecution" {
+                content = message
+                    .extra
+                    .get("output")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            if content.trim().is_empty() {
+                None
+            } else {
+                Some(crate::native_extensions::MemoryMessage {
+                    role: message.role.clone(),
+                    content,
+                })
+            }
+        })
+        .collect()
+}
+
 fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>) {
     complete_prompt_with_host(parsed, agent, None, false)
 }
@@ -1095,6 +1124,13 @@ fn complete_prompt_with_host(
     }) {
         auth = None;
     }
+    let fresh_host = existing_host.is_none();
+    let host = existing_host.unwrap_or_else(|| Arc::new(Mutex::new(loaded_extension_host(parsed))));
+    attach_shared_tool_executor(agent, host.clone());
+    let native_tool_specs = host
+        .lock()
+        .map(|host| host.native_tool_specs())
+        .unwrap_or_default();
     let tools: Vec<ToolSpec> = pi_agent::tool_specs()
         .into_iter()
         .filter(|tool| agent.tools.iter().any(|name| name == &tool.name))
@@ -1104,10 +1140,18 @@ fn complete_prompt_with_host(
             parameters: tool.parameters,
             constrained_sampling: crate::experimental::experimental_tool_sampling(),
         })
+        .chain(
+            native_tool_specs
+                .into_iter()
+                .filter(|tool| agent.tools.iter().any(|name| name == &tool.name)),
+        )
         .collect();
-    let host = existing_host.unwrap_or_else(|| Arc::new(Mutex::new(loaded_extension_host(parsed))));
+    agent.clear_ephemeral_context();
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+        if fresh_host {
+            host.emit(ExtensionEvent::SessionStart);
+        }
         host.runtime_active_tools = agent.tools.clone();
         host.runtime_all_tools = agent.tool_registry.clone();
         host.runtime_thinking_level = agent.thinking_level.as_str().to_string();
@@ -1122,6 +1166,9 @@ fn complete_prompt_with_host(
         }
         for message in host.take_before_agent_start_messages() {
             agent.record_custom_message(&message);
+        }
+        if let Some(memory) = host.native_memory_inject(&prompt) {
+            agent.set_ephemeral_context(vec![pi_ai::ChatMessage::text("custom", memory)]);
         }
         host.emit(ExtensionEvent::AgentStart);
         host.emit(ExtensionEvent::TurnStart);
@@ -1139,12 +1186,17 @@ fn complete_prompt_with_host(
         host.js_stream_provider(&agent.provider)
     };
     let hook_host = host.clone();
+    let tool_state_cwd = agent.cwd.clone();
     agent.pre_tool = Some(pi_agent::PreToolHook(Arc::new(move |name, args| {
         let mut host = hook_host.lock().ok()?;
         host.emit(ExtensionEvent::ToolCall {
             tool_name: name.to_string(),
             args: args.clone(),
         });
+        let state_hash = crate::native_extensions::repo_state_key(&tool_state_cwd);
+        if let Some(reason) = host.native_before_tool(name, args, &state_hash) {
+            return Some(reason);
+        }
         if host.tool_call_blocked() {
             Some(
                 host.last_js_result
@@ -1158,6 +1210,13 @@ fn complete_prompt_with_host(
             None
         }
     })));
+    let post_host = host.clone();
+    agent.post_tool = Some(pi_agent::PostToolHook(Arc::new(
+        move |_tool_call_id, _cwd, name, args, result| match post_host.lock() {
+            Ok(host) => host.native_after_tool(name, args, result),
+            Err(_) => result,
+        },
+    )));
     if stream_json {
         agent.event_sink = Some(EventSink(Arc::new(|event| {
             if let Ok(value) = to_json_print_event(event) {
@@ -1252,6 +1311,7 @@ fn complete_prompt_with_host(
         })
         .unwrap_or_default();
     agent.pre_tool = None;
+    agent.post_tool = None;
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
         host.emit(ExtensionEvent::AfterProviderResponse {
@@ -1261,6 +1321,8 @@ fn complete_prompt_with_host(
         host.emit(ExtensionEvent::TurnEnd);
         host.emit(ExtensionEvent::AgentEnd);
         host.emit(ExtensionEvent::AgentSettled);
+        let memory_messages = agent_memory_messages(agent);
+        let _ = host.native_index_messages(&memory_messages);
         for event in &events {
             match event {
                 AgentEvent::MessageStart { message } => {
@@ -1554,6 +1616,9 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         available_models(parsed),
     );
     let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
+    host.lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .emit(ExtensionEvent::SessionStart);
     {
         let host = host.lock().unwrap_or_else(|err| err.into_inner());
         for provider in host.registered_providers() {
@@ -1575,6 +1640,7 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             &runtime.agent.templates,
             &runtime.agent.skills,
         );
+        append_native_invocable_commands(&mut runtime.invocable_commands);
     }
     runtime.set_scoped_models(&parsed.models);
     let stored = load_settings(&default_agent_dir());
@@ -1699,6 +1765,7 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 &runtime.agent.templates,
                 &runtime.agent.skills,
             );
+            append_native_invocable_commands(&mut runtime.invocable_commands);
         }
         let mut extras = runtime.take_events();
         {
@@ -2948,18 +3015,17 @@ fn prepare_user_input(
     let mut text = prompt.to_string();
     let mut images = images.to_vec();
     if text.starts_with('/') {
-        let name = text
-            .trim_start_matches('/')
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let (name, args) = parse_extension_command(&text);
         if let Some(session) = session.as_mut() {
-            if try_extension_slash(parsed, agent, session, &name)? {
+            if try_extension_slash(parsed, agent, session, &name, &args)? {
                 return Ok(PreparedInput::Handled);
             }
         } else {
             let mut host = loaded_extension_host(parsed);
+            if let Some(result) = host.execute_native_command(&name, &args)? {
+                println!("/{name}: {}", format_extension_command_result(result));
+                return Ok(PreparedInput::Handled);
+            }
             if let Some(path) = host
                 .js
                 .iter()
@@ -3048,7 +3114,7 @@ fn handle_user_line(
         }
         SlashAction::Status(message) => {
             if let Some(name) = message.strip_prefix("Unknown command /") {
-                if try_extension_slash(parsed, agent, session, name)? {
+                if try_extension_slash(parsed, agent, session, name, "")? {
                     return Ok(true);
                 }
             }
@@ -3687,6 +3753,13 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
         "mermaid-rendering" => stored.markdown.mermaid = Some(value.to_string()),
         "enable-analytics" => set_enable_analytics(&mut stored, value == "true"),
         "autocompact" => stored.auto_compact = Some(value == "true"),
+        "autocompact-threshold" => {
+            if value.eq_ignore_ascii_case("default") || value.is_empty() {
+                clear_compaction_threshold(&mut stored);
+            } else {
+                set_compaction_threshold(&mut stored, value)?;
+            }
+        }
         "steering-mode" => stored.steering_mode = Some(value.to_string()),
         "follow-up-mode" => stored.follow_up_mode = Some(value.to_string()),
         "transport" => stored.transport = Some(value.to_string()),
@@ -3720,6 +3793,8 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
 
 fn sync_agent_from_settings(agent: &mut Agent) {
     let stored = load_settings(&default_agent_dir());
+    agent.auto_compaction = stored.compaction_enabled();
+    agent.compaction = stored.compaction_settings();
     agent.block_images = stored.block_images();
     agent.auto_resize_images = stored.image_auto_resize();
     agent.transport = stored.transport.clone();
@@ -3987,6 +4062,17 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
             argument_items: Vec::new(),
         });
     }
+    for (name, description, argument_hint) in command_specs() {
+        if commands.iter().any(|command| command.name == name) {
+            continue;
+        }
+        commands.push(SlashCommandSpec {
+            name: name.to_string(),
+            description: description.to_string(),
+            argument_hint: argument_hint.map(str::to_string),
+            argument_items: Vec::new(),
+        });
+    }
     for command in &mut commands {
         if let Some(detail) = host
             .js
@@ -4010,6 +4096,21 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
         }
     }
     commands
+}
+
+fn append_native_invocable_commands(commands: &mut Vec<serde_json::Value>) {
+    for native in native_invocable_commands() {
+        let Some(name) = native.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if commands
+            .iter()
+            .any(|command| command.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        {
+            continue;
+        }
+        commands.push(native);
+    }
 }
 
 fn interactive_extra_autocomplete(parsed: &Args) -> Vec<ExtraAutocompleteProvider> {
@@ -4242,8 +4343,15 @@ fn try_extension_slash(
     agent: &mut Agent,
     session: &mut InteractiveSession,
     name: &str,
+    args: &str,
 ) -> Result<bool, String> {
     let mut host = loaded_extension_host(parsed);
+    if let Some(result) = host.execute_native_command(name, args)? {
+        let message = format!("/{name}: {}", format_extension_command_result(result));
+        session.chrome.status = message.clone();
+        println!("{message}");
+        return Ok(true);
+    }
     let path = host
         .js
         .iter()
@@ -4263,6 +4371,21 @@ fn try_extension_slash(
     session.chrome.status = format!("/{name}");
     println!("{}", session.chrome.status);
     Ok(true)
+}
+
+fn parse_extension_command(input: &str) -> (String, String) {
+    let command = input.trim_start().trim_start_matches('/');
+    let mut parts = command.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or_default().to_string();
+    let args = parts.next().unwrap_or_default().trim().to_string();
+    (name, args)
+}
+
+fn format_extension_command_result(result: serde_json::Value) -> String {
+    match result {
+        serde_json::Value::String(text) => text,
+        value => serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
+    }
 }
 
 fn apply_custom_overlay_result(
@@ -4385,7 +4508,8 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
     apply_discovered_resources(parsed, agent);
     *host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
-    let mut names = parsed.extensions.clone();
+    let mut names = host.native_tool_names();
+    names.extend(parsed.extensions.clone());
     names.extend(extensions::extension_tool_names(&host.manifests));
     for ext in &host.js {
         names.extend(ext.tools.iter().cloned());
@@ -4602,7 +4726,21 @@ fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
     }));
 }
 
+fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>>) {
+    agent.custom_tool_executor = Some(CustomToolExecutor::new(move |cwd, name, args| {
+        let host = host
+            .lock()
+            .map_err(|error| pi_agent::ToolError::Failed(error.to_string()))?;
+        host.execute_js_or_manifest_tool(cwd, name, args)
+    }));
+}
+
 fn loaded_extension_host(parsed: &Args) -> ExtensionHost {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    loaded_extension_host_for_cwd(parsed, &cwd)
+}
+
+fn loaded_extension_host_for_cwd(parsed: &Args, cwd: &Path) -> ExtensionHost {
     let stored = load_settings(&default_agent_dir());
     let extensions = if parsed.no_extensions {
         parsed.extensions.clone()
@@ -4611,11 +4749,7 @@ fn loaded_extension_host(parsed: &Args) -> ExtensionHost {
         extensions.extend(parsed.extensions.clone());
         extensions
     };
-    if extensions.is_empty() {
-        ExtensionHost::default()
-    } else {
-        ExtensionHost::load(&default_agent_dir(), &extensions)
-    }
+    ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd)
 }
 
 fn replay_custom_messages(agent: &Agent, session: &mut InteractiveSession, host: &ExtensionHost) {

@@ -150,6 +150,128 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u64>,
     #[serde(default, rename = "keepRecentTokens")]
     pub keep_recent_tokens: Option<u64>,
+    /// Absolute token count or a percentage string (for example, `"75%"`).
+    /// Kept as JSON so malformed user settings can be ignored without making
+    /// the entire settings file unreadable.
+    #[serde(default)]
+    pub threshold: Option<serde_json::Value>,
+}
+
+/// Parse the persisted threshold shape used by pi's settings file.
+/// Invalid values are deliberately ignored so one malformed optional setting
+/// cannot prevent the rest of the settings file from loading.
+pub fn parse_compaction_threshold(
+    value: &serde_json::Value,
+) -> Option<pi_agent::CompactionThreshold> {
+    if let Some(tokens) = value.as_u64() {
+        return (tokens >= 1_000).then_some(pi_agent::CompactionThreshold::Tokens(tokens));
+    }
+    let text = value.as_str()?.trim();
+    let percent = text.strip_suffix('%')?.trim().parse::<u8>().ok()?;
+    (1..=100)
+        .contains(&percent)
+        .then_some(pi_agent::CompactionThreshold::Percent(percent))
+}
+
+/// Normalize a value entered in the interactive settings UI into the
+/// persisted JSON representation. Separators are accepted for readability,
+/// and `k`/`m` suffixes are converted to absolute token counts.
+pub fn normalize_compaction_threshold_input(text: &str) -> Option<serde_json::Value> {
+    let compact = text
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !matches!(character, ',' | '_' | ' ' | '\t' | '\r' | '\n'))
+        .collect::<String>();
+    if compact.is_empty() {
+        return None;
+    }
+
+    if let Some(value) = compact.strip_suffix('%') {
+        if value.is_empty() || !value.chars().all(|character| character.is_ascii_digit()) {
+            return None;
+        }
+        let percent = value.parse::<u16>().ok()?;
+        return (1..=100)
+            .contains(&percent)
+            .then(|| serde_json::json!(format!("{percent}%")));
+    }
+
+    let (number, multiplier) = if let Some(value) = compact.strip_suffix('k') {
+        (value, 1_000_f64)
+    } else if let Some(value) = compact.strip_suffix('m') {
+        (value, 1_000_000_f64)
+    } else {
+        (compact.as_str(), 1_f64)
+    };
+    if number.is_empty() || number.matches('.').count() > 1 {
+        return None;
+    }
+    if !number
+        .chars()
+        .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        return None;
+    }
+    let scaled = number.parse::<f64>().ok()? * multiplier;
+    if !scaled.is_finite() || scaled < 1_000_f64 || scaled > u64::MAX as f64 {
+        return None;
+    }
+    let tokens = scaled.round() as u64;
+    (tokens >= 1_000).then(|| serde_json::json!(tokens))
+}
+
+/// Persist a validated threshold in a settings value.
+pub fn set_compaction_threshold(settings: &mut Settings, text: &str) -> Result<(), String> {
+    let value = normalize_compaction_threshold_input(text)
+        .ok_or_else(|| format!("invalid compaction threshold: {text}"))?;
+    let compaction = settings.compaction.get_or_insert_with(Default::default);
+    compaction.threshold = Some(value);
+    Ok(())
+}
+
+/// Remove an explicit threshold while preserving other compaction settings.
+pub fn clear_compaction_threshold(settings: &mut Settings) {
+    if let Some(compaction) = settings.compaction.as_mut() {
+        compaction.threshold = None;
+        if compaction.enabled.is_none()
+            && compaction.reserve_tokens.is_none()
+            && compaction.keep_recent_tokens.is_none()
+        {
+            settings.compaction = None;
+        }
+    }
+}
+
+pub fn format_compaction_threshold(threshold: Option<pi_agent::CompactionThreshold>) -> String {
+    match threshold {
+        Some(pi_agent::CompactionThreshold::Percent(percent)) => format!("{percent}%"),
+        Some(pi_agent::CompactionThreshold::Tokens(tokens)) => format_token_count(tokens),
+        None => "default".into(),
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    let digits = tokens.to_string();
+    let first_group = digits.len() % 3;
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    if first_group != 0 {
+        formatted.push_str(&digits[..first_group]);
+    }
+    let start = first_group;
+    for (index, chunk) in digits[start..].as_bytes().chunks(3).enumerate() {
+        if start != 0 || index != 0 {
+            formatted.push(',');
+        }
+        formatted.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+    }
+    formatted
+}
+
+impl CompactionSettings {
+    pub fn compaction_threshold(&self) -> Option<pi_agent::CompactionThreshold> {
+        self.threshold.as_ref().and_then(parse_compaction_threshold)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -608,7 +730,17 @@ impl Settings {
                 .as_ref()
                 .and_then(|settings| settings.keep_recent_tokens)
                 .unwrap_or(pi_agent::DEFAULT_KEEP_RECENT_TOKENS),
+            threshold: self
+                .compaction
+                .as_ref()
+                .and_then(|settings| settings.compaction_threshold()),
         }
+    }
+
+    pub fn compaction_threshold(&self) -> Option<pi_agent::CompactionThreshold> {
+        self.compaction
+            .as_ref()
+            .and_then(CompactionSettings::compaction_threshold)
     }
 
     pub fn retry_enabled(&self) -> bool {
@@ -884,6 +1016,7 @@ pub fn to_interactive_config(
             .unwrap_or_else(|| "streaming".into()),
         enable_analytics: settings.enable_analytics.unwrap_or(false),
         auto_compact: settings.compaction_enabled(),
+        auto_compact_threshold: format_compaction_threshold(settings.compaction_threshold()),
         steering_mode: settings
             .steering_mode
             .clone()
@@ -1031,6 +1164,7 @@ mod tests {
         settings.tree_filter_mode = Some("user-only".into());
         let config = to_interactive_config(&settings, "dark");
         assert!(config.hide_thinking);
+        assert_eq!(config.auto_compact_threshold, "default");
         assert_eq!(config.http_idle_timeout, "disabled");
         assert_eq!(config.default_project_trust, "Never trust");
         assert_eq!(config.steering_mode, "all");
@@ -1044,6 +1178,13 @@ mod tests {
         assert!(ids.contains(&"warnings"));
         assert!(ids.contains(&"model-thinking"));
         assert!(ids.contains(&"theme"));
+        let threshold = list
+            .items
+            .iter()
+            .find(|item| item.id == "autocompact-threshold")
+            .expect("auto-compact threshold setting");
+        assert_eq!(threshold.current_value, "default");
+        assert_eq!(threshold.values, ["default", "90%", "75%", "50%", "25%"]);
     }
 
     #[test]
@@ -1209,6 +1350,66 @@ mod tests {
             Some(value) => std::env::set_var("HTTPS_PROXY", value),
             None => std::env::remove_var("HTTPS_PROXY"),
         }
+    }
+
+    #[test]
+    fn compaction_threshold_parser_accepts_valid_values_and_ignores_invalid_values() {
+        assert_eq!(
+            parse_compaction_threshold(&serde_json::json!(12_000)),
+            Some(pi_agent::CompactionThreshold::Tokens(12_000))
+        );
+        assert_eq!(
+            parse_compaction_threshold(&serde_json::json!("75%")),
+            Some(pi_agent::CompactionThreshold::Percent(75))
+        );
+        for value in [
+            serde_json::json!(999),
+            serde_json::json!("0%"),
+            serde_json::json!("101%"),
+            serde_json::json!("75"),
+            serde_json::json!(-1),
+        ] {
+            assert_eq!(parse_compaction_threshold(&value), None);
+        }
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "compaction": { "threshold": "75%" }
+        }))
+        .expect("settings with threshold");
+        assert_eq!(
+            settings.compaction_settings().threshold,
+            Some(pi_agent::CompactionThreshold::Percent(75))
+        );
+    }
+
+    #[test]
+    fn compaction_threshold_input_normalizes_presets_and_suffixes() {
+        assert_eq!(
+            normalize_compaction_threshold_input("200,000"),
+            Some(serde_json::json!(200_000))
+        );
+        assert_eq!(
+            normalize_compaction_threshold_input("1.5m"),
+            Some(serde_json::json!(1_500_000))
+        );
+        assert_eq!(
+            normalize_compaction_threshold_input(" 60% "),
+            Some(serde_json::json!("60%"))
+        );
+        for value in ["", "banana", "500", "0%", "101%", "-5000"] {
+            assert_eq!(normalize_compaction_threshold_input(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn compaction_threshold_setting_can_be_set_and_cleared() {
+        let mut settings = Settings::default();
+        set_compaction_threshold(&mut settings, "200k").expect("valid threshold");
+        assert_eq!(
+            settings.compaction_settings().threshold,
+            Some(pi_agent::CompactionThreshold::Tokens(200_000))
+        );
+        clear_compaction_threshold(&mut settings);
+        assert_eq!(settings.compaction_settings().threshold, None);
     }
 
     #[test]

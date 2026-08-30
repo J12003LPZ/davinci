@@ -25,11 +25,11 @@ pub use compaction::{
     estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
     format_file_operations, generate_summary_with_usage, get_summarization_failure,
     serialize_conversation, should_compact, CompactionDetails, CompactionResult,
-    CompactionSettings, CutPointResult, FileOperations, SummarizeRequest, SummarizeResponse,
-    Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX,
-    COMPACTION_SUMMARY_SUFFIX, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
-    SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
-    UPDATE_SUMMARIZATION_PROMPT,
+    CompactionSettings, CompactionThreshold, CutPointResult, FileOperations, SummarizeRequest,
+    SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, DEFAULT_KEEP_RECENT_TOKENS,
+    DEFAULT_RESERVE_TOKENS, SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT,
+    TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use context::{load_context_files, ContextFile};
 pub use events::AgentEvent;
@@ -61,6 +61,7 @@ use uuid::Uuid;
 
 type CustomToolFn = dyn Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync;
 type PreToolFn = dyn Fn(&str, &Value) -> Option<String> + Send + Sync;
+type PostToolFn = dyn Fn(&str, &Path, &str, &Value, ToolResult) -> ToolResult + Send + Sync;
 
 /// Blocks a tool call when the hook returns a reason (TS `tool_call` `{ block: true }`).
 #[derive(Clone)]
@@ -69,6 +70,18 @@ pub struct PreToolHook(pub Arc<PreToolFn>);
 impl std::fmt::Debug for PreToolHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PreToolHook")
+    }
+}
+
+/// Transforms a completed tool result before it is emitted and persisted.
+/// Extensions use this for lossless output compression and other middleware
+/// that must run for both built-in and custom tools.
+#[derive(Clone)]
+pub struct PostToolHook(pub Arc<PostToolFn>);
+
+impl std::fmt::Debug for PostToolHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PostToolHook")
     }
 }
 
@@ -145,6 +158,7 @@ pub struct Agent {
     pub tool_execution_mode: ToolExecutionMode,
     pub custom_tool_executor: Option<CustomToolExecutor>,
     pub pre_tool: Option<PreToolHook>,
+    pub post_tool: Option<PostToolHook>,
     pub summarizer: Option<Summarizer>,
     pub block_images: bool,
     pub auto_resize_images: bool,
@@ -156,6 +170,9 @@ pub struct Agent {
     base_system_prompt: String,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
+    /// Context supplied by extensions for the next provider request only.
+    /// These messages never enter the persisted session history.
+    ephemeral_context: Vec<ChatMessage>,
 }
 
 impl Agent {
@@ -191,6 +208,7 @@ impl Agent {
             tool_execution_mode: ToolExecutionMode::Sequential,
             custom_tool_executor: None,
             pre_tool: None,
+            post_tool: None,
             summarizer: None,
             block_images: false,
             auto_resize_images: true,
@@ -202,12 +220,26 @@ impl Agent {
             base_system_prompt: system_prompt,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
+            ephemeral_context: Vec::new(),
         }
     }
 
     /// Restore the base prompt before each extension-aware prompt turn.
     pub fn reset_system_prompt_to_base(&mut self) {
         self.system_prompt = self.base_system_prompt.clone();
+    }
+
+    /// Replace the ephemeral context used for the next provider request.
+    /// Extension-provided context is inserted immediately before the latest
+    /// user message so it supports, rather than follows, the active prompt.
+    pub fn set_ephemeral_context(&mut self, messages: Vec<ChatMessage>) {
+        self.ephemeral_context = messages;
+    }
+
+    /// Remove extension context after a prompt turn (or when a session is
+    /// switched) without touching persisted conversation messages.
+    pub fn clear_ephemeral_context(&mut self) {
+        self.ephemeral_context.clear();
     }
 
     pub fn push_event(&self, events: &mut Vec<AgentEvent>, event: AgentEvent) {
@@ -253,7 +285,16 @@ impl Agent {
     }
 
     pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
-        convert_to_llm_for_provider(&self.messages, self.block_images)
+        if self.ephemeral_context.is_empty() {
+            return convert_to_llm_for_provider(&self.messages, self.block_images);
+        }
+        let mut messages = self.messages.clone();
+        let insertion = messages
+            .iter()
+            .rposition(|message| message.role == "user")
+            .unwrap_or(messages.len());
+        messages.splice(insertion..insertion, self.ephemeral_context.iter().cloned());
+        convert_to_llm_for_provider(&messages, self.block_images)
     }
 
     fn persist_full_message(&mut self, message: &ChatMessage) {
@@ -1030,6 +1071,29 @@ mod tests {
         )));
         agent.abort_retry();
         assert!(agent.retry_aborted);
+    }
+
+    #[test]
+    fn ephemeral_context_precedes_latest_prompt_without_persistence() {
+        let mut agent = Agent::new("x");
+        agent.prompt("active question");
+        agent.set_ephemeral_context(vec![ChatMessage::text("custom", "supporting memory")]);
+
+        let provider_messages = agent.messages_for_provider();
+        assert_eq!(provider_messages.len(), 2);
+        assert_eq!(provider_messages[0].role, "user");
+        assert_eq!(
+            content_text(&provider_messages[0].content),
+            "supporting memory"
+        );
+        assert_eq!(
+            content_text(&provider_messages[1].content),
+            "active question"
+        );
+        assert_eq!(agent.messages.len(), 1);
+
+        agent.clear_ephemeral_context();
+        assert_eq!(agent.messages_for_provider().len(), 1);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use crate::extensions::{discover_extensions, ExtensionManifest};
 use crate::js_host::{
@@ -9,6 +10,7 @@ use crate::js_host::{
     stop_persistent_js_extension, JsAutocompleteProvider, JsExtensionResult, JsRegisteredCommand,
     JsRegisteredProvider, JsRegisteredTool,
 };
+use crate::native_extensions::{NativeExtensionHost, NATIVE_COMMANDS, NATIVE_TOOLS};
 use pi_tui::Keybindings;
 
 /// Extension event bus matching `vendor/pi/packages/coding-agent/src/core/extensions`.
@@ -170,12 +172,18 @@ pub struct ExtensionHost {
     pub editor_text: String,
     pub runtime_system_prompt: String,
     pub unregistered_providers: Vec<String>,
+    pub native: Arc<Mutex<NativeExtensionHost>>,
     before_agent_start_messages: Vec<Value>,
     before_agent_start_system_prompt: Option<String>,
 }
 
 impl ExtensionHost {
     pub fn load(agent_dir: &Path, names: &[String]) -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        Self::load_with_cwd(agent_dir, names, &cwd)
+    }
+
+    pub fn load_with_cwd(agent_dir: &Path, names: &[String], cwd: &Path) -> Self {
         let manifests = discover_extensions(agent_dir, names);
         let mut host = Self {
             events: Vec::new(),
@@ -196,6 +204,11 @@ impl ExtensionHost {
             editor_text: String::new(),
             runtime_system_prompt: String::new(),
             unregistered_providers: Vec::new(),
+            native: Arc::new(Mutex::new(NativeExtensionHost::new_with_agent_dir(
+                "runtime",
+                cwd,
+                Some(agent_dir),
+            ))),
             before_agent_start_messages: Vec::new(),
             before_agent_start_system_prompt: None,
         };
@@ -324,7 +337,103 @@ impl ExtensionHost {
 
     pub fn emit(&mut self, event: ExtensionEvent) {
         self.dispatch_js(&event);
+        if let Ok(mut native) = self.native.lock() {
+            match event {
+                ExtensionEvent::SessionStart => native.session_start(),
+                ExtensionEvent::SessionBeforeCompact | ExtensionEvent::SessionCompact => {
+                    native.session_compact()
+                }
+                _ => {}
+            }
+        }
         self.events.push(event);
+    }
+
+    pub fn native_tool_names(&self) -> Vec<String> {
+        NATIVE_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    pub fn native_command_names(&self) -> Vec<String> {
+        NATIVE_COMMANDS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    pub fn native_tool_specs(&self) -> Vec<pi_ai::ToolSpec> {
+        NativeExtensionHost::tool_specs()
+    }
+
+    pub fn native_before_tool(&self, name: &str, args: &Value, state_hash: &str) -> Option<String> {
+        self.native
+            .lock()
+            .ok()
+            .and_then(|mut native| native.before_tool(name, args, state_hash))
+    }
+
+    pub fn native_after_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        result: pi_agent::ToolResult,
+    ) -> pi_agent::ToolResult {
+        match self.native.lock() {
+            Ok(mut native) => native.after_tool(name, args, result),
+            Err(_) => result,
+        }
+    }
+
+    /// Retrieve a bounded, untrusted memory block for the active prompt.
+    /// Retrieval is deliberately best-effort: unavailable local/remote
+    /// indexes must never make a normal prompt fail.
+    pub fn native_memory_inject(&self, query: &str) -> Option<String> {
+        self.native
+            .lock()
+            .ok()
+            .and_then(|native| native.memory_inject(query))
+    }
+
+    /// Index the current session snapshot after a settled turn. Errors are
+    /// returned to the caller so the runtime can record diagnostics without
+    /// surfacing them as provider/tool failures.
+    pub fn native_index_messages(
+        &self,
+        messages: &[crate::native_extensions::MemoryMessage],
+    ) -> Result<usize, pi_agent::ToolError> {
+        self.native
+            .lock()
+            .map_err(|err| pi_agent::ToolError::Failed(err.to_string()))?
+            .memory_index_messages(messages)
+    }
+
+    pub fn execute_native_tool(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+    ) -> Option<Result<pi_agent::ToolResult, pi_agent::ToolError>> {
+        if !NATIVE_TOOLS.iter().any(|tool| *tool == name) {
+            return None;
+        }
+        Some(
+            self.native
+                .lock()
+                .map_err(|err| pi_agent::ToolError::Failed(err.to_string()))
+                .and_then(|mut native| native.execute_tool(cwd, name, args)),
+        )
+    }
+
+    pub fn execute_native_command(&self, name: &str, args: &str) -> Result<Option<Value>, String> {
+        if !NATIVE_COMMANDS.iter().any(|command| *command == name) {
+            return Ok(None);
+        }
+        self.native
+            .lock()
+            .map_err(|err| err.to_string())?
+            .command(name, args)
     }
 
     pub fn emit_before_agent_start(&mut self, prompt: &str, images: &[pi_ai::MessageContent]) {
@@ -743,6 +852,11 @@ impl ExtensionHost {
     }
 
     pub fn execute_named_tool(&self, name: &str, cwd: &Path) -> Option<Result<String, String>> {
+        // Native tools are executed by Agent's custom-tool executor with the
+        // model-supplied arguments. This helper is called from the event
+        // notification path, where arguments are intentionally unavailable;
+        // invoking a native tool here would run it a second time with an empty
+        // object (and could duplicate stateful scans or mutations).
         for ext in &self.js {
             if ext.tools.iter().any(|tool| tool == name) {
                 return Some(
@@ -775,6 +889,9 @@ impl ExtensionHost {
         name: &str,
         args: &Value,
     ) -> Result<pi_agent::ToolResult, pi_agent::ToolError> {
+        if let Some(result) = self.execute_native_tool(cwd, name, args) {
+            return result;
+        }
         for ext in &self.js {
             if ext.tools.iter().any(|tool| tool == name) {
                 return execute_js_tool(Path::new(&ext.path), name, args, cwd);
@@ -1209,6 +1326,14 @@ mod tests {
         };
 
         assert_eq!(host.last_user_bash_result(), None);
+    }
+
+    #[test]
+    fn event_notification_helper_does_not_execute_native_tools_without_arguments() {
+        let host = ExtensionHost::default();
+        assert!(host
+            .execute_named_tool("memory_search", Path::new("."))
+            .is_none());
     }
 
     #[test]

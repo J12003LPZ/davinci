@@ -483,7 +483,7 @@ impl Agent {
                 args: args.clone(),
             },
         );
-        let result =
+        let mut result =
             if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
                 crate::ToolResult {
                     content: reason,
@@ -524,6 +524,9 @@ impl Agent {
                     },
                 }
             };
+        if let Some(hook) = &self.post_tool {
+            result = (hook.0)(id, cwd, name, args, result);
+        }
         let mut details = result.details.clone();
         for partial in crate::ToolResult::take_updates(&mut details) {
             self.push_event(

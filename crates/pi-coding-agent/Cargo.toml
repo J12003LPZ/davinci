@@ -36,6 +36,8 @@ ureq.workspace = true
 url.workspace = true
 image.workspace = true
 signal-hook.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

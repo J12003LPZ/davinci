@@ -24,10 +24,18 @@ pub const BRANCH_SUMMARY_PREFIX: &str =
 pub const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionThreshold {
+    Tokens(u64),
+    Percent(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionSettings {
     pub enabled: bool,
     pub reserve_tokens: u64,
     pub keep_recent_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<CompactionThreshold>,
 }
 
 impl Default for CompactionSettings {
@@ -36,6 +44,7 @@ impl Default for CompactionSettings {
             enabled: true,
             reserve_tokens: DEFAULT_RESERVE_TOKENS,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
+            threshold: None,
         }
     }
 }
@@ -155,7 +164,8 @@ pub fn estimate_context_tokens(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(estimate_tokens).sum()
 }
 
-/// TS `shouldCompact`: enabled and contextTokens > contextWindow - reserveTokens.
+/// TS `shouldCompact`: apply an optional absolute or percentage threshold while
+/// retaining enough room for the recent-turn and reserved-token budgets.
 pub fn should_compact(
     context_tokens: u64,
     context_window: u64,
@@ -164,7 +174,22 @@ pub fn should_compact(
     if !settings.enabled {
         return false;
     }
-    (context_tokens as i128) > (context_window as i128) - (settings.reserve_tokens as i128)
+    let capacity_threshold = context_window.saturating_sub(settings.reserve_tokens);
+    let requested_threshold = match settings.threshold {
+        Some(CompactionThreshold::Tokens(tokens)) => tokens,
+        Some(CompactionThreshold::Percent(percent)) => {
+            let scaled = (u128::from(context_window) * u128::from(percent)) / 100;
+            scaled.min(u128::from(u64::MAX)) as u64
+        }
+        None => capacity_threshold,
+    };
+    let minimum_threshold = settings
+        .keep_recent_tokens
+        .saturating_add(settings.reserve_tokens);
+    let effective_threshold = requested_threshold
+        .max(minimum_threshold)
+        .min(capacity_threshold);
+    context_tokens > effective_threshold
 }
 
 fn is_cut_point_message(message: &ChatMessage) -> bool {
@@ -859,6 +884,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 10,
             keep_recent_tokens: 1,
+            threshold: None,
         };
         assert!(should_compact(11, 20, &settings));
         assert!(!should_compact(10, 20, &settings));
@@ -867,6 +893,7 @@ mod tests {
             20,
             &CompactionSettings {
                 enabled: false,
+                threshold: None,
                 ..settings
             }
         ));
@@ -877,10 +904,32 @@ mod tests {
                 enabled: true,
                 reserve_tokens: 20,
                 keep_recent_tokens: 1,
+                threshold: None,
             }
         ));
         assert_eq!(calculate_context_tokens(12, 1, 2, 3, 4), 12);
         assert_eq!(calculate_context_tokens(0, 1, 2, 3, 4), 10);
+    }
+
+    #[test]
+    fn explicit_compaction_threshold_supports_tokens_and_percent() {
+        let token_threshold = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 10,
+            keep_recent_tokens: 5,
+            threshold: Some(CompactionThreshold::Tokens(40)),
+        };
+        assert!(!should_compact(40, 100, &token_threshold));
+        assert!(should_compact(41, 100, &token_threshold));
+
+        let percent_threshold = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 10,
+            keep_recent_tokens: 5,
+            threshold: Some(CompactionThreshold::Percent(25)),
+        };
+        assert!(!should_compact(25, 100, &percent_threshold));
+        assert!(should_compact(26, 100, &percent_threshold));
     }
 
     #[test]
