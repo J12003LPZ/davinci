@@ -3,6 +3,7 @@ mod auth_cmd;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
+mod davinci_session;
 mod davinci_sources;
 #[cfg(unix)]
 mod experimental;
@@ -221,10 +222,10 @@ fn apply_offline_mode(raw: &[String]) {
     }
 }
 
-/// `pi --davinci` opens the davinci TUI (`docs/ui/design.md`). It is behind a
-/// flag while the screens are being built; it becomes the interactive UI once
-/// every surface is wired to real state, and the old chrome is deleted then.
-fn run_davinci(raw: &[String]) -> Result<i32, String> {
+/// `pi --davinci --screen <id>` renders one mockup screen against the fixtures
+/// in `docs/ui`, so each can be matched against `Pi TUI Mockups.dc.html` in a
+/// real terminal. The live shell is `davinci_session::run`.
+fn run_davinci_screens(raw: &[String]) -> Result<i32, String> {
     use pi_tui::davinci;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -274,8 +275,14 @@ fn main() {
 
 fn run(raw: Vec<String>) -> Result<i32, String> {
     apply_offline_mode(&raw);
+    // `--davinci --screen <id>` renders a mockup screen against fixtures for
+    // comparison with docs/ui; `--davinci` alone opens the real shell, which
+    // needs the full startup path (auth, trust, migrations) first.
     if raw.iter().any(|arg| arg == "--davinci") {
-        return run_davinci(&raw);
+        if raw.iter().any(|arg| arg == "--screen") {
+            return run_davinci_screens(&raw);
+        }
+        std::env::set_var("PI_DAVINCI", "1");
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     apply_http_proxy_settings(
@@ -2705,6 +2712,11 @@ fn run_interactive(
         return Ok(code);
     }
     install_mode_shutdown_watchers(parsed);
+    if std::env::var("PI_DAVINCI").is_ok_and(|value| value != "0") {
+        let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        return davinci_session::run(parsed, agent, &raw, host);
+    }
     let theme = builtin_themes()
         .into_iter()
         .find(|theme| parsed.use_theme.as_deref() == Some(theme.name.as_str()))
