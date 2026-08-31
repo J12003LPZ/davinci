@@ -13,7 +13,10 @@
 use std::path::Path;
 use std::time::Instant;
 
-use pi_tui::davinci::model::{Model, PlanStep, RecallHit, RecallMeta};
+use pi_agent::Agent;
+use pi_tui::davinci::model::{
+    BudgetMeta, BudgetRow, Model, PlanStep, Proposal, RecallHit, RecallMeta,
+};
 use pi_tui::davinci::theme::State;
 use pi_tui::davinci::views::disegno::roman;
 
@@ -181,12 +184,143 @@ fn thousands(value: u64) -> String {
     pi_tui::davinci::views::chrome::thousands(value)
 }
 
+/// The token governor (`2c`): where this session's context has gone, what it
+/// costs, and — when the window is nearly full — what to do about it.
+///
+/// The "roles" are the parts of the context, because that is what a context
+/// window is actually divided between. Every number states its unit and its
+/// cap (design.md §9).
+pub fn budget(agent: &Agent, window: u64) -> (Vec<BudgetRow>, BudgetMeta, Option<Proposal>) {
+    let window = window.max(1);
+    // Four characters to a token, the same estimate the compactor uses, so
+    // the two never disagree about how full the window is.
+    let text_tokens = |text: &str| (text.len() as u64).div_ceil(4);
+    let instructions = text_tokens(&agent.system_prompt)
+        + agent
+            .context_files
+            .iter()
+            .map(|file| text_tokens(&file.body))
+            .sum::<u64>();
+
+    let mut asked = 0;
+    let mut replied = 0;
+    let mut tools = 0;
+    for message in &agent.messages {
+        let tokens = pi_agent::estimate_context_tokens(std::slice::from_ref(message));
+        match message.role.as_str() {
+            "user" => asked += tokens,
+            "assistant" => replied += tokens,
+            _ => tools += tokens,
+        }
+    }
+    let in_use = instructions + asked + replied + tools;
+
+    // The cap a row is measured against is the window, not the largest row:
+    // a bar that renormalises hides how much room is left.
+    let row = |role: &str, tokens: u64, note: &str| {
+        let fraction = tokens as f64 / window as f64;
+        BudgetRow::new(
+            role,
+            &thousands(tokens),
+            fraction.min(1.0),
+            note,
+            fraction > 0.5,
+        )
+    };
+    let rows = vec![
+        row(
+            "instructions",
+            instructions,
+            "system prompt and context files",
+        ),
+        row("asked", asked, "what you sent"),
+        row("replied", replied, "what the model sent back"),
+        row("tool output", tools, "what the tools returned"),
+    ];
+
+    let turns = agent
+        .messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count()
+        .max(1) as u64;
+    let meta = BudgetMeta {
+        policy: compaction_policy(agent),
+        in_use: thousands(in_use),
+        window: thousands(window),
+        headroom: thousands(window.saturating_sub(in_use)),
+        in_use_fraction: (in_use as f64 / window as f64).min(1.0),
+        rate: format!("{}/turn", thousands(in_use / turns)),
+        session_spend: session_spend(agent),
+        // Nothing in this workspace tracks spend across sessions, so the
+        // governor says so rather than inventing a cap to measure against.
+        daily_cap: "not set".into(),
+        daily_fraction: 0.0,
+        history: format!("{turns} turns this session"),
+    };
+
+    (rows, meta, compaction_proposal(agent, in_use, window))
+}
+
+fn compaction_policy(agent: &Agent) -> String {
+    let settings = crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+    if settings.auto_compact.unwrap_or(true) {
+        "auto-compact on".into()
+    } else {
+        "auto-compact off".into()
+    }
+}
+
+fn session_spend(agent: &Agent) -> String {
+    let Some(store) = agent.session.as_ref() else {
+        return "$0.00".into();
+    };
+    let stats = pi_session::session_usage_stats(&store.entries);
+    format!("${:.2}", stats.cost)
+}
+
+/// A proposal is only worth making once the window is genuinely tight, and it
+/// must always say what it recovers, what it keeps, what it costs and whether
+/// it can be undone (design.md §6).
+fn compaction_proposal(agent: &Agent, in_use: u64, window: u64) -> Option<Proposal> {
+    if (in_use as f64) < 0.7 * window as f64 {
+        return None;
+    }
+    // Compaction summarises everything but the recent turns; what it recovers
+    // is what those older messages currently cost.
+    let keep = 6usize;
+    let older = agent.messages.len().saturating_sub(keep);
+    let recovers = pi_agent::estimate_context_tokens(&agent.messages[..older]);
+    if recovers == 0 {
+        return None;
+    }
+    Some(Proposal {
+        summary: format!(
+            "the window is {}% full; compacting would summarise the older turns",
+            ((in_use as f64 / window as f64) * 100.0) as u32
+        ),
+        recovers: format!("{} tokens", thousands(recovers)),
+        keeps: format!("the last {keep} messages verbatim"),
+        cost: "one summarisation call".into(),
+        // The session file keeps every original entry, so nothing is lost.
+        reversible: true,
+        actions: vec![
+            ("/compact".into(), "summarise now".into()),
+            ("esc".into(), "leave it".into()),
+        ],
+    })
+}
+
 /// Fill the surfaces that have a source, leaving the ones that do not alone.
-pub fn dress_from_extensions(model: &mut Model, cwd: &Path) {
+pub fn dress_from_extensions(model: &mut Model, cwd: &Path, agent: &Agent) {
     let plan = plan(cwd);
     if !plan.is_empty() {
         model.plan = plan;
     }
+    let (rows, meta, proposal) = budget(agent, agent.context_window);
+    model.budget = rows;
+    model.budget_meta = meta;
+    model.proposal = proposal;
 }
 
 #[cfg(test)]
@@ -285,6 +419,74 @@ mod tests {
 
         assert_eq!(plan[2].numeral, "III");
         assert_eq!(plan[2].state, State::Queued);
+    }
+
+    #[test]
+    fn the_governor_measures_every_row_against_the_window_not_the_largest_row() {
+        let mut agent = pi_agent::Agent::new("a".repeat(400).as_str());
+        agent.messages.push(user("b".repeat(800).as_str()));
+        agent.messages.push(assistant("c".repeat(1200).as_str()));
+
+        let (rows, meta, proposal) = budget(&agent, 10_000);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].role, "instructions");
+        assert_eq!(rows[0].tokens, "100");
+        assert_eq!(rows[1].tokens, "200");
+        assert_eq!(rows[3].tokens, "0", "no tools ran, so the row reads zero");
+
+        // Each fraction is of the window, so they sum to the meter total.
+        let summed: f64 = rows.iter().map(|row| row.fraction).sum();
+        assert!((summed - meta.in_use_fraction).abs() < 1e-9, "{summed}");
+
+        assert_eq!(meta.window, "10k");
+        assert_eq!(meta.daily_cap, "not set", "no source, so it says so");
+        assert!(meta.rate.ends_with("/turn"), "{}", meta.rate);
+        // Well under the window: nothing to propose.
+        assert!(proposal.is_none());
+    }
+
+    #[test]
+    fn a_nearly_full_window_gets_a_proposal_that_states_its_terms() {
+        let mut agent = pi_agent::Agent::new("system");
+        for _ in 0..10 {
+            agent.messages.push(user("x".repeat(400).as_str()));
+            agent.messages.push(assistant("y".repeat(400).as_str()));
+        }
+        let (_, meta, proposal) = budget(&agent, 2_500);
+        assert!(meta.in_use_fraction > 0.7, "{}", meta.in_use_fraction);
+
+        let proposal = proposal.expect("a full window earns a proposal");
+        // design.md §6: it always says what it recovers, keeps, costs, and
+        // whether it can be undone.
+        assert!(
+            proposal.recovers.ends_with("tokens"),
+            "{}",
+            proposal.recovers
+        );
+        assert!(proposal.keeps.contains("last 6"), "{}", proposal.keeps);
+        assert!(!proposal.cost.is_empty());
+        assert!(proposal.reversible, "the session file keeps the originals");
+        assert_eq!(proposal.actions.len(), 2);
+        assert_eq!(proposal.actions[0].0, "/compact");
+    }
+
+    fn user(text: &str) -> pi_ai::ChatMessage {
+        message("user", text)
+    }
+
+    fn assistant(text: &str) -> pi_ai::ChatMessage {
+        message("assistant", text)
+    }
+
+    fn message(role: &str, text: &str) -> pi_ai::ChatMessage {
+        pi_ai::ChatMessage {
+            role: role.into(),
+            content: vec![pi_ai::MessageContent::Text { text: text.into() }],
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+            extra: Default::default(),
+        }
     }
 
     #[test]

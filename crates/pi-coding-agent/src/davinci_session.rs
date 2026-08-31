@@ -1399,7 +1399,7 @@ impl Shell<'_> {
     fn redress(&mut self) {
         refresh_context(self.model, self.agent);
         crate::davinci_sources::dress_from_workspace(self.model, self.cwd, self.session_dir);
-        crate::davinci_surfaces::dress_from_extensions(self.model, self.cwd);
+        crate::davinci_surfaces::dress_from_extensions(self.model, self.cwd, self.agent);
         self.model.corpus = corpus(self.agent, &self.model.sessions);
         self.model.corpus_total = self.model.corpus.len();
     }
