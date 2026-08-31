@@ -167,6 +167,9 @@ pub struct Agent {
     pub install_telemetry: bool,
     pub reload_count: u32,
     pub event_sink: Option<EventSink>,
+    /// Cross-thread interrupt: set from the UI thread while `run_loop` runs
+    /// on a worker. Checked at every loop step alongside `aborted`.
+    pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     base_system_prompt: String,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -217,6 +220,7 @@ impl Agent {
             install_telemetry: true,
             reload_count: 0,
             event_sink: None,
+            abort_signal: None,
             base_system_prompt: system_prompt,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -566,6 +570,15 @@ impl Agent {
 
     pub fn abort(&mut self) {
         self.aborted = true;
+    }
+
+    /// True when either the local flag or the cross-thread signal fired.
+    pub fn abort_requested(&self) -> bool {
+        self.aborted
+            || self
+                .abort_signal
+                .as_ref()
+                .is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub fn load_from_session(&mut self, session: JsonlSession) {

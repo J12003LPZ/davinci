@@ -77,7 +77,7 @@ impl Agent {
         }
 
         loop {
-            if self.aborted {
+            if self.abort_requested() {
                 self.push_event(
                     &mut events,
                     AgentEvent::AgentEnd {
@@ -233,7 +233,7 @@ impl Agent {
                     match self.tool_execution_mode {
                         ToolExecutionMode::Sequential => {
                             for (id, name, args) in tool_calls {
-                                if self.aborted {
+                                if self.abort_requested() {
                                     break;
                                 }
                                 let result = self.execute_one(&cwd, &id, &name, &args, &mut events);
@@ -258,7 +258,7 @@ impl Agent {
                         ToolExecutionMode::Parallel => {
                             let prepared: Vec<_> = tool_calls;
                             for (id, name, args) in prepared {
-                                if self.aborted {
+                                if self.abort_requested() {
                                     break;
                                 }
                                 let result = self.execute_one(&cwd, &id, &name, &args, &mut events);
@@ -292,7 +292,7 @@ impl Agent {
                 },
             );
 
-            if had_tools && !self.aborted {
+            if had_tools && !self.abort_requested() {
                 self.push_event(&mut events, AgentEvent::TurnStart);
                 continue;
             }
@@ -368,7 +368,7 @@ impl Agent {
         let mut last_error = None;
         let mut scheduled_attempt = 0_u32;
         for attempt in 0..attempts {
-            if self.aborted || self.retry_aborted {
+            if self.abort_requested() || self.retry_aborted {
                 if scheduled_attempt > 0 {
                     self.push_event(
                         events,
