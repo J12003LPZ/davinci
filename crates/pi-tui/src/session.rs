@@ -158,6 +158,8 @@ pub struct InteractiveSession {
     pub last_autocomplete_debounce_ms: u64,
     pub cwd: PathBuf,
     pub login_providers: Vec<String>,
+    /// Catalog models without credentials, shown dimmed in the model picker.
+    pub locked_model_items: Vec<ModelSelectorItem>,
     pub login_auth_options: Vec<AuthSelectorProvider>,
     pub login_auth_type_labels: Option<(String, String)>,
     pub auth_selector_logout: bool,
@@ -275,6 +277,7 @@ impl InteractiveSession {
             last_autocomplete_debounce_ms: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             login_providers: Vec::new(),
+            locked_model_items: Vec::new(),
             login_auth_options: Vec::new(),
             login_auth_type_labels: None,
             auth_selector_logout: false,
@@ -391,7 +394,8 @@ impl InteractiveSession {
                 self.default_model.clone(),
                 scoped,
             )
-            .with_theme(self.chrome.theme.clone()),
+            .with_theme(self.chrome.theme.clone())
+            .with_locked_models(self.locked_model_items.clone()),
         );
         self.chrome.status = "Select model".into();
     }

@@ -53,6 +53,9 @@ pub struct ModelSelector {
     theme: Theme,
     all_models: Vec<ModelSelectorItem>,
     scoped_models: Vec<ModelSelectorItem>,
+    /// Catalog models whose provider has no credentials yet: listed dimmed
+    /// with a `/login` hint so every model stays discoverable.
+    locked_models: Vec<ModelSelectorItem>,
 }
 
 impl ModelSelector {
@@ -79,6 +82,7 @@ impl ModelSelector {
             theme: Theme::default(),
             all_models: models,
             scoped_models,
+            locked_models: Vec::new(),
         };
         selector.sort_models();
         selector.selected = selector.current_index().unwrap_or(0);
@@ -106,6 +110,19 @@ impl ModelSelector {
     pub fn with_theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
         self
+    }
+
+    pub fn with_locked_models(mut self, mut locked: Vec<ModelSelectorItem>) -> Self {
+        let known: std::collections::BTreeSet<String> =
+            self.all_models.iter().map(ModelSelectorItem::key).collect();
+        locked.retain(|item| !known.contains(&item.key()));
+        locked.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.id.cmp(&b.id)));
+        self.locked_models = locked;
+        self
+    }
+
+    pub fn is_locked(&self, key: &str) -> bool {
+        self.locked_models.iter().any(|item| item.key() == key)
     }
 
     pub fn set_refresh_status(&mut self, message: Option<String>, success: bool) {
@@ -194,6 +211,27 @@ impl ModelSelector {
     }
 
     fn filtered(&self) -> Vec<ModelSelectorItem> {
+        let mut out = self.filtered_available();
+        if self.scope == ModelScope::All || self.scoped_models.is_empty() {
+            out.extend(self.filtered_locked());
+        }
+        out
+    }
+
+    fn filtered_locked(&self) -> Vec<ModelSelectorItem> {
+        if self.search.is_empty() {
+            return self.locked_models.clone();
+        }
+        self.locked_models
+            .iter()
+            .filter(|item| {
+                fuzzy_match(&self.search, &Self::get_model_selector_search_text(item)).matches
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn filtered_available(&self) -> Vec<ModelSelectorItem> {
         let active = self.active_models();
         if self.search.is_empty() {
             return active.to_vec();
@@ -264,7 +302,21 @@ impl ModelSelector {
 impl Component for ModelSelector {
     fn render(&self, width: usize) -> Vec<String> {
         let mut lines = vec![String::new()];
-        if self.scoped_models.is_empty() {
+        lines.push(format!(
+            "{} {} {}",
+            self.theme.fg("secondary", "COGITATOR"),
+            self.theme.fg("border", "·"),
+            self.theme.fg("muted", "MODEL")
+        ));
+        if !self.locked_models.is_empty() {
+            lines.push(self.theme.fg(
+                "muted",
+                &format!(
+                    "{} more models need credentials; they are listed dimmed. Enter on one shows its /login.",
+                    self.locked_models.len()
+                ),
+            ));
+        } else if self.scoped_models.is_empty() {
             lines.push(self.theme.fg(
                 "warning",
                 "Only showing models from configured providers. Use /login to add providers.",
@@ -330,10 +382,19 @@ impl Component for ModelSelector {
             } else {
                 String::new()
             };
-            lines.push(truncate(
-                &format!("{prefix}{id} {provider_badge}{default_badge}{check}"),
-                width,
-            ));
+            let locked = self.is_locked(&item.key());
+            let line = if locked {
+                format!(
+                    "{prefix}{} {}{}",
+                    self.theme.fg("dim", &item.id),
+                    self.theme.fg("dim", &format!("[{}]", item.provider)),
+                    self.theme
+                        .fg("border", &format!(" · /login {}", item.provider)),
+                )
+            } else {
+                format!("{prefix}{id} {provider_badge}{default_badge}{check}")
+            };
+            lines.push(truncate(&line, width));
         }
         if start > 0 || end < filtered.len() {
             lines.push(self.theme.fg(
@@ -407,21 +468,10 @@ fn is_default_search(query: &str) -> bool {
 }
 
 fn truncate(line: &str, width: usize) -> String {
-    if crate::render::visible_width(line) <= width {
+    if crate::render::visible_width_stripped(line) <= width {
         line.to_string()
     } else {
-        let mut out = String::new();
-        for ch in line.chars() {
-            if crate::render::visible_width(&out)
-                + unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1)
-                > width.saturating_sub(1)
-            {
-                break;
-            }
-            out.push(ch);
-        }
-        out.push('…');
-        out
+        crate::ansi::truncate_to_width(line, width, "…", false)
     }
 }
 
@@ -461,6 +511,15 @@ mod tests {
 
     #[test]
     fn sorts_current_then_default_then_provider() {
+        // This asserts on colour, and sibling tests in this binary set
+        // NO_COLOR process-wide. Hold the lock across the render, not just
+        // the assertions, or the rows are painted with colour already off.
+        let _guard = crate::themes::NO_COLOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var("NO_COLOR").ok();
+        std::env::remove_var("NO_COLOR");
+
         let mut selector = ModelSelector::new(
             items(),
             Some("google/gemini".into()),
@@ -479,10 +538,23 @@ mod tests {
             .iter()
             .any(|line| line.contains("Enter to select · Ctrl+S to set as default")));
         assert!(lines.iter().any(|line| line.contains("Model Name:")));
-        assert!(lines.iter().any(|line| line.contains("\x1b[33m")));
-        assert!(lines.iter().any(|line| line.contains("\x1b[36m")));
-        assert!(lines.iter().any(|line| line.contains("\x1b[32m")));
-        assert!(lines.iter().any(|line| line.contains("\x1b[2m")));
+        // Role colors present: warning, accent (copper), success, muted.
+        let joined = lines.join("\n");
+        for role in ["warning", "accent", "success", "muted"] {
+            let colored = selector.theme.fg(role, "probe");
+            let code = colored
+                .strip_suffix("probe\x1b[39m")
+                .or_else(|| colored.strip_suffix("probe\x1b[22m"))
+                .unwrap_or("");
+            assert!(
+                !code.is_empty() && joined.contains(code),
+                "missing {role} color {code:?}"
+            );
+        }
+
+        if let Some(value) = previous {
+            std::env::set_var("NO_COLOR", value);
+        }
     }
 
     #[test]
