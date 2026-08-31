@@ -13,7 +13,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -92,6 +92,13 @@ impl Session {
 
     pub fn keyboard(&self) -> Keyboard {
         self.keyboard
+    }
+
+    /// Name the window. The session in hand and the folder it is in belong in
+    /// the tab strip, where they are legible with the terminal in the
+    /// background.
+    pub fn set_title(&mut self, title: &str) -> io::Result<()> {
+        execute!(io::stdout(), SetTitle(title))
     }
 
     pub fn size(&self) -> io::Result<(u16, u16)> {

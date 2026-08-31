@@ -500,6 +500,10 @@ pub enum Question {
     Thinking,
     /// Which stored credential to remove.
     Logout { providers: Vec<String> },
+    /// The one thing first-run has to ask. The old setup also asked for a
+    /// theme; davinci has one palette, negotiated from the terminal rather
+    /// than chosen (design.md §2), so only the analytics question remains.
+    FirstRun,
 }
 
 impl Question {
@@ -544,6 +548,16 @@ impl Question {
                         )
                     })
                     .collect(),
+            },
+            Question::FirstRun => Ask {
+                title: "SALVE".into(),
+                name: "WELCOME".into(),
+                key: "first run".into(),
+                note: "anonymous usage data helps pi improve; it is never required".into(),
+                items: vec![
+                    PickerItem::new("share anonymous usage data", "recommended"),
+                    PickerItem::new("keep it to this machine", ""),
+                ],
             },
             Question::Logout { providers } => Ask {
                 title: "CLAVES".into(),
@@ -858,6 +872,7 @@ pub fn run(
     agent: &mut Agent,
     raw: &[String],
     host: Arc<Mutex<ExtensionHost>>,
+    migrated_auth_providers: &[String],
 ) -> Result<i32, String> {
     use pi_tui::davinci::app::{self, Flow};
     use pi_tui::davinci::runtime::Session;
@@ -891,7 +906,35 @@ pub fn run(
         .unwrap_or(0);
     refresh_context(&mut model, agent);
 
+    // Everything the old chrome printed before the first prompt: extension
+    // startup events, notices, the trust warning, the changelog, the resource
+    // listing. The transcript is the only place a davinci shell can say any of
+    // it (design.md §6).
+    {
+        let mut host = host.lock().map_err(|err| err.to_string())?;
+        host.runtime_flag_values = crate::flag_values_json(parsed);
+        host.emit(crate::extension_host::ExtensionEvent::ResourcesDiscover {
+            cwd: cwd.display().to_string(),
+            reason: "startup".into(),
+        });
+        host.emit(crate::extension_host::ExtensionEvent::SessionStart);
+    }
+    crate::start_catalog_refresh_async(parsed);
+    for entry in opening_block(parsed, agent, migrated_auth_providers) {
+        model.transcript.push(entry);
+    }
+
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    terminal
+        .set_title(&crate::format_terminal_title(
+            agent
+                .session
+                .as_ref()
+                .and_then(|store| store.display_name())
+                .as_deref(),
+            &cwd,
+        ))
+        .map_err(|err| err.to_string())?;
     let (width, height) = terminal.size().map_err(|err| err.to_string())?;
     model.width = width;
     model.height = height;
@@ -901,6 +944,45 @@ pub fn run(
     // here rather than in the model because only this module knows what the
     // rows mean.
     let mut pending: Option<Question> = None;
+    if crate::settings::should_run_first_time_setup(&crate::settings::settings_path(
+        &crate::default_agent_dir(),
+    )) {
+        pending = Some(Question::FirstRun);
+        model.ask = Question::FirstRun.ask(agent);
+        model.overlay = Some(Overlay::Ask);
+    }
+
+    // `pi "do the thing"` and `--file` open straight into a turn rather than
+    // into an empty composer.
+    let stored = crate::settings::load_merged_settings(&crate::default_agent_dir(), &cwd);
+    let prepared = crate::file_processor::prepare_initial_message(
+        &parsed.messages,
+        &parsed.file_args,
+        None,
+        &cwd,
+        stored.image_auto_resize(),
+    )?;
+    let mut queued: Vec<String> = Vec::new();
+    if let Some(text) = prepared.text.clone() {
+        let expanded = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
+        agent.prompt_with(&expanded, &prepared.images);
+        if let Err(err) = run_turn(parsed, agent, &mut model, &mut terminal, host.clone()) {
+            return Err(err.to_string());
+        }
+        refresh_context(&mut model, agent);
+        crate::davinci_sources::dress_from_workspace(&mut model, &cwd, &session_dir);
+    }
+    queued.extend(prepared.remaining_messages.iter().cloned());
+    for text in queued {
+        let expanded = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
+        agent.prompt(&expanded);
+        if let Err(err) = run_turn(parsed, agent, &mut model, &mut terminal, host.clone()) {
+            return Err(err.to_string());
+        }
+        refresh_context(&mut model, agent);
+        crate::davinci_sources::dress_from_workspace(&mut model, &cwd, &session_dir);
+    }
+
     let result = loop {
         if let Err(err) = terminal.draw(&model) {
             break Err(err.to_string());
@@ -967,6 +1049,130 @@ pub fn run(
 
     terminal.close().map_err(|err| err.to_string())?;
     result
+}
+
+/// Everything the shell owes the user before the first prompt: startup
+/// notices, the model scope, the trust warning, the changelog on a version
+/// bump, the resources that loaded, and any custom messages the session
+/// already holds. The old chrome printed these into its transcript; so does
+/// this one, because the transcript is the interface (design.md §6).
+fn opening_block(
+    parsed: &crate::args::Args,
+    agent: &Agent,
+    migrated_auth_providers: &[String],
+) -> Vec<Entry> {
+    let agent_dir = crate::default_agent_dir();
+    let stored = crate::settings::load_merged_settings(&agent_dir, &agent.cwd);
+    let quiet = stored.quiet_startup && !parsed.verbose;
+    let mut out: Vec<Entry> = Vec::new();
+
+    let (_, models_json_error) = crate::load_available_models(parsed);
+    let notices = crate::startup::collect_startup_notices(
+        crate::VERSION,
+        &stored,
+        models_json_error,
+        migrated_auth_providers.to_vec(),
+    );
+    for (kind, line) in crate::startup::format_notices(&notices) {
+        out.push(Entry::Gap);
+        // A warning wears the attention glyph; anything else is prose.
+        if kind == "warning" || kind == "error" {
+            out.push(Entry::tool(State::Attention, "instrumenta", &line, None));
+        } else {
+            out.push(Entry::prose(&line));
+        }
+    }
+
+    if !quiet && !parsed.models.is_empty() {
+        out.push(Entry::Gap);
+        out.push(Entry::prose(&format!(
+            "models scoped to {}",
+            parsed.models.join(", ")
+        )));
+    }
+
+    if !crate::settings::is_trusted(&stored, &agent.cwd, parsed.project_trust_override)
+        && crate::trust::has_trust_requiring_project_resources(&agent.cwd)
+    {
+        out.push(Entry::Gap);
+        out.push(Entry::tool(
+            State::Attention,
+            "instrumenta",
+            "this project is not trusted, so its .pi resources are ignored — /trust to decide",
+            None,
+        ));
+    }
+
+    let entries = crate::changelog::parse_changelog(&crate::changelog::changelog_path());
+    let has_messages = agent.session.as_ref().is_some_and(|store| {
+        store
+            .entries
+            .iter()
+            .any(|entry| entry.entry_type == "message")
+    });
+    let display = crate::changelog::changelog_for_display(
+        stored.last_changelog_version.as_deref(),
+        crate::VERSION,
+        &entries,
+        has_messages,
+    );
+    if let Some(text) = display.markdown {
+        out.push(Entry::Gap);
+        out.push(Entry::prose(text.trim()));
+    }
+
+    if !quiet {
+        let mut loaded: Vec<String> = Vec::new();
+        if !agent.context_files.is_empty() {
+            loaded.push(format!("{} context files", agent.context_files.len()));
+        }
+        if !agent.skills.is_empty() {
+            loaded.push(format!("{} skills", agent.skills.len()));
+        }
+        if !agent.templates.is_empty() {
+            loaded.push(format!("{} prompts", agent.templates.len()));
+        }
+        if !loaded.is_empty() {
+            out.push(Entry::Gap);
+            out.push(Entry::prose(&format!("loaded {}", loaded.join(" · "))));
+        }
+    }
+
+    out.extend(custom_messages(agent));
+    out
+}
+
+/// Custom messages an extension wrote into the session, replayed on open so a
+/// resumed session reads the same as it did when it was live.
+fn custom_messages(agent: &Agent) -> Vec<Entry> {
+    let Some(store) = agent.session.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in &store.entries {
+        if entry.entry_type != "custom_message" && entry.entry_type != "custom" {
+            continue;
+        }
+        let text = entry
+            .message
+            .as_ref()
+            .map(pi_tui::CustomMessage::text_content)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                entry
+                    .extra
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push(Entry::Gap);
+        out.push(Entry::prose(text.trim()));
+    }
+    out
 }
 
 /// Everything a composer line or a chosen row may need. Bundled because the
@@ -1227,6 +1433,19 @@ fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<St
                 Done::Note(text) => Err(text),
                 _ => Ok(format!("thinking level {level}")),
             }
+        }
+        Question::FirstRun => {
+            let dir = crate::default_agent_dir();
+            let mut stored = crate::settings::load_settings(&dir);
+            let share = index == 0;
+            crate::settings::set_enable_analytics(&mut stored, share);
+            crate::settings::save_settings(&dir, &stored)?;
+            let _ = shell;
+            Ok(if share {
+                "sharing anonymous usage data. change it any time in settings.".into()
+            } else {
+                "nothing leaves this machine. change it any time in settings.".into()
+            })
         }
         Question::Logout { providers } => {
             let Some(provider) = providers.get(index) else {
@@ -1646,6 +1865,62 @@ mod tests {
         assert_eq!(credentials.title, "CLAVES");
         assert_eq!(credentials.items.len(), 2);
         assert_eq!(credentials.items[0].label, "anthropic");
+    }
+
+    #[test]
+    fn first_run_asks_only_what_davinci_cannot_decide_for_itself() {
+        let agent = pi_agent::Agent::new("test");
+        let panel = Question::FirstRun.ask(&agent);
+        // The old setup asked for a theme too; there is one palette here, so
+        // the only question left is the one about the user, not the terminal.
+        assert_eq!(panel.items.len(), 2);
+        assert!(panel.items[0].label.contains("share"));
+        assert!(panel.note.contains("never required"), "{}", panel.note);
+    }
+
+    #[test]
+    fn an_untrusted_project_with_pi_resources_is_warned_about_by_glyph() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".pi").join("skills")).unwrap();
+
+        let mut agent = pi_agent::Agent::new("test");
+        agent.cwd = project.clone();
+        let block = opening_block(&crate::args::Args::default(), &agent, &[]);
+
+        let warned = block.iter().any(|entry| {
+            matches!(entry, Entry::Tool { state, target, .. }
+                if *state == State::Attention && target.contains("not trusted"))
+        });
+        assert!(warned, "an untrusted project must say so");
+
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    #[test]
+    fn a_trusted_project_opens_without_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let project = dir.path().join("plain");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut agent = pi_agent::Agent::new("test");
+        agent.cwd = project;
+        let block = opening_block(&crate::args::Args::default(), &agent, &[]);
+        assert!(!block.iter().any(|entry| {
+            matches!(entry, Entry::Tool { target, .. } if target.contains("not trusted"))
+        }));
+
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
     }
 
     #[test]

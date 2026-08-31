@@ -2715,7 +2715,7 @@ fn run_interactive(
     if std::env::var("PI_DAVINCI").is_ok_and(|value| value != "0") {
         let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
         let raw: Vec<String> = std::env::args().skip(1).collect();
-        return davinci_session::run(parsed, agent, &raw, host);
+        return davinci_session::run(parsed, agent, &raw, host, migrated_auth_providers);
     }
     let theme = builtin_themes()
         .into_iter()
