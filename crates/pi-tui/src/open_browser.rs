@@ -16,10 +16,12 @@ pub fn open_browser_argv(target: &str) -> (&'static str, Vec<String>) {
 }
 
 pub fn open_browser_dry_run() -> bool {
-    matches!(
-        std::env::var("PI_OPEN_BROWSER_DRY_RUN").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    ) || std::env::var("PI_OAUTH_FIXTURE").is_ok()
+    cfg!(test)
+        || matches!(
+            std::env::var("PI_OPEN_BROWSER_DRY_RUN").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+        || std::env::var("PI_OAUTH_FIXTURE").is_ok()
 }
 
 pub fn copy_text_dry_run() -> bool {
@@ -75,6 +77,11 @@ pub fn open_browser(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_tests_never_open_a_real_browser() {
+        assert!(open_browser_dry_run());
+    }
 
     #[test]
     fn argv_matches_ts_platforms() {

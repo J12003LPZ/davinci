@@ -409,7 +409,12 @@ impl ProcessTerminal {
             self.writes.push(data.to_string());
         } else {
             use std::io::Write;
-            let _ = std::io::stdout().write_all(data.as_bytes());
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(data.as_bytes());
+            // Rust's stdout is line-buffered; repaint sequences rarely end in
+            // a newline, so an unflushed frame shows up only when some later
+            // write happens to flush — felt as keystroke latency.
+            let _ = stdout.flush();
         }
         if let Some(path) = &self.write_log_path {
             let _ = std::fs::OpenOptions::new()
