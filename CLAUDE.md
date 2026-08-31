@@ -45,7 +45,8 @@ Dependency direction is strictly bottom-up; `pi-coding-agent` is the only binary
 
 ```
 pi-coding-agent (bin `pi`)  — CLI, TUI wiring, extensions, slash commands, auth UI
-  ├── pi-tui        — terminal rendering (Component trait -> Vec<String> lines)
+  ├── pi-tui        — terminal rendering: `davinci/` (ratatui, the interactive
+  │                   default) and the legacy chrome (Component trait -> Vec<String>)
   ├── pi-agent      — agent loop, tools, compaction, skills, prompt templates
   │     └── pi-ai   — providers, auth/OAuth, streaming, model catalog, cost
   ├── pi-session(-sqlite) — JSONL session store + sqlite branch cache
@@ -55,7 +56,7 @@ pi-coding-agent (bin `pi`)  — CLI, TUI wiring, extensions, slash commands, aut
   └── pi-parity     — golden fixtures, optional diff against the TS binary
 ```
 
-**Entrypoint dispatch** (`crates/pi-coding-agent/src/main.rs`, ~7k lines): `run()` picks a mode — `run_rpc` (`--mode rpc`), `run_print` (`--print` / `--mode json` / non-TTY stdin or stdout), otherwise `run_interactive`. Unix-only `experimental` subcommands (`server`, `client`) are stubbed out on Windows by an inline `mod experimental` in `main.rs`.
+**Entrypoint dispatch** (`crates/pi-coding-agent/src/main.rs`, ~7k lines): `run()` picks a mode — `run_rpc` (`--mode rpc`), `run_print` (`--print` / `--mode json` / non-TTY stdin or stdout), otherwise `run_interactive`, which opens the davinci shell (`davinci_session::run`) unless `--legacy-tui` or `PI_DAVINCI=0` asks for the old chrome. Unix-only `experimental` subcommands (`server`, `client`) are stubbed out on Windows by an inline `mod experimental` in `main.rs`.
 
 **Agent runtime** (`pi-agent`): built-in tools are `read, write, edit, bash, powershell, grep, find, ls`. Extensions inject behavior through `PreToolHook` / `PostToolHook` / custom tool functions. Compaction (`compaction.rs`) and branch summarization (`branch.rs`) reproduce the TS prompts verbatim — the prompt string constants are part of the parity contract, do not reword them.
 
@@ -64,6 +65,8 @@ pi-coding-agent (bin `pi`)  — CLI, TUI wiring, extensions, slash commands, aut
 **Sessions** are JSONL files under `~/.pi/agent/sessions`, in cwd-encoded directories byte-compatible with TypeScript `pi`. Path resolution lives in `pi-session/src/discovery.rs` (`default_agent_dir`, `default_session_dir`). Project config and trust decisions live under `.pi/` in the project (`settings.rs`, `trust.rs`).
 
 **Protocol**: `pi-protocol` is length-prefixed CBOR with explicit depth/length limits; `pi-server` serves an `Agent` over it and `pi-client` consumes it. `PROTOCOL_VERSION` compatibility is checked on hello.
+
+**The davinci TUI** (`pi-tui/src/davinci/`, driven by `pi-coding-agent/src/davinci_{session,sources}.rs`) implements `docs/ui/design.md` against the mockups in `docs/ui/Pi TUI Mockups.dc.html` (screens `1a`–`1h`, `2a`–`2c`). Its rules are a contract, not preferences: one panel at a time, every state carries a glyph so `NO_COLOR` still reads, `theme.rs` is the only file holding a colour literal, exactly two things animate off one 250ms clock, prose wraps at 74 columns, and numbers are meters with their unit and cap. Views return `Vec<Line<'static>>` so heights are known before rendering. `pi --davinci --screen <id>` renders one mockup screen against fixtures for comparison.
 
 ## Conventions
 
