@@ -187,10 +187,22 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
                 model.toggle_screen(Screen::Mensura);
                 return Flow::Continue;
             }
+            // design.md §5 asks for ctrl+m here. At the ANSI and Windows
+            // console layers ctrl+m *is* enter (0x0D), and crossterm can only
+            // tell them apart through the kitty keyboard protocol, which the
+            // Windows console does not implement. Binding it would cost the
+            // composer its enter key, so recall lives on ctrl+r.
+            KeyCode::Char('r') => {
+                model.toggle_screen(Screen::Memoria);
+                return Flow::Continue;
+            }
             KeyCode::Char('e') => {
                 model.toggle_codex();
                 return Flow::Continue;
             }
+            // An unbound control chord is not text; it must never reach the
+            // composer.
+            KeyCode::Char(_) => return Flow::Continue,
             _ => {}
         }
     }
@@ -323,6 +335,8 @@ mod tests {
             ('l', Screen::Plan),
             ('g', Screen::Grafo),
             ('u', Screen::Mensura),
+            // ctrl+m in the spec; see the note in `handle_key`.
+            ('r', Screen::Memoria),
         ] {
             handle_key(&mut m, ctrl(ch));
             assert_eq!(m.screen, expected, "ctrl+{ch}");
@@ -341,6 +355,19 @@ mod tests {
         }
         handle_key(&mut m, ctrl('e'));
         assert!(m.codex_open());
+    }
+
+    #[test]
+    fn ctrl_m_stays_enter_so_the_composer_keeps_its_send_key() {
+        let mut m = model(120, 30);
+        m.type_char("run the tests");
+        // The terminal delivers ctrl+m as enter; recall must not steal it.
+        let flow = handle_key(&mut m, ctrl('m'));
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(m.screen, Screen::Agent, "ctrl+m did not open a screen");
+
+        let flow = handle_key(&mut m, key(KeyCode::Enter));
+        assert_eq!(flow, Flow::Submit("run the tests".to_string()));
     }
 
     #[test]
