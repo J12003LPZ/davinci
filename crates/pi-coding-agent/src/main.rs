@@ -276,13 +276,15 @@ fn main() {
 fn run(raw: Vec<String>) -> Result<i32, String> {
     apply_offline_mode(&raw);
     // `--davinci --screen <id>` renders a mockup screen against fixtures for
-    // comparison with docs/ui; `--davinci` alone opens the real shell, which
-    // needs the full startup path (auth, trust, migrations) first.
-    if raw.iter().any(|arg| arg == "--davinci") {
-        if raw.iter().any(|arg| arg == "--screen") {
-            return run_davinci_screens(&raw);
-        }
-        std::env::set_var("PI_DAVINCI", "1");
+    // comparison with docs/ui. The davinci shell is what interactive pi opens;
+    // `--legacy-tui` (or `PI_DAVINCI=0`) asks for the previous chrome, which
+    // still owns image display, alt-screen search, mouse selection and the
+    // extension dialogs.
+    if raw.iter().any(|arg| arg == "--davinci") && raw.iter().any(|arg| arg == "--screen") {
+        return run_davinci_screens(&raw);
+    }
+    if raw.iter().any(|arg| arg == "--legacy-tui") {
+        std::env::set_var("PI_DAVINCI", "0");
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     apply_http_proxy_settings(
@@ -2712,7 +2714,9 @@ fn run_interactive(
         return Ok(code);
     }
     install_mode_shutdown_watchers(parsed);
-    if std::env::var("PI_DAVINCI").is_ok_and(|value| value != "0") {
+    // The davinci shell is the interactive default; `PI_DAVINCI=0` and
+    // `--legacy-tui` opt back out.
+    if !parsed.legacy_tui && std::env::var("PI_DAVINCI").as_deref() != Ok("0") {
         let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
         let raw: Vec<String> = std::env::args().skip(1).collect();
         return davinci_session::run(parsed, agent, &raw, host, migrated_auth_providers);

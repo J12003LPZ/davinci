@@ -73,6 +73,8 @@ pub struct Args {
     pub offline: bool,
     pub tui_mode: Option<TuiMode>,
     pub verbose: bool,
+    /// `--legacy-tui`: open the previous chrome instead of the davinci shell.
+    pub legacy_tui: bool,
     pub project_trust_override: Option<bool>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
@@ -291,6 +293,12 @@ pub fn parse_args(args: &[String]) -> Args {
             }
         } else if arg == "--verbose" {
             result.verbose = true;
+        } else if arg == "--legacy-tui" || arg == "--davinci" {
+            // Boolean, and declared here so neither swallows the message that
+            // follows it. `--davinci` is now the default and kept only for
+            // `--davinci --screen <id>`; `--legacy-tui` asks for the old
+            // chrome. Both are read from the raw argv in `main`.
+            result.legacy_tui = arg == "--legacy-tui";
         } else if arg == "--approve" || arg == "-a" {
             result.project_trust_override = Some(true);
         } else if arg == "--no-approve" || arg == "-na" {
