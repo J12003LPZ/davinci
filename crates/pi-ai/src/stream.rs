@@ -642,6 +642,49 @@ fn openai_responses_body(
         body["tool_choice"] = Value::String("auto".into());
         body["parallel_tool_calls"] = Value::Bool(true);
     }
+    let retention = crate::cache::cache_retention_from_options(options);
+    let session_key = options
+        .session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(crate::cache::clamp_openai_prompt_cache_key);
+    match model.api.as_str() {
+        // azure-openai-responses.ts:293 — clamped key, no retention gate.
+        "azure-openai-responses" => {
+            if let Some(key) = session_key {
+                body["prompt_cache_key"] = Value::String(key);
+            }
+        }
+        // openai-codex-responses.ts:267-268, 557 — key unless retention none.
+        "openai-codex-responses" => {
+            if retention != crate::cache::CacheRetention::None {
+                if let Some(key) = session_key {
+                    body["prompt_cache_key"] = Value::String(key);
+                }
+            }
+        }
+        // openai-responses.ts:288-296.
+        _ => {
+            if retention != crate::cache::CacheRetention::None {
+                if let Some(key) = session_key {
+                    body["prompt_cache_key"] = Value::String(key);
+                }
+            }
+            if retention == crate::cache::CacheRetention::Long
+                && crate::cache::supports_long_cache_retention(&model.compat)
+            {
+                body["prompt_cache_retention"] = Value::String("24h".into());
+            }
+            let explicit_mode = model
+                .compat
+                .get("supportsExplicitPromptCacheMode")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if retention == crate::cache::CacheRetention::None && explicit_mode {
+                body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
+            }
+        }
+    }
     if !tools.is_empty() {
         body["tools"] = Value::Array(
             tools
@@ -1702,6 +1745,135 @@ mod tests {
             },
         );
         assert!(body["tools"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn responses_bodies_carry_prompt_cache_key() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-responses")
+            .expect("openai responses model");
+        let session = StreamOptions {
+            session_id: Some("sess-1234".into()),
+            ..StreamOptions::default()
+        };
+        let body = request_body_with(&model, &[], None, &[], &session);
+        assert_eq!(body["prompt_cache_key"], "sess-1234");
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert!(body.get("prompt_cache_options").is_none());
+
+        let long = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-1234".into()),
+                cache_retention: Some("long".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(long["prompt_cache_retention"], "24h");
+
+        let none = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-1234".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert!(none.get("prompt_cache_key").is_none());
+        assert!(none.get("prompt_cache_options").is_none());
+        model.compat = serde_json::json!({"supportsExplicitPromptCacheMode": true});
+        let explicit = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-1234".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(explicit["prompt_cache_options"]["mode"], "explicit");
+
+        let clamped = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("k".repeat(80)),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(
+            clamped["prompt_cache_key"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            64
+        );
+
+        let anonymous = request_body_with(&model, &[], None, &[], &StreamOptions::default());
+        assert!(anonymous.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn codex_and_azure_bodies_carry_prompt_cache_key() {
+        let codex = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-codex-responses")
+            .expect("codex model");
+        let body = request_body_with(
+            &codex,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-codex".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(body["prompt_cache_key"], "sess-codex");
+        assert!(body.get("prompt_cache_retention").is_none());
+        let none = request_body_with(
+            &codex,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-codex".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert!(none.get("prompt_cache_key").is_none());
+
+        let mut azure = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "azure-openai-responses")
+            .unwrap_or_else(|| codex.clone());
+        azure.api = "azure-openai-responses".into();
+        let azure_body = request_body_with(
+            &azure,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-azure".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(azure_body["prompt_cache_key"], "sess-azure");
+        assert!(azure_body.get("prompt_cache_retention").is_none());
     }
 
     #[test]
