@@ -3,6 +3,7 @@ mod auth_cmd;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
+mod davinci_sources;
 #[cfg(unix)]
 mod experimental;
 #[cfg(not(unix))]
@@ -240,9 +241,14 @@ fn run_davinci(raw: &[String]) -> Result<i32, String> {
         .join("config.json")
         .display()
         .to_string();
-    model.cwd = cwd.display().to_string();
-    if let Some(branch) = pi_tui::resolve_git_branch(&cwd) {
-        model.branch = branch;
+
+    // Everything this workspace can already answer comes from the real
+    // sources; the plan, the code graph, the recall index and the token budget
+    // are still fixtures, and are reported as such.
+    let session_dir = pi_session::default_session_dir();
+    davinci_sources::dress_from_workspace(&mut model, &cwd, &session_dir);
+    if screen == "1a" {
+        model.transcript.clear();
     }
 
     davinci::runtime::run(&mut model, |model, text| {
