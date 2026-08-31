@@ -81,6 +81,81 @@ pub enum Choice {
     Ask(usize),
 }
 
+/// A block of rows an extension owns. Extensions get rows, not colours and
+/// not a layout: the theme is the shell's (design.md §2) and the panel budget
+/// is the design's (§1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Widget {
+    pub key: String,
+    pub lines: Vec<String>,
+    /// `belowEditor` in the extension API; anything else sits above.
+    pub below: bool,
+}
+
+/// Everything the loaded extensions have asked to put on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extensions {
+    pub header: Vec<String>,
+    pub footer: Vec<String>,
+    pub widgets: Vec<Widget>,
+    /// `key -> text`, joined into one row above the composer. It does not go
+    /// in the status bar, because the meter there states a number against its
+    /// cap (§9) and must not be crowded out.
+    pub status: Vec<(String, String)>,
+}
+
+impl Extensions {
+    /// Add, replace or (with no lines) remove a widget, keyed as the
+    /// extension keyed it.
+    pub fn set_widget(&mut self, key: &str, lines: Vec<String>, below: bool) {
+        self.widgets.retain(|widget| widget.key != key);
+        if lines.is_empty() {
+            return;
+        }
+        self.widgets.push(Widget {
+            key: key.to_string(),
+            lines,
+            below,
+        });
+    }
+
+    pub fn set_status(&mut self, key: &str, text: Option<&str>) {
+        self.status.retain(|(existing, _)| existing != key);
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            self.status.push((key.to_string(), text.to_string()));
+        }
+    }
+
+    /// The rows that sit above the composer: widgets first, then the status
+    /// line the extensions share.
+    pub fn above(&self) -> Vec<String> {
+        let mut rows: Vec<String> = self
+            .widgets
+            .iter()
+            .filter(|widget| !widget.below)
+            .flat_map(|widget| widget.lines.clone())
+            .collect();
+        if !self.status.is_empty() {
+            rows.push(
+                self.status
+                    .iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            );
+        }
+        rows
+    }
+
+    pub fn below(&self) -> Vec<String> {
+        self.widgets
+            .iter()
+            .filter(|widget| widget.below)
+            .flat_map(|widget| widget.lines.clone())
+            .collect()
+    }
+}
+
 /// One Studio step: a ledger row of ✓ / ◉ / ○ (design.md §6).
 #[derive(Debug, Clone)]
 pub struct Step {
@@ -496,6 +571,8 @@ pub struct Model {
     pub queued: Vec<String>,
     pub query: String,
     pub transcript: Vec<Entry>,
+    /// Rows the loaded extensions have asked for.
+    pub extensions: Extensions,
     pub running: bool,
 
     pub palette_index: usize,
@@ -560,6 +637,7 @@ impl Model {
             codex: false,
             composer: String::new(),
             queued: Vec::new(),
+            extensions: Extensions::default(),
             query: String::new(),
             transcript: Vec::new(),
             running: false,

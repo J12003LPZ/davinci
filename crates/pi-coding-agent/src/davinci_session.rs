@@ -373,8 +373,8 @@ fn run_turn(
     let mut last_tick = Instant::now();
 
     std::thread::scope(|scope| -> std::io::Result<()> {
-        let worker =
-            scope.spawn(|| crate::complete_prompt_with_host(parsed, agent, Some(host), false));
+        let worker = scope
+            .spawn(|| crate::complete_prompt_with_host(parsed, agent, Some(host.clone()), false));
 
         loop {
             while let Ok(event) = event_rx.try_recv() {
@@ -436,7 +436,39 @@ fn run_turn(
     agent.abort_signal = None;
     agent.event_sink = None;
     model.running = false;
+
+    // Extensions may have asked for rows while the turn ran.
+    if let Ok(host) = host.lock() {
+        apply_ui_calls(model, &host.ui_calls);
+    }
+    apply_cache_miss_notices(model, agent);
     Ok(())
+}
+
+/// The cache-miss notice the old chrome showed after a turn, when the user has
+/// asked to see them.
+fn apply_cache_miss_notices(model: &mut Model, agent: &Agent) {
+    let stored = crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+    if !stored.show_cache_miss_notices.unwrap_or(false) {
+        return;
+    }
+    let Some(store) = agent.session.as_ref() else {
+        return;
+    };
+    let waste = crate::cache_stats::compute_cache_waste(&store.entries, &0.3);
+    if waste.missed_tokens <= 0 {
+        return;
+    }
+    model.transcript.push(Entry::Gap);
+    model.transcript.push(Entry::tool(
+        State::Attention,
+        "mensura",
+        &format!(
+            "cache misses cost {} tokens this session",
+            pi_tui::davinci::views::chrome::thousands(waste.missed_tokens as u64)
+        ),
+        None,
+    ));
 }
 
 /// Everything already in the session, as transcript blocks, so a resumed
@@ -973,6 +1005,7 @@ pub fn run(
             reason: "startup".into(),
         });
         host.emit(crate::extension_host::ExtensionEvent::SessionStart);
+        apply_ui_calls(&mut model, &host.ui_calls);
     }
     crate::start_catalog_refresh_async(parsed);
     for entry in opening_block(parsed, agent, migrated_auth_providers) {
@@ -1228,6 +1261,81 @@ fn custom_messages(agent: &Agent) -> Vec<Entry> {
         out.push(Entry::prose(text.trim()));
     }
     out
+}
+
+/// Apply the UI calls the loaded extensions have made, returning a window
+/// title if one was asked for.
+///
+/// Davinci honours the calls that are rows or text — widgets, header, footer,
+/// status, notifications, the composer and the title. It ignores the ones that
+/// would take over the design itself: `setTheme` (one palette, negotiated from
+/// the terminal, §2), `setEditorComponent`, `setWorkingIndicator` and
+/// `setWorkingVisible` (exactly two things animate, §8), and
+/// `setToolsExpanded`.
+pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<String> {
+    let mut title = None;
+    let text_lines = |value: Option<&serde_json::Value>| -> Vec<String> {
+        value
+            .and_then(serde_json::Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| line.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let field = |call: &serde_json::Value, key: &str| -> String {
+        call.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    for call in calls {
+        match call.get("op").and_then(serde_json::Value::as_str) {
+            Some("setWidget") => {
+                let key = field(call, "key");
+                let mut lines = text_lines(call.get("lines"));
+                if lines.is_empty() {
+                    if let Some(content) = call.get("content").and_then(serde_json::Value::as_str) {
+                        lines = content.lines().map(str::to_string).collect();
+                    }
+                }
+                let below = field(call, "placement") == "belowEditor";
+                model.extensions.set_widget(&key, lines, below);
+            }
+            Some("setStatus") => {
+                let key = field(call, "key");
+                let text = call.get("text").and_then(serde_json::Value::as_str);
+                model.extensions.set_status(&key, text);
+            }
+            Some("setHeader") => model.extensions.header = text_lines(call.get("lines")),
+            Some("setFooter") => model.extensions.footer = text_lines(call.get("lines")),
+            Some("notify") => {
+                let message = field(call, "message");
+                if !message.trim().is_empty() {
+                    model.transcript.push(Entry::Gap);
+                    model.transcript.push(Entry::tool(
+                        State::Attention,
+                        "instrumenta",
+                        message.trim(),
+                        None,
+                    ));
+                }
+            }
+            Some("setEditorText") => model.composer = field(call, "text"),
+            Some("pasteToEditor") => model.composer.push_str(&field(call, "text")),
+            Some("setTitle") => {
+                let value = field(call, "title");
+                if !value.is_empty() {
+                    title = Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    title
 }
 
 /// Everything a composer line or a chosen row may need. Bundled because the
@@ -1884,6 +1992,57 @@ mod tests {
             classify("/export report.html"),
             Sent::Command(SlashAction::Export(Some(path))) if path == "report.html"
         ));
+    }
+
+    #[test]
+    fn extensions_get_rows_and_a_title_but_never_the_palette() {
+        let mut m = model();
+        let title = apply_ui_calls(
+            &mut m,
+            &[
+                json!({"op": "setHeader", "lines": ["branch: rust-rewrite"]}),
+                json!({"op": "setFooter", "lines": ["2 checks pending"]}),
+                json!({"op": "setWidget", "key": "todo", "lines": ["3 open todos"]}),
+                json!({"op": "setWidget", "key": "hint", "content": "one\ntwo", "placement": "belowEditor"}),
+                json!({"op": "setStatus", "key": "sync", "text": "synced"}),
+                json!({"op": "notify", "message": "the index is stale"}),
+                json!({"op": "setTitle", "title": "pi · rust-rewrite"}),
+                // Ignored: davinci has one palette and two animations.
+                json!({"op": "setTheme", "theme": "solarized"}),
+                json!({"op": "setWorkingIndicator", "frames": ["-", "\\"]}),
+            ],
+        );
+
+        assert_eq!(title.as_deref(), Some("pi · rust-rewrite"));
+        assert_eq!(
+            m.extensions.header,
+            vec!["branch: rust-rewrite".to_string()]
+        );
+        assert_eq!(m.extensions.footer, vec!["2 checks pending".to_string()]);
+        assert_eq!(m.extensions.above(), vec!["3 open todos", "synced"]);
+        assert_eq!(m.extensions.below(), vec!["one", "two"]);
+        assert!(m.transcript.iter().any(|entry| {
+            matches!(entry, Entry::Tool { state, target, .. }
+                if *state == State::Attention && target == "the index is stale")
+        }));
+
+        // A widget with no lines is a removal, keyed as the extension keyed it.
+        apply_ui_calls(&mut m, &[json!({"op": "setWidget", "key": "todo"})]);
+        assert_eq!(m.extensions.above(), vec!["synced"]);
+        apply_ui_calls(&mut m, &[json!({"op": "setStatus", "key": "sync"})]);
+        assert!(m.extensions.above().is_empty());
+    }
+
+    #[test]
+    fn an_extension_can_fill_the_composer_and_add_to_it() {
+        let mut m = model();
+        apply_ui_calls(&mut m, &[json!({"op": "setEditorText", "text": "review "})]);
+        assert_eq!(m.composer, "review ");
+        apply_ui_calls(
+            &mut m,
+            &[json!({"op": "pasteToEditor", "text": "the diff"})],
+        );
+        assert_eq!(m.composer, "review the diff");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 
 use super::model::{Choice, Model, Overlay, Screen};
-use super::ui::{blank, pad_to, tail};
+use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::{
     ask, codex, cogitator, disegno, grafo, instrumenta, memoria, mensura, startup, transcript,
@@ -36,16 +36,38 @@ pub enum Flow {
 pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     let height = height.max(4) as usize;
     let composer_rows = composer_rows(model);
-    let reserved = 1 + composer_rows.len() + 1;
+    let top = extension_rows(model, &model.extensions.header);
+    let bottom = extension_rows(model, &model.extensions.footer);
+    let above = extension_rows(model, &model.extensions.above());
+    let below = extension_rows(model, &model.extensions.below());
+    let reserved =
+        1 + top.len() + bottom.len() + above.len() + composer_rows.len() + below.len() + 1;
     let body_height = height.saturating_sub(reserved);
 
     let mut rows = Vec::with_capacity(height);
     rows.push(chrome::header(model));
+    rows.extend(top);
     rows.extend(body(model, body_height));
+    rows.extend(bottom);
+    rows.extend(above);
     rows.extend(composer_rows);
+    rows.extend(below);
     rows.push(chrome::status(model));
     rows.truncate(height);
     rows
+}
+
+/// Rows an extension supplied. They are drawn as plain text in the shell's own
+/// muted ink and clipped to the window: an extension contributes words, not a
+/// palette and not a layout (design.md §2).
+fn extension_rows(model: &Model, lines: &[String]) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| {
+            let text = ui::clip(line, model.width.saturating_sub(2));
+            ui::indent(2, vec![ui::span(text, model.theme.muted)])
+        })
+        .collect()
 }
 
 fn composer_rows(model: &Model) -> Vec<Line<'static>> {
@@ -463,6 +485,36 @@ mod tests {
         }
         // Still exactly one window's worth of rows.
         assert_eq!(compose(&m, 30).len(), 30);
+    }
+
+    #[test]
+    fn extension_rows_take_their_place_without_costing_the_window_its_height() {
+        let mut m = model(120, 30);
+        m.extensions.header = vec!["branch: rust-rewrite".into()];
+        m.extensions.footer = vec!["2 checks pending".into()];
+        m.extensions
+            .set_widget("todo", vec!["3 open todos".into()], false);
+        m.extensions
+            .set_widget("keys", vec!["ctrl+k commands".into()], true);
+        m.extensions.set_status("sync", Some("synced"));
+
+        let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
+        assert_eq!(rows.len(), 30);
+        for expected in [
+            "branch: rust-rewrite",
+            "3 open todos",
+            "synced",
+            "2 checks pending",
+            "ctrl+k commands",
+        ] {
+            assert!(
+                rows.iter().any(|row| row.contains(expected)),
+                "{expected} is not on screen"
+            );
+        }
+        // The header stays the shell's, and the status bar keeps its meter.
+        assert!(rows[0].contains("davinci"));
+        assert!(rows[29].contains("/200k"), "{}", rows[29]);
     }
 
     #[test]
