@@ -2,6 +2,7 @@
 
 mod attribution;
 mod auth;
+pub mod cache;
 mod catalog;
 mod codex;
 mod codex_ws;
