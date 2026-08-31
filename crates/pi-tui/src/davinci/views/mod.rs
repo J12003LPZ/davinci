@@ -2,7 +2,9 @@
 //! nothing else.
 
 pub mod chrome;
+pub mod codex;
 pub mod cogitator;
+pub mod disegno;
 pub mod instrumenta;
 pub mod memoria;
 pub mod startup;

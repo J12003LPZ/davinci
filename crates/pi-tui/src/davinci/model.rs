@@ -181,6 +181,67 @@ impl ModelItem {
     }
 }
 
+/// One step of a Disegno plan (`1c`), numbered in Roman.
+#[derive(Debug, Clone)]
+pub struct PlanStep {
+    pub numeral: String,
+    pub state: State,
+    pub verb: String,
+    pub target: Option<String>,
+}
+
+impl PlanStep {
+    pub fn new(numeral: &str, state: State, verb: &str, target: Option<&str>) -> Self {
+        Self {
+            numeral: numeral.to_string(),
+            state,
+            verb: verb.to_string(),
+            target: target.map(str::to_string),
+        }
+    }
+}
+
+/// One row of the Codex file tree (`1e`), already flattened.
+#[derive(Debug, Clone)]
+pub struct TreeRow {
+    pub depth: u16,
+    /// `▾` open, `▸` closed, nothing for a leaf.
+    pub twisty: Option<String>,
+    pub name: String,
+    /// `Δ` when the file or directory has changes, `×` when it is failing.
+    pub status: Option<State>,
+}
+
+impl TreeRow {
+    pub fn new(depth: u16, twisty: Option<&str>, name: &str, status: Option<State>) -> Self {
+        Self {
+            depth,
+            twisty: twisty.map(str::to_string),
+            name: name.to_string(),
+            status,
+        }
+    }
+}
+
+/// One row of the git changes popover (`1e`).
+#[derive(Debug, Clone)]
+pub struct ChangeRow {
+    /// Porcelain status letter: `M`, `A`, `D`, `?`.
+    pub status: String,
+    pub path: String,
+    pub count: String,
+}
+
+impl ChangeRow {
+    pub fn new(status: &str, path: &str, count: &str) -> Self {
+        Self {
+            status: status.to_string(),
+            path: path.to_string(),
+            count: count.to_string(),
+        }
+    }
+}
+
 /// What the session found when it opened — the empty state, screen `1a`.
 #[derive(Debug, Clone, Default)]
 pub struct Startup {
@@ -233,6 +294,12 @@ pub struct Model {
     pub models: Vec<ModelItem>,
     /// Where the model picker says the configuration lives (`1f`).
     pub config_path: String,
+
+    /// `1c` — the plan in hand.
+    pub plan: Vec<PlanStep>,
+    /// `1e` — the workspace tree and the git changes beside it.
+    pub tree: Vec<TreeRow>,
+    pub changes_list: Vec<ChangeRow>,
 }
 
 impl Model {
@@ -265,6 +332,9 @@ impl Model {
             sessions: Vec::new(),
             models: Vec::new(),
             config_path: String::new(),
+            plan: Vec::new(),
+            tree: Vec::new(),
+            changes_list: Vec::new(),
         }
     }
 

@@ -6,7 +6,8 @@
 //! is scheduled for replacement; nothing else in the tree may depend on it.
 
 use super::model::{
-    CorpusItem, Entry, Hunk, HunkKind, Model, ModelItem, SessionItem, Startup, Step,
+    ChangeRow, CorpusItem, Entry, Hunk, HunkKind, Model, ModelItem, PlanStep, SessionItem, Startup,
+    Step, TreeRow,
 };
 use super::theme::State;
 
@@ -157,6 +158,106 @@ pub fn models() -> Vec<ModelItem> {
     ]
 }
 
+/// `1e` — the Codex transcript, a windows-path bug.
+pub fn codex_transcript() -> Vec<Entry> {
+    vec![
+        Entry::user("why does the session store fail on windows paths?"),
+        Entry::Gap,
+        Entry::agent("davinci"),
+        Entry::Gap,
+        Entry::tool(
+            State::Search,
+            "instrumenta",
+            "search \"PathBuf::from\" · 12 matches",
+            None,
+        ),
+        Entry::tool(
+            State::Read,
+            "instrumenta",
+            "read crates\\davinci-session\\src\\store.rs",
+            None,
+        ),
+        Entry::tool(
+            State::Failed,
+            "manus",
+            "cargo test -p davinci-session",
+            Some("0.42s"),
+        ),
+        Entry::Gap,
+        Entry::prose(
+            "The store joins session ids with a literal / instead of Path::join, so a \
+             restored path becomes C:\\Users\\ines\\.davinci/sessions/…. Canonicalising \
+             it fixes both platforms.",
+        ),
+        Entry::Gap,
+        Entry::Delta {
+            path: "crates\\davinci-session\\src\\store.rs".into(),
+            adds: 6,
+            dels: 3,
+            hunks: vec![
+                Hunk::new(
+                    HunkKind::Del,
+                    "let p = format!(\"{}/sessions/{}\", root, id);",
+                ),
+                Hunk::new(HunkKind::Add, "let p = root.join(\"sessions\").join(id);"),
+            ],
+        },
+    ]
+}
+
+/// `1c` — the Disegno plan.
+pub fn plan() -> Vec<PlanStep> {
+    vec![
+        PlanStep::new(
+            "I",
+            State::Done,
+            "Map provider abstraction",
+            Some("davinci-ai\\src\\provider.rs"),
+        ),
+        PlanStep::new("II", State::Done, "Trace session lifecycle", None),
+        PlanStep::new("III", State::Active, "Implement streaming adapter", None),
+        PlanStep::new(
+            "IV",
+            State::Queued,
+            "Add parity fixtures against TS davinci",
+            None,
+        ),
+        PlanStep::new(
+            "V",
+            State::Queued,
+            "Verify workspace: fmt, clippy, test",
+            None,
+        ),
+    ]
+}
+
+/// `1e` — the Codex file tree, already flattened to (depth, twisty, name).
+pub fn tree() -> Vec<TreeRow> {
+    vec![
+        TreeRow::new(0, Some("▾"), "crates", None),
+        TreeRow::new(1, Some("▸"), "davinci-agent", Some(State::Delta)),
+        TreeRow::new(1, Some("▸"), "davinci-ai", None),
+        TreeRow::new(1, Some("▸"), "davinci-client", None),
+        TreeRow::new(1, Some("▾"), "davinci-session", Some(State::Delta)),
+        TreeRow::new(2, None, "store.rs", Some(State::Failed)),
+        TreeRow::new(2, None, "manager.rs", None),
+        TreeRow::new(1, Some("▸"), "davinci-tui", Some(State::Delta)),
+        TreeRow::new(1, Some("▸"), "davinci-git", None),
+        TreeRow::new(0, None, "Cargo.toml", None),
+        TreeRow::new(0, None, "Cargo.lock", None),
+        TreeRow::new(0, None, "README.md", None),
+    ]
+}
+
+/// `1e` — the git changes popover.
+pub fn changes_list() -> Vec<ChangeRow> {
+    vec![
+        ChangeRow::new("M", "davinci-session\\src\\store.rs", "+6"),
+        ChangeRow::new("M", "davinci-agent\\src\\runtime.rs", "+31"),
+        ChangeRow::new("A", "davinci-tui\\src\\theme.rs", "+54"),
+    ]
+}
+
 /// A model dressed with the mockups' session, for eyeballing a screen.
 pub fn dress(model: &mut Model) {
     model.cwd = "C:\\dev\\oss\\davinci-rust".into();
@@ -169,6 +270,9 @@ pub fn dress(model: &mut Model) {
     model.corpus_total = CORPUS_TOTAL;
     model.sessions = sessions();
     model.models = models();
+    model.plan = plan();
+    model.tree = tree();
+    model.changes_list = changes_list();
     model.transcript = if model.narrow() {
         narrow_transcript()
     } else {
@@ -185,6 +289,11 @@ pub fn dress_screen(model: &mut Model, id: &str) {
         "1d" => model.toggle_overlay(crate::davinci::model::Overlay::Instrumenta),
         "1f" => model.toggle_overlay(crate::davinci::model::Overlay::Sessions),
         "1f-cogitator" => model.toggle_overlay(crate::davinci::model::Overlay::Cogitator),
+        "1c" => model.toggle_screen(crate::davinci::model::Screen::Plan),
+        "1e" => {
+            model.toggle_codex();
+            model.transcript = codex_transcript();
+        }
         "1g" | "1h" => model.transcript = narrow_transcript(),
         _ => {}
     }

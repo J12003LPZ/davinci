@@ -13,7 +13,7 @@ use ratatui::text::Line;
 use super::model::{Model, Overlay, Screen};
 use super::ui::{blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
-use super::views::{cogitator, instrumenta, memoria, startup, transcript};
+use super::views::{codex, cogitator, disegno, instrumenta, memoria, startup, transcript};
 
 /// What the runtime should do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +63,12 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
     if let Some(overlay) = model.overlay {
         return overlay_body(model, overlay, height);
     }
+    if model.screen == Screen::Plan {
+        return panel(model, disegno::lines(model), height);
+    }
+    if model.codex_open() {
+        return codex::lines(model, height);
+    }
     if model.transcript.is_empty() {
         return empty_state(model, height);
     }
@@ -90,6 +96,23 @@ fn empty_state(model: &Model, height: usize) -> Vec<Line<'static>> {
     let mut out = vec![blank(); lead];
     out.extend(rows);
     pad_to(out, height)
+}
+
+/// A screen that takes over the body: the turn that produced it stays visible
+/// above, and the panel is anchored above the composer, as the mockups show
+/// (`1c`, `2a`, `2b`, `2c`).
+fn panel(model: &Model, rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+    let panel = tail(rows, height);
+    let room = height - panel.len();
+    let mut above = tail(
+        transcript::lines(model, &model.transcript, model.width),
+        room,
+    );
+    while above.len() < room {
+        above.insert(0, blank());
+    }
+    above.extend(panel);
+    above
 }
 
 /// An instrument in hand: the transcript stays visible behind it with the ramp
