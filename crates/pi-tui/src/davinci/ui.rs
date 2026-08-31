@@ -83,14 +83,42 @@ pub fn spread_on(
     right: Vec<Span<'static>>,
     background: Option<Color>,
 ) -> Line<'static> {
-    let gap = width
-        .saturating_sub(run_width(&left))
-        .saturating_sub(run_width(&right))
-        .max(1);
+    // The header and the status bar are one line each at every width, so the
+    // right run gives way rather than pushing the row past the window (§6).
+    // The left run is the identity and the mode; it is never given away.
+    let left = truncate_run(left, width);
+    let room = width.saturating_sub(run_width(&left));
+    let right = truncate_run(right, room.saturating_sub(1));
+    let gap = room.saturating_sub(run_width(&right));
     let mut spans = left;
     spans.push(pad(gap, background));
     spans.extend(right);
     Line::from(spans)
+}
+
+/// Cut a run to `width` cells, dropping whole spans from the end and clipping
+/// the one that straddles the edge.
+pub fn truncate_run(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
+    if run_width(&spans) <= width {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    let mut used = 0u16;
+    for span in spans {
+        let span_width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
+        if used + span_width <= width {
+            used += span_width;
+            out.push(span);
+            continue;
+        }
+        let room = width.saturating_sub(used);
+        if room > 0 {
+            let clipped = clip(span.content.as_ref(), room);
+            out.push(Span::styled(clipped, span.style));
+        }
+        break;
+    }
+    out
 }
 
 /// Centre a run in `width`.
@@ -483,14 +511,49 @@ mod tests {
     }
 
     #[test]
-    fn spread_keeps_one_cell_of_gap_when_it_overflows() {
+    fn spread_never_pushes_a_row_past_the_window() {
+        let th = theme();
+        for width in [20u16, 40, 80, 100] {
+            let line = spread(
+                width,
+                vec![span(
+                    "C:\\a\\very\\long\\path\\that\\keeps\\going",
+                    th.muted,
+                )],
+                vec![span("main │ sonnet", th.secondary)],
+            );
+            assert_eq!(width_of(&line), width, "at width {width}");
+        }
+    }
+
+    #[test]
+    fn spread_gives_the_right_run_away_and_keeps_the_identity() {
         let th = theme();
         let line = spread(
-            10,
-            vec![span("a very long left run", th.text)],
-            vec![span("and a right one", th.text)],
+            24,
+            vec![span("D davinci · agent", th.text)],
+            vec![span("C:\\dev\\oss\\davinci-rust", th.muted)],
         );
-        assert!(text_of(&line).contains("left run and a right one"));
+        let drawn = text_of(&line);
+        assert!(drawn.starts_with("D davinci · agent"), "{drawn}");
+        assert_eq!(width_of(&line), 24);
+    }
+
+    #[test]
+    fn truncate_run_drops_whole_spans_then_clips_the_straddler() {
+        let th = theme();
+        let run = vec![
+            span("abc", th.text),
+            span("defgh", th.muted),
+            span("ij", th.border),
+        ];
+        assert_eq!(run_width(&truncate_run(run.clone(), 10)), 10);
+        let cut = truncate_run(run.clone(), 5);
+        assert_eq!(run_width(&cut), 5);
+        assert_eq!(cut.len(), 2);
+        assert_eq!(cut[1].content.as_ref(), "de");
+        assert_eq!(cut[1].style.fg, Some(th.muted));
+        assert!(truncate_run(run, 0).is_empty());
     }
 
     #[test]

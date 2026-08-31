@@ -96,6 +96,59 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// True while the raw-mode TUI owns the screen. Any raw `println!` in that
+/// state moves the hardware cursor behind the renderer's back and corrupts
+/// the diff-based repaint, so the shadowed macros below reroute output into
+/// the transcript instead. Process-wide (not thread-local): the streaming
+/// worker thread prints too.
+static HOSTED_TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HOSTED_PENDING_LINES: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
+
+fn hosted_tui_active() -> bool {
+    HOSTED_TUI_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn hosted_queue_line(role: &'static str, text: String) {
+    if let Ok(mut pending) = HOSTED_PENDING_LINES.lock() {
+        pending.push((role, text));
+    }
+}
+
+/// Shadow `std::println!`: while the TUI hosts the screen, route the line
+/// into the transcript (drained by `sync_hosted_chrome`) instead of stdout.
+/// Textual macro scope: every `println!` after this point uses it.
+macro_rules! println {
+    () => {{
+        if !crate::hosted_tui_active() {
+            ::std::println!();
+        }
+    }};
+    ($($arg:tt)*) => {{
+        let text = ::std::format!($($arg)*);
+        if crate::hosted_tui_active() {
+            crate::hosted_queue_line("system", text);
+        } else {
+            ::std::println!("{}", text);
+        }
+    }};
+}
+
+macro_rules! eprintln {
+    () => {{
+        if !crate::hosted_tui_active() {
+            ::std::eprintln!();
+        }
+    }};
+    ($($arg:tt)*) => {{
+        let text = ::std::format!($($arg)*);
+        if crate::hosted_tui_active() {
+            crate::hosted_queue_line("notice", text);
+        } else {
+            ::std::eprintln!("{}", text);
+        }
+    }};
+}
+
 use pi_agent::{
     default_system_prompt, discover_prompt_templates, discover_skills, env_summarizer,
     load_context_files, Agent, AgentEvent, CompleteOutput, CustomToolExecutor, EventSink,
@@ -119,17 +172,16 @@ use pi_session::{
     resolve_session_dir_from, resolve_session_ref, JsonlSession, SessionEntry,
 };
 use pi_tui::{
-    build_startup_header, builtin_themes, collect_name_collisions, copy_text,
-    detect_terminal_theme, detect_terminal_theme_for_auto, drain_osc_tty, encode_kitty,
-    format_collision_diagnostic, format_context_path, format_display_path, infer_source_info,
-    interactive_settings_list, load_themes_from_dir, parse_auto_theme, parse_http_idle_timeout,
-    resolve_git_branch, theme_files_from_dir, AuthSelectorMode, AuthSelectorProvider,
-    AutocompleteItem, ChatChrome, Component, CustomMessage, DoubleEscapeAction,
-    ExtraAutocompleteProvider, FilterMode, InteractiveSession, Keybindings, LiveAutocompleteQuery,
-    LoadedResourceItem, MermaidMode, ModelSelectorItem, ScopedModel, SessionAction, SessionItem,
-    SessionTreeEntry, SlashCommandSpec, Theme, ThemeDetection, ToolCard, TrustOption,
-    TrustSavedDecision, TrustSelector, TrustUpdate, TuiMode, FALLBACK_PREVIEW_LINES,
-    OSC_QUERY_TIMEOUT_MS,
+    builtin_themes, collect_name_collisions, copy_text, detect_terminal_theme,
+    detect_terminal_theme_for_auto, drain_osc_tty, encode_kitty, format_collision_diagnostic,
+    format_context_path, format_display_path, infer_source_info, interactive_settings_list,
+    load_themes_from_dir, parse_auto_theme, parse_http_idle_timeout, resolve_git_branch,
+    theme_files_from_dir, AuthSelectorMode, AuthSelectorProvider, AutocompleteItem, ChatChrome,
+    Component, CustomMessage, DoubleEscapeAction, ExtraAutocompleteProvider, FilterMode,
+    InteractiveSession, Keybindings, LiveAutocompleteQuery, LoadedResourceItem, MermaidMode,
+    ModelSelectorItem, ScopedModel, SessionAction, SessionItem, SessionTreeEntry, SlashCommandSpec,
+    Theme, ThemeDetection, ToolCard, TrustOption, TrustSavedDecision, TrustSelector, TrustUpdate,
+    TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{
@@ -168,6 +220,30 @@ fn apply_offline_mode(raw: &[String]) {
     }
 }
 
+/// `pi --davinci` opens the davinci TUI (`docs/ui/design.md`). It is behind a
+/// flag while the screens are being built; it becomes the interactive UI once
+/// every surface is wired to real state, and the old chrome is deleted then.
+fn run_davinci(raw: &[String]) -> Result<i32, String> {
+    use pi_tui::davinci;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut model = davinci::boot(raw, 100, 44);
+    davinci::fixtures::dress(&mut model);
+    model.cwd = cwd.display().to_string();
+    if let Some(branch) = pi_tui::resolve_git_branch(&cwd) {
+        model.branch = branch;
+    }
+
+    davinci::runtime::run(&mut model, |model, text| {
+        model.transcript.push(davinci::model::Entry::Gap);
+        model.transcript.push(davinci::model::Entry::prose(&format!(
+            "Not wired yet: {text}"
+        )));
+    })
+    .map_err(|err| err.to_string())?;
+    Ok(0)
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     match run(raw) {
@@ -181,6 +257,9 @@ fn main() {
 
 fn run(raw: Vec<String>) -> Result<i32, String> {
     apply_offline_mode(&raw);
+    if raw.iter().any(|arg| arg == "--davinci") {
+        return run_davinci(&raw);
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     apply_http_proxy_settings(
         load_merged_settings(&default_agent_dir(), &cwd)
@@ -289,8 +368,14 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         return run_rpc(&parsed, &mut agent);
     }
 
-    let stdin_tty = io::stdin().is_terminal();
-    let stdout_tty = io::stdout().is_terminal();
+    // Fixture: force the interactive path without a TTY so tests can inspect
+    // the rendered chrome (line-session mode).
+    let force_interactive = matches!(
+        std::env::var("PI_FORCE_INTERACTIVE").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let stdin_tty = io::stdin().is_terminal() || force_interactive;
+    let stdout_tty = io::stdout().is_terminal() || force_interactive;
     if parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty {
         let _ = tools_manager::ensure_managed_tools();
         return run_print(&parsed, &mut agent);
@@ -722,6 +807,43 @@ fn apply_resolved_models(parsed: &Args, agent: &mut Agent) -> Result<(), String>
             }
         }
         return Ok(());
+    }
+
+    // TS `findInitialModel` steps 3 and 4: the saved default from settings when
+    // its provider has auth, then the first available model — preferring each
+    // known provider's default id. Without these a plain `pi` fell through to
+    // the hardcoded `google` with an empty model id.
+    if parsed.provider.is_none() && parsed.model.is_none() {
+        let settings = load_settings(&default_agent_dir());
+        if let (Some(provider), Some(id)) = (&settings.default_provider, &settings.default_model) {
+            if let Some(model) = find_model(&snapshot.available, provider, id) {
+                agent.provider = model.provider.clone();
+                agent.model_id = model.id.clone();
+                agent.context_window = model.context_window;
+                if parsed.thinking.is_none() {
+                    if let Some(level) = settings
+                        .model_thinking_levels
+                        .as_ref()
+                        .and_then(|levels| levels.get(&format!("{provider}/{id}")))
+                        .or(settings.default_thinking_level.as_ref())
+                        .and_then(|level| pi_protocol::ThinkingLevel::parse(level))
+                    {
+                        agent.thinking_level = level;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        let fallback = model_resolver::DEFAULT_MODEL_PER_PROVIDER
+            .iter()
+            .find_map(|(provider, id)| find_model(&snapshot.available, provider, id))
+            .or_else(|| snapshot.available.first());
+        if let Some(model) = fallback {
+            agent.provider = model.provider.clone();
+            agent.model_id = model.id.clone();
+            agent.context_window = model.context_window;
+            return Ok(());
+        }
     }
 
     let (provider, model_id) = parse_model_ref(
@@ -2087,6 +2209,7 @@ fn emit_session_shutdown(parsed: &Args) {
     loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
         reason: "quit".into(),
     });
+    crate::js_host::shutdown_js_pool();
 }
 
 fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
@@ -2102,17 +2225,37 @@ fn install_mode_shutdown_watchers(parsed: &Args) {
     });
 }
 
+/// UI brand: the identity mark follows the installed binary name, so a copy
+/// installed as `davinci` presents as davinci while `pi` stays `pi`.
+fn ui_brand() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .filter(|stem| !stem.is_empty() && !stem.eq_ignore_ascii_case("pi-coding-agent"))
+        .unwrap_or_else(|| APP_NAME.to_string())
+}
+
 fn apply_startup_header(session: &mut InteractiveSession, verbose: bool) {
     if session.quiet_startup {
         session.chrome.startup_header = None;
         return;
     }
-    session.chrome.startup_header = Some(build_startup_header(
+    let info = pi_tui::StartupInfo {
+        cwd: Some(session.cwd.to_string_lossy().into_owned()),
+        branch: session.chrome.footer_branch.clone(),
+        model: session.current_model().map(str::to_string),
+        session_restored: false,
+    };
+    session.chrome.startup_header = Some(pi_tui::build_startup_header_with(
         &session.chrome.theme,
-        APP_NAME,
+        &ui_brand(),
         VERSION,
         &session.keybindings,
         verbose || session.chrome.tools_expanded,
+        &info,
     ));
 }
 
@@ -2222,7 +2365,63 @@ fn tui_options_from_session(
     )
 }
 
+/// Diagnostic for `PI_PERF_LOG`: how long one keystroke spent handling input
+/// versus rendering, with the document size that produced it.
+fn log_key_timing(
+    path: &Path,
+    input: std::time::Duration,
+    render: std::time::Duration,
+    session: &InteractiveSession,
+) {
+    use std::io::Write;
+    let line = format!(
+        "input_us={} render_us={} transcript_lines={} width={}
+",
+        input.as_micros(),
+        render.as_micros(),
+        session.chrome.transcript.lines.len(),
+        session.width,
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn sync_hosted_chrome(tui: &mut InteractiveTui, panes: &ChromePanes, session: &InteractiveSession) {
+    sync_hosted_chrome_mut(tui, panes, session)
+}
+
+/// Move lines swallowed from `println!`/`eprintln!` while the TUI owned the
+/// screen into the transcript. Returns true when anything was drained.
+fn drain_hosted_lines(session: &mut InteractiveSession) -> bool {
+    let pending = HOSTED_PENDING_LINES
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return false;
+    }
+    let status = session.chrome.status.clone();
+    let mut drained = false;
+    for (role, text) in pending {
+        if text.is_empty() || text == status {
+            continue;
+        }
+        session.chrome.transcript.push(role, text);
+        drained = true;
+    }
+    drained
+}
+
+fn sync_hosted_chrome_mut(
+    tui: &mut InteractiveTui,
+    panes: &ChromePanes,
+    session: &InteractiveSession,
+) {
     panes.sync(
         session.chrome.render_document(session.width),
         session.chrome.render_dock(session.width),
@@ -2232,6 +2431,252 @@ fn sync_hosted_chrome(tui: &mut InteractiveTui, panes: &ChromePanes, session: &I
     }
     tui.invalidate();
     tui.render_now(false);
+}
+
+thread_local! {
+    /// Chrome panes of the live raw-mode TUI. Set for the lifetime of
+    /// `run_raw_session` so the streaming turn can repaint mid-turn without
+    /// threading panes through every submit call site.
+    static ACTIVE_PANES: std::cell::RefCell<Option<ChromePanes>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_active_panes<T>(f: impl FnOnce(Option<&ChromePanes>) -> T) -> T {
+    ACTIVE_PANES.with(|slot| f(slot.borrow().as_ref()))
+}
+
+/// Work verb for the Studio working line (design spec §5).
+fn working_verb(tool_name: &str, args: &serde_json::Value) -> String {
+    let target = |key: &str| {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(|value| {
+                let line = value.lines().next().unwrap_or("");
+                let mut out: String = line.chars().take(48).collect();
+                if line.chars().count() > 48 {
+                    out.push('…');
+                }
+                out
+            })
+            .unwrap_or_default()
+    };
+    match tool_name {
+        "read" | "ls" => format!("studying {}", target("path")),
+        "grep" | "find" => format!("surveying \"{}\"", target("pattern")),
+        "bash" | "powershell" => format!("testing {}", target("command")),
+        "edit" | "write" => format!("constructing {}", target("path")),
+        "memory_search" => format!("recalling {}", target("query")),
+        name if name.starts_with("graph") => "tracing the graph".into(),
+        _ => format!("measuring {tool_name}"),
+    }
+}
+
+/// Apply one live agent event to the chrome: transcript text, working verb,
+/// and tool cards. Used while the worker streams and for the post-join drain.
+fn apply_stream_event(
+    session: &mut InteractiveSession,
+    render_host: &Arc<Mutex<ExtensionHost>>,
+    event: &AgentEvent,
+    verb: &mut String,
+    pushed_assistant: &mut bool,
+) {
+    match event {
+        AgentEvent::ToolExecutionStart {
+            tool_name, args, ..
+        } => {
+            *verb = working_verb(tool_name, args);
+        }
+        AgentEvent::MessageStart { message } if message.role == "assistant" => {
+            *verb = "composing".into();
+        }
+        AgentEvent::MessageEnd { message } if message.role == "assistant" => {
+            let text = content_text(&message.content);
+            if !text.trim().is_empty() {
+                let text = render_host
+                    .try_lock()
+                    .map(|h| h.transform_markdown(&text, "assistant", false, 80))
+                    .unwrap_or(text);
+                session.chrome.transcript.push("assistant", text);
+                *pushed_assistant = true;
+            }
+        }
+        _ => {}
+    }
+    let host_guard = render_host.try_lock().ok();
+    apply_tool_events(
+        &mut session.chrome,
+        std::slice::from_ref(event),
+        host_guard.as_deref(),
+        session.width,
+    );
+}
+
+/// Run one agent turn on a worker thread while this thread keeps the TUI
+/// alive: live tool lines, a Studio working line with the 4-frame spinner,
+/// Esc/Ctrl+C interrupt, and Enter queueing follow-up prompts.
+///
+/// Returns `(reply, events, queued_prompts)`.
+fn run_streaming_turn(
+    parsed: &Args,
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    tui: &mut InteractiveTui,
+    panes: &ChromePanes,
+    host: Arc<Mutex<ExtensionHost>>,
+) -> (String, Vec<AgentEvent>, Vec<String>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<AgentEvent>();
+    let abort = Arc::new(AtomicBool::new(false));
+    agent.abort_signal = Some(abort.clone());
+    agent.event_sink = Some(EventSink(Arc::new(move |event| {
+        let _ = event_tx.send(event.clone());
+    })));
+    let mut queued = Vec::new();
+    let mut pushed_assistant = false;
+    let mut verb = String::from("thinking");
+    let render_host = host.clone();
+    let outcome = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| complete_prompt_with_host(parsed, agent, Some(host), false));
+        let frames = pi_tui::glyphs::SPINNER_FRAMES;
+        let mut frame = 0_usize;
+        let mut last_spin = std::time::Instant::now();
+        let started = std::time::Instant::now();
+        loop {
+            let mut dirty = false;
+            while let Ok(event) = event_rx.try_recv() {
+                apply_stream_event(
+                    session,
+                    &render_host,
+                    &event,
+                    &mut verb,
+                    &mut pushed_assistant,
+                );
+                dirty = true;
+            }
+            dirty |= drain_hosted_lines(session);
+            if worker.is_finished() {
+                break;
+            }
+            if last_spin.elapsed() >= std::time::Duration::from_millis(250) {
+                frame = (frame + 1) % frames.len();
+                last_spin = std::time::Instant::now();
+                dirty = true;
+            }
+            let theme = session.chrome.theme.clone();
+            let elapsed = started.elapsed().as_secs();
+            let hint = if queued.is_empty() {
+                "esc interrupt".to_string()
+            } else {
+                format!("esc interrupt · {} queued", queued.len())
+            };
+            session.chrome.working_message = Some(format!(
+                "{} {} {}",
+                theme.fg("primary", frames[frame]),
+                theme.fg("text", &verb),
+                theme.fg("dim", &format!("· {elapsed}s · {hint}")),
+            ));
+            if dirty {
+                sync_hosted_chrome(tui, panes, session);
+            }
+            if crossterm::event::poll(std::time::Duration::from_millis(40)).unwrap_or(false) {
+                match crossterm::event::read() {
+                    Ok(crossterm::event::Event::Key(key)) => {
+                        if key.kind != crossterm::event::KeyEventKind::Press
+                            && key.kind != crossterm::event::KeyEventKind::Repeat
+                        {
+                            continue;
+                        }
+                        let bytes = key_event_to_bytes(&key);
+                        if bytes == "\x1b" || bytes == "\x03" {
+                            abort.store(true, Ordering::Relaxed);
+                            session.chrome.status =
+                                "interrupting · waiting for the current step".into();
+                            sync_hosted_chrome(tui, panes, session);
+                            continue;
+                        }
+                        match session.handle_bytes(&bytes) {
+                            pi_tui::SessionAction::Submit(text) => {
+                                if !text.trim().is_empty() {
+                                    session
+                                        .chrome
+                                        .transcript
+                                        .push("system", format!("queued: {text}"));
+                                    queued.push(text);
+                                }
+                            }
+                            pi_tui::SessionAction::Quit => {
+                                abort.store(true, Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
+                        sync_hosted_chrome(tui, panes, session);
+                    }
+                    Ok(crossterm::event::Event::Resize(cols, rows)) => {
+                        session.width = cols as usize;
+                        tui.set_terminal_size(cols as usize, rows as usize);
+                        sync_hosted_chrome(tui, panes, session);
+                    }
+                    _ => {}
+                }
+            } else {
+                tui.tick(40);
+            }
+        }
+        worker.join()
+    });
+    agent.abort_signal = None;
+    agent.event_sink = None;
+    session.chrome.working_message = None;
+    session.chrome.status.clear();
+    let worker_panicked = outcome.is_err();
+    let (reply, events) = outcome.unwrap_or_else(|_| {
+        (
+            String::new(),
+            vec![AgentEvent::AgentEnd {
+                messages: Vec::new(),
+                will_retry: false,
+            }],
+        )
+    });
+    // Drain the events that raced the worker's exit — with a short turn
+    // (no tools) every event lands here, including the assistant reply.
+    while let Ok(event) = event_rx.try_recv() {
+        apply_stream_event(
+            session,
+            &render_host,
+            &event,
+            &mut verb,
+            &mut pushed_assistant,
+        );
+    }
+    if !pushed_assistant {
+        let reply = reply.trim();
+        if worker_panicked {
+            session
+                .chrome
+                .transcript
+                .push("error", "the turn crashed; session state is preserved");
+        } else if agent.aborted || abort.load(std::sync::atomic::Ordering::Relaxed) {
+            session.chrome.transcript.push("system", "interrupted");
+        } else if reply.is_empty() {
+            session
+                .chrome
+                .transcript
+                .push("system", "the model returned no text");
+        } else if reply.starts_with("Provider error") {
+            session.chrome.transcript.push("error", reply);
+        } else {
+            let text = render_host
+                .try_lock()
+                .map(|h| h.transform_markdown(reply, "assistant", false, 80))
+                .unwrap_or_else(|_| reply.to_string());
+            session.chrome.transcript.push("assistant", text);
+        }
+    }
+    drain_hosted_lines(session);
+    refresh_chrome_footer(session, agent);
+    sync_hosted_chrome(tui, panes, session);
+    (reply, events, queued)
 }
 
 fn run_interactive(
@@ -2262,6 +2707,26 @@ fn run_interactive(
             name: model.name.clone(),
         })
         .collect();
+    {
+        // Every catalog model stays discoverable: providers without
+        // credentials are listed dimmed with a /login hint.
+        let snapshot = load_model_runtime(parsed);
+        let available: std::collections::BTreeSet<String> = snapshot
+            .available
+            .iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect();
+        session.locked_model_items = snapshot
+            .all
+            .iter()
+            .filter(|model| !available.contains(&format!("{}/{}", model.provider, model.id)))
+            .map(|model| ModelSelectorItem {
+                provider: model.provider.clone(),
+                id: model.id.clone(),
+                name: model.name.clone(),
+            })
+            .collect();
+    }
     if let Some(index) = session
         .models
         .iter()
@@ -2272,12 +2737,17 @@ fn run_interactive(
     session.cwd = agent.cwd.clone();
     session.slash_commands = interactive_slash_commands(agent, parsed);
     session.extra_autocomplete = interactive_extra_autocomplete(parsed);
-    session.login_providers = pi_ai::oauth_providers()
+    // Every provider (OAuth and API-key) completes after `/login `, not just
+    // the OAuth subset.
+    let mut login_provider_ids: Vec<String> = PROVIDER_SPECS
         .iter()
-        .map(|name| (*name).to_string())
+        .map(|spec| spec.id.to_string())
         .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
         .chain(loaded_extension_host(parsed).js_oauth_provider_names())
         .collect();
+    login_provider_ids.sort();
+    login_provider_ids.dedup();
+    session.login_providers = login_provider_ids;
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     session.double_escape_action =
         DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
@@ -2360,7 +2830,8 @@ fn run_interactive(
     session.extra_autocomplete = interactive_extra_autocomplete(parsed);
     replay_custom_messages(agent, &mut session, &host);
     let _ = FALLBACK_PREVIEW_LINES;
-    refresh_interactive_models(parsed, &mut session);
+    session.chrome.status = catalog_refresh::refresh_status_refreshing().into();
+    start_catalog_refresh_async(parsed);
     apply_startup_notices(
         &mut session,
         &stored,
@@ -2368,6 +2839,8 @@ fn run_interactive(
         migrated_auth_providers,
     );
     show_loaded_resources(&mut session, agent, &host, parsed);
+    refresh_chrome_footer(&mut session, agent);
+    session.chrome.transcript.agent_label = ui_brand();
     apply_startup_header(&mut session, parsed.verbose);
     if let Some(line) = model_scope_startup_line(&session) {
         println!("{line}");
@@ -2428,7 +2901,14 @@ fn run_interactive(
         stored.image_auto_resize(),
     )?;
     if let Some(prompt) = &prepared.text {
-        if !submit_user_message(parsed, agent, &mut session, prompt, &prepared.images)? {
+        if !submit_user_message(
+            parsed,
+            agent,
+            &mut session,
+            prompt,
+            &prepared.images,
+            tui_host.as_mut().map(|(tui, _)| tui),
+        )? {
             dispose_interactive(
                 parsed,
                 agent,
@@ -2444,7 +2924,14 @@ fn run_interactive(
         }
     }
     for extra in &prepared.remaining_messages {
-        if !submit_user_message(parsed, agent, &mut session, extra, &[])? {
+        if !submit_user_message(
+            parsed,
+            agent,
+            &mut session,
+            extra,
+            &[],
+            tui_host.as_mut().map(|(tui, _)| tui),
+        )? {
             dispose_interactive(
                 parsed,
                 agent,
@@ -2555,9 +3042,21 @@ fn run_raw_session(
     stored: &settings::Settings,
 ) -> Result<i32, String> {
     let _raw = RawModeGuard::enter()?;
+    ACTIVE_PANES.with(|slot| *slot.borrow_mut() = Some(panes.clone()));
+    HOSTED_TUI_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    struct PanesGuard;
+    impl Drop for PanesGuard {
+        fn drop(&mut self) {
+            ACTIVE_PANES.with(|slot| *slot.borrow_mut() = None);
+            HOSTED_TUI_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _panes_guard = PanesGuard;
     let mut stored = stored.clone();
     // Gate reloads on the settings file's mtime; a full read+parse on every
     // input event is wasted work per keystroke (worse on network home dirs).
+    // `PI_PERF_LOG=<file>` records per-keystroke input and render timings.
+    let perf_log = std::env::var_os("PI_PERF_LOG").map(PathBuf::from);
     let settings_path = default_agent_dir().join("settings.json");
     let mut settings_stamp = std::fs::metadata(&settings_path)
         .and_then(|meta| meta.modified())
@@ -2584,6 +3083,8 @@ fn run_raw_session(
             tui.tick(50);
             let mut dirty = poll_llama_job(session);
             dirty |= tick_custom_overlay(parsed, session);
+            dirty |= poll_catalog_refresh(parsed, session);
+            dirty |= drain_hosted_lines(session);
             if dirty {
                 sync_hosted_chrome(&mut tui, &panes, session);
             }
@@ -2597,6 +3098,7 @@ fn run_raw_session(
                     continue;
                 }
                 let bytes = key_event_to_bytes(&key);
+                let perf_started = perf_log.is_some().then(std::time::Instant::now);
                 if host.dispatch_terminal_input(&bytes) {
                     session.apply_extension_ui_calls(&host.ui_calls);
                     sync_hosted_chrome(&mut tui, &panes, session);
@@ -2613,11 +3115,25 @@ fn run_raw_session(
                     });
                     apply_suspend(session, true);
                     tui.start();
+                    tui.request_render(true);
                     sync_hosted_chrome(&mut tui, &panes, session);
                     continue;
                 }
+                let perf_after_input = perf_log.is_some().then(std::time::Instant::now);
                 if !apply_session_action(parsed, agent, session, action, Some(&mut tui))? {
                     break;
+                }
+                if let (Some(path), Some(started), Some(after_input)) =
+                    (perf_log.as_ref(), perf_started, perf_after_input)
+                {
+                    let render_started = std::time::Instant::now();
+                    sync_hosted_chrome(&mut tui, &panes, session);
+                    log_key_timing(
+                        path,
+                        after_input.duration_since(started),
+                        render_started.elapsed(),
+                        session,
+                    );
                 }
             }
             crossterm::event::Event::Mouse(mouse) => {
@@ -2661,6 +3177,7 @@ fn run_raw_session(
         if session.show_terminal_progress {
             tui.set_progress(true);
         }
+        drain_hosted_lines(session);
         sync_hosted_chrome(&mut tui, &panes, session);
     }
     dispose_interactive(parsed, agent, Some((tui, panes)), session, &stored, false);
@@ -3020,6 +3537,19 @@ fn apply_session_action(
         }
         SessionAction::Clear => Ok(true),
         SessionAction::SelectModel(value) => {
+            if session
+                .locked_model_items
+                .iter()
+                .any(|item| item.key() == value)
+            {
+                let provider = value.split('/').next().unwrap_or("provider").to_string();
+                session.chrome.status = format!("login required · /login {provider}");
+                session.chrome.transcript.push(
+                    "system",
+                    format!("{value} needs credentials: /login {provider}"),
+                );
+                return Ok(true);
+            }
             let (provider, model_id) = parse_model_ref("google", Some(&value));
             agent.provider = provider;
             agent.model_id = model_id;
@@ -3205,6 +3735,7 @@ fn submit_user_message(
     session: &mut InteractiveSession,
     prompt: &str,
     images: &[pi_ai::MessageContent],
+    mut tui: Option<&mut InteractiveTui>,
 ) -> Result<bool, String> {
     let prepared = prepare_user_input(parsed, agent, prompt, images, "interactive", Some(session))?;
     let PreparedInput::Ready { text, images } = prepared else {
@@ -3212,22 +3743,54 @@ fn submit_user_message(
     };
     session.chrome.transcript.push("user", &text);
     agent.prompt_with(&text, &images);
-    let (reply, events) = complete_prompt(parsed, agent);
-    let host = loaded_extension_host(parsed);
-    apply_tool_events(&mut session.chrome, &events, Some(&host), session.width);
-    apply_progress_events(session, &events);
-    let reply = host.transform_markdown(&reply, "assistant", false, 80);
-    session.chrome.transcript.push("assistant", &reply);
-    apply_cache_miss_notices(
-        &mut session.chrome,
-        agent,
-        load_merged_settings(&default_agent_dir(), &agent.cwd)
-            .show_cache_miss_notices
-            .unwrap_or(false),
-    );
-    refresh_chrome_footer(session, agent);
-    session.chrome.editor.handle_input("");
-    println!("{reply}");
+    // Inside the raw-mode TUI the turn runs on a worker thread so the
+    // interface keeps painting (spinner, live tool lines, Esc interrupt).
+    let streaming = with_active_panes(|panes| panes.cloned());
+    let queued = match (streaming, tui.as_deref_mut()) {
+        (Some(panes), Some(tui)) => {
+            let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
+            let (_, events, queued) = run_streaming_turn(parsed, agent, session, tui, &panes, host);
+            apply_progress_events(session, &events);
+            Some(queued)
+        }
+        _ => None,
+    };
+    match queued {
+        Some(queued) => {
+            refresh_chrome_footer(session, agent);
+            session.chrome.editor.handle_input("");
+            for follow_up in queued {
+                if !submit_user_message(
+                    parsed,
+                    agent,
+                    session,
+                    &follow_up,
+                    &[],
+                    tui.as_deref_mut(),
+                )? {
+                    return Ok(false);
+                }
+            }
+        }
+        None => {
+            let (reply, events) = complete_prompt(parsed, agent);
+            let host = loaded_extension_host(parsed);
+            apply_tool_events(&mut session.chrome, &events, Some(&host), session.width);
+            apply_progress_events(session, &events);
+            let reply = host.transform_markdown(&reply, "assistant", false, 80);
+            session.chrome.transcript.push("assistant", &reply);
+            apply_cache_miss_notices(
+                &mut session.chrome,
+                agent,
+                load_merged_settings(&default_agent_dir(), &agent.cwd)
+                    .show_cache_miss_notices
+                    .unwrap_or(false),
+            );
+            refresh_chrome_footer(session, agent);
+            session.chrome.editor.handle_input("");
+            println!("{reply}");
+        }
+    }
     Ok(true)
 }
 
@@ -3240,7 +3803,9 @@ fn handle_user_line(
 ) -> Result<bool, String> {
     match slash::parse_line(text) {
         SlashAction::Quit => Ok(false),
-        SlashAction::Prompt(prompt) => submit_user_message(parsed, agent, session, &prompt, &[]),
+        SlashAction::Prompt(prompt) => {
+            submit_user_message(parsed, agent, session, &prompt, &[], tui)
+        }
         SlashAction::OpenThinking => {
             sync_session_thinking(session, agent);
             session.open_thinking_selector(
@@ -3788,21 +4353,25 @@ fn apply_tool_events(
                 is_error,
                 ..
             } => {
+                // The live card becomes a permanent one-line transcript entry
+                // (spec §6 ToolCall); keeping the card too would render the
+                // whole tool history twice, once inline and once at the dock.
                 let finished = chrome
                     .tool_cards
-                    .iter_mut()
-                    .find(|card| card.tool_call_id == *tool_call_id)
-                    .map(|card| {
+                    .iter()
+                    .position(|card| card.tool_call_id == *tool_call_id)
+                    .map(|index| {
+                        let mut card = chrome.tool_cards.remove(index);
                         card.finish(result, *is_error);
                         if let Some(host) = host {
                             card.result_lines =
                                 host.render_tool_result_lines(&card.tool_name, result, width);
                         }
-                        (card.image_payloads(), card.format_tool_execution())
+                        card
                     });
-                if let Some((images, formatted)) = finished {
+                if let Some(card) = finished {
                     let base_id = chrome.tool_cards.len() as u32;
-                    for (index, (data, _)) in images.into_iter().enumerate() {
+                    for (index, (data, _)) in card.image_payloads().into_iter().enumerate() {
                         chrome.transcript.push(
                             "image",
                             encode_kitty(
@@ -3814,7 +4383,19 @@ fn apply_tool_events(
                             ),
                         );
                     }
-                    chrome.transcript.push("tool", formatted);
+                    let mut block = card.summary_block();
+                    if !card.result_lines.is_empty() {
+                        for line in &card.result_lines {
+                            block.push_str("\n  ");
+                            block.push_str(line);
+                        }
+                    } else if chrome.tools_expanded {
+                        for line in card.format_tool_execution().lines().take(40) {
+                            block.push_str("\n    ");
+                            block.push_str(line);
+                        }
+                    }
+                    chrome.transcript.push("tool", block);
                 }
             }
             _ => {}
@@ -4488,9 +5069,8 @@ fn try_extension_slash(
     let mut host = loaded_extension_host(parsed);
     apply_graph_session_context(parsed, agent, &host);
     if let Some(result) = host.execute_native_command(name, args)? {
-        let message = format!("/{name}: {}", format_extension_command_result(result));
-        session.chrome.status = message.clone();
-        println!("{message}");
+        push_native_panel(session, name, &result);
+        session.chrome.status = format!("/{name}");
         return Ok(true);
     }
     let path = host
@@ -4527,6 +5107,124 @@ fn format_extension_command_result(result: serde_json::Value) -> String {
         serde_json::Value::String(text) => text,
         value => serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
     }
+}
+
+/// `camelCase` / `snake_case` JSON keys → spaced labels for panel rows.
+fn humanize_key(key: &str) -> String {
+    let mut out = String::new();
+    for ch in key.chars() {
+        if ch == '_' || ch == '-' {
+            out.push(' ');
+        } else if ch.is_uppercase() {
+            out.push(' ');
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
+fn panel_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Bool(true) => "✓".into(),
+        serde_json::Value::Bool(false) => "off".into(),
+        serde_json::Value::Null => "—".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Instrument name + accent role for a native command (design spec §5).
+fn native_instrument(name: &str) -> (&'static str, &'static str, &'static str) {
+    if name.starts_with("memory") {
+        ("memoria", "VECTOR MEMORY", "secondary")
+    } else if name.starts_with("governor") {
+        ("mensura", "TOKEN GOVERNOR", "warning")
+    } else if name.starts_with("graph") {
+        ("grafo", "EXECUTION GRAPH", "primary")
+    } else if name.starts_with("sec") {
+        ("speculum", "SECURITY SCAN", "error")
+    } else {
+        ("instrumenta", "", "primary")
+    }
+}
+
+/// Render a native command result as a framed instrument panel in the
+/// transcript instead of a JSON dump on the status line.
+fn push_native_panel(session: &mut InteractiveSession, name: &str, result: &serde_json::Value) {
+    let theme = session.chrome.theme.clone();
+    let width = session.width.clamp(40, 100);
+    let (instrument, subtitle, accent) = native_instrument(name);
+    let mut body: Vec<String> = Vec::new();
+    match result {
+        serde_json::Value::Object(map) => {
+            // memory-search: hits get score rows, the rest key/value rows.
+            if let Some(hits) = map.get("hits").and_then(|value| value.as_array()) {
+                let query = map.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                body.push(format!(
+                    "{} {}",
+                    theme.fg("secondary", "⌕"),
+                    theme.fg("text", query)
+                ));
+                if hits.is_empty() {
+                    body.push(theme.fg("muted", "no matches above the relevance floor"));
+                }
+                for hit in hits.iter().take(8) {
+                    let score = hit
+                        .get("score")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0);
+                    let text = hit
+                        .get("text")
+                        .or_else(|| hit.get("summary"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .lines()
+                        .next()
+                        .unwrap_or("");
+                    let mut text: String = text.chars().take(width.saturating_sub(12)).collect();
+                    if text.is_empty() {
+                        text = "(no excerpt)".into();
+                    }
+                    body.push(format!(
+                        "{} {}",
+                        theme.fg("primary", &format!("{score:.2}")),
+                        theme.fg("muted", &text)
+                    ));
+                }
+            } else {
+                for (key, value) in map {
+                    if matches!(
+                        value,
+                        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+                    ) {
+                        continue;
+                    }
+                    let text = panel_value_text(value);
+                    let styled = match value {
+                        serde_json::Value::Bool(true) => theme.fg("success", &text),
+                        serde_json::Value::Bool(false) => theme.fg("dim", &text),
+                        serde_json::Value::Number(_) => theme.fg("text", &text),
+                        _ => theme.fg("muted", &text),
+                    };
+                    let label = format!("{:<20}", humanize_key(key));
+                    body.push(format!("{} {}", theme.fg("muted", &label), styled));
+                }
+            }
+        }
+        serde_json::Value::String(text) => {
+            for line in text.lines().take(30) {
+                body.push(theme.fg("muted", line));
+            }
+        }
+        other => body.push(theme.fg("muted", &other.to_string())),
+    }
+    if body.is_empty() {
+        body.push(theme.fg("dim", "(empty)"));
+    }
+    let panel = theme.panel(instrument, Some(subtitle), accent, &body, width);
+    session.chrome.transcript.push("panel", panel.join("\n"));
 }
 
 fn apply_custom_overlay_result(
@@ -5260,6 +5958,67 @@ fn refresh_chrome_footer(session: &mut InteractiveSession, agent: &Agent) {
         .as_ref()
         .and_then(|store| store.display_name());
     session.chrome.footer_stats = Some(footer_stats_line(agent));
+    session.chrome.footer_model = Some(if agent.model_id.is_empty() {
+        agent.provider.clone()
+    } else {
+        format!("{}/{}", agent.provider, agent.model_id)
+    });
+    session.chrome.footer_context = Some((
+        pi_agent::estimate_context_tokens(&agent.messages),
+        agent.context_window,
+    ));
+    session.chrome.footer_delta = Some(session_delta_stats(agent));
+}
+
+/// `Δfiles +added -removed` across this session's write/edit tool calls.
+fn session_delta_stats(agent: &Agent) -> (u64, u64, u64) {
+    let mut files = std::collections::BTreeSet::new();
+    let mut added = 0_u64;
+    let mut removed = 0_u64;
+    let Some(store) = agent.session.as_ref() else {
+        return (0, 0, 0);
+    };
+    for entry in &store.entries {
+        let Some(message) = entry.message.as_ref() else {
+            continue;
+        };
+        let Some(blocks) = message.get("content").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|value| value.as_str()) != Some("toolCall") {
+                continue;
+            }
+            let name = block.get("name").and_then(|value| value.as_str());
+            let args = block
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            match name {
+                Some("write") => {
+                    if let Some(path) = args.get("path").and_then(|value| value.as_str()) {
+                        files.insert(path.to_string());
+                    }
+                    if let Some(content) = args.get("content").and_then(|value| value.as_str()) {
+                        added += content.lines().count() as u64;
+                    }
+                }
+                Some("edit") => {
+                    if let Some(path) = args.get("path").and_then(|value| value.as_str()) {
+                        files.insert(path.to_string());
+                    }
+                    if let Some(old) = args.get("oldText").and_then(|value| value.as_str()) {
+                        removed += old.lines().count() as u64;
+                    }
+                    if let Some(new) = args.get("newText").and_then(|value| value.as_str()) {
+                        added += new.lines().count() as u64;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (files.len() as u64, added, removed)
 }
 
 fn apply_terminal_title(
@@ -5736,8 +6495,7 @@ fn apply_session_calls(
     }
 }
 
-fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
-    session.chrome.status = catalog_refresh::refresh_status_refreshing().into();
+fn compute_catalog_refresh(parsed: &Args) -> catalog_refresh::CatalogRefreshResult {
     let agent_dir = default_agent_dir();
     let allow_network = std::env::var("PI_OFFLINE").is_err();
     let mut refreshed = catalog_refresh::refresh_model_catalogs(&agent_dir, allow_network, false);
@@ -5747,6 +6505,64 @@ fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
         allow_network,
         false,
     );
+    refreshed
+}
+
+/// Receiver for the startup catalog refresh running on a worker thread. The
+/// synchronous refresh could stall launch for seconds of sequential HTTP
+/// once the cache went stale; the raw loop applies the result when it lands.
+static CATALOG_REFRESH_RX: Mutex<
+    Option<std::sync::mpsc::Receiver<catalog_refresh::CatalogRefreshResult>>,
+> = Mutex::new(None);
+
+fn start_catalog_refresh_async(parsed: &Args) {
+    let parsed = parsed.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(compute_catalog_refresh(&parsed));
+    });
+    if let Ok(mut slot) = CATALOG_REFRESH_RX.lock() {
+        *slot = Some(rx);
+    }
+}
+
+/// Apply a finished background refresh; true when the UI changed.
+fn poll_catalog_refresh(parsed: &Args, session: &mut InteractiveSession) -> bool {
+    let refreshed = {
+        let mut slot = match CATALOG_REFRESH_RX.lock() {
+            Ok(slot) => slot,
+            Err(_) => return false,
+        };
+        let Some(rx) = slot.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                *slot = None;
+                result
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *slot = None;
+                return false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+        }
+    };
+    apply_catalog_result(parsed, session, refreshed);
+    true
+}
+
+fn refresh_interactive_models(parsed: &Args, session: &mut InteractiveSession) {
+    session.chrome.status = catalog_refresh::refresh_status_refreshing().into();
+    let refreshed = compute_catalog_refresh(parsed);
+    apply_catalog_result(parsed, session, refreshed);
+}
+
+fn apply_catalog_result(
+    parsed: &Args,
+    session: &mut InteractiveSession,
+    refreshed: catalog_refresh::CatalogRefreshResult,
+) {
     let snapshot = load_model_runtime(parsed);
     let mut models: Vec<String> = snapshot
         .available
@@ -7547,6 +8363,159 @@ mod tests {
         apply_startup_header(&mut session, false);
         assert!(session.chrome.startup_header.is_none());
         assert!(model_scope_startup_line(&session).is_none());
+    }
+
+    #[test]
+    fn streaming_turn_delivers_offline_reply_to_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        let theme = builtin_themes()[0].clone();
+        let mut session = InteractiveSession::new(theme, "davinci", vec![]);
+        session.width = 100;
+        let mut agent = Agent::new("test system prompt");
+        agent.cwd = dir.path().to_path_buf();
+        agent.provider = "openai-codex".into();
+        agent.model_id = "gpt-5.6-sol".into();
+        let parsed = Args {
+            offline: true,
+            no_extensions: true,
+            ..Args::default()
+        };
+        let panes = ChromePanes::new(Vec::new(), Vec::new());
+        let options = InteractiveTuiOptions {
+            tui_mode: TuiMode::Regular,
+            show_hardware_cursor: false,
+            log_directory: dir.path().to_path_buf(),
+            terminal: Box::new(pi_tui::MemoryTerminal::new(100, 30)),
+            theme: builtin_themes()[0].clone(),
+            copy_on_select: false,
+            open_url: None,
+            on_right_click_paste: None,
+            copy_selection: None,
+        };
+        let mut tui = create_interactive_tui(options);
+        remount_chrome_panes(&mut tui, &panes);
+        ACTIVE_PANES.with(|slot| *slot.borrow_mut() = Some(panes.clone()));
+        let ok = submit_user_message(
+            &parsed,
+            &mut agent,
+            &mut session,
+            "hello there",
+            &[],
+            Some(&mut tui),
+        )
+        .unwrap();
+        ACTIVE_PANES.with(|slot| *slot.borrow_mut() = None);
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+        assert!(ok);
+        let doc = session.chrome.render_document(100).join("\n");
+        let plain = pi_tui::strip_terminal_sequences(&doc);
+        assert!(plain.contains("> hello there"), "{plain}");
+        assert!(
+            plain.contains("(offline) received"),
+            "assistant reply missing from transcript: {plain}"
+        );
+        assert!(session.chrome.working_message.is_none());
+    }
+
+    #[test]
+    fn keystroke_pipeline_stays_fast_on_long_transcripts() {
+        let theme = builtin_themes()[0].clone();
+        let mut session =
+            InteractiveSession::new(theme, "davinci", vec!["openai-codex/gpt-5.6-sol".into()]);
+        session.width = 120;
+        for i in 0..400 {
+            session
+                .chrome
+                .transcript
+                .push("user", format!("prompt {i}"));
+            session.chrome.transcript.push(
+                "assistant",
+                format!("Answer {i} with some *markdown* and `code` and a\nsecond line."),
+            );
+            session
+                .chrome
+                .transcript
+                .push("tool", format!("✓ manus · cargo check step {i}  0.3{i}s"));
+        }
+        session.chrome.footer_cwd = Some("C:\\dev\\davinci-rust".into());
+        session.chrome.footer_model = Some("openai-codex/gpt-5.6-sol".into());
+        session.chrome.footer_context = Some((47_000, 200_000));
+        // Warm the render memo like a running session.
+        let _ = session.chrome.render_document(120);
+        let started = std::time::Instant::now();
+        let keys = 60;
+        for i in 0..keys {
+            let ch = char::from(b'a' + (i % 26) as u8);
+            let _ = session.handle_bytes(&ch.to_string());
+            let _ = session.chrome.render_document(120);
+            let _ = session.chrome.render_dock(120);
+        }
+        let per_key = started.elapsed() / keys;
+        assert!(
+            per_key < std::time::Duration::from_millis(12),
+            "keystroke pipeline too slow: {per_key:?} per key"
+        );
+    }
+
+    #[test]
+    fn davinci_frame_composes_transcript_composer_and_status_bar() {
+        let theme = builtin_themes()[0].clone();
+        let mut session =
+            InteractiveSession::new(theme, "davinci", vec!["openai-codex/gpt-5.6-sol".into()]);
+        session.width = 100;
+        session.chrome.transcript.agent_label = "davinci".into();
+        session.chrome.transcript.push("user", "run the tests");
+        session
+            .chrome
+            .transcript
+            .push("tool", "✓ manus · cargo test -p pi-agent  1.84s");
+        session.chrome.transcript.push(
+            "tool",
+            "× manus · cargo test -p pi-session  0.42s\n  ! error[E0308] mismatched types · store.rs:118",
+        );
+        session.chrome.transcript.push(
+            "assistant",
+            "The failing case builds a path with a forward slash.",
+        );
+        push_native_panel(
+            &mut session,
+            "governor-status",
+            &serde_json::json!({
+                "enabled": true,
+                "compressedOutputs": 14,
+                "deduplicatedReads": 6,
+                "blockedCalls": 0,
+            }),
+        );
+        session.chrome.footer_cwd = Some("C:\\dev\\davinci-rust".into());
+        session.chrome.footer_branch = Some("main".into());
+        session.chrome.footer_model = Some("openai-codex/gpt-5.6-sol".into());
+        session.chrome.footer_context = Some((47_000, 200_000));
+        session.chrome.footer_delta = Some((3, 42, 11));
+        let document = session.chrome.render_document(100).join("\n");
+        let dock = session.chrome.render_dock(100).join("\n");
+        println!("─ document ─\n{document}\n─ dock ─\n{dock}");
+        let plain_doc = pi_tui::strip_terminal_sequences(&document);
+        let plain_dock = pi_tui::strip_terminal_sequences(&dock);
+        assert!(plain_doc.contains("> run the tests"), "{plain_doc}");
+        assert!(plain_doc.contains("◆ davinci"), "{plain_doc}");
+        assert!(plain_doc.contains("✓ manus · cargo test -p pi-agent"));
+        assert!(plain_doc.contains("! error[E0308]"), "{plain_doc}");
+        assert!(
+            plain_doc.contains("MENSURA · TOKEN GOVERNOR"),
+            "{plain_doc}"
+        );
+        assert!(plain_doc.contains("compressed outputs"), "{plain_doc}");
+        assert!(plain_dock.contains("›"), "{plain_dock}");
+        assert!(plain_dock.contains("enter send"), "{plain_dock}");
+        assert!(plain_dock.contains("47k/200k"), "{plain_dock}");
+        assert!(plain_dock.contains("Δ3 +42 -11"), "{plain_dock}");
+        assert!(plain_dock.contains("main"), "{plain_dock}");
     }
 
     #[test]
