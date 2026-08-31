@@ -2465,6 +2465,31 @@ mod tests {
     }
 
     #[test]
+    fn compaction_retention_none_strips_all_cache_fields() {
+        let anthropic = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("anthropic");
+        // main.rs:644 passes cache_retention "none" for compaction requests,
+        // matching TS compaction.ts:591.
+        let options = StreamOptions {
+            session_id: Some("sess-compact".into()),
+            cache_retention: Some("none".into()),
+            ..StreamOptions::default()
+        };
+        let body = request_body_with(
+            &anthropic,
+            &[ChatMessage::text("user", "summarize")],
+            Some("sys"),
+            &[],
+            &options,
+        );
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(!raw.contains("cache_control"));
+        assert!(!raw.contains("prompt_cache_key"));
+    }
+
+    #[test]
     fn affinity_headers_follow_ts_rules() {
         let session = StreamOptions {
             session_id: Some("sess-aff".into()),
