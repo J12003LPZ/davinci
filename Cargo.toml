@@ -16,7 +16,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.84.4"
+# The product version. It moved past the TypeScript parity pin (pi 0.84.4,
+# vendor commit 853a80d2) when the davinci UI landed; the identity presented
+# to providers and to JavaScript extensions still reports 0.84.4, because that
+# is a wire contract rather than a release number.
+version = "0.85.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/earendil-works/pi"

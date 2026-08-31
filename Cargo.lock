@@ -784,7 +784,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pi-agent"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "base64",
  "image",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ai"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "base64",
  "pi-protocol",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "pi-client"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "pi-protocol",
  "serde",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "pi-coding-agent"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "base64",
  "clap",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "pi-evals"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "pi-agent",
  "pi-ai",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "pi-parity"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "clap",
  "pi-agent",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "pi-protocol"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "pi-server"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "pi-agent",
  "pi-ai",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "pi-session"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "pi-protocol",
  "serde",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "pi-session-sqlite"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "pi-session",
  "rusqlite",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "pi-telemetry"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "pi-tui"
-version = "0.84.4"
+version = "0.85.0"
 dependencies = [
  "base64",
  "crossterm",
