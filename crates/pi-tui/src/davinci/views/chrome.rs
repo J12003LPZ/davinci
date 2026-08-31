@@ -177,7 +177,10 @@ pub fn composer_with(
 ) -> Vec<Line<'static>> {
     let th = &model.theme;
     let owned = lines.map(<[String]>::to_vec);
-    let entries: Vec<String> = owned.unwrap_or_else(|| vec![model.composer.clone()]);
+    // A composer holding newlines is drawn as the rows the user typed; an
+    // empty one is still one row, so the box never collapses.
+    let entries: Vec<String> =
+        owned.unwrap_or_else(|| model.composer.split('\n').map(str::to_string).collect());
     let last = entries.len().saturating_sub(1);
     let caret_style = if model.blink() {
         Style::default().bg(th.primary).fg(th.background)

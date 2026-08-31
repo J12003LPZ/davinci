@@ -205,6 +205,30 @@ fn walk(root: &Path, depth_limit: u16) -> Vec<(u16, PathBuf, bool)> {
     out
 }
 
+/// Workspace-relative paths for composer completion. Four levels deep and
+/// forward-slashed on every platform, because that is how a path gets typed
+/// into a prompt.
+pub fn completion_paths(cwd: &Path) -> Vec<String> {
+    let mut paths: Vec<String> = walk(cwd, 4)
+        .into_iter()
+        .map(|(_, path, is_dir)| {
+            let relative = path
+                .strip_prefix(cwd)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if is_dir {
+                format!("{relative}/")
+            } else {
+                relative
+            }
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// Memoria sessions (`1f`), from the real session store. Newest first, which
 /// is the order the picker opens in.
 pub fn sessions(session_dir: &Path, now_ms: u64) -> Vec<SessionItem> {
@@ -287,6 +311,7 @@ pub fn dress_from_workspace(model: &mut Model, cwd: &Path, session_dir: &Path) {
     model.changes = git_delta(cwd, &changes);
     model.changes_list = change_rows(cwd, &changes);
     model.tree = workspace_tree(cwd, &changes);
+    model.paths = completion_paths(cwd);
     model.sessions = sessions(session_dir, pi_session::now_ms());
     model.startup = startup(cwd, &branch, !model.sessions.is_empty());
 }

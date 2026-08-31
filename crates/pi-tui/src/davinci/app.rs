@@ -51,6 +51,9 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
 fn composer_rows(model: &Model) -> Vec<Line<'static>> {
     let hint = match (model.screen, model.overlay) {
         (Screen::Memoria, _) => Hint::Recall,
+        // Once the composer holds more than one row, the hint that matters is
+        // how to end it, not the full list.
+        (Screen::Agent, None) if model.composer.contains('\n') => Hint::Multiline,
         (Screen::Agent, None) => Hint::Default,
         _ => Hint::Closable,
     };
@@ -203,6 +206,13 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
                 model.toggle_codex();
                 return Flow::Continue;
             }
+            // Terminals that send neither shift+enter nor alt+enter send
+            // ctrl+j (0x0A) for a newline; it is the third spelling of the
+            // same key.
+            KeyCode::Char('j') => {
+                model.newline();
+                return Flow::Continue;
+            }
             // An unbound control chord is not text; it must never reach the
             // composer.
             KeyCode::Char(_) => return Flow::Continue,
@@ -213,6 +223,17 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     match key.code {
         KeyCode::Esc => model.close(),
         KeyCode::Backspace => model.backspace(),
+        KeyCode::Tab => {
+            model.complete();
+        }
+        // shift+enter and alt+enter both mean "another row", as the hint says.
+        // Terminals disagree about which they send, so both are taken.
+        KeyCode::Enter
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            model.newline();
+        }
         KeyCode::Enter => {
             if model.overlay.is_some() {
                 // An instrument is summoned, used, and dismissed (design.md
@@ -378,6 +399,47 @@ mod tests {
 
         let flow = handle_key(&mut m, key(KeyCode::Enter));
         assert_eq!(flow, Flow::Submit("run the tests".to_string()));
+    }
+
+    #[test]
+    fn the_composer_keeps_the_three_promises_its_hint_line_makes() {
+        let mut m = model(120, 30);
+        m.corpus = vec![crate::davinci::model::CorpusItem::new(
+            "/compact", "", "command",
+        )];
+
+        // tab complete
+        for ch in "/comp".chars() {
+            handle_key(&mut m, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.composer, "/compact ");
+
+        // shift+enter newline — and it must not send
+        m.composer = "first".into();
+        let flow = handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(m.composer, "first\n");
+        // alt+enter and ctrl+j spell the same key on terminals that send them
+        handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        handle_key(&mut m, ctrl('j'));
+        assert_eq!(m.composer, "first\n\n\n");
+
+        // enter send
+        m.composer = "first\nsecond".into();
+        let flow = handle_key(&mut m, key(KeyCode::Enter));
+        assert_eq!(flow, Flow::Submit("first\nsecond".to_string()));
+    }
+
+    #[test]
+    fn a_multiline_composer_is_drawn_as_the_rows_that_were_typed() {
+        let mut m = model(120, 30);
+        m.composer = "first\nsecond".into();
+        let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
+        assert!(rows.iter().any(|row| row.contains("› first")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("second")));
+        // With more than one row in hand, the hint says how to end it.
+        assert!(rows.iter().any(|row| row.contains("shift+enter newline")));
     }
 
     #[test]

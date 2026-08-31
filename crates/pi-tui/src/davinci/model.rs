@@ -516,6 +516,9 @@ pub struct Model {
     /// Everything Instrumenta can reach, and how much of it there is.
     pub corpus: Vec<CorpusItem>,
     pub corpus_total: usize,
+    /// Workspace-relative paths, for completing a file name in the composer.
+    /// Supplied by the shell; the view layer never walks a disk.
+    pub paths: Vec<String>,
     pub sessions: Vec<SessionItem>,
     pub models: Vec<ModelItem>,
     /// Where the model picker says the configuration lives (`1f`).
@@ -569,6 +572,7 @@ impl Model {
             startup: Startup::default(),
             corpus: Vec::new(),
             corpus_total: 0,
+            paths: Vec::new(),
             sessions: Vec::new(),
             models: Vec::new(),
             config_path: String::new(),
@@ -743,6 +747,63 @@ impl Model {
         }
     }
 
+    /// A newline inside the composer. The hint line promises `shift+enter
+    /// newline`; this is what keeps that promise.
+    pub fn newline(&mut self) {
+        if self.overlay.is_some() {
+            return;
+        }
+        self.composer.push('\n');
+    }
+
+    /// Complete the token under the caret against the commands and the
+    /// workspace. Returns whether anything changed, so the caller can leave
+    /// tab alone when there is nothing to complete.
+    ///
+    /// Completion goes as far as every candidate agrees and no further: a
+    /// prefix shared by four files is not a choice the user has made.
+    pub fn complete(&mut self) -> bool {
+        if self.overlay.is_some() {
+            return false;
+        }
+        let start = self
+            .composer
+            .rfind(|ch: char| ch.is_whitespace())
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let token = &self.composer[start..];
+        if token.is_empty() {
+            return false;
+        }
+
+        let candidates: Vec<&str> = if token.starts_with('/') {
+            self.corpus
+                .iter()
+                .filter(|item| item.kind == "command" && item.name.starts_with(token))
+                .map(|item| item.name.as_str())
+                .collect()
+        } else {
+            self.paths
+                .iter()
+                .filter(|path| path.starts_with(token))
+                .map(String::as_str)
+                .collect()
+        };
+        let Some(common) = common_prefix(&candidates) else {
+            return false;
+        };
+        if common.len() <= token.len() {
+            return false;
+        }
+        let only_one = candidates.len() == 1;
+        self.composer.truncate(start);
+        self.composer.push_str(&common);
+        if only_one {
+            self.composer.push(' ');
+        }
+        true
+    }
+
     pub fn backspace(&mut self) {
         let target = if self.overlay == Some(Overlay::Instrumenta) {
             &mut self.query
@@ -815,6 +876,25 @@ fn subsequence(needle: &str, haystack: &str) -> bool {
 }
 
 /// Move a selection index by `delta`, wrapping at both ends.
+/// The longest prefix every candidate shares, or `None` when there are none.
+/// Byte-wise, but only ever cut at a character boundary.
+pub fn common_prefix(candidates: &[&str]) -> Option<String> {
+    let first = candidates.first()?;
+    let mut end = first.len();
+    for candidate in &candidates[1..] {
+        let shared = first
+            .bytes()
+            .zip(candidate.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        end = end.min(shared);
+    }
+    while end > 0 && !first.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(first[..end].to_string())
+}
+
 pub fn wrap_index(index: usize, delta: isize, len: usize) -> usize {
     if len == 0 {
         return 0;
@@ -1098,6 +1178,86 @@ mod tests {
                 kind: "command".into()
             })
         );
+    }
+
+    #[test]
+    fn tab_completes_a_command_as_far_as_every_candidate_agrees() {
+        let mut m = model(120);
+        m.corpus = vec![
+            CorpusItem::new("/compact", "", "command"),
+            CorpusItem::new("/copy", "", "command"),
+            CorpusItem::new("/clone", "", "command"),
+            CorpusItem::new("read", "", "tool"),
+        ];
+
+        m.type_char("/c");
+        // `/compact`, `/copy` and `/clone` share `/c` and nothing more, so
+        // tab reports that it changed nothing rather than choosing.
+        assert!(!m.complete());
+        assert_eq!(m.composer, "/c");
+
+        m.composer = "/co".into();
+        assert!(!m.complete(), "/compact and /copy still disagree");
+        assert_eq!(m.composer, "/co");
+
+        m.composer = "/com".into();
+        assert!(m.complete());
+        assert_eq!(m.composer, "/compact ", "one candidate completes in full");
+    }
+
+    #[test]
+    fn tab_completes_a_path_from_the_workspace_and_leaves_prose_alone() {
+        let mut m = model(120);
+        m.paths = vec![
+            "crates/".into(),
+            "crates/pi-tui/".into(),
+            "crates/pi-tui/src/lib.rs".into(),
+        ];
+
+        m.type_char("read crates/pi-tui/s");
+        assert!(m.complete());
+        assert_eq!(m.composer, "read crates/pi-tui/src/lib.rs ");
+
+        m.composer = "explain the runtime".into();
+        assert!(!m.complete(), "prose has nothing to complete against");
+
+        m.composer = String::new();
+        assert!(!m.complete(), "an empty composer completes to nothing");
+    }
+
+    #[test]
+    fn tab_is_the_palettes_business_only_when_no_instrument_is_open() {
+        let mut m = model(120);
+        m.corpus = vec![CorpusItem::new("/compact", "", "command")];
+        m.toggle_overlay(Overlay::Instrumenta);
+        m.composer = "/comp".into();
+        assert!(!m.complete());
+        assert_eq!(m.composer, "/comp");
+    }
+
+    #[test]
+    fn a_newline_grows_the_composer_without_sending_it() {
+        let mut m = model(120);
+        m.type_char("first");
+        m.newline();
+        m.type_char("second");
+        assert_eq!(m.composer, "first\nsecond");
+        assert!(!m.running, "a newline is not a send");
+        m.submit();
+        assert_eq!(m.composer, "");
+        assert!(m.running);
+    }
+
+    #[test]
+    fn the_common_prefix_is_the_longest_all_candidates_share() {
+        assert_eq!(common_prefix(&[]), None);
+        assert_eq!(common_prefix(&["only"]).as_deref(), Some("only"));
+        assert_eq!(
+            common_prefix(&["/compact", "/copy", "/clone"]).as_deref(),
+            Some("/c")
+        );
+        // Never cut a multi-byte character in half.
+        assert_eq!(common_prefix(&["éa", "éb"]).as_deref(), Some("é"));
     }
 
     #[test]
