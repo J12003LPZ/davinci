@@ -57,7 +57,13 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
         (Screen::Agent, None) => Hint::Default,
         _ => Hint::Closable,
     };
-    chrome::composer(model, None, hint)
+    if model.queued.is_empty() {
+        return chrome::composer(model, None, hint);
+    }
+    // What is waiting sits above what is being typed, in the same box.
+    let mut rows: Vec<String> = model.queued.clone();
+    rows.extend(model.composer.split('\n').map(str::to_string));
+    chrome::composer(model, Some(&rows), hint)
 }
 
 /// The transcript, bottom-anchored: older rows fall off the top like a
@@ -440,6 +446,23 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("second")));
         // With more than one row in hand, the hint says how to end it.
         assert!(rows.iter().any(|row| row.contains("shift+enter newline")));
+    }
+
+    #[test]
+    fn what_is_waiting_to_be_sent_is_visible_above_what_is_being_typed() {
+        let mut m = model(120, 30);
+        m.running = true;
+        m.queued = vec!["then commit".into(), "then push".into()];
+        m.composer = "and open a pr".into();
+        let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
+        for expected in ["then commit", "then push", "and open a pr"] {
+            assert!(
+                rows.iter().any(|row| row.contains(expected)),
+                "{expected} is not on screen"
+            );
+        }
+        // Still exactly one window's worth of rows.
+        assert_eq!(compose(&m, 30).len(), 30);
     }
 
     #[test]

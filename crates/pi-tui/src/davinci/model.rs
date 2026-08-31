@@ -490,6 +490,10 @@ pub struct Model {
     pub codex: bool,
 
     pub composer: String,
+    /// Turns typed while one was already running, waiting their place. They
+    /// sit in the composer box above the line being typed, so what is waiting
+    /// is visible rather than remembered.
+    pub queued: Vec<String>,
     pub query: String,
     pub transcript: Vec<Entry>,
     pub running: bool,
@@ -555,6 +559,7 @@ impl Model {
             overlay: None,
             codex: false,
             composer: String::new(),
+            queued: Vec::new(),
             query: String::new(),
             transcript: Vec::new(),
             running: false,
@@ -831,9 +836,22 @@ impl Model {
         self.running = true;
     }
 
-    /// ctrl+c interrupts the run, never the app (design.md §6).
+    /// Set the composer aside to be sent when the running turn is over.
+    /// Returns whether anything was queued.
+    pub fn queue(&mut self) -> bool {
+        if self.composer.trim().is_empty() {
+            return false;
+        }
+        self.queued.push(std::mem::take(&mut self.composer));
+        true
+    }
+
+    /// ctrl+c interrupts the run, never the app (design.md §6). What was
+    /// waiting to be sent goes with it: the user stopped this train of
+    /// thought, not just this turn.
     pub fn interrupt(&mut self) {
         self.running = false;
+        self.queued.clear();
     }
 
     /// esc closes the instrument in hand and returns to the transcript.
@@ -1246,6 +1264,25 @@ mod tests {
         m.submit();
         assert_eq!(m.composer, "");
         assert!(m.running);
+    }
+
+    #[test]
+    fn a_follow_up_typed_mid_turn_waits_its_place_and_an_interrupt_drops_it() {
+        let mut m = model(120);
+        m.type_char("run the tests");
+        m.submit();
+        assert!(m.running);
+
+        m.type_char("then commit");
+        assert!(m.queue());
+        assert_eq!(m.queued, vec!["then commit".to_string()]);
+        assert_eq!(m.composer, "", "queuing clears the line being typed");
+        assert!(!m.queue(), "an empty composer queues nothing");
+
+        // ctrl+c stops the train of thought, not only the turn in flight.
+        m.interrupt();
+        assert!(!m.running);
+        assert!(m.queued.is_empty());
     }
 
     #[test]

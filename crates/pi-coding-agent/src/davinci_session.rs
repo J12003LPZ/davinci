@@ -295,6 +295,66 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
 /// `esc` and `ctrl+c` set the abort flag; every other key is ignored until the
 /// turn ends, so a keystroke can never land in the middle of a tool call.
 #[allow(clippy::too_many_arguments)]
+/// A key pressed while a turn is running. The composer stays live so a
+/// follow-up can be typed and queued; esc and ctrl+c stop the run, and every
+/// other chord is ignored rather than being taken for text.
+fn mid_turn_key(model: &mut Model, key: crossterm::event::KeyEvent, abort: &Arc<AtomicBool>) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            abort.store(true, Ordering::Relaxed);
+            model.interrupt();
+        }
+        KeyCode::Char('c') if ctrl => {
+            abort.store(true, Ordering::Relaxed);
+            model.interrupt();
+        }
+        KeyCode::Char('j') if ctrl => model.newline(),
+        KeyCode::Char(_) if ctrl => {}
+        KeyCode::Enter
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            model.newline()
+        }
+        KeyCode::Enter => {
+            model.queue();
+        }
+        KeyCode::Backspace => model.backspace(),
+        KeyCode::Tab => {
+            model.complete();
+        }
+        KeyCode::Char(ch) => model.type_char(&ch.to_string()),
+        _ => {}
+    }
+}
+
+/// A turn and everything queued behind it, in the order it was typed. Each
+/// follow-up opens its own block, exactly as if it had been sent by hand.
+fn run_turns(
+    parsed: &crate::args::Args,
+    agent: &mut Agent,
+    model: &mut Model,
+    session: &mut pi_tui::davinci::runtime::Session,
+    host: Arc<Mutex<ExtensionHost>>,
+) -> std::io::Result<()> {
+    loop {
+        run_turn(parsed, agent, model, session, host.clone())?;
+        if model.queued.is_empty() {
+            return Ok(());
+        }
+        let text = model.queued.remove(0);
+        let expanded = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
+        agent.prompt(&expanded);
+        model.transcript.push(Entry::Gap);
+        model.transcript.push(Entry::user(&text));
+        model.transcript.push(Entry::Gap);
+        model.transcript.push(Entry::agent("davinci"));
+        model.running = true;
+    }
+}
+
 fn run_turn(
     parsed: &crate::args::Args,
     agent: &mut Agent,
@@ -326,22 +386,17 @@ fn run_turn(
                 break;
             }
             if crossterm::event::poll(Duration::from_millis(40))? {
-                if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-                    if key.kind != KeyEventKind::Release {
-                        let stop = key.code == KeyCode::Esc
-                            || (key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL));
-                        if stop {
-                            abort.store(true, Ordering::Relaxed);
-                            model.interrupt();
-                        }
+                match crossterm::event::read()? {
+                    crossterm::event::Event::Key(key)
+                        if key.kind != crossterm::event::KeyEventKind::Release =>
+                    {
+                        mid_turn_key(model, key, &abort);
                     }
-                } else if let crossterm::event::Event::Resize(width, height) =
-                    crossterm::event::read()?
-                {
-                    model.width = width;
-                    model.height = height;
+                    crossterm::event::Event::Resize(width, height) => {
+                        model.width = width;
+                        model.height = height;
+                    }
+                    _ => {}
                 }
             }
             if last_tick.elapsed() >= pi_tui::davinci::runtime::TICK {
@@ -966,7 +1021,7 @@ pub fn run(
     if let Some(text) = prepared.text.clone() {
         let expanded = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
         agent.prompt_with(&expanded, &prepared.images);
-        if let Err(err) = run_turn(parsed, agent, &mut model, &mut terminal, host.clone()) {
+        if let Err(err) = run_turns(parsed, agent, &mut model, &mut terminal, host.clone()) {
             return Err(err.to_string());
         }
         refresh_context(&mut model, agent);
@@ -976,7 +1031,7 @@ pub fn run(
     for text in queued {
         let expanded = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
         agent.prompt(&expanded);
-        if let Err(err) = run_turn(parsed, agent, &mut model, &mut terminal, host.clone()) {
+        if let Err(err) = run_turns(parsed, agent, &mut model, &mut terminal, host.clone()) {
             return Err(err.to_string());
         }
         refresh_context(&mut model, agent);
@@ -1333,7 +1388,8 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
                 pi_agent::expand_user_text(&text, &shell.agent.skills, &shell.agent.templates);
             shell.agent.prompt(&text);
             let host = shell.host.clone();
-            if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host)
+            if let Err(err) =
+                run_turns(shell.parsed, shell.agent, shell.model, shell.terminal, host)
             {
                 return Next::Fail(err.to_string());
             }
