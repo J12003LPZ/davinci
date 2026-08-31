@@ -1,4 +1,5 @@
-//! Expandable built-in startup header matching TS `builtInHeader`.
+//! Startup header: the davinci identity mark (design spec §10) plus the
+//! expandable keybind help the TS `builtInHeader` provided.
 
 use crate::keybindings::Keybindings;
 use crate::loaded_resources::ExpandableText;
@@ -37,6 +38,47 @@ pub fn raw_key_hint(theme: &Theme, key: &str, description: &str) -> String {
     )
 }
 
+/// Extra facts shown under the wordmark at startup.
+#[derive(Debug, Clone, Default)]
+pub struct StartupInfo {
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub model: Option<String>,
+    pub session_restored: bool,
+}
+
+/// The identity mark: a line-drawn portrait after the Mona Lisa, built from
+/// the same box-drawing set as the UI, the smile as the only copper stroke.
+fn emblem_lines(theme: &Theme) -> Vec<String> {
+    let frame = |text: &str| theme.fg("muted", text);
+    let face = |text: &str| theme.fg("text", text);
+    let copper = |text: &str| theme.fg("primary", text);
+    let base = |text: &str| theme.fg("border", text);
+    vec![
+        frame("       ·─────────·"),
+        frame("     ╱             ╲"),
+        format!("{}{}{}", frame("    ╱  "), face("╭───────╮"), frame("  ╲")),
+        format!("{}{}{}", frame("   │  "), face("╱ ·     · ╲"), frame("  │")),
+        format!("{}{}{}", frame("   │  "), face("│    ╷    │"), frame("  │")),
+        format!(
+            "{}{}{}{}{}",
+            frame("   │  "),
+            face("╲  "),
+            copper("╰───╯"),
+            face("  ╱"),
+            frame("  │")
+        ),
+        format!("{}{}{}", frame("    ╲  "), face("╰───────╯"), frame("  ╱")),
+        frame("     ╲             ╱"),
+        format!(
+            "{}{}{}",
+            base("   ·────────"),
+            copper("┬"),
+            base("────────·")
+        ),
+    ]
+}
+
 pub fn build_startup_header(
     theme: &Theme,
     app_name: &str,
@@ -44,11 +86,72 @@ pub fn build_startup_header(
     bindings: &Keybindings,
     expanded: bool,
 ) -> ExpandableText {
-    let logo = format!(
-        "{}{}",
-        theme.bold(&theme.fg("accent", app_name)),
-        theme.fg("dim", &format!(" v{version}"))
-    );
+    build_startup_header_with(
+        theme,
+        app_name,
+        version,
+        bindings,
+        expanded,
+        &StartupInfo::default(),
+    )
+}
+
+pub fn build_startup_header_with(
+    theme: &Theme,
+    app_name: &str,
+    version: &str,
+    bindings: &Keybindings,
+    expanded: bool,
+    info: &StartupInfo,
+) -> ExpandableText {
+    let mut identity = emblem_lines(theme);
+    identity.push(String::new());
+    let wordmark: String = app_name
+        .to_uppercase()
+        .chars()
+        .flat_map(|ch| [ch, ' '])
+        .collect();
+    identity.push(format!(
+        "   {}{}",
+        theme.bold(&theme.fg("text", wordmark.trim_end())),
+        theme.fg("dim", &format!("  v{version}"))
+    ));
+    identity.push(format!(
+        "   {}",
+        theme.fg("primary", "macchina dell'intelletto")
+    ));
+    let mut facts = Vec::new();
+    if let Some(cwd) = info.cwd.as_deref().filter(|value| !value.is_empty()) {
+        facts.push(theme.fg("muted", cwd));
+    }
+    let mut second = String::new();
+    if let Some(branch) = info.branch.as_deref().filter(|value| !value.is_empty()) {
+        second.push_str(&theme.fg("secondary", branch));
+    }
+    if let Some(model) = info.model.as_deref().filter(|value| !value.is_empty()) {
+        if !second.is_empty() {
+            second.push_str(&theme.fg("border", " · "));
+        }
+        second.push_str(&theme.fg("muted", model));
+    }
+    if !second.is_empty() {
+        facts.push(second);
+    }
+    if info.session_restored {
+        facts.push(format!(
+            "{} {}",
+            theme.fg("success", "✓"),
+            theme.fg("muted", "session restored · memoria intacta")
+        ));
+    }
+    if !facts.is_empty() {
+        identity.push(String::new());
+        for fact in facts {
+            identity.push(format!("   {fact}"));
+        }
+    }
+    let logo = identity.join("\n");
+
     let compact_instructions = [
         key_hint(theme, bindings, "app.interrupt", "interrupt"),
         raw_key_hint(
@@ -64,7 +167,7 @@ pub fn build_startup_header(
         raw_key_hint(theme, "!", "bash"),
         key_hint(theme, bindings, "app.tools.expand", "more"),
     ]
-    .join(&theme.fg("muted", " · "));
+    .join(&theme.fg("border", " · "));
     let compact_onboarding = theme.fg(
         "dim",
         &format!(
@@ -74,7 +177,7 @@ pub fn build_startup_header(
     );
     let onboarding = theme.fg(
         "dim",
-        "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.",
+        "A machine for thought, built in Rust. Ask it how to use or extend itself.",
     );
     let expanded_instructions = [
         key_hint(theme, bindings, "app.interrupt", "to interrupt"),
@@ -141,8 +244,8 @@ pub fn build_startup_header(
     ]
     .join("\n");
     ExpandableText {
-        collapsed: format!("{logo}\n{compact_instructions}\n{compact_onboarding}\n\n{onboarding}"),
-        expanded_text: format!("{logo}\n{expanded_instructions}\n\n{onboarding}"),
+        collapsed: format!("{logo}\n\n{compact_instructions}\n{compact_onboarding}"),
+        expanded_text: format!("{logo}\n\n{expanded_instructions}\n\n{onboarding}"),
         expanded,
     }
 }
@@ -175,7 +278,7 @@ mod tests {
         let bindings = Keybindings::defaults();
         let mut header = build_startup_header(&theme, "pi", "0.84.4", &bindings, false);
         let compact = header.current();
-        assert!(compact.contains("pi"));
+        assert!(compact.contains("P I"));
         assert!(compact.contains("v0.84.4"));
         assert!(compact.contains("ctrl+o"));
         assert!(compact.contains("full startup help and loaded resources"));
@@ -185,5 +288,35 @@ mod tests {
         assert!(expanded.contains("to cycle thinking level"));
         assert!(expanded.contains("to expand tools"));
         assert!(expanded.contains("drop files"));
+    }
+
+    #[test]
+    fn identity_mark_and_facts_render() {
+        let _guard = crate::themes::NO_COLOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("NO_COLOR", "1");
+        let theme = builtin_themes()[0].clone();
+        let bindings = Keybindings::defaults();
+        let header = build_startup_header_with(
+            &theme,
+            "davinci",
+            "0.84.4",
+            &bindings,
+            false,
+            &StartupInfo {
+                cwd: Some("C:\\dev\\davinci-rust".into()),
+                branch: Some("main".into()),
+                model: Some("openai-codex/gpt-5.6-sol".into()),
+                session_restored: true,
+            },
+        );
+        let text = header.current();
+        std::env::remove_var("NO_COLOR");
+        assert!(text.contains("D A V I N C I"), "{text}");
+        assert!(text.contains("macchina dell'intelletto"));
+        assert!(text.contains("╰───╯"), "smile stroke present");
+        assert!(text.contains("main · openai-codex/gpt-5.6-sol"));
+        assert!(text.contains("session restored"));
     }
 }

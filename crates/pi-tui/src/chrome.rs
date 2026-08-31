@@ -16,7 +16,7 @@ use crate::scoped_models::ScopedModelsSelector;
 use crate::session_selector::SessionSelector;
 use crate::settings::SettingsList;
 use crate::settings_submenu::SettingsSubmenu;
-use crate::themes::{builtin_themes, Theme};
+use crate::themes::{builtin_themes, glyphs, Theme};
 use crate::thinking_selector::ThinkingSelector;
 use crate::tool_card::ToolCard;
 use crate::transcript::Transcript;
@@ -75,7 +75,15 @@ pub struct ChatChrome {
     pub footer_branch: Option<String>,
     pub footer_session_name: Option<String>,
     pub footer_stats: Option<String>,
+    /// `provider/model` shown on the right of the status bar.
+    pub footer_model: Option<String>,
+    /// `(used, window)` context tokens; rendered as a proportion meter.
+    pub footer_context: Option<(u64, u64)>,
+    /// `(files, added, removed)` session change stats (`Δ3 +42 -11`).
+    pub footer_delta: Option<(u64, u64, u64)>,
     pub tools_expanded: bool,
+    /// Dim hint shown in the empty composer.
+    pub composer_placeholder: String,
     pub startup_header: Option<ExpandableText>,
     pub loaded_resources: LoadedResources,
     pub available_themes: Vec<Theme>,
@@ -84,7 +92,7 @@ pub struct ChatChrome {
 
 impl ChatChrome {
     pub fn new(theme: Theme, title: impl Into<String>) -> Self {
-        Self {
+        let mut chrome = Self {
             transcript: Transcript::default(),
             editor: Editor::new(),
             selector: None,
@@ -133,12 +141,18 @@ impl ChatChrome {
             footer_branch: None,
             footer_session_name: None,
             footer_stats: None,
+            footer_model: None,
+            footer_context: None,
+            footer_delta: None,
             tools_expanded: false,
+            composer_placeholder: "What shall we construct?".into(),
             startup_header: None,
             loaded_resources: LoadedResources::default(),
             available_themes: builtin_themes(),
             terminal_input_registered: false,
-        }
+        };
+        chrome.transcript.theme = chrome.theme.clone();
+        chrome
     }
 
     pub fn get_theme_name(&self) -> &str {
@@ -164,7 +178,8 @@ impl ChatChrome {
                     .find(|theme| theme.name == name)
             })
         {
-            self.theme = theme;
+            self.theme = theme.clone();
+            self.transcript.theme = theme;
             Ok(())
         } else {
             Err(format!("Theme not found: {name}"))
@@ -181,6 +196,7 @@ impl ChatChrome {
         } else {
             self.available_themes.push(theme.clone());
         }
+        self.transcript.theme = theme.clone();
         self.theme = theme;
     }
 
@@ -399,15 +415,25 @@ impl ChatChrome {
             lines.extend(header.current().lines().map(str::to_string));
             lines.push(String::new());
         } else if !self.quiet_startup || self.extension_header.is_some() {
-            lines.push(format!("{}  theme={}", self.title, self.theme.name));
+            lines.push(format!(
+                "{} {}",
+                self.theme.fg("primary", glyphs::AGENT),
+                self.theme.fg("muted", &self.title)
+            ));
         }
         if let Some(header) = &self.extension_header {
             lines.extend(header.iter().cloned());
         }
         lines.extend(self.loaded_resources.render(width));
+        // One blank line of air between the startup block and the transcript.
+        if !self.transcript.lines.is_empty() && lines.last().is_some_and(|line| !line.is_empty()) {
+            lines.push(String::new());
+        }
         lines.extend(self.transcript.render(width));
         for card in &self.tool_cards {
-            lines.extend(card.render(width));
+            for line in card.render(width) {
+                lines.push(crate::transcript::style_glyph_line(&self.theme, &line));
+            }
         }
         lines
     }
@@ -517,7 +543,7 @@ impl ChatChrome {
             if let Some(custom) = &self.custom_editor_lines {
                 lines.extend(custom.iter().cloned());
             } else {
-                lines.extend(self.editor.render(width));
+                lines.extend(self.render_composer(width));
             }
             for widget in &self.widgets_below {
                 lines.extend(widget.lines.iter().cloned());
@@ -538,22 +564,140 @@ impl ChatChrome {
                 }
             }
         }
-        if let Some(cwd) = &self.footer_cwd {
+        lines.extend(self.render_status_bar(width));
+        if let Some(footer) = &self.extension_footer {
+            lines.extend(footer.iter().cloned());
+        }
+        lines
+    }
+
+    /// Composer (spec §6): copper top rule, `›` prompt, keybind hints below.
+    fn render_composer(&self, width: usize) -> Vec<String> {
+        let raw = self.editor.render(width.saturating_sub(2));
+        if raw.len() < 2 {
+            return raw;
+        }
+        let theme = &self.theme;
+        let mut lines = Vec::with_capacity(raw.len() + 1);
+        lines.push(theme.fg("primary", &"─".repeat(width)));
+        let content_count = raw.len().saturating_sub(2);
+        let placeholder = (self.editor.buffer.is_empty() && !self.composer_placeholder.is_empty())
+            .then(|| theme.fg("dim", &self.composer_placeholder));
+        for (index, line) in raw.iter().skip(1).take(content_count).enumerate() {
+            if index == 0 {
+                let mut line = format!(
+                    "{} {}",
+                    theme.fg("primary", glyphs::PROMPT),
+                    line.trim_end()
+                );
+                if let Some(hint) = &placeholder {
+                    line.push(' ');
+                    line.push_str(hint);
+                }
+                lines.push(line);
+            } else {
+                lines.push(format!("  {line}"));
+            }
+        }
+        lines.push(theme.fg("border", &"─".repeat(width)));
+        if width >= 70 {
+            lines.push(theme.fg(
+                "dim",
+                "  enter send · shift+enter newline · tab complete · esc cancel",
+            ));
+        }
+        lines
+    }
+
+    /// Status bar (spec §6): `dir (branch) · Δn +a -d` left, model + context
+    /// meter right. Falls back to the legacy pwd/stats lines when the
+    /// structured fields are unset.
+    fn render_status_bar(&self, width: usize) -> Vec<String> {
+        let Some(cwd) = &self.footer_cwd else {
+            return Vec::new();
+        };
+        let theme = &self.theme;
+        if self.footer_model.is_none() && self.footer_context.is_none() {
             let pwd = format_pwd_line(
                 cwd,
                 self.footer_home.as_deref(),
                 self.footer_branch.as_deref(),
                 self.footer_session_name.as_deref(),
             );
-            lines.push(truncate_to_width(&pwd, width, "..."));
+            let mut lines = vec![truncate_to_width(&pwd, width, "...")];
             if let Some(stats) = &self.footer_stats {
                 lines.push(truncate_to_width(stats, width, "..."));
             }
+            return lines;
         }
-        if let Some(footer) = &self.extension_footer {
-            lines.extend(footer.iter().cloned());
+        let sep = format!(" {} ", theme.fg("border", "·"));
+        let pwd = crate::footer::format_cwd_for_footer(cwd, self.footer_home.as_deref());
+        let mut left_plain = pwd.clone();
+        let mut left = theme.fg("muted", &pwd);
+        if let Some(branch) = self.footer_branch.as_deref().filter(|b| !b.is_empty()) {
+            left_plain.push_str(&format!(" · {branch}"));
+            left.push_str(&sep);
+            left.push_str(&theme.fg("secondary", branch));
         }
-        lines
+        if let Some((files, added, removed)) = self.footer_delta {
+            if files > 0 {
+                let plain = format!("Δ{files} +{added} -{removed}");
+                left_plain.push_str(&format!(" · {plain}"));
+                left.push_str(&sep);
+                left.push_str(&theme.fg("primary", &format!("Δ{files}")));
+                left.push_str(&theme.fg("success", &format!(" +{added}")));
+                left.push_str(&theme.fg("error", &format!(" -{removed}")));
+            }
+        }
+        let mut right_plain = String::new();
+        let mut right = String::new();
+        if let Some(model) = self.footer_model.as_deref() {
+            right_plain.push_str(model);
+            right.push_str(&theme.fg("muted", model));
+        }
+        if let Some((used, window)) = self.footer_context {
+            let counts = format!(
+                "{}/{}",
+                format_tokens_short(used),
+                format_tokens_short(window)
+            );
+            let meter_cells = if width >= 100 { 16 } else { 8 };
+            if !right_plain.is_empty() {
+                right_plain.push_str(" · ");
+                right.push_str(&sep);
+            }
+            right_plain.push_str(&format!("{} {counts}", "─".repeat(meter_cells)));
+            right.push_str(&theme.meter(used, window, meter_cells));
+            right.push(' ');
+            right.push_str(&theme.fg("muted", &counts));
+        }
+        let pad = width
+            .saturating_sub(crate::render::visible_width(&left_plain))
+            .saturating_sub(crate::render::visible_width(&right_plain))
+            .max(2);
+        let line = format!("{left}{}{right}", " ".repeat(pad));
+        vec![crate::ansi::truncate_to_width(
+            &line,
+            width.max(8),
+            "…",
+            false,
+        )]
+    }
+}
+
+/// `47k` / `1.2m` token counts (spec §9: numbers always carry unit and cap).
+pub fn format_tokens_short(count: u64) -> String {
+    if count >= 1_000_000 {
+        let millions = count as f64 / 1_000_000.0;
+        if millions.fract() < 0.05 {
+            format!("{}m", millions as u64)
+        } else {
+            format!("{millions:.1}m")
+        }
+    } else if count >= 1_000 {
+        format!("{}k", count / 1_000)
+    } else {
+        count.to_string()
     }
 }
 
