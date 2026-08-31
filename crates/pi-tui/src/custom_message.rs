@@ -67,12 +67,7 @@ impl CustomMessage {
             output_pad: 1,
             renderer: None,
             renderer_lines: None,
-            theme: Theme {
-                name: "dark".into(),
-                background: String::new(),
-                foreground: String::new(),
-                accent: String::new(),
-            },
+            theme: Theme::default(),
             code_block_indent: DEFAULT_CODE_BLOCK_INDENT.into(),
         }
     }
