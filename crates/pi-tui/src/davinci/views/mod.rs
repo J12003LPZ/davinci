@@ -2,5 +2,6 @@
 //! nothing else.
 
 pub mod chrome;
+pub mod startup;
 pub mod studio;
 pub mod transcript;

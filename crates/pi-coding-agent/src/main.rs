@@ -227,8 +227,15 @@ fn run_davinci(raw: &[String]) -> Result<i32, String> {
     use pi_tui::davinci;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let screen = raw
+        .iter()
+        .position(|arg| arg == "--screen")
+        .and_then(|index| raw.get(index + 1))
+        .cloned()
+        .unwrap_or_else(|| "1b".to_string());
+
     let mut model = davinci::boot(raw, 100, 44);
-    davinci::fixtures::dress(&mut model);
+    davinci::fixtures::dress_screen(&mut model, &screen);
     model.cwd = cwd.display().to_string();
     if let Some(branch) = pi_tui::resolve_git_branch(&cwd) {
         model.branch = branch;

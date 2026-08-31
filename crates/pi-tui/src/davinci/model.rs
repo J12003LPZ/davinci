@@ -126,6 +126,16 @@ impl Entry {
     }
 }
 
+/// What the session found when it opened — the empty state, screen `1a`.
+#[derive(Debug, Clone, Default)]
+pub struct Startup {
+    pub cwd: String,
+    pub branch: String,
+    pub language: String,
+    pub crates: String,
+    pub restored: bool,
+}
+
 /// Where the session lives, and what it costs. Every field here is shown as a
 /// meter or a labelled unit, never as a bare number (design.md §9).
 #[derive(Debug, Clone)]
@@ -158,6 +168,8 @@ pub struct Model {
     pub changes: (u32, u32, u32),
     /// `(used, cap)` in tokens.
     pub context: (u64, u64),
+    /// The empty state, shown while the transcript has nothing in it.
+    pub startup: Startup,
 }
 
 impl Model {
@@ -184,6 +196,7 @@ impl Model {
             model_name: String::new(),
             changes: (0, 0, 0),
             context: (0, 200_000),
+            startup: Startup::default(),
         }
     }
 

@@ -13,7 +13,7 @@ use ratatui::text::Line;
 use super::model::{Model, Overlay, Screen};
 use super::ui::{blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
-use super::views::transcript;
+use super::views::{startup, transcript};
 
 /// What the runtime should do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,9 +55,13 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
 
 /// The transcript, bottom-anchored: older rows fall off the top like a
 /// scrollback, and a short transcript is padded so the composer stays put.
+/// An empty transcript is the empty state instead, centred in the body (`1a`).
 fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
+    }
+    if model.transcript.is_empty() {
+        return empty_state(model, height);
     }
     let width = model.width;
     let mut rows = transcript::lines(model, &model.transcript, width);
@@ -70,6 +74,19 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
         rows = padded;
     }
     pad_to(rows, height)
+}
+
+/// The identity mark and what the session found, vertically centred. If the
+/// window is too short for the mark, the mark goes rather than the words.
+fn empty_state(model: &Model, height: usize) -> Vec<Line<'static>> {
+    let mut rows = startup::lines(model, &model.startup);
+    if rows.len() > height {
+        rows = rows.split_off(rows.len() - height);
+    }
+    let lead = (height - rows.len()) / 2;
+    let mut out = vec![blank(); lead];
+    out.extend(rows);
+    pad_to(out, height)
 }
 
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the

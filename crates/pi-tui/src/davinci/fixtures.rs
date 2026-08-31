@@ -5,8 +5,19 @@
 //! session store, git status, token accountant and code graph. Everything here
 //! is scheduled for replacement; nothing else in the tree may depend on it.
 
-use super::model::{Entry, Hunk, HunkKind, Model, Step};
+use super::model::{Entry, Hunk, HunkKind, Model, Startup, Step};
 use super::theme::State;
+
+/// `1a` — what the session found when it opened.
+pub fn startup() -> Startup {
+    Startup {
+        cwd: "C:\\dev\\oss\\davinci-rust".into(),
+        branch: "main".into(),
+        language: "rust".into(),
+        crates: "11 crates".into(),
+        restored: true,
+    }
+}
 
 /// `1b` — transcript with tools, Studio and a Δ block.
 pub fn transcript() -> Vec<Entry> {
@@ -113,11 +124,23 @@ pub fn dress(model: &mut Model) {
     model.model_name = "sonnet".into();
     model.changes = (3, 42, 11);
     model.context = (47_000, 200_000);
+    model.startup = startup();
     model.transcript = if model.narrow() {
         narrow_transcript()
     } else {
         transcript()
     };
+}
+
+/// Dress the model as one named mockup screen, so it can be matched against
+/// `docs/ui/Pi TUI Mockups.dc.html` in a real terminal.
+pub fn dress_screen(model: &mut Model, id: &str) {
+    dress(model);
+    match id {
+        "1a" => model.transcript.clear(),
+        "1g" | "1h" => model.transcript = narrow_transcript(),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
