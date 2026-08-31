@@ -560,7 +560,7 @@ pub fn request_body_with(
             google_body(model, messages, system, tools, options)
         }
         "bedrock-converse-stream" => bedrock_body(model, messages, system, tools),
-        "mistral-conversations" => mistral_body(model, messages, system, tools),
+        "mistral-conversations" => mistral_body(model, messages, system, tools, options),
         "openai-responses" | "openai-codex-responses" | "azure-openai-responses" => {
             openai_responses_body(model, messages, system, tools, options)
         }
@@ -898,9 +898,18 @@ fn mistral_body(
     messages: &[ChatMessage],
     system: Option<&str>,
     tools: &[ToolSpec],
+    options: &StreamOptions,
 ) -> Value {
+    // Build on the completions shape without inheriting its OpenAI cache
+    // fields; mistral-conversations.ts has its own gate.
     let mut body = openai_body(model, messages, system, tools, &StreamOptions::default());
     body["stream"] = Value::Bool(false);
+    let retention = crate::cache::cache_retention_from_options(options);
+    if retention != crate::cache::CacheRetention::None {
+        if let Some(session_id) = options.session_id.as_deref().filter(|id| !id.is_empty()) {
+            body["prompt_cache_key"] = Value::String(session_id.to_string());
+        }
+    }
     body
 }
 
@@ -1011,7 +1020,98 @@ fn openai_body(
         );
     }
     apply_openai_thinking(&mut body, model, options);
+
+    // openai-completions.ts:805-810.
+    let retention = crate::cache::cache_retention_from_options(options);
+    let long_supported = retention == crate::cache::CacheRetention::Long
+        && crate::cache::completions_supports_long_cache_retention(model);
+    let is_openai_host = model
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1")
+        .contains("api.openai.com");
+    if (is_openai_host && retention != crate::cache::CacheRetention::None) || long_supported {
+        if let Some(key) = options
+            .session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(crate::cache::clamp_openai_prompt_cache_key)
+        {
+            body["prompt_cache_key"] = Value::String(key);
+        }
+    }
+    if long_supported {
+        body["prompt_cache_retention"] = Value::String("24h".into());
+    }
+    // openai-completions.ts getCompatCacheControl + applyAnthropicCacheControl.
+    if crate::cache::completions_cache_control_format(model).as_deref() == Some("anthropic") {
+        if let Some(cache_control) = crate::cache::anthropic_cache_control(
+            &serde_json::json!({
+                "supportsLongCacheRetention":
+                    crate::cache::completions_supports_long_cache_retention(model),
+            }),
+            retention,
+        ) {
+            apply_anthropic_cache_control_to_completions(&mut body, &cache_control);
+        }
+    }
     body
+}
+
+/// TS openai-completions.ts `applyAnthropicCacheControl`: mark the system
+/// prompt, the last tool definition, and the last user/assistant/tool message
+/// with Anthropic-style `cache_control` for `cacheControlFormat: "anthropic"`
+/// providers.
+fn apply_anthropic_cache_control_to_completions(body: &mut Value, cache_control: &Value) {
+    fn mark_text_content(message: &mut Value, cache_control: &Value) -> bool {
+        match message.get_mut("content") {
+            Some(content) if content.is_string() => {
+                let text = content.as_str().unwrap_or_default().to_string();
+                if text.is_empty() {
+                    return false;
+                }
+                *content = serde_json::json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": cache_control,
+                }]);
+                true
+            }
+            Some(Value::Array(parts)) => {
+                for part in parts.iter_mut().rev() {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        part["cache_control"] = cache_control.clone();
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages.iter_mut() {
+            let role = message.get("role").and_then(Value::as_str);
+            if role == Some("system") || role == Some("developer") {
+                mark_text_content(message, cache_control);
+                break;
+            }
+        }
+        for message in messages.iter_mut().rev() {
+            let role = message.get("role").and_then(Value::as_str);
+            if (role == Some("user") || role == Some("assistant") || role == Some("tool"))
+                && mark_text_content(message, cache_control)
+            {
+                break;
+            }
+        }
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = cache_control.clone();
+        }
+    }
 }
 
 /// TS `resolveJsonSchemaStrictSampling` — attach `strict: true` when the tool
@@ -1874,6 +1974,162 @@ mod tests {
         );
         assert_eq!(azure_body["prompt_cache_key"], "sess-azure");
         assert!(azure_body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn completions_body_carries_prompt_cache_key_for_openai() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("openai completions shape");
+        model.provider = "openai".into();
+        model.base_url = Some("https://api.openai.com/v1".into());
+        model.compat = serde_json::Value::Null;
+        let body = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-c".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(body["prompt_cache_key"], "sess-c");
+        assert!(body.get("prompt_cache_retention").is_none());
+        let long = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-c".into()),
+                cache_retention: Some("long".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(long["prompt_cache_retention"], "24h");
+        let none = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-c".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert!(none.get("prompt_cache_key").is_none());
+        assert!(none.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn completions_body_skips_key_for_non_openai_hosts_on_short() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("completions model");
+        model.provider = "custom".into();
+        model.base_url = Some("https://api.example.com/v1".into());
+        model.compat = serde_json::Value::Null;
+        let short = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-x".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert!(short.get("prompt_cache_key").is_none());
+        let long = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-x".into()),
+                cache_retention: Some("long".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(long["prompt_cache_key"], "sess-x");
+        assert_eq!(long["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn completions_body_applies_anthropic_markers_for_openrouter_claude() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("completions model");
+        model.provider = "openrouter".into();
+        model.id = "anthropic/claude-sonnet-5".into();
+        model.base_url = Some("https://openrouter.ai/api/v1".into());
+        model.compat = serde_json::Value::Null;
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            constrained_sampling: None,
+        }];
+        let messages = vec![ChatMessage::text("user", "hello")];
+        let body = request_body_with(
+            &model,
+            &messages,
+            Some("sys"),
+            &tools,
+            &StreamOptions {
+                session_id: Some("sess-or".into()),
+                ..StreamOptions::default()
+            },
+        );
+        let system = &body["messages"][0];
+        assert_eq!(system["role"], "system");
+        assert_eq!(system["content"][0]["text"], "sys");
+        assert_eq!(system["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn mistral_body_carries_prompt_cache_key() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "mistral-conversations")
+            .unwrap_or_else(|| {
+                load_builtin_models()
+                    .into_iter()
+                    .find(|m| m.api == "openai-completions")
+                    .expect("base model")
+            });
+        model.api = "mistral-conversations".into();
+        let body = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-m".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(body["prompt_cache_key"], "sess-m");
+        let none = request_body_with(
+            &model,
+            &[],
+            None,
+            &[],
+            &StreamOptions {
+                session_id: Some("sess-m".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert!(none.get("prompt_cache_key").is_none());
     }
 
     #[test]
