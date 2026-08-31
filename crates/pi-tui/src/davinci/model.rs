@@ -242,6 +242,156 @@ impl ChangeRow {
     }
 }
 
+/// Which role a run of the graph drawing plays (`2a`). Connectors are drawn in
+/// border, names in muted, and the node in hand in copper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphInk {
+    Connector,
+    Name,
+    Current,
+}
+
+/// One row of the graph drawing, on a strict column grid.
+#[derive(Debug, Clone)]
+pub struct GraphRow(pub Vec<(String, GraphInk)>);
+
+/// One row of the impact list under the graph (`2a`).
+#[derive(Debug, Clone)]
+pub struct ImpactRow {
+    pub state: State,
+    pub symbol: String,
+    pub distance: String,
+    pub sites: String,
+    /// Untested edges are drawn in warning (design.md §6).
+    pub untested: bool,
+}
+
+impl ImpactRow {
+    pub fn new(state: State, symbol: &str, distance: &str, sites: &str, untested: bool) -> Self {
+        Self {
+            state,
+            symbol: symbol.to_string(),
+            distance: distance.to_string(),
+            sites: sites.to_string(),
+            untested,
+        }
+    }
+}
+
+/// What the graph knows about itself, for the panel's notches (`2a`).
+#[derive(Debug, Clone, Default)]
+pub struct GraphMeta {
+    pub nodes: String,
+    pub edges: String,
+    pub cycles: String,
+    pub subject: String,
+    pub fan_in: String,
+    pub fan_out: String,
+    pub depth: String,
+    pub tests: String,
+    pub untested: String,
+    pub freshness: String,
+}
+
+/// One hit from vector recall (`2b`). Two rows each: score, summary and
+/// location, then a proportion meter and provenance.
+#[derive(Debug, Clone)]
+pub struct RecallHit {
+    pub score: f64,
+    pub summary: String,
+    pub location: String,
+    pub provenance: String,
+    /// Hits below the relevance floor are counted, not drawn, so the retrieval
+    /// stays auditable.
+    pub above_floor: bool,
+}
+
+impl RecallHit {
+    pub fn new(
+        score: f64,
+        summary: &str,
+        location: &str,
+        provenance: &str,
+        above_floor: bool,
+    ) -> Self {
+        Self {
+            score,
+            summary: summary.to_string(),
+            location: location.to_string(),
+            provenance: provenance.to_string(),
+            above_floor,
+        }
+    }
+}
+
+/// What the recall index knows about itself (`2b`).
+#[derive(Debug, Clone, Default)]
+pub struct RecallMeta {
+    pub query: String,
+    pub vectors: String,
+    pub shards: String,
+    pub embedding: String,
+    pub metric: String,
+    pub elapsed: String,
+    pub k: String,
+    pub floor: f64,
+    pub promoted: String,
+    pub freshness: String,
+}
+
+/// One role's share of the context window (`2c`).
+#[derive(Debug, Clone)]
+pub struct BudgetRow {
+    pub role: String,
+    pub tokens: String,
+    pub fraction: f64,
+    pub note: String,
+    /// The breaching row is copper with a warning cap note; the rest verdigris.
+    pub breach: bool,
+}
+
+impl BudgetRow {
+    pub fn new(role: &str, tokens: &str, fraction: f64, note: &str, breach: bool) -> Self {
+        Self {
+            role: role.to_string(),
+            tokens: tokens.to_string(),
+            fraction,
+            note: note.to_string(),
+            breach,
+        }
+    }
+}
+
+/// A governor proposal (`2c`). It always states what it recovers, what it
+/// keeps, what it costs and whether it is reversible, and it never acts
+/// silently (design.md §6).
+#[derive(Debug, Clone, Default)]
+pub struct Proposal {
+    pub summary: String,
+    pub recovers: String,
+    pub keeps: String,
+    pub cost: String,
+    pub reversible: bool,
+    /// `(key, what it does)`, in the order they are offered.
+    pub actions: Vec<(String, String)>,
+}
+
+/// What the governor knows about the session's spend (`2c`).
+#[derive(Debug, Clone, Default)]
+pub struct BudgetMeta {
+    pub policy: String,
+    pub in_use: String,
+    pub window: String,
+    pub headroom: String,
+    /// How much of the window is in use, as a proportion.
+    pub in_use_fraction: f64,
+    pub rate: String,
+    pub session_spend: String,
+    pub daily_cap: String,
+    pub daily_fraction: f64,
+    pub history: String,
+}
+
 /// What the session found when it opened — the empty state, screen `1a`.
 #[derive(Debug, Clone, Default)]
 pub struct Startup {
@@ -300,6 +450,18 @@ pub struct Model {
     /// `1e` — the workspace tree and the git changes beside it.
     pub tree: Vec<TreeRow>,
     pub changes_list: Vec<ChangeRow>,
+
+    /// `2a` — the dependency study.
+    pub graph: Vec<GraphRow>,
+    pub graph_meta: GraphMeta,
+    pub impact: Vec<ImpactRow>,
+    /// `2b` — vector recall.
+    pub recall: Vec<RecallHit>,
+    pub recall_meta: RecallMeta,
+    /// `2c` — the token governor.
+    pub budget: Vec<BudgetRow>,
+    pub budget_meta: BudgetMeta,
+    pub proposal: Option<Proposal>,
 }
 
 impl Model {
@@ -335,6 +497,14 @@ impl Model {
             plan: Vec::new(),
             tree: Vec::new(),
             changes_list: Vec::new(),
+            graph: Vec::new(),
+            graph_meta: GraphMeta::default(),
+            impact: Vec::new(),
+            recall: Vec::new(),
+            recall_meta: RecallMeta::default(),
+            budget: Vec::new(),
+            budget_meta: BudgetMeta::default(),
+            proposal: None,
         }
     }
 

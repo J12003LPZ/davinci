@@ -6,8 +6,9 @@
 //! is scheduled for replacement; nothing else in the tree may depend on it.
 
 use super::model::{
-    ChangeRow, CorpusItem, Entry, Hunk, HunkKind, Model, ModelItem, PlanStep, SessionItem, Startup,
-    Step, TreeRow,
+    BudgetMeta, BudgetRow, ChangeRow, CorpusItem, Entry, GraphInk, GraphMeta, GraphRow, Hunk,
+    HunkKind, ImpactRow, Model, ModelItem, PlanStep, Proposal, RecallHit, RecallMeta, SessionItem,
+    Startup, Step, TreeRow,
 };
 use super::theme::State;
 
@@ -258,6 +259,203 @@ pub fn changes_list() -> Vec<ChangeRow> {
     ]
 }
 
+/// `2a` — the graph drawing, on a strict column grid. The connector columns
+/// are literal so the grid can be verified by eye against the mockup.
+pub fn graph() -> Vec<GraphRow> {
+    use GraphInk::{Connector, Current, Name};
+    vec![
+        GraphRow(vec![
+            ("davinci-cli ".into(), Name),
+            ("──┬── ".into(), Connector),
+            ("davinci-agent ".into(), Name),
+            ("──┬── ".into(), Connector),
+            ("davinci-ai ".into(), Name),
+            ("─── ".into(), Connector),
+            ("providers".into(), Name),
+        ]),
+        GraphRow(vec![
+            ("            ".into(), Name),
+            ("  │".into(), Connector),
+            ("                   ".into(), Name),
+            ("├── ".into(), Connector),
+            ("davinci-tools".into(), Name),
+        ]),
+        GraphRow(vec![
+            ("            ".into(), Name),
+            ("  │".into(), Connector),
+            ("                   ".into(), Name),
+            ("└── ".into(), Connector),
+            ("davinci-session ◉".into(), Current),
+            (" ── ".into(), Connector),
+            ("davinci-store".into(), Name),
+        ]),
+        GraphRow(vec![
+            ("            ".into(), Name),
+            ("  └── ".into(), Connector),
+            ("davinci-tui".into(), Name),
+        ]),
+    ]
+}
+
+pub fn graph_meta() -> GraphMeta {
+    GraphMeta {
+        nodes: "412".into(),
+        edges: "1207".into(),
+        cycles: "0".into(),
+        subject: "store.rs".into(),
+        fan_in: "6".into(),
+        fan_out: "2".into(),
+        depth: "3".into(),
+        tests: "14".into(),
+        untested: "2".into(),
+        freshness: "graph rebuilt 4s ago from rust-analyzer".into(),
+    }
+}
+
+/// `2a` — the impact list.
+pub fn impact() -> Vec<ImpactRow> {
+    vec![
+        ImpactRow::new(
+            State::Active,
+            "davinci-session::store",
+            "direct",
+            "6 call sites",
+            false,
+        ),
+        ImpactRow::new(
+            State::Read,
+            "davinci-session::manager",
+            "1 hop",
+            "2 call sites",
+            false,
+        ),
+        ImpactRow::new(
+            State::Read,
+            "davinci-agent::runtime",
+            "2 hops",
+            "1 call site",
+            false,
+        ),
+        ImpactRow::new(
+            State::Read,
+            "davinci-tui::app",
+            "3 hops",
+            "render only",
+            false,
+        ),
+        ImpactRow::new(
+            State::Attention,
+            "davinci-cli::main",
+            "3 hops",
+            "no test coverage",
+            true,
+        ),
+    ]
+}
+
+/// `2b` — vector recall.
+pub fn recall() -> Vec<RecallHit> {
+    vec![
+        RecallHit::new(
+            0.91,
+            "store::roundtrip: write after every tool call",
+            "davinci-session\\src\\store.rs:118",
+            "turn 12 · promoted",
+            true,
+        ),
+        RecallHit::new(
+            0.87,
+            "manager::resume rebuilds the transcript",
+            "davinci-session\\src\\manager.rs:44",
+            "turn 12 · promoted",
+            true,
+        ),
+        RecallHit::new(
+            0.74,
+            "notes: \"interrupts must not truncate memoria\"",
+            "memoria\\decisions.md:9",
+            "session · tui-redesign",
+            true,
+        ),
+        RecallHit::new(
+            0.61,
+            "test roundtrip_windows_paths",
+            "davinci-session\\tests\\store.rs:7",
+            "below floor",
+            false,
+        ),
+        RecallHit::new(
+            0.58,
+            "changelog: atomic write via tempfile + rename",
+            "CHANGELOG.md:212",
+            "below floor",
+            false,
+        ),
+    ]
+}
+
+pub fn recall_meta() -> RecallMeta {
+    RecallMeta {
+        query: "how does session persistence survive an interrupt".into(),
+        vectors: "18,402".into(),
+        shards: "3".into(),
+        embedding: "bge-small 384d".into(),
+        metric: "cosine".into(),
+        elapsed: "12ms".into(),
+        k: "6".into(),
+        floor: 0.70,
+        promoted: "3 chunks · 1.2k tokens".into(),
+        freshness: "reindexed on last commit".into(),
+    }
+}
+
+/// `2c` — the budget by role.
+pub fn budget() -> Vec<BudgetRow> {
+    vec![
+        BudgetRow::new("system", "4.2k", 4.2 / 40.0, "pinned", false),
+        BudgetRow::new("codex map", "22.8k", 22.8 / 40.0, "cap 40k", false),
+        BudgetRow::new("transcript", "71.6k", 1.0, "! soft cap 60k", true),
+        BudgetRow::new("instrumenta", "21.4k", 21.4 / 40.0, "14 schemas", false),
+        BudgetRow::new("memoria", "8.4k", 8.4 / 40.0, "3 chunks", false),
+        BudgetRow::new("reserve", "10.0k", 10.0 / 40.0, "for the reply", false),
+    ]
+}
+
+pub fn budget_meta() -> BudgetMeta {
+    BudgetMeta {
+        policy: "balanced".into(),
+        in_use: "128.4k".into(),
+        window: "200k".into(),
+        headroom: "71.6k".into(),
+        in_use_fraction: 128.4 / 200.0,
+        rate: "1.9k tok/s".into(),
+        session_spend: "412k".into(),
+        daily_cap: "2m".into(),
+        daily_fraction: 0.21,
+        history: "governor acted 3× today · last: evicted 2 tool results".into(),
+    }
+}
+
+/// `2c` — the standing proposal.
+pub fn proposal() -> Proposal {
+    Proposal {
+        summary: "transcript is 19% over its soft cap. Proposed: summarise turns 1-18 into \
+                  one note and evict their tool output."
+            .into(),
+        recovers: "18.2k".into(),
+        keeps: "last 6 turns".into(),
+        cost: "1 summarising call".into(),
+        reversible: true,
+        actions: vec![
+            ("a".into(), "apply".into()),
+            ("e".into(), "evict oldest 6".into()),
+            ("p".into(), "policy".into()),
+            ("h".into(), "hold, warn at 90%".into()),
+            ("d".into(), "dismiss".into()),
+        ],
+    }
+}
+
 /// A model dressed with the mockups' session, for eyeballing a screen.
 pub fn dress(model: &mut Model) {
     model.cwd = "C:\\dev\\oss\\davinci-rust".into();
@@ -273,6 +471,14 @@ pub fn dress(model: &mut Model) {
     model.plan = plan();
     model.tree = tree();
     model.changes_list = changes_list();
+    model.graph = graph();
+    model.graph_meta = graph_meta();
+    model.impact = impact();
+    model.recall = recall();
+    model.recall_meta = recall_meta();
+    model.budget = budget();
+    model.budget_meta = budget_meta();
+    model.proposal = Some(proposal());
     model.transcript = if model.narrow() {
         narrow_transcript()
     } else {
@@ -295,6 +501,9 @@ pub fn dress_screen(model: &mut Model, id: &str) {
             model.transcript = codex_transcript();
         }
         "1g" | "1h" => model.transcript = narrow_transcript(),
+        "2a" => model.toggle_screen(crate::davinci::model::Screen::Grafo),
+        "2b" => model.toggle_screen(crate::davinci::model::Screen::Memoria),
+        "2c" => model.toggle_screen(crate::davinci::model::Screen::Mensura),
         _ => {}
     }
 }

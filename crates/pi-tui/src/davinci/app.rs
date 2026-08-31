@@ -13,7 +13,9 @@ use ratatui::text::Line;
 use super::model::{Model, Overlay, Screen};
 use super::ui::{blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
-use super::views::{codex, cogitator, disegno, instrumenta, memoria, startup, transcript};
+use super::views::{
+    codex, cogitator, disegno, grafo, instrumenta, memoria, mensura, startup, transcript,
+};
 
 /// What the runtime should do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,8 +65,15 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
     if let Some(overlay) = model.overlay {
         return overlay_body(model, overlay, height);
     }
-    if model.screen == Screen::Plan {
-        return panel(model, disegno::lines(model), height);
+    let screen_rows = match model.screen {
+        Screen::Plan => Some(disegno::lines(model)),
+        Screen::Grafo => Some(grafo::lines(model)),
+        Screen::Memoria => Some(memoria::recall(model)),
+        Screen::Mensura => Some(mensura::lines(model)),
+        Screen::Agent => None,
+    };
+    if let Some(rows) = screen_rows {
+        return panel(model, rows, height);
     }
     if model.codex_open() {
         return codex::lines(model, height);

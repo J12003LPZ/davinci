@@ -7,8 +7,10 @@
 use ratatui::text::{Line, Span};
 
 use crate::davinci::model::Model;
-use crate::davinci::theme::{State, Theme};
-use crate::davinci::ui::{pad, run_width, span, span_on, span_strong, Surface};
+use crate::davinci::theme::{glyph, State, Theme};
+use crate::davinci::ui::{
+    blank, meter, pad, run_width, span, span_on, span_strong, spread, Surface, MEASURE,
+};
 
 /// The sessions list (`1f`).
 pub fn sessions(model: &Model) -> Vec<Line<'static>> {
@@ -64,6 +66,93 @@ pub fn sessions(model: &Model) -> Vec<Line<'static>> {
         .right(vec![span("ctrl+s", th.border)])
         .rows(body)
         .lines()
+}
+
+/// `2b` — vector recall.
+///
+/// Each hit is two rows: score, summary and location, then a proportion meter
+/// and provenance. Hits below the relevance floor are shown as held back, with
+/// the count, so the retrieval stays auditable (design.md §6).
+pub fn recall(model: &Model) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let width = model.width.min(MEASURE + 14);
+    let meta = &model.recall_meta;
+    let selected = model.selection(model.recall.len());
+
+    let mut rows = Surface::new(width, th)
+        .border(th.secondary)
+        .title(vec![
+            span("MEMORIA", th.secondary),
+            span(" · ", th.border),
+            span("RECALL", th.muted),
+        ])
+        .right(vec![
+            span(meta.metric.clone(), th.border),
+            span(" · ", th.muted),
+            span(meta.elapsed.clone(), th.border),
+            span(" · ", th.muted),
+            span(format!("k={}", meta.k), th.border),
+        ])
+        .row(vec![
+            span(format!("{} ", glyph::SEARCH), th.secondary),
+            span(meta.query.clone(), th.text),
+        ])
+        .lines();
+
+    rows.push(Line::from(vec![
+        span(format!("{} vectors", meta.vectors), th.muted),
+        span(" │ ", th.border),
+        span(format!("{} shards", meta.shards), th.muted),
+        span(" │ ", th.border),
+        span(meta.embedding.clone(), th.muted),
+    ]));
+    rows.push(blank());
+
+    let held_back = model.recall.iter().filter(|hit| !hit.above_floor).count();
+
+    for (index, hit) in model
+        .recall
+        .iter()
+        .filter(|hit| hit.above_floor)
+        .enumerate()
+    {
+        let current = Some(index) == selected;
+        let score_color = if current { th.primary } else { th.secondary };
+        rows.push(spread(
+            width,
+            vec![
+                span_strong(format!("{:.2}  ", hit.score), score_color, th),
+                span(
+                    hit.summary.clone(),
+                    if current { th.text } else { th.muted },
+                ),
+            ],
+            vec![span(hit.location.clone(), th.secondary)],
+        ));
+        let mut second = vec![pad(6, None)];
+        second.extend(meter(hit.score, 20, th, Some(score_color)));
+        second.push(span("  ", th.border));
+        second.push(span(hit.provenance.clone(), th.border));
+        rows.push(Line::from(second));
+    }
+
+    rows.push(blank());
+    rows.push(Line::from(vec![
+        span("promoted to context ", th.muted),
+        span(meta.promoted.clone(), th.text),
+    ]));
+    rows.push(Line::from(vec![
+        span_strong(format!("{} ", glyph::ATTENTION), th.warning, th),
+        span(format!("held back {held_back}"), th.muted),
+        span(" · ", th.border),
+        span(format!("below {:.2} relevance floor", meta.floor), th.muted),
+    ]));
+    rows.push(Line::from(vec![
+        span("index freshness ", th.muted),
+        span_strong(format!("{} ", glyph::DONE), th.success, th),
+        span(meta.freshness.clone(), th.muted),
+    ]));
+    rows
 }
 
 /// A picker row: `◉`/`○`, a name, and something on the right. Shared by
