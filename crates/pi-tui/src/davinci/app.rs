@@ -13,7 +13,7 @@ use ratatui::text::Line;
 use super::model::{Model, Overlay, Screen};
 use super::ui::{blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
-use super::views::{startup, transcript};
+use super::views::{cogitator, instrumenta, memoria, startup, transcript};
 
 /// What the runtime should do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +60,9 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
     }
+    if let Some(overlay) = model.overlay {
+        return overlay_body(model, overlay, height);
+    }
     if model.transcript.is_empty() {
         return empty_state(model, height);
     }
@@ -87,6 +90,33 @@ fn empty_state(model: &Model, height: usize) -> Vec<Line<'static>> {
     let mut out = vec![blank(); lead];
     out.extend(rows);
     pad_to(out, height)
+}
+
+/// An instrument in hand: the transcript stays visible behind it with the ramp
+/// dropped, and the panel is drawn over it, anchored above the composer
+/// (design.md §2, screens `1d` and `1f`).
+fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'static>> {
+    let dimmed = Model {
+        theme: model.theme.dim(),
+        overlay: None,
+        ..model.clone()
+    };
+    let mut behind = body(&dimmed, height);
+
+    let panel = match overlay {
+        Overlay::Instrumenta => instrumenta::lines(model),
+        Overlay::Sessions => memoria::sessions(model),
+        Overlay::Cogitator => cogitator::lines(model, &model.config_path),
+    };
+
+    let panel = if panel.len() > height {
+        tail(panel, height)
+    } else {
+        panel
+    };
+    behind.truncate(height - panel.len());
+    behind.extend(panel);
+    behind
 }
 
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the
@@ -147,6 +177,8 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
                 }
             }
         }
+        KeyCode::Up => model.move_selection(-1),
+        KeyCode::Down => model.move_selection(1),
         KeyCode::Char(ch) => model.type_char(&ch.to_string()),
         _ => {}
     }

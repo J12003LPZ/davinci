@@ -236,6 +236,10 @@ fn run_davinci(raw: &[String]) -> Result<i32, String> {
 
     let mut model = davinci::boot(raw, 100, 44);
     davinci::fixtures::dress_screen(&mut model, &screen);
+    model.config_path = default_agent_dir()
+        .join("config.json")
+        .display()
+        .to_string();
     model.cwd = cwd.display().to_string();
     if let Some(branch) = pi_tui::resolve_git_branch(&cwd) {
         model.branch = branch;

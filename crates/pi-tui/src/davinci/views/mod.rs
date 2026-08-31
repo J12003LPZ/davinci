@@ -2,6 +2,9 @@
 //! nothing else.
 
 pub mod chrome;
+pub mod cogitator;
+pub mod instrumenta;
+pub mod memoria;
 pub mod startup;
 pub mod studio;
 pub mod transcript;

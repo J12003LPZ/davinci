@@ -126,6 +126,61 @@ impl Entry {
     }
 }
 
+/// One row of the Instrumenta corpus (`1d`): tools, sessions, files, modes.
+#[derive(Debug, Clone)]
+pub struct CorpusItem {
+    pub name: String,
+    pub description: String,
+    pub kind: String,
+}
+
+impl CorpusItem {
+    pub fn new(name: &str, description: &str, kind: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
+    /// The haystack a query is matched against.
+    fn haystack(&self) -> String {
+        format!("{} {} {}", self.name, self.description, self.kind).to_lowercase()
+    }
+}
+
+/// One row of Memoria sessions (`1f`).
+#[derive(Debug, Clone)]
+pub struct SessionItem {
+    pub name: String,
+    pub age: String,
+}
+
+impl SessionItem {
+    pub fn new(name: &str, age: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            age: age.to_string(),
+        }
+    }
+}
+
+/// One row of Cogitator (`1f`): a provider and model, with its context window.
+#[derive(Debug, Clone)]
+pub struct ModelItem {
+    pub name: String,
+    pub window: String,
+}
+
+impl ModelItem {
+    pub fn new(name: &str, window: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            window: window.to_string(),
+        }
+    }
+}
+
 /// What the session found when it opened — the empty state, screen `1a`.
 #[derive(Debug, Clone, Default)]
 pub struct Startup {
@@ -170,6 +225,14 @@ pub struct Model {
     pub context: (u64, u64),
     /// The empty state, shown while the transcript has nothing in it.
     pub startup: Startup,
+
+    /// Everything Instrumenta can reach, and how much of it there is.
+    pub corpus: Vec<CorpusItem>,
+    pub corpus_total: usize,
+    pub sessions: Vec<SessionItem>,
+    pub models: Vec<ModelItem>,
+    /// Where the model picker says the configuration lives (`1f`).
+    pub config_path: String,
 }
 
 impl Model {
@@ -197,6 +260,56 @@ impl Model {
             changes: (0, 0, 0),
             context: (0, 200_000),
             startup: Startup::default(),
+            corpus: Vec::new(),
+            corpus_total: 0,
+            sessions: Vec::new(),
+            models: Vec::new(),
+            config_path: String::new(),
+        }
+    }
+
+    /// The corpus, narrowed by the palette query. Matching is subsequence
+    /// matching over name, description and kind, so `git` finds `/git status`
+    /// and `fix-git-hooks` alike.
+    pub fn filtered_corpus(&self) -> Vec<&CorpusItem> {
+        if self.query.is_empty() {
+            return self.corpus.iter().collect();
+        }
+        let needle = self.query.to_lowercase();
+        self.corpus
+            .iter()
+            .filter(|item| subsequence(&needle, &item.haystack()))
+            .collect()
+    }
+
+    /// The selected row of whichever list is open, clamped to what is there.
+    pub fn selection(&self, len: usize) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let index = match self.overlay {
+            Some(Overlay::Instrumenta) => self.palette_index,
+            Some(Overlay::Sessions) => self.session_index,
+            Some(Overlay::Cogitator) => self.model_index,
+            None => self.recall_index,
+        };
+        Some(index % len)
+    }
+
+    /// Move the selection in whichever list is open.
+    pub fn move_selection(&mut self, delta: isize) {
+        match self.overlay {
+            Some(Overlay::Instrumenta) => {
+                let len = self.filtered_corpus().len();
+                self.palette_index = wrap_index(self.palette_index, delta, len);
+            }
+            Some(Overlay::Sessions) => {
+                self.session_index = wrap_index(self.session_index, delta, self.sessions.len());
+            }
+            Some(Overlay::Cogitator) => {
+                self.model_index = wrap_index(self.model_index, delta, self.models.len());
+            }
+            None => {}
         }
     }
 
@@ -348,6 +461,14 @@ impl Model {
         self.overlay = None;
         self.screen = Screen::Agent;
     }
+}
+
+/// Whether `needle` appears in `haystack` in order, not necessarily adjacent.
+fn subsequence(needle: &str, haystack: &str) -> bool {
+    let mut chars = haystack.chars();
+    needle
+        .chars()
+        .all(|wanted| chars.any(|candidate| candidate == wanted))
 }
 
 /// Move a selection index by `delta`, wrapping at both ends.

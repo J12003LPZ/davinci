@@ -5,7 +5,9 @@
 //! session store, git status, token accountant and code graph. Everything here
 //! is scheduled for replacement; nothing else in the tree may depend on it.
 
-use super::model::{Entry, Hunk, HunkKind, Model, Startup, Step};
+use super::model::{
+    CorpusItem, Entry, Hunk, HunkKind, Model, ModelItem, SessionItem, Startup, Step,
+};
 use super::theme::State;
 
 /// `1a` — what the session found when it opened.
@@ -117,6 +119,44 @@ pub fn narrow_transcript() -> Vec<Entry> {
     ]
 }
 
+/// `1d` — the Instrumenta corpus: tools, sessions, files, modes.
+pub fn corpus() -> Vec<CorpusItem> {
+    vec![
+        CorpusItem::new("/git status", "working tree · 3 modified", "tool"),
+        CorpusItem::new("/git diff", "unstaged hunks", "tool"),
+        CorpusItem::new("/git commit", "stage all · write message", "tool"),
+        CorpusItem::new("memoria: fix-git-hooks", "session · 2 days ago", "session"),
+        CorpusItem::new(".gitignore", "C:\\dev\\oss\\davinci-rust", "file"),
+        CorpusItem::new("crates\\davinci-git\\src\\lib.rs", "414 lines", "file"),
+        CorpusItem::new("mode: git-worktree", "isolate edits per turn", "mode"),
+    ]
+}
+
+/// How much of the corpus there is, so the palette can say `7 of 214`.
+pub const CORPUS_TOTAL: usize = 214;
+
+/// `1f` — Memoria sessions.
+pub fn sessions() -> Vec<SessionItem> {
+    vec![
+        SessionItem::new("review-agent-runtime", "3m"),
+        SessionItem::new("implement-rpc-mode", "18m"),
+        SessionItem::new("provider-parity", "1h"),
+        SessionItem::new("tui-redesign", "yesterday"),
+        SessionItem::new("fix-git-hooks", "2d"),
+    ]
+}
+
+/// `1f` — Cogitator models.
+pub fn models() -> Vec<ModelItem> {
+    vec![
+        ModelItem::new("anthropic / sonnet", "200k"),
+        ModelItem::new("anthropic / opus", "200k"),
+        ModelItem::new("openai / gpt", "128k"),
+        ModelItem::new("google / gemini", "1m"),
+        ModelItem::new("local / ollama", "32k"),
+    ]
+}
+
 /// A model dressed with the mockups' session, for eyeballing a screen.
 pub fn dress(model: &mut Model) {
     model.cwd = "C:\\dev\\oss\\davinci-rust".into();
@@ -125,6 +165,10 @@ pub fn dress(model: &mut Model) {
     model.changes = (3, 42, 11);
     model.context = (47_000, 200_000);
     model.startup = startup();
+    model.corpus = corpus();
+    model.corpus_total = CORPUS_TOTAL;
+    model.sessions = sessions();
+    model.models = models();
     model.transcript = if model.narrow() {
         narrow_transcript()
     } else {
@@ -138,6 +182,9 @@ pub fn dress_screen(model: &mut Model, id: &str) {
     dress(model);
     match id {
         "1a" => model.transcript.clear(),
+        "1d" => model.toggle_overlay(crate::davinci::model::Overlay::Instrumenta),
+        "1f" => model.toggle_overlay(crate::davinci::model::Overlay::Sessions),
+        "1f-cogitator" => model.toggle_overlay(crate::davinci::model::Overlay::Cogitator),
         "1g" | "1h" => model.transcript = narrow_transcript(),
         _ => {}
     }

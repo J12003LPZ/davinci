@@ -316,6 +316,9 @@ impl Surface {
 
         out.push(self.top_rule(width));
         for row in self.body {
+            // A row that would push past the rule is cut, never wrapped: a
+            // surface reports one height and keeps it.
+            let row = truncate_run(row, inner);
             let used = run_width(&row);
             let mut spans = vec![span("│ ", self.border)];
             spans.extend(row);
