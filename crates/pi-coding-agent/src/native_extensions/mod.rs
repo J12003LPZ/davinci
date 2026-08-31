@@ -1,9 +1,9 @@
 //! Native Rust ports of the bundled pi extensions.
 
-mod graph;
+pub mod graph;
 mod security_scan;
 mod token_governor;
-mod vector_memory;
+pub mod vector_memory;
 
 pub use graph::*;
 pub use security_scan::*;

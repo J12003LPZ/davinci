@@ -1082,6 +1082,7 @@ pub fn run(
                 Ok(crossterm::event::Event::Key(key))
                     if key.kind != crossterm::event::KeyEventKind::Release =>
                 {
+                    let was = model.screen;
                     let next = match app::handle_key(&mut model, key) {
                         Flow::Quit => Next::Leave,
                         Flow::Submit(line) => on_line(
@@ -1112,6 +1113,17 @@ pub fn run(
                         ),
                         Flow::Continue | Flow::Interrupt => Next::Go,
                     };
+                    // Recall is a search, so it runs when the instrument is
+                    // summoned rather than being kept warm behind it.
+                    if model.screen == pi_tui::davinci::model::Screen::Memoria
+                        && was != pi_tui::davinci::model::Screen::Memoria
+                    {
+                        let query = recall_query(&model, agent);
+                        let (hits, meta) = crate::davinci_surfaces::recall(&cwd, &query, 8);
+                        model.recall = hits;
+                        model.recall_meta = meta;
+                        model.recall_index = 0;
+                    }
                     match next {
                         Next::Go => {}
                         Next::Leave => break Ok(0),
@@ -1387,6 +1399,7 @@ impl Shell<'_> {
     fn redress(&mut self) {
         refresh_context(self.model, self.agent);
         crate::davinci_sources::dress_from_workspace(self.model, self.cwd, self.session_dir);
+        crate::davinci_surfaces::dress_from_extensions(self.model, self.cwd);
         self.model.corpus = corpus(self.agent, &self.model.sessions);
         self.model.corpus_total = self.model.corpus.len();
     }
@@ -1620,6 +1633,34 @@ fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<St
             Ok(format!("removed {provider}"))
         }
     }
+}
+
+/// What recall searches for: what is being typed, else the last thing the
+/// user asked. Opening recall with nothing in hand should still recall
+/// something about the work in progress.
+pub fn recall_query(model: &Model, agent: &Agent) -> String {
+    let typed = model.composer.trim();
+    if !typed.is_empty() {
+        return typed.to_string();
+    }
+    agent
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| {
+            let text: String = message
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    pi_ai::MessageContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            clip(text.trim(), 120)
+        })
+        .unwrap_or_default()
 }
 
 fn refresh_context(model: &mut Model, agent: &Agent) {
@@ -1992,6 +2033,29 @@ mod tests {
             classify("/export report.html"),
             Sent::Command(SlashAction::Export(Some(path))) if path == "report.html"
         ));
+    }
+
+    #[test]
+    fn recall_searches_for_what_is_typed_and_falls_back_to_the_last_ask() {
+        let mut m = model();
+        let mut agent = pi_agent::Agent::new("test");
+        assert_eq!(recall_query(&m, &agent), "", "nothing typed, nothing asked");
+
+        agent.messages.push(pi_ai::ChatMessage {
+            role: "user".into(),
+            content: vec![pi_ai::MessageContent::Text {
+                text: "how does the session store work".into(),
+            }],
+            tool_call_id: None,
+            tool_name: None,
+            is_error: None,
+            extra: Default::default(),
+        });
+        agent.messages.push(assistant("it appends to a jsonl file"));
+        assert_eq!(recall_query(&m, &agent), "how does the session store work");
+
+        m.composer = "  branch cache  ".into();
+        assert_eq!(recall_query(&m, &agent), "branch cache");
     }
 
     #[test]

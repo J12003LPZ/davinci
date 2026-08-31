@@ -75,6 +75,12 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         body.push(row);
     }
 
+    if body.is_empty() {
+        // A plan sheet with nothing on it says so rather than drawing an
+        // empty frame that looks like a failure.
+        body.push(vec![span("no plan drawn for this project yet", th.muted)]);
+    }
+
     body.push(Vec::new());
     let mut footer = vec![
         span("constructio ", th.muted),

@@ -629,6 +629,12 @@ impl VectorMemory {
         Ok(inserted)
     }
 
+    /// How many records the index holds, for the surfaces that state the
+    /// size of what they searched (design.md §9: a number carries its cap).
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<MemoryHit> {
         if !self.config.enabled || query.trim().is_empty() {
             return Vec::new();

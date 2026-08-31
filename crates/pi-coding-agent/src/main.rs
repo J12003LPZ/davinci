@@ -5,6 +5,7 @@ mod catalog_refresh;
 mod changelog;
 mod davinci_session;
 mod davinci_sources;
+mod davinci_surfaces;
 #[cfg(unix)]
 mod experimental;
 #[cfg(not(unix))]
