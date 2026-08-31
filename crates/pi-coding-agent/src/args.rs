@@ -367,6 +367,25 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn the_ui_flags_are_boolean_and_never_swallow_the_message_after_them() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        let legacy = args(&["--legacy-tui", "explain the runtime"]);
+        assert!(legacy.legacy_tui);
+        assert_eq!(legacy.messages, vec!["explain the runtime".to_string()]);
+        assert!(legacy.unknown_flags.is_empty());
+
+        // `--davinci` is the default now and survives only for the fixture
+        // renderer, but it must not eat a message either.
+        let davinci = args(&["--davinci", "explain the runtime"]);
+        assert!(!davinci.legacy_tui);
+        assert_eq!(davinci.messages, vec!["explain the runtime".to_string()]);
+
+        assert!(!args(&["explain the runtime"]).legacy_tui);
+    }
+
+    #[test]
     fn terminal_title_matches_ts_update_terminal_title() {
         assert_eq!(
             format_terminal_title(None, Path::new("/tmp/project")),
