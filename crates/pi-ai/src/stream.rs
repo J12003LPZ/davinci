@@ -561,9 +561,125 @@ pub fn request_body_with(
         }
         "bedrock-converse-stream" => bedrock_body(model, messages, system, tools),
         "mistral-conversations" => mistral_body(model, messages, system, tools),
+        "openai-responses" | "openai-codex-responses" | "azure-openai-responses" => {
+            openai_responses_body(model, messages, system, tools, options)
+        }
         _ => openai_body(model, messages, system, tools, options),
     };
     apply_max_tokens_override(&mut body, options);
+    body
+}
+
+/// OpenAI Responses API body (TS `openai-responses.ts` `buildParams` /
+/// `openai-codex-responses.ts` `buildRequestBody`). Chat-completions bodies
+/// are rejected here; ChatGPT Codex additionally rejects a missing or true
+/// `store` field ("Store must be set to false").
+fn openai_responses_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+) -> Value {
+    let codex = model.api == "openai-codex-responses";
+    let mut input = Vec::new();
+    for message in messages {
+        if message.role == "toolResult" {
+            input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": message.tool_call_id.clone().unwrap_or_default(),
+                "output": content_text(&message.content),
+            }));
+            continue;
+        }
+        if message.role == "assistant" {
+            let text = content_text(&message.content);
+            if !text.is_empty() {
+                input.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }));
+            }
+            for block in &message.content {
+                if let MessageContent::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } = block
+                {
+                    input.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": arguments.to_string(),
+                    }));
+                }
+            }
+            continue;
+        }
+        let text = content_text(&message.content);
+        if text.is_empty() {
+            continue;
+        }
+        input.push(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        }));
+    }
+    let instructions = system
+        .filter(|value| !value.is_empty())
+        .unwrap_or("You are a helpful assistant.");
+    let mut body = serde_json::json!({
+        "model": model.id,
+        "store": false,
+        "stream": false,
+        "instructions": instructions,
+        "input": input,
+    });
+    if codex {
+        body["text"] = serde_json::json!({"verbosity": "low"});
+        body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+        body["tool_choice"] = Value::String("auto".into());
+        body["parallel_tool_calls"] = Value::Bool(true);
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    let mut function = serde_json::json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    });
+                    if resolve_json_schema_strict_sampling(tool).unwrap_or(false) {
+                        function["strict"] = Value::Bool(true);
+                    }
+                    function
+                })
+                .collect(),
+        );
+    }
+    if model.reasoning {
+        if let Some(level) = options
+            .thinking_level
+            .filter(|level| *level != ThinkingLevel::Off)
+        {
+            // `thinkingLevelMap` renames or (with an explicit null) drops a level.
+            let mapped = match model.thinking_level_map.get(level.as_str()) {
+                Some(Some(mapped)) => Some(mapped.clone()),
+                Some(None) => None,
+                None => Some(level.as_str().to_string()),
+            };
+            if let Some(effort) = mapped {
+                body["reasoning"] = serde_json::json!({
+                    "effort": effort,
+                    "summary": "auto",
+                });
+            }
+        }
+    }
     body
 }
 

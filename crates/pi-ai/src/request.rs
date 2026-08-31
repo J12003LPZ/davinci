@@ -270,6 +270,9 @@ fn openai_responses(model_id: &str, ctx: &RequestContext) -> Value {
         "model": model_id,
         "stream": ctx.stream,
         "input": input,
+        // ChatGPT Codex rejects a missing/true `store` ("Store must be set
+        // to false"); the TS reference always sends `store: false`.
+        "store": false,
     });
     if let Some(system) = &ctx.system {
         body["instructions"] = json!(system);
