@@ -559,7 +559,7 @@ pub fn request_body_with(
         "google-generative-ai" | "google-vertex" => {
             google_body(model, messages, system, tools, options)
         }
-        "bedrock-converse-stream" => bedrock_body(model, messages, system, tools),
+        "bedrock-converse-stream" => bedrock_body(model, messages, system, tools, options),
         "mistral-conversations" => mistral_body(model, messages, system, tools, options),
         "openai-responses" | "openai-codex-responses" | "azure-openai-responses" => {
             openai_responses_body(model, messages, system, tools, options)
@@ -862,8 +862,18 @@ fn bedrock_body(
     messages: &[ChatMessage],
     system: Option<&str>,
     tools: &[ToolSpec],
+    options: &StreamOptions,
 ) -> Value {
-    let converted: Vec<Value> = messages
+    let retention = crate::cache::cache_retention_from_options(options);
+    let cache_point = if crate::cache::bedrock_supports_prompt_caching(
+        model,
+        std::env::var("AWS_BEDROCK_FORCE_CACHE").ok().as_deref(),
+    ) {
+        crate::cache::bedrock_cache_point(retention)
+    } else {
+        None
+    };
+    let mut converted: Vec<Value> = messages
         .iter()
         .map(|message| {
             serde_json::json!({
@@ -872,12 +882,25 @@ fn bedrock_body(
             })
         })
         .collect();
+    if let Some(cache_point) = cache_point.as_ref() {
+        if let Some(last) = converted.last_mut() {
+            if last.get("role").and_then(Value::as_str) == Some("user") {
+                if let Some(content) = last.get_mut("content").and_then(Value::as_array_mut) {
+                    content.push(cache_point.clone());
+                }
+            }
+        }
+    }
     let mut body = serde_json::json!({
         "modelId": model.id,
         "messages": converted,
     });
     if let Some(system) = system {
-        body["system"] = serde_json::json!([{"text": system}]);
+        let mut blocks = vec![serde_json::json!({"text": system})];
+        if let Some(cache_point) = cache_point.as_ref() {
+            blocks.push(cache_point.clone());
+        }
+        body["system"] = Value::Array(blocks);
     }
     if !tools.is_empty() {
         body["toolConfig"] = serde_json::json!({
@@ -2130,6 +2153,79 @@ mod tests {
             },
         );
         assert!(none.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn bedrock_body_adds_cache_points_for_claude() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "bedrock-converse-stream")
+            .expect("bedrock model");
+        model.id = "anthropic.claude-fable-5".into();
+        model.name = model.id.clone();
+        let messages = vec![ChatMessage::text("user", "hello")];
+        let body = request_body_with(
+            &model,
+            &messages,
+            Some("sys"),
+            &[],
+            &StreamOptions {
+                cache_retention: Some("short".into()),
+                ..StreamOptions::default()
+            },
+        );
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system[0]["text"], "sys");
+        assert_eq!(system[1]["cachePoint"]["type"], "default");
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        let content = last["content"].as_array().unwrap();
+        assert_eq!(content.last().unwrap()["cachePoint"]["type"], "default");
+
+        let long = request_body_with(
+            &model,
+            &messages,
+            Some("sys"),
+            &[],
+            &StreamOptions {
+                cache_retention: Some("long".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(long["system"][1]["cachePoint"]["ttl"], "1h");
+
+        model.id = "amazon.nova-pro-v1:0".into();
+        model.name = model.id.clone();
+        let nova = request_body_with(
+            &model,
+            &messages,
+            Some("sys"),
+            &[],
+            &StreamOptions {
+                cache_retention: Some("short".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(nova["system"].as_array().unwrap().len(), 1);
+        let nova_last = nova["messages"].as_array().unwrap().last().unwrap();
+        assert!(nova_last["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block.get("cachePoint").is_none()));
+
+        model.id = "anthropic.claude-fable-5".into();
+        model.name = model.id.clone();
+        let none = request_body_with(
+            &model,
+            &messages,
+            Some("sys"),
+            &[],
+            &StreamOptions {
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(none["system"].as_array().unwrap().len(), 1);
     }
 
     #[test]
