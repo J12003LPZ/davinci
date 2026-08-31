@@ -234,24 +234,7 @@ pub fn replay_sse_events(model: &Model, corpus: &str) -> Vec<AssistantMessageEve
             });
         }
         if let Some(usage) = value.get("usage") {
-            message.usage = Some(Usage {
-                input: usage
-                    .get("prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                output: usage
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                cache_read: 0,
-                cache_write: 0,
-                reasoning: None,
-                total_tokens: usage
-                    .get("total_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                cost: Default::default(),
-            });
+            message.usage = Some(usage_from_value(model, usage));
         }
     }
     if started_text {
@@ -1370,6 +1353,71 @@ fn google_body(
     body
 }
 
+/// Cache-aware usage extraction across provider shapes. Mirrors:
+/// - anthropic-messages.ts:604, 749-750 (input excludes cached; own keys)
+/// - openai-completions.ts:1509-1531 (subtract cached + written from prompt)
+/// - openai-responses-shared.ts:561-570 (subtract details from input_tokens)
+/// - bedrock-converse-stream.ts:693 (camelCase converse keys)
+fn usage_from_value(model: &Model, usage: &Value) -> Usage {
+    let get = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let base_input = get("prompt_tokens")
+        .or_else(|| get("input_tokens"))
+        .or_else(|| get("inputTokens"))
+        .unwrap_or(0);
+    let output = get("completion_tokens")
+        .or_else(|| get("output_tokens"))
+        .or_else(|| get("outputTokens"))
+        .unwrap_or(0);
+    let anthropic_read = get("cache_read_input_tokens").or_else(|| get("cacheReadInputTokens"));
+    let anthropic_write =
+        get("cache_creation_input_tokens").or_else(|| get("cacheWriteInputTokens"));
+    let (input, cache_read, cache_write) = if anthropic_read.is_some() || anthropic_write.is_some()
+    {
+        (
+            base_input,
+            anthropic_read.unwrap_or(0),
+            anthropic_write.unwrap_or(0),
+        )
+    } else {
+        let read = usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+            .and_then(Value::as_u64)
+            .or_else(|| get("prompt_cache_hit_tokens"))
+            .or_else(|| get("cached_tokens"))
+            .unwrap_or(0);
+        let write = usage
+            .pointer("/prompt_tokens_details/cache_write_tokens")
+            .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        (
+            base_input.saturating_sub(read).saturating_sub(write),
+            read,
+            write,
+        )
+    };
+    let mut computed = crate::calculate_usage(model, input, output, cache_read, cache_write);
+    if let Some(total) = get("total_tokens").or_else(|| get("totalTokens")) {
+        computed.total_tokens = total;
+    }
+    computed
+}
+
+/// google-generative-ai.ts:225-236 — usageMetadata mapping with cached tokens
+/// subtracted from the prompt count.
+fn usage_from_google_metadata(model: &Model, metadata: &Value) -> Usage {
+    let get = |key: &str| metadata.get(key).and_then(Value::as_u64);
+    let cached = get("cachedContentTokenCount").unwrap_or(0);
+    let input = get("promptTokenCount").unwrap_or(0).saturating_sub(cached);
+    let output = get("candidatesTokenCount").unwrap_or(0);
+    let mut computed = crate::calculate_usage(model, input, output, cached, 0);
+    if let Some(total) = get("totalTokenCount") {
+        computed.total_tokens = total;
+    }
+    computed
+}
+
 fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
     if raw.contains("data:") {
         return fixture_complete(model, &[], raw);
@@ -1502,26 +1550,14 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
             text: raw.to_string(),
         });
     }
-    let usage = value.get("usage").map(|usage| Usage {
-        input: usage
-            .get("prompt_tokens")
-            .or_else(|| usage.get("input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output: usage
-            .get("completion_tokens")
-            .or_else(|| usage.get("output_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cache_read: 0,
-        cache_write: 0,
-        reasoning: None,
-        total_tokens: usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cost: Default::default(),
-    });
+    let usage = value
+        .get("usage")
+        .map(|usage| usage_from_value(model, usage))
+        .or_else(|| {
+            value
+                .get("usageMetadata")
+                .map(|metadata| usage_from_google_metadata(model, metadata))
+        });
     let stop_reason = if content
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
@@ -2226,6 +2262,135 @@ mod tests {
             },
         );
         assert_eq!(none["system"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn usage_parses_cache_tokens_per_provider() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("model");
+        let anthropic = usage_from_value(
+            &model,
+            &serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 100,
+            }),
+        );
+        assert_eq!(anthropic.input, 10);
+        assert_eq!(anthropic.cache_read, 900);
+        assert_eq!(anthropic.cache_write, 100);
+        assert!(anthropic.cost.total > 0.0);
+
+        let completions = usage_from_value(
+            &model,
+            &serde_json::json!({
+                "prompt_tokens": 1000,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 700, "cache_write_tokens": 100},
+            }),
+        );
+        assert_eq!(completions.input, 200);
+        assert_eq!(completions.cache_read, 700);
+        assert_eq!(completions.cache_write, 100);
+
+        let deepseek = usage_from_value(
+            &model,
+            &serde_json::json!({"prompt_tokens": 100, "completion_tokens": 1, "prompt_cache_hit_tokens": 40}),
+        );
+        assert_eq!(deepseek.cache_read, 40);
+        assert_eq!(deepseek.input, 60);
+        let kimi = usage_from_value(
+            &model,
+            &serde_json::json!({"prompt_tokens": 100, "completion_tokens": 1, "cached_tokens": 30}),
+        );
+        assert_eq!(kimi.cache_read, 30);
+        assert_eq!(kimi.input, 70);
+
+        let responses = usage_from_value(
+            &model,
+            &serde_json::json!({
+                "input_tokens": 500,
+                "output_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 450},
+                "total_tokens": 510,
+            }),
+        );
+        assert_eq!(responses.input, 50);
+        assert_eq!(responses.cache_read, 450);
+        assert_eq!(responses.total_tokens, 510);
+
+        let bedrock = usage_from_value(
+            &model,
+            &serde_json::json!({
+                "inputTokens": 25,
+                "outputTokens": 5,
+                "cacheReadInputTokens": 300,
+                "cacheWriteInputTokens": 50,
+            }),
+        );
+        assert_eq!(bedrock.input, 25);
+        assert_eq!(bedrock.cache_read, 300);
+        assert_eq!(bedrock.cache_write, 50);
+
+        let odd = usage_from_value(
+            &model,
+            &serde_json::json!({"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 50}}),
+        );
+        assert_eq!(odd.input, 0);
+    }
+
+    #[test]
+    fn usage_parses_google_metadata() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "google-generative-ai")
+            .expect("google model");
+        let usage = usage_from_google_metadata(
+            &model,
+            &serde_json::json!({
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 30,
+                "totalTokenCount": 1030,
+                "cachedContentTokenCount": 800,
+            }),
+        );
+        assert_eq!(usage.input, 200);
+        assert_eq!(usage.cache_read, 800);
+        assert_eq!(usage.output, 30);
+        assert_eq!(usage.total_tokens, 1030);
+    }
+
+    #[test]
+    fn parse_provider_response_reads_cache_usage() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("model");
+        let parsed = parse_provider_response(
+            &model,
+            r#"{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":70,"cache_creation_input_tokens":7}}"#,
+        );
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.cache_read, 70);
+        assert_eq!(usage.cache_write, 7);
+    }
+
+    #[test]
+    fn parse_provider_response_reads_google_usage_metadata() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "google-generative-ai")
+            .expect("google model");
+        let parsed = parse_provider_response(
+            &model,
+            r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":105,"cachedContentTokenCount":60}}"#,
+        );
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.cache_read, 60);
+        assert_eq!(usage.input, 40);
     }
 
     #[test]
