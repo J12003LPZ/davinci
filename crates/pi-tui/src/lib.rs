@@ -9,6 +9,7 @@ mod chrome;
 mod config_selector;
 mod container;
 mod custom_message;
+pub mod davinci;
 mod editor;
 mod extension_ui;
 mod first_time;
@@ -191,7 +192,10 @@ pub use stack::{
     allocate_stack_sizes, HStack, LayoutViewport, StackAlign, StackBasis, StackEntryOptions,
     StackLayoutEntry, VStack,
 };
-pub use startup_header::{build_startup_header, format_key_text, key_hint, key_text, raw_key_hint};
+pub use startup_header::{
+    build_startup_header, build_startup_header_with, format_key_text, key_hint, key_text,
+    raw_key_hint, StartupInfo,
+};
 pub use stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvents};
 pub use terminal::{
     is_apple_terminal_session, is_keyboard_protocol_negotiation_sequence_prefix,
@@ -204,7 +208,7 @@ pub use terminal::{
     KITTY_KEYBOARD_PROTOCOL_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE,
     NATIVE_SHIFT_ENTER_SEQUENCE,
 };
-pub use themes::{builtin_themes, load_themes_from_dir, Theme};
+pub use themes::{builtin_themes, glyphs, load_themes_from_dir, no_color, Palette, Theme};
 pub use thinking_selector::{
     ThinkingSelector, ThinkingSelectorAction, LEVEL_DESCRIPTIONS as THINKING_LEVEL_DESCRIPTIONS,
 };
