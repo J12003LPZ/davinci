@@ -344,7 +344,7 @@ pub fn live_complete_with(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
-        &collect_request_headers(model, auth, options.session_id.as_deref()),
+        &collect_request_headers(model, auth, options),
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
@@ -398,7 +398,7 @@ pub fn live_complete_streaming_with(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
-        &collect_request_headers(model, auth, options.session_id.as_deref()),
+        &collect_request_headers(model, auth, options),
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
@@ -426,8 +426,9 @@ pub fn live_complete_streaming_with(
 fn collect_request_headers(
     model: &Model,
     auth: &ResolvedAuth,
-    session_id: Option<&str>,
+    options: &StreamOptions,
 ) -> Vec<(String, String)> {
+    let session_id = options.session_id.as_deref().filter(|id| !id.is_empty());
     if model.api == "openai-codex-responses" {
         if let Some(token) = &auth.api_key {
             if let Ok(account_id) = crate::codex::extract_account_id(token) {
@@ -463,6 +464,76 @@ fn collect_request_headers(
         }
     }
     headers.push(("content-type".into(), "application/json".into()));
+
+    let push_if_absent = |headers: &mut Vec<(String, String)>, name: &str, value: &str| {
+        if !headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            headers.push((name.to_string(), value.to_string()));
+        }
+    };
+    if let Some(session_id) = session_id {
+        let retention = crate::cache::cache_retention_from_options(options);
+        let affinity_format = model
+            .compat
+            .get("sessionAffinityFormat")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let openrouter = model.provider == "openrouter"
+                    || model
+                        .base_url
+                        .as_deref()
+                        .is_some_and(|url| url.contains("openrouter.ai"));
+                if openrouter {
+                    "openrouter".into()
+                } else {
+                    "openai".into()
+                }
+            });
+        let opted_in = model
+            .compat
+            .get("sendSessionAffinityHeaders")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match model.api.as_str() {
+            "anthropic-messages" | "pi-messages" => {
+                if opted_in && retention != crate::cache::CacheRetention::None {
+                    push_if_absent(&mut headers, "x-session-affinity", session_id);
+                }
+            }
+            "openai-responses" | "azure-openai-responses" => {
+                if affinity_format == "openrouter" {
+                    push_if_absent(&mut headers, "x-session-id", session_id);
+                } else {
+                    if affinity_format == "openai" {
+                        push_if_absent(&mut headers, "session_id", session_id);
+                    }
+                    push_if_absent(&mut headers, "x-client-request-id", session_id);
+                }
+            }
+            "mistral-conversations" => {
+                if retention != crate::cache::CacheRetention::None {
+                    push_if_absent(&mut headers, "x-affinity", session_id);
+                }
+            }
+            "openai-codex-responses" => {}
+            _ => {
+                if opted_in {
+                    if affinity_format == "openrouter" {
+                        push_if_absent(&mut headers, "x-session-id", session_id);
+                    } else {
+                        if affinity_format == "openai" {
+                            push_if_absent(&mut headers, "session_id", session_id);
+                        }
+                        push_if_absent(&mut headers, "x-client-request-id", session_id);
+                        push_if_absent(&mut headers, "x-session-affinity", session_id);
+                    }
+                }
+            }
+        }
+    }
     headers
 }
 
@@ -2391,6 +2462,97 @@ mod tests {
         let usage = parsed.usage.expect("usage");
         assert_eq!(usage.cache_read, 60);
         assert_eq!(usage.input, 40);
+    }
+
+    #[test]
+    fn affinity_headers_follow_ts_rules() {
+        let session = StreamOptions {
+            session_id: Some("sess-aff".into()),
+            ..StreamOptions::default()
+        };
+        let auth = crate::auth::ResolvedAuth {
+            api_key: Some("k".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let header = |headers: &[(String, String)], name: &str| -> Option<String> {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+
+        let mut anthropic = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("anthropic");
+        let plain = collect_request_headers(&anthropic, &auth, &session);
+        assert_eq!(header(&plain, "x-session-affinity"), None);
+        anthropic.compat = serde_json::json!({"sendSessionAffinityHeaders": true});
+        let opted = collect_request_headers(&anthropic, &auth, &session);
+        assert_eq!(
+            header(&opted, "x-session-affinity"),
+            Some("sess-aff".into())
+        );
+        let none = collect_request_headers(
+            &anthropic,
+            &auth,
+            &StreamOptions {
+                session_id: Some("sess-aff".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(header(&none, "x-session-affinity"), None);
+
+        let responses = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-responses")
+            .expect("responses model");
+        let resp_headers = collect_request_headers(&responses, &auth, &session);
+        assert_eq!(
+            header(&resp_headers, "x-client-request-id"),
+            Some("sess-aff".into())
+        );
+        assert_eq!(header(&resp_headers, "session_id"), Some("sess-aff".into()));
+
+        let mut openrouter = responses.clone();
+        openrouter.provider = "openrouter".into();
+        openrouter.base_url = Some("https://openrouter.ai/api/v1".into());
+        let or_headers = collect_request_headers(&openrouter, &auth, &session);
+        assert_eq!(header(&or_headers, "x-session-id"), Some("sess-aff".into()));
+        assert_eq!(header(&or_headers, "x-client-request-id"), None);
+
+        let mut completions = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("completions model");
+        completions.provider = "openai".into();
+        completions.base_url = Some("https://api.openai.com/v1".into());
+        completions.compat = serde_json::Value::Null;
+        let comp_plain = collect_request_headers(&completions, &auth, &session);
+        assert_eq!(header(&comp_plain, "x-session-affinity"), None);
+        let mut comp_opted_model = completions.clone();
+        comp_opted_model.compat = serde_json::json!({"sendSessionAffinityHeaders": true});
+        let comp_opted = collect_request_headers(&comp_opted_model, &auth, &session);
+        assert_eq!(
+            header(&comp_opted, "x-session-affinity"),
+            Some("sess-aff".into())
+        );
+        assert_eq!(
+            header(&comp_opted, "x-client-request-id"),
+            Some("sess-aff".into())
+        );
+        assert_eq!(header(&comp_opted, "session_id"), Some("sess-aff".into()));
+
+        let mut mistral = completions.clone();
+        mistral.api = "mistral-conversations".into();
+        mistral.compat = serde_json::Value::Null;
+        let mistral_headers = collect_request_headers(&mistral, &auth, &session);
+        assert_eq!(
+            header(&mistral_headers, "x-affinity"),
+            Some("sess-aff".into())
+        );
     }
 
     #[test]
