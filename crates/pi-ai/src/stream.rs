@@ -1033,7 +1033,11 @@ fn anthropic_body(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Value {
-    let converted: Vec<Value> = messages
+    let cache_control = crate::cache::anthropic_cache_control(
+        &model.compat,
+        crate::cache::cache_retention_from_options(options),
+    );
+    let mut converted: Vec<Value> = messages
         .iter()
         .map(|message| {
             if message.role == "toolResult" {
@@ -1080,6 +1084,28 @@ fn anthropic_body(
             }
         })
         .collect();
+    if let Some(cache_control) = cache_control.as_ref() {
+        if let Some(last) = converted.last_mut() {
+            if last.get("role").and_then(Value::as_str) == Some("user") {
+                match last.get_mut("content") {
+                    Some(Value::Array(blocks)) => {
+                        if let Some(block) = blocks.last_mut() {
+                            block["cache_control"] = cache_control.clone();
+                        }
+                    }
+                    Some(content) if content.is_string() => {
+                        let text = content.as_str().unwrap_or_default().to_string();
+                        *content = serde_json::json!([{
+                            "type": "text",
+                            "text": text,
+                            "cache_control": cache_control,
+                        }]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     let mut body = serde_json::json!({
         "model": model.id,
         "max_tokens": model.max_tokens.min(8192),
@@ -1087,7 +1113,11 @@ fn anthropic_body(
         "stream": false,
     });
     if let Some(system) = system {
-        body["system"] = Value::String(system.to_string());
+        let mut block = serde_json::json!({"type": "text", "text": system});
+        if let Some(cache_control) = cache_control.as_ref() {
+            block["cache_control"] = cache_control.clone();
+        }
+        body["system"] = Value::Array(vec![block]);
     }
     if !tools.is_empty() {
         body["tools"] = Value::Array(
@@ -1102,6 +1132,16 @@ fn anthropic_body(
                 })
                 .collect(),
         );
+    }
+    if let Some(cache_control) = cache_control
+        .as_ref()
+        .filter(|_| crate::cache::supports_cache_control_on_tools(&model.compat))
+    {
+        if let Some(tools_array) = body.get_mut("tools").and_then(Value::as_array_mut) {
+            if let Some(last) = tools_array.last_mut() {
+                last["cache_control"] = cache_control.clone();
+            }
+        }
     }
     if let Some(level) = options
         .thinking_level
@@ -1531,6 +1571,137 @@ mod tests {
                     |block| matches!(block, ContentBlock::Text { text } if text.contains("ok"))
                 )
         );
+    }
+
+    #[test]
+    fn anthropic_body_places_cache_control_breakpoints() {
+        let anthropic = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("anthropic");
+        let messages = vec![
+            ChatMessage::text("user", "first"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![MessageContent::Text {
+                    text: "reply".into(),
+                }],
+                ..ChatMessage::default()
+            },
+            ChatMessage::text("user", "second"),
+        ];
+        let tools = vec![
+            ToolSpec {
+                name: "read".into(),
+                description: "read".into(),
+                parameters: serde_json::json!({"type":"object"}),
+                constrained_sampling: None,
+            },
+            ToolSpec {
+                name: "write".into(),
+                description: "write".into(),
+                parameters: serde_json::json!({"type":"object"}),
+                constrained_sampling: None,
+            },
+        ];
+        let options = StreamOptions {
+            cache_retention: Some("short".into()),
+            ..StreamOptions::default()
+        };
+        let body = request_body_with(&anthropic, &messages, Some("sys"), &tools, &options);
+
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "sys");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"][0]["text"], "second");
+        assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["messages"][0]["content"], "first");
+
+        let long = request_body_with(
+            &anthropic,
+            &messages,
+            Some("sys"),
+            &tools,
+            &StreamOptions {
+                cache_retention: Some("long".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(long["system"][0]["cache_control"]["ttl"], "1h");
+
+        let none = request_body_with(
+            &anthropic,
+            &messages,
+            Some("sys"),
+            &tools,
+            &StreamOptions {
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(none["system"][0]["text"], "sys");
+        assert!(none["system"][0].get("cache_control").is_none());
+        assert!(none["tools"][1].get("cache_control").is_none());
+        let none_last = none["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(none_last["content"], "second");
+    }
+
+    #[test]
+    fn anthropic_body_marks_tool_result_content_block() {
+        let anthropic = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("anthropic");
+        let messages = vec![ChatMessage {
+            role: "toolResult".into(),
+            tool_call_id: Some("t1".into()),
+            content: vec![MessageContent::Text { text: "out".into() }],
+            ..ChatMessage::default()
+        }];
+        let body = request_body_with(
+            &anthropic,
+            &messages,
+            None,
+            &[],
+            &StreamOptions {
+                cache_retention: Some("short".into()),
+                ..StreamOptions::default()
+            },
+        );
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"][0]["type"], "tool_result");
+        assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_body_respects_tool_cache_compat() {
+        let mut anthropic = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("anthropic");
+        anthropic.compat = serde_json::json!({"supportsCacheControlOnTools": false});
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            constrained_sampling: None,
+        }];
+        let body = request_body_with(
+            &anthropic,
+            &[],
+            None,
+            &tools,
+            &StreamOptions {
+                cache_retention: Some("short".into()),
+                ..StreamOptions::default()
+            },
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
     }
 
     #[test]
