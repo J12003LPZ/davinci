@@ -371,6 +371,7 @@ fn run_turn(
 
     let mut turn = Turn::default();
     let mut last_tick = Instant::now();
+    let crashed = Arc::new(AtomicBool::new(false));
 
     std::thread::scope(|scope| -> std::io::Result<()> {
         let worker = scope
@@ -405,7 +406,11 @@ fn run_turn(
             }
         }
 
-        let _ = worker.join();
+        // A panicking worker used to be discarded, which showed up as a turn
+        // that quietly returned nothing. Report it as the failure it is.
+        if worker.join().is_err() {
+            crashed.store(true, Ordering::Relaxed);
+        }
         Ok(())
     })?;
 
@@ -415,7 +420,15 @@ fn run_turn(
     let interrupted = abort.load(Ordering::Relaxed);
     turn.close(model, interrupted);
 
-    if interrupted {
+    if crashed.load(Ordering::Relaxed) {
+        model.transcript.push(Entry::Gap);
+        model.transcript.push(Entry::tool(
+            State::Failed,
+            "manus",
+            "the turn crashed · the transcript is kept, the session is intact",
+            None,
+        ));
+    } else if interrupted {
         model.transcript.push(Entry::Gap);
         model.transcript.push(Entry::tool(
             State::Skipped,
@@ -1014,6 +1027,11 @@ pub fn run(
     }
 
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    // Proving the panic hook gives the terminal back needs a panic to happen
+    // inside the alternate screen, which nothing else can arrange.
+    if std::env::var("PI_DAVINCI_PANIC_FIXTURE").is_ok() {
+        panic!("PI_DAVINCI_PANIC_FIXTURE");
+    }
     terminal
         .set_title(&crate::format_terminal_title(
             agent

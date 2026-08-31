@@ -5,8 +5,11 @@
 //! and close in one frame.
 
 use std::io::{self, Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::Show;
 use crossterm::event::{
     self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
@@ -61,6 +64,46 @@ fn supports_keyboard_enhancement() -> bool {
     false
 }
 
+/// Whether the keyboard enhancement flags are currently pushed. Held globally
+/// so the terminal can be given back from a panic hook, which has no `Session`
+/// to ask.
+static DISAMBIGUATED: AtomicBool = AtomicBool::new(false);
+/// Whether the alternate screen is currently ours.
+static HELD: AtomicBool = AtomicBool::new(false);
+
+/// Undo everything [`Session::open`] did, from anywhere, at most once.
+///
+/// Idempotent and safe to call when the terminal was never taken.
+pub fn restore() -> io::Result<()> {
+    if !HELD.swap(false, Ordering::SeqCst) {
+        return Ok(());
+    }
+    if DISAMBIGUATED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    let _ = disable_raw_mode();
+    io::stdout().flush()
+}
+
+/// Give the terminal back before a panic prints.
+///
+/// Without this a panic inside the alternate screen writes its message onto a
+/// buffer that is discarded a moment later: the user is left with a terminal
+/// in raw mode and no explanation of why. Installing the hook is idempotent,
+/// and the previous hook still runs, so the message and any backtrace are
+/// printed as usual — onto the real screen.
+pub fn install_panic_hook() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = restore();
+            previous(info);
+        }));
+    });
+}
+
 /// The terminal, for as long as the TUI owns it.
 pub struct Session {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -71,9 +114,11 @@ impl Session {
     /// Take the terminal: raw mode, alternate screen, and the kitty keyboard
     /// protocol when the terminal supports it.
     pub fn open() -> io::Result<Self> {
+        install_panic_hook();
         enable_raw_mode()?;
         let mut out = io::stdout();
         execute!(out, EnterAlternateScreen)?;
+        HELD.store(true, Ordering::SeqCst);
 
         let disambiguated = supports_keyboard_enhancement();
         if disambiguated {
@@ -81,6 +126,7 @@ impl Session {
                 out,
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
             )?;
+            DISAMBIGUATED.store(true, Ordering::SeqCst);
         }
 
         let terminal = Terminal::new(CrosstermBackend::new(out))?;
@@ -119,14 +165,7 @@ impl Session {
 
     /// Give the terminal back. Safe to call twice.
     pub fn close(&mut self) -> io::Result<()> {
-        if self.keyboard.disambiguated {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        }
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        disable_raw_mode()?;
-        self.terminal.show_cursor()?;
-        io::stdout().flush()?;
-        Ok(())
+        restore()
     }
 }
 
