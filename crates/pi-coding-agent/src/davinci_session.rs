@@ -9,7 +9,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pi_agent::{Agent, AgentEvent, EventSink};
-use pi_tui::davinci::model::{CorpusItem, Entry, Model, ModelItem, Step};
+use pi_tui::davinci::model::{
+    Ask, Choice, CorpusItem, Entry, Model, ModelItem, Overlay, PickerItem, Step,
+};
 use pi_tui::davinci::theme::State;
 
 use crate::extension_host::ExtensionHost;
@@ -446,9 +448,8 @@ pub enum Sent {
     Say(String),
     /// Summon one of the instruments the shell already owns.
     Open(pi_tui::davinci::model::Overlay),
-    /// A slash command this shell does not own yet, named so the user is told
-    /// rather than ignored.
-    Unsupported(String),
+    /// A command that needs the agent and the session to carry it out.
+    Command(crate::slash::SlashAction),
 }
 
 pub fn classify(line: &str) -> Sent {
@@ -460,21 +461,395 @@ pub fn classify(line: &str) -> Sent {
         SlashAction::Quit => Sent::Quit,
         SlashAction::Status(text) => Sent::Say(text),
         // The instruments the design already gives these commands a home in.
-        SlashAction::OpenModel | SlashAction::SetModel(_) => Sent::Open(Overlay::Cogitator),
-        SlashAction::Resume | SlashAction::Tree => Sent::Open(Overlay::Sessions),
+        SlashAction::OpenModel => Sent::Open(Overlay::Cogitator),
+        SlashAction::Resume => Sent::Open(Overlay::Sessions),
         SlashAction::Settings | SlashAction::Hotkeys => Sent::Open(Overlay::Instrumenta),
-        _ => Sent::Unsupported(command_name(line)),
+        other => Sent::Command(other),
     }
 }
 
-/// The command as the user typed it, for the line that says it is not wired in
-/// yet. Naming it from the input rather than from the parsed variant means the
-/// message always matches what was on screen.
-fn command_name(line: &str) -> String {
-    line.split_whitespace()
-        .next()
-        .unwrap_or("/command")
-        .to_string()
+/// What carrying a command out amounted to. Every command says something: a
+/// command that changed nothing visible still owes the user a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Done {
+    /// Prose in the transcript.
+    Said(String),
+    /// A line that carries the attention glyph: a refusal, a usage error, a
+    /// cancellation (design.md §4 — the glyph, not the colour, says so).
+    Note(String),
+    /// Summon an instrument instead of printing anything.
+    Open(pi_tui::davinci::model::Overlay),
+    /// Put a question to the user as a list, and act on the row they choose.
+    Ask(Question),
+    /// Leave the alt screen, run this, come back. Reserved for the flows that
+    /// own the terminal themselves — a browser handshake and its prompts.
+    Detach(Detached),
+}
+
+/// A question the shell puts to the user through the `Ask` instrument. The
+/// rows the panel shows are derived from this; the answer comes back as the
+/// index of the row chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Question {
+    /// Whether this project's `.pi` resources may be used.
+    Trust {
+        path: String,
+        options: Vec<crate::trust::ProjectTrustOption>,
+    },
+    /// How hard the model should think.
+    Thinking,
+    /// Which stored credential to remove.
+    Logout { providers: Vec<String> },
+}
+
+impl Question {
+    /// The panel this question wears: its paired name, its key, the line that
+    /// says what is being decided, and one row per answer.
+    pub fn ask(&self, agent: &Agent) -> Ask {
+        match self {
+            Question::Trust { path, options } => Ask {
+                title: "FIDES".into(),
+                name: "TRUST".into(),
+                key: "/trust".into(),
+                note: format!("{path} · takes effect on the next start"),
+                items: options
+                    .iter()
+                    .map(|option| {
+                        PickerItem::new(
+                            &option.label,
+                            if option.trusted {
+                                "project .pi resources are used"
+                            } else {
+                                "project .pi resources are ignored"
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            Question::Thinking => Ask {
+                title: "MEDITATIO".into(),
+                name: "THINKING".into(),
+                key: "/thinking".into(),
+                note: format!("in hand: {}", agent.thinking_level.as_str()),
+                items: THINKING_LEVELS
+                    .iter()
+                    .map(|level| {
+                        PickerItem::new(
+                            level,
+                            if *level == agent.thinking_level.as_str() {
+                                "in hand"
+                            } else {
+                                ""
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            Question::Logout { providers } => Ask {
+                title: "CLAVES".into(),
+                name: "CREDENTIALS".into(),
+                key: "/logout".into(),
+                note: "chosen credentials are removed from this machine".into(),
+                items: providers
+                    .iter()
+                    .map(|provider| PickerItem::new(provider, "stored by /login"))
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// Work that cannot happen underneath the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detached {
+    Login {
+        provider: String,
+        key: Option<String>,
+    },
+}
+
+/// Carry out a command that needs the live agent. Everything here mirrors the
+/// arm of `handle_user_line` in `main.rs` that the old chrome ran, minus the
+/// chrome: the same stores, the same extension events, the same order.
+pub fn perform(
+    parsed: &crate::args::Args,
+    agent: &mut Agent,
+    model: &mut Model,
+    action: crate::slash::SlashAction,
+) -> Result<Done, String> {
+    use crate::extension_host::ExtensionEvent;
+    use crate::slash::SlashAction;
+    use pi_session::JsonlSession;
+    use std::path::PathBuf;
+
+    let agent_dir = crate::default_agent_dir();
+    match action {
+        // Routed by `classify`; carried here only so the match is total.
+        SlashAction::Prompt(text) => Ok(Done::Said(text)),
+        SlashAction::Quit => Ok(Done::Said("goodbye".into())),
+        SlashAction::Status(text) => Ok(Done::Said(text)),
+        SlashAction::OpenModel => Ok(Done::Open(Overlay::Cogitator)),
+        SlashAction::Resume => Ok(Done::Open(Overlay::Sessions)),
+        SlashAction::Settings | SlashAction::Hotkeys => Ok(Done::Open(Overlay::Instrumenta)),
+
+        SlashAction::NewSession => {
+            let session_dir = crate::resolved_session_dir(parsed, &agent.cwd);
+            let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
+                .map_err(|err| err.to_string())?;
+            agent.messages.clear();
+            agent.session = Some(store);
+            model.transcript.clear();
+            Ok(Done::Said("started a new session".into()))
+        }
+        SlashAction::Compact(instructions) => {
+            let mut host = crate::loaded_extension_host(parsed);
+            host.runtime_flag_values = crate::flag_values_json(parsed);
+            host.emit(ExtensionEvent::SessionBeforeCompact);
+            if host.last_result_cancelled() {
+                return Ok(Done::Note("compaction cancelled".into()));
+            }
+            let result = agent.compact(instructions.as_deref());
+            if result.compacted {
+                host.emit(ExtensionEvent::SessionCompact);
+            } else {
+                host.emit(ExtensionEvent::SessionCompactFailed {
+                    error: result.summary.clone(),
+                });
+            }
+            model.transcript = transcript_from(&agent.messages);
+            Ok(Done::Said(result.summary))
+        }
+        SlashAction::Export(path) => {
+            let Some(store) = agent.session.as_ref() else {
+                return Ok(Done::Note("no session to export".into()));
+            };
+            let output = PathBuf::from(path.unwrap_or_else(|| "session.html".into()));
+            Ok(Done::Said(crate::export::export_session(store, &output)?))
+        }
+        SlashAction::Name(name) => {
+            let Some(store) = agent.session.as_mut() else {
+                return Ok(Done::Note("no session to name".into()));
+            };
+            store.set_name(&name).map_err(|err| err.to_string())?;
+            Ok(Done::Said(format!("named this session {name}")))
+        }
+        SlashAction::Fork => {
+            let mut host = crate::loaded_extension_host(parsed);
+            host.runtime_flag_values = crate::flag_values_json(parsed);
+            host.emit(ExtensionEvent::SessionBeforeFork);
+            if host.last_result_cancelled() {
+                return Ok(Done::Note("fork cancelled".into()));
+            }
+            let Some(store) = agent.session.as_ref() else {
+                return Ok(Done::Note("no session to fork".into()));
+            };
+            let session_dir = crate::resolved_session_dir(parsed, &agent.cwd);
+            let next = store
+                .fork(
+                    store.leaf_id.as_deref().unwrap_or(&store.header.id),
+                    &session_dir,
+                )
+                .map_err(|err| err.to_string())?;
+            agent.load_from_session(next);
+            model.transcript = transcript_from(&agent.messages);
+            Ok(Done::Said(format!("forked to {}", session_id(agent))))
+        }
+        SlashAction::Clone => {
+            let Some(store) = agent.session.as_ref() else {
+                return Ok(Done::Note("no session to clone".into()));
+            };
+            let session_dir = crate::resolved_session_dir(parsed, &agent.cwd);
+            let next = store
+                .clone_session(&session_dir)
+                .map_err(|err| err.to_string())?;
+            agent.load_from_session(next);
+            model.transcript = transcript_from(&agent.messages);
+            Ok(Done::Said(format!("cloned to {}", session_id(agent))))
+        }
+        SlashAction::Import(path) => {
+            if path.is_empty() {
+                return Ok(Done::Note("usage: /import <path.jsonl>".into()));
+            }
+            let expanded = pi_session::expand_tilde(&path);
+            let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
+            agent.load_from_session(next);
+            model.transcript = transcript_from(&agent.messages);
+            Ok(Done::Said(format!("imported {}", session_id(agent))))
+        }
+        SlashAction::Copy => match agent.last_assistant_text() {
+            Some(text) => {
+                pi_tui::copy_text(&text);
+                Ok(Done::Said("copied the last reply to the clipboard".into()))
+            }
+            None => Ok(Done::Note("no agent messages to copy yet".into())),
+        },
+        SlashAction::Share => Ok(Done::Said(crate::share_current_session(agent)?)),
+        SlashAction::Changelog => {
+            let entries = crate::changelog::parse_changelog(&crate::changelog::changelog_path());
+            let stored = crate::settings::load_merged_settings(&agent_dir, &agent.cwd);
+            let text = match stored.last_changelog_version.as_deref() {
+                Some(since) => crate::changelog::format_changelog_since(&entries, Some(since)),
+                None => crate::changelog::format_changelog(&entries),
+            };
+            Ok(Done::Said(text))
+        }
+        SlashAction::SessionInfo => {
+            let models = crate::available_models(parsed);
+            let found = models
+                .iter()
+                .find(|item| item.provider == agent.provider && item.id == agent.model_id);
+            let stats = crate::rpc::session_stats_for_agent(agent, found);
+            let waste = agent
+                .session
+                .as_ref()
+                .map(|store| crate::cache_stats::compute_cache_waste(&store.entries, &0.3));
+            Ok(Done::Said(crate::format_session_info(
+                &stats,
+                waste.as_ref(),
+            )))
+        }
+        SlashAction::SetModel(value) => {
+            let (provider, model_id) =
+                crate::parse_model_ref(&agent.provider.clone(), Some(&value));
+            agent.provider = provider;
+            agent.model_id = model_id;
+            crate::loaded_extension_host(parsed).emit(ExtensionEvent::ModelSelect {
+                provider: agent.provider.clone(),
+                model: agent.model_id.clone(),
+            });
+            adopt_model(parsed, agent, model);
+            Ok(Done::Said(format!(
+                "model {} / {}",
+                agent.provider, agent.model_id
+            )))
+        }
+        SlashAction::SetThinking(level) => {
+            let Some(parsed_level) = pi_protocol::ThinkingLevel::parse(&level) else {
+                return Ok(Done::Note(format!("unknown thinking level {level}")));
+            };
+            agent.thinking_level = parsed_level;
+            crate::loaded_extension_host(parsed)
+                .emit(ExtensionEvent::ThinkingLevelSelect { level });
+            Ok(Done::Said(format!(
+                "thinking level {}",
+                agent.thinking_level.as_str()
+            )))
+        }
+        SlashAction::OpenThinking => Ok(Done::Ask(Question::Thinking)),
+        SlashAction::Tree => {
+            let mut host = crate::loaded_extension_host(parsed);
+            host.runtime_flag_values = crate::flag_values_json(parsed);
+            host.emit(ExtensionEvent::SessionBeforeTree);
+            if host.last_result_cancelled() {
+                return Ok(Done::Note("tree navigation cancelled".into()));
+            }
+            host.emit(ExtensionEvent::UiPromptStart {
+                kind: "tree".into(),
+            });
+            host.emit(ExtensionEvent::SessionTree);
+            host.emit(ExtensionEvent::UiPromptEnd {
+                kind: "tree".into(),
+            });
+            Ok(Done::Open(Overlay::Sessions))
+        }
+        SlashAction::Reload => {
+            crate::apply_discovered_resources(parsed, agent);
+            let mut host = crate::loaded_extension_host(parsed);
+            host.runtime_flag_values = crate::flag_values_json(parsed);
+            host.emit(ExtensionEvent::SessionStart);
+            model.corpus = corpus(agent, &model.sessions);
+            model.corpus_total = model.corpus.len();
+            Ok(Done::Said(
+                "reloaded extensions, skills, prompts and context files".into(),
+            ))
+        }
+        SlashAction::Trust => {
+            let mut host = crate::loaded_extension_host(parsed);
+            host.emit(ExtensionEvent::UiPromptStart {
+                kind: "trust".into(),
+            });
+            host.emit(ExtensionEvent::ProjectTrust {
+                path: agent.cwd.display().to_string(),
+            });
+            host.emit(ExtensionEvent::UiPromptEnd {
+                kind: "trust".into(),
+            });
+            Ok(Done::Ask(Question::Trust {
+                path: agent.cwd.display().to_string(),
+                options: crate::trust::get_project_trust_options(&agent.cwd, false),
+            }))
+        }
+        SlashAction::Login { provider, key } => Ok(Done::Detach(Detached::Login { provider, key })),
+        SlashAction::Logout { provider } => {
+            let mut storage = pi_ai::AuthStorage::create().map_err(|err| err.to_string())?;
+            match provider {
+                Some(provider) => {
+                    storage.remove(&provider).map_err(|err| err.to_string())?;
+                    Ok(Done::Said(format!("removed {provider}")))
+                }
+                None => {
+                    let names = crate::logout_provider_options()
+                        .map_err(|err| format!("could not read stored credentials: {err}"))?;
+                    if names.is_empty() {
+                        return Ok(Done::Note(
+                            "no stored credentials to remove. /logout only removes what /login saved; environment variables and models.json are untouched".into(),
+                        ));
+                    }
+                    Ok(Done::Ask(Question::Logout {
+                        providers: names.iter().map(|item| item.id.clone()).collect(),
+                    }))
+                }
+            }
+        }
+        SlashAction::ScopedModels => Ok(Done::Said(scoped_models_summary(parsed, agent))),
+        SlashAction::Llama => Ok(Done::Said(format!(
+            "llama.cpp server {}",
+            std::env::var("LLAMA_BASE_URL")
+                .unwrap_or_else(|_| crate::llama::DEFAULT_LLAMA_SERVER_URL.into())
+        ))),
+    }
+}
+
+/// The thinking levels the protocol accepts, in the order the old selector
+/// listed them.
+pub const THINKING_LEVELS: [&str; 4] = ["off", "low", "medium", "high"];
+
+fn session_id(agent: &Agent) -> String {
+    agent
+        .session
+        .as_ref()
+        .map(|store| store.header.id.clone())
+        .unwrap_or_else(|| "in-memory".into())
+}
+
+/// After a model switch: the name in the header, the cap on the context meter,
+/// and the row Cogitator marks as the one in hand all move together.
+fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model) {
+    if let Some(found) = crate::available_models(parsed)
+        .into_iter()
+        .find(|item| item.provider == agent.provider && item.id == agent.model_id)
+    {
+        agent.context_window = found.context_window;
+    }
+    model.model_index = model
+        .models
+        .iter()
+        .position(|item| item.provider == agent.provider && item.id == agent.model_id)
+        .unwrap_or(model.model_index);
+    model.model_name = agent.model_id.clone();
+    model.context.1 = agent.context_window;
+}
+
+/// The models `--models` pinned this run to, and the one actually in hand.
+fn scoped_models_summary(parsed: &crate::args::Args, agent: &Agent) -> String {
+    let mut rows = vec![format!("in hand  {} / {}", agent.provider, agent.model_id)];
+    for spec in &parsed.models {
+        rows.push(format!("scoped   {spec}"));
+    }
+    if rows.len() == 1 {
+        rows.push("no --models scope for this run".into());
+    }
+    rows.join("\n")
 }
 
 /// Run the davinci TUI against a live agent until the user leaves.
@@ -506,6 +881,7 @@ pub fn run(
                 &format!("{} / {}", entry.provider, entry.id),
                 &pi_tui::davinci::views::chrome::thousands(entry.context_window),
             )
+            .of(&entry.provider, &entry.id, entry.context_window)
         })
         .collect();
     model.model_index = model
@@ -521,6 +897,10 @@ pub fn run(
     model.height = height;
 
     let mut last_tick = Instant::now();
+    // The question the `Ask` instrument is currently putting, if any. It lives
+    // here rather than in the model because only this module knows what the
+    // rows mean.
+    let mut pending: Option<Question> = None;
     let result = loop {
         if let Err(err) = terminal.draw(&model) {
             break Err(err.to_string());
@@ -532,53 +912,40 @@ pub fn run(
                 Ok(crossterm::event::Event::Key(key))
                     if key.kind != crossterm::event::KeyEventKind::Release =>
                 {
-                    match app::handle_key(&mut model, key) {
-                        Flow::Quit => break Ok(0),
-                        Flow::Submit(line) => match classify(&line) {
-                            Sent::Quit => break Ok(0),
-                            Sent::Say(text) => {
-                                model.running = false;
-                                model.transcript.push(Entry::Gap);
-                                model.transcript.push(Entry::prose(text.trim()));
-                            }
-                            Sent::Open(overlay) => {
-                                model.running = false;
-                                model.toggle_overlay(overlay);
-                            }
-                            Sent::Unsupported(what) => {
-                                model.running = false;
-                                model.transcript.push(Entry::Gap);
-                                model.transcript.push(Entry::tool(
-                                    State::Attention,
-                                    "instrumenta",
-                                    &format!("{what} is not wired into this shell yet"),
-                                    None,
-                                ));
-                            }
-                            Sent::Prompt(text) => {
-                                // `prompt` is what writes the user turn to the
-                                // session file; pushing onto `messages`
-                                // directly would lose it on restart.
-                                let text = pi_agent::expand_user_text(
-                                    &text,
-                                    &agent.skills,
-                                    &agent.templates,
-                                );
-                                agent.prompt(&text);
-                                if let Err(err) =
-                                    run_turn(parsed, agent, &mut model, &mut terminal, host.clone())
-                                {
-                                    break Err(err.to_string());
-                                }
-                                refresh_context(&mut model, agent);
-                                crate::davinci_sources::dress_from_workspace(
-                                    &mut model,
-                                    &cwd,
-                                    &session_dir,
-                                );
-                            }
-                        },
-                        Flow::Continue | Flow::Interrupt => {}
+                    let next = match app::handle_key(&mut model, key) {
+                        Flow::Quit => Next::Leave,
+                        Flow::Submit(line) => on_line(
+                            &mut Shell {
+                                parsed,
+                                agent,
+                                model: &mut model,
+                                terminal: &mut terminal,
+                                host: &host,
+                                pending: &mut pending,
+                                cwd: &cwd,
+                                session_dir: &session_dir,
+                            },
+                            &line,
+                        ),
+                        Flow::Choose(choice) => on_choice(
+                            &mut Shell {
+                                parsed,
+                                agent,
+                                model: &mut model,
+                                terminal: &mut terminal,
+                                host: &host,
+                                pending: &mut pending,
+                                cwd: &cwd,
+                                session_dir: &session_dir,
+                            },
+                            choice,
+                        ),
+                        Flow::Continue | Flow::Interrupt => Next::Go,
+                    };
+                    match next {
+                        Next::Go => {}
+                        Next::Leave => break Ok(0),
+                        Next::Fail(err) => break Err(err),
                     }
                 }
                 Ok(crossterm::event::Event::Resize(width, height)) => {
@@ -600,6 +967,276 @@ pub fn run(
 
     terminal.close().map_err(|err| err.to_string())?;
     result
+}
+
+/// Everything a composer line or a chosen row may need. Bundled because the
+/// borrow checker will not let the loop hand out eight `&mut` pieces at once.
+struct Shell<'a> {
+    parsed: &'a crate::args::Args,
+    agent: &'a mut Agent,
+    model: &'a mut Model,
+    terminal: &'a mut pi_tui::davinci::runtime::Session,
+    host: &'a Arc<Mutex<ExtensionHost>>,
+    pending: &'a mut Option<Question>,
+    cwd: &'a std::path::Path,
+    session_dir: &'a std::path::Path,
+}
+
+/// What the loop should do after handling one key's worth of consequence.
+enum Next {
+    Go,
+    Leave,
+    Fail(String),
+}
+
+impl Shell<'_> {
+    /// A block of prose in the transcript, preceded by the one blank row that
+    /// separates blocks (design.md §3).
+    fn say(&mut self, text: &str) {
+        self.model.running = false;
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.model.transcript.push(Entry::Gap);
+        for paragraph in text.split("\n\n") {
+            self.model.transcript.push(Entry::prose(paragraph.trim()));
+        }
+    }
+
+    /// A line that needs the attention glyph. Colour is never the only signal
+    /// (design.md §4), so this reads as a warning under `NO_COLOR` too.
+    fn note(&mut self, text: &str) {
+        self.model.running = false;
+        self.model.transcript.push(Entry::Gap);
+        self.model
+            .transcript
+            .push(Entry::tool(State::Attention, "instrumenta", text, None));
+    }
+
+    /// Re-read everything the workspace owns: git, the tree, the session list.
+    fn redress(&mut self) {
+        refresh_context(self.model, self.agent);
+        crate::davinci_sources::dress_from_workspace(self.model, self.cwd, self.session_dir);
+        self.model.corpus = corpus(self.agent, &self.model.sessions);
+        self.model.corpus_total = self.model.corpus.len();
+    }
+
+    fn finish(&mut self, done: Done) -> Next {
+        match done {
+            Done::Said(text) => self.say(&text),
+            Done::Note(text) => self.note(&text),
+            Done::Open(overlay) => {
+                self.model.running = false;
+                self.model.overlay = Some(overlay);
+            }
+            Done::Ask(question) => {
+                self.model.running = false;
+                self.model.ask = question.ask(self.agent);
+                self.model.ask_index = 0;
+                self.model.overlay = Some(Overlay::Ask);
+                *self.pending = Some(question);
+            }
+            Done::Detach(detached) => return self.detach(detached),
+        }
+        Next::Go
+    }
+
+    /// Hand the terminal back, run something that owns a console of its own,
+    /// then take it again. A browser handshake prints and prompts; it cannot
+    /// do either underneath an alternate screen.
+    fn detach(&mut self, detached: Detached) -> Next {
+        if let Err(err) = self.terminal.close() {
+            return Next::Fail(err.to_string());
+        }
+        let outcome = match &detached {
+            Detached::Login { provider, key } => {
+                if provider.is_empty() {
+                    Err("usage: /login <provider> [key]".to_string())
+                } else {
+                    crate::login_provider(provider, key.as_deref())
+                        .map(|()| format!("signed in to {provider}"))
+                }
+            }
+        };
+        match pi_tui::davinci::runtime::Session::open() {
+            Ok(session) => *self.terminal = session,
+            Err(err) => return Next::Fail(err.to_string()),
+        }
+        if let Ok((width, height)) = self.terminal.size() {
+            self.model.width = width;
+            self.model.height = height;
+        }
+        match outcome {
+            Ok(text) => self.say(&text),
+            Err(err) => self.note(&err),
+        }
+        Next::Go
+    }
+
+    /// Open a session file and make it the one in hand.
+    fn resume(&mut self, path: &str) -> Next {
+        if path.is_empty() {
+            self.note("that session has no file on disk");
+            return Next::Go;
+        }
+        match pi_session::JsonlSession::open(std::path::Path::new(path)) {
+            Ok(store) => {
+                self.agent.load_from_session(store);
+                self.model.transcript = transcript_from(&self.agent.messages);
+                self.model.running = false;
+                self.redress();
+                Next::Go
+            }
+            Err(err) => {
+                self.note(&format!("could not open that session: {err}"));
+                Next::Go
+            }
+        }
+    }
+}
+
+/// One composer line, carried out.
+fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
+    match classify(line) {
+        Sent::Quit => Next::Leave,
+        Sent::Say(text) => {
+            shell.say(&text);
+            Next::Go
+        }
+        Sent::Open(overlay) => {
+            shell.model.running = false;
+            shell.model.toggle_overlay(overlay);
+            Next::Go
+        }
+        Sent::Command(action) => match perform(shell.parsed, shell.agent, shell.model, action) {
+            Ok(done) => {
+                let next = shell.finish(done);
+                shell.redress();
+                next
+            }
+            Err(err) => {
+                shell.note(&err);
+                Next::Go
+            }
+        },
+        Sent::Prompt(text) => {
+            // `prompt` is what writes the user turn to the session file;
+            // pushing onto `messages` directly would lose it on restart.
+            let text =
+                pi_agent::expand_user_text(&text, &shell.agent.skills, &shell.agent.templates);
+            shell.agent.prompt(&text);
+            let host = shell.host.clone();
+            if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host)
+            {
+                return Next::Fail(err.to_string());
+            }
+            shell.redress();
+            Next::Go
+        }
+    }
+}
+
+/// One row of an open instrument, chosen with enter.
+fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
+    match choice {
+        Choice::Command { name, kind } => match kind.as_str() {
+            "command" => on_line(shell, &name),
+            "session" => {
+                let label = name.trim_start_matches("memoria: ").to_string();
+                let path = shell
+                    .model
+                    .sessions
+                    .iter()
+                    .find(|item| item.name == label)
+                    .map(|item| item.path.clone());
+                match path {
+                    Some(path) => shell.resume(&path),
+                    None => {
+                        shell.note("that session is no longer on disk");
+                        Next::Go
+                    }
+                }
+            }
+            // A tool is the agent's to reach for, not the user's to run. The
+            // palette row hands its name to the composer instead.
+            _ => {
+                shell.model.composer.push_str(&name);
+                Next::Go
+            }
+        },
+        Choice::Session(index) => {
+            let path = shell
+                .model
+                .sessions
+                .get(index)
+                .map(|item| item.path.clone())
+                .unwrap_or_default();
+            shell.resume(&path)
+        }
+        Choice::Model(index) => {
+            let Some(item) = shell.model.models.get(index).cloned() else {
+                return Next::Go;
+            };
+            shell.agent.provider = item.provider.clone();
+            shell.agent.model_id = item.id.clone();
+            crate::loaded_extension_host(shell.parsed).emit(
+                crate::extension_host::ExtensionEvent::ModelSelect {
+                    provider: item.provider.clone(),
+                    model: item.id.clone(),
+                },
+            );
+            adopt_model(shell.parsed, shell.agent, shell.model);
+            shell.say(&format!("model {} / {}", item.provider, item.id));
+            Next::Go
+        }
+        Choice::Ask(index) => {
+            let Some(question) = shell.pending.take() else {
+                return Next::Go;
+            };
+            match answer(shell, &question, index) {
+                Ok(text) => shell.say(&text),
+                Err(err) => shell.note(&err),
+            }
+            Next::Go
+        }
+    }
+}
+
+/// Carry out the row chosen from a question.
+fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<String, String> {
+    match question {
+        Question::Trust { options, .. } => {
+            let Some(option) = options.get(index) else {
+                return Err("that trust option is gone".into());
+            };
+            let store = crate::trust::ProjectTrustStore::open(&crate::default_agent_dir());
+            store.set_many(&option.updates)?;
+            Ok(format!(
+                "saved: {}. it takes effect the next time pi starts.",
+                option.label
+            ))
+        }
+        Question::Thinking => {
+            let Some(level) = THINKING_LEVELS.get(index) else {
+                return Err("that thinking level is gone".into());
+            };
+            let action = crate::slash::SlashAction::SetThinking((*level).to_string());
+            match perform(shell.parsed, shell.agent, shell.model, action)? {
+                Done::Said(text) => Ok(text),
+                Done::Note(text) => Err(text),
+                _ => Ok(format!("thinking level {level}")),
+            }
+        }
+        Question::Logout { providers } => {
+            let Some(provider) = providers.get(index) else {
+                return Err("that credential is gone".into());
+            };
+            let mut storage = pi_ai::AuthStorage::create().map_err(|err| err.to_string())?;
+            storage.remove(provider).map_err(|err| err.to_string())?;
+            Ok(format!("removed {provider}"))
+        }
+    }
 }
 
 fn refresh_context(model: &mut Model, agent: &Agent) {
@@ -925,7 +1562,6 @@ mod tests {
         use pi_tui::davinci::model::Overlay;
         assert!(matches!(classify("/model"), Sent::Open(Overlay::Cogitator)));
         assert!(matches!(classify("/resume"), Sent::Open(Overlay::Sessions)));
-        assert!(matches!(classify("/tree"), Sent::Open(Overlay::Sessions)));
         assert!(matches!(
             classify("/settings"),
             Sent::Open(Overlay::Instrumenta)
@@ -938,19 +1574,96 @@ mod tests {
     }
 
     #[test]
-    fn a_command_with_no_home_yet_is_named_rather_than_swallowed() {
-        match classify("/compact") {
-            Sent::Unsupported(name) => assert_eq!(name, "/compact"),
-            other => panic!("{}", matches!(other, Sent::Prompt(_))),
+    fn every_builtin_command_reaches_the_agent_rather_than_the_model() {
+        use crate::slash::SlashAction;
+        // Nothing a `/` line can parse to may fall through to the model as
+        // prose: either an instrument opens, or the agent carries it out.
+        for line in [
+            "/compact",
+            "/new",
+            "/export report.html",
+            "/name work",
+            "/fork",
+            "/clone",
+            "/copy",
+            "/trust",
+            "/reload",
+            "/import a.jsonl",
+            "/share",
+            "/changelog",
+            "/session",
+            "/scoped-models",
+            "/llama",
+            "/thinking",
+            "/thinking high",
+            "/logout",
+            "/login openai",
+            "/tree",
+        ] {
+            match classify(line) {
+                Sent::Command(_) | Sent::Open(_) => {}
+                _ => panic!("{line} did not reach the agent"),
+            }
         }
-        match classify("/new") {
-            Sent::Unsupported(name) => assert_eq!(name, "/new"),
-            _ => panic!("expected an unsupported command"),
+        assert!(matches!(
+            classify("/export report.html"),
+            Sent::Command(SlashAction::Export(Some(path))) if path == "report.html"
+        ));
+    }
+
+    #[test]
+    fn a_question_wears_a_named_panel_and_one_row_per_answer() {
+        let mut agent = pi_agent::Agent::new("test");
+        agent.thinking_level = pi_protocol::ThinkingLevel::Medium;
+
+        let thinking = Question::Thinking.ask(&agent);
+        assert_eq!(thinking.title, "MEDITATIO");
+        assert_eq!(thinking.name, "THINKING");
+        assert_eq!(thinking.items.len(), THINKING_LEVELS.len());
+        // The level in hand is named on its own row, not only highlighted:
+        // colour is never the only signal (design.md §4).
+        let marked: Vec<&PickerItem> = thinking
+            .items
+            .iter()
+            .filter(|item| item.detail == "in hand")
+            .collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].label, "medium");
+
+        let trust = Question::Trust {
+            path: "C:\\work\\pi-rust".into(),
+            options: crate::trust::get_project_trust_options(std::path::Path::new("."), false),
+        };
+        let panel = trust.ask(&agent);
+        assert_eq!(panel.title, "FIDES");
+        assert!(panel.note.contains("C:\\work\\pi-rust"), "{}", panel.note);
+        assert!(!panel.items.is_empty());
+
+        let credentials = Question::Logout {
+            providers: vec!["anthropic".into(), "openai".into()],
         }
-        match classify("/export report.html") {
-            Sent::Unsupported(name) => assert_eq!(name, "/export"),
-            _ => panic!("expected an unsupported command"),
-        }
+        .ask(&agent);
+        assert_eq!(credentials.title, "CLAVES");
+        assert_eq!(credentials.items.len(), 2);
+        assert_eq!(credentials.items[0].label, "anthropic");
+    }
+
+    #[test]
+    fn a_question_with_nothing_in_it_still_produces_a_panel() {
+        let agent = pi_agent::Agent::new("test");
+        let panel = Question::Logout { providers: vec![] }.ask(&agent);
+        assert!(panel.items.is_empty());
+        assert_eq!(panel.key, "/logout");
+    }
+
+    #[test]
+    fn the_model_scope_names_the_model_in_hand_even_with_no_scope_set() {
+        let mut agent = pi_agent::Agent::new("test");
+        agent.provider = "anthropic".into();
+        agent.model_id = "claude-opus-5".into();
+        let summary = scoped_models_summary(&crate::args::Args::default(), &agent);
+        assert!(summary.contains("anthropic / claude-opus-5"), "{summary}");
+        assert!(summary.contains("no --models scope"), "{summary}");
     }
 
     #[test]

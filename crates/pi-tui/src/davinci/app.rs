@@ -10,11 +10,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 
-use super::model::{Model, Overlay, Screen};
+use super::model::{Choice, Model, Overlay, Screen};
 use super::ui::{blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::{
-    codex, cogitator, disegno, grafo, instrumenta, memoria, mensura, startup, transcript,
+    ask, codex, cogitator, disegno, grafo, instrumenta, memoria, mensura, startup, transcript,
 };
 
 /// What the runtime should do after a key.
@@ -28,6 +28,8 @@ pub enum Flow {
     Interrupt,
     /// The composer was sent; the caller owns what happens next.
     Submit(String),
+    /// A row of the open instrument was chosen; the caller owns the action.
+    Choose(Choice),
 }
 
 /// Compose exactly `height` rows: header, body, composer, status bar.
@@ -139,6 +141,7 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
         Overlay::Instrumenta => instrumenta::lines(model),
         Overlay::Sessions => memoria::sessions(model),
         Overlay::Cogitator => cogitator::lines(model, &model.config_path),
+        Overlay::Ask => ask::lines(model),
     };
 
     let panel = if panel.len() > height {
@@ -212,7 +215,14 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         KeyCode::Backspace => model.backspace(),
         KeyCode::Enter => {
             if model.overlay.is_some() {
+                // An instrument is summoned, used, and dismissed (design.md
+                // §1): enter is the "used" half, so it both chooses and closes.
+                let chosen = model.accept();
                 model.overlay = None;
+                model.query.clear();
+                if let Some(chosen) = chosen {
+                    return Flow::Choose(chosen);
+                }
             } else {
                 let sent = model.composer.clone();
                 model.submit();

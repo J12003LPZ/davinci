@@ -216,7 +216,7 @@ pub fn sessions(session_dir: &Path, now_ms: u64) -> Vec<SessionItem> {
         .into_iter()
         .map(|summary| {
             let age = humanise(now_ms.saturating_sub(summary.modified_at) / 1_000);
-            SessionItem::new(&session_name(&summary), &age)
+            SessionItem::new(&session_name(&summary), &age).at(&summary.path.display().to_string())
         })
         .collect()
 }

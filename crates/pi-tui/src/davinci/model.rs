@@ -32,6 +32,53 @@ pub enum Overlay {
     Sessions,
     /// `1f` — Cogitator, the model picker.
     Cogitator,
+    /// The one-question instrument: a titled list, one row chosen. Trust,
+    /// thinking level and stored credentials all borrow it rather than each
+    /// growing a panel of its own (design.md §1 — one panel at a time).
+    Ask,
+}
+
+/// One row of the `Ask` instrument: what it is, and what is worth knowing
+/// about it on the same line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PickerItem {
+    pub label: String,
+    pub detail: String,
+}
+
+impl PickerItem {
+    pub fn new(label: &str, detail: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+}
+
+/// A question put to the user as a list. `title` is the paired name the panel
+/// wears (design.md §5), `key` the right-hand run, `note` the line above the
+/// footer that says what is being decided.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ask {
+    pub title: String,
+    pub name: String,
+    pub key: String,
+    pub note: String,
+    pub items: Vec<PickerItem>,
+}
+
+/// What enter meant while an instrument was open. The shell knows which row
+/// was highlighted; only the caller knows what to do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+    /// A row of Instrumenta, named as it was listed.
+    Command { name: String, kind: String },
+    /// A row of Memoria sessions, as an index into `sessions`.
+    Session(usize),
+    /// A row of Cogitator, as an index into `models`.
+    Model(usize),
+    /// A row of the `Ask` instrument, as an index into `ask.items`.
+    Ask(usize),
 }
 
 /// One Studio step: a ledger row of ✓ / ◉ / ○ (design.md §6).
@@ -154,6 +201,9 @@ impl CorpusItem {
 pub struct SessionItem {
     pub name: String,
     pub age: String,
+    /// The JSONL file this row stands for, so choosing the row can open it.
+    /// Empty for the mockup fixtures, which stand for no file on disk.
+    pub path: String,
 }
 
 impl SessionItem {
@@ -161,7 +211,13 @@ impl SessionItem {
         Self {
             name: name.to_string(),
             age: age.to_string(),
+            path: String::new(),
         }
+    }
+
+    pub fn at(mut self, path: &str) -> Self {
+        self.path = path.to_string();
+        self
     }
 }
 
@@ -170,6 +226,12 @@ impl SessionItem {
 pub struct ModelItem {
     pub name: String,
     pub window: String,
+    /// The provider and model id behind the row, so choosing it can switch the
+    /// agent. Empty for the mockup fixtures.
+    pub provider: String,
+    pub id: String,
+    /// The context window in tokens, for the meter after a switch.
+    pub window_tokens: u64,
 }
 
 impl ModelItem {
@@ -177,7 +239,17 @@ impl ModelItem {
         Self {
             name: name.to_string(),
             window: window.to_string(),
+            provider: String::new(),
+            id: String::new(),
+            window_tokens: 0,
         }
+    }
+
+    pub fn of(mut self, provider: &str, id: &str, window_tokens: u64) -> Self {
+        self.provider = provider.to_string();
+        self.id = id.to_string();
+        self.window_tokens = window_tokens;
+        self
     }
 }
 
@@ -427,6 +499,10 @@ pub struct Model {
     pub model_index: usize,
     pub recall_index: usize,
 
+    /// The question in hand, when `Overlay::Ask` is open.
+    pub ask: Ask,
+    pub ask_index: usize,
+
     pub cwd: String,
     pub branch: String,
     pub model_name: String,
@@ -483,6 +559,8 @@ impl Model {
             session_index: 0,
             model_index: 0,
             recall_index: 0,
+            ask: Ask::default(),
+            ask_index: 0,
             cwd: String::new(),
             branch: String::new(),
             model_name: String::new(),
@@ -531,9 +609,31 @@ impl Model {
             Some(Overlay::Instrumenta) => self.palette_index,
             Some(Overlay::Sessions) => self.session_index,
             Some(Overlay::Cogitator) => self.model_index,
+            Some(Overlay::Ask) => self.ask_index,
             None => self.recall_index,
         };
         Some(index % len)
+    }
+
+    /// What the highlighted row of the open instrument stands for. `None` when
+    /// no instrument is open, or when the one that is has nothing in it — an
+    /// empty list must not answer enter with a choice it cannot make.
+    pub fn accept(&self) -> Option<Choice> {
+        match self.overlay {
+            Some(Overlay::Instrumenta) => {
+                let rows = self.filtered_corpus();
+                let index = self.selection(rows.len())?;
+                let row = rows[index];
+                Some(Choice::Command {
+                    name: row.name.clone(),
+                    kind: row.kind.clone(),
+                })
+            }
+            Some(Overlay::Sessions) => self.selection(self.sessions.len()).map(Choice::Session),
+            Some(Overlay::Cogitator) => self.selection(self.models.len()).map(Choice::Model),
+            Some(Overlay::Ask) => self.selection(self.ask.items.len()).map(Choice::Ask),
+            None => None,
+        }
     }
 
     /// Move the selection in whichever list is open.
@@ -548,6 +648,9 @@ impl Model {
             }
             Some(Overlay::Cogitator) => {
                 self.model_index = wrap_index(self.model_index, delta, self.models.len());
+            }
+            Some(Overlay::Ask) => {
+                self.ask_index = wrap_index(self.ask_index, delta, self.ask.items.len());
             }
             None => {}
         }
@@ -918,6 +1021,83 @@ mod tests {
         assert_eq!(m.context_fraction(), 1.0);
         m.context = (10, 0);
         assert_eq!(m.context_fraction(), 0.0);
+    }
+
+    #[test]
+    fn enter_answers_with_the_highlighted_row_of_whatever_is_open() {
+        let mut m = model(120);
+        m.corpus = vec![
+            CorpusItem::new("/compact", "summarise the session", "command"),
+            CorpusItem::new("read", "instrumenta", "tool"),
+        ];
+        m.sessions = vec![
+            SessionItem::new("first", "3m").at("a.jsonl"),
+            SessionItem::new("second", "1h").at("b.jsonl"),
+        ];
+        m.models = vec![
+            ModelItem::new("anthropic / opus", "200k").of("anthropic", "opus", 200_000),
+            ModelItem::new("openai / gpt", "128k").of("openai", "gpt", 128_000),
+        ];
+        m.ask.items = vec![PickerItem::new("trust", ""), PickerItem::new("ask", "")];
+
+        m.toggle_overlay(Overlay::Instrumenta);
+        assert_eq!(
+            m.accept(),
+            Some(Choice::Command {
+                name: "/compact".into(),
+                kind: "command".into()
+            })
+        );
+        m.move_selection(1);
+        assert_eq!(
+            m.accept(),
+            Some(Choice::Command {
+                name: "read".into(),
+                kind: "tool".into()
+            })
+        );
+
+        m.toggle_overlay(Overlay::Sessions);
+        m.move_selection(1);
+        assert_eq!(m.accept(), Some(Choice::Session(1)));
+
+        m.toggle_overlay(Overlay::Cogitator);
+        assert_eq!(m.accept(), Some(Choice::Model(0)));
+
+        m.toggle_overlay(Overlay::Ask);
+        m.move_selection(-1);
+        assert_eq!(m.accept(), Some(Choice::Ask(1)));
+    }
+
+    #[test]
+    fn an_empty_list_answers_with_nothing_rather_than_a_row_that_is_not_there() {
+        let mut m = model(120);
+        m.toggle_overlay(Overlay::Sessions);
+        assert_eq!(m.accept(), None);
+        m.toggle_overlay(Overlay::Ask);
+        assert_eq!(m.accept(), None);
+        // With no instrument open, enter is the composer's, not a choice.
+        m.close();
+        assert_eq!(m.accept(), None);
+    }
+
+    #[test]
+    fn a_query_that_narrows_the_palette_still_answers_with_the_row_on_screen() {
+        let mut m = model(120);
+        m.corpus = vec![
+            CorpusItem::new("/compact", "summarise the session", "command"),
+            CorpusItem::new("/export", "write the session out", "command"),
+        ];
+        m.toggle_overlay(Overlay::Instrumenta);
+        m.type_char("exp");
+        assert_eq!(m.filtered_corpus().len(), 1);
+        assert_eq!(
+            m.accept(),
+            Some(Choice::Command {
+                name: "/export".into(),
+                kind: "command".into()
+            })
+        );
     }
 
     #[test]
