@@ -1130,8 +1130,11 @@ mod tests {
         memory.config.embedding_dimensions = 2;
         memory.config.ollama_url = format!("http://{address}");
         memory.config.qdrant_url = format!("http://{address}");
-        memory.config.embed_timeout_seconds = 1;
-        memory.config.request_timeout_seconds = 1;
+        // The server is a thread in this process, so these only ever expire
+        // when the machine is busy — which, in a full `cargo test --workspace`
+        // run, it is. One second was tight enough to fail there.
+        memory.config.embed_timeout_seconds = 15;
+        memory.config.request_timeout_seconds = 15;
         memory.config.promotion = false;
         let inserted = memory
             .index_messages(&[MemoryMessage {
