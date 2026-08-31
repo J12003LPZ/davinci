@@ -126,6 +126,11 @@ pub struct Settings {
     pub shell_path: Option<String>,
     #[serde(default, rename = "shellCommandPrefix")]
     pub shell_command_prefix: Option<String>,
+    /// Settings keys this struct does not model (for example `subagents`,
+    /// written by extensions). They are carried through untouched so a rewrite
+    /// by `pi install`/`pi remove` cannot silently drop another tool's config.
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -895,13 +900,35 @@ impl Settings {
     }
 }
 
+/// Drop `null` members so a rewrite does not expand every unset field into an
+/// explicit null. A null and a missing key parse identically here, and TS `pi`
+/// writes only the keys that are set.
+fn prune_nulls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, entry| !entry.is_null());
+            for entry in map.values_mut() {
+                prune_nulls(entry);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                prune_nulls(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn save_settings(agent_dir: &Path, settings: &Settings) -> Result<(), String> {
     fs::create_dir_all(agent_dir).map_err(|err| err.to_string())?;
     let path = settings_path(agent_dir);
     with_settings_lock(&path, || {
+        let mut value = serde_json::to_value(settings).map_err(|e| e.to_string())?;
+        prune_nulls(&mut value);
         fs::write(
             &path,
-            serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?,
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?,
         )
         .map_err(|err| err.to_string())
     })
@@ -1080,6 +1107,45 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewriting_settings_keeps_unknown_keys_and_writes_no_nulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+  "theme": "dark",
+  "extensions": ["a.ts", "b.ts"],
+  "subagents": {"defaultExtensions": ["a.ts"]},
+  "someFutureKey": 7
+}"#,
+        )
+        .unwrap();
+
+        let mut settings = load_settings(dir.path());
+        settings.extensions.retain(|entry| entry != "a.ts");
+        save_settings(dir.path(), &settings).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The edit landed.
+        assert_eq!(written["extensions"], serde_json::json!(["b.ts"]));
+        // Keys this struct does not model survive the rewrite.
+        assert_eq!(
+            written["subagents"],
+            serde_json::json!({"defaultExtensions": ["a.ts"]})
+        );
+        assert_eq!(written["someFutureKey"], serde_json::json!(7));
+        // Unset fields are omitted, not written as explicit nulls.
+        let object = written.as_object().expect("settings object");
+        assert!(
+            !object.values().any(serde_json::Value::is_null),
+            "settings rewrite wrote null members: {written}"
+        );
+        assert!(!object.contains_key("defaultModel"));
+    }
 
     #[test]
     fn autocomplete_max_visible_defaults_to_ts_five() {
