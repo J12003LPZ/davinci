@@ -211,6 +211,10 @@ struct PersistentJsSession {
     stdin: ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     module: PathBuf,
+    /// Reply from the implicit `load` that `--persistent` performs at spawn.
+    /// It carries the ui/session calls the factory made while loading; the
+    /// first explicit `load` consumes it instead of re-sending.
+    initial_load: Option<JsExtensionResult>,
 }
 
 impl PersistentJsSession {
@@ -242,8 +246,9 @@ impl PersistentJsSession {
             stdin,
             stdout,
             module: module.to_path_buf(),
+            initial_load: None,
         };
-        let _ = session.read_line()?;
+        session.initial_load = session.read_line().ok();
         Ok(session)
     }
 
@@ -354,16 +359,105 @@ pub fn stop_persistent_js_extension() {
     }
 }
 
+/// One long-lived `--persistent` runner per extension module. A fresh node
+/// spawn per event made every agent turn pay seconds of process startup
+/// (worse with TypeScript extensions that load a transpiler); the runner
+/// already speaks line-delimited `{op, payload}` in persistent mode, and the
+/// TS reference keeps extensions loaded for the whole session anyway.
+static JS_POOL: Mutex<Option<std::collections::HashMap<PathBuf, PersistentJsSession>>> =
+    Mutex::new(None);
+
+fn js_pool_enabled() -> bool {
+    !matches!(
+        std::env::var("PI_JS_POOL").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
+fn run_pooled_js_extension(
+    module: &Path,
+    op: &str,
+    payload: &Value,
+) -> Result<JsExtensionResult, String> {
+    let mut pool = JS_POOL.lock().map_err(|err| err.to_string())?;
+    let pool = pool.get_or_insert_with(std::collections::HashMap::new);
+    if !pool.contains_key(module) {
+        pool.insert(module.to_path_buf(), PersistentJsSession::start(module)?);
+    }
+    let session = pool.get_mut(module).expect("pooled session");
+    if op == "load" {
+        if let Some(initial) = session.initial_load.take() {
+            return Ok(initial);
+        }
+    }
+    match session.send(op, payload) {
+        Ok(result) => Ok(result),
+        Err(_) => {
+            // The runner died (crash, stdin closed): respawn once and retry.
+            pool.remove(module);
+            let mut fresh = PersistentJsSession::start(module)?;
+            let result = fresh.send(op, payload);
+            pool.insert(module.to_path_buf(), fresh);
+            result
+        }
+    }
+}
+
+/// Drop every pooled runner (used on shutdown and by tests).
+pub fn shutdown_js_pool() {
+    if let Ok(mut pool) = JS_POOL.lock() {
+        *pool = None;
+    }
+    if let Ok(mut cache) = LOAD_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+/// `load` replies memoized per (module, mtime, payload). Host objects are
+/// rebuilt frequently; without this every rebuild paid one node spawn per
+/// extension just to re-read a manifest that cannot have changed.
+type LoadCacheKey = (PathBuf, Option<std::time::SystemTime>, String);
+static LOAD_CACHE: Mutex<std::collections::BTreeMap<LoadCacheKey, JsExtensionResult>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn load_cache_key(module: &Path, payload: &Value) -> LoadCacheKey {
+    let mtime = std::fs::metadata(module)
+        .and_then(|meta| meta.modified())
+        .ok();
+    (module.to_path_buf(), mtime, payload.to_string())
+}
+
 pub fn run_js_extension(
     module: &Path,
     op: &str,
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
+    let wait_ui = ui_waiter_installed();
+    // The UI-wait channel and the `PI_EXTENSION_UI_REPLY` fixture are wired
+    // through spawn-time environment, so those calls keep the one-shot path.
+    // `load` also stays one-shot: the factory must observe the load payload
+    // (themes, cwd), which a warm runner has already consumed. Repeated
+    // identical loads are served from the memo instead of a fresh spawn.
+    let pooling =
+        !wait_ui && std::env::var_os("PI_EXTENSION_UI_REPLY").is_none() && js_pool_enabled();
+    if op == "load" && pooling {
+        let key = load_cache_key(module, payload);
+        if let Some(cached) = LOAD_CACHE
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).cloned())
+        {
+            return Ok(cached);
+        }
+    }
+    if op != "load" && pooling {
+        let _guard = NODE_LOCK.lock().map_err(|err| err.to_string())?;
+        return run_pooled_js_extension(module, op, payload);
+    }
     let _guard = NODE_LOCK.lock().map_err(|err| err.to_string())?;
     let node =
         find_node().ok_or_else(|| "Node.js is not available for JS extensions".to_string())?;
     let runner = runner_path()?;
-    let wait_ui = ui_waiter_installed();
     let channel = if wait_ui {
         let dir = std::env::temp_dir().join(format!("pi-ui-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
@@ -411,13 +505,19 @@ pub fn run_js_extension(
     }
     let output = child.wait_with_output().map_err(|err| err.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout).map_err(|err| {
+    let parsed: JsExtensionResult = serde_json::from_str(&stdout).map_err(|err| {
         format!(
             "extension runner: {err}: {} {}",
             stdout.trim(),
             String::from_utf8_lossy(&output.stderr)
         )
-    })
+    })?;
+    if op == "load" && pooling && parsed.ok {
+        if let Ok(mut cache) = LOAD_CACHE.lock() {
+            cache.insert(load_cache_key(module, payload), parsed.clone());
+        }
+    }
+    Ok(parsed)
 }
 
 pub fn query_js_autocomplete(module: &Path, text: &str) -> Vec<JsAutocompleteItem> {
