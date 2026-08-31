@@ -77,19 +77,21 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
 
     if body.is_empty() {
         // A plan sheet with nothing on it says so rather than drawing an
-        // empty frame that looks like a failure.
+        // empty frame that looks like a failure — and there is no progress to
+        // meter, so the tally goes with it rather than reading `/`.
         body.push(vec![span("no plan drawn for this project yet", th.muted)]);
+        body.push(Vec::new());
+    } else {
+        body.push(Vec::new());
+        let mut footer = vec![
+            span("constructio ", th.muted),
+            span(roman(done.min(total)), th.text),
+            span(" / ", th.border),
+            span(format!("{}  ", roman(total)), th.muted),
+        ];
+        footer.extend(ticks(done, total, 24, th));
+        body.push(footer);
     }
-
-    body.push(Vec::new());
-    let mut footer = vec![
-        span("constructio ", th.muted),
-        span(roman(done.min(total)), th.text),
-        span(" / ", th.border),
-        span(format!("{}  ", roman(total)), th.muted),
-    ];
-    footer.extend(ticks(done, total, 24, th));
-    body.push(footer);
     body.push(vec![
         span("a accept", th.border),
         span(" · ", th.border),

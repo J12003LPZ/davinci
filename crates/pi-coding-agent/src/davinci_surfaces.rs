@@ -242,21 +242,23 @@ pub fn budget(agent: &Agent, window: u64) -> (Vec<BudgetRow>, BudgetMeta, Option
         .messages
         .iter()
         .filter(|message| message.role == "user")
-        .count()
-        .max(1) as u64;
+        .count() as u64;
     let meta = BudgetMeta {
         policy: compaction_policy(agent),
         in_use: thousands(in_use),
         window: thousands(window),
         headroom: thousands(window.saturating_sub(in_use)),
         in_use_fraction: (in_use as f64 / window as f64).min(1.0),
-        rate: format!("{}/turn", thousands(in_use / turns)),
+        rate: format!("{}/turn", thousands(in_use / turns.max(1))),
         session_spend: session_spend(agent),
         // Nothing in this workspace tracks spend across sessions, so the
         // governor says so rather than inventing a cap to measure against.
         daily_cap: "not set".into(),
         daily_fraction: 0.0,
-        history: format!("{turns} turns this session"),
+        history: match turns {
+            1 => "1 turn this session".into(),
+            other => format!("{other} turns this session"),
+        },
     };
 
     (rows, meta, compaction_proposal(agent, in_use, window))

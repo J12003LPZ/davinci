@@ -968,6 +968,7 @@ pub fn run(
     let mut model = pi_tui::davinci::boot(raw, 100, 44);
     let session_dir = pi_session::default_session_dir();
     crate::davinci_sources::dress_from_workspace(&mut model, &cwd, &session_dir);
+    crate::davinci_surfaces::dress_from_extensions(&mut model, &cwd, agent);
     model.model_name = agent.model_id.clone();
     model.config_path = crate::default_agent_dir()
         .join("config.json")
