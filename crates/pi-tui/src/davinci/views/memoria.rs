@@ -35,6 +35,12 @@ pub fn sessions(model: &Model) -> Vec<Line<'static>> {
         })
         .collect();
 
+    if body.is_empty() {
+        // A first session in a new folder has nothing to resume; say so
+        // rather than opening an empty list.
+        body.push(vec![span("no earlier sessions in this folder", th.muted)]);
+    }
+
     body.push(Vec::new());
     body.push(vec![
         span(format!("{} turns", model.transcript.len()), th.muted),
@@ -222,6 +228,17 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn a_folder_with_no_earlier_sessions_says_so_and_still_states_its_exits() {
+        let mut m = model(100);
+        m.sessions.clear();
+        let rows: Vec<String> = sessions(&m).iter().map(text).collect();
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("no earlier sessions in this folder")));
+        assert!(rows.iter().any(|row| row.contains("ctrl+s close")));
     }
 
     #[test]

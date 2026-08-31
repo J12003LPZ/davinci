@@ -25,6 +25,15 @@ pub fn lines(model: &Model, config_path: &str) -> Vec<Line<'static>> {
         })
         .collect();
 
+    if body.is_empty() {
+        // No catalog reached this session — offline, or no credentials. Say
+        // which, rather than showing a picker with nothing to pick.
+        body.push(vec![span(
+            "no models available — /login to add a provider",
+            th.muted,
+        )]);
+    }
+
     body.push(Vec::new());
     body.push(vec![
         span("configured in ", th.muted),
@@ -75,6 +84,16 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn a_session_with_no_catalog_is_told_how_to_get_one() {
+        let mut m = model(100);
+        m.models.clear();
+        let rows: Vec<String> = lines(&m, "config.json").iter().map(text).collect();
+        assert!(rows.iter().any(|row| row.contains("no models available")));
+        assert!(rows.iter().any(|row| row.contains("/login")));
+        assert!(rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]

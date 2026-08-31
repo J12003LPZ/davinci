@@ -137,4 +137,21 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_label_longer_than_the_panel_is_clipped_rather_than_bursting_it() {
+        // Trust offers a row naming a parent folder, and a deep path is
+        // longer than any window. The row gives way; the frame does not.
+        for width in [72u16, 80, 100, 120, 160] {
+            let mut m = model(width);
+            m.ask.items = vec![PickerItem::new(
+                &format!("Trust parent folder ({})", "C:\\deep\\path".repeat(20)),
+                "project .pi resources are used",
+            )];
+            m.ask.note = "x".repeat(400);
+            for row in lines(&m) {
+                assert_eq!(run_width(&row.spans), width, "at {width}");
+            }
+        }
+    }
 }
