@@ -375,6 +375,169 @@ mod tests {
         assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Quit);
     }
 
+    /// Every state the shell can be in, so the responsive and NO_COLOR audits
+    /// can walk all of them.
+    fn every_surface(width: u16, height: u16) -> Vec<(String, Model)> {
+        use crate::davinci::fixtures;
+
+        let base = |screen: &str| {
+            let mut model = Model::new(
+                Theme::da_vinci(ColorDepth::TrueColor, false),
+                width,
+                height,
+                true,
+            );
+            fixtures::dress_screen(&mut model, screen);
+            model.config_path = "%USERPROFILE%\\.pi\\config.json".into();
+            model
+        };
+
+        let mut all: Vec<(String, Model)> = ["1a", "1b", "1c", "1d", "1e", "1f", "2a", "2b", "2c"]
+            .iter()
+            .map(|screen| (screen.to_string(), base(screen)))
+            .collect();
+        all.push(("1f-cogitator".into(), base("1f-cogitator")));
+        all
+    }
+
+    #[test]
+    fn no_screen_overflows_its_window_at_any_breakpoint() {
+        for (width, height) in [(60u16, 20u16), (80, 24), (100, 30), (120, 40), (160, 44)] {
+            for (screen, model) in every_surface(width, height) {
+                let rows = compose(&model, height);
+                assert_eq!(rows.len(), height as usize, "{screen} at {width}");
+                for row in &rows {
+                    assert!(
+                        run_width(&row.spans) <= width,
+                        "{screen} overflows {width}: {:?}",
+                        text(row)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn below_eighty_columns_there_is_only_a_transcript_and_a_composer() {
+        for (screen, model) in every_surface(60, 20) {
+            assert!(!model.codex_open(), "{screen} opened a split below 80");
+            assert_eq!(
+                model.overlay_inset(),
+                0,
+                "{screen} inset a panel below 80 instead of filling the window"
+            );
+        }
+    }
+
+    #[test]
+    fn the_codex_split_never_opens_below_a_hundred_and_twenty_columns() {
+        for width in [60u16, 80, 100, 119] {
+            let mut m = model(width, 30);
+            m.toggle_codex();
+            assert!(!m.codex_open(), "a split opened at {width}");
+        }
+        let mut m = model(120, 30);
+        m.toggle_codex();
+        assert!(m.codex_open());
+    }
+
+    #[test]
+    fn no_color_leaves_every_state_readable_by_glyph_alone() {
+        use crate::davinci::fixtures;
+
+        for screen in ["1a", "1b", "1c", "1d", "1e", "1f", "2a", "2b", "2c"] {
+            let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 120, 40, true);
+            fixtures::dress_screen(&mut m, screen);
+            let rows = compose(&m, 40);
+
+            for row in &rows {
+                for span in &row.spans {
+                    if let Some(ratatui::style::Color::Rgb(r, g, b)) = span.style.fg {
+                        assert!(
+                            r == g && g == b,
+                            "{screen} drew a colored run under NO_COLOR: {:?}",
+                            span.content
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_transcript_still_states_every_outcome_under_no_color() {
+        use crate::davinci::fixtures;
+
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 100, 40, true);
+        fixtures::dress_screen(&mut m, "1b");
+        let drawn: String = compose(&m, 40).iter().map(|row| text(row)).collect();
+
+        // Screen 1h: done, failed, in progress, queued, change and read all
+        // read from the glyph alone.
+        for glyph in ['✓', '×', '○', 'Δ', '↳', '⌕'] {
+            assert!(drawn.contains(glyph), "{glyph} is missing under NO_COLOR");
+        }
+    }
+
+    #[test]
+    fn animations_stop_under_no_animation() {
+        use crate::davinci::fixtures;
+
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            120,
+            40,
+            false,
+        );
+        fixtures::dress_screen(&mut m, "1b");
+
+        let frames: Vec<String> = (0..8)
+            .map(|tick| {
+                m.tick = tick;
+                compose(&m, 40).iter().map(|row| text(row)).collect()
+            })
+            .collect();
+        assert!(
+            frames.windows(2).all(|pair| pair[0] == pair[1]),
+            "something moved with --no-animation"
+        );
+    }
+
+    #[test]
+    fn exactly_two_things_move_when_animation_is_on() {
+        use crate::davinci::fixtures;
+
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 120, 40, true);
+        fixtures::dress_screen(&mut m, "1b");
+
+        let mut moving: Vec<char> = Vec::new();
+        let base: Vec<String> = {
+            m.tick = 0;
+            compose(&m, 40).iter().map(|row| text(row)).collect()
+        };
+        for tick in 1..8u64 {
+            m.tick = tick;
+            let frame: Vec<String> = compose(&m, 40).iter().map(|row| text(row)).collect();
+            for (before, after) in base.iter().zip(&frame) {
+                if before == after {
+                    continue;
+                }
+                for (a, b) in before.chars().zip(after.chars()) {
+                    if a != b {
+                        moving.push(a);
+                        moving.push(b);
+                    }
+                }
+            }
+        }
+        moving.sort_unstable();
+        moving.dedup();
+        // The spinner's four frames and the caret's two states, nothing else.
+        for ch in &moving {
+            assert!("◜◝◞◟ ".contains(*ch), "{ch:?} animates, and it should not");
+        }
+    }
+
     #[test]
     fn nothing_breaks_below_eighty_columns() {
         let mut m = model(60, 18);

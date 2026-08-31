@@ -223,6 +223,15 @@ fn hint_line(model: &Model, hint: Hint, inset: u16) -> Line<'static> {
             dot(),
             span("esc close", th.border),
         ],
+        // Hints abbreviate rather than wrap; the exit is the part that is
+        // never dropped (design.md §7, §9).
+        Hint::Recall if model.minimal() => vec![
+            span("enter pin", th.border),
+            dot(),
+            span("r reindex", th.border),
+            dot(),
+            span("esc close", th.border),
+        ],
         Hint::Recall => vec![
             span("enter pin to context", th.border),
             dot(),
@@ -231,6 +240,11 @@ fn hint_line(model: &Model, hint: Hint, inset: u16) -> Line<'static> {
             span("r reindex", th.border),
             dot(),
             span("esc close", th.border),
+        ],
+        Hint::Multiline if model.minimal() => vec![
+            span("enter send", th.border),
+            dot(),
+            span("esc cancel", th.border),
         ],
         Hint::Multiline => vec![
             span("shift+enter newline", th.border),
