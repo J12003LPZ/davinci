@@ -67,7 +67,10 @@ pub fn header(model: &Model) -> Line<'static> {
             span(" │ ", th.border),
             span(format!("window {}", meta.window), th.muted),
             span(" │ ", th.border),
-            span(model.model_name.clone(), th.muted),
+            span(
+                format!("{} · {}", model.model_name, model.thinking_level),
+                th.muted,
+            ),
         ]
     } else {
         let mut right = vec![
@@ -75,7 +78,10 @@ pub fn header(model: &Model) -> Line<'static> {
             span(" │ ", th.border),
             span(model.branch.clone(), th.secondary),
             span(" │ ", th.border),
-            span(model.model_name.clone(), th.muted),
+            span(
+                format!("{} · {}", model.model_name, model.thinking_level),
+                th.muted,
+            ),
         ];
         if model.codex_open() {
             right.push(span(" │ ", th.border));
@@ -155,7 +161,10 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
             span(" · ", th.border),
             span(model.branch.clone(), th.secondary),
             span(" · ", th.border),
-            span(model.model_name.clone(), th.muted),
+            span(
+                format!("{} · {}", model.model_name, model.thinking_level),
+                th.muted,
+            ),
         ],
         Screen::Agent => {
             let mut left = vec![
@@ -321,24 +330,57 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
     // sheet is the one exception: its row suggests the command that summoned
     // it, which is a hint, not chat.
     let placeholder = screen_placeholder(model.screen);
-    let caret_style = if model.blink() {
+    let lit = model.blink();
+    let caret_style = if lit {
         Style::default().bg(th.primary).fg(th.background)
     } else {
         Style::default().bg(th.background).fg(th.background)
     };
+    // Where the editor's cursor actually sits, as `(row, byte column)`. Only
+    // the composer's own text can be indexed this way: a caller-supplied row
+    // set (a sheet's suggestion, recall's keys) is not what the editor holds,
+    // so those keep the caret parked at the end.
+    let caret_at = if lines.is_none() && !overlaid {
+        Some(model.composer.editor().get_cursor())
+    } else {
+        None
+    };
+    let caret_row = caret_at.map_or(last, |(row, _)| row.min(last));
 
     let mut surface = Surface::new(model.width, th).border(border);
     for (index, entry) in entries.into_iter().enumerate() {
-        let body = if entry.is_empty() {
-            span(placeholder.unwrap_or("").to_string(), th.muted)
+        // An echoed command reads muted, prose bright (`2a`, `2c`).
+        let ink = if entry.starts_with('/') {
+            th.muted
         } else {
-            // An echoed command reads muted, prose bright (`2a`, `2c`).
-            let ink = if entry.starts_with('/') {
-                th.muted
-            } else {
-                th.text
-            };
-            span(clip_ellipsis(&entry, model.width.saturating_sub(10)), ink)
+            th.text
+        };
+        let shown = clip_ellipsis(&entry, model.width.saturating_sub(10));
+        // The caret sits *on* the character it is in front of, not after the
+        // whole row: parking a block at end-of-line made the arrow keys look
+        // dead even though the editor had moved.
+        let split = match caret_at {
+            Some((row, col)) if row == index && !overlaid => split_at_caret(&shown, col),
+            _ => None,
+        };
+        let caret_here = split.is_some();
+        let body = if entry.is_empty() {
+            vec![span(placeholder.unwrap_or("").to_string(), th.muted)]
+        } else if let Some((before, under, after)) = split {
+            vec![
+                span(before, ink),
+                // Unlit, the character under the caret is still the user's
+                // text — painting it background-on-background would blink the
+                // letter itself out of the line.
+                if lit {
+                    Span::styled(under, caret_style)
+                } else {
+                    span(under, ink)
+                },
+                span(after, ink),
+            ]
+        } else {
+            vec![span(shown, ink)]
         };
         // The prompt is copper on the opening row; continuation rows carry a
         // quiet one, as the mockup's wrapped composer does (`1c`).
@@ -347,10 +389,12 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         } else {
             th.border
         };
-        let mut row = vec![span(format!("{} ", glyph::PROMPT), prompt_ink), body];
+        let mut row = vec![span(format!("{} ", glyph::PROMPT), prompt_ink)];
+        row.extend(body);
         // The caret belongs to whatever owns the keyboard; an open instrument
-        // owns it, so the composer's goes with it (`1d`, `1f`).
-        if index == last && !overlaid {
+        // owns it, so the composer's goes with it (`1d`, `1f`). At end of line
+        // it has no character to sit on, so it takes a cell of its own.
+        if index == caret_row && !overlaid && !caret_here {
             row.push(Span::styled(" ", caret_style));
         }
         surface = surface.row(row);
@@ -362,6 +406,26 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         rows.push(hint_line(model, hint, rows_typed));
     }
     rows
+}
+
+/// Split a drawn composer row into `(before, under, after)` around the caret,
+/// where `col` is a byte offset into the row's text.
+///
+/// `None` means the caret has no character to sit on in this row and the caller
+/// should give it a cell of its own: the cursor is at end of line, or past what
+/// survived `clip_ellipsis` on an over-long row (davinci's composer does not
+/// scroll horizontally, so a caret out beyond the `…` has nowhere to land).
+fn split_at_caret(shown: &str, col: usize) -> Option<(String, String, String)> {
+    if col >= shown.len() || !shown.is_char_boundary(col) {
+        return None;
+    }
+    let under = shown[col..].chars().next()?;
+    let end = col + under.len_utf8();
+    Some((
+        shown[..col].to_string(),
+        under.to_string(),
+        shown[end..].to_string(),
+    ))
 }
 
 /// What the composer suggests while a sheet is open: the command that
@@ -664,6 +728,15 @@ mod tests {
     }
 
     #[test]
+    fn the_header_carries_active_reasoning_next_to_the_model() {
+        let mut m = model(100);
+        m.thinking_level = "high".into();
+
+        let drawn = text(&header(&m));
+        assert!(drawn.contains("sonnet · high"), "{drawn}");
+    }
+
+    #[test]
     fn the_header_carries_path_branch_and_model_when_there_is_room() {
         let drawn = text(&header(&model(100)));
         assert!(drawn.starts_with("D davinci · agent"), "{drawn}");
@@ -842,6 +915,91 @@ mod tests {
             !drawn.contains("…"),
             "no placeholder under an overlay: {drawn}"
         );
+    }
+
+    /// The caret cell is the one span drawn on the theme's primary; find where
+    /// it sits within a composer row, in columns after the `› ` prompt.
+    fn caret_column(model: &Model, row: usize) -> Option<usize> {
+        let line = composer(model, None, Hint::Default).remove(row);
+        // Everything the surface draws before the text: the box rule and the
+        // `› ` prompt.
+        let mut prefix = 0usize;
+        let mut column = 0usize;
+        let mut caret = None;
+        for span in &line.spans {
+            if caret.is_none() && span.style.bg == Some(model.theme.primary) {
+                caret = Some(column);
+            }
+            column += UnicodeWidthStr::width(span.content.as_ref());
+            if span.content.contains(glyph::PROMPT) {
+                prefix = column;
+            }
+        }
+        caret.map(|at| at.saturating_sub(prefix))
+    }
+
+    #[test]
+    fn the_caret_sits_where_the_cursor_is_not_at_the_end_of_the_row() {
+        let mut m = model(100);
+        m.type_char("what llm model are you");
+        assert_eq!(
+            caret_column(&m, 1),
+            Some(22),
+            "end of line takes its own cell"
+        );
+
+        for _ in 0..5 {
+            m.composer.editor_mut().move_left();
+        }
+        assert_eq!(
+            caret_column(&m, 1),
+            Some(17),
+            "five left of the end is the `e` of `are`, not the end of the row"
+        );
+
+        m.composer.editor_mut().move_line_start();
+        assert_eq!(caret_column(&m, 1), Some(0), "line start is column zero");
+    }
+
+    #[test]
+    fn the_caret_follows_the_cursor_onto_an_earlier_composer_row() {
+        let mut m = model(100);
+        m.type_char("alpha");
+        m.newline();
+        m.type_char("bravo");
+        assert_eq!(
+            caret_column(&m, 2),
+            Some(5),
+            "the caret starts on the row being typed"
+        );
+        assert_eq!(caret_column(&m, 1), None, "and only on that row");
+
+        m.composer.editor_mut().cursor_up();
+        assert_eq!(
+            caret_column(&m, 1),
+            Some(5),
+            "up moves the caret onto `alpha`"
+        );
+        assert_eq!(caret_column(&m, 2), None, "and off `bravo`");
+    }
+
+    #[test]
+    fn a_caret_past_the_clip_keeps_its_own_cell() {
+        // No horizontal scrolling: a cursor out beyond the `…` has no
+        // character to sit on, so the row falls back to a trailing caret
+        // rather than indexing into text that was never drawn.
+        assert_eq!(split_at_caret("abc…", 9), None);
+        assert_eq!(
+            split_at_caret("abc", 3),
+            None,
+            "end of line has no character"
+        );
+        assert_eq!(
+            split_at_caret("héllo", 1),
+            Some((String::from("h"), String::from("é"), String::from("llo"))),
+            "a multi-byte character is taken whole"
+        );
+        assert_eq!(split_at_caret("héllo", 2), None, "never splits a character");
     }
 
     #[test]

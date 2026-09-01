@@ -316,6 +316,56 @@ impl Extensions {
     }
 }
 
+/// What a turn under way has cost so far, for the working line pinned above
+/// the composer (design.md §8).
+///
+/// The shell owns the clock and the counter; the view only reads them, so a
+/// frame is a pure function of the model and stays testable.
+#[derive(Debug, Clone, Default)]
+pub struct Working {
+    /// Seconds since the turn was sent.
+    pub seconds: u64,
+    /// Tokens streamed back so far — output, not context.
+    pub tokens: u64,
+    /// `high`, `medium`, … — `None` when the model is not thinking.
+    pub thinking: Option<String>,
+}
+
+impl Working {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The word beside the spinner. It is drawn from the elapsed second, not
+    /// from a random seed, so a frame is reproducible in a test.
+    pub fn verb(&self) -> &'static str {
+        // A workshop's vocabulary, one word every three seconds.
+        const VERBS: [&str; 20] = [
+            "Pondering",
+            "Sketching",
+            "Drafting",
+            "Composing",
+            "Measuring",
+            "Devising",
+            "Chiselling",
+            "Layering",
+            "Gilding",
+            "Mixing",
+            "Sculpting",
+            "Etching",
+            "Burnishing",
+            "Contemplating",
+            "Refining",
+            "Rendering",
+            "Studying",
+            "Tinkering",
+            "Weaving",
+            "Distilling",
+        ];
+        VERBS[((self.seconds / 3) as usize) % VERBS.len()]
+    }
+}
+
 /// One Studio step: a ledger row of ✓ / ◉ / ○ (design.md §6).
 #[derive(Debug, Clone)]
 pub struct Step {
@@ -382,6 +432,15 @@ pub enum Entry {
         subject: String,
     },
     Prose(String),
+    /// The model's reasoning. While `live` the last few rows are shown as
+    /// they arrive; once done it collapses to one row — `⟐ reasoned 4s ·
+    /// first sentence` — so the thinking is auditable without crowding the
+    /// answer.
+    Thinking {
+        text: String,
+        live: bool,
+        seconds: u64,
+    },
     Studio(Vec<Step>),
     Delta {
         path: String,
@@ -402,6 +461,14 @@ impl Entry {
 
     pub fn prose(text: &str) -> Self {
         Entry::Prose(text.to_string())
+    }
+
+    pub fn thinking(text: &str, live: bool, seconds: u64) -> Self {
+        Entry::Thinking {
+            text: text.to_string(),
+            live,
+            seconds,
+        }
     }
 
     pub fn detail(text: &str) -> Self {
@@ -1081,6 +1148,11 @@ pub struct Startup {
     pub language: String,
     pub crates: String,
     pub restored: bool,
+    /// What the session found when it opened — `loaded 1 context file · 41
+    /// skills`, `models scoped to …` — one row each under the mark, so a
+    /// fresh session opens on the `1a` screen instead of a transcript that
+    /// begins with bookkeeping.
+    pub found: Vec<String>,
 }
 
 /// Where the session lives, and what it costs. Every field here is shown as a
@@ -1091,6 +1163,10 @@ pub struct Model {
     pub height: u16,
     /// One clock, 250ms per step, driving both animations (design.md §8).
     pub tick: u64,
+    /// The tick the caret last moved on. The blink phase is measured from here
+    /// rather than from zero, so a caret being typed at or arrowed across is
+    /// solid and only resumes blinking once the composer has been left alone.
+    pub caret_moved_at: u64,
     pub animate: bool,
     pub theme: Theme,
 
@@ -1127,6 +1203,9 @@ pub struct Model {
     /// Rows the loaded extensions have asked for.
     pub extensions: Extensions,
     pub running: bool,
+    /// The working line's numbers while a turn is under way. `None` between
+    /// turns, which is what takes the row off the window.
+    pub working: Option<Working>,
 
     pub palette_index: usize,
     pub session_index: usize,
@@ -1140,6 +1219,8 @@ pub struct Model {
     pub cwd: String,
     pub branch: String,
     pub model_name: String,
+    /// Active thinking/reasoning level for the model in hand (`off`, `high`, ...).
+    pub thinking_level: String,
     /// `Δn +a -d` for the status bar.
     pub changes: (u32, u32, u32),
     /// `(used, cap)` in tokens.
@@ -1246,6 +1327,7 @@ impl Model {
             width,
             height,
             tick: 0,
+            caret_moved_at: 0,
             animate,
             theme,
             screen: Screen::Agent,
@@ -1263,6 +1345,7 @@ impl Model {
             query: String::new(),
             transcript: Vec::new(),
             running: false,
+            working: None,
             palette_index: 0,
             session_index: 0,
             model_index: 0,
@@ -1272,6 +1355,7 @@ impl Model {
             cwd: String::new(),
             branch: String::new(),
             model_name: String::new(),
+            thinking_level: "off".into(),
             changes: (0, 0, 0),
             context: (0, 200_000),
             startup: Startup::default(),
@@ -1469,11 +1553,22 @@ impl Model {
     }
 
     /// The caret blinks at ~1s, step-end, off the same clock as the spinner.
+    ///
+    /// The phase is measured from the last caret move, not from zero, so the
+    /// caret is solid while it is being typed at or arrowed across and only
+    /// resumes blinking a full phase after the composer goes still. A caret
+    /// that winks out mid-motion reads as a dropped keystroke.
     pub fn blink(&self) -> bool {
         if !self.animate {
             return true;
         }
-        (self.tick / 4) % 2 == 0
+        (self.tick.wrapping_sub(self.caret_moved_at) / 4) % 2 == 0
+    }
+
+    /// Restart the blink phase: the caret is somewhere new, so it is drawn
+    /// solid from here. `tick` wraps, so the phase arithmetic wraps with it.
+    pub fn mark_caret_moved(&mut self) {
+        self.caret_moved_at = self.tick;
     }
 
     pub fn context_fraction(&self) -> f64 {
@@ -1499,6 +1594,7 @@ impl Model {
     }
 
     pub fn type_char(&mut self, text: &str) {
+        self.mark_caret_moved();
         if self.overlay == Some(Overlay::Instrumenta) {
             self.query.push_str(text);
             self.palette_index = 0;
@@ -1588,6 +1684,7 @@ impl Model {
             self.dismiss_suggestions();
             return false;
         }
+        self.mark_caret_moved();
         self.composer.set_text(completed);
         let end = self.composer.editor().buffer.len();
         self.composer.editor_mut().cursor = end;
@@ -1613,6 +1710,7 @@ impl Model {
         if self.overlay.is_some() {
             return;
         }
+        self.mark_caret_moved();
         self.composer.push('\n');
         self.refresh_suggestions();
     }
@@ -1671,6 +1769,7 @@ impl Model {
     }
 
     pub fn backspace(&mut self) {
+        self.mark_caret_moved();
         if self.overlay == Some(Overlay::Instrumenta) {
             self.query.pop();
             self.palette_index = 0;
@@ -1689,6 +1788,7 @@ impl Model {
         if self.composer.trim().is_empty() {
             return;
         }
+        self.mark_caret_moved();
         let text = self.composer.editor_mut().submit();
         self.dismiss_suggestions();
         if !self.transcript.is_empty() {
@@ -1707,6 +1807,7 @@ impl Model {
         if self.composer.trim().is_empty() {
             return false;
         }
+        self.mark_caret_moved();
         let text = self.composer.editor_mut().submit();
         self.queued.push(text);
         self.dismiss_suggestions();
@@ -2075,6 +2176,33 @@ mod tests {
         m.animate = false;
         m.tick = 6;
         assert!(m.blink(), "a still caret is drawn, not hidden");
+    }
+
+    #[test]
+    fn a_caret_being_moved_does_not_blink() {
+        let mut m = model(120);
+        m.type_char("hello");
+        // Six ticks after the last keystroke would be the dark half of the
+        // phase if the phase ran from zero.
+        m.tick = 6;
+        assert!(!m.blink(), "left alone, it blinks");
+
+        // Typing at that same tick restarts the phase.
+        m.type_char("!");
+        assert!(m.blink(), "a caret being typed at is solid");
+
+        // And so does moving it, without editing anything.
+        m.tick = 10;
+        assert!(!m.blink(), "still again, blinking again");
+        m.composer.editor_mut().move_left();
+        m.mark_caret_moved();
+        assert!(m.blink(), "a caret being arrowed across is solid");
+
+        // Solid for the whole phase after the last move, then blinking.
+        m.tick = 13;
+        assert!(m.blink(), "solid to the end of the phase");
+        m.tick = 14;
+        assert!(!m.blink(), "and dark on the next one");
     }
 
     #[test]

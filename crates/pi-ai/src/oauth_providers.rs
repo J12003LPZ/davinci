@@ -59,6 +59,19 @@ pub fn generate_pkce(verifier_bytes: &[u8]) -> Pkce {
     }
 }
 
+/// Generate browser OAuth material with the same sizes as the TypeScript source:
+/// 32 random-ish bytes for PKCE and a fresh 32-hex-character state per login.
+pub fn fresh_authorize_request(provider: &str) -> Option<AuthorizeRequest> {
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    let mut verifier_bytes = [0u8; 32];
+    verifier_bytes[..16].copy_from_slice(first.as_bytes());
+    verifier_bytes[16..].copy_from_slice(second.as_bytes());
+    let pkce = generate_pkce(&verifier_bytes);
+    let state = uuid::Uuid::new_v4().simple().to_string();
+    authorize_request(provider, &pkce, &state)
+}
+
 fn base64url(bytes: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
@@ -314,17 +327,92 @@ pub fn token_exchange_request(
     }
 }
 
+/// What a token endpoint hands back. `expires` is a Unix epoch millisecond
+/// stamp, the same shape the TS credential stores (`Date.now() + expires_in *
+/// 1000`); a provider that omits `expires_in` leaves it `None`. Dropping this
+/// field is what used to make a stored login unrefreshable: with no expiry
+/// recorded, nothing ever decided the token was old enough to renew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OauthTokens {
+    pub access: String,
+    pub refresh: Option<String>,
+    pub expires: Option<u64>,
+}
+
+/// TS refresh bodies (`refreshAnthropicToken`, `refreshAccessToken`,
+/// `refreshXaiToken`, Kimi's `/api/oauth/token`): every provider posts
+/// `grant_type=refresh_token` with its client id, Anthropic as JSON and the
+/// rest form-encoded.
+pub fn token_refresh_request(provider: &str, refresh: &str) -> Option<TokenExchangeRequest> {
+    let form = |url: String, client_id: &str| TokenExchangeRequest {
+        url,
+        content_type: "application/x-www-form-urlencoded".into(),
+        body: url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("client_id", client_id)
+            .append_pair("refresh_token", refresh)
+            .finish(),
+        redirect_uri: String::new(),
+    };
+    match provider {
+        "anthropic" => Some(TokenExchangeRequest {
+            url: ANTHROPIC_TOKEN_URL.into(),
+            content_type: "application/json".into(),
+            body: serde_json::json!({
+                "grant_type": "refresh_token",
+                "client_id": ANTHROPIC_CLIENT_ID,
+                "refresh_token": refresh,
+            })
+            .to_string(),
+            redirect_uri: String::new(),
+        }),
+        "openai-codex" => Some(form(CODEX_TOKEN_URL.into(), CODEX_CLIENT_ID)),
+        "xai" => Some(form(XAI_TOKEN_URL.into(), XAI_CLIENT_ID)),
+        "kimi-coding" => Some(form(
+            format!("{KIMI_OAUTH_HOST}/api/oauth/token"),
+            KIMI_CLIENT_ID,
+        )),
+        // OpenRouter exchanges a code for a durable API key and has no refresh
+        // grant; Radius' token URL is per-gateway and not known here.
+        _ => None,
+    }
+}
+
+/// Trade a refresh token for a fresh access token. Fixture refresh (a
+/// `pi-fixture-` token or `PI_OAUTH_FIXTURE`) never hits the network.
+pub fn refresh_oauth_token(provider: &str, refresh: &str) -> Result<OauthTokens, String> {
+    if refresh.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok() {
+        return Ok(OauthTokens {
+            access: format!("{refresh}-access"),
+            refresh: Some(refresh.to_string()),
+            expires: Some(crate::models_store::now_ms().saturating_add(3_600_000)),
+        });
+    }
+    let request = token_refresh_request(provider, refresh)
+        .ok_or_else(|| format!("OAuth refresh is not configured for {provider}"))?;
+    let mut tokens = post_token_exchange(&request)?;
+    // Providers that rotate refresh tokens return a new one; the ones that do
+    // not expect the old one to be kept. Dropping it here would log the user
+    // out on the next renewal.
+    if tokens.refresh.is_none() {
+        tokens.refresh = Some(refresh.to_string());
+    }
+    Ok(tokens)
+}
+
 /// Fixture token exchange never hits the network. Live POST uses the TS token URL
 /// (overridable with `PI_OAUTH_TOKEN_URL`). Tests use `pi-fixture-` / `PI_OAUTH_FIXTURE`.
 pub fn exchange_authorization_code(
     provider: &str,
     code: &str,
     pkce: Option<&Pkce>,
-) -> Result<(String, Option<String>), String> {
+) -> Result<OauthTokens, String> {
     if code.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok() {
-        let access = format!("{provider}-{code}-access");
-        let refresh = pkce.map(|p| format!("pi-fixture-{}", p.verifier));
-        return Ok((access, refresh));
+        return Ok(OauthTokens {
+            access: format!("{provider}-{code}-access"),
+            refresh: pkce.map(|p| format!("pi-fixture-{}", p.verifier)),
+            expires: Some(crate::models_store::now_ms().saturating_add(3_600_000)),
+        });
     }
     let request =
         token_exchange_request(provider, code, pkce, pkce.map(|p| p.verifier.as_str()))
@@ -332,7 +420,7 @@ pub fn exchange_authorization_code(
     post_token_exchange(&request)
 }
 
-fn post_token_exchange(request: &TokenExchangeRequest) -> Result<(String, Option<String>), String> {
+fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, String> {
     let url = std::env::var("PI_OAUTH_TOKEN_URL").unwrap_or_else(|_| request.url.clone());
     let response = ureq::post(&url)
         .set("content-type", &request.content_type)
@@ -367,7 +455,23 @@ fn post_token_exchange(request: &TokenExchangeRequest) -> Result<(String, Option
         .or_else(|| value.get("refresh"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    Ok((access.to_string(), refresh))
+    // TS reads `expires_in` seconds and stamps `Date.now() + expires_in * 1000`;
+    // an absolute `expires_at`/`expires` is taken as already being that stamp.
+    let expires = value
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .map(|seconds| crate::models_store::now_ms().saturating_add(seconds.saturating_mul(1000)))
+        .or_else(|| {
+            value
+                .get("expires_at")
+                .or_else(|| value.get("expires"))
+                .and_then(|v| v.as_u64())
+        });
+    Ok(OauthTokens {
+        access: access.to_string(),
+        refresh,
+        expires,
+    })
 }
 
 pub fn oauth_providers() -> &'static [&'static str] {
@@ -398,6 +502,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fresh_codex_authorize_request_uses_ts_sized_secrets() {
+        let request = fresh_authorize_request("openai-codex").unwrap();
+        let pkce = request.pkce.as_ref().unwrap();
+        let state = request.state.as_deref().unwrap();
+        assert_eq!(pkce.verifier.len(), 43);
+        assert_eq!(pkce.challenge.len(), 43);
+        assert_eq!(state.len(), 32);
+        assert!(state.chars().all(|ch| ch.is_ascii_hexdigit()));
+        let url = url::Url::parse(&request.url).unwrap();
+        let url_state = url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned());
+        assert_eq!(url_state.as_deref(), Some(state));
+        assert_ne!(state, "pi");
+    }
+
+    #[test]
+    fn refresh_bodies_match_ts() {
+        // `refreshAccessToken` in openai-codex.ts: form-encoded, client id,
+        // grant_type=refresh_token. Nothing else.
+        let codex = token_refresh_request("openai-codex", "rt.1.abc").unwrap();
+        assert_eq!(codex.url, CODEX_TOKEN_URL);
+        assert_eq!(codex.content_type, "application/x-www-form-urlencoded");
+        assert!(codex.body.contains("grant_type=refresh_token"));
+        assert!(codex.body.contains(&format!("client_id={CODEX_CLIENT_ID}")));
+        assert!(codex.body.contains("refresh_token=rt.1.abc"));
+
+        // `refreshAnthropicToken` posts the same three fields as JSON.
+        let anthropic = token_refresh_request("anthropic", "rt-2").unwrap();
+        assert_eq!(anthropic.url, ANTHROPIC_TOKEN_URL);
+        assert_eq!(anthropic.content_type, "application/json");
+        let body: serde_json::Value = serde_json::from_str(&anthropic.body).unwrap();
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert_eq!(body["client_id"], ANTHROPIC_CLIENT_ID);
+        assert_eq!(body["refresh_token"], "rt-2");
+
+        assert!(token_refresh_request("xai", "rt-3").is_some());
+        assert!(token_refresh_request("kimi-coding", "rt-4").is_some());
+        // OpenRouter hands back a durable key and has no refresh grant.
+        assert!(token_refresh_request("openrouter", "rt-5").is_none());
+    }
+
+    #[test]
+    fn fixture_exchange_and_refresh_record_an_expiry() {
+        // The expiry is the whole point: a credential stored without one is a
+        // credential nothing ever renews.
+        let pkce = generate_pkce(&[7u8; 32]);
+        let exchanged =
+            exchange_authorization_code("openai-codex", "pi-fixture-code", Some(&pkce)).unwrap();
+        assert!(exchanged.expires.is_some());
+        assert!(exchanged.refresh.is_some());
+
+        let refreshed = refresh_oauth_token("openai-codex", "pi-fixture-refresh").unwrap();
+        assert!(refreshed.expires.is_some());
+        assert_eq!(refreshed.refresh.as_deref(), Some("pi-fixture-refresh"));
+    }
+
+    #[test]
     fn anthropic_and_codex_authorize_urls_match_ts() {
         let pkce = generate_pkce(&[1u8; 32]);
         let anthropic = authorize_request("anthropic", &pkce, "state").unwrap();
@@ -424,9 +587,9 @@ mod tests {
                 "{provider}"
             );
         }
-        let (access, _) =
+        let exchanged =
             exchange_authorization_code("anthropic", "pi-fixture-code", Some(&pkce)).unwrap();
-        assert!(access.contains("anthropic"));
+        assert!(exchanged.access.contains("anthropic"));
         let anthropic_token =
             token_exchange_request("anthropic", "abc", Some(&pkce), Some("st")).unwrap();
         assert_eq!(anthropic_token.content_type, "application/json");

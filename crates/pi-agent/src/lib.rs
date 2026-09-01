@@ -253,6 +253,17 @@ impl Agent {
         events.push(event);
     }
 
+    /// Hand an event to the sink without recording it. A provider closure
+    /// that streams live uses this for `MessageStart` and every
+    /// `MessageUpdate`, and returns `CompleteOutput { streamed_live: true }`
+    /// so the loop records them into the event list without sending them a
+    /// second time.
+    pub fn emit_live(&self, event: AgentEvent) {
+        if let Some(sink) = &self.event_sink {
+            (sink.0)(&event);
+        }
+    }
+
     /// TS `evalSession.reload()` — isolated evals have no extensions; count the step.
     pub fn reload(&mut self) {
         self.reload_count = self.reload_count.saturating_add(1);
@@ -802,6 +813,10 @@ fn first_kept_entry_id(
 pub struct CompleteOutput {
     pub message: AssistantMessage,
     pub stream_events: Option<Vec<AssistantMessageEvent>>,
+    /// The closure already sent `MessageStart` and one `MessageUpdate` per
+    /// stream event through `Agent::emit_live` while the provider was
+    /// answering. The loop then only records them.
+    pub streamed_live: bool,
 }
 
 impl From<AssistantMessage> for CompleteOutput {
@@ -809,6 +824,7 @@ impl From<AssistantMessage> for CompleteOutput {
         Self {
             message,
             stream_events: None,
+            streamed_live: false,
         }
     }
 }
@@ -891,6 +907,86 @@ mod tests {
         assert!(kinds.contains(&"auto_retry_end"));
         assert_eq!(calls, 2);
         assert_eq!(agent.last_assistant_text().as_deref(), Some("recovered"));
+    }
+
+    #[test]
+    fn a_closure_that_streamed_live_is_recorded_but_not_resent_to_the_sink() {
+        use pi_ai::{AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.event_sink = Some(EventSink(Arc::new(move |event: &AgentEvent| {
+            sink_seen.lock().unwrap().push(event.kind());
+        })));
+        agent.prompt("stream me");
+        let events = agent
+            .run_loop(|current| {
+                let message = AssistantMessage {
+                    id: "live".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "hi there".into(),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                };
+                let stream_events = pi_ai::events_from_complete(&message);
+                let chat = std::sync::Arc::new(pi_ai::assistant_to_chat(&message));
+                current.emit_live(AgentEvent::MessageStart {
+                    message: (*chat).clone(),
+                });
+                for event in &stream_events {
+                    current.emit_live(AgentEvent::MessageUpdate {
+                        message: chat.clone(),
+                        assistant_message_event: event.clone(),
+                    });
+                }
+                let _: &AssistantMessageEvent = &stream_events[0];
+                Ok(CompleteOutput {
+                    message,
+                    stream_events: Some(stream_events),
+                    streamed_live: true,
+                })
+            })
+            .unwrap();
+        let recorded: Vec<_> = events.iter().map(AgentEvent::kind).collect();
+        let sunk = seen.lock().unwrap().clone();
+        // The record and the sink saw the same sequence, once each: no
+        // update was sent twice and none was dropped.
+        assert_eq!(recorded, sunk);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|kind| **kind == "message_start")
+                .count(),
+            2 // the user prompt and the assistant reply
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|kind| **kind == "message_update")
+                .count(),
+            stream_events_len("hi there")
+        );
+        assert_eq!(agent.last_assistant_text().as_deref(), Some("hi there"));
+    }
+
+    fn stream_events_len(text: &str) -> usize {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+        pi_ai::events_from_complete(&AssistantMessage {
+            id: "n".into(),
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+            model: "fixture".into(),
+            usage: None,
+            stop_reason: Some(StopReason::Stop),
+            error_message: None,
+        })
+        .len()
     }
 
     #[test]

@@ -71,6 +71,9 @@ pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
         ],
     ));
     rows.push(center(width, restored_row(th, info.restored)));
+    for found in &info.found {
+        rows.push(center(width, vec![span(found.clone(), th.muted)]));
+    }
     rows.push(blank());
 
     let rule_width = width.min(62);
@@ -188,7 +191,26 @@ mod tests {
             language: "rust".into(),
             crates: "11 crates".into(),
             restored: true,
+            found: Vec::new(),
         }
+    }
+
+    #[test]
+    fn what_the_session_found_sits_under_the_restored_row() {
+        let m = Model::new(
+            Theme::da_vinci(crate::davinci::theme::ColorDepth::TrueColor, false),
+            110,
+            44,
+            true,
+        );
+        let mut found = info();
+        found.found = vec!["loaded 1 context file · 41 skills".into()];
+        let rows: Vec<String> = lines(&m, &found).iter().map(text).collect();
+        let restored = rows
+            .iter()
+            .position(|row| row.contains("session restored"))
+            .expect("restored row");
+        assert!(rows[restored + 1].contains("loaded 1 context file · 41 skills"));
     }
 
     fn text(line: &Line<'_>) -> String {

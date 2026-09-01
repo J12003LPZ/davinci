@@ -101,7 +101,7 @@ impl Agent {
                 }
             }
 
-            let (assistant, stream_events) =
+            let (assistant, stream_events, streamed_live) =
                 match self.complete_with_retry(&mut complete, &mut events) {
                     Ok(output) => output,
                     Err(err) => {
@@ -114,22 +114,28 @@ impl Agent {
             self.messages.push(chat.clone());
             self.persist_assistant(&assistant, &chat);
             new_messages.push(chat.clone());
-            self.push_event(
-                &mut events,
-                AgentEvent::MessageStart {
-                    message: chat.clone(),
-                },
-            );
+            // A closure that streamed live has already shown the sink the
+            // start and every update; they are recorded here, not resent.
+            let start = AgentEvent::MessageStart {
+                message: chat.clone(),
+            };
+            if streamed_live {
+                events.push(start);
+            } else {
+                self.push_event(&mut events, start);
+            }
             let updates = stream_events.unwrap_or_else(|| pi_ai::events_from_complete(&assistant));
             let shared_chat = std::sync::Arc::new(chat.clone());
             for assistant_message_event in updates {
-                self.push_event(
-                    &mut events,
-                    AgentEvent::MessageUpdate {
-                        message: std::sync::Arc::clone(&shared_chat),
-                        assistant_message_event,
-                    },
-                );
+                let update = AgentEvent::MessageUpdate {
+                    message: std::sync::Arc::clone(&shared_chat),
+                    assistant_message_event,
+                };
+                if streamed_live {
+                    events.push(update);
+                } else {
+                    self.push_event(&mut events, update);
+                }
             }
             self.push_event(
                 &mut events,
@@ -354,7 +360,14 @@ impl Agent {
         &mut self,
         complete: &mut F,
         events: &mut Vec<AgentEvent>,
-    ) -> Result<(AssistantMessage, Option<Vec<pi_ai::AssistantMessageEvent>>), String>
+    ) -> Result<
+        (
+            AssistantMessage,
+            Option<Vec<pi_ai::AssistantMessageEvent>>,
+            bool,
+        ),
+        String,
+    >
     where
         F: FnMut(&Agent) -> Result<T, String>,
         T: Into<crate::CompleteOutput>,
@@ -390,6 +403,7 @@ impl Agent {
                         error_message: Some("aborted".into()),
                     },
                     None,
+                    false,
                 ));
             }
             match complete(self) {
@@ -432,7 +446,7 @@ impl Agent {
                             },
                         );
                     }
-                    return Ok((message, output.stream_events));
+                    return Ok((message, output.stream_events, output.streamed_live));
                 }
                 Err(err) => {
                     last_error = Some(err.clone());
@@ -449,8 +463,10 @@ impl Agent {
                             },
                         );
                         sleep_retry_delay(delay);
-                    } else if attempt + 1 < attempts {
-                        sleep_retry_delay(retry_delay_ms(self.retry_base_delay_ms, attempt));
+                    } else {
+                        // A refused request (a 400, a bad key) comes back the
+                        // same every time; TS fails at once and so does this.
+                        break;
                     }
                 }
             }

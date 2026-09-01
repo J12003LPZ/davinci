@@ -10,7 +10,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::catalog::Model;
-use crate::stream::{AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason};
+use crate::stream::{AssistantMessage, AssistantMessageEvent};
 
 pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const WEBSOCKET_CONNECTION_LIMIT_REACHED: &str = "websocket_connection_limit_reached";
@@ -97,6 +97,16 @@ pub fn normalize_codex_terminal_event(event_type: &str) -> &str {
         "response.done" | "response.completed" | "response.incomplete" => "response.completed",
         other => other,
     }
+}
+
+/// Tests that touch the process-wide websocket state (sessions, stats, the
+/// `PI_CODEX_WS_*` variables) take this lock, in this module and in
+/// `codex_ws`, so one test's `close_openai_codex_websocket_sessions(None)`
+/// cannot land between another's store and read.
+#[cfg(test)]
+pub(crate) fn websocket_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 pub fn is_websocket_connection_limit_reached(error: &str) -> bool {
@@ -202,6 +212,24 @@ pub fn extract_account_id(token: &str) -> Result<String, String> {
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "Failed to extract accountId from token".into())
+}
+
+/// The `exp` claim of a JWT access token as a Unix epoch millisecond stamp.
+/// Credentials written before the expiry was recorded carry no `expires`, and
+/// a login that never expires in the store is a login that never refreshes;
+/// for the providers whose access token is a JWT the token itself still says
+/// when it dies. Returns `None` for anything that is not a JWT with `exp`.
+pub fn jwt_expiry_ms(token: &str) -> Option<u64> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload = decode_jwt_part(parts[1]).ok()?;
+    let value: Value = serde_json::from_slice(&payload).ok()?;
+    value
+        .get("exp")
+        .and_then(Value::as_u64)
+        .map(|seconds| seconds.saturating_mul(1000))
 }
 
 fn header_key_eq(left: &str, right: &str) -> bool {
@@ -660,6 +688,36 @@ pub fn try_codex_websocket_transport(
     websocket_connect_timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
 ) -> Result<CodexWebsocketOutcome, String> {
+    try_codex_websocket_transport_with(
+        model,
+        body,
+        token,
+        options_transport,
+        session_id,
+        cache_retention,
+        websocket_connect_timeout_ms,
+        idle_timeout_ms,
+        None,
+        &mut |_| {},
+    )
+}
+
+/// `try_codex_websocket_transport` with a live sink: every stream event is
+/// handed to `on_event` as its frame arrives, and `abort` is checked between
+/// frames.
+#[allow(clippy::too_many_arguments)]
+pub fn try_codex_websocket_transport_with(
+    model: &Model,
+    body: &Value,
+    token: &str,
+    options_transport: Option<&str>,
+    session_id: Option<&str>,
+    cache_retention: Option<&str>,
+    websocket_connect_timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+    abort: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<CodexWebsocketOutcome, String> {
     if options_transport == Some("sse") {
         return Ok(CodexWebsocketOutcome::FallbackToSse);
     }
@@ -694,9 +752,14 @@ pub fn try_codex_websocket_transport(
             &account_id,
             use_cached,
             &mut started,
+            abort,
+            on_event,
         ) {
             Ok(message) => return Ok(CodexWebsocketOutcome::Message(Box::new(message))),
             Err(error) => {
+                crate::trace::log(&format!(
+                    "websocket attempt failed (started={started} retried_limit={retried_limit} retried_missing={retried_missing}): {error}"
+                ));
                 if should_retry_missing_previous_response(&error, retried_missing) {
                     retried_missing = true;
                     clear_cached_continuation(cache_id.as_deref(), &account_id);
@@ -717,159 +780,16 @@ pub fn try_codex_websocket_transport(
     }
 }
 
-fn event_delta(value: &Value) -> String {
-    value
-        .get("delta")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
-}
-
 /// Replay a Codex Responses JSON/SSE fixture into pi-ai assistant events.
 /// Never opens a websocket or hits the network.
 pub fn replay_codex_events(model: &Model, corpus: &str) -> Vec<AssistantMessageEvent> {
-    let mut message = AssistantMessage {
-        id: Uuid::new_v4().to_string(),
-        role: "assistant".into(),
-        content: Vec::new(),
-        model: format!("{}/{}", model.provider, model.id),
-        usage: None,
-        stop_reason: None,
-        error_message: None,
-    };
+    use crate::stream_decoder::StreamDecoder;
+    let mut decoder = crate::stream_decoder::ResponsesDecoder::new(model);
     let mut events = Vec::new();
-    let mut text = String::new();
-    let mut thinking = String::new();
-    let mut started = false;
-    let mut text_started = false;
-    let mut thinking_started = false;
-
     for raw_event in corpus_events(corpus) {
-        let event_type = raw_event
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let mapped = map_codex_event_type(event_type);
-        match mapped {
-            Some("start") => {
-                if !started {
-                    events.push(AssistantMessageEvent::Start {
-                        partial: message.clone(),
-                    });
-                    started = true;
-                }
-            }
-            Some("text_delta") => {
-                let delta = event_delta(&raw_event);
-                if !started {
-                    events.push(AssistantMessageEvent::Start {
-                        partial: message.clone(),
-                    });
-                    started = true;
-                }
-                if !text_started {
-                    events.push(AssistantMessageEvent::TextStart {
-                        content_index: 0,
-                        partial: message.clone(),
-                    });
-                    text_started = true;
-                }
-                text.push_str(&delta);
-                if let Some(ContentBlock::Text { text: existing }) = message.content.get_mut(0) {
-                    existing.push_str(&delta);
-                } else {
-                    message.content.insert(
-                        0,
-                        ContentBlock::Text {
-                            text: delta.clone(),
-                        },
-                    );
-                }
-                events.push(AssistantMessageEvent::TextDelta {
-                    content_index: 0,
-                    delta,
-                    partial: message.clone(),
-                });
-            }
-            Some("thinking_delta") => {
-                let delta = if event_type == "response.reasoning_summary_part.done" {
-                    "\n\n".into()
-                } else {
-                    event_delta(&raw_event)
-                };
-                if !thinking_started {
-                    events.push(AssistantMessageEvent::ThinkingStart {
-                        content_index: if text_started { 1 } else { 0 },
-                        partial: message.clone(),
-                    });
-                    thinking_started = true;
-                }
-                thinking.push_str(&delta);
-                events.push(AssistantMessageEvent::ThinkingDelta {
-                    content_index: if text_started { 1 } else { 0 },
-                    delta,
-                    partial: message.clone(),
-                });
-            }
-            Some("toolcall_delta") => {
-                let delta = raw_event
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .or_else(|| raw_event.get("arguments").and_then(Value::as_str))
-                    .unwrap_or_default()
-                    .to_string();
-                events.push(AssistantMessageEvent::ToolcallDelta {
-                    content_index: message.content.len(),
-                    delta,
-                    partial: message.clone(),
-                });
-            }
-            Some("done") => {
-                if text_started {
-                    events.push(AssistantMessageEvent::TextEnd {
-                        content_index: 0,
-                        content: text.clone(),
-                        partial: message.clone(),
-                    });
-                }
-                if thinking_started {
-                    events.push(AssistantMessageEvent::ThinkingEnd {
-                        content_index: if text_started { 1 } else { 0 },
-                        content: thinking.clone(),
-                        partial: message.clone(),
-                    });
-                }
-                message.stop_reason = Some(StopReason::Stop);
-                events.push(AssistantMessageEvent::Done {
-                    reason: StopReason::Stop,
-                    message: message.clone(),
-                });
-            }
-            Some("error") => {
-                message.stop_reason = Some(StopReason::Error);
-                message.error_message = raw_event
-                    .pointer("/error/code")
-                    .and_then(Value::as_str)
-                    .or_else(|| raw_event.get("code").and_then(Value::as_str))
-                    .map(str::to_string);
-                events.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
-                    error: message.clone(),
-                });
-            }
-            _ => {}
-        }
+        decoder.feed(&raw_event, &mut events);
     }
-    if !events
-        .iter()
-        .any(|event| matches!(event, AssistantMessageEvent::Done { .. }))
-    {
-        message.stop_reason = Some(StopReason::Stop);
-        events.push(AssistantMessageEvent::Done {
-            reason: StopReason::Stop,
-            message,
-        });
-    }
+    decoder.finish(&mut events);
     events
 }
 
@@ -915,12 +835,10 @@ fn corpus_events(corpus: &str) -> Vec<Value> {
 mod tests {
     use super::*;
     use crate::catalog::ModelCost;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::stream::ContentBlock;
 
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+        websocket_state_test_lock()
     }
 
     fn model() -> Model {

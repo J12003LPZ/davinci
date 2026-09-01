@@ -177,7 +177,7 @@ use pi_ai::{
     apply_config_auth_with_shell, apply_models_config, check_auth, complete_simple, content_text,
     find_model, format_no_api_key_found_message, format_no_model_selected_message,
     format_no_models_available_message, format_oauth_auth_failed_message, fuzzy_models,
-    get_supported_thinking_levels, live_complete_streaming_with, load_builtin_models,
+    get_supported_thinking_levels, live_complete_streaming_with_sink, load_builtin_models,
     models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
     ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
     StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE, PROVIDER_SPECS,
@@ -444,6 +444,33 @@ fn is_package_command(command: Option<&str>) -> bool {
     )
 }
 
+/// The system prompt for one request, with the model actually serving it named
+/// in the text.
+///
+/// A documented divergence from vendor `pi`: `buildSystemPrompt`
+/// (`vendor/pi/packages/coding-agent/src/core/system-prompt.ts`) carries cwd,
+/// tools, context files and skills but no model identity, so "what model are
+/// you?" was answered from the model's training prior rather than from the run.
+/// The line is appended per request rather than stored on the agent, so a
+/// `/model` switch, a thinking-level change, or an extension's `systemPrompt`
+/// override can never leave a stale identity behind.
+fn system_prompt_with_identity(agent: &Agent) -> String {
+    let mut prompt = agent.system_prompt.clone();
+    if agent.provider.is_empty() || agent.model_id.is_empty() {
+        return prompt;
+    }
+    if !prompt.is_empty() {
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(&format!(
+        "You are running as {}/{} (thinking: {}).",
+        agent.provider,
+        agent.model_id,
+        agent.thinking_level.as_str()
+    ));
+    prompt
+}
+
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
     let mut prompt = parsed
         .system_prompt
@@ -621,7 +648,13 @@ fn complete_simple_summarization(
         storage.set_runtime_override(&request.provider, key);
     }
     if let Some(storage) = storage.as_mut() {
-        maybe_refresh_auth(storage, &request.provider, now_ms(), 0, false);
+        maybe_refresh_auth(
+            storage,
+            &request.provider,
+            now_ms(),
+            OAUTH_MIN_VALIDITY_MS,
+            false,
+        );
     }
     let env = std::env::vars().collect();
     let mut auth = storage
@@ -662,6 +695,7 @@ fn complete_simple_summarization(
         session_id: None,
         cache_retention: Some("none".into()),
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
+        abort_signal: None,
     };
     let response = complete_simple(
         &model,
@@ -1326,7 +1360,13 @@ fn complete_prompt_with_host(
         storage.set_runtime_override(&agent.provider, key);
     }
     if let Some(storage) = storage.as_mut() {
-        maybe_refresh_auth(storage, &agent.provider, now_ms(), 0, false);
+        maybe_refresh_auth(
+            storage,
+            &agent.provider,
+            now_ms(),
+            OAUTH_MIN_VALIDITY_MS,
+            false,
+        );
     }
     let env = std::env::vars().collect();
     let mut auth = storage
@@ -1356,6 +1396,18 @@ fn complete_prompt_with_host(
     if auth.as_ref().is_some_and(|item| {
         item.api_key.is_none() && item.headers.is_empty() && item.source == "none"
     }) {
+        auth = None;
+    }
+    // The refresh above already had its chance. A token that is past its
+    // expiry now cannot be renewed, and sending it would come back as a bare
+    // 401; say which of the two happened instead.
+    let expired_oauth = storage
+        .as_ref()
+        .and_then(|storage| storage.get(&agent.provider))
+        .is_some_and(|cred| {
+            cred.kind == CredentialKind::Oauth && pi_ai::credential_expires_by(cred, now_ms())
+        });
+    if expired_oauth {
         auth = None;
     }
     let fresh_host = existing_host.is_none();
@@ -1474,6 +1526,7 @@ fn complete_prompt_with_host(
                 .find(|m| m.role == "user")
                 .map(|m| content_text(&m.content).len())
                 .unwrap_or(0);
+            let system = system_prompt_with_identity(current);
             match (offline, model.as_ref(), auth.as_ref(), js_stream.as_ref()) {
                 (false, Some(model), _, Some((path, name))) => {
                     crate::js_host::run_js_stream_simple(
@@ -1481,38 +1534,61 @@ fn complete_prompt_with_host(
                         name,
                         model,
                         &current.messages_for_provider(),
-                        &current.system_prompt,
+                        &system,
                     )
                     .map(CompleteOutput::from)
                 }
-                (false, Some(model), Some(auth), None) => live_complete_streaming_with(
-                    model,
-                    &current.messages_for_provider(),
-                    auth,
-                    Some(&current.system_prompt),
-                    &tools,
-                    &StreamOptions {
-                        thinking_level: Some(current.thinking_level),
-                        thinking_budgets: current.thinking_budgets.clone(),
-                        timeout_ms: current.provider_timeout_ms,
-                        max_retries: current.provider_max_retries,
-                        max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
-                        max_tokens: None,
-                        websocket_connect_timeout_ms: load_settings(&default_agent_dir())
-                            .websocket_connect_timeout_ms,
-                        transport: current.transport.clone(),
-                        session_id: current
-                            .session
-                            .as_ref()
-                            .map(|session| session.header.id.clone()),
-                        cache_retention: None,
-                        install_telemetry: Some(current.install_telemetry),
-                    },
-                )
-                .map(|(message, stream_events)| CompleteOutput {
-                    message,
-                    stream_events: Some(stream_events),
-                }),
+                (false, Some(model), Some(auth), None) => {
+                    // Every stream event reaches the sink the moment it is
+                    // decoded, as a `MessageUpdate` carrying the partial
+                    // message, with a `MessageStart` ahead of the first one.
+                    // The loop records them afterwards without resending.
+                    let mut started = false;
+                    let mut sink = |event: &pi_ai::AssistantMessageEvent| {
+                        let partial = Arc::new(pi_ai::assistant_to_chat(event.message()));
+                        if !started {
+                            started = true;
+                            current.emit_live(AgentEvent::MessageStart {
+                                message: (*partial).clone(),
+                            });
+                        }
+                        current.emit_live(AgentEvent::MessageUpdate {
+                            message: partial,
+                            assistant_message_event: event.clone(),
+                        });
+                    };
+                    let result = live_complete_streaming_with_sink(
+                        model,
+                        &current.messages_for_provider(),
+                        auth,
+                        Some(&system),
+                        &tools,
+                        &StreamOptions {
+                            thinking_level: Some(current.thinking_level),
+                            thinking_budgets: current.thinking_budgets.clone(),
+                            timeout_ms: current.provider_timeout_ms,
+                            max_retries: current.provider_max_retries,
+                            max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
+                            max_tokens: None,
+                            websocket_connect_timeout_ms: load_settings(&default_agent_dir())
+                                .websocket_connect_timeout_ms,
+                            transport: current.transport.clone(),
+                            session_id: current
+                                .session
+                                .as_ref()
+                                .map(|session| session.header.id.clone()),
+                            cache_retention: None,
+                            install_telemetry: Some(current.install_telemetry),
+                            abort_signal: current.abort_signal.clone(),
+                        },
+                        &mut sink,
+                    );
+                    result.map(|(message, stream_events)| CompleteOutput {
+                        message,
+                        stream_events: Some(stream_events),
+                        streamed_live: started,
+                    })
+                }
                 // Nothing was asked of a provider. Say which of the three
                 // reasons it was: an offline run answers with the stub the
                 // fixtures expect, but a missing model or a missing credential
@@ -1533,6 +1609,10 @@ fn complete_prompt_with_host(
                     "No model matched {}/{}. Run /model to choose one, or check ~/.pi/agent/models.json.",
                     current.provider, current.model_id
                 )),
+                (false, Some(_), None, None) if expired_oauth => Err(format!(
+                    "The {provider} sign-in expired and could not be refreshed. Run /login {provider}.",
+                    provider = current.provider
+                )),
                 (false, Some(_), None, None) => Err(format!(
                     "No credential for {provider}. Run /login {provider}.",
                     provider = current.provider
@@ -1540,17 +1620,25 @@ fn complete_prompt_with_host(
             }
         })
         .unwrap_or_else(|err| {
-            vec![AgentEvent::AgentEnd {
+            // A run that failed outright never reached the sink with an end
+            // event; give it one, so JSON and RPC clients see the failure.
+            let end = AgentEvent::AgentEnd {
                 messages: vec![pi_ai::ChatMessage::text(
                     "assistant",
                     format!("Provider error: {err}"),
                 )],
                 will_retry: false,
-            }]
+            };
+            agent.emit_live(end.clone());
+            vec![end]
         });
     agent.event_sink = None;
+    // The last assistant message may be a tool call with no text — the
+    // reply is then whatever the run ended on, not an empty string that
+    // hides a provider error behind "the model returned no text".
     let reply = agent
         .last_assistant_text()
+        .filter(|text| !text.trim().is_empty())
         .or_else(|| {
             events.iter().rev().find_map(|event| match event {
                 AgentEvent::AgentEnd { messages, .. } => messages
@@ -1747,6 +1835,12 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         }
     }
     let (exit_code, error) = print_text_exit(&all_events);
+    // A provider failure that the loop gave up on carries no error stop
+    // reason of its own: it is the reply text. Report it as the failure it is.
+    let (exit_code, error) = match error {
+        None if last_reply.starts_with("Provider error: ") => (1, Some(last_reply.clone())),
+        other => (exit_code, other),
+    };
     if !json_mode {
         if let Some(error) = error {
             eprintln!("{error}");
@@ -4617,6 +4711,11 @@ fn login_js_oauth_provider(provider: &str) -> Option<(String, String)> {
     ExtensionHost::load(&default_agent_dir(), &stored.extensions).js_oauth_provider(provider)
 }
 
+/// TS `DEFAULT_OAUTH_MINIMUM_VALIDITY_MS` (`auth/resolve.ts`): a token with
+/// less than five minutes left is renewed before the request rather than
+/// after it fails.
+const OAUTH_MIN_VALIDITY_MS: u64 = 5 * 60 * 1000;
+
 fn maybe_refresh_auth(
     storage: &mut AuthStorage,
     provider: &str,
@@ -4640,11 +4739,7 @@ fn maybe_refresh_auth(
     if cred.kind != CredentialKind::Oauth {
         return;
     }
-    let expired = cred
-        .expires
-        .map(|exp| exp <= now.saturating_add(min_expiry_ms))
-        .unwrap_or(false);
-    if !expired {
+    if !pi_ai::credential_expires_by(cred, now.saturating_add(min_expiry_ms)) {
         return;
     }
     if let Ok((access, refresh, expires)) = crate::js_host::run_js_oauth_refresh(
@@ -4690,6 +4785,18 @@ fn apply_js_oauth_api_key(
 }
 
 fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
+    login_provider_with_wait(provider, key, false).map(|_| ())
+}
+
+/// `Ok(true)` when a credential reached the store. A browser handshake that
+/// only printed its URL returns `Ok(false)`: the caller must not announce a
+/// sign-in that never happened, which is how `/login` used to report success
+/// and leave the next request with no credential at all.
+fn login_provider_with_wait(
+    provider: &str,
+    key: Option<&str>,
+    wait_for_oauth_callback: bool,
+) -> Result<bool, String> {
     let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
     if key.is_none() {
         if let Some((path, name)) = login_js_oauth_provider(provider) {
@@ -4699,7 +4806,7 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
                 .login_oauth(provider, access, refresh, expires)
                 .map_err(|err| err.to_string())?;
             println!("stored oauth token for {provider}");
-            return Ok(());
+            return Ok(true);
         }
     }
     if provider == llama::LLAMA_PROVIDER_ID {
@@ -4736,84 +4843,96 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
             )
             .map_err(|err| err.to_string())?;
         println!("stored llama.cpp server {url}");
-        return Ok(());
+        return Ok(true);
     }
     if let Some(key) = key {
         if looks_like_oauth_input(key) {
             let (code, _) = pi_ai::parse_authorization_input(key);
             let code = code.ok_or_else(|| "Missing authorization code.".to_string())?;
             let pkce = pi_ai::generate_pkce(uuid::Uuid::new_v4().as_bytes());
-            let (access, refresh) =
-                pi_ai::exchange_authorization_code(provider, &code, Some(&pkce))?;
-            storage
-                .login_oauth(provider, access, refresh, None)
-                .map_err(|err| err.to_string())?;
-            println!("stored oauth token for {provider}");
-            return Ok(());
+            let tokens = pi_ai::exchange_authorization_code(provider, &code, Some(&pkce))?;
+            return store_oauth_tokens(&mut storage, provider, tokens);
         }
         storage
             .login_api_key(provider, key)
             .map_err(|err| err.to_string())?;
         println!("stored api key for {provider}");
-        return Ok(());
+        return Ok(true);
     }
     if provider.is_empty() {
         println!("Usage: /login <provider> <api-key>");
-        return Ok(());
+        return Ok(false);
     }
-    let id = uuid::Uuid::new_v4();
-    let pkce = pi_ai::generate_pkce(id.as_bytes());
-    if let Some(request) = pi_ai::authorize_request(provider, &pkce, "pi") {
-        println!("{}", request.url);
-        println!("{}", request.instructions);
+    if let Some(request) = pi_ai::fresh_authorize_request(provider) {
         if let Ok(code) = std::env::var("PI_OAUTH_CODE") {
-            let (access, refresh) =
+            let tokens =
                 pi_ai::exchange_authorization_code(provider, &code, request.pkce.as_ref())?;
-            storage
-                .login_oauth(provider, access, refresh, None)
-                .map_err(|err| err.to_string())?;
-            println!("stored oauth token for {provider}");
-            return Ok(());
+            return store_oauth_tokens(&mut storage, provider, tokens);
         }
-        if std::env::var("PI_OAUTH_WAIT").is_ok() {
+        let should_wait = wait_for_oauth_callback || std::env::var("PI_OAUTH_WAIT").is_ok();
+        if should_wait {
             if let Some(kind) = pi_ai::CallbackProvider::parse(provider) {
                 let host = pi_ai::callback_host();
                 let port = std::env::var("PI_OAUTH_CALLBACK_PORT")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| kind.default_port());
                 let expected = request
                     .state
                     .clone()
-                    .unwrap_or_else(|| pkce.verifier.clone());
+                    .or_else(|| request.pkce.as_ref().map(|pkce| pkce.verifier.clone()))
+                    .unwrap_or_default();
                 let mut server = pi_ai::CallbackServer::bind(&host, port, kind, expected)?;
+                println!("{}", request.url);
+                println!("{}", request.instructions);
                 println!("Waiting for browser callback on {}", server.redirect_uri()?);
                 let response = server.accept_one()?;
                 if let Some(code) = response.code {
-                    let (access, refresh) =
+                    let tokens =
                         pi_ai::exchange_authorization_code(provider, &code, request.pkce.as_ref())?;
-                    storage
-                        .login_oauth(provider, access, refresh, None)
-                        .map_err(|err| err.to_string())?;
-                    println!("stored oauth token for {provider}");
-                    return Ok(());
+                    return store_oauth_tokens(&mut storage, provider, tokens);
                 }
+                return Err("OAuth callback did not include an authorization code.".into());
             }
         }
-        return Ok(());
+        println!("{}", request.url);
+        println!("{}", request.instructions);
+        return Ok(false);
     }
     if let (Ok(access), refresh) = (
         std::env::var("PI_OAUTH_ACCESS"),
         std::env::var("PI_OAUTH_REFRESH").ok(),
     ) {
-        storage
-            .login_oauth(provider, access, refresh, None)
-            .map_err(|err| err.to_string())?;
-        println!("stored oauth token for {provider}");
-        return Ok(());
+        return store_oauth_tokens(
+            &mut storage,
+            provider,
+            pi_ai::OauthTokens {
+                access,
+                refresh,
+                expires: None,
+            },
+        );
     }
     println!("Usage: /login <provider> <api-key>");
-    Ok(())
+    Ok(false)
+}
+
+/// Write an exchanged or refreshed OAuth credential. The expiry is what makes
+/// the login survive: with none recorded nothing ever renews the token, so a
+/// JWT access token's own `exp` stands in when the provider did not say.
+fn store_oauth_tokens(
+    storage: &mut AuthStorage,
+    provider: &str,
+    tokens: pi_ai::OauthTokens,
+) -> Result<bool, String> {
+    let expires = tokens
+        .expires
+        .or_else(|| pi_ai::jwt_expiry_ms(&tokens.access));
+    storage
+        .login_oauth(provider, tokens.access, tokens.refresh, expires)
+        .map_err(|err| err.to_string())?;
+    println!("stored oauth token for {provider}");
+    Ok(true)
 }
 
 /// Every provider (OAuth and API-key) completes after `/login `, not just the
@@ -8089,8 +8208,7 @@ fn start_login(
         }
         return Ok(());
     }
-    let pkce = pi_ai::generate_pkce(uuid::Uuid::new_v4().as_bytes());
-    if let Some(request) = pi_ai::authorize_request(provider, &pkce, "pi") {
+    if let Some(request) = pi_ai::fresh_authorize_request(provider) {
         if let Some(dialog) = &mut session.chrome.login_dialog {
             dialog.show_auth(&request.url, Some(request.instructions.as_str()));
             dialog.show_manual_input("Paste the redirect URL or authorization code");
@@ -8153,6 +8271,59 @@ fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn codex_fixture_login_persists_exact_provider_and_resolves_immediately() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("temp auth dir");
+        let _agent_dir = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _oauth_code = EnvRestore::set("PI_OAUTH_CODE", "pi-fixture-code");
+
+        assert_eq!(
+            login_provider_with_wait("openai-codex", None, false),
+            Ok(true)
+        );
+
+        let storage = AuthStorage::open(&dir.path().join("auth.json")).expect("persisted auth");
+        let credential = storage
+            .get("openai-codex")
+            .expect("credential stored under exact provider id");
+        assert_eq!(credential.kind, CredentialKind::Oauth);
+        assert!(storage.get("openai").is_none());
+
+        let resolved = pi_ai::resolve_provider_auth(
+            "openai-codex",
+            &storage,
+            &std::collections::HashMap::new(),
+            false,
+        )
+        .expect("stored codex credential resolves immediately");
+        assert_eq!(resolved.source, "OAuth");
+        assert!(resolved.api_key.is_some());
+    }
 
     #[test]
     fn rpc_prompt_auth_error_matches_ts_no_model_copy() {

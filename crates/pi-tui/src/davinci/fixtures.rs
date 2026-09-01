@@ -24,6 +24,7 @@ pub fn startup() -> Startup {
         language: "rust".into(),
         crates: "11 crates".into(),
         restored: true,
+        found: Vec::new(),
     }
 }
 
@@ -1657,6 +1658,15 @@ pub fn review() -> ReviewSheet {
     }
 }
 
+/// A turn twelve seconds in, for the screens that show one running.
+fn working() -> crate::davinci::model::Working {
+    crate::davinci::model::Working {
+        seconds: 12,
+        tokens: 423,
+        thinking: Some("high".into()),
+    }
+}
+
 pub fn dress(model: &mut Model) {
     model.cwd = "C:\\dev\\oss\\davinci-rust".into();
     model.branch = "main".into();
@@ -1720,7 +1730,10 @@ pub fn dress_screen(model: &mut Model, id: &str) {
             model.changes = (0, 0, 0);
             model.context = (0, 200_000);
         }
-        "1b" => model.composer = "now fix the store.rs type error".into(),
+        "1b" => {
+            model.composer = "now fix the store.rs type error".into();
+            model.working = Some(working());
+        }
         "1d" => {
             model.toggle_overlay(Overlay::Instrumenta);
             model.query = "git".into();
@@ -1747,6 +1760,9 @@ pub fn dress_screen(model: &mut Model, id: &str) {
         }
         "1g" | "1h" => {
             model.transcript = narrow_transcript();
+            if id == "1g" {
+                model.working = Some(working());
+            }
             if id == "1h" {
                 model.transcript.push(Entry::Gap);
                 model.transcript.push(Entry::Delta {

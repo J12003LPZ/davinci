@@ -449,7 +449,10 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
                         Flow::Submit(text) => on_submit(model, text),
                         // The fixture runner has no agent to act on a
                         // choice; the live shell in `davinci_session` does.
-                        Flow::Choose(_) | Flow::Continue | Flow::Interrupt => {}
+                        Flow::Choose(_)
+                        | Flow::Continue
+                        | Flow::Interrupt
+                        | Flow::CycleThinking => {}
                     }
                 }
                 Event::Resize(width, height) => {

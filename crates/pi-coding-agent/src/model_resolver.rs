@@ -12,7 +12,7 @@ pub const DEFAULT_MODEL_PER_PROVIDER: &[(&str, &str)] = &[
     ("anthropic", "claude-opus-4-8"),
     ("openai", "gpt-5.5"),
     ("azure-openai-responses", "gpt-5.4"),
-    ("openai-codex", "gpt-5.5"),
+    ("openai-codex", "gpt-5.6-luna"),
     ("radius", "auto"),
     ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
     ("deepseek", "deepseek-v4-pro"),

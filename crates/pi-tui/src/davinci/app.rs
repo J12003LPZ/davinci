@@ -17,7 +17,7 @@ use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::{
     ask, codex, cogitator, compact, diff, disegno, export, governor, grafo, graph_run, instrumenta,
-    keys, login, memoria, mensura, officina, recovery, resume, securitas, settings, startup,
+    keys, login, memoria, mensura, officina, opera, recovery, resume, securitas, settings, startup,
     transcript, tree, trust, vectors,
 };
 
@@ -30,6 +30,8 @@ pub enum Flow {
     Quit,
     /// The user asked to interrupt the run in progress.
     Interrupt,
+    /// Cycle the active model's thinking/reasoning level.
+    CycleThinking,
     /// The composer was sent; the caller owns what happens next.
     Submit(String),
     /// A row of the open instrument was chosen; the caller owns the action.
@@ -55,10 +57,19 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     let bottom = extension_rows(model, &model.extensions.footer);
     let above = extension_rows(model, &model.extensions.above());
     let below = extension_rows(model, &model.extensions.below());
+    // The working line is a block of its own, so it never runs into the last
+    // transcript row (design.md §3). It is pinned here rather than pushed into
+    // the transcript so what a running turn has cost stays put while the
+    // transcript scrolls under it.
+    let mut working = opera::lines(chrome_model);
+    if !working.is_empty() {
+        working.insert(0, blank());
+    }
     let reserved = 1
         + top.len()
         + bottom.len()
         + above.len()
+        + working.len()
         + offered.len()
         + composer_rows.len()
         + below.len()
@@ -71,6 +82,7 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     rows.extend(body(model, body_height));
     rows.extend(bottom);
     rows.extend(above);
+    rows.extend(working);
     rows.extend(offered);
     rows.extend(composer_rows);
     rows.extend(below);
@@ -284,6 +296,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         if apply_editor_key(model.composer.editor_mut(), &model.keybindings, data) {
             // Deleting a word or moving the caret changes what is on offer.
             model.refresh_suggestions();
+            // Arrows, word motions and history recall all land the caret
+            // somewhere new: it stays solid rather than blinking mid-move.
+            model.mark_caret_moved();
             return Flow::Continue;
         }
         if model.keybindings.matches(data, "davinci.composer.newLine") {
@@ -357,6 +372,9 @@ fn action_matches(model: &Model, data: Option<&str>, action: &str) -> bool {
 }
 
 fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
+    if model.keybindings.matches(data, "app.thinking.cycle") {
+        return Some(Flow::CycleThinking);
+    }
     if model.keybindings.matches(data, "davinci.quit") {
         return Some(Flow::Quit);
     }
@@ -788,6 +806,16 @@ mod tests {
             assert_eq!(handle_key(&mut m, key(KeyCode::Enter)), Flow::Continue);
             assert_eq!(m.composer, "draft", "{screen:?} submitted the composer");
         }
+    }
+
+    #[test]
+    fn shift_tab_requests_thinking_cycle_when_composer_owns_input() {
+        let mut m = model(120, 30);
+
+        assert_eq!(
+            handle_key(&mut m, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),),
+            Flow::CycleThinking,
+        );
     }
 
     #[test]

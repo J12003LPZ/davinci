@@ -11,6 +11,8 @@ use crate::thinking::{
 };
 use crate::{ChatMessage, MessageContent, ToolSpec};
 use pi_protocol::{ThinkingLevel, Usage};
+use std::sync::mpsc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
@@ -25,6 +27,9 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     pub cache_retention: Option<String>,
     pub install_telemetry: Option<bool>,
+    /// Set from another thread to stop a live stream between frames. The
+    /// message then closes with `StopReason::Aborted`.
+    pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,72 +189,209 @@ pub fn parse_sse_block(block: &str) -> Option<Value> {
     serde_json::from_str(&data).ok()
 }
 
+/// Replay a recorded SSE corpus through the decoder its frames call for.
+/// Fixtures replay any provider's stream through any model, so the frames
+/// are sniffed before the model's API is consulted.
 pub fn replay_sse_events(model: &Model, corpus: &str) -> Vec<AssistantMessageEvent> {
-    let mut message = AssistantMessage {
-        id: Uuid::new_v4().to_string(),
-        role: "assistant".into(),
-        content: Vec::new(),
-        model: format!("{}/{}", model.provider, model.id),
-        usage: None,
-        stop_reason: None,
-        error_message: None,
-    };
-    let mut events = vec![AssistantMessageEvent::Start {
-        partial: message.clone(),
-    }];
-    let mut text = String::new();
-    let mut started_text = false;
-    for block in corpus.split("\n\n") {
-        let Some(value) = parse_sse_block(block) else {
-            continue;
-        };
-        if let Some(event_type) = value.get("type").and_then(Value::as_str) {
-            if crate::codex::map_codex_event_type(event_type).is_some() {
-                return crate::codex::replay_codex_events(model, corpus);
-            }
+    let frames = crate::stream_decoder::frames_of(corpus);
+    let mut decoder = decoder_for_frames(model, &frames);
+    let mut events = Vec::new();
+    for frame in &frames {
+        decoder.feed(&frame.data, &mut events);
+    }
+    decoder.finish(&mut events);
+    events
+}
+
+fn decoder_for_frames(
+    model: &Model,
+    frames: &[crate::stream_decoder::SseFrame],
+) -> Box<dyn crate::stream_decoder::StreamDecoder> {
+    use crate::stream_decoder::ResponsesDecoder;
+    use crate::stream_decoder_anthropic::AnthropicDecoder;
+    use crate::stream_decoder_completions::CompletionsDecoder;
+    for frame in frames {
+        let kind = frame.data.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind.starts_with("response.") {
+            return Box::new(ResponsesDecoder::new(model));
         }
-        if let Some(delta) = value
-            .pointer("/choices/0/delta/content")
-            .and_then(Value::as_str)
-        {
-            if !started_text {
-                events.push(AssistantMessageEvent::TextStart {
-                    content_index: 0,
-                    partial: message.clone(),
-                });
-                started_text = true;
-            }
-            text.push_str(delta);
-            if let Some(ContentBlock::Text { text: existing }) = message.content.get_mut(0) {
-                existing.push_str(delta);
-            } else {
-                message.content.push(ContentBlock::Text {
-                    text: delta.to_string(),
-                });
-            }
-            events.push(AssistantMessageEvent::TextDelta {
-                content_index: 0,
-                delta: delta.to_string(),
-                partial: message.clone(),
-            });
+        if matches!(
+            kind,
+            "message_start"
+                | "content_block_start"
+                | "content_block_delta"
+                | "content_block_stop"
+                | "message_delta"
+                | "message_stop"
+        ) {
+            return Box::new(AnthropicDecoder::new(model));
         }
-        if let Some(usage) = value.get("usage") {
-            message.usage = Some(usage_from_value(model, usage));
+        if frame.data.get("choices").is_some() {
+            return Box::new(CompletionsDecoder::new(model));
         }
     }
-    if started_text {
-        events.push(AssistantMessageEvent::TextEnd {
-            content_index: 0,
-            content: text,
-            partial: message.clone(),
+    crate::stream_decoder::decoder_for(model)
+        .unwrap_or_else(|| Box::new(CompletionsDecoder::new(model)))
+}
+
+/// Read a provider's event stream as it arrives. Every frame goes through
+/// `decoder` and every event it yields reaches `on_event` before the next
+/// frame is read, so a token is painted the moment it lands. A body that
+/// turns out not to be an event stream (a provider that ignored `stream`, an
+/// error document) is parsed whole instead.
+fn read_provider_stream(
+    response: ureq::Response,
+    model: &Model,
+    decoder: &mut dyn crate::stream_decoder::StreamDecoder,
+    abort: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<(AssistantMessage, Vec<AssistantMessageEvent>), String> {
+    use std::sync::atomic::Ordering;
+
+    // The body is read on its own thread and handed over line by line, so the
+    // abort flag is checked every few milliseconds even while the provider is
+    // silent — a stalled request answers `esc` at once instead of at its next
+    // token. When the receiver goes away the reader ends at its next line and
+    // the connection closes with it.
+    let (line_tx, line_rx) = mpsc::channel::<std::io::Result<String>>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(response.into_reader());
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if line_tx.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = line_tx.send(Err(err));
+                    break;
+                }
+            }
+        }
+    });
+    let mut framer = crate::stream_decoder::SseFramer::default();
+    let mut events = Vec::new();
+    let mut raw = String::new();
+    let mut frames = 0usize;
+    let mut aborted = false;
+    let mut read_error: Option<String> = None;
+
+    let feed = |data: &Value,
+                decoder: &mut dyn crate::stream_decoder::StreamDecoder,
+                events: &mut Vec<AssistantMessageEvent>,
+                on_event: &mut dyn FnMut(&AssistantMessageEvent)| {
+        let start = events.len();
+        decoder.feed(data, events);
+        for event in &events[start..] {
+            on_event(event);
+        }
+    };
+
+    loop {
+        if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            aborted = true;
+            break;
+        }
+        let line = match line_rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(Ok(line)) => line,
+            Ok(Err(err)) => {
+                crate::trace::log(&format!("sse read error after {frames} frames: {err}"));
+                read_error = Some(format!("Unable to read provider response: {err}"));
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if frames == 0 {
+            raw.push_str(&line);
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if let Some(frame) = framer.feed_line(trimmed) {
+            frames += 1;
+            raw.clear();
+            if crate::trace::enabled() {
+                crate::trace::log(&format!(
+                    "sse frame {}",
+                    crate::trace::describe_event(&frame.data)
+                ));
+            }
+            feed(&frame.data, decoder, &mut events, on_event);
+            if decoder.is_done() {
+                break;
+            }
+        }
+        if framer.saw_done() {
+            break;
+        }
+    }
+    // A connection torn down after the stream's own end (`[DONE]`, the
+    // terminal event) is how some servers hang up; it is not a failure of
+    // the reply. A drop before that point is reported below.
+    if read_error.is_some() && frames > 0 && (framer.saw_done() || decoder.is_done()) {
+        read_error = None;
+    }
+    if !aborted && !decoder.is_done() {
+        if let Some(frame) = framer.flush() {
+            frames += 1;
+            raw.clear();
+            feed(&frame.data, decoder, &mut events, on_event);
+        }
+    }
+
+    if frames == 0 && !aborted {
+        if let Some(err) = read_error {
+            return Err(err);
+        }
+        if crate::trace::enabled() {
+            crate::trace::log(&format!(
+                "body was not an event stream ({} bytes): {}",
+                raw.len(),
+                raw.chars().take(300).collect::<String>()
+            ));
+        }
+        let message = parse_provider_response(model, &raw);
+        let synthesized = events_from_complete(&message);
+        for event in &synthesized {
+            on_event(event);
+        }
+        return Ok((message, synthesized));
+    }
+
+    if aborted {
+        let mut closing = Vec::new();
+        let mut message = decoder.finish(&mut closing);
+        message.stop_reason = Some(StopReason::Aborted);
+        message.error_message = Some("Request was aborted".into());
+        let event = AssistantMessageEvent::Error {
+            reason: StopReason::Aborted,
+            error: message.clone(),
+        };
+        on_event(&event);
+        events.push(event);
+        return Ok((message, events));
+    }
+
+    let start = events.len();
+    let mut message = decoder.finish(&mut events);
+    if let Some(err) = read_error.filter(|_| message.stop_reason != Some(StopReason::Error)) {
+        // The connection dropped after the stream began: keep what arrived,
+        // say why it stopped.
+        message.stop_reason = Some(StopReason::Error);
+        message.error_message = Some(err);
+        events.truncate(start);
+        events.push(AssistantMessageEvent::Error {
+            reason: StopReason::Error,
+            error: message.clone(),
         });
     }
-    message.stop_reason = Some(StopReason::Stop);
-    events.push(AssistantMessageEvent::Done {
-        reason: StopReason::Stop,
-        message,
-    });
-    events
+    for event in &events[start..] {
+        on_event(event);
+    }
+    Ok((message, events))
 }
 
 pub fn complete_from_events(events: &[AssistantMessageEvent]) -> Option<AssistantMessage> {
@@ -323,7 +465,7 @@ pub fn live_complete_with(
     let body = request_body_with(model, messages, system, tools, options);
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
-            match crate::codex::try_codex_websocket_transport(
+            match crate::codex::try_codex_websocket_transport_with(
                 model,
                 &body,
                 token,
@@ -332,6 +474,8 @@ pub fn live_complete_with(
                 options.cache_retention.as_deref(),
                 options.websocket_connect_timeout_ms,
                 options.timeout_ms,
+                options.abort_signal.as_ref(),
+                &mut |_| {},
             ) {
                 Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => return Ok(*message),
                 Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {}
@@ -359,7 +503,9 @@ pub fn live_complete_with(
     Ok(parse_provider_response(model, &text))
 }
 
-/// Streaming complete: prefer live SSE events over synthesizing `events_from_complete`.
+/// Streaming complete: the events the provider sent, replayed after the fact.
+/// `live_complete_streaming_with_sink` is the same request with a sink that
+/// sees each event as it arrives.
 pub fn live_complete_streaming_with(
     model: &Model,
     messages: &[ChatMessage],
@@ -368,13 +514,52 @@ pub fn live_complete_streaming_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<(AssistantMessage, Vec<AssistantMessageEvent>), String> {
+    live_complete_streaming_with_sink(model, messages, auth, system, tools, options, &mut |_| {})
+}
+
+/// Streaming complete with a live sink: `on_event` is called for every stream
+/// event the moment it is decoded, before the next frame is read. APIs with an
+/// incremental decoder are asked for `stream: true`; the rest are requested
+/// whole and their events synthesised, so tool calls work everywhere and
+/// tokens arrive live wherever the wire format is understood.
+pub fn live_complete_streaming_with_sink(
+    model: &Model,
+    messages: &[ChatMessage],
+    auth: &ResolvedAuth,
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<(AssistantMessage, Vec<AssistantMessageEvent>), String> {
+    let incremental = crate::stream_decoder::supports_incremental_stream(model);
     let mut body = request_body_with(model, messages, system, tools, options);
-    if let Value::Object(map) = &mut body {
-        map.insert("stream".into(), Value::Bool(true));
+    if crate::trace::enabled() {
+        crate::trace::log(&format!(
+            "request {}/{} api={} incremental={} messages={} tools={}",
+            model.provider,
+            model.id,
+            model.api,
+            incremental,
+            messages.len(),
+            tools.len()
+        ));
+    }
+    if incremental {
+        if let Value::Object(map) = &mut body {
+            map.insert("stream".into(), Value::Bool(true));
+            // TS asks completions endpoints for a trailing usage chunk.
+            if model.api == "openai-completions" && !map.contains_key("stream_options") {
+                map.insert(
+                    "stream_options".into(),
+                    serde_json::json!({"include_usage": true}),
+                );
+            }
+        }
     }
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
-            match crate::codex::try_codex_websocket_transport(
+            let mut collected = Vec::new();
+            let outcome = crate::codex::try_codex_websocket_transport_with(
                 model,
                 &body,
                 token,
@@ -383,13 +568,40 @@ pub fn live_complete_streaming_with(
                 options.cache_retention.as_deref(),
                 options.websocket_connect_timeout_ms,
                 options.timeout_ms,
-            ) {
+                options.abort_signal.as_ref(),
+                &mut |event| {
+                    collected.push(event.clone());
+                    on_event(event);
+                },
+            );
+            match outcome {
                 Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => {
-                    let events = events_from_complete(&message);
+                    if crate::trace::enabled() {
+                        crate::trace::log(&format!(
+                            "websocket reply stop={:?} blocks={} error={:?}",
+                            message.stop_reason,
+                            message.content.len(),
+                            message.error_message
+                        ));
+                    }
+                    let events = if collected.is_empty() {
+                        let synthesized = events_from_complete(&message);
+                        for event in &synthesized {
+                            on_event(event);
+                        }
+                        synthesized
+                    } else {
+                        collected
+                    };
                     return Ok((*message, events));
                 }
-                Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {}
-                Err(error) => return Err(error),
+                Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {
+                    crate::trace::log("websocket fell back to sse");
+                }
+                Err(error) => {
+                    crate::trace::log(&format!("websocket failed: {error}"));
+                    return Err(error);
+                }
             }
         }
     }
@@ -402,24 +614,47 @@ pub fn live_complete_streaming_with(
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
-    let text = crate::provider_retry::retry_provider_request(
-        || send_provider_body(&url, &headers, &body, timeout_ms, compress_zstd),
+    crate::trace::log(&format!("sse post {url}"));
+    let response = crate::provider_retry::retry_provider_request(
+        || send_provider_request(&url, &headers, &body, timeout_ms, compress_zstd),
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
         },
     )
-    .map_err(|err| err.message)?;
-    if text.contains("data:") {
-        let events = replay_sse_events(model, &text);
-        let message = complete_from_events(&events)
-            .or_else(|| events.last().map(|event| event.message().clone()))
-            .ok_or_else(|| "Empty provider stream".to_string())?;
-        Ok((message, events))
-    } else {
-        let message = parse_provider_response(model, &text);
-        let events = events_from_complete(&message);
-        Ok((message, events))
+    .map_err(|err| {
+        crate::trace::log(&format!("sse request failed: {}", err.message));
+        err.message
+    })?;
+    crate::trace::log(&format!("sse status {}", response.status()));
+    match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
+        Some(mut decoder) => read_provider_stream(
+            response,
+            model,
+            decoder.as_mut(),
+            options.abort_signal.as_ref(),
+            on_event,
+        ),
+        None => {
+            let text = response
+                .into_string()
+                .map_err(|err| format!("Unable to read provider response: {err}"))?;
+            let (message, events) = if text.contains("data:") {
+                let events = replay_sse_events(model, &text);
+                let message = complete_from_events(&events)
+                    .or_else(|| events.last().map(|event| event.message().clone()))
+                    .ok_or_else(|| "Empty provider stream".to_string())?;
+                (message, events)
+            } else {
+                let message = parse_provider_response(model, &text);
+                let events = events_from_complete(&message);
+                (message, events)
+            };
+            for event in &events {
+                on_event(event);
+            }
+            Ok((message, events))
+        }
     }
 }
 
@@ -537,13 +772,16 @@ fn collect_request_headers(
     headers
 }
 
-fn send_provider_body(
+/// Send the request and hand back the response with its body unread, so the
+/// caller can stream it. HTTP failures are already `ProviderError`s here,
+/// which is what the retry loop inspects.
+fn send_provider_request(
     url: &str,
     headers: &[(String, String)],
     body: &Value,
     timeout_ms: Option<u64>,
     compress_zstd: bool,
-) -> Result<String, crate::provider_retry::ProviderError> {
+) -> Result<ureq::Response, crate::provider_retry::ProviderError> {
     let mut request = ureq::post(url);
     if let Some(timeout_ms) = timeout_ms {
         request = request.timeout(std::time::Duration::from_millis(timeout_ms));
@@ -551,19 +789,29 @@ fn send_provider_body(
     for (key, value) in headers {
         request = request.set(key, value);
     }
-    let response = if compress_zstd {
+    if compress_zstd {
         let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
             request = request.set("content-encoding", "zstd");
         }
         request
             .send_bytes(&bytes)
-            .map_err(crate::provider_retry::provider_error_from_ureq)?
+            .map_err(crate::provider_retry::provider_error_from_ureq)
     } else {
         request
             .send_string(&body.to_string())
-            .map_err(crate::provider_retry::provider_error_from_ureq)?
-    };
+            .map_err(crate::provider_retry::provider_error_from_ureq)
+    }
+}
+
+fn send_provider_body(
+    url: &str,
+    headers: &[(String, String)],
+    body: &Value,
+    timeout_ms: Option<u64>,
+    compress_zstd: bool,
+) -> Result<String, crate::provider_retry::ProviderError> {
+    let response = send_provider_request(url, headers, body, timeout_ms, compress_zstd)?;
     response.into_string().map_err(|err| {
         crate::provider_retry::ProviderError::new(
             None,
@@ -628,20 +876,23 @@ pub fn request_body_with(
 /// `openai-codex-responses.ts` `buildRequestBody`). Chat-completions bodies
 /// are rejected here; ChatGPT Codex additionally rejects a missing or true
 /// `store` field ("Store must be set to false").
-fn openai_responses_body(
-    model: &Model,
-    messages: &[ChatMessage],
-    system: Option<&str>,
-    tools: &[ToolSpec],
-    options: &StreamOptions,
-) -> Value {
-    let codex = model.api == "openai-codex-responses";
+/// The `call_id` half of a tool call id. The Responses decoders persist
+/// `call_id|item_id` (TS does the same), and a replayed `function_call` or
+/// `function_call_output` carries only the `call_id`: the item id pairs the
+/// call with a reasoning item that is never replayed here (no signature is
+/// stored), and OpenAI rejects an unpaired `fc_…` id — as it rejects the
+/// joined form, which is longer than the 64 characters a `call_id` may be.
+pub(crate) fn responses_call_id(id: &str) -> &str {
+    id.split_once('|').map(|(call_id, _)| call_id).unwrap_or(id)
+}
+
+pub(crate) fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     let mut input = Vec::new();
     for message in messages {
         if message.role == "toolResult" {
             input.push(serde_json::json!({
                 "type": "function_call_output",
-                "call_id": message.tool_call_id.clone().unwrap_or_default(),
+                "call_id": responses_call_id(message.tool_call_id.as_deref().unwrap_or_default()),
                 "output": content_text(&message.content),
             }));
             continue;
@@ -663,7 +914,7 @@ fn openai_responses_body(
                 {
                     input.push(serde_json::json!({
                         "type": "function_call",
-                        "call_id": id,
+                        "call_id": responses_call_id(id),
                         "name": name,
                         "arguments": arguments.to_string(),
                     }));
@@ -680,6 +931,18 @@ fn openai_responses_body(
             "content": [{"type": "input_text", "text": text}],
         }));
     }
+    input
+}
+
+fn openai_responses_body(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+) -> Value {
+    let codex = model.api == "openai-codex-responses";
+    let input = openai_responses_input(messages);
     let instructions = system
         .filter(|value| !value.is_empty())
         .unwrap_or("You are a helpful assistant.");
@@ -1429,7 +1692,7 @@ fn google_body(
 /// - openai-completions.ts:1509-1531 (subtract cached + written from prompt)
 /// - openai-responses-shared.ts:561-570 (subtract details from input_tokens)
 /// - bedrock-converse-stream.ts:693 (camelCase converse keys)
-fn usage_from_value(model: &Model, usage: &Value) -> Usage {
+pub(crate) fn usage_from_value(model: &Model, usage: &Value) -> Usage {
     let get = |key: &str| usage.get(key).and_then(Value::as_u64);
     let base_input = get("prompt_tokens")
         .or_else(|| get("input_tokens"))
@@ -1652,6 +1915,190 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
 mod tests {
     use super::*;
     use crate::catalog::load_builtin_models;
+
+    /// A loopback HTTP server that answers one POST with an SSE body in two
+    /// halves, the second only once `release` fires (or after `patience`).
+    /// Returns whether the release arrived in time.
+    fn sse_server(
+        first: &'static str,
+        second: &'static str,
+        patience: Duration,
+    ) -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<bool>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(request.starts_with("POST "), "{request}");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.write_all(first.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let released = release_rx.recv_timeout(patience).is_ok();
+            stream.write_all(second.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            released
+        });
+        (format!("http://{addr}"), release_tx, server)
+    }
+
+    fn loopback_model(base_url: &str) -> Model {
+        Model {
+            id: "loop-1".into(),
+            name: "loop-1".into(),
+            api: "openai-completions".into(),
+            provider: "loopback".into(),
+            base_url: Some(base_url.to_string()),
+            reasoning: false,
+            input: vec!["text".into()],
+            cost: crate::catalog::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 8_000,
+            max_tokens: 1_000,
+            compat: Value::Null,
+            headers: Default::default(),
+            thinking_level_map: Default::default(),
+        }
+    }
+
+    fn loopback_auth() -> ResolvedAuth {
+        ResolvedAuth {
+            api_key: Some("test-key".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        }
+    }
+
+    #[test]
+    fn a_live_stream_delivers_each_frame_before_the_next_is_sent() {
+        let (base, release, server) = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            Duration::from_secs(5),
+        );
+        let model = loopback_model(&base);
+        let mut seen = Vec::new();
+        let (message, events) = live_complete_streaming_with_sink(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &loopback_auth(),
+            None,
+            &[],
+            &StreamOptions::default(),
+            &mut |event| {
+                if let AssistantMessageEvent::TextDelta { delta, .. } = event {
+                    seen.push(delta.clone());
+                    // The first token has arrived: only now may the server
+                    // send the rest. A client that buffered the whole body
+                    // would never get here in time.
+                    let _ = release.send(());
+                }
+            },
+        )
+        .expect("stream");
+        assert!(
+            server.join().unwrap(),
+            "first delta must arrive before the second frame is sent"
+        );
+        assert_eq!(seen, ["Hel", "lo"]);
+        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "Hello"));
+        assert_eq!(message.stop_reason, Some(StopReason::Stop));
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Done { .. })
+        ));
+    }
+
+    #[test]
+    fn an_abort_flag_stops_a_stalled_stream_at_once() {
+        let (base, _release, server) = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            Duration::from_secs(4),
+        );
+        let model = loopback_model(&base);
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = abort.clone();
+        let started = std::time::Instant::now();
+        let (message, events) = live_complete_streaming_with_sink(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &loopback_auth(),
+            None,
+            &[],
+            &StreamOptions {
+                abort_signal: Some(abort),
+                ..StreamOptions::default()
+            },
+            &mut |event| {
+                if matches!(event, AssistantMessageEvent::TextDelta { .. }) {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .expect("stream");
+        // The server sits on the second frame for four seconds; the abort
+        // must not wait for it.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "abort waited for the server"
+        );
+        assert_eq!(message.stop_reason, Some(StopReason::Aborted));
+        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "Hel"));
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Error {
+                reason: StopReason::Aborted,
+                ..
+            })
+        ));
+        let _ = server.join();
+    }
+
+    #[test]
+    fn replayed_tool_calls_carry_only_the_call_id_half() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![MessageContent::ToolCall {
+                    id: "call_abc|fc_0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "a"}),
+                }],
+                ..ChatMessage::default()
+            },
+            ChatMessage::tool_result(
+                "call_abc|fc_0123456789abcdef0123456789abcdef0123456789abcdef",
+                "read",
+                "hello",
+                false,
+            ),
+        ];
+        let input = openai_responses_input(&messages);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_abc");
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_abc");
+        // A plain id, from a provider that never joined one, passes through.
+        assert_eq!(responses_call_id("call_plain"), "call_plain");
+    }
 
     #[test]
     fn sse_lifecycle_matches_ts_event_names() {

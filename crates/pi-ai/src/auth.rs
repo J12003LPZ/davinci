@@ -61,6 +61,17 @@ impl Drop for Credential {
     }
 }
 
+/// Whether an OAuth credential is dead by `deadline` (epoch ms). The stored
+/// `expires` is authoritative; credentials written before it was recorded fall
+/// back to the access token's own `exp` claim, and one that says nothing at all
+/// is treated as still good rather than refreshed on every request.
+pub fn credential_expires_by(cred: &Credential, deadline: u64) -> bool {
+    cred.expires
+        .or_else(|| cred.access.as_deref().and_then(crate::codex::jwt_expiry_ms))
+        .map(|expires| expires <= deadline)
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedAuth {
     pub api_key: Option<String>,
@@ -187,11 +198,7 @@ impl AuthStorage {
         if cred.kind != CredentialKind::Oauth {
             return Ok(false);
         }
-        let expired = cred
-            .expires
-            .map(|exp| exp <= now_ms.saturating_add(min_expiry_ms))
-            .unwrap_or(false);
-        if !expired {
+        if !credential_expires_by(&cred, now_ms.saturating_add(min_expiry_ms)) {
             return Ok(false);
         }
         let refresh = cred.refresh.clone().unwrap_or_default();
@@ -246,7 +253,19 @@ impl AuthStorage {
                 .login_oauth(provider, access, next_refresh, expires)
                 .map(|_| true);
         }
-        Ok(false)
+        // The provider's own refresh grant. Without this a stored OAuth login
+        // was good until its token died and then needed a fresh `/login`,
+        // which is what "no credential" looked like from the outside.
+        if refresh.is_empty() {
+            return Ok(false);
+        }
+        let tokens = crate::oauth_providers::refresh_oauth_token(provider, &refresh)
+            .map_err(AuthStorageError::Read)?;
+        let expires = tokens
+            .expires
+            .or_else(|| crate::codex::jwt_expiry_ms(&tokens.access));
+        self.login_oauth(provider, tokens.access, tokens.refresh, expires)
+            .map(|_| true)
     }
 
     fn persist(&self) -> Result<(), AuthStorageError> {
@@ -717,6 +736,92 @@ mod tests {
         assert_eq!(cred.access.as_deref(), Some("pi-fixture-refresh-access"));
         assert!(cred.expires.unwrap() > 10_000);
         assert!(!storage.maybe_refresh("anthropic", 10_000, 0, true).unwrap());
+    }
+
+    /// A JWT with the given `exp` (seconds) and nothing else that matters.
+    fn jwt_expiring_at(exp_seconds: u64) -> String {
+        use base64::Engine;
+        let encode = |raw: &str| {
+            base64::engine::general_purpose::STANDARD
+                .encode(raw)
+                .trim_end_matches('=')
+                .replace('+', "-")
+                .replace('/', "_")
+        };
+        format!(
+            "{}.{}.{}",
+            encode(r#"{"alg":"none"}"#),
+            encode(&format!(r#"{{"exp":{exp_seconds}}}"#)),
+            "sig"
+        )
+    }
+
+    #[test]
+    fn oauth_expiry_falls_back_to_the_access_token_claim() {
+        let live = Credential {
+            kind: CredentialKind::Oauth,
+            key: None,
+            access: Some(jwt_expiring_at(2_000)),
+            refresh: None,
+            expires: None,
+            env: HashMap::new(),
+            available_model_ids: Vec::new(),
+        };
+        assert!(credential_expires_by(&live, 2_000_000));
+        assert!(!credential_expires_by(&live, 1_999_000));
+
+        // A credential that says nothing about expiry is left alone rather
+        // than renewed on every single request.
+        let mut opaque = live.clone();
+        opaque.access = Some("not-a-jwt".into());
+        assert!(!credential_expires_by(&opaque, u64::MAX));
+    }
+
+    #[test]
+    fn a_credential_stored_without_an_expiry_still_refreshes() {
+        // Exactly the shape `/login` used to write: access and refresh, no
+        // expiry. The token's own `exp` says it is dead, so the refresh runs
+        // instead of the request failing with a token nothing renewed.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut storage = AuthStorage::open(&path).unwrap();
+        storage
+            .login_oauth(
+                "openai-codex",
+                jwt_expiring_at(1_000),
+                Some("pi-fixture-refresh".into()),
+                None,
+            )
+            .unwrap();
+        assert!(storage
+            .maybe_refresh("openai-codex", 2_000_000, 0, false)
+            .unwrap());
+        let cred = storage.get("openai-codex").unwrap();
+        assert_eq!(cred.access.as_deref(), Some("pi-fixture-refresh-access"));
+        assert!(cred.expires.unwrap() > 2_000_000);
+        assert_eq!(cred.refresh.as_deref(), Some("pi-fixture-refresh"));
+    }
+
+    #[test]
+    fn a_token_with_room_left_is_not_refreshed_until_the_margin() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut storage = AuthStorage::open(&path).unwrap();
+        storage
+            .login_oauth(
+                "openai-codex",
+                "access",
+                Some("pi-fixture-refresh".into()),
+                Some(1_000_000),
+            )
+            .unwrap();
+        assert!(!storage
+            .maybe_refresh("openai-codex", 500_000, 60_000, false)
+            .unwrap());
+        // Within the five-minute window the TS resolver uses, it renews early.
+        assert!(storage
+            .maybe_refresh("openai-codex", 700_000, 300_000, false)
+            .unwrap());
     }
 
     #[test]

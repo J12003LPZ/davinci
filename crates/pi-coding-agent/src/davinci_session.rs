@@ -14,7 +14,7 @@ use pi_tui::davinci::model::{
     Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
     HunkKind, KeymapGroup, Model, ModelItem, Overlay, PickerItem, ProjectTrustSheet, ProviderRow,
     ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step,
-    ThinkingRow, Tone, TreeNode, TrustFile, VectorIndex, WorkshopSheet,
+    ThinkingRow, Tone, TreeNode, TrustFile, VectorIndex, Working, WorkshopSheet,
 };
 use pi_tui::davinci::theme::State;
 
@@ -198,6 +198,19 @@ struct Turn {
     /// What each finished call came to, in order — the recovery sheet (`6c`)
     /// replays it when the turn is interrupted.
     log: Vec<(State, String, String)>,
+    /// Output tokens from the assistant messages that have already finished.
+    /// The message still streaming is added on top, so the working line's
+    /// counter climbs across a whole tool-calling run rather than resetting at
+    /// every step.
+    streamed: u64,
+    /// The prose entry the current message is streaming into, so each text
+    /// delta lands in the block it belongs to.
+    prose: Option<usize>,
+    /// The live reasoning entry of the current message, and when it began.
+    thinking: Option<usize>,
+    thinking_started: Option<Instant>,
+    /// `hideThinkingBlock`: reasoning is neither shown live nor kept.
+    hide_thinking: bool,
 }
 
 impl Turn {
@@ -283,6 +296,124 @@ impl Turn {
                 *studio += by;
             }
         }
+        if let Some(prose) = self.prose.as_mut() {
+            if *prose > after {
+                *prose += by;
+            }
+        }
+        if let Some(thinking) = self.thinking.as_mut() {
+            if *thinking > after {
+                *thinking += by;
+            }
+        }
+    }
+
+    /// A new assistant message begins: whatever the last one streamed into
+    /// is closed, and the next delta opens a block of its own.
+    fn begin_message(&mut self, model: &mut Model) {
+        self.settle_thinking(model);
+        self.prose = None;
+        self.thinking = None;
+        self.thinking_started = None;
+    }
+
+    fn append_text(&mut self, model: &mut Model, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.settle_thinking(model);
+        let index = match self.prose {
+            Some(index) if matches!(model.transcript.get(index), Some(Entry::Prose(_))) => index,
+            _ => {
+                model.transcript.push(Entry::Gap);
+                model.transcript.push(Entry::Prose(String::new()));
+                let index = model.transcript.len() - 1;
+                self.prose = Some(index);
+                index
+            }
+        };
+        if let Some(Entry::Prose(text)) = model.transcript.get_mut(index) {
+            // The first delta of a block often opens with the newline that
+            // separated it from a tool call; the block is already its own
+            // paragraph.
+            if text.is_empty() {
+                text.push_str(delta.trim_start());
+            } else {
+                text.push_str(delta);
+            }
+            if !text.trim().is_empty() {
+                self.said_something = true;
+            }
+        }
+    }
+
+    /// The final text of the block being streamed, or a whole block at once
+    /// for a message that was never streamed.
+    fn set_text(&mut self, model: &mut Model, text: &str) {
+        let text = text.trim();
+        match self.prose {
+            Some(index) if matches!(model.transcript.get(index), Some(Entry::Prose(_))) => {
+                if let Some(Entry::Prose(existing)) = model.transcript.get_mut(index) {
+                    if !text.is_empty() {
+                        *existing = text.to_string();
+                    }
+                }
+            }
+            _ if !text.is_empty() => {
+                self.settle_thinking(model);
+                model.transcript.push(Entry::Gap);
+                model.transcript.push(Entry::prose(text));
+                self.prose = Some(model.transcript.len() - 1);
+            }
+            _ => {}
+        }
+        if !text.is_empty() {
+            self.said_something = true;
+        }
+    }
+
+    fn append_thinking(&mut self, model: &mut Model, delta: &str) {
+        if self.hide_thinking {
+            return;
+        }
+        let index = match self.thinking {
+            Some(index) if matches!(model.transcript.get(index), Some(Entry::Thinking { .. })) => {
+                index
+            }
+            _ => {
+                model.transcript.push(Entry::Gap);
+                model.transcript.push(Entry::thinking("", true, 0));
+                let index = model.transcript.len() - 1;
+                self.thinking = Some(index);
+                self.thinking_started = Some(Instant::now());
+                index
+            }
+        };
+        if let Some(Entry::Thinking { text, .. }) = model.transcript.get_mut(index) {
+            text.push_str(delta);
+        }
+    }
+
+    /// Close the live reasoning row, if any: it collapses to its one-line
+    /// summary with how long the model spent.
+    fn settle_thinking(&mut self, model: &mut Model) {
+        let Some(index) = self.thinking.take() else {
+            return;
+        };
+        let seconds = self
+            .thinking_started
+            .take()
+            .map(|started| started.elapsed().as_secs())
+            .unwrap_or(0);
+        if let Some(Entry::Thinking {
+            live,
+            seconds: took,
+            ..
+        }) = model.transcript.get_mut(index)
+        {
+            *live = false;
+            *took = seconds;
+        }
     }
 
     fn push_step(&mut self, model: &mut Model, tool_name: &str, args: &serde_json::Value) {
@@ -332,7 +463,23 @@ impl Turn {
         }
         self.open.clear();
         self.studio = None;
+        self.settle_thinking(model);
+        self.prose = None;
     }
+}
+
+/// Roughly what a run of text cost, for the working line's counter while the
+/// provider has not reported a usage figure yet. Four characters a token is
+/// the same approximation `estimate_context_tokens` uses.
+fn estimate_tokens(text: &str) -> u64 {
+    text.chars().count() as u64 / 4
+}
+
+/// `high`, `medium`, … for the working line. `off` says nothing, because a
+/// model that is not thinking has no effort to report.
+fn thinking_effort(agent: &Agent) -> Option<String> {
+    let level = agent.thinking_level.as_str();
+    (level != "off").then(|| level.to_string())
 }
 
 /// Fold one agent event into the transcript.
@@ -351,13 +498,59 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
             is_error,
         } => turn.end_tool(model, tool_call_id, tool_name, result, *is_error),
 
+        AgentEvent::MessageStart { message } if message.role == "assistant" => {
+            turn.begin_message(model);
+        }
+
+        // Every delta lands in the transcript as it arrives: text into the
+        // block being streamed, reasoning into its live row. The stream's own
+        // counter feeds the working line — a provider that reports usage
+        // mid-stream is believed; one that does not gets the character
+        // estimate, so the number climbs either way.
+        AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } => {
+            use pi_ai::AssistantMessageEvent as Ev;
+            match assistant_message_event {
+                Ev::TextStart { .. } => turn.settle_thinking(model),
+                Ev::TextDelta { delta, .. } => turn.append_text(model, delta),
+                Ev::TextEnd { content, .. } => turn.set_text(model, content),
+                Ev::ThinkingDelta { delta, .. } => turn.append_thinking(model, delta),
+                Ev::ThinkingEnd { content, .. } => {
+                    if let Some(Entry::Thinking { text, .. }) = turn
+                        .thinking
+                        .and_then(|index| model.transcript.get_mut(index))
+                    {
+                        if !content.trim().is_empty() {
+                            *text = content.clone();
+                        }
+                    }
+                    turn.settle_thinking(model);
+                }
+                _ => {}
+            }
+            if let Some(working) = model.working.as_mut() {
+                let reported = assistant_message_event
+                    .message()
+                    .usage
+                    .as_ref()
+                    .map(|usage| usage.output)
+                    .unwrap_or_default();
+                let estimated = estimate_tokens(&pi_ai::content_text(&message.content));
+                working.tokens = turn.streamed + reported.max(estimated);
+            }
+        }
+
         AgentEvent::MessageEnd { message } if message.role == "assistant" => {
             let text = pi_ai::content_text(&message.content);
-            if !text.trim().is_empty() {
-                model.transcript.push(Entry::Gap);
-                model.transcript.push(Entry::prose(text.trim()));
-                turn.said_something = true;
+            turn.streamed += estimate_tokens(&text);
+            if let Some(working) = model.working.as_mut() {
+                working.tokens = working.tokens.max(turn.streamed);
             }
+            turn.settle_thinking(model);
+            turn.set_text(model, &text);
+            turn.prose = None;
         }
 
         AgentEvent::AutoRetryStart {
@@ -476,8 +669,23 @@ fn run_turn(
         let _ = event_tx.send(event.clone());
     })));
 
-    let mut turn = Turn::default();
+    let mut turn = Turn {
+        hide_thinking: crate::settings::load_merged_settings(
+            &crate::default_agent_dir(),
+            &agent.cwd,
+        )
+        .hide_thinking_block
+        .unwrap_or(false),
+        ..Turn::default()
+    };
     let mut last_tick = Instant::now();
+    // The working line above the composer, for as long as the turn runs.
+    let started = Instant::now();
+    model.working = Some(Working {
+        seconds: 0,
+        tokens: 0,
+        thinking: thinking_effort(agent),
+    });
     if model.terminal_progress {
         let _ = session.set_progress(true);
     }
@@ -498,6 +706,9 @@ fn run_turn(
         loop {
             while let Ok(event) = event_rx.try_recv() {
                 apply(model, &mut turn, &event);
+            }
+            if let Some(working) = model.working.as_mut() {
+                working.seconds = started.elapsed().as_secs();
             }
             session.draw(model)?;
 
@@ -568,6 +779,8 @@ fn run_turn(
         apply(model, &mut turn, &event);
     }
     let interrupted = abort.load(Ordering::Relaxed);
+    // The turn is over: the working line goes with it.
+    model.working = None;
     turn.close(model, interrupted);
 
     for entry in turn_outcome(
@@ -1565,6 +1778,14 @@ pub fn perform(
         SlashAction::SetModel(value) => {
             let (provider, model_id) =
                 crate::parse_model_ref(&agent.provider.clone(), Some(&value));
+            // The `3a` catalog refuses a dimmed row; a hand-typed `/model` has
+            // to refuse the same pair, or the switch succeeds and every turn
+            // after it comes back unauthenticated.
+            if !model_has_credential(parsed, &provider, &model_id) {
+                return Ok(Done::Note(format!(
+                    "no credential for {provider} — /login {provider} adds one"
+                )));
+            }
             agent.provider = provider;
             agent.model_id = model_id;
             crate::loaded_extension_host(parsed).emit(ExtensionEvent::ModelSelect {
@@ -1572,10 +1793,14 @@ pub fn perform(
                 model: agent.model_id.clone(),
             });
             adopt_model(parsed, agent, model);
-            Ok(Done::Said(format!(
-                "model {} / {}",
-                agent.provider, agent.model_id
-            )))
+            let remembered = persist_model_choice(&agent.provider, &agent.model_id);
+            Ok(Done::Said(match remembered {
+                Ok(()) => format!("model {} / {}", agent.provider, agent.model_id),
+                Err(err) => format!(
+                    "model {} / {} · this run only ({err})",
+                    agent.provider, agent.model_id
+                ),
+            }))
         }
         SlashAction::SetThinking(level) => {
             let Some(parsed_level) = pi_protocol::ThinkingLevel::parse(&level) else {
@@ -1584,10 +1809,21 @@ pub fn perform(
             agent.thinking_level = parsed_level;
             crate::loaded_extension_host(parsed)
                 .emit(ExtensionEvent::ThinkingLevelSelect { level });
-            Ok(Done::Said(format!(
-                "thinking level {}",
-                agent.thinking_level.as_str()
-            )))
+            // The header reads `model.thinking_level`, not the agent's, so the
+            // label stayed on the old level until the next model switch.
+            sync_thinking_state(agent, model);
+            let remembered = persist_thinking_choice(
+                &agent.provider,
+                &agent.model_id,
+                agent.thinking_level.as_str(),
+            );
+            Ok(Done::Said(match remembered {
+                Ok(()) => format!("thinking level {}", agent.thinking_level.as_str()),
+                Err(err) => format!(
+                    "thinking level {} · this run only ({err})",
+                    agent.thinking_level.as_str()
+                ),
+            }))
         }
         SlashAction::OpenThinking => {
             open_thinking_sheet(agent, model);
@@ -1854,8 +2090,72 @@ fn session_id(agent: &Agent) -> String {
         .unwrap_or_else(|| "in-memory".into())
 }
 
+/// Remember the model in hand, the way TS `setDefaultModelAndProvider`
+/// (`vendor/pi/packages/coding-agent/src/core/agent-session.ts`) and the legacy
+/// chrome's `SessionAction::SelectModelAsDefault` both do. A switch that only
+/// lived in memory came back as the previous provider on the next start, which
+/// read from the outside as a login that had been lost.
+fn persist_model_choice(provider: &str, model_id: &str) -> Result<(), String> {
+    let dir = crate::default_agent_dir();
+    let mut stored = crate::settings::load_settings(&dir);
+    stored.default_provider = Some(provider.to_string());
+    stored.default_model = Some(model_id.to_string());
+    crate::settings::save_settings(&dir, &stored)
+}
+
+/// Remember the thinking level for this model, mirroring TS
+/// `settingsManager.setModelThinkingLevel`: the per-model entry is what a later
+/// start reads back, and the global default follows the last choice so a model
+/// with no entry of its own still opens where the user left off.
+fn persist_thinking_choice(provider: &str, model_id: &str, level: &str) -> Result<(), String> {
+    let dir = crate::default_agent_dir();
+    let mut stored = crate::settings::load_settings(&dir);
+    let mut levels = stored.model_thinking_levels.take().unwrap_or_default();
+    levels.insert(format!("{provider}/{model_id}"), level.to_string());
+    stored.model_thinking_levels = Some(levels);
+    stored.default_thinking_level = Some(level.to_string());
+    crate::settings::save_settings(&dir, &stored)
+}
+
+/// Whether the runtime has a credential for this provider/model pair. `/model
+/// <provider>/<id>` typed by hand reaches providers the `3a` catalog draws
+/// dimmed, and switching to one silently left every later turn unauthenticated.
+fn model_has_credential(parsed: &crate::args::Args, provider: &str, model_id: &str) -> bool {
+    crate::load_model_runtime(parsed)
+        .available
+        .iter()
+        .any(|entry| entry.provider == provider && entry.id == model_id)
+}
+
 /// After a model switch: the name in the header, the cap on the context meter,
 /// and the row Cogitator marks as the one in hand all move together.
+fn sync_thinking_state(agent: &Agent, model: &mut Model) {
+    model.thinking_level = agent.thinking_level.as_str().to_string();
+    model.thinking_levels = crate::current_runtime_model(agent)
+        .map(|runtime| {
+            crate::get_supported_thinking_levels(&runtime)
+                .iter()
+                .map(|level| level.as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+}
+
+fn cycle_thinking(agent: &mut Agent, model: &mut Model) -> Option<String> {
+    let current = agent.thinking_level.as_str();
+    let next_index = model
+        .thinking_levels
+        .iter()
+        .position(|level| level == current)
+        .map(|index| (index + 1) % model.thinking_levels.len())
+        .unwrap_or(0);
+    let next = model.thinking_levels.get(next_index)?.clone();
+    let parsed = pi_protocol::ThinkingLevel::parse(&next)?;
+    agent.thinking_level = parsed;
+    model.thinking_level = next.clone();
+    Some(next)
+}
+
 fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model) {
     if let Some(found) = crate::available_models(parsed)
         .into_iter()
@@ -1870,6 +2170,7 @@ fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model)
         .unwrap_or(model.model_index);
     model.model_name = agent.model_id.clone();
     model.context.1 = agent.context_window;
+    sync_thinking_state(agent, model);
 }
 
 /// The models `--models` pinned this run to, and the one actually in hand.
@@ -1928,14 +2229,7 @@ pub fn run(
     model.extra_autocomplete = crate::interactive_extra_autocomplete(parsed);
     model.login_providers = crate::interactive_login_providers(parsed);
     model.model_names = model.models.iter().map(|item| item.name.clone()).collect();
-    model.thinking_levels = crate::current_runtime_model(agent)
-        .map(|runtime| {
-            crate::get_supported_thinking_levels(&runtime)
-                .iter()
-                .map(|level| level.as_str().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    sync_thinking_state(agent, &mut model);
     model.model_index = model
         .models
         .iter()
@@ -1963,6 +2257,7 @@ pub fn run(
     for entry in opening_block(parsed, agent, migrated_auth_providers) {
         model.transcript.push(entry);
     }
+    model.startup.found = opening_found(parsed, agent);
 
     // The user's own bindings, which davinci was rendering the defaults of
     // however `~/.pi/agent/keybindings.json` read.
@@ -2335,6 +2630,56 @@ pub fn run(
                             },
                             choice,
                         ),
+                        Flow::CycleThinking => {
+                            let cycled = cycle_thinking(agent, &mut model);
+                            if let Some(level) = cycled.clone() {
+                                let mut extension_host =
+                                    host.lock().unwrap_or_else(|err| err.into_inner());
+                                extension_host.runtime_thinking_level = level.clone();
+                                extension_host.emit(
+                                    crate::extension_host::ExtensionEvent::ThinkingLevelSelect {
+                                        level,
+                                    },
+                                );
+                            }
+                            let mut shell = Shell {
+                                parsed,
+                                agent,
+                                model: &mut model,
+                                terminal: &mut terminal,
+                                host: &host,
+                                pending: &mut pending,
+                                cwd: &cwd,
+                                dresser: &dresser,
+                                images: &mut attached_images,
+                            };
+                            match cycled {
+                                // The header carries the new level, but a chord
+                                // that only moves a token in the top-right row
+                                // reads as a key that did nothing.
+                                Some(level) => {
+                                    let provider = shell.agent.provider.clone();
+                                    let model_id = shell.agent.model_id.clone();
+                                    match persist_thinking_choice(&provider, &model_id, &level) {
+                                        Ok(()) => shell.say(&format!("thinking level {level}")),
+                                        Err(err) => shell.say(&format!(
+                                            "thinking level {level} · this run only ({err})"
+                                        )),
+                                    }
+                                }
+                                // Refusing in silence is what made shift+tab
+                                // look broken rather than inapplicable.
+                                None => {
+                                    let why = if shell.model.thinking_levels.is_empty() {
+                                        "no model in hand — /model picks one before thinking has levels"
+                                    } else {
+                                        "this model has one thinking level"
+                                    };
+                                    shell.note(why);
+                                }
+                            }
+                            Next::Go
+                        }
                         Flow::Continue | Flow::Interrupt => Next::Go,
                     };
                     // Recall is a search, so it runs when the instrument is
@@ -2401,7 +2746,6 @@ fn opening_block(
 ) -> Vec<Entry> {
     let agent_dir = crate::default_agent_dir();
     let stored = crate::settings::load_merged_settings(&agent_dir, &agent.cwd);
-    let quiet = stored.quiet_startup && !parsed.verbose;
     let mut out: Vec<Entry> = Vec::new();
 
     let (_, models_json_error) = crate::load_available_models(parsed);
@@ -2419,14 +2763,6 @@ fn opening_block(
         } else {
             out.push(Entry::prose(&line));
         }
-    }
-
-    if !quiet && !parsed.models.is_empty() {
-        out.push(Entry::Gap);
-        out.push(Entry::prose(&format!(
-            "models scoped to {}",
-            parsed.models.join(", ")
-        )));
     }
 
     if !crate::settings::is_trusted(&stored, &agent.cwd, parsed.project_trust_override)
@@ -2459,25 +2795,48 @@ fn opening_block(
         out.push(Entry::prose(text.trim()));
     }
 
-    if !quiet {
-        let mut loaded: Vec<String> = Vec::new();
-        if !agent.context_files.is_empty() {
-            loaded.push(format!("{} context files", agent.context_files.len()));
-        }
-        if !agent.skills.is_empty() {
-            loaded.push(format!("{} skills", agent.skills.len()));
-        }
-        if !agent.templates.is_empty() {
-            loaded.push(format!("{} prompts", agent.templates.len()));
-        }
-        if !loaded.is_empty() {
-            out.push(Entry::Gap);
-            out.push(Entry::prose(&format!("loaded {}", loaded.join(" · "))));
-        }
-    }
-
     out.extend(custom_messages(agent));
     out
+}
+
+/// What the session found, for the rows under the mark on the `1a` screen:
+/// the context files, skills and prompts that loaded, and any model scope.
+/// Kept off the transcript so a fresh session opens on the emblem rather
+/// than on bookkeeping.
+fn opening_found(parsed: &crate::args::Args, agent: &Agent) -> Vec<String> {
+    let stored = crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+    if stored.quiet_startup && !parsed.verbose {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut loaded: Vec<String> = Vec::new();
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    if !agent.context_files.is_empty() {
+        loaded.push(plural(
+            agent.context_files.len(),
+            "context file",
+            "context files",
+        ));
+    }
+    if !agent.skills.is_empty() {
+        loaded.push(plural(agent.skills.len(), "skill", "skills"));
+    }
+    if !agent.templates.is_empty() {
+        loaded.push(plural(agent.templates.len(), "prompt", "prompts"));
+    }
+    if !loaded.is_empty() {
+        found.push(format!("loaded {}", loaded.join(" · ")));
+    }
+    if !parsed.models.is_empty() {
+        found.push(format!("models scoped to {}", parsed.models.join(", ")));
+    }
+    found
 }
 
 /// Custom messages an extension wrote into the session, replayed on open so a
@@ -2704,10 +3063,14 @@ pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<
                 }
             }
             Some("setEditorText") => model.composer = field(call, "text").into(),
-            Some("pasteToEditor") => model.composer.push_str(&field(call, "text")),
-            // Davinci has no separate working row — the Studio ledger carries
-            // the one spinner — so an extension's working message takes the
-            // shape extensions are given: a status row above the composer.
+            Some("pasteToEditor") => {
+                model.composer.push_str(&field(call, "text"));
+                model.mark_caret_moved();
+            }
+            // The shell's own working row states what the *turn* costs and is
+            // written by the turn loop alone, so an extension's working
+            // message takes the shape extensions are given instead: a status
+            // row above the composer.
             Some("setWorkingMessage") => {
                 let message = call.get("message").and_then(serde_json::Value::as_str);
                 model.extensions.set_status("§working", message);
@@ -2800,12 +3163,24 @@ fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
             }
         })
         .collect();
-    model.catalog_index = model
-        .catalog
-        .iter()
-        .position(|row| row.provider == agent.provider && row.id == agent.model_id)
-        .unwrap_or(0);
+    model.catalog_index = order_catalog(&mut model.catalog, &agent.provider, &agent.model_id);
     open_sheet(model, Screen::Models);
+}
+
+/// The model in hand first, then everything a credential unlocks (the
+/// current provider's models ahead of the others), then the rest of the
+/// catalogue — the row the user can act on is never buried under a thousand
+/// providers they have not signed in to. Returns the current model's row.
+fn order_catalog(catalog: &mut [CatalogRow], provider: &str, model_id: &str) -> usize {
+    let current = |row: &CatalogRow| row.provider == provider && row.id == model_id;
+    catalog.sort_by_key(|row| {
+        (
+            !current(row),
+            row.credential != Credential::Ready,
+            row.provider != provider,
+        )
+    });
+    catalog.iter().position(current).unwrap_or(0)
 }
 
 /// `3b` — the settings sheet, from the same list the legacy overlay builds,
@@ -3873,8 +4248,11 @@ impl Shell<'_> {
                 if provider.is_empty() {
                     Err("usage: /login <provider> [key]".to_string())
                 } else {
-                    crate::login_provider(provider, key.as_deref())
-                        .map(|()| format!("signed in to {provider}"))
+                    // `stored` is false when the handshake only printed its
+                    // URL. Calling that "signed in" is what left the next
+                    // request with no credential and no explanation.
+                    crate::login_provider_with_wait(provider, key.as_deref(), true)
+                        .and_then(|stored| detached_login_message(provider, !stored))
                 }
             }
         };
@@ -4136,6 +4514,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             // palette row hands its name to the composer instead.
             _ => {
                 shell.model.composer.push_str(&name);
+                shell.model.mark_caret_moved();
                 Next::Go
             }
         },
@@ -4161,7 +4540,13 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 },
             );
             adopt_model(shell.parsed, shell.agent, shell.model);
-            shell.say(&format!("model {} / {}", item.provider, item.id));
+            match persist_model_choice(&item.provider, &item.id) {
+                Ok(()) => shell.say(&format!("model {} / {}", item.provider, item.id)),
+                Err(err) => shell.say(&format!(
+                    "model {} / {} · this run only ({err})",
+                    item.provider, item.id
+                )),
+            }
             Next::Go
         }
         Choice::Ask(index) => {
@@ -4196,7 +4581,13 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 },
             );
             adopt_model(shell.parsed, shell.agent, shell.model);
-            shell.say(&format!("model {} / {}", row.provider, row.id));
+            match persist_model_choice(&row.provider, &row.id) {
+                Ok(()) => shell.say(&format!("model {} / {}", row.provider, row.id)),
+                Err(err) => shell.say(&format!(
+                    "model {} / {} · this run only ({err})",
+                    row.provider, row.id
+                )),
+            }
             Next::Go
         }
         // `3b` — advance the setting to its next value and persist it.
@@ -4397,6 +4788,23 @@ pub fn recall_query(model: &Model, agent: &Agent) -> String {
         .unwrap_or_default()
 }
 
+fn detached_login_message(provider: &str, oauth_pending: bool) -> Result<String, String> {
+    if oauth_pending {
+        if pi_ai::PROVIDER_SPECS
+            .iter()
+            .find(|spec| spec.id == provider)
+            .is_some_and(|spec| !spec.oauth)
+        {
+            return Err(format!(
+                "API key required for {provider}. Run /login {provider} <api-key>."
+            ));
+        }
+        Err(format!("authorization required to sign in to {provider}"))
+    } else {
+        Ok(format!("signed in to {provider}"))
+    }
+}
+
 fn refresh_context(model: &mut Model, agent: &Agent) {
     model.context = (
         pi_agent::estimate_context_tokens(&agent.messages),
@@ -4409,6 +4817,31 @@ fn refresh_context(model: &mut Model, agent: &Agent) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn detached_login_does_not_report_pending_oauth_as_signed_in() {
+        let outcome = detached_login_message("anthropic", true);
+        assert_eq!(
+            outcome,
+            Err("authorization required to sign in to anthropic".to_string())
+        );
+    }
+
+    #[test]
+    fn detached_openai_without_key_reports_api_key_requirement() {
+        assert_eq!(
+            detached_login_message("openai", true),
+            Err("API key required for openai. Run /login openai <api-key>.".to_string())
+        );
+    }
+
+    #[test]
+    fn detached_login_reports_completed_login_as_signed_in() {
+        assert_eq!(
+            detached_login_message("anthropic", false),
+            Ok("signed in to anthropic".to_string())
+        );
+    }
 
     fn assistant(text: &str) -> pi_ai::ChatMessage {
         pi_ai::ChatMessage {
@@ -4465,6 +4898,22 @@ mod tests {
             .any(|item| item.name == "/diff" && item.kind == "command"));
     }
 
+    #[test]
+    fn cycling_thinking_advances_supported_levels_and_syncs_chrome() {
+        let mut agent = pi_agent::Agent::new("test");
+        agent.thinking_level = pi_protocol::ThinkingLevel::Low;
+        let mut m = model();
+        m.thinking_levels = vec!["off".into(), "low".into(), "medium".into(), "high".into()];
+        m.thinking_level = "low".into();
+
+        assert_eq!(
+            cycle_thinking(&mut agent, &mut m).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(agent.thinking_level.as_str(), "medium");
+        assert_eq!(m.thinking_level, "medium");
+    }
+
     fn model() -> Model {
         Model::new(
             pi_tui::davinci::theme::Theme::da_vinci(
@@ -4475,6 +4924,230 @@ mod tests {
             40,
             true,
         )
+    }
+
+    fn partial(text: &str) -> pi_ai::AssistantMessage {
+        pi_ai::AssistantMessage {
+            id: "m".into(),
+            role: "assistant".into(),
+            content: vec![pi_ai::ContentBlock::Text { text: text.into() }],
+            model: "fixture".into(),
+            usage: None,
+            stop_reason: None,
+            error_message: None,
+        }
+    }
+
+    fn update(event: pi_ai::AssistantMessageEvent) -> AgentEvent {
+        AgentEvent::MessageUpdate {
+            message: Arc::new(pi_ai::assistant_to_chat(event.message())),
+            assistant_message_event: event,
+        }
+    }
+
+    #[test]
+    fn text_deltas_stream_into_one_prose_entry_that_message_end_keeps() {
+        use pi_ai::AssistantMessageEvent as Ev;
+        let mut m = model();
+        let mut turn = Turn::default();
+        apply(
+            &mut m,
+            &mut turn,
+            &AgentEvent::MessageStart {
+                message: pi_ai::ChatMessage::text("assistant", ""),
+            },
+        );
+        apply(
+            &mut m,
+            &mut turn,
+            &update(Ev::TextStart {
+                content_index: 0,
+                partial: partial(""),
+            }),
+        );
+        apply(
+            &mut m,
+            &mut turn,
+            &update(Ev::TextDelta {
+                content_index: 0,
+                delta: "Hel".into(),
+                partial: partial("Hel"),
+            }),
+        );
+        apply(
+            &mut m,
+            &mut turn,
+            &update(Ev::TextDelta {
+                content_index: 0,
+                delta: "lo".into(),
+                partial: partial("Hello"),
+            }),
+        );
+        let prose: Vec<&Entry> = m
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Prose(_)))
+            .collect();
+        assert_eq!(prose.len(), 1, "{:?}", m.transcript);
+        assert!(matches!(prose[0], Entry::Prose(text) if text == "Hello"));
+
+        apply(
+            &mut m,
+            &mut turn,
+            &AgentEvent::MessageEnd {
+                message: pi_ai::ChatMessage::text("assistant", "Hello"),
+            },
+        );
+        let prose: Vec<&Entry> = m
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Prose(_)))
+            .collect();
+        assert_eq!(
+            prose.len(),
+            1,
+            "message end must not repeat the streamed text"
+        );
+        assert!(turn.said_something);
+    }
+
+    #[test]
+    fn a_message_that_never_streamed_still_lands_at_message_end() {
+        let mut m = model();
+        let mut turn = Turn::default();
+        apply(
+            &mut m,
+            &mut turn,
+            &AgentEvent::MessageEnd {
+                message: pi_ai::ChatMessage::text("assistant", "whole reply"),
+            },
+        );
+        assert!(matches!(
+            m.transcript.last(),
+            Some(Entry::Prose(text)) if text == "whole reply"
+        ));
+    }
+
+    #[test]
+    fn reasoning_streams_live_and_collapses_when_the_text_starts() {
+        use pi_ai::AssistantMessageEvent as Ev;
+        let mut m = model();
+        let mut turn = Turn::default();
+        apply(
+            &mut m,
+            &mut turn,
+            &update(Ev::ThinkingDelta {
+                content_index: 0,
+                delta: "Need the file first.".into(),
+                partial: partial(""),
+            }),
+        );
+        assert!(matches!(
+            m.transcript.last(),
+            Some(Entry::Thinking { text, live: true, .. }) if text == "Need the file first."
+        ));
+        apply(
+            &mut m,
+            &mut turn,
+            &update(Ev::TextDelta {
+                content_index: 1,
+                delta: "Reading.".into(),
+                partial: partial("Reading."),
+            }),
+        );
+        let thinking = m
+            .transcript
+            .iter()
+            .find(|entry| matches!(entry, Entry::Thinking { .. }))
+            .expect("thinking row");
+        assert!(matches!(thinking, Entry::Thinking { live: false, .. }));
+        assert!(matches!(m.transcript.last(), Some(Entry::Prose(text)) if text == "Reading."));
+    }
+
+    #[test]
+    fn hidden_reasoning_never_reaches_the_transcript() {
+        use pi_ai::AssistantMessageEvent as Ev;
+        let mut m = model();
+        let mut turn = Turn {
+            hide_thinking: true,
+            ..Turn::default()
+        };
+        apply(
+            &mut m,
+            &mut turn,
+            &update(Ev::ThinkingDelta {
+                content_index: 0,
+                delta: "secret".into(),
+                partial: partial(""),
+            }),
+        );
+        assert!(!m
+            .transcript
+            .iter()
+            .any(|entry| matches!(entry, Entry::Thinking { .. })));
+    }
+
+    #[test]
+    fn the_catalogue_opens_on_the_model_in_hand_with_usable_rows_first() {
+        let row = |provider: &str, id: &str, ready: bool| CatalogRow {
+            name: format!("{provider}/{id}"),
+            window: "200k".into(),
+            thinking: "none".into(),
+            price: "1.00 · 2.00".into(),
+            credential: if ready {
+                Credential::Ready
+            } else {
+                Credential::Absent
+            },
+            note: String::new(),
+            ring: false,
+            provider: provider.into(),
+            id: id.into(),
+        };
+        let mut catalog = vec![
+            row("amazon-bedrock", "nova", false),
+            row("anthropic", "claude", true),
+            row("openai-codex", "gpt-5", true),
+            row("openai-codex", "gpt-5-mini", true),
+            row("xai", "grok", false),
+        ];
+        let index = order_catalog(&mut catalog, "openai-codex", "gpt-5-mini");
+        assert_eq!(index, 0);
+        let names: Vec<&str> = catalog.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "openai-codex/gpt-5-mini",
+                "openai-codex/gpt-5",
+                "anthropic/claude",
+                "amazon-bedrock/nova",
+                "xai/grok",
+            ]
+        );
+    }
+
+    #[test]
+    fn what_the_session_found_is_said_under_the_mark_not_in_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let mut agent = pi_agent::Agent::new("test");
+        agent.cwd = dir.path().to_path_buf();
+        agent.context_files.push(pi_agent::ContextFile {
+            path: dir.path().join("AGENTS.md"),
+            name: "AGENTS.md".into(),
+            body: "be kind".into(),
+        });
+        let found = opening_found(&crate::args::Args::default(), &agent);
+        assert_eq!(found, ["loaded 1 context file"]);
+        let block = opening_block(&crate::args::Args::default(), &agent, &[]);
+        assert!(!block
+            .iter()
+            .any(|entry| matches!(entry, Entry::Prose(text) if text.starts_with("loaded"))));
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
     }
 
     #[test]

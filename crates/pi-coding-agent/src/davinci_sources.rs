@@ -298,6 +298,7 @@ pub fn startup(cwd: &Path, branch: &str, restored: bool) -> Startup {
             n => format!("{n} crates"),
         },
         restored,
+        found: Vec::new(),
     }
 }
 
@@ -342,7 +343,11 @@ pub fn apply_workspace_dress(model: &mut Model, dress: WorkspaceDress) {
     model.tree = dress.tree;
     model.paths = dress.paths;
     model.sessions = dress.sessions;
+    // What the session found is known only to the shell; a later dress from
+    // the workspace thread must not blank it.
+    let found = std::mem::take(&mut model.startup.found);
     model.startup = dress.startup;
+    model.startup.found = found;
 }
 
 /// Fill the model from everything this workspace can actually answer,

@@ -7,13 +7,16 @@
 
 use ratatui::text::Line;
 
-use super::studio;
+use super::{markdown, studio};
 use crate::davinci::model::{Entry, HunkKind, Model};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
     blank, clip_ellipsis, detail_line, failure_line, indent, span, span_strong, tool_line, wrap,
     MEASURE,
 };
+
+/// How many rows of live reasoning are shown while it streams.
+const THINKING_TAIL: usize = 3;
 
 /// Render a whole transcript, at a width that may be narrower than the window
 /// when the Codex sidebar is open.
@@ -87,10 +90,13 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
         Entry::Failure { what, subject } => vec![failure_line(th, what, subject)],
 
-        Entry::Prose(text) => wrap(text, MEASURE.min(width.saturating_sub(2)))
-            .into_iter()
-            .map(|row| Line::from(vec![span(row, th.text)]))
-            .collect(),
+        Entry::Prose(text) => markdown::lines(th, text, MEASURE.min(width.saturating_sub(2))),
+
+        Entry::Thinking {
+            text,
+            live,
+            seconds,
+        } => thinking_lines(th, text, *live, *seconds, width),
 
         Entry::Studio(steps) => studio::lines(model, steps),
 
@@ -110,6 +116,70 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             rows
         }
     }
+}
+
+/// Reasoning: while live, a `⟐ reasoning` row and the last few rows of the
+/// summary as they arrive; once done, one muted row with how long it took
+/// and its first sentence, so the thought is auditable without crowding the
+/// answer. Empty reasoning that finished says only how long it took.
+fn thinking_lines(
+    theme: &Theme,
+    text: &str,
+    live: bool,
+    seconds: u64,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let measure = MEASURE.min(width.saturating_sub(4));
+    if live {
+        let mut rows = vec![Line::from(vec![
+            span(format!("{} ", glyph::COLLAPSED), theme.primary),
+            span("reasoning", theme.muted),
+        ])];
+        let wrapped = wrap(text.trim(), measure);
+        let start = wrapped.len().saturating_sub(THINKING_TAIL);
+        rows.extend(
+            wrapped
+                .into_iter()
+                .skip(start)
+                .map(|row| indent(2, vec![span(row, theme.muted)])),
+        );
+        return rows;
+    }
+    let mut label = if seconds == 0 {
+        "reasoned".to_string()
+    } else {
+        format!("reasoned {seconds}s")
+    };
+    let first = first_sentence(text);
+    if !first.is_empty() {
+        label.push_str(" · ");
+        label.push_str(&first);
+    }
+    vec![Line::from(vec![
+        span(format!("{} ", glyph::COLLAPSED), theme.border),
+        span(clip_ellipsis(&label, measure), theme.muted),
+    ])]
+}
+
+/// The first sentence of a reasoning summary, on one row: up to the first
+/// full stop followed by a space or a line end, headings' `**` dropped.
+pub fn first_sentence(text: &str) -> String {
+    let flat: String = text
+        .replace("**", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut end = flat.len();
+    for (index, ch) in flat.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let next = flat[index + ch.len_utf8()..].chars().next();
+            if next.is_none() || next == Some(' ') {
+                end = index + ch.len_utf8();
+                break;
+            }
+        }
+    }
+    flat[..end].to_string()
 }
 
 /// Hunks sit behind a single left rule; no line numbers unless asked (§6).
@@ -180,6 +250,51 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn live_reasoning_shows_its_tail_and_collapses_to_one_row_when_done() {
+        let m = model(100);
+        let long = (1..=12)
+            .map(|n| format!("step {n} of the plan"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let live = lines(&m, &[Entry::thinking(&long, true, 0)], 100);
+        assert_eq!(text(&live[0]), "⟐ reasoning");
+        assert_eq!(
+            live.len(),
+            1 + THINKING_TAIL,
+            "{:?}",
+            live.iter().map(text).collect::<Vec<_>>()
+        );
+        assert!(text(&live[1]).starts_with("  "));
+
+        let done = lines(
+            &m,
+            &[Entry::thinking(
+                "**Planning** the file read. Then answer.",
+                false,
+                4,
+            )],
+            100,
+        );
+        assert_eq!(done.len(), 1);
+        assert_eq!(text(&done[0]), "⟐ reasoned 4s · Planning the file read.");
+
+        let quick = lines(&m, &[Entry::thinking("", false, 0)], 100);
+        assert_eq!(text(&quick[0]), "⟐ reasoned");
+    }
+
+    #[test]
+    fn prose_renders_as_markdown() {
+        let m = model(100);
+        let rows = lines(&m, &[Entry::prose("# Title\n\n- one\n- two")], 100);
+        let texts: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(texts[0], "Title");
+        assert!(
+            texts.iter().any(|row| row.starts_with("· one")),
+            "{texts:?}"
+        );
     }
 
     #[test]

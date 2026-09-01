@@ -22,6 +22,9 @@ use crate::codex::{
     WEBSOCKET_CLOSED_BEFORE_COMPLETED,
 };
 use crate::stream::{AssistantMessage, AssistantMessageEvent, StopReason};
+use crate::stream_decoder::{ResponsesDecoder, StreamDecoder};
+
+type AbortFlag<'a> = Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>;
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const OPCODE_TEXT: u8 = 0x1;
@@ -41,6 +44,8 @@ pub fn process_codex_websocket(
     account_id: &str,
     use_cached_context: bool,
     started: &mut bool,
+    abort: AbortFlag<'_>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<AssistantMessage, String> {
     if let Ok(reply) = std::env::var("PI_CODEX_WS_REPLY") {
         return process_fixture(
@@ -53,6 +58,7 @@ pub fn process_codex_websocket(
             account_id,
             use_cached_context,
             started,
+            on_event,
         );
     }
     if !allows_live_websocket(url) {
@@ -93,21 +99,26 @@ pub fn process_codex_websocket(
         release_live_socket(acquired.key, stream, false);
         return Err(err);
     }
-    let events = match read_codex_events(&mut stream, idle_timeout_ms, started) {
-        Ok(events) => events,
+    let mut decoder = ResponsesDecoder::new(model);
+    let (events, message, aborted) = match read_codex_events(
+        &mut stream,
+        idle_timeout_ms,
+        started,
+        &mut decoder,
+        abort,
+        on_event,
+    ) {
+        Ok(read) => read,
         Err(err) => {
             release_live_socket(acquired.key, stream, false);
             return Err(err);
         }
     };
-    let replayed = replay_codex_events(model, &events_to_corpus(&events));
-    let message = match done_message(&replayed) {
-        Ok(message) => message,
-        Err(err) => {
-            release_live_socket(acquired.key, stream, false);
-            return Err(err);
-        }
-    };
+    if aborted {
+        // The socket is mid-response; nothing later can reuse it.
+        release_live_socket(acquired.key, stream, false);
+        return Ok(message);
+    }
     let mut keep = acquired.key.is_some();
     if use_cached_context {
         if let Some(response_id) = events.iter().rev().find_map(|event| {
@@ -122,7 +133,7 @@ pub fn process_codex_websocket(
                 CachedWebSocketContinuation {
                     last_request_body: body.clone(),
                     last_response_id: response_id,
-                    last_response_items: Value::Array(Vec::new()),
+                    last_response_items: cached_response_items(&message),
                 },
                 socket_reused,
                 Instant::now(),
@@ -146,6 +157,7 @@ fn process_fixture(
     account_id: &str,
     use_cached_context: bool,
     started: &mut bool,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<AssistantMessage, String> {
     match reply {
         "timeout" => Err(websocket_connect_timeout_error(connect_timeout_ms)),
@@ -167,6 +179,9 @@ fn process_fixture(
             );
             *started = true;
             let events = replay_codex_events(model, corpus);
+            for event in &events {
+                on_event(event);
+            }
             let message = done_message(&events)?;
             if use_cached_context {
                 store_cached_continuation(
@@ -175,7 +190,7 @@ fn process_fixture(
                     CachedWebSocketContinuation {
                         last_request_body: body.clone(),
                         last_response_id: "resp_fixture".into(),
-                        last_response_items: Value::Array(Vec::new()),
+                        last_response_items: cached_response_items(&message),
                     },
                     reused,
                     Instant::now(),
@@ -197,6 +212,20 @@ fn is_loopback(url: &str) -> bool {
     url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]")
 }
 
+fn cached_response_items(message: &AssistantMessage) -> Value {
+    let chat = crate::assistant_to_chat(message);
+    let items = crate::stream::openai_responses_input(std::slice::from_ref(&chat))
+        .into_iter()
+        .filter(|item| {
+            !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+        })
+        .collect();
+    Value::Array(items)
+}
+
 fn done_message(events: &[AssistantMessageEvent]) -> Result<AssistantMessage, String> {
     events
         .iter()
@@ -211,14 +240,6 @@ fn done_message(events: &[AssistantMessageEvent]) -> Result<AssistantMessage, St
             _ => None,
         })
         .ok_or_else(|| WEBSOCKET_CLOSED_BEFORE_COMPLETED.to_string())
-}
-
-fn events_to_corpus(events: &[Value]) -> String {
-    events
-        .iter()
-        .map(|event| format!("data: {event}\n"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 struct LiveSocketKey {
@@ -638,14 +659,34 @@ fn write_frame(
         .map_err(|err| format!("WebSocket send failed: {err}"))
 }
 
+/// Read frames until the response completes, feeding each one through the
+/// decoder and handing every event to `on_event` as it is produced. Returns
+/// the raw events (the continuation cache needs the response id), the
+/// finished message, and whether the read was cut short by `abort`.
 fn read_codex_events(
     stream: &mut WsStream,
     idle_timeout_ms: Option<u64>,
     started: &mut bool,
-) -> Result<Vec<Value>, String> {
+    decoder: &mut ResponsesDecoder,
+    abort: AbortFlag<'_>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<(Vec<Value>, AssistantMessage, bool), String> {
+    use std::sync::atomic::Ordering;
     let mut events = Vec::new();
+    let mut produced = Vec::new();
     let mut saw_completion = false;
     loop {
+        if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let mut closing = Vec::new();
+            let mut message = decoder.finish(&mut closing);
+            message.stop_reason = Some(StopReason::Aborted);
+            message.error_message = Some("Request was aborted".into());
+            on_event(&AssistantMessageEvent::Error {
+                reason: StopReason::Aborted,
+                error: message.clone(),
+            });
+            return Ok((events, message, true));
+        }
         let (opcode, payload) = match read_frame(stream, idle_timeout_ms) {
             Ok(frame) => frame,
             Err(_) if saw_completion => break,
@@ -657,15 +698,31 @@ fn read_codex_events(
                     .map_err(|_| "Invalid Codex WebSocket JSON: invalid utf8".to_string())?;
                 let parsed: Value = serde_json::from_str(&text)
                     .map_err(|err| format!("Invalid Codex WebSocket JSON: {err}"))?;
-                if parsed.get("type").and_then(Value::as_str) == Some("error") {
-                    let code = parsed
-                        .pointer("/error/code")
-                        .and_then(Value::as_str)
-                        .or_else(|| parsed.get("code").and_then(Value::as_str))
-                        .unwrap_or("error");
-                    return Err(format!("Codex error: {code}"));
-                }
                 let event_type = parsed.get("type").and_then(Value::as_str).unwrap_or("");
+                if crate::trace::enabled() {
+                    crate::trace::log(&format!(
+                        "ws frame {}",
+                        crate::trace::describe_event(&parsed)
+                    ));
+                }
+                if event_type == "error" {
+                    let detail = parsed
+                        .pointer("/error/message")
+                        .or_else(|| parsed.get("message"))
+                        .or_else(|| parsed.pointer("/error/code"))
+                        .or_else(|| parsed.get("code"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("error");
+                    return Err(format!("Codex error: {detail}"));
+                }
+                if event_type == "response.failed" {
+                    let reason = parsed
+                        .pointer("/response/error/message")
+                        .or_else(|| parsed.pointer("/response/error/code"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex response failed");
+                    return Err(format!("Codex error: {reason}"));
+                }
                 if matches!(
                     event_type,
                     "response.created"
@@ -675,6 +732,11 @@ fn read_codex_events(
                         | "response.incomplete"
                 ) {
                     *started = true;
+                }
+                let first = produced.len();
+                decoder.feed(&parsed, &mut produced);
+                for event in &produced[first..] {
+                    on_event(event);
                 }
                 if matches!(
                     event_type,
@@ -699,7 +761,12 @@ fn read_codex_events(
     if !saw_completion {
         return Err(WEBSOCKET_CLOSED_BEFORE_COMPLETED.into());
     }
-    Ok(events)
+    let first = produced.len();
+    let message = decoder.finish(&mut produced);
+    for event in &produced[first..] {
+        on_event(event);
+    }
+    Ok((events, message, false))
 }
 
 fn read_frame(
@@ -805,4 +872,94 @@ pub(crate) fn write_unmasked_text(stream: &mut impl Write, text: &str) -> std::i
     frame.extend_from_slice(payload);
     stream.write_all(&frame)?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::ModelCost;
+
+    fn codex_model() -> Model {
+        Model {
+            id: "gpt-5".into(),
+            name: "gpt-5".into(),
+            api: "openai-codex-responses".into(),
+            provider: "openai-codex".into(),
+            base_url: Some(crate::codex::DEFAULT_CODEX_BASE_URL.into()),
+            reasoning: true,
+            input: vec!["text".into()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 32_000,
+            compat: Value::Null,
+            headers: Default::default(),
+            thinking_level_map: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cached_fixture_response_is_subtracted_from_the_next_user_delta() {
+        let _guard = crate::codex::websocket_state_test_lock();
+        const SESSION: &str = "cached-fixture-response-delta";
+        crate::codex::close_openai_codex_websocket_sessions(Some(SESSION));
+        let first = serde_json::json!({
+            "model": "gpt-5",
+            "input": [
+                {"role":"user","content":[{"type":"input_text","text":"one"}]}
+            ]
+        });
+        let corpus = r#"{"type":"response.created"}
+{"type":"response.output_text.delta","delta":"Hi"}
+{"type":"response.completed","response":{"id":"resp_fixture","status":"completed"}}"#;
+        let mut started = false;
+        process_fixture(
+            corpus,
+            &first,
+            &codex_model(),
+            50,
+            None,
+            Some(SESSION),
+            "acc_test",
+            true,
+            &mut started,
+            &mut |_| {},
+        )
+        .expect("fixture completes");
+
+        let (_, continuation) =
+            acquire_cached_continuation(Some(SESSION), "acc_test", Instant::now());
+        let continuation = continuation.expect("cached continuation");
+        let assistant_item = serde_json::json!({
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"Hi"}]
+        });
+        assert_eq!(
+            continuation.last_response_items,
+            Value::Array(vec![assistant_item.clone()]),
+            "the cached baseline must include the response represented in previous_response_id"
+        );
+
+        let second = serde_json::json!({
+            "model": "gpt-5",
+            "input": [
+                {"role":"user","content":[{"type":"input_text","text":"one"}]},
+                assistant_item,
+                {"role":"user","content":[{"type":"input_text","text":"two"}]}
+            ]
+        });
+        let (delta, used) = build_cached_websocket_request_body(&second, Some(&continuation));
+        assert!(used);
+        assert_eq!(
+            delta["input"],
+            serde_json::json!([
+                {"role":"user","content":[{"type":"input_text","text":"two"}]}
+            ])
+        );
+        crate::codex::close_openai_codex_websocket_sessions(Some(SESSION));
+    }
 }

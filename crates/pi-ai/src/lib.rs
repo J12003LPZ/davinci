@@ -20,12 +20,16 @@ mod providers;
 mod retry;
 mod shell;
 mod stream;
+mod stream_decoder;
+mod stream_decoder_anthropic;
+mod stream_decoder_completions;
 mod thinking;
+pub mod trace;
 
 pub use attribution::{is_install_telemetry_enabled, merge_provider_attribution_headers};
 pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
-    copilot_base_url_from_token, fetch_github_copilot_available_model_ids,
+    copilot_base_url_from_token, credential_expires_by, fetch_github_copilot_available_model_ids,
     parse_copilot_available_model_ids, resolve_provider_auth, vertex_ambient_auth, AuthStorage,
     AuthStorageError, Credential, CredentialKind, ResolvedAuth,
 };
@@ -38,8 +42,8 @@ pub use codex::{
     build_cached_websocket_request_body, build_sse_headers, build_websocket_headers,
     close_openai_codex_websocket_sessions, compress_request_body_zstd, connect_codex_websocket,
     encode_codex_sse_body, extract_account_id, get_openai_codex_websocket_debug_stats,
-    is_previous_response_not_found, is_websocket_connection_limit_reached, map_codex_event_type,
-    normalize_codex_terminal_event, pi_user_agent, replay_codex_events,
+    is_previous_response_not_found, is_websocket_connection_limit_reached, jwt_expiry_ms,
+    map_codex_event_type, normalize_codex_terminal_event, pi_user_agent, replay_codex_events,
     reset_openai_codex_websocket_debug_stats, resolve_codex_url, resolve_codex_websocket_url,
     resolve_websocket_connect_timeout_ms, should_fallback_to_sse,
     should_retry_missing_previous_response, should_retry_websocket_connection_limit,
@@ -86,9 +90,10 @@ pub use oauth_callback::{
     ERR_MISSING_CODE_OR_STATE, ERR_STATE_MISMATCH, TITLE_FAILED, TITLE_SUCCESS,
 };
 pub use oauth_providers::{
-    authorize_request, device_status_from_error, exchange_authorization_code, generate_pkce,
-    oauth_providers, parse_authorization_input, token_exchange_request, AuthorizeRequest, Pkce,
-    TokenExchangeRequest,
+    authorize_request, device_status_from_error, exchange_authorization_code,
+    fresh_authorize_request, generate_pkce, oauth_providers, parse_authorization_input,
+    refresh_oauth_token, token_exchange_request, token_refresh_request, AuthorizeRequest,
+    OauthTokens, Pkce, TokenExchangeRequest,
 };
 pub use provider_retry::{
     is_retryable_provider_error, provider_error_from_ureq, retry_delay_from_headers,
@@ -102,11 +107,18 @@ pub use shell::{
 };
 pub use stream::{
     assistant_to_chat, complete_from_events, complete_simple, events_from_complete,
-    fixture_complete, live_complete, live_complete_streaming_with, live_complete_with, live_stream,
-    parse_sse_block, replay_sse_events, request_body, request_body_with, request_url,
+    fixture_complete, live_complete, live_complete_streaming_with,
+    live_complete_streaming_with_sink, live_complete_with, live_stream, parse_sse_block,
+    replay_sse_events, request_body, request_body_with, request_url,
     resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
     StopReason, StreamEvent, StreamOptions,
 };
+pub use stream_decoder::{
+    decoder_for, frames_of, new_message, supports_incremental_stream, ResponsesDecoder, SseFrame,
+    SseFramer, StreamDecoder,
+};
+pub use stream_decoder_anthropic::AnthropicDecoder;
+pub use stream_decoder_completions::CompletionsDecoder;
 pub use thinking::{
     available_thinking_levels, clamp_reasoning, clamp_thinking_budget_to_answer_room,
     cycle_thinking_level, get_supported_thinking_levels, google_thinking_budget,
