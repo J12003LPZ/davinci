@@ -6,7 +6,119 @@
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/model.ex`.
 
+use std::fmt;
+use std::ops::Deref;
+use std::path::Path;
+
+use crate::autocomplete::{
+    apply_completion, suggestions, AutocompleteSuggestions, ExtraAutocompleteProvider,
+    SlashCommandSpec, SuggestionQuery,
+};
+use crate::{Editor, Keybindings};
+
 use super::theme::{State, Theme};
+
+/// How many completions the composer offers at once. The list sits between the
+/// transcript and the composer, so it stays short enough to leave the turn it
+/// belongs to visible (design.md §2).
+pub const SUGGESTION_ROWS: usize = 6;
+
+/// Da Vinci's composer text backed by the mature shared [`Editor`].
+///
+/// `Deref<str>` and the string conversions keep the renderer/fixture surface
+/// lightweight while all mutations go through editor semantics rather than an
+/// append-only `String`.
+#[derive(Debug, Clone)]
+pub struct Composer {
+    editor: Editor,
+}
+
+impl Default for Composer {
+    fn default() -> Self {
+        Self {
+            editor: Editor::new(),
+        }
+    }
+}
+
+impl Composer {
+    pub fn editor(&self) -> &Editor {
+        &self.editor
+    }
+
+    pub fn editor_mut(&mut self) -> &mut Editor {
+        &mut self.editor
+    }
+
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.editor.set_text(text);
+    }
+
+    pub fn push_str(&mut self, text: &str) {
+        self.editor.insert_str(text);
+    }
+
+    pub fn push(&mut self, ch: char) {
+        self.editor.insert(ch);
+    }
+
+    pub fn clear(&mut self) {
+        self.editor.set_text(String::new());
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        let mut end = len.min(self.editor.buffer.len());
+        while end > 0 && !self.editor.buffer.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = self.editor.buffer[..end].to_string();
+        self.editor.set_text(text);
+    }
+
+    pub fn into_string(self) -> String {
+        self.editor.buffer
+    }
+}
+
+impl Deref for Composer {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.editor.get_text()
+    }
+}
+
+impl fmt::Display for Composer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.editor.get_text())
+    }
+}
+
+impl From<String> for Composer {
+    fn from(value: String) -> Self {
+        let mut composer = Self::default();
+        composer.set_text(value);
+        composer
+    }
+}
+
+impl From<&str> for Composer {
+    fn from(value: &str) -> Self {
+        value.to_string().into()
+    }
+}
+
+impl PartialEq<&str> for Composer {
+    fn eq(&self, other: &&str) -> bool {
+        self.editor.get_text() == *other
+    }
+}
+
+impl PartialEq<String> for Composer {
+    fn eq(&self, other: &String) -> bool {
+        self.editor.get_text() == other
+    }
+}
 
 /// The transcript is the interface; a screen is what replaces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +133,40 @@ pub enum Screen {
     Memoria,
     /// `2c` — Mensura, the token governor.
     Mensura,
+    /// `3a` — the full model catalog (`/model`).
+    Models,
+    /// `3b` — settings (`/settings`).
+    Settings,
+    /// `3c` — thinking levels (`/thinking`).
+    Thinking,
+    /// `3d` — provider credentials (`/login`).
+    Login,
+    /// `3e` — the keymap (`/hotkeys`).
+    Keys,
+    /// `4a` — the session list (`/resume`).
+    Resume,
+    /// `4b` — the session tree (`/tree`).
+    Tree,
+    /// `4c` — the compaction preview (`/compact`).
+    Compact,
+    /// `4d` — the export ledger (`/export`).
+    Export,
+    /// `5a` — a task running as a graph (`/graph`).
+    GraphRun,
+    /// `5b` — the vector index (`/memory-status`).
+    Vectors,
+    /// `5c` — the token governor's ledger (`/governor-status`).
+    Governor,
+    /// `5d` — the security scan (`/sec-report`).
+    Securitas,
+    /// `6a` — project trust (`/trust`).
+    Trust,
+    /// `6b` — the workshop, what `/reload` loaded.
+    Officina,
+    /// `6c` — the interrupt aftermath.
+    Recovery,
+    /// `6d` — the Δ review (`/diff`).
+    Diff,
 }
 
 /// An instrument summoned over the transcript, dismissed with esc.
@@ -79,6 +225,20 @@ pub enum Choice {
     Model(usize),
     /// A row of the `Ask` instrument, as an index into `ask.items`.
     Ask(usize),
+    /// A row of the model catalog screen (`3a`), as an index into `catalog`.
+    Catalog(usize),
+    /// A setting to advance to its next value (`3b`).
+    Setting(usize),
+    /// A thinking level (`3c`), as an index into `thinking_rows`.
+    ThinkingLevel(usize),
+    /// A provider to sign in to (`3d`), as an index into `providers`.
+    Provider(usize),
+    /// A session of the resume screen (`4a`).
+    ResumeSession(usize),
+    /// A node of the session tree (`4b`), as an index into `session_tree`.
+    TreeEntry(usize),
+    /// Enter on the trust sheet (`6a`): read first, then decide.
+    TrustDecide,
 }
 
 /// A block of rows an extension owns. Extensions get rows, not colours and
@@ -209,8 +369,18 @@ pub enum Entry {
         instrument: String,
         target: String,
         duration: Option<String>,
+        /// What the call came back with, in the fewest words that still say it
+        /// — `412 lines`, `8 matches`, `+31 -8`. It sits at the end of the tool
+        /// line so a finished call states its outcome without a second row.
+        summary: Option<String>,
     },
     Detail(String),
+    /// A failure detail: what went wrong, then the subject — `1 failed
+    /// store::roundtrip_windows_paths` (`1g`).
+    Failure {
+        what: String,
+        subject: String,
+    },
     Prose(String),
     Studio(Vec<Step>),
     Delta {
@@ -238,13 +408,29 @@ impl Entry {
         Entry::Detail(text.to_string())
     }
 
+    pub fn failure(what: &str, subject: &str) -> Self {
+        Entry::Failure {
+            what: what.to_string(),
+            subject: subject.to_string(),
+        }
+    }
+
     pub fn tool(state: State, instrument: &str, target: &str, duration: Option<&str>) -> Self {
         Entry::Tool {
             state,
             instrument: instrument.to_string(),
             target: target.to_string(),
             duration: duration.map(str::to_string),
+            summary: None,
         }
+    }
+
+    /// The same tool line, with what it came back with.
+    pub fn summarised(mut self, text: &str) -> Self {
+        if let Entry::Tool { summary, .. } = &mut self {
+            *summary = Some(text.to_string());
+        }
+        self
     }
 }
 
@@ -279,6 +465,12 @@ pub struct SessionItem {
     /// The JSONL file this row stands for, so choosing the row can open it.
     /// Empty for the mockup fixtures, which stand for no file on disk.
     pub path: String,
+    /// What the panel footer says about the highlighted row: `42 turns │
+    /// 128k tokens │ forked from provider-parity` (`1f`). Empty runs are
+    /// dropped from the footer.
+    pub turns: String,
+    pub tokens: String,
+    pub lineage: String,
 }
 
 impl SessionItem {
@@ -287,11 +479,21 @@ impl SessionItem {
             name: name.to_string(),
             age: age.to_string(),
             path: String::new(),
+            turns: String::new(),
+            tokens: String::new(),
+            lineage: String::new(),
         }
     }
 
     pub fn at(mut self, path: &str) -> Self {
         self.path = path.to_string();
+        self
+    }
+
+    pub fn facts(mut self, turns: &str, tokens: &str, lineage: &str) -> Self {
+        self.turns = turns.to_string();
+        self.tokens = tokens.to_string();
+        self.lineage = lineage.to_string();
         self
     }
 }
@@ -357,6 +559,8 @@ pub struct TreeRow {
     pub name: String,
     /// `Δ` when the file or directory has changes, `×` when it is failing.
     pub status: Option<State>,
+    /// The row in hand: a copper bar and a tint, like every other selection.
+    pub selected: bool,
 }
 
 impl TreeRow {
@@ -366,7 +570,13 @@ impl TreeRow {
             twisty: twisty.map(str::to_string),
             name: name.to_string(),
             status,
+            selected: false,
         }
+    }
+
+    pub fn current(mut self) -> Self {
+        self.selected = true;
+        self
     }
 }
 
@@ -539,6 +749,330 @@ pub struct BudgetMeta {
     pub history: String,
 }
 
+/// Whether a credential stands behind a provider or a catalog row (`3a`,
+/// `3d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Credential {
+    Ready,
+    Pending,
+    Expired,
+    #[default]
+    Absent,
+    Local,
+}
+
+/// One row of the full model catalog (`3a`). Rows with no credential stay
+/// listed, dimmed, so the catalog reads the same every time.
+#[derive(Debug, Clone, Default)]
+pub struct CatalogRow {
+    pub name: String,
+    pub window: String,
+    pub thinking: String,
+    pub price: String,
+    pub credential: Credential,
+    pub note: String,
+    /// Whether the row is one of the models `--models` ringed for this run.
+    pub ring: bool,
+    /// The provider and id behind the row, so choosing it can switch.
+    pub provider: String,
+    pub id: String,
+}
+
+/// One setting (`3b`), with the ramp of values it accepts and its scope.
+#[derive(Debug, Clone, Default)]
+pub struct SettingRow {
+    pub label: String,
+    pub value: String,
+    /// `true` when the project set it, overriding the user's value.
+    pub project: bool,
+    pub values: Vec<String>,
+    pub description: String,
+    /// The stored key behind the row, so a change knows where to land.
+    pub key: String,
+}
+
+/// One thinking level (`3c`). `fraction` is of the 64k ceiling, not of the
+/// window; `warn` marks a level that takes a third of the window.
+#[derive(Debug, Clone, Default)]
+pub struct ThinkingRow {
+    pub level: String,
+    pub budget: String,
+    pub fraction: f64,
+    pub maps_to: String,
+    pub warn: bool,
+}
+
+/// One provider credential and where it came from (`3d`).
+#[derive(Debug, Clone, Default)]
+pub struct ProviderRow {
+    pub name: String,
+    pub method: String,
+    pub source: String,
+    pub state: Credential,
+}
+
+/// The device-code grant in flight (`3d`).
+#[derive(Debug, Clone, Default)]
+pub struct DeviceCode {
+    pub code: String,
+    pub url: String,
+    pub expires: String,
+    pub polls: u32,
+}
+
+/// One group of the keymap (`3e`).
+#[derive(Debug, Clone, Default)]
+pub struct KeymapGroup {
+    pub title: String,
+    pub note: String,
+    pub rows: Vec<(String, String)>,
+}
+
+/// One session of the resume list (`4a`), with what resuming it would carry.
+#[derive(Debug, Clone, Default)]
+pub struct ResumeRow {
+    pub name: String,
+    pub branch: String,
+    pub turns: String,
+    pub tokens: String,
+    pub model: String,
+    pub touched: String,
+    pub named: bool,
+    pub warning: Option<String>,
+    pub note: String,
+    pub last: String,
+    pub path: String,
+}
+
+/// One row of the session tree (`4b`). Rows with no `id` are spacers that
+/// carry only the trunk, so the verticals stay continuous.
+#[derive(Debug, Clone, Default)]
+pub struct TreeNode {
+    pub trunk: String,
+    pub state: Option<State>,
+    pub id: Option<String>,
+    pub label: Option<String>,
+    pub meta: Option<String>,
+    /// The session entry behind the row, so choosing it can navigate.
+    pub entry_id: String,
+}
+
+/// What a compaction would do, before it does it (`4c`).
+#[derive(Debug, Clone, Default)]
+pub struct Compaction {
+    pub before_tokens: String,
+    pub before_fraction: f64,
+    pub before_note: String,
+    pub after_tokens: String,
+    pub after_fraction: f64,
+    pub after_note: String,
+    pub kept: Vec<String>,
+    pub folded: Vec<String>,
+    pub recovers: String,
+    pub call_cost: String,
+    pub cache_cost: String,
+}
+
+/// What an export carries out of the session (`4d`).
+#[derive(Debug, Clone, Default)]
+pub struct ExportLedger {
+    pub included: Vec<String>,
+    pub excluded: Vec<(State, String)>,
+    pub size: String,
+    pub elapsed: String,
+    pub gist: String,
+}
+
+/// One worker of a graph run (`5a`).
+#[derive(Debug, Clone, Default)]
+pub struct GraphTask {
+    pub id: String,
+    pub policy: String,
+    pub artifact: String,
+    pub usage: String,
+    pub state: State,
+}
+
+/// A task running as a graph of isolated workers (`5a`).
+#[derive(Debug, Clone, Default)]
+pub struct GraphRunSheet {
+    pub goal: String,
+    pub phases: Vec<(String, State)>,
+    pub shape: Vec<String>,
+    pub tasks: Vec<GraphTask>,
+    pub cost: String,
+    pub cost_cap: String,
+    pub cost_fraction: f64,
+    pub workers: String,
+    pub parallel: String,
+    pub cycles: String,
+    pub replans: String,
+    pub artifacts: String,
+}
+
+/// The vector index itself (`5b`).
+#[derive(Debug, Clone, Default)]
+pub struct VectorIndex {
+    pub repo: String,
+    pub repo_records: String,
+    pub total_records: String,
+    pub injection_cap: String,
+    pub floor: String,
+    /// `(kind, count, fraction, note)`.
+    pub kinds: Vec<(String, String, f64, String)>,
+    pub embeddings: String,
+    pub embed_host: String,
+    pub store: String,
+    pub collection: String,
+    pub extraction: String,
+    pub config: String,
+    pub health: Vec<(State, String)>,
+}
+
+/// One counter of the governor's ledger (`5c`).
+#[derive(Debug, Clone, Default)]
+pub struct GovernorCounter {
+    pub number: String,
+    pub of: String,
+    pub verb: String,
+    pub note: String,
+    /// Which theme colour the number is drawn in.
+    pub tone: Tone,
+}
+
+/// One stored output the governor holds on disk (`5c`).
+#[derive(Debug, Clone, Default)]
+pub struct GovernorStored {
+    pub id: String,
+    pub tool: String,
+    pub call: String,
+    pub size: String,
+    pub stale: bool,
+}
+
+/// What the governor did to this session's tool output (`5c`).
+#[derive(Debug, Clone, Default)]
+pub struct GovernorSheet {
+    pub counters: Vec<GovernorCounter>,
+    pub stored: Vec<GovernorStored>,
+    pub store_dir: String,
+}
+
+/// Which of the theme's inks a figure is drawn in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tone {
+    #[default]
+    Primary,
+    Secondary,
+    Warning,
+    Success,
+}
+
+/// A finding's severity band (`5d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Severity {
+    Critical,
+    High,
+    #[default]
+    Medium,
+    Low,
+    Dismissed,
+}
+
+/// One security finding (`5d`).
+#[derive(Debug, Clone, Default)]
+pub struct Finding {
+    pub message: String,
+    pub location: String,
+    pub severity: Severity,
+    pub rule: String,
+    pub evidence: String,
+    pub path: String,
+}
+
+/// A security scan mid-validation (`5d`).
+#[derive(Debug, Clone, Default)]
+pub struct SecurityScan {
+    pub validated: u32,
+    pub candidates: u32,
+    pub fraction: f64,
+    pub files: String,
+    pub skipped: String,
+    pub bytes: String,
+    pub severities: Vec<(String, u32, Severity)>,
+    pub dismissed: u32,
+    pub findings: Vec<Finding>,
+    pub seal: String,
+    pub report: String,
+}
+
+/// One file a project would load, before it is trusted (`6a`).
+#[derive(Debug, Clone, Default)]
+pub struct TrustFile {
+    pub state: State,
+    pub path: String,
+    pub detail: String,
+    pub risk_label: String,
+}
+
+/// What a project would load, before it is trusted (`6a`).
+#[derive(Debug, Clone, Default)]
+pub struct ProjectTrustSheet {
+    pub files: Vec<TrustFile>,
+    pub path: String,
+    pub trusted: String,
+    pub ignored: String,
+    pub store: String,
+}
+
+/// What `/reload` loaded, and what it cost (`6b`).
+#[derive(Debug, Clone, Default)]
+pub struct WorkshopSheet {
+    /// `(state, what, elapsed, error detail)`.
+    pub reload: Vec<(State, String, String, Option<String>)>,
+    pub native: Vec<(State, String, String)>,
+    pub javascript: Vec<(State, String, String)>,
+    pub node: String,
+    pub schema: String,
+    /// `(kind, count, fraction, note)`.
+    pub tools: Vec<(String, String, f64, String)>,
+}
+
+/// The turn that did not complete, and the interrupt after it (`6c`).
+#[derive(Debug, Clone, Default)]
+pub struct FailedRun {
+    pub prompt: String,
+    pub tools: Vec<(State, String, String)>,
+    pub kept: String,
+    pub billed: String,
+    pub aftermath: Vec<(State, String)>,
+}
+
+/// One file of the Δ review (`6d`), carrying its own hunk.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewFile {
+    pub state: State,
+    pub path: String,
+    pub adds: Option<u32>,
+    pub dels: Option<u32>,
+    pub tests: String,
+    pub test_state: State,
+    pub hunk_note: String,
+    pub hunk: Vec<Hunk>,
+}
+
+/// Every file the turn changed (`6d`).
+#[derive(Debug, Clone, Default)]
+pub struct ReviewSheet {
+    pub files: Vec<ReviewFile>,
+    pub adds: u32,
+    pub dels: u32,
+    pub branch: String,
+    pub behind: String,
+    pub warning: String,
+    pub tests: String,
+}
+
 /// What the session found when it opened — the empty state, screen `1a`.
 #[derive(Debug, Clone, Default)]
 pub struct Startup {
@@ -564,7 +1098,26 @@ pub struct Model {
     pub overlay: Option<Overlay>,
     pub codex: bool,
 
-    pub composer: String,
+    pub composer: Composer,
+    /// Configurable bindings shared with the regular TUI editor.
+    pub keybindings: Keybindings,
+    /// `(key, extension path)` for every `pi.registerShortcut` an extension
+    /// made, resolved against the keybindings so a shortcut never shadows a
+    /// reserved chord. The shell dispatches these before its own keys.
+    pub extension_shortcuts: Vec<(String, String)>,
+    /// An extension asked to see raw terminal input (`onTerminalInput`); the
+    /// shell offers it each chord before its own keys, as the legacy loop
+    /// does through `dispatch_terminal_input`.
+    pub terminal_input_registered: bool,
+    /// How many completion rows the composer offers — the stored
+    /// `autocomplete_max_visible`, clamped as the legacy chrome clamps it.
+    pub suggestion_rows: usize,
+    /// Whether the stored `show_terminal_progress` asked for OSC 9;4
+    /// progress reports while a turn runs.
+    pub terminal_progress: bool,
+    /// The stored double-escape action — `tree`, `fork` or `none` — kept on
+    /// the model so a settings change takes effect at once.
+    pub double_escape_action: String,
     /// Turns typed while one was already running, waiting their place. They
     /// sit in the composer box above the line being typed, so what is waiting
     /// is visible rather than remembered.
@@ -600,6 +1153,22 @@ pub struct Model {
     /// Workspace-relative paths, for completing a file name in the composer.
     /// Supplied by the shell; the view layer never walks a disk.
     pub paths: Vec<String>,
+    /// What `/` offers, and what its arguments offer. Supplied by the shell so
+    /// davinci and the legacy chrome complete against the same corpus through
+    /// the same engine (`crate::autocomplete`, which mirrors
+    /// `vendor/pi/packages/tui/src/autocomplete.ts`).
+    pub slash_commands: Vec<SlashCommandSpec>,
+    pub model_names: Vec<String>,
+    pub thinking_levels: Vec<String>,
+    pub login_providers: Vec<String>,
+    /// Autocomplete providers a loaded extension registered, keyed by their
+    /// trigger characters (`#` and friends).
+    pub extra_autocomplete: Vec<ExtraAutocompleteProvider>,
+    /// What the composer is offering right now, and which row is marked. A
+    /// list open here owns the arrows, tab and enter until it is taken or
+    /// dismissed (design.md §6: the most specific layer wins).
+    pub suggestions: Option<AutocompleteSuggestions>,
+    pub suggestion_index: usize,
     pub sessions: Vec<SessionItem>,
     pub models: Vec<ModelItem>,
     /// Where the model picker says the configuration lives (`1f`).
@@ -622,6 +1191,53 @@ pub struct Model {
     pub budget: Vec<BudgetRow>,
     pub budget_meta: BudgetMeta,
     pub proposal: Option<Proposal>,
+
+    // --- screens 3a–6d ------------------------------------------------------
+    /// `3a` — the full model catalog, and its selection.
+    pub catalog: Vec<CatalogRow>,
+    pub catalog_index: usize,
+    /// `3b` — the settings sheet.
+    pub settings_rows: Vec<SettingRow>,
+    pub settings_index: usize,
+    /// `3c` — the thinking sheet.
+    pub thinking_rows: Vec<ThinkingRow>,
+    pub thinking_index: usize,
+    /// `3d` — provider credentials, and the grant in flight if any.
+    pub providers: Vec<ProviderRow>,
+    pub login_index: usize,
+    pub device_code: Option<DeviceCode>,
+    /// `3e` — the keymap, and how far it is scrolled.
+    pub keymap: Vec<KeymapGroup>,
+    pub keys_offset: usize,
+    /// `4a` — the resume list, and how many sessions exist in all.
+    pub resume_sessions: Vec<ResumeRow>,
+    pub resume_index: usize,
+    pub session_count: usize,
+    /// `4b` — the session tree.
+    pub session_tree: Vec<TreeNode>,
+    pub tree_index: usize,
+    /// `4c` — the compaction preview.
+    pub compaction: Option<Compaction>,
+    /// `4d` — the export ledger.
+    pub export_ledger: Option<ExportLedger>,
+    /// `5a` — the graph run.
+    pub graph_run: Option<GraphRunSheet>,
+    /// `5b` — the vector index.
+    pub vector_index: Option<VectorIndex>,
+    /// `5c` — the governor's ledger.
+    pub governor: Option<GovernorSheet>,
+    /// `5d` — the security scan, and its selection.
+    pub security: Option<SecurityScan>,
+    pub security_index: usize,
+    /// `6a` — project trust.
+    pub project_trust: Option<ProjectTrustSheet>,
+    /// `6b` — the workshop.
+    pub workshop: Option<WorkshopSheet>,
+    /// `6c` — the interrupt aftermath.
+    pub failed_run: Option<FailedRun>,
+    /// `6d` — the Δ review, and which file is in hand.
+    pub review: Option<ReviewSheet>,
+    pub diff_index: usize,
 }
 
 impl Model {
@@ -635,7 +1251,13 @@ impl Model {
             screen: Screen::Agent,
             overlay: None,
             codex: false,
-            composer: String::new(),
+            composer: Composer::default(),
+            keybindings: Keybindings::defaults(),
+            extension_shortcuts: Vec::new(),
+            terminal_input_registered: false,
+            suggestion_rows: SUGGESTION_ROWS,
+            terminal_progress: false,
+            double_escape_action: "tree".into(),
             queued: Vec::new(),
             extensions: Extensions::default(),
             query: String::new(),
@@ -656,6 +1278,13 @@ impl Model {
             corpus: Vec::new(),
             corpus_total: 0,
             paths: Vec::new(),
+            slash_commands: Vec::new(),
+            model_names: Vec::new(),
+            thinking_levels: Vec::new(),
+            login_providers: Vec::new(),
+            extra_autocomplete: Vec::new(),
+            suggestions: None,
+            suggestion_index: 0,
             sessions: Vec::new(),
             models: Vec::new(),
             config_path: String::new(),
@@ -670,6 +1299,34 @@ impl Model {
             budget: Vec::new(),
             budget_meta: BudgetMeta::default(),
             proposal: None,
+            catalog: Vec::new(),
+            catalog_index: 0,
+            settings_rows: Vec::new(),
+            settings_index: 0,
+            thinking_rows: Vec::new(),
+            thinking_index: 0,
+            providers: Vec::new(),
+            login_index: 0,
+            device_code: None,
+            keymap: Vec::new(),
+            keys_offset: 0,
+            resume_sessions: Vec::new(),
+            resume_index: 0,
+            session_count: 0,
+            session_tree: Vec::new(),
+            tree_index: 0,
+            compaction: None,
+            export_ledger: None,
+            graph_run: None,
+            vector_index: None,
+            governor: None,
+            security: None,
+            security_index: 0,
+            project_trust: None,
+            workshop: None,
+            failed_run: None,
+            review: None,
+            diff_index: 0,
         }
     }
 
@@ -795,11 +1452,19 @@ impl Model {
     /// The word under the identity mark in the header.
     pub fn mode(&self) -> &'static str {
         match self.screen {
-            Screen::Agent => "agent",
+            Screen::Agent | Screen::Recovery | Screen::Diff => "agent",
             Screen::Plan => "plan",
-            Screen::Grafo => "grafo",
-            Screen::Memoria => "memoria",
-            Screen::Mensura => "mensura",
+            Screen::Grafo | Screen::GraphRun => "grafo",
+            Screen::Memoria | Screen::Resume | Screen::Tree | Screen::Export | Screen::Vectors => {
+                "memoria"
+            }
+            Screen::Mensura | Screen::Compact | Screen::Governor => "mensura",
+            Screen::Models | Screen::Thinking | Screen::Login => "cogitator",
+            Screen::Settings => "settings",
+            Screen::Keys => "keys",
+            Screen::Securitas => "securitas",
+            Screen::Trust => "fiducia",
+            Screen::Officina => "officina",
         }
     }
 
@@ -821,13 +1486,125 @@ impl Model {
 
     // --- reducers ------------------------------------------------------------
 
+    /// A bracketed paste: text, arriving whole. Newlines stay newlines in the
+    /// composer — the block was pasted, not typed, so none of them is a
+    /// submit — and are flattened in a query, which is one line by definition.
+    pub fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.overlay == Some(Overlay::Instrumenta) {
+            self.type_char(&text.replace('\n', " "));
+        } else {
+            self.type_char(&text);
+        }
+    }
+
     pub fn type_char(&mut self, text: &str) {
         if self.overlay == Some(Overlay::Instrumenta) {
             self.query.push_str(text);
             self.palette_index = 0;
         } else {
             self.composer.push_str(text);
+            self.refresh_suggestions();
         }
+    }
+
+    /// Recompute what the composer offers, after every edit that could change
+    /// it. Slash names and their arguments are matched in memory; only an `@`
+    /// token reaches the disk, which is what keeps this cheap enough to run on
+    /// each keystroke.
+    pub fn refresh_suggestions(&mut self) {
+        if self.overlay.is_some() || self.screen != Screen::Agent || self.codex_open() {
+            self.suggestions = None;
+            self.suggestion_index = 0;
+            return;
+        }
+        let text = self.composer.to_string();
+        let found = suggestions(SuggestionQuery {
+            text: &text,
+            commands: &self.slash_commands,
+            models: &self.model_names,
+            thinking_levels: &self.thinking_levels,
+            login_providers: &self.login_providers,
+            extra_providers: &self.extra_autocomplete,
+            cwd: Path::new(&self.cwd),
+            force_path: false,
+        });
+        // The whole list is kept: the composer window shows a slice of it
+        // around the selection, so a provider past the fold is still
+        // reachable with ↓ — truncating here silently lost everything past
+        // the cap.
+        self.suggestions = found;
+        self.suggestion_index = 0;
+    }
+
+    /// The visible slice of the suggestion list: `suggestion_rows` around the
+    /// selection. What is folded is counted by the view either side.
+    pub fn suggestion_window(&self) -> (usize, usize) {
+        let Some(found) = &self.suggestions else {
+            return (0, 0);
+        };
+        let len = found.items.len();
+        let window = self.suggestion_rows.max(1);
+        if len <= window {
+            return (0, len);
+        }
+        let start = self
+            .suggestion_index
+            .saturating_sub(window / 2)
+            .min(len - window);
+        (start, start + window)
+    }
+
+    /// Move down (`+1`) or up (`-1`) the offered list, wrapping at both ends.
+    /// Returns whether there was a list to move within.
+    pub fn suggestion_move(&mut self, delta: isize) -> bool {
+        let Some(found) = &self.suggestions else {
+            return false;
+        };
+        let len = found.items.len();
+        if len == 0 {
+            return false;
+        }
+        let index = self.suggestion_index.min(len - 1) as isize;
+        self.suggestion_index = (index + delta).rem_euclid(len as isize) as usize;
+        true
+    }
+
+    /// Take the marked row into the composer, replacing the token it completes.
+    pub fn accept_suggestion(&mut self) -> bool {
+        let Some(found) = self.suggestions.clone() else {
+            return false;
+        };
+        let Some(item) = found.items.get(self.suggestion_index) else {
+            return false;
+        };
+        let text = self.composer.to_string();
+        let cursor = self.composer.editor().cursor.min(text.len());
+        let completed = apply_completion(&text, cursor, &found.prefix, item);
+        // Taking the row the composer already holds is not a completion. The
+        // list steps aside so the next enter sends, rather than trapping the
+        // user in a suggestion they have already accepted.
+        if completed == text {
+            self.dismiss_suggestions();
+            return false;
+        }
+        self.composer.set_text(completed);
+        let end = self.composer.editor().buffer.len();
+        self.composer.editor_mut().cursor = end;
+        // What the composer now holds may itself be completable — `/model `
+        // offers the models — so ask again rather than closing blind.
+        self.refresh_suggestions();
+        true
+    }
+
+    /// esc with a list open closes the list rather than the screen behind it.
+    pub fn dismiss_suggestions(&mut self) -> bool {
+        if self.suggestions.is_none() {
+            return false;
+        }
+        self.suggestions = None;
+        self.suggestion_index = 0;
+        true
     }
 
     /// A newline inside the composer. The hint line promises `shift+enter
@@ -837,6 +1614,7 @@ impl Model {
             return;
         }
         self.composer.push('\n');
+        self.refresh_suggestions();
     }
 
     /// Complete the token under the caret against the commands and the
@@ -849,10 +1627,15 @@ impl Model {
         if self.overlay.is_some() {
             return false;
         }
+        // Past the whitespace, not one byte past its start: a non-breaking
+        // space is whitespace and is two bytes wide, so `index + 1` landed
+        // mid-character and the slice below panicked.
         let start = self
             .composer
-            .rfind(|ch: char| ch.is_whitespace())
-            .map(|index| index + 1)
+            .char_indices()
+            .filter(|(_, ch)| ch.is_whitespace())
+            .next_back()
+            .map(|(index, ch)| index + ch.len_utf8())
             .unwrap_or(0);
         let token = &self.composer[start..];
         if token.is_empty() {
@@ -888,23 +1671,26 @@ impl Model {
     }
 
     pub fn backspace(&mut self) {
-        let target = if self.overlay == Some(Overlay::Instrumenta) {
-            &mut self.query
-        } else {
-            &mut self.composer
-        };
-        target.pop();
         if self.overlay == Some(Overlay::Instrumenta) {
+            self.query.pop();
             self.palette_index = 0;
+        } else {
+            self.composer.editor_mut().backspace();
+            self.refresh_suggestions();
         }
     }
 
     /// Enter sends. An empty composer sends nothing.
+    ///
+    /// The line goes through [`Editor::submit`], which is what records it in
+    /// the composer history and expands any paste markers — taking the buffer
+    /// directly shipped markers literally and remembered nothing.
     pub fn submit(&mut self) {
         if self.composer.trim().is_empty() {
             return;
         }
-        let text = std::mem::take(&mut self.composer);
+        let text = self.composer.editor_mut().submit();
+        self.dismiss_suggestions();
         if !self.transcript.is_empty() {
             self.transcript.push(Entry::Gap);
         }
@@ -915,12 +1701,15 @@ impl Model {
     }
 
     /// Set the composer aside to be sent when the running turn is over.
-    /// Returns whether anything was queued.
+    /// Returns whether anything was queued. Queued lines join the history
+    /// too: they were typed and sent, only later.
     pub fn queue(&mut self) -> bool {
         if self.composer.trim().is_empty() {
             return false;
         }
-        self.queued.push(std::mem::take(&mut self.composer));
+        let text = self.composer.editor_mut().submit();
+        self.queued.push(text);
+        self.dismiss_suggestions();
         true
     }
 
@@ -930,6 +1719,21 @@ impl Model {
     pub fn interrupt(&mut self) {
         self.running = false;
         self.queued.clear();
+    }
+
+    /// Keep the transcript bounded. A multi-hour session grows without limit
+    /// otherwise, and every entry kept is memory held for the life of the
+    /// process. The cut lands on a block boundary so no block is beheaded.
+    pub fn trim_transcript(&mut self) {
+        const TRANSCRIPT_CAP: usize = 4000;
+        if self.transcript.len() <= TRANSCRIPT_CAP {
+            return;
+        }
+        let mut cut = self.transcript.len() - TRANSCRIPT_CAP;
+        while cut < self.transcript.len() && !matches!(self.transcript[cut], Entry::Gap) {
+            cut += 1;
+        }
+        self.transcript.drain(..cut);
     }
 
     /// esc closes the instrument in hand and returns to the transcript.
@@ -1128,6 +1932,101 @@ mod tests {
         assert_eq!(m.composer, "gi");
     }
 
+    fn with_commands() -> Model {
+        let mut m = model(100);
+        m.slash_commands = ["settings", "sessions", "model", "compact"]
+            .into_iter()
+            .map(|name| SlashCommandSpec {
+                name: name.to_string(),
+                description: format!("the {name} command"),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            })
+            .collect();
+        m
+    }
+
+    #[test]
+    fn typing_a_slash_offers_the_commands_it_could_be() {
+        let mut m = with_commands();
+        m.type_char("/");
+        let offered = m.suggestions.as_ref().expect("a bare slash offers all");
+        assert_eq!(offered.items.len(), 4);
+
+        m.type_char("se");
+        let names: Vec<&str> = m
+            .suggestions
+            .as_ref()
+            .expect("/se still matches")
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert!(names.contains(&"settings"), "got {names:?}");
+        assert!(names.contains(&"sessions"), "got {names:?}");
+        assert!(!names.contains(&"compact"), "got {names:?}");
+    }
+
+    #[test]
+    fn nothing_is_offered_for_ordinary_prose() {
+        let mut m = with_commands();
+        m.type_char("explain the runtime");
+        assert!(m.suggestions.is_none());
+    }
+
+    #[test]
+    fn taking_a_row_puts_it_in_the_composer() {
+        let mut m = with_commands();
+        m.type_char("/se");
+        m.suggestion_move(1);
+        let taken = m.suggestions.as_ref().unwrap().items[m.suggestion_index]
+            .label
+            .clone();
+        assert!(m.accept_suggestion());
+        assert_eq!(m.composer, format!("/{taken} "));
+    }
+
+    #[test]
+    fn a_row_already_in_the_composer_is_not_a_completion() {
+        let mut m = with_commands();
+        m.type_char("/compact");
+        // `/compact ` is what taking the only row would produce, so the first
+        // enter completes it and the second must be free to send.
+        assert!(m.accept_suggestion());
+        assert_eq!(m.composer, "/compact ");
+        assert!(!m.accept_suggestion());
+        assert!(m.suggestions.is_none());
+    }
+
+    #[test]
+    fn escape_closes_the_list_before_anything_else() {
+        let mut m = with_commands();
+        m.type_char("/se");
+        assert!(m.dismiss_suggestions());
+        assert!(m.suggestions.is_none());
+        assert!(!m.dismiss_suggestions());
+        assert_eq!(m.composer, "/se", "the composer is not disturbed");
+    }
+
+    #[test]
+    fn backspacing_narrows_what_is_offered() {
+        let mut m = with_commands();
+        m.type_char("/settingsx");
+        assert!(m.suggestions.is_none(), "nothing matches that");
+        m.backspace();
+        assert!(m.suggestions.is_some(), "removing the typo offers again");
+    }
+
+    #[test]
+    fn an_open_instrument_takes_the_offer_off_the_screen() {
+        let mut m = with_commands();
+        m.type_char("/se");
+        assert!(m.suggestions.is_some());
+        m.toggle_overlay(Overlay::Instrumenta);
+        m.refresh_suggestions();
+        assert!(m.suggestions.is_none());
+    }
+
     #[test]
     fn submit_appends_a_turn_and_clears_the_composer() {
         let mut m = model(120);
@@ -1317,7 +2216,7 @@ mod tests {
         m.composer = "explain the runtime".into();
         assert!(!m.complete(), "prose has nothing to complete against");
 
-        m.composer = String::new();
+        m.composer = String::new().into();
         assert!(!m.complete(), "an empty composer completes to nothing");
     }
 
@@ -1373,6 +2272,56 @@ mod tests {
         );
         // Never cut a multi-byte character in half.
         assert_eq!(common_prefix(&["éa", "éb"]).as_deref(), Some("é"));
+    }
+
+    #[test]
+    fn completing_after_a_non_breaking_space_does_not_split_a_character() {
+        // U+00A0 is whitespace and two bytes wide. Stepping one byte past its
+        // start landed mid-character, and the slice that follows panicked —
+        // inside the alternate screen, on text pasted from a browser.
+        let mut m = model(100);
+        m.corpus = vec![CorpusItem::new("/compact", "", "command")];
+        m.composer = "look\u{a0}/comp".into();
+        assert!(m.complete());
+        assert!(
+            m.composer.to_string().starts_with("look\u{a0}/compact"),
+            "{}",
+            m.composer.to_string()
+        );
+
+        m.composer = "look\u{3000}at".into();
+        m.complete();
+    }
+
+    #[test]
+    fn a_paste_is_text_not_a_run_of_submits() {
+        let mut m = model(100);
+        m.paste("first line\r\nsecond line");
+        assert_eq!(m.composer.to_string(), "first line\nsecond line");
+
+        // A query is one line by definition, so a pasted block flattens.
+        let mut m = model(100);
+        m.toggle_overlay(Overlay::Instrumenta);
+        m.paste("one\ntwo");
+        assert_eq!(m.query, "one two");
+    }
+
+    #[test]
+    fn the_transcript_is_bounded_and_cut_on_a_block_boundary() {
+        let mut m = model(100);
+        for turn in 0..3000 {
+            m.transcript.push(Entry::Gap);
+            m.transcript.push(Entry::user(&format!("turn {turn}")));
+        }
+        m.trim_transcript();
+        assert!(m.transcript.len() <= 4000, "{}", m.transcript.len());
+        // The cut lands on a Gap so no block is beheaded.
+        assert!(matches!(m.transcript.first(), Some(Entry::Gap)));
+        // The newest turns survive.
+        assert!(m
+            .transcript
+            .iter()
+            .any(|entry| matches!(entry, Entry::User(text) if text == "turn 2999")));
     }
 
     #[test]

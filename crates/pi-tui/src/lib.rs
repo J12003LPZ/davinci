@@ -17,6 +17,7 @@ mod footer;
 mod fuzzy;
 mod image;
 mod input;
+mod interaction;
 mod item_select_list;
 mod keybindings;
 mod keys;
@@ -109,6 +110,7 @@ pub use image::{
     KittyImageHeader, KittyImageMetadata, KittyImagePlacement, KITTY_IMAGE_PREFIX,
 };
 pub use input::{Input, InputAction};
+pub use interaction::key_event_bytes;
 pub use item_select_list::{
     ItemSelectList, SelectItem, SelectListLayoutOptions, SelectListTheme,
     SelectListTruncatePrimaryContext,

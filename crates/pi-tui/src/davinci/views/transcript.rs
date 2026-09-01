@@ -11,7 +11,8 @@ use super::studio;
 use crate::davinci::model::{Entry, HunkKind, Model};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip, detail_line, indent, span, span_strong, tool_line, wrap, MEASURE,
+    blank, clip_ellipsis, detail_line, failure_line, indent, span, span_strong, tool_line, wrap,
+    MEASURE,
 };
 
 /// Render a whole transcript, at a width that may be narrower than the window
@@ -23,6 +24,34 @@ pub fn lines(model: &Model, entries: &[Entry], width: u16) -> Vec<Line<'static>>
         .collect()
 }
 
+/// The last `height` rows of the transcript, rendered from the end.
+///
+/// Every entry renders independently, so a window's worth can be built by
+/// walking backwards until enough rows exist — rendering the whole transcript
+/// four times a second grew with the session and was the frame's whole cost.
+pub fn tail_lines(
+    model: &Model,
+    entries: &[Entry],
+    width: u16,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut total = 0usize;
+    for entry in entries.iter().rev() {
+        let rows = entry_lines(model, entry, width);
+        total += rows.len();
+        chunks.push(rows);
+        if total >= height {
+            break;
+        }
+    }
+    let mut out: Vec<Line<'static>> = chunks.into_iter().rev().flatten().collect();
+    if out.len() > height {
+        out = crate::davinci::ui::tail(out, height);
+    }
+    out
+}
+
 fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
     let th = &model.theme;
     match entry {
@@ -30,7 +59,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
         Entry::User(text) => vec![Line::from(vec![
             span(format!("{} ", glyph::USER), th.primary),
-            span(clip(text, width.saturating_sub(4)), th.muted),
+            span(clip_ellipsis(text, width.saturating_sub(4)), th.muted),
         ])],
 
         Entry::Agent(name) => vec![Line::from(vec![
@@ -43,6 +72,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             instrument,
             target,
             duration,
+            summary,
         } => vec![tool_line(
             width,
             th,
@@ -50,9 +80,12 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             instrument,
             target,
             duration.as_deref(),
+            summary.as_deref(),
         )],
 
         Entry::Detail(text) => vec![detail_line(th, text)],
+
+        Entry::Failure { what, subject } => vec![failure_line(th, what, subject)],
 
         Entry::Prose(text) => wrap(text, MEASURE.min(width.saturating_sub(2)))
             .into_iter()
@@ -69,7 +102,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
         } => {
             let mut rows = vec![Line::from(vec![
                 span(format!("{} ", glyph::DELTA), th.primary),
-                span(clip(path, width.saturating_sub(20)), th.text),
+                span(clip_ellipsis(path, width.saturating_sub(20)), th.text),
                 span(format!("  +{adds}"), th.success),
                 span(format!(" -{dels}"), th.error),
             ])];
@@ -91,7 +124,7 @@ fn hunk_line(theme: &Theme, hunk: &crate::davinci::model::Hunk, width: u16) -> L
         vec![
             span("│ ", theme.border),
             span(format!("{sign} "), color),
-            span(clip(&hunk.text, width.saturating_sub(10)), color),
+            span(clip_ellipsis(&hunk.text, width.saturating_sub(10)), color),
         ],
     )
 }
@@ -147,6 +180,25 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn tail_lines_matches_a_full_render_tailed_at_every_height() {
+        // The frame renders only the tail; it must draw exactly what the
+        // full render's tail would have drawn.
+        let m = model(100);
+        let entries = transcript();
+        let full = lines(&m, &entries, 100);
+        for height in [1usize, 3, 8, 15, 40, 200] {
+            let short = tail_lines(&m, &entries, 100, height);
+            let expected: Vec<String> = full
+                .iter()
+                .skip(full.len().saturating_sub(height))
+                .map(text)
+                .collect();
+            let got: Vec<String> = short.iter().map(text).collect();
+            assert_eq!(got, expected, "at height {height}");
+        }
     }
 
     /// Screen `1b`, verbatim.
@@ -256,8 +308,9 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         let drawn = text(&rows[0]);
-        assert!(drawn.starts_with("  ✓ manus · cargo fmt"), "{drawn}");
-        assert!(drawn.ends_with("0.31s"), "{drawn}");
+        assert!(drawn.starts_with("  ⎿ ✓ cargo fmt"), "{drawn}");
+        assert!(drawn.contains("· 0.31s"), "{drawn}");
+        assert!(drawn.ends_with("· manus"), "{drawn}");
         assert!(!drawn.contains('╭'));
     }
 
@@ -278,16 +331,32 @@ mod tests {
         let kept = failure_detail(&body);
         assert_eq!(kept.len(), 4);
 
+        // Tool detail sits two columns under the tool line (design.md §3).
         let rows = lines(
             &m,
-            &[Entry::detail(
-                "error[E0308] mismatched types · store.rs:118",
+            &[Entry::failure(
+                "error[E0308]",
+                "mismatched types · store.rs:118",
             )],
             100,
         );
         let drawn = text(&rows[0]);
-        assert!(drawn.starts_with("      error[E0308]"), "{drawn}");
+        assert!(drawn.starts_with("    error[E0308]"), "{drawn}");
         assert!(drawn.contains("store.rs:118"));
+        assert_eq!(rows[0].spans[1].style.fg, Some(m.theme.error));
+    }
+
+    #[test]
+    fn a_failure_detail_carries_a_glyph_under_no_color() {
+        let mut m = model(100);
+        m.theme = Theme::da_vinci(ColorDepth::TrueColor, true);
+        let rows = lines(
+            &m,
+            &[Entry::failure("1 failed", "store::roundtrip_windows_paths")],
+            100,
+        );
+        let drawn = text(&rows[0]);
+        assert!(drawn.contains("! 1 failed"), "{drawn}");
     }
 
     #[test]

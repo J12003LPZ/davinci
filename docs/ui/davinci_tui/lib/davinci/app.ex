@@ -13,8 +13,10 @@ defmodule Davinci.App do
   import Ratatouille.View
 
   alias Davinci.{Model, Theme, Ui}
-  alias Davinci.Views.{Chrome, Cogitator, Codex, Disegno, Grafo, Instrumenta, Memoria,
-                       Mensura, Startup, Transcript}
+  alias Davinci.Views.{Chrome, Codex, Cogitator, Compact, Diff, Disegno, Export,
+                       Governor, Grafo, GraphRun, Instrumenta, Keys, Login, Memoria,
+                       Mensura, Officina, Recovery, Resume, Securitas, Settings,
+                       Startup, Thinking, Transcript, Tree, Trust, Vectors}
   alias Ratatouille.Constants
   alias Ratatouille.Runtime.Subscription
 
@@ -142,6 +144,35 @@ defmodule Davinci.App do
       model.screen == :memoria ->
         %{model | recall_index: wrap(model.recall_index + delta, length(Model.recall()))}
 
+      model.screen == :models ->
+        %{model | catalog_index: wrap(model.catalog_index + delta, length(Model.catalog()))}
+
+      model.screen == :settings ->
+        %{model | settings_index: wrap(model.settings_index + delta, length(Model.settings()))}
+
+      model.screen == :thinking ->
+        %{model | thinking_index: wrap(model.thinking_index + delta, length(Model.thinking_levels()))}
+
+      model.screen == :login ->
+        %{model | login_index: wrap(model.login_index + delta, length(Model.providers()))}
+
+      # The keymap scrolls rather than wrapping: a reference sheet that jumped
+      # back to the top mid-read would be worse than one that stops.
+      model.screen == :keys ->
+        %{model | keys_offset: max(model.keys_offset + delta, 0)}
+
+      model.screen == :resume ->
+        %{model | resume_index: wrap(model.resume_index + delta, length(Model.resume_sessions()))}
+
+      model.screen == :tree ->
+        %{model | tree_index: wrap(model.tree_index + delta, Enum.count(Model.session_tree(), & &1.id))}
+
+      model.screen == :securitas ->
+        %{model | security_index: wrap(model.security_index + delta, length(Model.security_scan().findings))}
+
+      model.screen == :diff ->
+        %{model | diff_index: wrap(model.diff_index + delta, length(Model.review().files))}
+
       true ->
         model
     end
@@ -171,7 +202,7 @@ defmodule Davinci.App do
         [Codex.render(model, content_rows)]
       else
         model
-        |> content()
+        |> content(content_rows)
         |> Ui.tail(content_rows)
         |> Ui.pad_to(content_rows)
       end
@@ -179,7 +210,13 @@ defmodule Davinci.App do
     content ++ composer
   end
 
-  defp content(model) do
+  # `rows` is what the window has left after the composer. Only the reference
+  # sheet needs it: `Ui.tail/2` keeps the *last* rows, which is right for a
+  # transcript and wrong for a sheet, where it would silently eat the first
+  # group.
+  defp content(%{screen: :keys} = model, rows), do: Keys.lines(model, rows)
+
+  defp content(model, _rows) do
     case {model.screen, model.overlay} do
       {:plan, _} ->
         Disegno.lines(model)
@@ -192,6 +229,54 @@ defmodule Davinci.App do
 
       {:mensura, _} ->
         Mensura.lines(model)
+
+      {:models, _} ->
+        Cogitator.lines(model)
+
+      {:settings, _} ->
+        Settings.lines(model)
+
+      {:thinking, _} ->
+        Thinking.lines(model)
+
+      {:login, _} ->
+        Login.lines(model)
+
+      {:resume, _} ->
+        Resume.lines(model)
+
+      {:tree, _} ->
+        Tree.lines(model)
+
+      {:compact, _} ->
+        Compact.lines(model)
+
+      {:export, _} ->
+        Export.lines(model)
+
+      {:graph_run, _} ->
+        GraphRun.lines(model)
+
+      {:vectors, _} ->
+        Vectors.lines(model)
+
+      {:governor, _} ->
+        Governor.lines(model)
+
+      {:securitas, _} ->
+        Securitas.lines(model)
+
+      {:trust, _} ->
+        Trust.lines(model)
+
+      {:officina, _} ->
+        Officina.lines(model)
+
+      {:recovery, _} ->
+        Recovery.lines(model)
+
+      {:diff, _} ->
+        Diff.lines(model)
 
       {_, :instrumenta} ->
         dimmed(model) ++ [Ui.blank()] ++ Instrumenta.lines(model)
@@ -250,6 +335,60 @@ defmodule Davinci.App do
 
       {:mensura, _} ->
         Chrome.composer(model, placeholder: "/mensura policy frugal", hint: :closable)
+
+      {:models, _} ->
+        Chrome.composer(model, placeholder: "/model anthropic/claude-opus", hint: :closable)
+
+      {:settings, _} ->
+        Chrome.composer(model, placeholder: "/settings", hint: :closable)
+
+      {:thinking, _} ->
+        Chrome.composer(model, placeholder: "/thinking high", hint: :closable)
+
+      {:login, _} ->
+        Chrome.composer(model, placeholder: "/login openai", hint: :closable)
+
+      {:keys, _} ->
+        Chrome.composer(model, placeholder: "/hotkeys", hint: :closable)
+
+      {:resume, _} ->
+        Chrome.composer(model, placeholder: "/resume provider-parity", hint: :closable)
+
+      {:tree, _} ->
+        Chrome.composer(model, placeholder: "/tree", hint: :closable)
+
+      {:compact, _} ->
+        Chrome.composer(model, placeholder: "/compact keep the store.rs decisions", hint: :closable)
+
+      {:export, _} ->
+        Chrome.composer(model, placeholder: "/share", hint: :closable)
+
+      {:graph_run, _} ->
+        Chrome.composer(model, placeholder: "/graph-view t6", hint: :closable)
+
+      {:vectors, _} ->
+        Chrome.composer(model, placeholder: "/memory-search interrupt handling", hint: :closable)
+
+      {:governor, _} ->
+        Chrome.composer(model, placeholder: "/governor-status", hint: :closable)
+
+      {:securitas, _} ->
+        Chrome.composer(model, placeholder: "/sec-report --severity high", hint: :closable)
+
+      {:officina, _} ->
+        Chrome.composer(model, placeholder: "/reload", hint: :closable)
+
+      {:diff, _} ->
+        Chrome.composer(model, placeholder: "fix the two legacy.rs references", hint: :closable)
+
+      # After an interrupt the composer is the way out, so it keeps the full
+      # send hints rather than the instrument's "esc close".
+      {:recovery, _} ->
+        Chrome.composer(model, placeholder: "continue, but do the sse path first")
+
+      # Nothing has been loaded yet, so there is nothing to ask.
+      {:trust, _} ->
+        Chrome.composer(model, theme: Theme.dim(model.theme), placeholder: "decide first", hint: :none)
 
       {_, nil} ->
         Chrome.composer(model)

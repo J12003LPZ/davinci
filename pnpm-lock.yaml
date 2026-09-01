@@ -1,0 +1,53 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  packages/agent:
+    dependencies:
+      '@pi/ai':
+        specifier: workspace:*
+        version: link:../ai
+      '@pi/core':
+        specifier: workspace:*
+        version: link:../core
+      '@pi/session-sqlite':
+        specifier: workspace:*
+        version: link:../session-sqlite
+
+  packages/ai:
+    dependencies:
+      '@pi/core':
+        specifier: workspace:*
+        version: link:../core
+
+  packages/client:
+    dependencies:
+      '@pi/core':
+        specifier: workspace:*
+        version: link:../core
+
+  packages/core: {}
+
+  packages/server:
+    dependencies:
+      '@pi/agent':
+        specifier: workspace:*
+        version: link:../agent
+      '@pi/core':
+        specifier: workspace:*
+        version: link:../core
+      '@pi/session-sqlite':
+        specifier: workspace:*
+        version: link:../session-sqlite
+
+  packages/session-sqlite:
+    dependencies:
+      '@pi/core':
+        specifier: workspace:*
+        version: link:../core

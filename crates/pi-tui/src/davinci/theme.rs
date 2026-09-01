@@ -26,6 +26,9 @@ pub mod glyph {
     pub const PROMPT: &str = "›";
     pub const USER: &str = ">";
     pub const TICK: &str = "·";
+    /// The elbow a tool line hangs from, so a turn's calls read as one branch
+    /// under the agent mark rather than as loose rows.
+    pub const BRANCH: &str = "⎿";
     /// Studio, collapsed to one line below 100 columns (design.md §6).
     pub const COLLAPSED: &str = "⟐";
 
@@ -41,8 +44,9 @@ pub mod glyph {
 }
 
 /// Every state that has a glyph. Color is always secondary to this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum State {
+    #[default]
     Done,
     Active,
     Queued,

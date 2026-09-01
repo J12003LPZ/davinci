@@ -109,6 +109,7 @@ pub fn metadata_from_header(
             4
         },
         all_messages_text: String::new(),
+        message_count: 0,
     }
 }
 

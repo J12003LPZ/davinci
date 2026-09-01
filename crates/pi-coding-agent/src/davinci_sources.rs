@@ -301,19 +301,100 @@ pub fn startup(cwd: &Path, branch: &str, restored: bool) -> Startup {
     }
 }
 
-/// Fill the model from everything this workspace can actually answer.
-pub fn dress_from_workspace(model: &mut Model, cwd: &Path, session_dir: &Path) {
+/// Everything [`dress_from_workspace`] reads, as data, so the reading — four
+/// git subprocesses and a tree walk — can happen on a worker thread instead
+/// of the drawing one.
+pub struct WorkspaceDress {
+    pub cwd: String,
+    pub branch: String,
+    pub changes: (u32, u32, u32),
+    pub changes_list: Vec<ChangeRow>,
+    pub tree: Vec<TreeRow>,
+    pub paths: Vec<String>,
+    pub sessions: Vec<SessionItem>,
+    pub startup: Startup,
+}
+
+/// Read everything the workspace can answer. Safe on any thread.
+pub fn compute_workspace_dress(cwd: &Path, session_dir: &Path) -> WorkspaceDress {
     let branch = pi_tui::resolve_git_branch(cwd).unwrap_or_default();
     let changes = git_changes(cwd);
+    let sessions = sessions(session_dir, pi_session::now_ms());
+    let startup = startup(cwd, &branch, !sessions.is_empty());
+    WorkspaceDress {
+        cwd: cwd.display().to_string(),
+        branch,
+        changes: git_delta(cwd, &changes),
+        changes_list: change_rows(cwd, &changes),
+        tree: workspace_tree(cwd, &changes),
+        paths: completion_paths(cwd),
+        sessions,
+        startup,
+    }
+}
 
-    model.cwd = cwd.display().to_string();
-    model.branch = branch.clone();
-    model.changes = git_delta(cwd, &changes);
-    model.changes_list = change_rows(cwd, &changes);
-    model.tree = workspace_tree(cwd, &changes);
-    model.paths = completion_paths(cwd);
-    model.sessions = sessions(session_dir, pi_session::now_ms());
-    model.startup = startup(cwd, &branch, !model.sessions.is_empty());
+/// Put a computed dress on the model.
+pub fn apply_workspace_dress(model: &mut Model, dress: WorkspaceDress) {
+    model.cwd = dress.cwd;
+    model.branch = dress.branch;
+    model.changes = dress.changes;
+    model.changes_list = dress.changes_list;
+    model.tree = dress.tree;
+    model.paths = dress.paths;
+    model.sessions = dress.sessions;
+    model.startup = dress.startup;
+}
+
+/// Fill the model from everything this workspace can actually answer,
+/// synchronously — the opening frame, and tests.
+pub fn dress_from_workspace(model: &mut Model, cwd: &Path, session_dir: &Path) {
+    apply_workspace_dress(model, compute_workspace_dress(cwd, session_dir));
+}
+
+/// A worker that re-reads the workspace off the drawing thread.
+///
+/// `redress()` used to spawn four git subprocesses and walk the tree from the
+/// key-handling path, which is a visible stall on a large repository. Requests
+/// are coalesced: however many pile up while one read runs, the worker reads
+/// once more.
+pub struct WorkspaceDresser {
+    requests: std::sync::mpsc::Sender<()>,
+    results: std::sync::mpsc::Receiver<WorkspaceDress>,
+}
+
+impl WorkspaceDresser {
+    pub fn start(cwd: PathBuf, session_dir: PathBuf) -> Self {
+        let (requests, incoming) = std::sync::mpsc::channel::<()>();
+        let (outgoing, results) = std::sync::mpsc::channel::<WorkspaceDress>();
+        std::thread::spawn(move || {
+            while incoming.recv().is_ok() {
+                // Coalesce the backlog: one read answers them all.
+                while incoming.try_recv().is_ok() {}
+                if outgoing
+                    .send(compute_workspace_dress(&cwd, &session_dir))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self { requests, results }
+    }
+
+    /// Ask for a re-read; returns at once.
+    pub fn request(&self) {
+        let _ = self.requests.send(());
+    }
+
+    /// Apply any finished read; `true` when the model changed.
+    pub fn apply_ready(&self, model: &mut Model) -> bool {
+        let mut dirty = false;
+        while let Ok(dress) = self.results.try_recv() {
+            apply_workspace_dress(model, dress);
+            dirty = true;
+        }
+        dirty
+    }
 }
 
 #[cfg(test)]
@@ -424,6 +505,7 @@ mod tests {
             parent_session_id: None,
             source_format: 4,
             all_messages_text: "explain how the agent runtime works\nsure".into(),
+            message_count: 2,
         };
         assert_eq!(session_name(&summary), "tui-redesign");
 

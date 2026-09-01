@@ -29,12 +29,18 @@ pub fn install_shutdown_watchers(dispose: impl Fn(i32) + Send + Sync + 'static) 
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term));
     #[cfg(unix)]
     let _ = signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&hup));
+    // `process::exit` runs no destructor, so the TUI's own `Drop` never gives
+    // the terminal back: a killed pi used to leave the shell in raw mode
+    // inside the alternate screen. `restore` is idempotent and a no-op when no
+    // TUI ever opened.
     thread::spawn(move || loop {
         if term.load(Ordering::SeqCst) {
+            let _ = pi_tui::davinci::runtime::restore();
             dispose(143);
             std::process::exit(143);
         }
         if hup.load(Ordering::SeqCst) {
+            let _ = pi_tui::davinci::runtime::restore();
             dispose(129);
             std::process::exit(129);
         }

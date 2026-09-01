@@ -117,6 +117,22 @@ fn hosted_queue_line(role: &'static str, text: String) {
     }
 }
 
+/// Say whether a TUI owns the screen. The davinci shell holds the alternate
+/// screen too, so without this every stray `println!` in shared code painted
+/// straight over its frame.
+fn set_hosted_tui_active(active: bool) {
+    HOSTED_TUI_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The queue `drain_hosted_lines` empties, for a shell that keeps its
+/// transcript somewhere other than the legacy chrome.
+fn take_hosted_lines() -> Vec<(&'static str, String)> {
+    HOSTED_PENDING_LINES
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default()
+}
+
 /// Shadow `std::println!`: while the TUI hosts the screen, route the line
 /// into the transcript (drained by `sync_hosted_chrome`) instead of stdout.
 /// Textual macro scope: every `println!` after this point uses it.
@@ -524,7 +540,10 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     let mut host = ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd);
     let mut names = host.native_tool_names();
-    names.extend(extensions.clone());
+    // The extension *paths* are not tool names — TS registers only what an
+    // extension declares (`resolvedExtensionPaths` never reaches the tool
+    // registry). Registering them here put rows like
+    // `C:/Users/…/pi-main/packages/…` in the palette's tool corpus.
     names.extend(extensions::extension_tool_names(&host.manifests));
     for ext in &host.js {
         names.extend(ext.tools.iter().cloned());
@@ -1403,7 +1422,12 @@ fn complete_prompt_with_host(
     let hook_host = host.clone();
     let tool_state_cwd = agent.cwd.clone();
     agent.pre_tool = Some(pi_agent::PreToolHook(Arc::new(move |name, args| {
-        let mut host = hook_host.lock().ok()?;
+        // A poisoned lock used to bail out of the closure with `None`, which
+        // the agent reads as "not blocked": one panic anywhere holding this
+        // mutex silently disabled every pre-tool guard, the security scan's
+        // included, for the rest of the process. Take the value through the
+        // poison instead, as every other site here does.
+        let mut host = hook_host.lock().unwrap_or_else(|err| err.into_inner());
         host.emit(ExtensionEvent::ToolCall {
             tool_name: name.to_string(),
             args: args.clone(),
@@ -1489,7 +1513,12 @@ fn complete_prompt_with_host(
                     message,
                     stream_events: Some(stream_events),
                 }),
-                _ => Ok(CompleteOutput::from(AssistantMessage {
+                // Nothing was asked of a provider. Say which of the three
+                // reasons it was: an offline run answers with the stub the
+                // fixtures expect, but a missing model or a missing credential
+                // is a fault, and a reply that only counts the characters it
+                // was handed reads like an answer while hiding one.
+                (true, ..) => Ok(CompleteOutput::from(AssistantMessage {
                     id: pi_agent::new_message_id(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -1500,6 +1529,14 @@ fn complete_prompt_with_host(
                     stop_reason: Some(StopReason::Stop),
                     error_message: None,
                 })),
+                (false, None, ..) => Err(format!(
+                    "No model matched {}/{}. Run /model to choose one, or check ~/.pi/agent/models.json.",
+                    current.provider, current.model_id
+                )),
+                (false, Some(_), None, None) => Err(format!(
+                    "No credential for {provider}. Run /login {provider}.",
+                    provider = current.provider
+                )),
             }
         })
         .unwrap_or_else(|err| {
@@ -1588,20 +1625,33 @@ fn complete_prompt_with_host(
                 _ => {}
             }
         }
+        // Taken, not cloned: davinci shares one host across every turn, and
+        // re-reading the vector re-applied every past call — a fork would
+        // fork again on each later turn.
+        let session_calls = std::mem::take(&mut host.session_calls);
         apply_session_calls(
             Some(parsed),
             agent,
-            None,
-            &host.session_calls.clone(),
+            SessionCallUi::Silent,
+            &session_calls,
             false,
         );
-        if host.session_calls.iter().any(|call| {
+        if session_calls.iter().any(|call| {
             matches!(
                 call.get("op").and_then(|value| value.as_str()),
                 Some("newSession" | "fork" | "switchSession" | "reload")
             )
         }) {
             rebind_print_extensions(parsed, agent, &mut host);
+        }
+        // The davinci transcript is the only place those calls can be seen;
+        // print mode stays silent about them, as the TS reference is.
+        if hosted_tui_active() {
+            for call in &session_calls {
+                if let Some(line) = session_call_note(call) {
+                    println!("{line}");
+                }
+            }
         }
         let _ = host.kinds();
     }
@@ -2771,17 +2821,7 @@ fn run_interactive(
     session.cwd = agent.cwd.clone();
     session.slash_commands = interactive_slash_commands(agent, parsed);
     session.extra_autocomplete = interactive_extra_autocomplete(parsed);
-    // Every provider (OAuth and API-key) completes after `/login `, not just
-    // the OAuth subset.
-    let mut login_provider_ids: Vec<String> = PROVIDER_SPECS
-        .iter()
-        .map(|spec| spec.id.to_string())
-        .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
-        .chain(loaded_extension_host(parsed).js_oauth_provider_names())
-        .collect();
-    login_provider_ids.sort();
-    login_provider_ids.dedup();
-    session.login_providers = login_provider_ids;
+    session.login_providers = interactive_login_providers(parsed);
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     session.double_escape_action =
         DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
@@ -4481,6 +4521,14 @@ fn apply_interactive_setting(session: &mut InteractiveSession, spec: &str) -> Re
         }
         _ => {}
     }
+    persist_interactive_setting(spec)
+}
+
+/// The stored half of a settings change: write `id=value` into
+/// `settings.json`. Shared by the legacy overlay and the davinci sheet, so
+/// both write the same keys the same way.
+fn persist_interactive_setting(spec: &str) -> Result<(), String> {
+    let (id, value) = spec.split_once('=').unwrap_or((spec, ""));
     let dir = default_agent_dir();
     let mut stored = load_settings(&dir);
     match id {
@@ -4766,6 +4814,21 @@ fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     }
     println!("Usage: /login <provider> <api-key>");
     Ok(())
+}
+
+/// Every provider (OAuth and API-key) completes after `/login `, not just the
+/// OAuth subset. Shared by the legacy chrome and the davinci shell so both
+/// offer the same list.
+fn interactive_login_providers(parsed: &Args) -> Vec<String> {
+    let mut ids: Vec<String> = PROVIDER_SPECS
+        .iter()
+        .map(|spec| spec.id.to_string())
+        .chain(std::iter::once(llama::LLAMA_PROVIDER_ID.to_string()))
+        .chain(loaded_extension_host(parsed).js_oauth_provider_names())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandSpec> {
@@ -5382,7 +5445,6 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
     *host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
     let mut names = host.native_tool_names();
-    names.extend(parsed.extensions.clone());
     names.extend(extensions::extension_tool_names(&host.manifests));
     for ext in &host.js {
         names.extend(ext.tools.iter().cloned());
@@ -6272,7 +6334,7 @@ fn apply_host_session_calls(
     apply_session_calls(
         Some(parsed),
         agent,
-        Some(&mut session.chrome),
+        SessionCallUi::Chrome(&mut session.chrome),
         &allowed,
         trigger_turns,
     );
@@ -6297,10 +6359,79 @@ fn apply_host_session_calls(
     }
 }
 
+/// Where a session call's visible effects land. The state effects are the
+/// same everywhere; what differs is who gets told: the legacy chrome takes a
+/// status string, the davinci transcript takes a block (design.md §6 — the
+/// transcript is the only place a davinci shell can say anything), and the
+/// print path says nothing, as the TS reference does.
+pub(crate) enum SessionCallUi<'a> {
+    Chrome(&'a mut ChatChrome),
+    Davinci(&'a mut pi_tui::davinci::model::Model),
+    Silent,
+}
+
+impl SessionCallUi<'_> {
+    /// A transcript line: a user message an extension sent, exec output.
+    fn push(&mut self, kind: &str, text: &str) {
+        use pi_tui::davinci::model::Entry;
+        match self {
+            SessionCallUi::Chrome(chrome) => chrome.transcript.push(kind, text),
+            SessionCallUi::Davinci(model) => {
+                model.transcript.push(Entry::Gap);
+                if kind == "user" {
+                    model.transcript.push(Entry::user(text));
+                } else {
+                    model.transcript.push(Entry::prose(text));
+                }
+            }
+            SessionCallUi::Silent => {}
+        }
+    }
+
+    /// What just happened, in a word or two: `fork=…`, `model=…`.
+    fn status(&mut self, text: &str) {
+        use pi_tui::davinci::model::Entry;
+        use pi_tui::davinci::theme::State;
+        match self {
+            SessionCallUi::Chrome(chrome) => chrome.status = text.to_string(),
+            SessionCallUi::Davinci(model) => {
+                model.transcript.push(Entry::Gap);
+                model
+                    .transcript
+                    .push(Entry::tool(State::Done, "instrumenta", text, None));
+            }
+            SessionCallUi::Silent => {}
+        }
+    }
+}
+
+/// The one-line note a session call earns in a hosted transcript when it was
+/// applied where no UI handle was available (the post-turn sweep). Only the
+/// calls that change what the user is looking at are worth a line.
+fn session_call_note(call: &serde_json::Value) -> Option<String> {
+    let field = |key: &str| {
+        call.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    match call.get("op").and_then(|value| value.as_str())? {
+        "fork" => Some("an extension forked the session".into()),
+        "newSession" => Some("an extension started a new session".into()),
+        "switchSession" => Some(format!(
+            "an extension switched the session to {}",
+            field("sessionPath")
+        )),
+        "reload" => Some("an extension reloaded skills, prompts and context files".into()),
+        "setModel" => Some(format!("an extension set the model to {}", field("model"))),
+        "setSessionName" => Some(format!("an extension named the session {}", field("name"))),
+        _ => None,
+    }
+}
+
 fn apply_session_calls(
     parsed: Option<&Args>,
     agent: &mut Agent,
-    mut chrome: Option<&mut ChatChrome>,
+    mut ui: SessionCallUi,
     calls: &[serde_json::Value],
     trigger_turns: bool,
 ) {
@@ -6315,9 +6446,7 @@ fn apply_session_calls(
                 if text.is_empty() {
                     continue;
                 }
-                if let Some(chrome) = chrome.as_mut() {
-                    chrome.transcript.push("user", text);
-                }
+                ui.push("user", text);
                 let deliver = call
                     .get("options")
                     .and_then(|value| value.get("deliverAs"))
@@ -6383,27 +6512,21 @@ fn apply_session_calls(
             }
             Some("exec") => {
                 if let Some(stdout) = call.get("stdout").and_then(|value| value.as_str()) {
-                    if let Some(chrome) = chrome.as_mut() {
-                        chrome.transcript.push("exec", stdout);
-                        chrome.status = format!(
-                            "exec {}",
-                            call.get("command")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("")
-                        );
-                    }
+                    ui.push("exec", stdout);
+                    ui.status(&format!(
+                        "exec {}",
+                        call.get("command")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                    ));
                 } else if let Some(command) = call.get("command").and_then(|value| value.as_str()) {
                     match crate::js_host::execute_command_tool(command, &agent.cwd) {
                         Ok(out) => {
-                            if let Some(chrome) = chrome.as_mut() {
-                                chrome.transcript.push("exec", &out);
-                                chrome.status = format!("exec {command}");
-                            }
+                            ui.push("exec", &out);
+                            ui.status(&format!("exec {command}"));
                         }
                         Err(err) => {
-                            if let Some(chrome) = chrome.as_mut() {
-                                chrome.status = format!("exec error: {err}");
-                            }
+                            ui.status(&format!("exec error: {err}"));
                         }
                     }
                 }
@@ -6416,9 +6539,7 @@ fn apply_session_calls(
                 {
                     agent.messages.clear();
                     agent.session = Some(store);
-                    if let Some(chrome) = chrome.as_mut() {
-                        chrome.status = "newSession".into();
-                    }
+                    ui.status("newSession");
                 }
             }
             Some("fork") => {
@@ -6433,16 +6554,14 @@ fn apply_session_calls(
                         .to_string();
                     if let Ok(next) = store.fork(&entry_id, &session_dir) {
                         agent.load_from_session(next);
-                        if let Some(chrome) = chrome.as_mut() {
-                            chrome.status = format!(
-                                "fork={}",
-                                agent
-                                    .session
-                                    .as_ref()
-                                    .map(|session| session.header.id.clone())
-                                    .unwrap_or_default()
-                            );
-                        }
+                        ui.status(&format!(
+                            "fork={}",
+                            agent
+                                .session
+                                .as_ref()
+                                .map(|session| session.header.id.clone())
+                                .unwrap_or_default()
+                        ));
                     }
                 }
             }
@@ -6457,9 +6576,7 @@ fn apply_session_calls(
                     };
                     agent.provider = next_provider;
                     agent.model_id = model_id;
-                    if let Some(chrome) = chrome.as_mut() {
-                        chrome.status = format!("model={}/{}", agent.provider, agent.model_id);
-                    }
+                    ui.status(&format!("model={}/{}", agent.provider, agent.model_id));
                 }
             }
             Some("waitForIdle") => {}
@@ -6467,9 +6584,7 @@ fn apply_session_calls(
                 if let Some(path) = call.get("sessionPath").and_then(|value| value.as_str()) {
                     if let Ok(next) = JsonlSession::open(Path::new(path)) {
                         agent.load_from_session(next);
-                        if let Some(chrome) = chrome.as_mut() {
-                            chrome.status = format!("session={}", path);
-                        }
+                        ui.status(&format!("session={}", path));
                     }
                 }
             }
@@ -6481,9 +6596,7 @@ fn apply_session_calls(
                         .and_then(|value| value.as_bool())
                         .unwrap_or(false);
                     let _ = agent.navigate_tree_entry(target, summarize, None, false, 16_384);
-                    if let Some(chrome) = chrome.as_mut() {
-                        chrome.status = format!("tree={target}");
-                    }
+                    ui.status(&format!("tree={target}"));
                 }
             }
             Some("reload") => {
@@ -6491,10 +6604,9 @@ fn apply_session_calls(
                 agent.templates =
                     discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
                 agent.context_files = load_context_files(&agent.cwd, true);
-                if let Some(chrome) = chrome.as_mut() {
-                    chrome.status = "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
-                        .into();
-                }
+                ui.status(
+                    "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
+                );
             }
             Some("setActiveTools") => {
                 let names: Vec<String> = call
@@ -6508,9 +6620,7 @@ fn apply_session_calls(
                     })
                     .unwrap_or_default();
                 agent.set_active_tools_by_name(&names);
-                if let Some(chrome) = chrome.as_mut() {
-                    chrome.status = format!("tools {}", agent.tools.join(","));
-                }
+                ui.status(&format!("tools {}", agent.tools.join(",")));
             }
             Some("setThinkingLevel") => {
                 if let Some(level) = call
@@ -6519,9 +6629,7 @@ fn apply_session_calls(
                     .and_then(pi_protocol::ThinkingLevel::parse)
                 {
                     agent.thinking_level = level;
-                    if let Some(chrome) = chrome.as_mut() {
-                        chrome.status = format!("thinking {}", level.as_str());
-                    }
+                    ui.status(&format!("thinking {}", level.as_str()));
                 }
             }
             _ => {}
@@ -8264,7 +8372,7 @@ mod tests {
         apply_session_calls(
             Some(&parsed),
             &mut agent,
-            Some(&mut chrome),
+            SessionCallUi::Chrome(&mut chrome),
             &[
                 serde_json::json!({"op":"setModel","model":"sonnet","provider":"anthropic"}),
                 serde_json::json!({"op":"sendUserMessage","text":"hi","options":{"deliverAs":"steer"}}),

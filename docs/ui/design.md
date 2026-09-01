@@ -81,6 +81,21 @@ Line rhythm: one blank line between transcript blocks, none inside a block.
 Indent tool lines two columns under the agent mark; indent tool detail (error
 bodies, diff hunks) two further.
 
+A tool line hangs from an elbow and states what it did before anything else:
+
+```
+  ⎿ ↳ read crates\pi-agent\src\lib.rs · 412 lines
+  ⎿ ✓ cargo check -p pi-agent · 1.84s · manus
+```
+
+`⎿` then the state glyph, then the target, then what came back — `412 lines`,
+`8 matches`, `+31 -8` — then how long it took. The instrument that ran it comes
+last and is named only when it says something the target does not: `manus`,
+`memoria`, `grafo`. The general-purpose `instrumenta` is the default and is
+never named, and the instrument gives way entirely before the outcome does when
+the row is short of room. This supersedes the `↳ instrumenta · read …` ordering
+the `1b` mockup draws: the outcome earns the row, the instrument does not.
+
 Panels are drawn with a full rule and a label notched into the top-left corner
 of it, label always uppercase, letter-spaced, and prefixed by nothing:
 
@@ -228,8 +243,9 @@ must accept input during it. Everything collapses to static under
 
 ## 10. Signature
 
-The identity mark is a line-drawn portrait after the Mona Lisa, built from the
-same box-drawing set as the UI, with the smile as the only copper stroke
+The identity mark is a line-drawn Vitruvian Man — the figure in the circle and
+the square — built from the same box-drawing set as the UI, with the navel, the
+compass point of Leonardo's circle, as the only copper stroke
 (`1a`). It appears at startup and in the empty state, nowhere else. Recurring
 motifs across the product: `Δ` for change, `◉` for the thing in hand, Roman
 numerals for plans, proportion meters instead of raw counts, and the Latin

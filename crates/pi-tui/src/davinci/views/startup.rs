@@ -1,9 +1,10 @@
 //! `1a` — startup and the empty state.
 //!
-//! The identity mark is a line-drawn portrait after the Mona Lisa, built from
-//! the same box-drawing set as the UI, with the smile as its only copper
-//! stroke. It appears here and nowhere else (design.md §10), and it is dropped
-//! entirely below 100 columns (§7).
+//! The identity mark is a line-drawn Vitruvian Man — l'uomo vitruviano, the
+//! figure in the circle and the square — built from the same box-drawing set
+//! as the UI, with the navel, the compass point of Leonardo's circle, as its
+//! only copper stroke. It appears here and nowhere else (design.md §10), and
+//! it is dropped entirely below 100 columns (§7).
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/views/startup.ex`.
 
@@ -13,26 +14,30 @@ use crate::davinci::model::{Model, Startup};
 use crate::davinci::theme::{glyph, Theme};
 use crate::davinci::ui::{blank, center, hair_rule, indent, span, span_strong};
 
-/// The mark, as it appears in screen `1a`.
-const EMBLEM: [&str; 13] = [
-    "      ·───────·",
-    "    ╱           ╲",
-    "   ╱  ╭───────╮  ╲",
-    "  ╱  ╱  ·   ·  ╲  ╲",
-    " │  │     ╷     │  │",
-    " │   ╲  ╰───╯  ╱   │",
-    "  ╲   ╰───────╯   ╱",
-    "   ╲             ╱",
-    "    ╲     ╷     ╱",
-    "   ╱─────────────╲",
-    "  │               │",
-    " ╱     ╰──┬──╯     ╲",
-    "·─────────────────────·",
+/// The mark, as it appears in screen `1a`: the figure with both pairs of
+/// limbs — arms straight to the square, arms raised to the circle, legs
+/// together on the square's base, legs spread to the circle's rim.
+const EMBLEM: [&str; 14] = [
+    "         ·───────────·",
+    "      ╱                 ╲",
+    "    ╱    ┌───────────┐    ╲",
+    "   │     │    ╭─╮    │     │",
+    "  │    ╲ │    ╰┬╯    │ ╱    │",
+    "  │     ╲├─────┼─────┤╱     │",
+    "  │      │     │     │      │",
+    "  │      │    ─·─    │      │",
+    "  │      │   ╱│ │╲   │      │",
+    "  │      │  ╱ │ │ ╲  │      │",
+    "   │     │ ╱  │ │  ╲ │     │",
+    "    ╲    │╱   │ │   ╲│    ╱",
+    "      ╲  └────┴─┴────┘  ╱",
+    "         ·───────────·",
 ];
 
-/// The one copper stroke.
-const SMILE_ROW: usize = 5;
-const SMILE: &str = "╰───╯";
+/// The one copper stroke: the navel, centre of the circle, as Leonardo
+/// annotated it.
+const NAVEL_ROW: usize = 7;
+const NAVEL: &str = "─·─";
 
 pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let th = &model.theme;
@@ -42,6 +47,7 @@ pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     if model.decoration() {
         rows.extend(emblem(th, width));
         rows.push(blank());
+        annotate(th, width, &mut rows);
     }
 
     rows.push(center(
@@ -76,12 +82,26 @@ pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
         vec![span("A machine for thought, built in Rust.", th.text)],
     ));
 
-    if model.decoration() {
-        rows.push(blank());
-        rows.push(center(width, vec![span("proportio humana", th.border)]));
-    }
-
     rows
+}
+
+/// The margin note beside the mark — `proportio humana`, in faded copper, at
+/// the mark's shoulder (`1a`). Decoration only; dropped with the mark.
+fn annotate(theme: &Theme, width: u16, rows: &mut [Line<'static>]) {
+    let faded = theme.dim().primary;
+    let margin = width.saturating_sub(emblem_width()) / 2 + emblem_width() + 4;
+    for (row, note) in [(2usize, "proportio"), (3, "humana")] {
+        let Some(line) = rows.get_mut(row) else {
+            continue;
+        };
+        let used = crate::davinci::ui::run_width(&line.spans);
+        if margin + 12 > width || used > margin {
+            continue;
+        }
+        line.spans
+            .push(crate::davinci::ui::pad(margin - used, None));
+        line.spans.push(span(note, faded));
+    }
 }
 
 fn restored_row(theme: &Theme, restored: bool) -> Vec<Span<'static>> {
@@ -112,13 +132,13 @@ fn emblem(theme: &Theme, width: u16) -> Vec<Line<'static>> {
 }
 
 fn emblem_row(theme: &Theme, row: &str, index: usize) -> Vec<Span<'static>> {
-    if index != SMILE_ROW {
+    if index != NAVEL_ROW {
         return vec![span(row.to_string(), theme.muted)];
     }
-    match row.split_once(SMILE) {
+    match row.split_once(NAVEL) {
         Some((head, tail)) => vec![
             span(head.to_string(), theme.muted),
-            span_strong(SMILE, theme.primary, theme),
+            span_strong(NAVEL, theme.primary, theme),
             span(tail.to_string(), theme.muted),
         ],
         None => vec![span(row.to_string(), theme.muted)],
@@ -127,10 +147,11 @@ fn emblem_row(theme: &Theme, row: &str, index: usize) -> Vec<Span<'static>> {
 
 /// Row count, so the shell can centre the empty state in the body.
 pub fn height(model: &Model) -> usize {
-    // mark + gap, then the ten rows of copy, then the annotation and its gap.
+    // mark + gap, then the ten rows of copy; the margin note rides on the
+    // mark's own rows.
     let copy = 10;
     if model.decoration() {
-        EMBLEM.len() + 1 + copy + 2
+        EMBLEM.len() + 1 + copy
     } else {
         copy
     }
@@ -190,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn the_smile_is_the_only_copper_stroke_in_the_mark() {
+    fn the_navel_is_the_only_copper_stroke_in_the_mark() {
         let m = model(120);
         let th = m.theme;
         let rows = lines(&m, &info());
@@ -200,7 +221,7 @@ mod tests {
             .filter(|span| span.style.fg == Some(th.primary))
             .map(|span| span.content.to_string())
             .collect();
-        assert_eq!(copper, vec![SMILE.to_string()]);
+        assert_eq!(copper, vec![NAVEL.to_string()]);
     }
 
     #[test]
@@ -256,7 +277,9 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.contains("A machine for thought, built in Rust.")));
-        assert!(rows.iter().any(|row| row.contains("proportio humana")));
+        // The margin note rides the mark's shoulder, two words on two rows.
+        assert!(rows.iter().any(|row| row.contains("proportio")));
+        assert!(rows.iter().any(|row| row.contains("humana")));
     }
 
     #[test]

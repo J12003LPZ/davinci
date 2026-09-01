@@ -993,6 +993,16 @@ impl InteractiveSession {
         {
             return SessionAction::CustomEditorInput(data.to_string());
         }
+        if crate::interaction::input_owner(
+            self.overlay_open(),
+            self.chrome.autocomplete.is_some(),
+            false,
+        ) == crate::interaction::InputOwner::Autocomplete
+        {
+            if let Some(action) = self.handle_autocomplete_key(data) {
+                return action;
+            }
+        }
         if !self.overlay_open() {
             if let Some((key, path)) = self.matching_extension_shortcut(data) {
                 return SessionAction::ExtensionShortcut { key, path };
@@ -1114,6 +1124,34 @@ impl InteractiveSession {
             }
             other => self.handle_printable(other),
         }
+    }
+
+    fn handle_autocomplete_key(&mut self, data: &str) -> Option<SessionAction> {
+        let len = self.chrome.autocomplete.as_ref()?.items.len();
+        if self.keybindings.matches(data, "tui.select.cancel") {
+            self.chrome.autocomplete = None;
+            return Some(SessionAction::None);
+        }
+        if self.keybindings.matches(data, "tui.select.up") {
+            if len > 0 {
+                self.chrome.autocomplete_selected =
+                    (self.chrome.autocomplete_selected + len - 1) % len;
+            }
+            return Some(SessionAction::None);
+        }
+        if self.keybindings.matches(data, "tui.select.down") {
+            if len > 0 {
+                self.chrome.autocomplete_selected = (self.chrome.autocomplete_selected + 1) % len;
+            }
+            return Some(SessionAction::None);
+        }
+        if self.keybindings.matches(data, "tui.input.tab")
+            || self.keybindings.matches(data, "tui.select.confirm")
+        {
+            self.accept_autocomplete();
+            return Some(SessionAction::None);
+        }
+        None
     }
 
     fn handle_tab(&mut self) -> SessionAction {
@@ -1638,123 +1676,7 @@ impl InteractiveSession {
     }
 
     fn apply_editor_key(&mut self, data: &str) -> bool {
-        let editor = &mut self.chrome.editor;
-        if editor.jump_mode().is_some()
-            && (self.keybindings.matches(data, "tui.editor.jumpForward")
-                || self.keybindings.matches(data, "tui.editor.jumpBackward"))
-        {
-            editor.cancel_jump();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.historyPrevious") {
-            editor.navigate_history(-1);
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.historyNext") {
-            editor.navigate_history(1);
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.cursorUp") {
-            editor.cursor_up();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.cursorDown") {
-            editor.cursor_down();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.pageUp") {
-            editor.page_up();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.pageDown") {
-            editor.page_down();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.cursorWordLeft") {
-            editor.move_word_backwards();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.cursorWordRight") {
-            editor.move_word_forwards();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.cursorLeft") {
-            editor.move_left();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.cursorRight") {
-            editor.move_right();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.cursorLineStart") {
-            editor.move_line_start();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.cursorLineEnd") {
-            editor.move_line_end();
-            return true;
-        }
-        if self
-            .keybindings
-            .matches(data, "tui.editor.deleteWordBackward")
-        {
-            editor.delete_word_backwards();
-            return true;
-        }
-        if self
-            .keybindings
-            .matches(data, "tui.editor.deleteWordForward")
-        {
-            editor.delete_word_forwards();
-            return true;
-        }
-        if self
-            .keybindings
-            .matches(data, "tui.editor.deleteCharForward")
-            && !editor.buffer.is_empty()
-        {
-            editor.delete_forward();
-            return true;
-        }
-        if self
-            .keybindings
-            .matches(data, "tui.editor.deleteCharBackward")
-        {
-            editor.backspace();
-            return true;
-        }
-        if self
-            .keybindings
-            .matches(data, "tui.editor.deleteToLineStart")
-        {
-            editor.delete_to_line_start();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.deleteToLineEnd") {
-            editor.delete_to_line_end();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.yank") {
-            editor.yank();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.yankPop") {
-            editor.yank_pop();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.undo") {
-            editor.undo();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.jumpForward") {
-            editor.begin_jump_forward();
-            return true;
-        }
-        if self.keybindings.matches(data, "tui.editor.jumpBackward") {
-            editor.begin_jump_backward();
-            return true;
-        }
-        false
+        crate::interaction::apply_editor_key(&mut self.chrome.editor, &self.keybindings, data)
     }
 
     fn handle_printable(&mut self, data: &str) -> SessionAction {
@@ -1906,6 +1828,83 @@ mod tests {
         assert!(leave.contains(BRACKETED_PASTE_DISABLE));
         assert!(leave.contains(MOUSE_DISABLE));
         assert!(leave.contains(ALT_BUFFER_LEAVE));
+    }
+
+    #[test]
+    fn shared_input_owner_orders_modal_autocomplete_surface_and_composer() {
+        use crate::interaction::{input_owner, InputOwner};
+
+        assert_eq!(input_owner(true, true, true), InputOwner::Modal);
+        assert_eq!(input_owner(false, true, true), InputOwner::Autocomplete);
+        assert_eq!(input_owner(false, false, true), InputOwner::Surface);
+        assert_eq!(input_owner(false, false, false), InputOwner::Composer);
+    }
+
+    #[test]
+    fn shared_editor_router_applies_configured_editor_actions() {
+        let mut editor = crate::Editor::new();
+        editor.set_text("ab");
+        let bindings = Keybindings::defaults();
+
+        assert!(crate::interaction::apply_editor_key(
+            &mut editor,
+            &bindings,
+            "\x1b[D"
+        ));
+        assert_eq!(editor.cursor, 1);
+
+        assert!(crate::interaction::apply_editor_key(
+            &mut editor,
+            &bindings,
+            "\x7f"
+        ));
+        assert_eq!(editor.get_text(), "b");
+    }
+
+    #[test]
+    fn autocomplete_owns_down_before_editor_cursor_navigation_and_enter_accepts_it() {
+        let theme = builtin_themes().into_iter().next().expect("theme");
+        let mut session = InteractiveSession::new(theme, "pi", Vec::new());
+        session.slash_commands = vec![
+            SlashCommandSpec {
+                name: "grep".into(),
+                description: "Search files".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            },
+            SlashCommandSpec {
+                name: "graph".into(),
+                description: "Show graph".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            },
+        ];
+        session.chrome.editor.buffer = "/gr".into();
+        session.chrome.editor.cursor = session.chrome.editor.buffer.len();
+        session.refresh_autocomplete(false);
+
+        let suggestions = session
+            .chrome
+            .autocomplete
+            .as_ref()
+            .expect("autocomplete open");
+        assert!(
+            suggestions.items.len() >= 2,
+            "test requires two /gr matches"
+        );
+        let expected = suggestions.items[1].value.clone();
+        let cursor_before = session.chrome.editor.cursor;
+
+        assert_eq!(session.handle_bytes("\x1b[B"), SessionAction::None);
+        assert_eq!(session.chrome.autocomplete_selected, 1);
+        assert_eq!(session.chrome.editor.cursor, cursor_before);
+
+        assert_eq!(session.handle_bytes("\r"), SessionAction::None);
+        assert!(session.chrome.autocomplete.is_none());
+        assert!(
+            session.chrome.editor.buffer.contains(&expected),
+            "enter should accept the selected autocomplete item"
+        );
     }
 
     #[test]

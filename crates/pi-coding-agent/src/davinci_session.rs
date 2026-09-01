@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 
 use pi_agent::{Agent, AgentEvent, EventSink};
 use pi_tui::davinci::model::{
-    Ask, Choice, CorpusItem, Entry, Model, ModelItem, Overlay, PickerItem, Step,
+    Ask, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
+    Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
+    HunkKind, KeymapGroup, Model, ModelItem, Overlay, PickerItem, ProjectTrustSheet, ProviderRow,
+    ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step,
+    ThinkingRow, Tone, TreeNode, TrustFile, VectorIndex, WorkshopSheet,
 };
 use pi_tui::davinci::theme::State;
 
@@ -119,14 +123,81 @@ pub fn failure_lines(result: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// The text a tool result carries, whatever shape the event wrapped it in.
+fn result_text(result: &serde_json::Value) -> String {
+    match result {
+        serde_json::Value::String(text) => text.clone(),
+        other => other
+            .get("output")
+            .or_else(|| other.get("content"))
+            .or_else(|| other.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default(),
+    }
+}
+
+/// What a finished call came back with, in the fewest words that still say it:
+/// `412 lines`, `8 matches`, `+31 -8`. `None` where the call has nothing to
+/// report beyond having happened — the duration already says that.
+pub fn summary_of(
+    tool_name: &str,
+    args: &serde_json::Value,
+    result: &serde_json::Value,
+) -> Option<String> {
+    let rows = || {
+        let text = result_text(result);
+        let count = text.lines().filter(|line| !line.trim().is_empty()).count();
+        (count > 0).then_some(count)
+    };
+    let plural = |count: usize, unit: &str| {
+        if count == 1 {
+            format!("1 {unit}")
+        } else {
+            format!("{count} {unit}s")
+        }
+    };
+    match tool_name {
+        "read" => rows().map(|count| plural(count, "line")),
+        "ls" => rows().map(|count| plural(count, "entry").replace("entrys", "entries")),
+        "grep" | "find" => Some(plural(rows().unwrap_or(0), "match").replace("matchs", "matches")),
+        "bash" | "powershell" => rows().map(|count| plural(count, "line")),
+        // The edit tool reports the path it touched, not the shape of the
+        // change, so the change is counted from what was asked for.
+        "edit" => {
+            let edits = args.get("edits")?.as_array()?;
+            let (adds, dels) = edits.iter().fold((0usize, 0usize), |(adds, dels), edit| {
+                let count = |key: &str| {
+                    edit.get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(|text| text.lines().count())
+                        .unwrap_or(0)
+                };
+                (adds + count("newText"), dels + count("oldText"))
+            });
+            Some(format!("+{adds} -{dels}"))
+        }
+        "write" => args
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(|content| plural(content.lines().count(), "line")),
+        _ => None,
+    }
+}
+
 /// The transcript state a turn builds up, so events can find the block they
 /// belong to without searching the transcript.
 #[derive(Default)]
 struct Turn {
-    /// `tool_call_id` -> (index in the transcript, when it started).
-    open: Vec<(String, usize, Instant)>,
+    /// `tool_call_id` -> (index in the transcript, when it started, what it
+    /// was asked to do). The arguments are kept because several outcomes —
+    /// the shape of an edit, the size of a write — are only in the request.
+    open: Vec<(String, usize, Instant, serde_json::Value)>,
     studio: Option<usize>,
     said_something: bool,
+    /// What each finished call came to, in order — the recovery sheet (`6c`)
+    /// replays it when the turn is interrupted.
+    log: Vec<(State, String, String)>,
 }
 
 impl Turn {
@@ -144,8 +215,12 @@ impl Turn {
             &target_of(tool_name, args),
             None,
         ));
-        self.open
-            .push((tool_call_id.to_string(), index, Instant::now()));
+        self.open.push((
+            tool_call_id.to_string(),
+            index,
+            Instant::now(),
+            args.clone(),
+        ));
         self.push_step(model, tool_name, args);
     }
 
@@ -157,16 +232,32 @@ impl Turn {
         result: &serde_json::Value,
         is_error: bool,
     ) {
-        let Some(position) = self.open.iter().position(|(id, _, _)| id == tool_call_id) else {
+        let Some(position) = self
+            .open
+            .iter()
+            .position(|(id, _, _, _)| id == tool_call_id)
+        else {
             return;
         };
-        let (_, index, started) = self.open.remove(position);
+        let (_, index, started, args) = self.open.remove(position);
+        let outcome = (!is_error)
+            .then(|| summary_of(tool_name, &args, result))
+            .flatten();
+        self.log.push((
+            state_of(tool_name, is_error),
+            target_of(tool_name, &args),
+            duration_of(started.elapsed()),
+        ));
         if let Some(Entry::Tool {
-            state, duration, ..
+            state,
+            duration,
+            summary,
+            ..
         }) = model.transcript.get_mut(index)
         {
             *state = state_of(tool_name, is_error);
             *duration = Some(duration_of(started.elapsed()));
+            *summary = outcome;
         }
         if is_error {
             // The detail belongs directly under the line that failed.
@@ -182,7 +273,7 @@ impl Turn {
 
     /// Keep the recorded indices valid when detail rows are spliced in.
     fn shift(&mut self, after: usize, by: usize) {
-        for (_, index, _) in self.open.iter_mut() {
+        for (_, index, _, _) in self.open.iter_mut() {
             if *index > after {
                 *index += by;
             }
@@ -298,17 +389,30 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
 /// A key pressed while a turn is running. The composer stays live so a
 /// follow-up can be typed and queued; esc and ctrl+c stop the run, and every
 /// other chord is ignored rather than being taken for text.
-fn mid_turn_key(model: &mut Model, key: crossterm::event::KeyEvent, abort: &Arc<AtomicBool>) {
+///
+/// Returns `true` when the user pressed the interrupt again after the abort
+/// was already requested — the worker is not answering the flag (a hung
+/// provider read, a wedged extension), and the only way out left is to give
+/// the terminal back and leave. That path restores the screen first, which is
+/// what killing the process from outside never did.
+#[must_use]
+fn mid_turn_key(
+    model: &mut Model,
+    key: crossterm::event::KeyEvent,
+    abort: &Arc<AtomicBool>,
+) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => {
-            abort.store(true, Ordering::Relaxed);
+            let again = abort.swap(true, Ordering::Relaxed);
             model.interrupt();
+            return again;
         }
         KeyCode::Char('c') if ctrl => {
-            abort.store(true, Ordering::Relaxed);
+            let again = abort.swap(true, Ordering::Relaxed);
             model.interrupt();
+            return again;
         }
         KeyCode::Char('j') if ctrl => model.newline(),
         KeyCode::Char(_) if ctrl => {}
@@ -328,31 +432,34 @@ fn mid_turn_key(model: &mut Model, key: crossterm::event::KeyEvent, abort: &Arc<
         KeyCode::Char(ch) => model.type_char(&ch.to_string()),
         _ => {}
     }
+    false
 }
 
-/// A turn and everything queued behind it, in the order it was typed. Each
-/// follow-up opens its own block, exactly as if it had been sent by hand.
-fn run_turns(
-    parsed: &crate::args::Args,
-    agent: &mut Agent,
-    model: &mut Model,
-    session: &mut pi_tui::davinci::runtime::Session,
-    host: Arc<Mutex<ExtensionHost>>,
-) -> std::io::Result<()> {
-    loop {
-        run_turn(parsed, agent, model, session, host.clone())?;
-        if model.queued.is_empty() {
-            return Ok(());
-        }
-        let text = model.queued.remove(0);
-        let expanded = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
-        agent.prompt(&expanded);
-        model.transcript.push(Entry::Gap);
-        model.transcript.push(Entry::user(&text));
-        model.transcript.push(Entry::Gap);
-        model.transcript.push(Entry::agent("davinci"));
-        model.running = true;
+/// A turn and everything queued behind it, in the order it was typed.
+///
+/// Each queued line goes back through `on_line`, exactly as if it had been
+/// sent by hand — which is what the legacy loop does by re-entering
+/// `submit_user_message`. Sending the queue straight to `agent.prompt`
+/// bypassed every check: a queued `/command` went to the provider verbatim.
+fn run_turns(shell: &mut Shell<'_>) -> Next {
+    let host = shell.host.clone();
+    if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host) {
+        return Next::Fail(err.to_string());
     }
+    while !shell.model.queued.is_empty() {
+        let line = shell.model.queued.remove(0);
+        // What the composer's own submit pushes before a line is routed.
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(Entry::user(&line));
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(Entry::agent("davinci"));
+        shell.model.running = true;
+        match on_line(shell, &line) {
+            Next::Go => {}
+            other => return other,
+        }
+    }
+    Next::Go
 }
 
 fn run_turn(
@@ -371,7 +478,18 @@ fn run_turn(
 
     let mut turn = Turn::default();
     let mut last_tick = Instant::now();
+    if model.terminal_progress {
+        let _ = session.set_progress(true);
+    }
     let crashed = Arc::new(AtomicBool::new(false));
+    // What the worker came back with. A provider failure is not an event of its
+    // own: it arrives as a `MessageUpdate` whose message stopped on
+    // `StopReason::Error`, which `apply` does not read. Dropping the worker's
+    // return value threw the only copy of that message away, and every failed
+    // request — a refused key, an unreachable base URL, a 400 — read as "the
+    // model returned no text".
+    let mut failure: Option<String> = None;
+    let mut reply = String::new();
 
     std::thread::scope(|scope| -> std::io::Result<()> {
         let worker = scope
@@ -386,17 +504,29 @@ fn run_turn(
             if worker.is_finished() {
                 break;
             }
-            if crossterm::event::poll(Duration::from_millis(40))? {
-                match crossterm::event::read()? {
+            if let Some(event) = session.poll_event(Duration::from_millis(40))? {
+                match event {
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release =>
                     {
-                        mid_turn_key(model, key, &abort);
+                        if mid_turn_key(model, key, &abort) {
+                            // The abort flag was already up and the worker is
+                            // not answering it: a hung read holds it somewhere
+                            // with no timeout left to fire. Give the terminal
+                            // back first, then leave — the session file is
+                            // already written through the last completed step.
+                            let _ = pi_tui::davinci::runtime::restore();
+                            eprintln!(
+                                "pi: the turn would not stop (a hung provider or extension); the session file is intact"
+                            );
+                            std::process::exit(130);
+                        }
                     }
                     crossterm::event::Event::Resize(width, height) => {
-                        model.width = width;
-                        model.height = height;
+                        model.width = width.max(20);
+                        model.height = height.max(4);
                     }
+                    crossterm::event::Event::Paste(text) => model.paste(&text),
                     _ => {}
                 }
             }
@@ -408,11 +538,31 @@ fn run_turn(
 
         // A panicking worker used to be discarded, which showed up as a turn
         // that quietly returned nothing. Report it as the failure it is.
-        if worker.join().is_err() {
-            crashed.store(true, Ordering::Relaxed);
+        match worker.join() {
+            Err(_) => crashed.store(true, Ordering::Relaxed),
+            Ok((text, events)) => {
+                // The same scan `--print` runs before choosing an exit code,
+                // which catches a stream that stopped on an error. A fault
+                // found before the request went out — no model, no credential
+                // — never reaches the sink at all: it is folded into the reply
+                // with this prefix, and is the whole of it.
+                failure = crate::print_text_exit(&events).1.or_else(|| {
+                    text.strip_prefix("Provider error: ")
+                        .map(|reason| reason.trim().to_string())
+                });
+                reply = text;
+            }
         }
         Ok(())
     })?;
+
+    if crashed.load(Ordering::Relaxed) {
+        // The worker's panic ran the panic hook, which restored the terminal
+        // from that thread — the message went to the real screen, but the
+        // alternate screen and raw mode went with it. Take them back before
+        // drawing another frame, or the loop paints over the user's shell.
+        session.reacquire()?;
+    }
 
     while let Ok(event) = event_rx.try_recv() {
         apply(model, &mut turn, &event);
@@ -420,40 +570,68 @@ fn run_turn(
     let interrupted = abort.load(Ordering::Relaxed);
     turn.close(model, interrupted);
 
-    if crashed.load(Ordering::Relaxed) {
-        model.transcript.push(Entry::Gap);
-        model.transcript.push(Entry::tool(
-            State::Failed,
-            "manus",
-            "the turn crashed · the transcript is kept, the session is intact",
-            None,
-        ));
-    } else if interrupted {
-        model.transcript.push(Entry::Gap);
-        model.transcript.push(Entry::tool(
-            State::Skipped,
-            "manus",
-            "interrupted · the transcript is kept",
-            None,
-        ));
-    } else if !turn.said_something {
-        model.transcript.push(Entry::Gap);
-        model.transcript.push(Entry::tool(
-            State::Attention,
-            "manus",
-            "the model returned no text",
-            None,
-        ));
+    for entry in turn_outcome(
+        crashed.load(Ordering::Relaxed),
+        interrupted,
+        turn.said_something,
+        failure,
+        &reply,
+    ) {
+        model.transcript.push(entry);
+    }
+
+    if interrupted {
+        // The `6c` sheet: what the interrupted turn came to — what ran, what
+        // is kept, what is still on disk — so ctrl+c never reads as a hole.
+        let prompt = agent
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| clip(pi_ai::content_text(&message.content).trim(), 60))
+            .unwrap_or_default();
+        let kept = pi_agent::estimate_context_tokens(&agent.messages);
+        model.failed_run = Some(FailedRun {
+            prompt,
+            tools: turn.log.clone(),
+            kept: format!(
+                "{} tokens in context",
+                pi_tui::davinci::views::chrome::thousands(kept)
+            ),
+            billed: "in the next /session stats".into(),
+            aftermath: vec![
+                (
+                    State::Done,
+                    "transcript written to the session file · nothing to recover on restart".into(),
+                ),
+                (
+                    State::Done,
+                    "the abort was delivered; a running tool stops at its next check".into(),
+                ),
+                (
+                    State::Attention,
+                    "queued follow-ups were dropped with the interrupt".into(),
+                ),
+                (
+                    State::Skipped,
+                    "esc esc opens the session tree · ctrl+d quits".into(),
+                ),
+            ],
+        });
+        open_sheet(model, Screen::Recovery);
     }
 
     agent.abort_signal = None;
     agent.event_sink = None;
     model.running = false;
-
-    // Extensions may have asked for rows while the turn ran.
-    if let Ok(host) = host.lock() {
-        apply_ui_calls(model, &host.ui_calls);
+    if model.terminal_progress {
+        let _ = session.set_progress(false);
     }
+
+    // Extensions may have asked for rows while the turn ran. Taking the queue
+    // rather than reading it is what keeps a `notify` from being replayed into
+    // the transcript on every later turn.
+    drain_ui_calls(model, &host);
     apply_cache_miss_notices(model, agent);
     Ok(())
 }
@@ -488,35 +666,159 @@ fn apply_cache_miss_notices(model: &mut Model, agent: &Agent) {
 /// session opens where it left off rather than empty.
 pub fn transcript_from(messages: &[pi_ai::ChatMessage]) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
+    // `tool_call_id` -> where its line sits, and what it was asked to do, so a
+    // resumed session states its outcomes the way the live one did.
+    let mut open: Vec<(String, usize, String, serde_json::Value)> = Vec::new();
+
     for message in messages {
         let text = pi_ai::content_text(&message.content);
         let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        if !entries.is_empty() {
-            entries.push(Entry::Gap);
-        }
         match message.role.as_str() {
-            "user" => entries.push(Entry::user(text)),
+            "user" if !text.is_empty() => {
+                if !entries.is_empty() {
+                    entries.push(Entry::Gap);
+                }
+                entries.push(Entry::user(text));
+            }
             "assistant" => {
+                let calls: Vec<(&String, &String, &serde_json::Value)> = message
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        pi_ai::MessageContent::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => Some((id, name, arguments)),
+                        _ => None,
+                    })
+                    .collect();
+                if text.is_empty() && calls.is_empty() {
+                    continue;
+                }
+                if !entries.is_empty() {
+                    entries.push(Entry::Gap);
+                }
                 entries.push(Entry::agent("davinci"));
-                entries.push(Entry::Gap);
-                entries.push(Entry::prose(text));
+                if !text.is_empty() {
+                    entries.push(Entry::Gap);
+                    entries.push(Entry::prose(text));
+                }
+                for (id, name, arguments) in calls {
+                    open.push((id.clone(), entries.len(), name.clone(), arguments.clone()));
+                    entries.push(Entry::tool(
+                        state_of(name, false),
+                        instrument_of(name),
+                        &target_of(name, arguments),
+                        None,
+                    ));
+                }
             }
-            _ => {
-                entries.pop();
+            // A tool result closes the line its call opened. Its own text is
+            // never a turn of its own: what it did is already on that line.
+            "tool" | "toolResult" => {
+                let Some(id) = message.tool_call_id.as_ref() else {
+                    continue;
+                };
+                let Some(position) = open.iter().position(|(open_id, ..)| open_id == id) else {
+                    continue;
+                };
+                let (_, index, name, arguments) = open.remove(position);
+                let failed = message.is_error.unwrap_or(false);
+                let result = serde_json::Value::String(text.to_string());
+                let outcome = (!failed)
+                    .then(|| summary_of(&name, &arguments, &result))
+                    .flatten();
+                if let Some(Entry::Tool { state, summary, .. }) = entries.get_mut(index) {
+                    *state = state_of(&name, failed);
+                    *summary = outcome;
+                }
+                if failed {
+                    let mut at = index + 1;
+                    for line in failure_lines(&result) {
+                        entries.insert(at, Entry::detail(&line));
+                        at += 1;
+                        for (_, open_index, _, _) in open.iter_mut() {
+                            if *open_index >= at {
+                                *open_index += 1;
+                            }
+                        }
+                    }
+                }
             }
+            _ => {}
         }
     }
     entries
 }
 
+/// What a finished turn owes the transcript beyond what it already said.
+///
+/// The instrument on these lines is `cogitator`, the model, not `manus`, the
+/// shell (design.md §7): the turn is the model's, and naming the hands for what
+/// the mind did sends the reader looking in the wrong place. A turn that said
+/// nothing owes a reason, and "the model returned no text" is only the reason
+/// when there is no better one — a failed request has the provider's own words
+/// for it, and those used to be thrown away with the worker's return value.
+fn turn_outcome(
+    crashed: bool,
+    interrupted: bool,
+    said_something: bool,
+    failure: Option<String>,
+    reply: &str,
+) -> Vec<Entry> {
+    let line =
+        |state: State, text: &str| vec![Entry::Gap, Entry::tool(state, "cogitator", text, None)];
+    if crashed {
+        return line(
+            State::Failed,
+            "the turn crashed · the transcript is kept, the session is intact",
+        );
+    }
+    if interrupted {
+        return line(State::Skipped, "interrupted · the transcript is kept");
+    }
+    if let Some(failure) = failure.filter(|failure| !failure.trim().is_empty()) {
+        // What actually went wrong, in the provider's own words, on rows of
+        // their own so a long one is read rather than clipped to the line.
+        let mut out = line(State::Failed, "the request failed");
+        out.extend(
+            failure
+                .trim()
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(6)
+                .map(|line| Entry::Detail(line.to_string())),
+        );
+        return out;
+    }
+    if said_something {
+        return Vec::new();
+    }
+    if !reply.trim().is_empty() {
+        // Text the run returned that no `MessageEnd` carried. Better said late
+        // than dropped.
+        return vec![Entry::Gap, Entry::prose(reply.trim())];
+    }
+    line(
+        State::Attention,
+        "the model returned no text · nothing was added to the session",
+    )
+}
+
 /// Everything Instrumenta can reach: the real slash commands, the real tools,
 /// and the sessions already on disk (`1d`).
-pub fn corpus(agent: &Agent, sessions: &[pi_tui::davinci::model::SessionItem]) -> Vec<CorpusItem> {
-    let mut items: Vec<CorpusItem> = crate::slash::builtin_slash_commands()
-        .into_iter()
+pub fn corpus(
+    agent: &Agent,
+    commands: &[pi_tui::SlashCommandSpec],
+    sessions: &[pi_tui::davinci::model::SessionItem],
+) -> Vec<CorpusItem> {
+    // Every command the composer completes, not only the built-in ones: an
+    // extension command the palette cannot reach is a command the user cannot
+    // find.
+    let mut items: Vec<CorpusItem> = commands
+        .iter()
         .map(|command| {
             CorpusItem::new(
                 &format!("/{}", command.name),
@@ -526,8 +828,15 @@ pub fn corpus(agent: &Agent, sessions: &[pi_tui::davinci::model::SessionItem]) -
         })
         .collect();
 
+    // Davinci's own commands, which no shared command list carries.
+    items.push(CorpusItem::new(
+        "/diff",
+        "review every change in the working tree",
+        "command",
+    ));
+
     for tool in &agent.tools {
-        items.push(CorpusItem::new(tool, instrument_of(tool), "tool"));
+        items.push(CorpusItem::new(tool, &tool_summary(tool), "tool"));
     }
     for session in sessions.iter().take(8) {
         items.push(CorpusItem::new(
@@ -539,6 +848,40 @@ pub fn corpus(agent: &Agent, sessions: &[pi_tui::davinci::model::SessionItem]) -
     items
 }
 
+/// The middle column of a tool row: what the tool does, in the fewest words
+/// that still say it. The instrument used to stand here, which named
+/// `instrumenta` on almost every row — the one thing design.md §3 says is
+/// never named, and a column that repeats itself is a column that says nothing.
+fn tool_summary(name: &str) -> String {
+    let described = pi_agent::tool_specs()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .map(|tool| tool.description)
+        .or_else(|| {
+            crate::native_extensions::NativeExtensionHost::tool_specs()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .map(|tool| tool.description)
+        });
+    let Some(described) = described else {
+        // An extension's tool, whose description the host holds rather than the
+        // registry. Its instrument is the only thing left worth saying, and
+        // only when it is not the default one.
+        let instrument = instrument_of(name);
+        return if instrument == "instrumenta" {
+            String::new()
+        } else {
+            instrument.to_string()
+        };
+    };
+    let first = described
+        .split(['.', '\n'])
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    first.chars().take(64).collect()
+}
+
 /// What the composer line means. A `/` line is a command, everything else is a
 /// prompt (design.md §6: the composer is the only input).
 pub enum Sent {
@@ -546,26 +889,329 @@ pub enum Sent {
     Quit,
     /// Say something back without asking the model.
     Say(String),
-    /// Summon one of the instruments the shell already owns.
-    Open(pi_tui::davinci::model::Overlay),
     /// A command that needs the agent and the session to carry it out.
     Command(crate::slash::SlashAction),
 }
 
 pub fn classify(line: &str) -> Sent {
     use crate::slash::SlashAction;
-    use pi_tui::davinci::model::Overlay;
 
     match crate::slash::parse_line(line) {
         SlashAction::Prompt(text) => Sent::Prompt(text),
         SlashAction::Quit => Sent::Quit,
         SlashAction::Status(text) => Sent::Say(text),
-        // The instruments the design already gives these commands a home in.
-        SlashAction::OpenModel => Sent::Open(Overlay::Cogitator),
-        SlashAction::Resume => Sent::Open(Overlay::Sessions),
-        SlashAction::Settings | SlashAction::Hotkeys => Sent::Open(Overlay::Instrumenta),
+        // Everything else — including /model, /settings, /hotkeys, /resume —
+        // reaches `perform`, which opens the sheet each one designs
+        // (screens 3a–6d) with live data behind it.
         other => Sent::Command(other),
     }
+}
+
+/// The instrument a native command answers as, so `/memory-status` lands on the
+/// same paired name the tool lines use (design.md §3).
+pub fn instrument_of_command(name: &str) -> &'static str {
+    match name {
+        name if name.starts_with("memory") => "memoria",
+        name if name.starts_with("governor") => "mensura",
+        name if name.starts_with("graph") => "grafo",
+        name if name.starts_with("sec") => "speculum",
+        _ => "instrumenta",
+    }
+}
+
+/// Run a `/command` an extension owns — a native Rust one (`/graph-view`,
+/// `/memory-status`, `/sec-report`) or a JavaScript extension's — and state
+/// what came back in the transcript.
+///
+/// `None` means no extension claimed the line, so the shell should carry on
+/// classifying it. Mirrors the extension-command arm of `prepare_user_input`
+/// in `main.rs`, which the legacy chrome runs before every prompt.
+fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
+    let (name, args) = crate::parse_extension_command(line);
+    if name.is_empty() {
+        return None;
+    }
+
+    let outcome = {
+        let mut host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
+        crate::apply_graph_session_context(shell.parsed, shell.agent, &host);
+        match host.execute_native_command(&name, &args) {
+            Ok(Some(value)) => Some(Ok(value)),
+            Err(err) => Some(Err(err)),
+            Ok(None) => {
+                let path = host
+                    .js
+                    .iter()
+                    .find(|ext| ext.commands.iter().any(|command| command == &name))
+                    .map(|ext| ext.path.clone())?;
+                host.runtime_active_tools = shell.agent.tools.clone();
+                host.runtime_all_tools = shell.agent.tool_registry.clone();
+                host.runtime_thinking_level = shell.agent.thinking_level.as_str().to_string();
+                host.runtime_flag_values = crate::flag_values_json(shell.parsed);
+                Some(
+                    host.invoke_command(&path, &name)
+                        .map(|value| value.unwrap_or(serde_json::Value::Null)),
+                )
+            }
+        }
+    };
+
+    // Anything the extension drew while it ran, before what it returned.
+    drain_ui_calls(shell.model, shell.host);
+    shell.model.running = false;
+
+    match outcome? {
+        // The native status commands have whole screens designed for them
+        // (`5a`–`5d`); their results open the sheet rather than printing rows.
+        Ok(value) => match name.as_str() {
+            "memory-status" => {
+                shell.model.vector_index = Some(vectors_sheet(&value));
+                open_sheet(shell.model, Screen::Vectors);
+            }
+            "governor-status" => {
+                shell.model.governor = Some(governor_sheet(&value));
+                open_sheet(shell.model, Screen::Governor);
+            }
+            "sec-status" => {
+                shell.model.security = Some(security_sheet(&value));
+                shell.model.security_index = 0;
+                open_sheet(shell.model, Screen::Securitas);
+            }
+            "sec-report" => {
+                // The report command answers with markdown; the sheet wants
+                // the structured scan, which `sec-status` carries.
+                let structured = {
+                    let host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
+                    host.execute_native_command("sec-status", "")
+                };
+                match structured {
+                    Ok(Some(scan)) => {
+                        shell.model.security = Some(security_sheet(&scan));
+                        shell.model.security_index = 0;
+                        open_sheet(shell.model, Screen::Securitas);
+                    }
+                    _ => push_command_result(shell.model, &name, &value),
+                }
+            }
+            "graph-status" | "graph-view" => match graph_sheet(&value) {
+                Some(sheet) => {
+                    shell.model.graph_run = Some(sheet);
+                    open_sheet(shell.model, Screen::GraphRun);
+                }
+                None => push_command_result(shell.model, &name, &value),
+            },
+            _ => push_command_result(shell.model, &name, &value),
+        },
+        Err(err) => shell.note(&format!("/{name}: {err}")),
+    }
+    // A command may have driven the session — sent a message, forked,
+    // switched — through `pi.sendMessage` and friends; those calls sit on the
+    // host until applied.
+    match apply_host_effects(shell) {
+        Next::Go => {}
+        other => return Some(other),
+    }
+    shell.redress();
+    Some(Next::Go)
+}
+
+/// Whether a composer line is a `/command` nobody owns, and what to say about
+/// it. Only a bare token counts: `/graph-view`, or `/graph-view.` with the
+/// punctuation a sentence leaves behind. A slash line carrying arguments or
+/// prose is a prompt, and is sent as one.
+fn unknown_command(model: &Model, line: &str) -> Option<String> {
+    let token = line.trim().strip_prefix('/')?;
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        return None;
+    }
+    // Matched as typed, punctuation included: `/graph-view.` is not the command
+    // `/graph-view`, and quietly running it as one would teach the wrong name.
+    let typed = token.to_ascii_lowercase();
+    if model
+        .slash_commands
+        .iter()
+        .any(|item| item.name.eq_ignore_ascii_case(token))
+    {
+        return None;
+    }
+
+    // The nearest name the user could have meant, in three bands: a name the
+    // typed token begins, a name a small edit away — which is what catches the
+    // transposition and the stray full stop — and a name that merely contains
+    // it. Ranking edit distance ahead of containment is what keeps `/graph-veiw`
+    // from being answered with `/graph`.
+    let budget = (typed.chars().count() / 2).max(3);
+    let nearest = model
+        .slash_commands
+        .iter()
+        .map(|item| item.name.as_str())
+        .filter_map(|name| {
+            let lower = name.to_ascii_lowercase();
+            if lower.starts_with(&typed) {
+                return Some((0usize, lower.chars().count(), name));
+            }
+            let distance = edit_distance(&lower, &typed);
+            if distance <= budget {
+                return Some((1, distance, name));
+            }
+            lower
+                .contains(&typed)
+                .then_some((2, lower.chars().count(), name))
+        })
+        .min();
+    Some(match nearest {
+        Some((_, _, name)) => format!("/{token} is not a command · did you mean /{name}?"),
+        None => format!("/{token} is not a command · ctrl+p lists every one"),
+    })
+}
+
+/// Levenshtein distance, one row at a time. Only ever run over slash-command
+/// names, so the quadratic cost is a few hundred cells.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            let next = (row[j + 1] + 1).min(row[j] + 1).min(diagonal + cost);
+            diagonal = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
+}
+
+/// State a native command's result in the transcript: one tool line naming the
+/// instrument and the command, then one detail row per field. The legacy chrome
+/// frames this as an ANSI panel; davinci says it in the transcript, which is
+/// the only place a davinci shell can say anything (design.md §6).
+fn push_command_result(model: &mut Model, name: &str, value: &serde_json::Value) {
+    let instrument = instrument_of_command(name);
+    let error = value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let rows = command_result_rows(value);
+
+    model.transcript.push(Entry::Gap);
+    model.transcript.push(Entry::tool(
+        if error.is_some() {
+            State::Attention
+        } else {
+            State::Done
+        },
+        instrument,
+        &format!("/{name}"),
+        None,
+    ));
+    if let Some(error) = error {
+        model.transcript.push(Entry::Detail(error));
+    } else if rows.is_empty() {
+        // A command that returned an empty object still ran. Saying so beats a
+        // line that names the command and then stops.
+        model
+            .transcript
+            .push(Entry::Detail("nothing to report".into()));
+    }
+    for row in rows {
+        model.transcript.push(Entry::Detail(row));
+    }
+}
+
+/// A command result as detail rows. Scalars become `key · value`; a list of
+/// objects becomes one row per item; everything else is left as compact JSON so
+/// nothing is silently dropped.
+fn command_result_rows(value: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+
+    let scalar = |value: &Value| -> Option<String> {
+        match value {
+            Value::String(text) => Some(text.lines().next().unwrap_or("").to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        }
+    };
+
+    match value {
+        Value::Null => Vec::new(),
+        Value::Object(map) => {
+            let mut rows = Vec::new();
+            for (key, item) in map {
+                // A field the command had nothing to put in is not news. Saying
+                // `run · null` back to the user is worse than saying nothing.
+                if key == "error" || item.is_null() {
+                    continue;
+                }
+                let label = crate::humanize_key(key);
+                match item {
+                    Value::Array(items) if items.is_empty() => {
+                        rows.push(format!("{label} · none"));
+                    }
+                    Value::Array(items) => {
+                        rows.push(format!("{label} · {}", items.len()));
+                        for item in items.iter().take(12) {
+                            let row = scalar(item).unwrap_or_else(|| summarize_object(item));
+                            if !row.is_empty() {
+                                rows.push(format!("  {row}"));
+                            }
+                        }
+                        if items.len() > 12 {
+                            rows.push(format!("  … {} more", items.len() - 12));
+                        }
+                    }
+                    item => {
+                        let row = scalar(item).unwrap_or_else(|| summarize_object(item));
+                        if !row.is_empty() {
+                            rows.push(format!("{label} · {row}"));
+                        }
+                    }
+                }
+            }
+            rows
+        }
+        Value::Array(items) => items
+            .iter()
+            .take(12)
+            .map(|item| scalar(item).unwrap_or_else(|| summarize_object(item)))
+            .filter(|row| !row.is_empty())
+            .collect(),
+        other => scalar(other).into_iter().collect(),
+    }
+}
+
+/// One line for a nested object: its scalar fields, ` · ` separated, so a task
+/// row reads `review-1 · running · reviewer` rather than as raw JSON.
+fn summarize_object(value: &serde_json::Value) -> String {
+    let serde_json::Value::Object(map) = value else {
+        return serde_json::to_string(value).unwrap_or_default();
+    };
+    map.values()
+        .filter_map(|item| match item {
+            serde_json::Value::String(text) => {
+                Some(text.lines().next().unwrap_or("").trim().to_string())
+            }
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Apply everything the extension host has queued for the interface, then clear
+/// it. The host accumulates `ui_calls` for the life of the process; davinci
+/// shares one host across every turn, so re-reading the vector without taking
+/// it replayed every past `notify` into the transcript on each turn.
+pub fn drain_ui_calls(model: &mut Model, host: &Arc<Mutex<ExtensionHost>>) -> Option<String> {
+    let calls = {
+        let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+        std::mem::take(&mut host.ui_calls)
+    };
+    apply_ui_calls(model, &calls)
 }
 
 /// What carrying a command out amounted to. Every command says something: a
@@ -577,8 +1223,9 @@ pub enum Done {
     /// A line that carries the attention glyph: a refusal, a usage error, a
     /// cancellation (design.md §4 — the glyph, not the colour, says so).
     Note(String),
-    /// Summon an instrument instead of printing anything.
-    Open(pi_tui::davinci::model::Overlay),
+    /// A sheet was built onto the model and is on screen; the sheet is the
+    /// answer, so nothing more is said.
+    Opened,
     /// Put a question to the user as a list, and act on the row they choose.
     Ask(Question),
     /// Leave the alt screen, run this, come back. Reserved for the flows that
@@ -596,8 +1243,6 @@ pub enum Question {
         path: String,
         options: Vec<crate::trust::ProjectTrustOption>,
     },
-    /// How hard the model should think.
-    Thinking,
     /// Which stored credential to remove.
     Logout { providers: Vec<String> },
     /// The one thing first-run has to ask. The old setup also asked for a
@@ -609,7 +1254,7 @@ pub enum Question {
 impl Question {
     /// The panel this question wears: its paired name, its key, the line that
     /// says what is being decided, and one row per answer.
-    pub fn ask(&self, agent: &Agent) -> Ask {
+    pub fn ask(&self, _agent: &Agent) -> Ask {
         match self {
             Question::Trust { path, options } => Ask {
                 title: "FIDES".into(),
@@ -625,25 +1270,6 @@ impl Question {
                                 "project .pi resources are used"
                             } else {
                                 "project .pi resources are ignored"
-                            },
-                        )
-                    })
-                    .collect(),
-            },
-            Question::Thinking => Ask {
-                title: "MEDITATIO".into(),
-                name: "THINKING".into(),
-                key: "/thinking".into(),
-                note: format!("in hand: {}", agent.thinking_level.as_str()),
-                items: THINKING_LEVELS
-                    .iter()
-                    .map(|level| {
-                        PickerItem::new(
-                            level,
-                            if *level == agent.thinking_level.as_str() {
-                                "in hand"
-                            } else {
-                                ""
                             },
                         )
                     })
@@ -702,9 +1328,22 @@ pub fn perform(
         SlashAction::Prompt(text) => Ok(Done::Said(text)),
         SlashAction::Quit => Ok(Done::Said("goodbye".into())),
         SlashAction::Status(text) => Ok(Done::Said(text)),
-        SlashAction::OpenModel => Ok(Done::Open(Overlay::Cogitator)),
-        SlashAction::Resume => Ok(Done::Open(Overlay::Sessions)),
-        SlashAction::Settings | SlashAction::Hotkeys => Ok(Done::Open(Overlay::Instrumenta)),
+        SlashAction::OpenModel => {
+            open_models_sheet(parsed, agent, model);
+            Ok(Done::Opened)
+        }
+        SlashAction::Resume => {
+            open_resume_sheet(parsed, agent, model);
+            Ok(Done::Opened)
+        }
+        SlashAction::Settings => {
+            open_settings_sheet(agent, model);
+            Ok(Done::Opened)
+        }
+        SlashAction::Hotkeys => {
+            open_keys_sheet(model);
+            Ok(Done::Opened)
+        }
 
         SlashAction::NewSession => {
             let session_dir = crate::resolved_session_dir(parsed, &agent.cwd);
@@ -722,6 +1361,7 @@ pub fn perform(
             if host.last_result_cancelled() {
                 return Ok(Done::Note("compaction cancelled".into()));
             }
+            let messages_before = agent.messages.len();
             let result = agent.compact(instructions.as_deref());
             if result.compacted {
                 host.emit(ExtensionEvent::SessionCompact);
@@ -731,14 +1371,114 @@ pub fn perform(
                 });
             }
             model.transcript = transcript_from(&agent.messages);
-            Ok(Done::Said(result.summary))
+            if !result.compacted {
+                return Ok(Done::Said(result.summary));
+            }
+            // The `4c` sheet, as the receipt of what just happened: both
+            // sides measured, what was kept named, what was folded counted.
+            let window = agent.context_window.max(1);
+            let before = result.tokens_before;
+            let after = pi_agent::estimate_context_tokens(&agent.messages);
+            let folded_messages = messages_before.saturating_sub(agent.messages.len());
+            let thousands = pi_tui::davinci::views::chrome::thousands;
+            let mut kept = vec![
+                format!("the last {} messages, whole", agent.messages.len()),
+                "the summary of everything folded".into(),
+            ];
+            if let Some(instructions) = instructions.as_deref().filter(|text| !text.is_empty()) {
+                kept.push(format!("your instruction: {}", clip(instructions, 48)));
+            }
+            if !result.details.modified_files.is_empty() {
+                kept.push(format!(
+                    "the {} files the turn modified, named",
+                    result.details.modified_files.len()
+                ));
+            }
+            model.compaction = Some(Compaction {
+                before_tokens: thousands(before),
+                before_fraction: (before as f64 / window as f64).clamp(0.0, 1.0),
+                before_note: format!(
+                    "{:.0}% of {}",
+                    before as f64 / window as f64 * 100.0,
+                    thousands(window)
+                ),
+                after_tokens: thousands(after),
+                after_fraction: (after as f64 / window as f64).clamp(0.0, 1.0),
+                after_note: format!(
+                    "{:.0}% of {}",
+                    after as f64 / window as f64 * 100.0,
+                    thousands(window)
+                ),
+                kept,
+                folded: vec![format!(
+                    "{folded_messages} messages folded into the summary"
+                )],
+                recovers: thousands(before.saturating_sub(after)),
+                call_cost: "in the next /session stats".into(),
+                cache_cost: "the cache re-primes on the next turn".into(),
+            });
+            open_sheet(model, Screen::Compact);
+            Ok(Done::Opened)
         }
         SlashAction::Export(path) => {
             let Some(store) = agent.session.as_ref() else {
                 return Ok(Done::Note("no session to export".into()));
             };
             let output = PathBuf::from(path.unwrap_or_else(|| "session.html".into()));
-            Ok(Done::Said(crate::export::export_session(store, &output)?))
+            let started = Instant::now();
+            let said = crate::export::export_session(store, &output)?;
+            // The `4d` ledger: what left the session, measured from it.
+            let turns = agent
+                .messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count();
+            let calls = agent
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|part| matches!(part, pi_ai::MessageContent::ToolCall { .. }))
+                .count();
+            let images = agent
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|part| matches!(part, pi_ai::MessageContent::Image { .. }))
+                .count();
+            let size = std::fs::metadata(&output)
+                .map(|meta| {
+                    let bytes = meta.len();
+                    if bytes >= 1_000_000 {
+                        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+                    } else {
+                        format!("{:.1} KB", bytes as f64 / 1_000.0)
+                    }
+                })
+                .unwrap_or_default();
+            model.export_ledger = Some(ExportLedger {
+                included: vec![
+                    format!("{turns} turns of prose and thinking"),
+                    format!("{calls} tool calls with their output"),
+                    "every Δ hunk".into(),
+                    format!("{images} images, inlined as base64"),
+                ],
+                excluded: vec![
+                    (
+                        State::Attention,
+                        "absolute paths · kept, they name your machine".into(),
+                    ),
+                    (
+                        State::Attention,
+                        "branch names and commit subjects · kept".into(),
+                    ),
+                ],
+                size,
+                elapsed: format!("{:.1}s", started.elapsed().as_secs_f64()),
+                gist: output.display().to_string(),
+            });
+            open_sheet(model, Screen::Export);
+            let _ = said;
+            Ok(Done::Opened)
         }
         SlashAction::Name(name) => {
             let Some(store) = agent.session.as_mut() else {
@@ -849,7 +1589,10 @@ pub fn perform(
                 agent.thinking_level.as_str()
             )))
         }
-        SlashAction::OpenThinking => Ok(Done::Ask(Question::Thinking)),
+        SlashAction::OpenThinking => {
+            open_thinking_sheet(agent, model);
+            Ok(Done::Opened)
+        }
         SlashAction::Tree => {
             let mut host = crate::loaded_extension_host(parsed);
             host.runtime_flag_values = crate::flag_values_json(parsed);
@@ -864,18 +1607,190 @@ pub fn perform(
             host.emit(ExtensionEvent::UiPromptEnd {
                 kind: "tree".into(),
             });
-            Ok(Done::Open(Overlay::Sessions))
+            if open_tree_sheet(agent, model) {
+                Ok(Done::Opened)
+            } else {
+                Ok(Done::Note(
+                    "no session tree yet — it grows with the first turn".into(),
+                ))
+            }
         }
         SlashAction::Reload => {
+            let keybindings_started = Instant::now();
+            model.keybindings = pi_tui::Keybindings::load(&agent_dir);
+            let keybindings_ms = keybindings_started.elapsed().as_millis();
+            let resources_started = Instant::now();
             crate::apply_discovered_resources(parsed, agent);
+            let resources_ms = resources_started.elapsed().as_millis();
+            let host_started = Instant::now();
             let mut host = crate::loaded_extension_host(parsed);
+            let host_ms = host_started.elapsed().as_millis();
             host.runtime_flag_values = crate::flag_values_json(parsed);
             host.emit(ExtensionEvent::SessionStart);
-            model.corpus = corpus(agent, &model.sessions);
+            // A reload that leaves the old command list behind has not
+            // reloaded: an extension added on disk has to become reachable.
+            model.slash_commands = crate::interactive_slash_commands(agent, parsed);
+            model.corpus = corpus(agent, &model.slash_commands, &model.sessions);
             model.corpus_total = model.corpus.len();
-            Ok(Done::Said(
-                "reloaded extensions, skills, prompts and context files".into(),
-            ))
+
+            // The `6b` workshop sheet: what loaded, what failed, what it costs.
+            let context_tokens: usize = agent
+                .context_files
+                .iter()
+                .map(|file| file.body.len() / 4)
+                .sum();
+            let reload = vec![
+                (
+                    State::Done,
+                    format!("keybindings · {} bindings", pi_tui::get_keybindings().len()),
+                    format!("{keybindings_ms}ms"),
+                    None,
+                ),
+                (
+                    State::Done,
+                    format!(
+                        "skills · {} found, none loaded until named",
+                        agent.skills.len()
+                    ),
+                    format!("{resources_ms}ms"),
+                    None,
+                ),
+                (
+                    State::Done,
+                    format!(
+                        "context files · {} files · {}k",
+                        agent.context_files.len(),
+                        (context_tokens as f64 / 1000.0).round() as u64
+                    ),
+                    String::new(),
+                    None,
+                ),
+                (
+                    State::Done,
+                    format!("extensions · {} javascript, 4 native", host.js.len()),
+                    format!("{host_ms}ms"),
+                    None,
+                ),
+            ];
+            let native_commands = |prefix: &str| {
+                crate::native_extensions::NATIVE_COMMANDS
+                    .iter()
+                    .filter(|name| name.starts_with(prefix))
+                    .count()
+            };
+            let native_tools = |prefix: &str| {
+                crate::native_extensions::NATIVE_TOOLS
+                    .iter()
+                    .filter(|name| name.starts_with(prefix))
+                    .count()
+            };
+            let native = vec![
+                (
+                    State::Done,
+                    "vector-memory".to_string(),
+                    format!(
+                        "{} tools · {} commands",
+                        native_tools("memory") + 1,
+                        native_commands("memory")
+                    ),
+                ),
+                (
+                    State::Done,
+                    "token-governor".to_string(),
+                    format!(
+                        "{} tools · {} commands",
+                        native_tools("retrieve"),
+                        native_commands("governor")
+                    ),
+                ),
+                (
+                    State::Done,
+                    "graph".to_string(),
+                    format!(
+                        "{} tools · {} commands",
+                        native_tools("graph"),
+                        native_commands("graph")
+                    ),
+                ),
+                (
+                    State::Done,
+                    "security-scan".to_string(),
+                    format!(
+                        "{} tools · {} commands",
+                        native_tools("sec"),
+                        native_commands("sec")
+                    ),
+                ),
+            ];
+            let javascript: Vec<(State, String, String)> = host
+                .js
+                .iter()
+                .map(|ext| {
+                    let name = std::path::Path::new(&ext.path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ext.path.clone());
+                    (
+                        State::Done,
+                        name,
+                        format!(
+                            "{} tools · {} commands",
+                            ext.tools.len(),
+                            ext.commands.len()
+                        ),
+                    )
+                })
+                .collect();
+            let node = match crate::js_host::find_node() {
+                Some(path) => path.display().to_string(),
+                None => "node not found — JS extensions inactive".into(),
+            };
+            let schema_tokens = serde_json::to_string(&pi_agent::tool_specs())
+                .map(|text| text.len() / 4)
+                .unwrap_or(0)
+                + serde_json::to_string(
+                    &crate::native_extensions::NativeExtensionHost::tool_specs(),
+                )
+                .map(|text| text.len() / 4)
+                .unwrap_or(0);
+            let window = agent.context_window.max(1) as f64;
+            let builtin = pi_agent::tool_specs().len();
+            let native_count = crate::native_extensions::NATIVE_TOOLS.len();
+            let extension_count: usize = host.js.iter().map(|ext| ext.tools.len()).sum();
+            let total = (builtin + native_count + extension_count).max(1) as f64;
+            model.workshop = Some(WorkshopSheet {
+                reload,
+                native,
+                javascript,
+                node,
+                schema: format!(
+                    "{}k · {:.0}%",
+                    (schema_tokens as f64 / 1000.0).round() as u64,
+                    schema_tokens as f64 / window * 100.0
+                ),
+                tools: vec![
+                    (
+                        "built-in tools".into(),
+                        builtin.to_string(),
+                        builtin as f64 / total,
+                        "read write edit grep find ls bash pwsh".into(),
+                    ),
+                    (
+                        "native tools".into(),
+                        native_count.to_string(),
+                        native_count as f64 / total,
+                        "memory, governor, graph, sec".into(),
+                    ),
+                    (
+                        "extension tools".into(),
+                        extension_count.to_string(),
+                        extension_count as f64 / total,
+                        String::new(),
+                    ),
+                ],
+            });
+            open_sheet(model, Screen::Officina);
+            Ok(Done::Opened)
         }
         SlashAction::Trust => {
             let mut host = crate::loaded_extension_host(parsed);
@@ -888,10 +1803,17 @@ pub fn perform(
             host.emit(ExtensionEvent::UiPromptEnd {
                 kind: "trust".into(),
             });
-            Ok(Done::Ask(Question::Trust {
-                path: agent.cwd.display().to_string(),
-                options: crate::trust::get_project_trust_options(&agent.cwd, false),
-            }))
+            // The sheet says what the project would load (`6a`); enter moves
+            // on to the decision itself.
+            open_trust_sheet(agent, model);
+            Ok(Done::Opened)
+        }
+        // A bare `/login` lists every provider and where its credential came
+        // from (`3d`); with a provider named, the handshake runs detached.
+        SlashAction::Login { provider, key } if provider.is_empty() => {
+            let _ = key;
+            open_login_sheet(parsed, model);
+            Ok(Done::Opened)
         }
         SlashAction::Login { provider, key } => Ok(Done::Detach(Detached::Login { provider, key })),
         SlashAction::Logout { provider } => {
@@ -923,10 +1845,6 @@ pub fn perform(
         ))),
     }
 }
-
-/// The thinking levels the protocol accepts, in the order the old selector
-/// listed them.
-pub const THINKING_LEVELS: [&str; 4] = ["off", "low", "medium", "high"];
 
 fn session_id(agent: &Agent) -> String {
     agent
@@ -981,6 +1899,8 @@ pub fn run(
     let mut model = pi_tui::davinci::boot(raw, 100, 44);
     let session_dir = pi_session::default_session_dir();
     crate::davinci_sources::dress_from_workspace(&mut model, &cwd, &session_dir);
+    // Every later re-read runs on this worker rather than the drawing thread.
+    let dresser = crate::davinci_sources::WorkspaceDresser::start(cwd.clone(), session_dir.clone());
     crate::davinci_surfaces::dress_from_extensions(&mut model, &cwd, agent);
     model.model_name = agent.model_id.clone();
     model.config_path = crate::default_agent_dir()
@@ -988,8 +1908,6 @@ pub fn run(
         .display()
         .to_string();
     model.transcript = transcript_from(&agent.messages);
-    model.corpus = corpus(agent, &model.sessions);
-    model.corpus_total = model.corpus.len();
     model.models = crate::available_models(parsed)
         .iter()
         .map(|entry| {
@@ -1000,6 +1918,24 @@ pub fn run(
             .of(&entry.provider, &entry.id, entry.context_window)
         })
         .collect();
+    // What the composer completes: the same slash corpus, extension providers
+    // and `/login` list the legacy chrome offers, through the same engine.
+    model.slash_commands = crate::interactive_slash_commands(agent, parsed);
+    // The palette lists what the composer completes, so it is built from the
+    // same command list rather than from the built-ins alone.
+    model.corpus = corpus(agent, &model.slash_commands, &model.sessions);
+    model.corpus_total = model.corpus.len();
+    model.extra_autocomplete = crate::interactive_extra_autocomplete(parsed);
+    model.login_providers = crate::interactive_login_providers(parsed);
+    model.model_names = model.models.iter().map(|item| item.name.clone()).collect();
+    model.thinking_levels = crate::current_runtime_model(agent)
+        .map(|runtime| {
+            crate::get_supported_thinking_levels(&runtime)
+                .iter()
+                .map(|level| level.as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     model.model_index = model
         .models
         .iter()
@@ -1019,14 +1955,73 @@ pub fn run(
             reason: "startup".into(),
         });
         host.emit(crate::extension_host::ExtensionEvent::SessionStart);
-        apply_ui_calls(&mut model, &host.ui_calls);
+        let calls = std::mem::take(&mut host.ui_calls);
+        drop(host);
+        apply_ui_calls(&mut model, &calls);
     }
     crate::start_catalog_refresh_async(parsed);
     for entry in opening_block(parsed, agent, migrated_auth_providers) {
         model.transcript.push(entry);
     }
 
+    // The user's own bindings, which davinci was rendering the defaults of
+    // however `~/.pi/agent/keybindings.json` read.
+    model.keybindings = pi_tui::Keybindings::load(&crate::default_agent_dir());
+    // Every `pi.registerShortcut` an extension made, resolved against those
+    // bindings so a shortcut never shadows a reserved chord. Without this,
+    // every registered shortcut was dead under davinci.
+    {
+        let host = host.lock().map_err(|err| err.to_string())?;
+        let (shortcuts, diagnostics) = host.resolve_shortcuts(&model.keybindings);
+        model.extension_shortcuts = shortcuts;
+        drop(host);
+        if let Some(warning) = diagnostics.first() {
+            model.transcript.push(Entry::Gap);
+            model
+                .transcript
+                .push(Entry::tool(State::Attention, "instrumenta", warning, None));
+        }
+    }
+
+    // The stored settings the legacy startup honours, applied where davinci
+    // has the same surface: the completion-list height, the model scope, the
+    // terminal progress report, and the double-escape action (below). The
+    // presentation settings the legacy transcript reads — mermaid mode, code
+    // indent, editor padding, hidden thinking blocks — have no davinci
+    // surface: the transcript's shape is the design contract's (design.md §3).
+    let stored_settings = crate::settings::load_merged_settings(&crate::default_agent_dir(), &cwd);
+    if let Some(rows) = stored_settings.autocomplete_max_visible {
+        model.suggestion_rows = rows.clamp(3, 20) as usize;
+    }
+    model.terminal_progress = stored_settings.show_terminal_progress();
+    if let Some(enabled) = stored_settings
+        .enabled_models
+        .clone()
+        .filter(|enabled| !enabled.is_empty())
+    {
+        model
+            .models
+            .retain(|item| enabled.contains(&format!("{}/{}", item.provider, item.id)));
+        model.model_names = model.models.iter().map(|item| item.name.clone()).collect();
+        model.model_index = model
+            .models
+            .iter()
+            .position(|item| item.name.ends_with(&agent.model_id))
+            .unwrap_or(0);
+    }
+    model.double_escape_action = stored_settings
+        .double_escape_action
+        .clone()
+        .unwrap_or_else(|| "tree".into());
+    let mut last_escape: Option<Instant> = None;
+    // Images pasted with ctrl+v, sent with the next prompt so a vision model
+    // is reachable from this interface.
+    let mut attached_images: Vec<pi_ai::MessageContent> = Vec::new();
+
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    // From here the alternate screen is ours, so a `println!` from shared code
+    // is queued for the transcript instead of painted over the frame.
+    crate::set_hosted_tui_active(true);
     // Proving the panic hook gives the terminal back needs a panic to happen
     // inside the alternate screen, which nothing else can arrange.
     if std::env::var("PI_DAVINCI_PANIC_FIXTURE").is_ok() {
@@ -1069,38 +2064,246 @@ pub fn run(
         &cwd,
         stored.image_auto_resize(),
     )?;
-    let mut queued: Vec<String> = Vec::new();
+    let mut openers: Vec<(String, Vec<pi_ai::MessageContent>)> = Vec::new();
     if let Some(text) = prepared.text.clone() {
-        let expanded = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
-        agent.prompt_with(&expanded, &prepared.images);
-        if let Err(err) = run_turns(parsed, agent, &mut model, &mut terminal, host.clone()) {
-            return Err(err.to_string());
-        }
-        refresh_context(&mut model, agent);
-        crate::davinci_sources::dress_from_workspace(&mut model, &cwd, &session_dir);
+        openers.push((text, prepared.images.clone()));
     }
-    queued.extend(prepared.remaining_messages.iter().cloned());
-    for text in queued {
-        let expanded = pi_agent::expand_user_text(&text, &agent.skills, &agent.templates);
-        agent.prompt(&expanded);
-        if let Err(err) = run_turns(parsed, agent, &mut model, &mut terminal, host.clone()) {
-            return Err(err.to_string());
+    openers.extend(
+        prepared
+            .remaining_messages
+            .iter()
+            .map(|text| (text.clone(), Vec::new())),
+    );
+    for (text, images) in openers {
+        let mut shell = Shell {
+            parsed,
+            agent,
+            model: &mut model,
+            terminal: &mut terminal,
+            host: &host,
+            pending: &mut pending,
+            cwd: &cwd,
+            dresser: &dresser,
+            images: &mut attached_images,
+        };
+        // What the composer's own submit would have pushed, so the opening
+        // question is on screen above its answer.
+        if !shell.model.transcript.is_empty() {
+            shell.model.transcript.push(Entry::Gap);
         }
-        refresh_context(&mut model, agent);
-        crate::davinci_sources::dress_from_workspace(&mut model, &cwd, &session_dir);
+        shell.model.transcript.push(Entry::user(&text));
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(Entry::agent("davinci"));
+        shell.model.running = true;
+        let next = submit_prompt(&mut shell, &text, &images);
+        match next {
+            Next::Go => {}
+            // The terminal has to be given back on the way out, whatever the
+            // opening turn came to.
+            Next::Leave | Next::Fail(_) => {
+                crate::set_hosted_tui_active(false);
+                terminal.close().map_err(|err| err.to_string())?;
+                for (_, line) in crate::take_hosted_lines() {
+                    if !line.trim().is_empty() {
+                        std::println!("{line}");
+                    }
+                }
+                return match next {
+                    Next::Fail(err) => Err(err),
+                    _ => Ok(0),
+                };
+            }
+        }
     }
 
     let result = loop {
+        // Lines shared code printed while the screen was ours belong in the
+        // transcript, which is the only place a davinci shell can say anything
+        // (design.md §6).
+        for (kind, line) in crate::take_hosted_lines() {
+            let line = line.trim_end().to_string();
+            if line.trim().is_empty() {
+                continue;
+            }
+            model.transcript.push(Entry::Gap);
+            if kind == "error" {
+                model
+                    .transcript
+                    .push(Entry::tool(State::Attention, "instrumenta", &line, None));
+            } else {
+                model.transcript.push(Entry::prose(&line));
+            }
+        }
+        // Between turns only: a live turn holds indices into the transcript,
+        // and trimming under it would repoint its open tool lines.
+        model.trim_transcript();
+        // A workspace re-read that finished on the dresser's thread.
+        dresser.apply_ready(&mut model);
         if let Err(err) = terminal.draw(&model) {
             break Err(err.to_string());
         }
 
         let timeout = pi_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed());
-        match crossterm::event::poll(timeout) {
-            Ok(true) => match crossterm::event::read() {
-                Ok(crossterm::event::Event::Key(key))
+        match terminal.poll_event(timeout) {
+            Ok(Some(event)) => match event {
+                crossterm::event::Event::Key(key)
                     if key.kind != crossterm::event::KeyEventKind::Release =>
                 {
+                    // An extension's registered shortcut gets the chord before
+                    // the shell's own keys, exactly as the legacy loop gives
+                    // it. Resolution already refused the reserved chords.
+                    let claimed = pi_tui::key_event_bytes(&key).and_then(|data| {
+                        model
+                            .extension_shortcuts
+                            .iter()
+                            .find(|(chord, _)| pi_tui::key_to_bytes(chord) == data)
+                            .cloned()
+                    });
+                    if let Some((chord, path)) = claimed {
+                        let mut shell = Shell {
+                            parsed,
+                            agent,
+                            model: &mut model,
+                            terminal: &mut terminal,
+                            host: &host,
+                            pending: &mut pending,
+                            cwd: &cwd,
+                            dresser: &dresser,
+                            images: &mut attached_images,
+                        };
+                        match shell.run_shortcut(&chord, &path) {
+                            Next::Go => {}
+                            Next::Leave => break Ok(0),
+                            Next::Fail(err) => break Err(err),
+                        }
+                        continue;
+                    }
+                    // An extension that registered `onTerminalInput` sees the
+                    // raw chord before the shell's own keys, exactly as the
+                    // legacy loop offers it through `dispatch_terminal_input`.
+                    if model.terminal_input_registered {
+                        let taken = pi_tui::key_event_bytes(&key).is_some_and(|data| {
+                            let mut locked = host.lock().unwrap_or_else(|err| err.into_inner());
+                            locked.dispatch_terminal_input(&data)
+                        });
+                        if taken {
+                            let mut shell = Shell {
+                                parsed,
+                                agent,
+                                model: &mut model,
+                                terminal: &mut terminal,
+                                host: &host,
+                                pending: &mut pending,
+                                cwd: &cwd,
+                                dresser: &dresser,
+                                images: &mut attached_images,
+                            };
+                            match apply_host_effects(&mut shell) {
+                                Next::Go => {}
+                                Next::Leave => break Ok(0),
+                                Next::Fail(err) => break Err(err),
+                            }
+                            continue;
+                        }
+                    }
+                    // ctrl+v reads the clipboard the way the legacy chrome's
+                    // `PasteClipboard` does: an image is attached to the next
+                    // prompt — the only way a vision model is reachable from
+                    // this interface — and text goes into the composer.
+                    if key.code == crossterm::event::KeyCode::Char('v')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        if let Some(png) = crate::external_editor::clipboard_image_png() {
+                            let (bytes, note) = match crate::image_convert::resize_image_in_process(
+                                &png,
+                                "image/png",
+                            ) {
+                                Some(resized) => {
+                                    let note = format!("{}x{}", resized.width, resized.height);
+                                    let bytes = if resized.was_resized
+                                        && resized.mime_type == "image/png"
+                                    {
+                                        resized.bytes
+                                    } else {
+                                        png
+                                    };
+                                    (bytes, note)
+                                }
+                                None => (png, "image".to_string()),
+                            };
+                            let data = base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                bytes,
+                            );
+                            attached_images.push(pi_ai::MessageContent::Image {
+                                data,
+                                mime_type: "image/png".into(),
+                            });
+                            let count = attached_images.len();
+                            model.extensions.set_status(
+                                "§images",
+                                Some(&format!(
+                                    "{count} image{} attached ({note}) · sent with the next prompt",
+                                    if count == 1 { "" } else { "s" },
+                                )),
+                            );
+                            continue;
+                        }
+                        if let Some(text) = crate::external_editor::clipboard_text() {
+                            model.paste(&text);
+                            continue;
+                        }
+                        // An empty clipboard falls through to the editor's own
+                        // ctrl+v, if the user bound one.
+                    }
+                    // Two escapes on an empty composer, within the same window
+                    // the legacy chrome uses, run the stored double-escape
+                    // action: the session tree by default, a fork if asked.
+                    if key.code == crossterm::event::KeyCode::Esc
+                        && key.modifiers.is_empty()
+                        && model.overlay.is_none()
+                        && model.suggestions.is_none()
+                        && model.screen == pi_tui::davinci::model::Screen::Agent
+                        && !model.codex_open()
+                        && model.composer.trim().is_empty()
+                        && model.double_escape_action != "none"
+                    {
+                        let now = Instant::now();
+                        let doubled = last_escape.is_some_and(|prev| {
+                            now.duration_since(prev)
+                                < Duration::from_millis(pi_tui::DOUBLE_ESCAPE_MS)
+                        });
+                        if doubled {
+                            last_escape = None;
+                            match pi_tui::DoubleEscapeAction::parse(&model.double_escape_action) {
+                                pi_tui::DoubleEscapeAction::Fork => {
+                                    let mut shell = Shell {
+                                        parsed,
+                                        agent,
+                                        model: &mut model,
+                                        terminal: &mut terminal,
+                                        host: &host,
+                                        pending: &mut pending,
+                                        cwd: &cwd,
+                                        dresser: &dresser,
+                                        images: &mut attached_images,
+                                    };
+                                    match on_line(&mut shell, "/fork") {
+                                        Next::Go => {}
+                                        Next::Leave => break Ok(0),
+                                        Next::Fail(err) => break Err(err),
+                                    }
+                                }
+                                _ => model.toggle_overlay(Overlay::Sessions),
+                            }
+                            continue;
+                        }
+                        last_escape = Some(now);
+                    } else {
+                        last_escape = None;
+                    }
                     let was = model.screen;
                     let next = match app::handle_key(&mut model, key) {
                         Flow::Quit => Next::Leave,
@@ -1113,7 +2316,8 @@ pub fn run(
                                 host: &host,
                                 pending: &mut pending,
                                 cwd: &cwd,
-                                session_dir: &session_dir,
+                                dresser: &dresser,
+                                images: &mut attached_images,
                             },
                             &line,
                         ),
@@ -1126,7 +2330,8 @@ pub fn run(
                                 host: &host,
                                 pending: &mut pending,
                                 cwd: &cwd,
-                                session_dir: &session_dir,
+                                dresser: &dresser,
+                                images: &mut attached_images,
                             },
                             choice,
                         ),
@@ -1149,14 +2354,20 @@ pub fn run(
                         Next::Fail(err) => break Err(err),
                     }
                 }
-                Ok(crossterm::event::Event::Resize(width, height)) => {
-                    model.width = width;
-                    model.height = height;
+                crossterm::event::Event::Resize(width, height) => {
+                    // A measure of nothing wraps nothing: the prose measure and
+                    // the panel insets are all derived from this.
+                    model.width = width.max(20);
+                    model.height = height.max(4);
                 }
-                Ok(_) => {}
-                Err(err) => break Err(err.to_string()),
+                // A paste is text, never keys: dropping it made every newline
+                // in the pasted block submit a turn of its own. On Windows the
+                // burst of keys the console delivers is reassembled into this
+                // event by the paste filter behind `poll_event`.
+                crossterm::event::Event::Paste(text) => model.paste(&text),
+                _ => {}
             },
-            Ok(false) => {}
+            Ok(None) => {}
             Err(err) => break Err(err.to_string()),
         }
 
@@ -1166,7 +2377,15 @@ pub fn run(
         }
     };
 
+    crate::set_hosted_tui_active(false);
     terminal.close().map_err(|err| err.to_string())?;
+    // Anything shared code printed while the screen was ours, said now that
+    // stdout is the user's again rather than dropped.
+    for (_, line) in crate::take_hosted_lines() {
+        if !line.trim().is_empty() {
+            std::println!("{line}");
+        }
+    }
     result
 }
 
@@ -1294,15 +2513,144 @@ fn custom_messages(agent: &Agent) -> Vec<Entry> {
     out
 }
 
+/// Apply everything the shared extension host has queued — UI rows first,
+/// then session calls — with the davinci transcript as the visible surface.
+///
+/// The davinci counterpart of `apply_host_session_calls` in main.rs: the same
+/// gating events before a fork, switch or tree move, the same state effects
+/// through `apply_session_calls`, and the same consequences afterwards — a
+/// reload rebuilds the command list, an unregistered provider leaves the
+/// model picker. A `sendMessage` carrying `triggerTurn` runs a full davinci
+/// turn, spinner and all, rather than a blind blocking completion.
+fn apply_host_effects(shell: &mut Shell<'_>) -> Next {
+    use crate::extension_host::ExtensionEvent;
+
+    drain_ui_calls(shell.model, shell.host);
+    let op_of = |call: &serde_json::Value| -> String {
+        call.get("op")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let calls = {
+        let mut host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
+        let taken = std::mem::take(&mut host.session_calls);
+        let mut allowed = Vec::new();
+        for call in taken {
+            match op_of(&call).as_str() {
+                "fork" => {
+                    host.emit(ExtensionEvent::SessionBeforeFork);
+                    if host.last_result_cancelled() {
+                        continue;
+                    }
+                }
+                "switchSession" => {
+                    host.emit(ExtensionEvent::SessionBeforeSwitch);
+                    if host.last_result_cancelled() {
+                        continue;
+                    }
+                }
+                "navigateTree" => {
+                    host.emit(ExtensionEvent::SessionBeforeTree);
+                    if host.last_result_cancelled() {
+                        continue;
+                    }
+                }
+                "reload" => host.emit(ExtensionEvent::SessionShutdown {
+                    reason: "reload".into(),
+                }),
+                _ => {}
+            }
+            allowed.push(call);
+        }
+        allowed
+    };
+    if calls.is_empty() {
+        return Next::Go;
+    }
+
+    let wants_turn = calls.iter().any(|call| {
+        matches!(op_of(call).as_str(), "sendMessage" | "sendUserMessage")
+            && call
+                .get("options")
+                .and_then(|options| options.get("triggerTurn"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+    });
+    crate::apply_session_calls(
+        Some(shell.parsed),
+        shell.agent,
+        crate::SessionCallUi::Davinci(shell.model),
+        &calls,
+        false,
+    );
+
+    if calls.iter().any(|call| op_of(call) == "reload") {
+        crate::apply_discovered_resources(shell.parsed, shell.agent);
+        shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+    }
+    for call in &calls {
+        if op_of(call) != "unregisterProvider" {
+            continue;
+        }
+        let Some(name) = call.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        shell.model.models.retain(|item| item.provider != name);
+        shell
+            .model
+            .model_names
+            .retain(|model| !model.starts_with(&format!("{name}/")));
+        shell
+            .model
+            .login_providers
+            .retain(|provider| provider != name);
+    }
+    if calls.iter().any(|call| {
+        matches!(
+            op_of(call).as_str(),
+            "fork" | "switchSession" | "newSession"
+        )
+    }) {
+        // The session in hand changed, so the transcript is rebuilt from it —
+        // which wipes the status lines `apply_session_calls` just pushed.
+        // State the change again on the fresh transcript.
+        shell.model.transcript = transcript_from(&shell.agent.messages);
+        for call in &calls {
+            if matches!(
+                op_of(call).as_str(),
+                "fork" | "switchSession" | "newSession"
+            ) {
+                if let Some(note) = crate::session_call_note(call) {
+                    shell.note(&note);
+                }
+            }
+        }
+    }
+    shell.redress();
+
+    if wants_turn {
+        shell.model.running = true;
+        match run_turns(shell) {
+            Next::Go => {}
+            other => return other,
+        }
+        shell.redress();
+    }
+    Next::Go
+}
+
 /// Apply the UI calls the loaded extensions have made, returning a window
 /// title if one was asked for.
 ///
 /// Davinci honours the calls that are rows or text — widgets, header, footer,
-/// status, notifications, the composer and the title. It ignores the ones that
-/// would take over the design itself: `setTheme` (one palette, negotiated from
-/// the terminal, §2), `setEditorComponent`, `setWorkingIndicator` and
-/// `setWorkingVisible` (exactly two things animate, §8), and
-/// `setToolsExpanded`.
+/// status, notifications, the composer, the title, the working message (as an
+/// extension status row) and `onTerminalInput` (the shell offers raw chords
+/// to the host before its own keys). It deliberately ignores the ones that
+/// would take over the design itself: `setTheme` (one palette, negotiated
+/// from the terminal, §2), `setEditorComponent` (the composer is the shell's,
+/// §6), `setWorkingIndicator` (exactly two things animate off one clock, §8),
+/// and `setToolsExpanded` (a tool call is one line, §6).
 pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<String> {
     let mut title = None;
     let text_lines = |value: Option<&serde_json::Value>| -> Vec<String> {
@@ -1355,8 +2703,25 @@ pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<
                     ));
                 }
             }
-            Some("setEditorText") => model.composer = field(call, "text"),
+            Some("setEditorText") => model.composer = field(call, "text").into(),
             Some("pasteToEditor") => model.composer.push_str(&field(call, "text")),
+            // Davinci has no separate working row — the Studio ledger carries
+            // the one spinner — so an extension's working message takes the
+            // shape extensions are given: a status row above the composer.
+            Some("setWorkingMessage") => {
+                let message = call.get("message").and_then(serde_json::Value::as_str);
+                model.extensions.set_status("§working", message);
+            }
+            Some("setWorkingVisible") => {
+                let visible = call
+                    .get("visible")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                if !visible {
+                    model.extensions.set_status("§working", None);
+                }
+            }
+            Some("onTerminalInput") => model.terminal_input_registered = true,
             Some("setTitle") => {
                 let value = field(call, "title");
                 if !value.is_empty() {
@@ -1369,6 +2734,1028 @@ pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<
     title
 }
 
+// --- the command sheets (screens 3a–6d) -------------------------------------
+//
+// Each builder reads live state — the model runtime, the settings store, the
+// session store, git, the native extensions — into the sheet the Elixir
+// reference designs (`docs/ui/davinci_tui/lib/davinci/views/*.ex`), then opens
+// the screen. Nothing here is fixture data.
+
+fn open_sheet(model: &mut Model, screen: Screen) {
+    model.running = false;
+    model.overlay = None;
+    model.screen = screen;
+}
+
+/// `3a` — the full model catalog, from the live runtime snapshot. Every
+/// catalog model stays listed; a row without a credential draws dimmed with
+/// its note saying so, exactly as the legacy `/model` lists them locked.
+fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Model) {
+    let snapshot = crate::load_model_runtime(parsed);
+    let available: std::collections::BTreeSet<String> = snapshot
+        .available
+        .iter()
+        .map(|entry| format!("{}/{}", entry.provider, entry.id))
+        .collect();
+    let ringed: std::collections::BTreeSet<String> = model
+        .models
+        .iter()
+        .map(|item| format!("{}/{}", item.provider, item.id))
+        .collect();
+    model.catalog = snapshot
+        .all
+        .iter()
+        .map(|entry| {
+            let key = format!("{}/{}", entry.provider, entry.id);
+            let ready = available.contains(&key);
+            let auth = snapshot.auth.get(&entry.provider);
+            let price = if entry.cost.input == 0.0 && entry.cost.output == 0.0 {
+                "free · local".to_string()
+            } else {
+                format!("{:.2} · {:.2}", entry.cost.input, entry.cost.output)
+            };
+            CatalogRow {
+                name: key.clone(),
+                window: pi_tui::davinci::views::chrome::thousands(entry.context_window),
+                thinking: if entry.reasoning {
+                    "budget".into()
+                } else {
+                    "none".into()
+                },
+                price,
+                credential: if ready {
+                    Credential::Ready
+                } else {
+                    Credential::Absent
+                },
+                note: if ready {
+                    auth.map(|check| check.kind.clone())
+                        .unwrap_or_else(|| "ready".into())
+                } else {
+                    "none".into()
+                },
+                ring: ringed.contains(&key),
+                provider: entry.provider.clone(),
+                id: entry.id.clone(),
+            }
+        })
+        .collect();
+    model.catalog_index = model
+        .catalog
+        .iter()
+        .position(|row| row.provider == agent.provider && row.id == agent.model_id)
+        .unwrap_or(0);
+    open_sheet(model, Screen::Models);
+}
+
+/// `3b` — the settings sheet, from the same list the legacy overlay builds,
+/// so both surfaces offer the same keys with the same ramps. A row whose
+/// merged value differs from the user file's was set by the project.
+fn open_settings_sheet(agent: &Agent, model: &mut Model) {
+    let dir = crate::default_agent_dir();
+    let user = crate::settings::load_settings(&dir);
+    let merged = crate::settings::load_merged_settings(&dir, &agent.cwd);
+    let user_list = pi_tui::interactive_settings_list(&crate::settings::to_interactive_config(
+        &user, "davinci",
+    ));
+    let merged_list = pi_tui::interactive_settings_list(&crate::settings::to_interactive_config(
+        &merged, "davinci",
+    ));
+    model.settings_rows = merged_list
+        .items
+        .into_iter()
+        .map(|item| {
+            let project = user_list
+                .items
+                .iter()
+                .find(|own| own.id == item.id)
+                .map(|own| own.current_value != item.current_value)
+                .unwrap_or(false);
+            SettingRow {
+                label: item.label,
+                value: item.current_value,
+                project,
+                values: item.values,
+                description: item.description.unwrap_or_default(),
+                key: item.id,
+            }
+        })
+        .collect();
+    model.settings_index = 0;
+    open_sheet(model, Screen::Settings);
+}
+
+/// `3c` — the thinking sheet: every level this model supports, as the budget
+/// it actually sends, with its share of the 64k ceiling and a warning when a
+/// level would take a third of the window before the turn starts.
+fn open_thinking_sheet(agent: &Agent, model: &mut Model) {
+    let stored = crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+    let budgets = stored.thinking_budgets.clone();
+    let levels = crate::current_runtime_model(agent)
+        .map(|runtime| crate::get_supported_thinking_levels(&runtime))
+        .unwrap_or_else(|| pi_protocol::ThinkingLevel::all().to_vec());
+    let window = agent.context_window.max(1) as f64;
+    model.thinking_rows = levels
+        .iter()
+        .map(|level| {
+            let budget = if *level == pi_protocol::ThinkingLevel::Off {
+                0u32
+            } else {
+                pi_ai::thinking_budget_for_level(*level, budgets.as_ref())
+            };
+            let of_window = budget as f64 / window;
+            let warn = of_window >= 1.0 / 3.0;
+            let maps_to = if budget == 0 {
+                "disabled → none".to_string()
+            } else if warn {
+                format!("! {:.0}% of the window", of_window * 100.0)
+            } else {
+                let sent = pi_ai::clamp_reasoning(*level)
+                    .map(|resolved| resolved.as_str().to_string())
+                    .unwrap_or_else(|| "none".into());
+                format!("{budget} → {sent}")
+            };
+            ThinkingRow {
+                level: level.as_str().to_string(),
+                budget: if budget == 0 {
+                    "0".into()
+                } else {
+                    format!("{:.1}k", budget as f64 / 1000.0)
+                },
+                fraction: budget as f64 / 65_536.0,
+                maps_to,
+                warn,
+            }
+        })
+        .collect();
+    model.thinking_index = model
+        .thinking_rows
+        .iter()
+        .position(|row| row.level == agent.thinking_level.as_str())
+        .unwrap_or(0);
+    open_sheet(model, Screen::Thinking);
+}
+
+/// `3d` — provider credentials: every provider `/login` offers, with where
+/// its credential came from, from the same auth resolution `/model` uses.
+fn open_login_sheet(parsed: &crate::args::Args, model: &mut Model) {
+    let snapshot = crate::load_model_runtime(parsed);
+    let names = crate::interactive_login_providers(parsed);
+    model.providers = names
+        .iter()
+        .map(|name| match snapshot.auth.get(name) {
+            Some(check) => ProviderRow {
+                name: name.clone(),
+                method: check.kind.clone(),
+                source: check.source.clone(),
+                state: Credential::Ready,
+            },
+            None => ProviderRow {
+                name: name.clone(),
+                method: "api key or oauth".into(),
+                source: "never configured".into(),
+                state: Credential::Absent,
+            },
+        })
+        .collect();
+    model.login_index = 0;
+    model.device_code = None;
+    open_sheet(model, Screen::Login);
+}
+
+/// A binding's action id, said in words: `cursorWordLeft` → `cursor word left`.
+fn humanize_action(action: &str) -> String {
+    let name = action.rsplit('.').next().unwrap_or(action);
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_uppercase() {
+            out.push(' ');
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// `3e` — the keymap, grouped by the surface a key belongs to, from the real
+/// binding table plus every extension shortcut.
+fn open_keys_sheet(model: &mut Model) {
+    let bindings = pi_tui::get_keybindings();
+    let mut instruments: Vec<(String, String)> = Vec::new();
+    let mut composer: Vec<(String, String)> = Vec::new();
+    let mut lists: Vec<(String, String)> = Vec::new();
+    let mut other: Vec<(String, String)> = Vec::new();
+    for binding in &bindings {
+        let row = (binding.keys.join(", "), humanize_action(&binding.action));
+        if binding.action.starts_with("davinci.") {
+            instruments.push(row);
+        } else if binding.action.starts_with("tui.editor.")
+            || binding.action.starts_with("tui.input.")
+        {
+            composer.push(row);
+        } else if binding.action.starts_with("tui.select.") {
+            lists.push(row);
+        } else {
+            other.push(row);
+        }
+    }
+    let mut groups = vec![
+        KeymapGroup {
+            title: "INSTRUMENTS".into(),
+            note: "over the transcript".into(),
+            rows: instruments,
+        },
+        KeymapGroup {
+            title: "COMPOSER".into(),
+            note: String::new(),
+            rows: composer,
+        },
+        KeymapGroup {
+            title: "LISTS".into(),
+            note: "inside a panel".into(),
+            rows: lists,
+        },
+    ];
+    if !other.is_empty() {
+        groups.push(KeymapGroup {
+            title: "SESSION".into(),
+            note: String::new(),
+            rows: other,
+        });
+    }
+    if !model.extension_shortcuts.is_empty() {
+        groups.push(KeymapGroup {
+            title: "EXTENSIONS".into(),
+            note: "registered by extensions".into(),
+            rows: model
+                .extension_shortcuts
+                .iter()
+                .map(|(key, path)| {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    (key.clone(), name)
+                })
+                .collect(),
+        });
+    }
+    model.keymap = groups;
+    model.keys_offset = 0;
+    open_sheet(model, Screen::Keys);
+}
+
+/// `4a` — the session list, with what resuming each one would carry, from the
+/// real store. Token counts are an estimate and say so.
+fn open_resume_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Model) {
+    let session_dir = crate::resolved_session_dir(parsed, &agent.cwd);
+    let mut found = pi_session::discover_sessions(&session_dir, None).unwrap_or_default();
+    found.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    model.session_count = found.len();
+    let now = pi_session::now_ms();
+    model.resume_sessions = found
+        .iter()
+        .take(30)
+        .map(|summary| {
+            let last = summary
+                .all_messages_text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let last = if last.chars().count() > 60 {
+                let tail: String = last
+                    .chars()
+                    .rev()
+                    .take(57)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                format!("…{tail}")
+            } else {
+                last
+            };
+            ResumeRow {
+                name: crate::davinci_sources::session_name(summary),
+                branch: String::new(),
+                turns: summary.message_count.to_string(),
+                tokens: format!(
+                    "~{}",
+                    pi_tui::davinci::views::chrome::thousands(
+                        (summary.all_messages_text.len() / 4) as u64
+                    )
+                ),
+                model: String::new(),
+                touched: crate::davinci_sources::humanise(
+                    now.saturating_sub(summary.modified_at) / 1_000,
+                ),
+                named: summary
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty()),
+                warning: None,
+                note: summary
+                    .parent_session_id
+                    .as_ref()
+                    .map(|parent| {
+                        format!("forked from {}", parent.chars().take(8).collect::<String>())
+                    })
+                    .unwrap_or_default(),
+                last,
+                path: summary.path.display().to_string(),
+            }
+        })
+        .collect();
+    model.resume_index = 0;
+    open_sheet(model, Screen::Resume);
+}
+
+/// `4b` — the session tree, from the current session's entry graph: one node
+/// per user turn, spacers carrying the trunk between them.
+fn open_tree_sheet(agent: &Agent, model: &mut Model) -> bool {
+    let Some(store) = agent.session.as_ref() else {
+        return false;
+    };
+    let turn_text = |entry: &pi_session::SessionEntry| -> Option<String> {
+        let message = entry.message.as_ref()?;
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+            return None;
+        }
+        let text = pi_tui::CustomMessage::text_content(message);
+        let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+        Some(clip(line, 48))
+    };
+    let turns: Vec<(&pi_session::SessionEntry, String)> = store
+        .entries
+        .iter()
+        .filter(|entry| entry.entry_type == "message")
+        .filter_map(|entry| turn_text(entry).map(|text| (entry, text)))
+        .collect();
+    if turns.is_empty() {
+        return false;
+    }
+    let on_path: std::collections::BTreeSet<&str> = {
+        // The chain from the leaf back to the root is the trunk in hand.
+        let by_id: std::collections::BTreeMap<&str, &pi_session::SessionEntry> = store
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry))
+            .collect();
+        let mut path = std::collections::BTreeSet::new();
+        let mut cursor = store.leaf_id.as_deref();
+        while let Some(id) = cursor {
+            path.insert(id);
+            cursor = by_id.get(id).and_then(|entry| entry.parent_id.as_deref());
+        }
+        path
+    };
+    let stamp = |ms: u64| -> String {
+        let seconds = ms / 1_000;
+        format!("{:02}:{:02}", (seconds / 3_600) % 24, (seconds / 60) % 60)
+    };
+    let mut rows: Vec<TreeNode> = Vec::new();
+    let count = turns.len();
+    for (index, (entry, text)) in turns.iter().enumerate() {
+        if index > 0 {
+            rows.push(TreeNode {
+                trunk: "│".into(),
+                ..TreeNode::default()
+            });
+        }
+        let last = index + 1 == count;
+        let active = on_path.contains(entry.id.as_str())
+            && store.leaf_id.as_deref() == Some(entry.id.as_str());
+        rows.push(TreeNode {
+            trunk: if index == 0 {
+                String::new()
+            } else if last {
+                "└── ".into()
+            } else {
+                "├── ".into()
+            },
+            state: Some(if active {
+                State::Active
+            } else if on_path.contains(entry.id.as_str()) {
+                State::Done
+            } else {
+                State::Queued
+            }),
+            id: Some(format!("{:02}", index + 1)),
+            label: Some(text.clone()),
+            meta: Some(stamp(entry.timestamp)),
+            entry_id: entry.id.clone(),
+        });
+    }
+    model.tree_index = rows
+        .iter()
+        .position(|row| row.state == Some(State::Active))
+        .or_else(|| rows.iter().rposition(|row| row.id.is_some()))
+        .unwrap_or(0);
+    model.session_tree = rows;
+    open_sheet(model, Screen::Tree);
+    true
+}
+
+/// `6a` — what this project would load if trusted, walked from the real
+/// `.pi` directory and context files.
+fn open_trust_sheet(agent: &Agent, model: &mut Model) {
+    let cwd = &agent.cwd;
+    let mut files: Vec<TrustFile> = Vec::new();
+    let count_in = |dir: &std::path::Path| -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+    };
+    let extensions = cwd.join(".pi").join("extensions");
+    if extensions.is_dir() {
+        for entry in std::fs::read_dir(&extensions)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            files.push(TrustFile {
+                state: State::Attention,
+                path: format!(".pi\\extensions\\{}", entry.file_name().to_string_lossy()),
+                detail: "runs as node, no sandbox".into(),
+                risk_label: "executes code".into(),
+            });
+        }
+    }
+    let settings = cwd.join(".pi").join("settings.json");
+    if settings.is_file() {
+        let keys = std::fs::read_to_string(&settings)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| value.as_object().map(|map| map.len()))
+            .unwrap_or(0);
+        files.push(TrustFile {
+            state: State::Attention,
+            path: ".pi\\settings.json".into(),
+            detail: format!("{keys} keys, incl. limits and allowlists"),
+            risk_label: "changes limits".into(),
+        });
+    }
+    let skills = cwd.join(".pi").join("skills");
+    if skills.is_dir() {
+        files.push(TrustFile {
+            state: State::Read,
+            path: format!(".pi\\skills\\ ({})", count_in(&skills)),
+            detail: "instructions loaded on demand".into(),
+            risk_label: "prompt text".into(),
+        });
+    }
+    let prompts = cwd.join(".pi").join("prompts");
+    if prompts.is_dir() {
+        files.push(TrustFile {
+            state: State::Read,
+            path: format!(".pi\\prompts\\ ({})", count_in(&prompts)),
+            detail: "slash commands that expand to prompts".into(),
+            risk_label: "prompt text".into(),
+        });
+    }
+    let mut context_lines = 0usize;
+    let mut context_names: Vec<&str> = Vec::new();
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        if let Ok(text) = std::fs::read_to_string(cwd.join(name)) {
+            context_lines += text.lines().count();
+            context_names.push(name);
+        }
+    }
+    if !context_names.is_empty() {
+        files.push(TrustFile {
+            state: State::Read,
+            path: context_names.join(" · "),
+            detail: format!("{context_lines} lines, prepended to every turn"),
+            risk_label: "prompt text".into(),
+        });
+    }
+    let store = crate::trust::ProjectTrustStore::open(&crate::default_agent_dir());
+    let (trusted, ignored) = store.counts();
+    model.project_trust = Some(ProjectTrustSheet {
+        files,
+        path: cwd.display().to_string(),
+        trusted: format!("{trusted} projects"),
+        ignored: ignored.to_string(),
+        store: crate::default_agent_dir()
+            .join("trust.json")
+            .display()
+            .to_string(),
+    });
+    open_sheet(model, Screen::Trust);
+}
+
+/// `6d` — the Δ review, from the real working tree: every changed file with
+/// its counts and its own first hunk. `/diff` is davinci's own command — the
+/// legacy chrome has no such screen.
+fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
+    use std::process::Command;
+    let cwd = shell.cwd;
+    let changes = crate::davinci_sources::git_changes(cwd);
+    if changes.is_empty() {
+        shell.note("nothing to review — the working tree is clean");
+        return Next::Go;
+    }
+    let numstat: Vec<(String, u32, u32)> = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["diff", "--numstat", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.split('\t');
+                    let adds = fields.next()?.parse().ok()?;
+                    let dels = fields.next()?.parse().ok()?;
+                    Some((fields.next()?.to_string(), adds, dels))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let hunk_of = |path: &str| -> (Vec<Hunk>, String) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["diff", "--unified=2", "HEAD", "--", path])
+            .output();
+        let Ok(output) = output else {
+            return (Vec::new(), String::new());
+        };
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        let hunk_count = text.lines().filter(|line| line.starts_with("@@")).count();
+        let mut rows = Vec::new();
+        let mut inside = false;
+        for line in text.lines() {
+            if line.starts_with("@@") {
+                if inside {
+                    break; // the first hunk is enough for the sheet
+                }
+                inside = true;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            if rows.len() >= 12 {
+                break;
+            }
+            let (kind, body) = match line.chars().next() {
+                Some('+') => (HunkKind::Add, &line[1..]),
+                Some('-') => (HunkKind::Del, &line[1..]),
+                _ => (HunkKind::Context, line.trim_start_matches(' ')),
+            };
+            rows.push(Hunk::new(kind, &clip(body, 90)));
+        }
+        let note = match hunk_count {
+            0 => String::new(),
+            1 => "hunk 1 of 1".to_string(),
+            n => format!("hunk 1 of {n}"),
+        };
+        (rows, note)
+    };
+    let mut total_adds = 0u32;
+    let mut total_dels = 0u32;
+    let files: Vec<ReviewFile> = changes
+        .iter()
+        .take(24)
+        .map(|change| {
+            let normalized = change.path.replace('\\', "/");
+            let counted = numstat.iter().find(|(path, _, _)| path == &normalized);
+            let (adds, dels) = counted
+                .map(|(_, adds, dels)| (Some(*adds), Some(*dels)))
+                .unwrap_or((None, None));
+            total_adds += adds.unwrap_or(0);
+            total_dels += dels.unwrap_or(0);
+            let untracked = change.status == "?";
+            let (hunk, hunk_note) = if untracked {
+                (Vec::new(), "new file · untracked".to_string())
+            } else {
+                hunk_of(&normalized)
+            };
+            ReviewFile {
+                state: match change.status.as_str() {
+                    "D" => State::Failed,
+                    "A" | "?" => State::Done,
+                    _ => State::Delta,
+                },
+                path: change.path.clone(),
+                adds,
+                dels,
+                tests: "not run".into(),
+                test_state: State::Queued,
+                hunk_note,
+                hunk,
+            }
+        })
+        .collect();
+    let behind = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-list", "--count", "HEAD..@{upstream}"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+        .filter(|count| *count > 0)
+        .map(|count| format!("{count} commits behind"))
+        .unwrap_or_default();
+    shell.model.review = Some(ReviewSheet {
+        files,
+        adds: total_adds,
+        dels: total_dels,
+        branch: shell.model.branch.clone(),
+        behind,
+        warning: String::new(),
+        tests: "run the tests before trusting the diff · !cargo test".into(),
+    });
+    shell.model.diff_index = 0;
+    open_sheet(shell.model, Screen::Diff);
+    Next::Go
+}
+
+/// A JSON string field, or empty.
+fn json_str(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `5b` — the vector index sheet, from the real `memory-status` payload.
+fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
+    let records = value
+        .get("records")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let enabled = value
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let automatic = value
+        .get("automaticRetrieval")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut health = vec![(
+        if enabled {
+            State::Done
+        } else {
+            State::Attention
+        },
+        if enabled {
+            "index enabled".to_string()
+        } else {
+            "index disabled — memory tools answer empty".to_string()
+        },
+    )];
+    let last_indexed = json_str(value, "lastIndexed");
+    if !last_indexed.is_empty() {
+        health.push((State::Done, format!("last indexed {last_indexed}")));
+    }
+    health.push((
+        if automatic {
+            State::Done
+        } else {
+            State::Queued
+        },
+        if automatic {
+            "automatic retrieval before each turn".to_string()
+        } else {
+            "retrieval on demand only — /memory-search".to_string()
+        },
+    ));
+    VectorIndex {
+        repo: json_str(value, "repoId"),
+        repo_records: records.to_string(),
+        total_records: records.to_string(),
+        injection_cap: String::new(),
+        floor: String::new(),
+        kinds: Vec::new(),
+        embeddings: "ollama".into(),
+        embed_host: json_str(value, "ollama"),
+        store: "qdrant".into(),
+        collection: format!("collection {}", json_str(value, "collection")),
+        extraction: String::new(),
+        config: crate::default_agent_dir()
+            .join("vector-memory.json")
+            .display()
+            .to_string(),
+        health,
+    }
+}
+
+/// `5c` — the governor's ledger, from the real `governor-status` payload plus
+/// a look into its store directory.
+fn governor_sheet(value: &serde_json::Value) -> GovernorSheet {
+    let count = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let store_dir = json_str(value, "store");
+    let stored: Vec<GovernorStored> = std::fs::read_dir(&store_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .take(8)
+        .map(|entry| {
+            let size = entry
+                .metadata()
+                .map(|meta| {
+                    let bytes = meta.len();
+                    if bytes >= 1_000 {
+                        format!("{} KB", bytes / 1_000)
+                    } else {
+                        format!("{bytes} B")
+                    }
+                })
+                .unwrap_or_default();
+            GovernorStored {
+                id: entry.file_name().to_string_lossy().to_string(),
+                tool: String::new(),
+                call: String::new(),
+                size,
+                stale: false,
+            }
+        })
+        .collect();
+    GovernorSheet {
+        counters: vec![
+            GovernorCounter {
+                number: count("compressedOutputs").to_string(),
+                of: "results".into(),
+                verb: "compressed".into(),
+                note: "head and tail kept · rest on disk".into(),
+                tone: Tone::Primary,
+            },
+            GovernorCounter {
+                number: count("deduplicatedReads").to_string(),
+                of: "reads".into(),
+                verb: "deduplicated".into(),
+                note: "same file, same state hash".into(),
+                tone: Tone::Secondary,
+            },
+            GovernorCounter {
+                number: count("blockedCalls").to_string(),
+                of: "calls".into(),
+                verb: "blocked".into(),
+                note: "anti-loop · no new state".into(),
+                tone: Tone::Warning,
+            },
+        ],
+        stored,
+        store_dir: format!("{store_dir} · dropped when the session ends"),
+    }
+}
+
+/// `5d` — the security scan sheet, from the structured `sec-status` payload.
+fn security_sheet(value: &serde_json::Value) -> SecurityScan {
+    let severity_of = |name: &str| match name {
+        "critical" => Severity::Critical,
+        "high" => Severity::High,
+        "medium" => Severity::Medium,
+        "low" => Severity::Low,
+        _ => Severity::Dismissed,
+    };
+    let empty = Vec::new();
+    let raw_findings = value
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
+    let findings: Vec<Finding> = raw_findings
+        .iter()
+        .map(|finding| {
+            let severity = if finding
+                .get("falsePositive")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                Severity::Dismissed
+            } else {
+                severity_of(&json_str(finding, "severity"))
+            };
+            Finding {
+                message: json_str(finding, "message"),
+                location: format!(
+                    "{}:{}",
+                    json_str(finding, "file"),
+                    finding
+                        .get("line")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                ),
+                severity,
+                rule: json_str(finding, "ruleId"),
+                evidence: json_str(finding, "evidence"),
+                path: String::new(),
+            }
+        })
+        .collect();
+    let validated = raw_findings
+        .iter()
+        .filter(|finding| {
+            finding
+                .get("validated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count() as u32;
+    let dismissed = findings
+        .iter()
+        .filter(|finding| finding.severity == Severity::Dismissed)
+        .count() as u32;
+    let candidates = value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .map(|list| list.len() as u32)
+        .unwrap_or(0);
+    let mut severities: Vec<(String, u32, Severity)> = Vec::new();
+    for (name, severity) in [
+        ("critical", Severity::Critical),
+        ("high", Severity::High),
+        ("medium", Severity::Medium),
+        ("low", Severity::Low),
+        ("dismissed", Severity::Dismissed),
+    ] {
+        let count = findings
+            .iter()
+            .filter(|finding| finding.severity == severity)
+            .count() as u32;
+        if count > 0 {
+            severities.push((name.to_string(), count, severity));
+        }
+    }
+    let coverage = value.get("coverage").cloned().unwrap_or_default();
+    SecurityScan {
+        validated,
+        candidates: candidates.max(findings.len() as u32),
+        fraction: if candidates == 0 {
+            1.0
+        } else {
+            validated as f64 / candidates as f64
+        },
+        files: coverage
+            .get("filesScanned")
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| count.to_string())
+            .unwrap_or_default(),
+        skipped: coverage
+            .get("filesSkipped")
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| count.to_string())
+            .unwrap_or_default(),
+        bytes: String::new(),
+        severities,
+        dismissed,
+        findings,
+        seal: json_str(
+            value.get("manifest").unwrap_or(&serde_json::Value::Null),
+            "scanId",
+        ),
+        report: "report.md in the scan artifact · /sec-report".into(),
+    }
+}
+
+/// `5a` — the graph run sheet, from the real `graph-status` payload.
+fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
+    let run = value.get("run").filter(|run| !run.is_null())?;
+    let current_phase = json_str(run, "phase");
+    let phases: Vec<(String, State)> = {
+        let order = [
+            "classify",
+            "investigate",
+            "plan",
+            "implement",
+            "verify",
+            "review",
+            "done",
+        ];
+        let at = order
+            .iter()
+            .position(|phase| *phase == current_phase)
+            .unwrap_or(0);
+        order
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| {
+                let state = match index.cmp(&at) {
+                    std::cmp::Ordering::Less => State::Done,
+                    std::cmp::Ordering::Equal => {
+                        if current_phase == "done" {
+                            State::Done
+                        } else {
+                            State::Active
+                        }
+                    }
+                    std::cmp::Ordering::Greater => State::Queued,
+                };
+                (phase.to_string(), state)
+            })
+            .collect()
+    };
+    let empty = Vec::new();
+    let tasks: Vec<GraphTask> = run
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty)
+        .iter()
+        .map(|task| {
+            let status = json_str(task, "status");
+            let usage = task
+                .get("usage")
+                .map(|usage| {
+                    let field = |key: &str| {
+                        usage
+                            .get(key)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                    };
+                    format!(
+                        "{}↑ {}↓",
+                        pi_tui::davinci::views::chrome::thousands(field("inputTokens")),
+                        pi_tui::davinci::views::chrome::thousands(field("outputTokens")),
+                    )
+                })
+                .unwrap_or_default();
+            GraphTask {
+                id: format!("{} {}", json_str(task, "id"), json_str(task, "role")),
+                policy: json_str(task, "role"),
+                artifact: task
+                    .get("artifactFile")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("pending")
+                    .to_string(),
+                usage,
+                state: match status.as_str() {
+                    "done" | "succeeded" => State::Done,
+                    "running" | "started" => State::Active,
+                    "failed" => State::Failed,
+                    _ => State::Queued,
+                },
+            }
+        })
+        .collect();
+    let counters = run.get("counters").cloned().unwrap_or_default();
+    let budgets = run.get("budgets").cloned().unwrap_or_default();
+    let cost = counters
+        .get("costUsd")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let cost_cap = budgets
+        .get("maxCostUsd")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let number = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    Some(GraphRunSheet {
+        goal: json_str(run, "goal"),
+        phases,
+        shape: Vec::new(),
+        tasks,
+        cost: format!("${cost:.2}"),
+        cost_cap: if cost_cap > 0.0 {
+            format!("${cost_cap:.2}")
+        } else {
+            "no cap".into()
+        },
+        cost_fraction: if cost_cap > 0.0 {
+            (cost / cost_cap).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        workers: format!(
+            "{} of {}",
+            number(&counters, "workersSpawned"),
+            number(&budgets, "maxWorkers")
+        ),
+        parallel: number(&budgets, "maxParallelWorkers").to_string(),
+        cycles: format!(
+            "{} of {}",
+            number(&counters, "revisionCycles"),
+            number(&budgets, "maxRevisionCycles")
+        ),
+        replans: format!(
+            "{} of {}",
+            number(&counters, "replans"),
+            number(&budgets, "maxReplans")
+        ),
+        artifacts: format!(".pi\\graph\\{}\\", json_str(run, "runId")),
+    })
+}
+
 /// Everything a composer line or a chosen row may need. Bundled because the
 /// borrow checker will not let the loop hand out eight `&mut` pieces at once.
 struct Shell<'a> {
@@ -1379,7 +3766,9 @@ struct Shell<'a> {
     host: &'a Arc<Mutex<ExtensionHost>>,
     pending: &'a mut Option<Question>,
     cwd: &'a std::path::Path,
-    session_dir: &'a std::path::Path,
+    dresser: &'a crate::davinci_sources::WorkspaceDresser,
+    /// Images pasted from the clipboard, waiting for the next prompt.
+    images: &'a mut Vec<pi_ai::MessageContent>,
 }
 
 /// What the loop should do after handling one key's worth of consequence.
@@ -1414,23 +3803,49 @@ impl Shell<'_> {
             .push(Entry::tool(State::Attention, "instrumenta", text, None));
     }
 
-    /// Re-read everything the workspace owns: git, the tree, the session list.
+    /// Re-read everything the workspace owns: git, the tree, the session
+    /// list. The git and filesystem half runs on the dresser's thread — four
+    /// subprocesses and a tree walk have no place on the key-handling path —
+    /// and lands on the model when the loop next looks.
     fn redress(&mut self) {
         refresh_context(self.model, self.agent);
-        crate::davinci_sources::dress_from_workspace(self.model, self.cwd, self.session_dir);
+        self.dresser.request();
         crate::davinci_surfaces::dress_from_extensions(self.model, self.cwd, self.agent);
-        self.model.corpus = corpus(self.agent, &self.model.sessions);
-        self.model.corpus_total = self.model.corpus.len();
+        let items = corpus(self.agent, &self.model.slash_commands, &self.model.sessions);
+        self.model.corpus_total = items.len();
+        self.model.corpus = items;
+        // Shortcuts an extension registered since the last look — a reload
+        // may have added or removed one.
+        let host = self.host.lock().unwrap_or_else(|err| err.into_inner());
+        let (shortcuts, _) = host.resolve_shortcuts(&self.model.keybindings);
+        drop(host);
+        self.model.extension_shortcuts = shortcuts;
+    }
+
+    /// Run the handler behind an extension's registered shortcut, then apply
+    /// everything it queued. Mirrors `host_invoke_shortcut` in main.rs.
+    fn run_shortcut(&mut self, key: &str, path: &str) -> Next {
+        let outcome = {
+            let mut host = self.host.lock().unwrap_or_else(|err| err.into_inner());
+            host.runtime_flag_values = crate::flag_values_json(self.parsed);
+            if host.js.iter().any(|ext| ext.path == path) {
+                host.invoke_shortcut(path, key)
+            } else {
+                ExtensionHost::default().invoke_shortcut(path, key)
+            }
+        };
+        if let Err(err) = outcome {
+            self.note(&format!("shortcut {key}: {err}"));
+            return Next::Go;
+        }
+        apply_host_effects(self)
     }
 
     fn finish(&mut self, done: Done) -> Next {
         match done {
             Done::Said(text) => self.say(&text),
             Done::Note(text) => self.note(&text),
-            Done::Open(overlay) => {
-                self.model.running = false;
-                self.model.overlay = Some(overlay);
-            }
+            Done::Opened => self.model.running = false,
             Done::Ask(question) => {
                 self.model.running = false;
                 self.model.ask = question.ask(self.agent);
@@ -1450,6 +3865,9 @@ impl Shell<'_> {
         if let Err(err) = self.terminal.close() {
             return Next::Fail(err.to_string());
         }
+        // The screen is the user's again, so a browser handshake may print and
+        // prompt on it directly.
+        crate::set_hosted_tui_active(false);
         let outcome = match &detached {
             Detached::Login { provider, key } => {
                 if provider.is_empty() {
@@ -1464,6 +3882,7 @@ impl Shell<'_> {
             Ok(session) => *self.terminal = session,
             Err(err) => return Next::Fail(err.to_string()),
         }
+        crate::set_hosted_tui_active(true);
         if let Ok((width, height)) = self.terminal.size() {
             self.model.width = width;
             self.model.height = height;
@@ -1497,17 +3916,133 @@ impl Shell<'_> {
     }
 }
 
+/// Run `!command` in the shell without a model turn, exactly as the legacy
+/// chrome's `SessionAction::RunBash` does: the extension event first (an
+/// extension may run it itself), then the built-in bash tool, with the result
+/// recorded into the session unless `!!` asked to keep it out of context.
+fn run_user_bash(shell: &mut Shell<'_>, line: &str) -> Next {
+    use crate::extension_host::ExtensionEvent;
+
+    let trimmed = line.trim_start();
+    let Some(stripped) = trimmed.strip_prefix('!') else {
+        return Next::Go;
+    };
+    let exclude_from_context = trimmed.starts_with("!!");
+    let command = if exclude_from_context {
+        stripped.strip_prefix('!').unwrap_or(stripped).trim()
+    } else {
+        stripped.trim()
+    };
+    if command.is_empty() {
+        shell.note("usage: !<command> — !! keeps the output out of context");
+        return Next::Go;
+    }
+
+    {
+        let mut host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
+        host.runtime_flag_values = crate::flag_values_json(shell.parsed);
+        host.emit(ExtensionEvent::UserBash {
+            command: command.to_string(),
+            exclude_from_context,
+            cwd: shell.agent.cwd.display().to_string(),
+        });
+    }
+    match apply_host_effects(shell) {
+        Next::Go => {}
+        other => return other,
+    }
+
+    let say_output = |shell: &mut Shell<'_>, output: &str, failed: bool| {
+        shell.model.running = false;
+        shell.model.transcript.push(Entry::Gap);
+        let lines: Vec<&str> = output
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let summary = if lines.len() == 1 {
+            "1 line".to_string()
+        } else {
+            format!("{} lines", lines.len())
+        };
+        shell.model.transcript.push(
+            Entry::tool(state_of("bash", failed), "manus", &clip(command, 60), None)
+                .summarised(&summary),
+        );
+        let shown = lines.len().min(20);
+        for line in &lines[..shown] {
+            shell.model.transcript.push(Entry::detail(&clip(line, 100)));
+        }
+        if lines.len() > shown {
+            shell
+                .model
+                .transcript
+                .push(Entry::detail(&format!("… {} more", lines.len() - shown)));
+        }
+    };
+
+    // An extension may have run the command itself.
+    let handled = {
+        let host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
+        host.last_user_bash_result()
+    };
+    if let Some(result) = handled {
+        shell
+            .agent
+            .record_bash_result(command, &result, exclude_from_context);
+        let output = result
+            .get("output")
+            .or_else(|| result.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        say_output(shell, output, false);
+        shell.redress();
+        return Next::Go;
+    }
+
+    match pi_agent::execute_tool(
+        &shell.agent.cwd,
+        "bash",
+        &serde_json::json!({ "command": command }),
+    ) {
+        Ok(result) => {
+            let value = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+            shell
+                .agent
+                .record_bash_result(command, &value, exclude_from_context);
+            say_output(shell, &result.content, result.is_error);
+        }
+        Err(err) => say_output(shell, &err.to_string(), true),
+    }
+    shell.redress();
+    Next::Go
+}
+
 /// One composer line, carried out.
 fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
+    // `!command` runs in the shell, never in the model (the legacy chrome's
+    // `SessionAction::RunBash`); without this it was sent as prose.
+    if line.trim_start().starts_with('!') {
+        return run_user_bash(shell, line);
+    }
+    // An extension owns its `/command` before the model ever sees the line.
+    // The legacy chrome does this in `prepare_user_input`; davinci ran without
+    // it, so `/graph-view` and every other extension command was sent to the
+    // provider as literal text and came back as "the model returned no text".
+    if line.trim_start().starts_with('/') {
+        if let Some(next) = run_extension_command(shell, line) {
+            return next;
+        }
+        // `/diff` is davinci's own: the Δ review sheet (`6d`) over the real
+        // working tree. Checked after extensions so one may still claim it.
+        if line.trim() == "/diff" {
+            return open_diff_sheet(shell);
+        }
+    }
     match classify(line) {
         Sent::Quit => Next::Leave,
         Sent::Say(text) => {
             shell.say(&text);
-            Next::Go
-        }
-        Sent::Open(overlay) => {
-            shell.model.running = false;
-            shell.model.toggle_overlay(overlay);
             Next::Go
         }
         Sent::Command(action) => match perform(shell.parsed, shell.agent, shell.model, action) {
@@ -1521,22 +4056,59 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
                 Next::Go
             }
         },
-        Sent::Prompt(text) => {
-            // `prompt` is what writes the user turn to the session file;
-            // pushing onto `messages` directly would lose it on restart.
-            let text =
-                pi_agent::expand_user_text(&text, &shell.agent.skills, &shell.agent.templates);
-            shell.agent.prompt(&text);
-            let host = shell.host.clone();
-            if let Err(err) =
-                run_turns(shell.parsed, shell.agent, shell.model, shell.terminal, host)
-            {
-                return Next::Fail(err.to_string());
-            }
-            shell.redress();
-            Next::Go
+        Sent::Prompt(text) => submit_prompt(shell, &text, &[]),
+    }
+}
+
+/// One prompt, from the composer or the initial `pi "…"` message, through the
+/// same gauntlet the legacy chrome's `prepare_user_input` runs: extensions
+/// see it first and may swallow or transform it, then skills and templates
+/// expand it, then the turn runs, then whatever was queued behind it.
+fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[pi_ai::MessageContent]) -> Next {
+    // Whatever ctrl+v attached goes with this prompt.
+    let mut images = images.to_vec();
+    images.append(shell.images);
+    shell.model.extensions.set_status("§images", None);
+    let images = images.as_slice();
+    // Extensions with an input handler get the line before the model does.
+    let input = {
+        let mut host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
+        host.runtime_flag_values = crate::flag_values_json(shell.parsed);
+        host.editor_text = shell.model.composer.to_string();
+        host.emit_input(text, images, "interactive")
+    };
+    match apply_host_effects(shell) {
+        Next::Go => {}
+        other => return other,
+    }
+    if input.action == "handled" {
+        shell.model.running = false;
+        return Next::Go;
+    }
+    let (text, images) = if input.action == "transform" {
+        (input.text, input.images)
+    } else {
+        (text.to_string(), images.to_vec())
+    };
+
+    // `prompt` is what writes the user turn to the session file;
+    // pushing onto `messages` directly would lose it on restart.
+    let expanded = pi_agent::expand_user_text(&text, &shell.agent.skills, &shell.agent.templates);
+    // A line that is nothing but a `/word` nobody claims — not a
+    // command, not an extension's, not a skill or a template, since
+    // expansion left it alone — has nothing the model can do with it.
+    // TS sends it anyway; sending it is what produced a turn that
+    // answered "the model returned no text" and named no cause.
+    if expanded == text {
+        if let Some(note) = unknown_command(shell.model, &text) {
+            shell.note(&note);
+            return Next::Go;
         }
     }
+    shell.agent.prompt_with(&expanded, &images);
+    let next = run_turns(shell);
+    shell.redress();
+    next
 }
 
 /// One row of an open instrument, chosen with enter.
@@ -1602,7 +4174,161 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             }
             Next::Go
         }
+        // `3a` — a catalog row: switch, unless nothing stands behind it.
+        Choice::Catalog(index) => {
+            let Some(row) = shell.model.catalog.get(index).cloned() else {
+                return Next::Go;
+            };
+            if row.credential == Credential::Absent {
+                shell.note(&format!(
+                    "no credential for {} — /login {} adds one",
+                    row.name, row.provider
+                ));
+                return Next::Go;
+            }
+            shell.model.close();
+            shell.agent.provider = row.provider.clone();
+            shell.agent.model_id = row.id.clone();
+            crate::loaded_extension_host(shell.parsed).emit(
+                crate::extension_host::ExtensionEvent::ModelSelect {
+                    provider: row.provider.clone(),
+                    model: row.id.clone(),
+                },
+            );
+            adopt_model(shell.parsed, shell.agent, shell.model);
+            shell.say(&format!("model {} / {}", row.provider, row.id));
+            Next::Go
+        }
+        // `3b` — advance the setting to its next value and persist it.
+        Choice::Setting(index) => cycle_setting(shell, index),
+        // `3c` — a thinking level.
+        Choice::ThinkingLevel(index) => {
+            let Some(level) = shell
+                .model
+                .thinking_rows
+                .get(index)
+                .map(|row| row.level.clone())
+            else {
+                return Next::Go;
+            };
+            shell.model.thinking_index = index;
+            let action = crate::slash::SlashAction::SetThinking(level);
+            match perform(shell.parsed, shell.agent, shell.model, action) {
+                Ok(Done::Said(text)) => shell.say(&text),
+                Ok(Done::Note(text)) | Err(text) => shell.note(&text),
+                Ok(_) => {}
+            }
+            Next::Go
+        }
+        // `3d` — sign in to the chosen provider, then rebuild the ledger so
+        // the fresh credential is on it.
+        Choice::Provider(index) => {
+            let Some(name) = shell.model.providers.get(index).map(|row| row.name.clone()) else {
+                return Next::Go;
+            };
+            shell.model.close();
+            let next = shell.detach(Detached::Login {
+                provider: name,
+                key: None,
+            });
+            open_login_sheet(shell.parsed, shell.model);
+            next
+        }
+        // `4a` — open the chosen session.
+        Choice::ResumeSession(index) => {
+            let Some(path) = shell
+                .model
+                .resume_sessions
+                .get(index)
+                .map(|row| row.path.clone())
+            else {
+                return Next::Go;
+            };
+            shell.model.close();
+            shell.resume(&path)
+        }
+        // `4b` — move the session to the chosen turn.
+        Choice::TreeEntry(index) => {
+            let Some(node) = shell.model.session_tree.get(index).cloned() else {
+                return Next::Go;
+            };
+            let target = node.entry_id;
+            if target.is_empty() {
+                return Next::Go;
+            }
+            {
+                let mut host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
+                host.emit(crate::extension_host::ExtensionEvent::SessionBeforeTree);
+                if host.last_result_cancelled() {
+                    drop(host);
+                    shell.note("tree navigation cancelled");
+                    return Next::Go;
+                }
+            }
+            match shell
+                .agent
+                .navigate_tree_entry(&target, false, None, false, 16_384)
+            {
+                Ok(_) => {
+                    shell.model.close();
+                    shell.model.transcript = transcript_from(&shell.agent.messages);
+                    shell.say(&format!(
+                        "moved to turn {}",
+                        node.id.unwrap_or_else(|| target.clone())
+                    ));
+                    shell.redress();
+                }
+                Err(err) => shell.note(&format!("could not move there: {err}")),
+            }
+            Next::Go
+        }
+        // `6a` — the sheet was read; put the actual decision.
+        Choice::TrustDecide => {
+            shell.model.close();
+            let question = Question::Trust {
+                path: shell.agent.cwd.display().to_string(),
+                options: crate::trust::get_project_trust_options(&shell.agent.cwd, false),
+            };
+            shell.finish(Done::Ask(question))
+        }
     }
+}
+
+/// `3b` — advance a setting to the next value on its ramp, write it through
+/// the same store the legacy overlay writes, and re-honour it at once where
+/// davinci reads it live.
+fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
+    let Some(row) = shell.model.settings_rows.get_mut(index) else {
+        return Next::Go;
+    };
+    if row.values.is_empty() {
+        return Next::Go;
+    }
+    let at = row
+        .values
+        .iter()
+        .position(|value| value == &row.value)
+        .unwrap_or(0);
+    let next = row.values[(at + 1) % row.values.len()].clone();
+    let key = row.key.clone();
+    row.value = next.clone();
+    row.project = false;
+    if let Err(err) = crate::persist_interactive_setting(&format!("{key}={next}")) {
+        shell.note(&err);
+        return Next::Go;
+    }
+    crate::sync_agent_from_settings(shell.agent);
+    match key.as_str() {
+        "autocomplete-max-visible" => {
+            if let Ok(rows) = next.parse::<usize>() {
+                shell.model.suggestion_rows = rows.clamp(3, 20);
+            }
+        }
+        "terminal-progress" => shell.model.terminal_progress = next == "true",
+        "double-escape-action" => shell.model.double_escape_action = next.clone(),
+        _ => {}
+    }
+    Next::Go
 }
 
 /// Carry out the row chosen from a question.
@@ -1618,17 +4344,6 @@ fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<St
                 "saved: {}. it takes effect the next time pi starts.",
                 option.label
             ))
-        }
-        Question::Thinking => {
-            let Some(level) = THINKING_LEVELS.get(index) else {
-                return Err("that thinking level is gone".into());
-            };
-            let action = crate::slash::SlashAction::SetThinking((*level).to_string());
-            match perform(shell.parsed, shell.agent, shell.model, action)? {
-                Done::Said(text) => Ok(text),
-                Done::Note(text) => Err(text),
-                _ => Ok(format!("thinking level {level}")),
-            }
         }
         Question::FirstRun => {
             let dir = crate::default_agent_dir();
@@ -1704,6 +4419,50 @@ mod tests {
             is_error: None,
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_second_interrupt_while_one_is_pending_asks_for_the_way_out() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut m = model();
+        let abort = Arc::new(AtomicBool::new(false));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        // The first esc requests the abort and is not a force-quit.
+        assert!(!mid_turn_key(&mut m, esc, &abort));
+        assert!(abort.load(Ordering::Relaxed));
+        // The second, with the flag already up, is: the worker is not
+        // answering, and the only way left restores the terminal first.
+        assert!(mid_turn_key(&mut m, esc, &abort));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(mid_turn_key(&mut m, ctrl_c, &abort));
+    }
+
+    #[test]
+    fn an_interrupted_turn_opens_the_recovery_sheet_with_what_it_ran() {
+        // The `6c` sheet is populated from the turn's own log; this pins the
+        // log's shape so `end_tool` keeps feeding it.
+        let mut m = model();
+        let mut turn = Turn::default();
+        turn.start_tool(&mut m, "call-1", "read", &json!({"path": "src/lib.rs"}));
+        turn.end_tool(
+            &mut m,
+            "call-1",
+            "read",
+            &serde_json::Value::String("line".into()),
+            false,
+        );
+        assert_eq!(turn.log.len(), 1);
+        assert_eq!(turn.log[0].0, State::Read);
+        assert!(turn.log[0].1.contains("read src/lib.rs"));
+    }
+
+    #[test]
+    fn the_diff_command_is_findable_in_the_palette() {
+        let agent = pi_agent::Agent::new("test");
+        let items = corpus(&agent, &[], &[]);
+        assert!(items
+            .iter()
+            .any(|item| item.name == "/diff" && item.kind == "command"));
     }
 
     fn model() -> Model {
@@ -1809,6 +4568,7 @@ mod tests {
                 instrument,
                 target,
                 duration,
+                ..
             } => {
                 assert_eq!(*state, State::Done);
                 assert_eq!(instrument, "manus");
@@ -2001,13 +4761,25 @@ mod tests {
     }
 
     #[test]
-    fn commands_with_a_home_open_their_instrument() {
-        use pi_tui::davinci::model::Overlay;
-        assert!(matches!(classify("/model"), Sent::Open(Overlay::Cogitator)));
-        assert!(matches!(classify("/resume"), Sent::Open(Overlay::Sessions)));
+    fn commands_with_a_home_reach_perform_which_opens_their_sheet() {
+        use crate::slash::SlashAction;
+        // Each of these opens its designed sheet (screens 3a–4a) from
+        // `perform`, with live data behind it, rather than a bare overlay.
+        assert!(matches!(
+            classify("/model"),
+            Sent::Command(SlashAction::OpenModel)
+        ));
+        assert!(matches!(
+            classify("/resume"),
+            Sent::Command(SlashAction::Resume)
+        ));
         assert!(matches!(
             classify("/settings"),
-            Sent::Open(Overlay::Instrumenta)
+            Sent::Command(SlashAction::Settings)
+        ));
+        assert!(matches!(
+            classify("/hotkeys"),
+            Sent::Command(SlashAction::Hotkeys)
         ));
     }
 
@@ -2044,7 +4816,7 @@ mod tests {
             "/tree",
         ] {
             match classify(line) {
-                Sent::Command(_) | Sent::Open(_) => {}
+                Sent::Command(_) => {}
                 _ => panic!("{line} did not reach the agent"),
             }
         }
@@ -2132,20 +4904,6 @@ mod tests {
     fn a_question_wears_a_named_panel_and_one_row_per_answer() {
         let mut agent = pi_agent::Agent::new("test");
         agent.thinking_level = pi_protocol::ThinkingLevel::Medium;
-
-        let thinking = Question::Thinking.ask(&agent);
-        assert_eq!(thinking.title, "MEDITATIO");
-        assert_eq!(thinking.name, "THINKING");
-        assert_eq!(thinking.items.len(), THINKING_LEVELS.len());
-        // The level in hand is named on its own row, not only highlighted:
-        // colour is never the only signal (design.md §4).
-        let marked: Vec<&PickerItem> = thinking
-            .items
-            .iter()
-            .filter(|item| item.detail == "in hand")
-            .collect();
-        assert_eq!(marked.len(), 1);
-        assert_eq!(marked[0].label, "medium");
 
         let trust = Question::Trust {
             path: "C:\\work\\pi-rust".into(),
@@ -2242,7 +5000,265 @@ mod tests {
     #[test]
     fn an_unknown_slash_command_is_still_a_prompt() {
         // Skills and templates arrive this way; the agent expands them.
+        // Extension commands never reach here — `on_line` runs them first.
         assert!(matches!(classify("/skill:review"), Sent::Prompt(_)));
+    }
+
+    #[test]
+    fn a_native_command_is_run_by_the_shell_not_sent_to_the_model() {
+        // `/graph-view` used to fall through `classify` as prose, reach the
+        // provider verbatim, and come back as "the model returned no text".
+        let host = crate::extension_host::ExtensionHost::default();
+        let result = host
+            .execute_native_command("graph-status", "")
+            .expect("graph-status is a native command");
+        assert!(result.is_some(), "the host must claim it");
+
+        let mut model = Model::new(
+            pi_tui::davinci::theme::Theme::da_vinci(
+                pi_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            100,
+            44,
+            true,
+        );
+        push_command_result(&mut model, "graph-status", &result.unwrap());
+        let said: Vec<String> = model
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool { target, .. } => Some(target.clone()),
+                Entry::Detail(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            said.iter().any(|line| line == "/graph-status"),
+            "the command names itself: {said:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_request_says_why_instead_of_blaming_the_model() {
+        let target = |entries: &[Entry]| -> Vec<String> {
+            entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Tool { target, .. } => Some(target.clone()),
+                    Entry::Detail(text) => Some(text.clone()),
+                    Entry::Prose(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // The provider's own words, not "the model returned no text". This is
+        // the whole point: the reason used to be dropped with the worker's
+        // return value, and every failure read as an empty answer.
+        let out = turn_outcome(
+            false,
+            false,
+            false,
+            Some("No credential for openai-codex. Run /login openai-codex.".into()),
+            "",
+        );
+        assert!(target(&out).iter().any(|line| line == "the request failed"));
+        assert!(target(&out)
+            .iter()
+            .any(|line| line.contains("Run /login openai-codex")));
+        assert!(out
+            .iter()
+            .any(|entry| matches!(entry, Entry::Tool { state, .. } if *state == State::Failed)));
+
+        // A turn that genuinely said nothing still says so.
+        let out = turn_outcome(false, false, false, None, "");
+        assert!(target(&out)
+            .iter()
+            .any(|line| line.contains("the model returned no text")));
+
+        // Text the events never carried is said rather than dropped.
+        let out = turn_outcome(false, false, false, None, "  late answer  ");
+        assert_eq!(target(&out), vec!["late answer".to_string()]);
+
+        // A turn that spoke owes nothing more.
+        assert!(turn_outcome(false, false, true, None, "").is_empty());
+
+        // A crash and an interrupt outrank a failure message.
+        let out = turn_outcome(true, false, false, Some("ignored".into()), "");
+        assert!(target(&out).iter().any(|line| line.contains("crashed")));
+        let out = turn_outcome(false, true, false, Some("ignored".into()), "");
+        assert!(target(&out).iter().any(|line| line.contains("interrupted")));
+
+        // An empty failure string is not a failure.
+        let out = turn_outcome(false, false, false, Some("   ".into()), "");
+        assert!(target(&out)
+            .iter()
+            .any(|line| line.contains("the model returned no text")));
+    }
+
+    #[test]
+    fn a_slash_nobody_owns_is_named_rather_than_sent_to_the_model() {
+        let mut m = Model::new(
+            pi_tui::davinci::theme::Theme::da_vinci(
+                pi_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            100,
+            44,
+            true,
+        );
+        m.slash_commands = ["graph-view", "graph-status", "compact"]
+            .into_iter()
+            .map(|name| pi_tui::SlashCommandSpec {
+                name: name.into(),
+                description: String::new(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            })
+            .collect();
+
+        // A transposition must not be answered with the shorter command it
+        // happens to begin with.
+        let note = unknown_command(&m, "/graph-veiw").expect("not a command");
+        assert!(note.contains("did you mean /graph-view?"), "{note}");
+
+        // The typo in the screenshot: a trailing full stop.
+        let note = unknown_command(&m, "/graph-view.").expect("not a command");
+        assert!(note.contains("did you mean /graph-view?"), "{note}");
+
+        // A prefix offers the shortest name it could still become.
+        let note = unknown_command(&m, "/graph-s").expect("not a command");
+        assert!(note.contains("did you mean /graph-status?"), "{note}");
+
+        // A real command is left alone.
+        assert!(unknown_command(&m, "/graph-view").is_none());
+        assert!(unknown_command(&m, "/compact").is_none());
+
+        // A slash line with arguments is a prompt, not a mistyped command.
+        assert!(unknown_command(&m, "/explain this file").is_none());
+        assert!(unknown_command(&m, "plain prose").is_none());
+
+        // Nothing close: still say what to press.
+        let note = unknown_command(&m, "/zzzz").expect("not a command");
+        assert!(note.contains("ctrl+p"), "{note}");
+    }
+
+    #[test]
+    fn a_command_result_becomes_rows_rather_than_a_json_dump() {
+        let value = serde_json::json!({
+            "runId": "run-7",
+            "tasks": [{"id": "review-1", "status": "running"}],
+            "pending": [],
+        });
+        let rows = command_result_rows(&value);
+        assert!(rows.iter().any(|row| row == "run id · run-7"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "tasks · 1"), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row == "  review-1 · running"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|row| row == "pending · none"), "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.contains('{')),
+            "no raw JSON: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_error_result_carries_the_attention_glyph() {
+        let mut model = Model::new(
+            pi_tui::davinci::theme::Theme::da_vinci(
+                pi_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            100,
+            44,
+            true,
+        );
+        push_command_result(
+            &mut model,
+            "graph-view",
+            &serde_json::json!({"error": "No graph runs in this project."}),
+        );
+        let failed = model.transcript.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Tool { state, instrument, .. }
+                    if *state == State::Attention && instrument == "grafo"
+            )
+        });
+        assert!(failed, "{:?}", model.transcript);
+    }
+
+    #[test]
+    fn the_palette_lists_every_command_the_composer_completes() {
+        let agent = Agent::new("x");
+        let commands = vec![
+            pi_tui::SlashCommandSpec {
+                name: "graph-view".into(),
+                description: "Tail a graph worker's live transcript.".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            },
+            pi_tui::SlashCommandSpec {
+                name: "quit".into(),
+                description: "Leave".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            },
+        ];
+        let items = corpus(&agent, &commands, &[]);
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        assert!(names.contains(&"/graph-view"), "{names:?}");
+        assert!(names.contains(&"/quit"), "{names:?}");
+    }
+
+    #[test]
+    fn a_tool_row_says_what_the_tool_does_not_which_instrument_ran_it() {
+        // design.md §3: `instrumenta` is the default instrument and is never
+        // named. It used to fill the middle column of nearly every tool row,
+        // which made the column say nothing at all.
+        let mut agent = Agent::new("x");
+        agent.tools = vec!["bash".into(), "read".into()];
+        let items = corpus(&agent, &[], &[]);
+        for item in &items {
+            assert_ne!(item.description, "instrumenta", "{item:?}");
+        }
+        let bash = items.iter().find(|item| item.name == "bash").unwrap();
+        assert!(!bash.description.is_empty(), "{bash:?}");
+    }
+
+    #[test]
+    fn extension_ui_calls_are_taken_rather_than_replayed_each_turn() {
+        let host = Arc::new(Mutex::new(crate::extension_host::ExtensionHost::default()));
+        host.lock().unwrap().ui_calls = vec![serde_json::json!({
+            "op": "notify",
+            "message": "index rebuilt",
+        })];
+        let mut model = Model::new(
+            pi_tui::davinci::theme::Theme::da_vinci(
+                pi_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            100,
+            44,
+            true,
+        );
+        drain_ui_calls(&mut model, &host);
+        let notices = |model: &Model| {
+            model
+                .transcript
+                .iter()
+                .filter(|entry| matches!(entry, Entry::Tool { target, .. } if target == "index rebuilt"))
+                .count()
+        };
+        assert_eq!(notices(&model), 1);
+
+        // The host is shared across every turn, so reading the queue without
+        // taking it said the same thing again on each one.
+        drain_ui_calls(&mut model, &host);
+        assert_eq!(notices(&model), 1);
     }
 
     #[test]
@@ -2264,6 +5280,114 @@ mod tests {
         assert!(matches!(&entries[0], Entry::Agent(name) if name == "davinci"));
         assert!(matches!(&entries[2], Entry::Prose(text) if text == "first reply"));
         assert!(matches!(&entries[4], Entry::User(text) if text == "and then?"));
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_the_calls_the_turn_made() {
+        let messages = vec![
+            pi_ai::ChatMessage {
+                role: "assistant".into(),
+                content: vec![
+                    pi_ai::MessageContent::Text {
+                        text: "looking".into(),
+                    },
+                    pi_ai::MessageContent::ToolCall {
+                        id: "call-1".into(),
+                        name: "read".into(),
+                        arguments: json!({"path": "src/lib.rs"}),
+                    },
+                    pi_ai::MessageContent::ToolCall {
+                        id: "call-2".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "cargo test"}),
+                    },
+                ],
+                tool_call_id: None,
+                tool_name: None,
+                is_error: None,
+                extra: Default::default(),
+            },
+            pi_ai::ChatMessage {
+                role: "tool".into(),
+                content: vec![pi_ai::MessageContent::Text {
+                    text: "one\ntwo\nthree".into(),
+                }],
+                tool_call_id: Some("call-1".into()),
+                tool_name: Some("read".into()),
+                is_error: None,
+                extra: Default::default(),
+            },
+            pi_ai::ChatMessage {
+                role: "tool".into(),
+                content: vec![pi_ai::MessageContent::Text {
+                    text: "error[E0308] mismatched types".into(),
+                }],
+                tool_call_id: Some("call-2".into()),
+                tool_name: Some("bash".into()),
+                is_error: Some(true),
+                extra: Default::default(),
+            },
+        ];
+
+        let entries = transcript_from(&messages);
+        let read = entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Tool {
+                    state,
+                    target,
+                    summary,
+                    ..
+                } if target.starts_with("read ") => Some((*state, summary.clone())),
+                _ => None,
+            })
+            .expect("the read is drawn");
+        assert_eq!(read, (State::Read, Some("3 lines".to_string())));
+
+        let failed = entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Tool {
+                    state,
+                    target,
+                    summary,
+                    ..
+                } if target == "cargo test" => Some((*state, summary.clone())),
+                _ => None,
+            })
+            .expect("the command is drawn");
+        assert_eq!(failed, (State::Failed, None), "a failure states no outcome");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Detail(text) if text.contains("E0308"))),
+            "the failure detail follows the line that failed"
+        );
+    }
+
+    #[test]
+    fn an_outcome_is_stated_in_the_fewest_words_that_say_it() {
+        assert_eq!(
+            summary_of("grep", &json!({"pattern": "x"}), &json!("a\nb")),
+            Some("2 matches".into())
+        );
+        assert_eq!(
+            summary_of("grep", &json!({"pattern": "x"}), &json!("")),
+            Some("0 matches".into())
+        );
+        assert_eq!(
+            summary_of("read", &json!({"path": "a"}), &json!("only")),
+            Some("1 line".into())
+        );
+        assert_eq!(
+            summary_of(
+                "edit",
+                &json!({"edits": [{"oldText": "a\nb", "newText": "a\nb\nc\nd"}]}),
+                &json!("Edited a")
+            ),
+            Some("+4 -2".into())
+        );
+        assert_eq!(summary_of("ask", &json!({}), &json!("whatever")), None);
     }
 
     #[test]

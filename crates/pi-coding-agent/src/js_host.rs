@@ -209,13 +209,31 @@ pub fn resolve_extension_module(dir: &Path) -> Option<PathBuf> {
 struct PersistentJsSession {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    /// Replies from the runner, read on a thread of their own so a hung
+    /// extension can be timed out rather than blocking the caller forever —
+    /// the caller may be holding the extension-host lock under a live turn.
+    lines: std::sync::mpsc::Receiver<std::io::Result<String>>,
     module: PathBuf,
     /// Reply from the implicit `load` that `--persistent` performs at spawn.
     /// It carries the ui/session calls the factory made while loading; the
     /// first explicit `load` consumes it instead of re-sending.
     initial_load: Option<JsExtensionResult>,
 }
+
+/// How long one extension reply may take before the runner is declared hung
+/// and killed. The TS reference has no such limit, but there a hung extension
+/// hangs an async task; here it would wedge the turn with the host lock held.
+fn extension_reply_timeout() -> Duration {
+    std::env::var("PI_EXTENSION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(120))
+}
+
+/// The marker every timeout error carries, so callers can tell a hung runner
+/// from a crashed one and skip the respawn-and-retry that would hang again.
+pub(crate) const EXTENSION_TIMEOUT_MARK: &str = "extension reply timed out";
 
 impl PersistentJsSession {
     fn start(module: &Path) -> Result<Self, String> {
@@ -235,16 +253,33 @@ impl PersistentJsSession {
             .stdin
             .take()
             .ok_or_else(|| "persistent stdin".to_string())?;
-        let stdout = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| "persistent stdout".to_string())?,
-        );
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "persistent stdout".to_string())?;
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        break;
+                    }
+                }
+            }
+        });
         let mut session = Self {
             child,
             stdin,
-            stdout,
+            lines,
             module: module.to_path_buf(),
             initial_load: None,
         };
@@ -262,11 +297,25 @@ impl PersistentJsSession {
     }
 
     fn read_line(&mut self) -> Result<JsExtensionResult, String> {
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .map_err(|err| err.to_string())?;
-        serde_json::from_str(line.trim()).map_err(|err| format!("extension runner: {err}: {line}"))
+        match self.lines.recv_timeout(extension_reply_timeout()) {
+            Ok(Ok(line)) => serde_json::from_str(line.trim())
+                .map_err(|err| format!("extension runner: {err}: {line}")),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The runner is hung, not merely slow to exit: kill it so the
+                // reader thread unblocks and the next call gets a fresh one.
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                Err(format!(
+                    "{EXTENSION_TIMEOUT_MARK} after {}s ({})",
+                    extension_reply_timeout().as_secs(),
+                    self.module.display()
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("extension runner exited".into())
+            }
+        }
     }
 }
 
@@ -348,9 +397,16 @@ pub fn run_persistent_js_extension(
     if slot.is_none() {
         *slot = Some(PersistentJsSession::start(module)?);
     }
-    slot.as_mut()
+    let result = slot
+        .as_mut()
         .ok_or_else(|| "persistent JS session missing".to_string())?
-        .send(op, payload)
+        .send(op, payload);
+    // A dead or hung runner must not linger in the slot: the next call should
+    // start a fresh one rather than write into a closed pipe.
+    if result.is_err() {
+        *slot = None;
+    }
+    result
 }
 
 pub fn stop_persistent_js_extension() {
@@ -392,6 +448,12 @@ fn run_pooled_js_extension(
     }
     match session.send(op, payload) {
         Ok(result) => Ok(result),
+        // A hung runner was killed by the timeout; retrying the same op on a
+        // fresh one would hang the caller for another whole timeout.
+        Err(err) if err.contains(EXTENSION_TIMEOUT_MARK) => {
+            pool.remove(module);
+            Err(err)
+        }
         Err(_) => {
             // The runner died (crash, stdin closed): respawn once and retry.
             pool.remove(module);

@@ -8,7 +8,7 @@ use ratatui::text::Line;
 
 use crate::davinci::model::{Model, Step};
 use crate::davinci::theme::State;
-use crate::davinci::ui::{clip, span, span_strong, Surface, MEASURE};
+use crate::davinci::ui::{clip_ellipsis, span, span_strong, Surface, MEASURE};
 
 pub fn lines(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
     if model.narrow() {
@@ -46,7 +46,10 @@ fn collapsed(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
             th.primary,
         ),
         span("studying ", th.muted),
-        span(clip(&subject, model.width.saturating_sub(14)), th.secondary),
+        span(
+            clip_ellipsis(&subject, model.width.saturating_sub(14)),
+            th.secondary,
+        ),
     ])]
 }
 
@@ -71,8 +74,11 @@ fn expanded(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
             span(step.verb.clone(), verb_color),
         ];
         if let Some(target) = &step.target {
-            row.push(span("  ", th.border));
-            row.push(span(clip(target, width.saturating_sub(40)), th.border));
+            row.push(span(" · ", th.border));
+            row.push(span(
+                clip_ellipsis(target, width.saturating_sub(40)),
+                th.border,
+            ));
         }
         surface = surface.row(row);
     }

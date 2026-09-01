@@ -16,7 +16,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let ask = &model.ask;
     let inset = model.overlay_inset();
     let width = model.width;
-    let inner = width.saturating_sub(inset).saturating_sub(4);
+    let inner = width.saturating_sub(inset * 2).saturating_sub(4);
     let selected = model.selection(ask.items.len());
 
     let mut body: Vec<Vec<Span<'static>>> = ask
@@ -105,7 +105,7 @@ mod tests {
         let rows = lines(&m);
         let top = text(&rows[0]);
         assert!(top.contains("╭─ FIDES · TRUST ─"), "{top}");
-        assert!(top.ends_with("─ /trust ─╮"), "{top}");
+        assert!(top.trim_end().ends_with("─ /trust ─╮"), "{top}");
         let drawn: Vec<String> = rows.iter().map(text).collect();
         assert!(drawn.iter().any(|row| row.contains("esc close")));
         assert!(drawn.iter().any(|row| row.contains("C:\\work\\pi-rust")));

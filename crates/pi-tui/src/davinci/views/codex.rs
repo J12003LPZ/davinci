@@ -10,7 +10,9 @@ use ratatui::text::{Line, Span};
 
 use super::transcript;
 use crate::davinci::model::Model;
-use crate::davinci::ui::{blank, clip, pad, run_width, span, span_strong, tail, Surface};
+use crate::davinci::ui::{
+    blank, clip_ellipsis, pad, run_width, span, span_on, span_strong, surface_rule, tail, Surface,
+};
 
 /// The sidebar takes a quarter of the window, and the transcript the rest.
 pub fn sidebar_width(width: u16) -> u16 {
@@ -23,7 +25,25 @@ pub fn lines(model: &Model, height: usize) -> Vec<Line<'static>> {
     let main_width = model.width - side_width - 1;
 
     let side = fit(sidebar(model, side_width), height, side_width);
-    let main = fit(main_column(model, main_width), height, main_width);
+
+    // The git changes popover floats at the bottom right of the transcript
+    // column, clear of the flow (`1e`).
+    let mut main_rows = transcript::lines(model, &model.transcript, main_width);
+    if model.wide() && !model.changes_list.is_empty() {
+        let popover = changes(model, main_width);
+        let room = height.saturating_sub(popover.len());
+        main_rows = tail(main_rows, room);
+        while main_rows.len() < room {
+            main_rows.push(blank());
+        }
+        let lead = main_width.saturating_sub(46);
+        for row in popover {
+            let mut spans = vec![pad(lead, None)];
+            spans.extend(row.spans);
+            main_rows.push(Line::from(spans));
+        }
+    }
+    let main = fit(main_rows, height, main_width);
 
     side.into_iter()
         .zip(main)
@@ -59,23 +79,42 @@ fn sidebar(model: &Model, width: u16) -> Vec<Line<'static>> {
         .tree
         .iter()
         .map(|row| {
-            let name_color = if row.depth == 0 { th.text } else { th.muted };
-            let mut spans = vec![
-                pad(row.depth * 2, None),
-                span(
-                    match &row.twisty {
-                        Some(twisty) => format!("{twisty} "),
-                        None => "  ".to_string(),
-                    },
-                    th.border,
-                ),
-                span(clip(&row.name, width.saturating_sub(12)), name_color),
-            ];
+            // The row in hand carries the same 1-cell copper bar and tint as
+            // every other selection (`1e`).
+            let tint = if row.selected { Some(th.surface) } else { None };
+            let name_color = if row.selected || row.depth == 0 {
+                th.text
+            } else {
+                th.muted
+            };
+            let twisty_color = if row.selected { th.primary } else { th.border };
+            let lead = row.depth * 2;
+            let mut spans = if row.selected {
+                vec![
+                    span_on("▌", th.primary, tint),
+                    pad(lead.saturating_sub(1), tint),
+                ]
+            } else {
+                vec![pad(lead, tint)]
+            };
+            spans.push(span_on(
+                match &row.twisty {
+                    Some(twisty) => format!("{twisty} "),
+                    None => "  ".to_string(),
+                },
+                twisty_color,
+                tint,
+            ));
+            spans.push(span_on(
+                clip_ellipsis(&row.name, width.saturating_sub(12)),
+                name_color,
+                tint,
+            ));
             if let Some(status) = row.status {
-                spans.push(span_strong(
+                spans.push(span_on(
                     format!(" {}", status.glyph()),
                     th.state_color(status),
-                    th,
+                    tint,
                 ));
             }
             spans
@@ -83,9 +122,10 @@ fn sidebar(model: &Model, width: u16) -> Vec<Line<'static>> {
         .collect();
 
     body.push(Vec::new());
+    body.push(surface_rule(width, th));
     body.push(vec![
         span("ctrl+e close", th.border),
-        span(" · ", th.border),
+        span(" │ ", th.border),
         span("/ filter", th.border),
     ]);
 
@@ -97,15 +137,6 @@ fn sidebar(model: &Model, width: u16) -> Vec<Line<'static>> {
         ])
         .rows(body)
         .lines()
-}
-
-fn main_column(model: &Model, width: u16) -> Vec<Line<'static>> {
-    let mut rows = transcript::lines(model, &model.transcript, width);
-    if model.wide() && !model.changes_list.is_empty() {
-        rows.push(blank());
-        rows.extend(changes(model, width));
-    }
-    rows
 }
 
 /// The git changes popover, allowed only at ≥150 columns (`1e`).
@@ -127,7 +158,10 @@ fn changes(model: &Model, width: u16) -> Vec<Line<'static>> {
             };
             let left = vec![
                 span_strong(format!("{}  ", change.status), color, th),
-                span(clip(&change.path, inner.saturating_sub(10)), th.muted),
+                span(
+                    clip_ellipsis(&change.path, inner.saturating_sub(10)),
+                    th.muted,
+                ),
             ];
             let right = vec![span(change.count.clone(), th.success)];
             let gap = inner
@@ -142,11 +176,7 @@ fn changes(model: &Model, width: u16) -> Vec<Line<'static>> {
         .collect();
 
     Surface::new(box_width, th)
-        .title(vec![span("CHANGES", th.primary)])
-        .right(vec![span(
-            format!("{} files", model.changes_list.len()),
-            th.border,
-        )])
+        .title(vec![span("CHANGES", th.secondary)])
         .rows(body)
         .lines()
 }
@@ -193,7 +223,22 @@ mod tests {
             .any(|row| row.contains("╭─ CODEX · WORKSPACE ─")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("ctrl+e close · / filter")));
+            .any(|row| row.contains("ctrl+e close │ / filter")));
+    }
+
+    #[test]
+    fn the_row_in_hand_carries_a_copper_bar_and_a_tint() {
+        let m = model(160);
+        let rows = lines(&m, 30);
+        let selected = rows
+            .iter()
+            .find(|row| text(row).contains("davinci-session Δ"))
+            .expect("the selected tree row");
+        assert!(text(selected).contains('▌'), "{}", text(selected));
+        assert!(selected
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(m.theme.surface)));
     }
 
     #[test]
@@ -217,7 +262,13 @@ mod tests {
 
         let wide: Vec<String> = lines(&model(160), 30).iter().map(text).collect();
         assert!(wide.iter().any(|row| row.contains("╭─ CHANGES ─")));
-        assert!(wide.iter().any(|row| row.contains("3 files")));
+        // The popover floats bottom-right of the transcript column (`1e`).
+        let top = wide
+            .iter()
+            .find(|row| row.contains("╭─ CHANGES ─"))
+            .unwrap();
+        let column = top.find("╭─ CHANGES").unwrap();
+        assert!(column > 60, "the popover hugs the right edge: {top}");
     }
 
     #[test]

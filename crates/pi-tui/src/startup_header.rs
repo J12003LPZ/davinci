@@ -47,35 +47,33 @@ pub struct StartupInfo {
     pub session_restored: bool,
 }
 
-/// The identity mark: a line-drawn portrait after the Mona Lisa, built from
-/// the same box-drawing set as the UI, the smile as the only copper stroke.
+/// The identity mark: a line-drawn Vitruvian Man, built from the same
+/// box-drawing set as the UI, the navel — the compass point of Leonardo's
+/// circle — as the only copper stroke.
 fn emblem_lines(theme: &Theme) -> Vec<String> {
     let frame = |text: &str| theme.fg("muted", text);
-    let face = |text: &str| theme.fg("text", text);
     let copper = |text: &str| theme.fg("primary", text);
     let base = |text: &str| theme.fg("border", text);
     vec![
-        frame("       ·─────────·"),
-        frame("     ╱             ╲"),
-        format!("{}{}{}", frame("    ╱  "), face("╭───────╮"), frame("  ╲")),
-        format!("{}{}{}", frame("   │  "), face("╱ ·     · ╲"), frame("  │")),
-        format!("{}{}{}", frame("   │  "), face("│    ╷    │"), frame("  │")),
-        format!(
-            "{}{}{}{}{}",
-            frame("   │  "),
-            face("╲  "),
-            copper("╰───╯"),
-            face("  ╱"),
-            frame("  │")
-        ),
-        format!("{}{}{}", frame("    ╲  "), face("╰───────╯"), frame("  ╱")),
-        frame("     ╲             ╱"),
+        frame("         ·───────────·"),
+        frame("      ╱                 ╲"),
+        frame("    ╱    ┌───────────┐    ╲"),
+        frame("   │     │    ╭─╮    │     │"),
+        frame("  │    ╲ │    ╰┬╯    │ ╱    │"),
+        frame("  │     ╲├─────┼─────┤╱     │"),
+        frame("  │      │     │     │      │"),
         format!(
             "{}{}{}",
-            base("   ·────────"),
-            copper("┬"),
-            base("────────·")
+            frame("  │      │    "),
+            copper("─·─"),
+            frame("    │      │")
         ),
+        frame("  │      │   ╱│ │╲   │      │"),
+        frame("  │      │  ╱ │ │ ╲  │      │"),
+        frame("   │     │ ╱  │ │  ╲ │     │"),
+        frame("    ╲    │╱   │ │   ╲│    ╱"),
+        frame("      ╲  └────┴─┴────┘  ╱"),
+        base("         ·───────────·"),
     ]
 }
 
@@ -315,7 +313,7 @@ mod tests {
         std::env::remove_var("NO_COLOR");
         assert!(text.contains("D A V I N C I"), "{text}");
         assert!(text.contains("macchina dell'intelletto"));
-        assert!(text.contains("╰───╯"), "smile stroke present");
+        assert!(text.contains("─·─"), "navel stroke present");
         assert!(text.contains("main · openai-codex/gpt-5.6-sol"));
         assert!(text.contains("session restored"));
     }

@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 
 use crate::davinci::model::Model;
 use crate::davinci::theme::State;
-use crate::davinci::ui::{pad, run_width, span, span_strong, ticks, Surface, MEASURE};
+use crate::davinci::ui::{pad, run_width, span, span_strong, surface_rule, Surface, MEASURE};
 
 /// The compass, one row per plan step, drawn in the right margin.
 const COMPASS: [&str; 5] = [
@@ -26,11 +26,20 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
     let width = model.width.min(MEASURE + 12);
     let inner = width.saturating_sub(4);
-    let done = model
+    // `constructio III / V` counts the step in hand, not the steps behind
+    // (`1c`); with nothing active it falls back to what is done.
+    let current = model
         .plan
         .iter()
-        .filter(|step| step.state == State::Done)
-        .count();
+        .position(|step| step.state == State::Active)
+        .map(|index| index + 1)
+        .unwrap_or_else(|| {
+            model
+                .plan
+                .iter()
+                .filter(|step| step.state == State::Done)
+                .count()
+        });
     let total = model.plan.len();
 
     let mut body: Vec<Vec<Span<'static>>> = Vec::new();
@@ -80,25 +89,60 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         // empty frame that looks like a failure — and there is no progress to
         // meter, so the tally goes with it rather than reading `/`.
         body.push(vec![span("no plan drawn for this project yet", th.muted)]);
-        body.push(Vec::new());
+        body.push(surface_rule(width, th));
+        body.push(vec![
+            span("a accept", th.border),
+            span(" │ ", th.border),
+            span("e edit step", th.border),
+            span(" │ ", th.border),
+            span("ctrl+p", th.border),
+        ]);
     } else {
-        body.push(Vec::new());
-        let mut footer = vec![
+        // The margin note, when there is room for decoration (`1c`).
+        if model.decoration() {
+            let mut note = vec![pad(
+                inner.saturating_sub("parity first,".len() as u16 + 2),
+                None,
+            )];
+            note.push(span("parity first,", th.secondary));
+            body.push(note);
+            let mut note = vec![pad(
+                inner.saturating_sub("speed after".len() as u16 + 2),
+                None,
+            )];
+            note.push(span("speed after", th.secondary));
+            body.push(note);
+        } else {
+            body.push(Vec::new());
+        }
+        body.push(surface_rule(width, th));
+        // One footer row: the tally and its meter left, the keys right (`1c`).
+        let cells = 12u16;
+        let filled = ((current as f64 / total.max(1) as f64) * cells as f64).round() as usize;
+        let left = vec![
             span("constructio ", th.muted),
-            span(roman(done.min(total)), th.text),
+            span(roman(current.min(total)), th.primary),
             span(" / ", th.border),
             span(format!("{}  ", roman(total)), th.muted),
+            span("━".repeat(filled), th.primary),
+            span("━".repeat(cells as usize - filled), th.border),
         ];
-        footer.extend(ticks(done, total, 24, th));
+        let right = vec![
+            span("a accept", th.border),
+            span(" │ ", th.border),
+            span("e edit step", th.border),
+            span(" │ ", th.border),
+            span("ctrl+p", th.border),
+        ];
+        let gap = inner
+            .saturating_sub(run_width(&left))
+            .saturating_sub(run_width(&right))
+            .max(1);
+        let mut footer = left;
+        footer.push(pad(gap, None));
+        footer.extend(right);
         body.push(footer);
     }
-    body.push(vec![
-        span("a accept", th.border),
-        span(" · ", th.border),
-        span("e edit step", th.border),
-        span(" · ", th.border),
-        span("esc close", th.border),
-    ]);
 
     Surface::new(width, th)
         .title(vec![
@@ -199,15 +243,19 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_reads_constructio_with_a_tick_meter() {
+    fn the_footer_counts_the_step_in_hand_with_a_meter_and_the_keys() {
         let m = model(120);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
         let footer = rows
             .iter()
             .find(|row| row.contains("constructio"))
             .expect("footer");
-        assert!(footer.contains("constructio II / V"), "{footer}");
-        assert!(footer.contains('━') && footer.contains('·'), "{footer}");
+        assert!(footer.contains("constructio III / V"), "{footer}");
+        assert!(footer.contains('━'), "{footer}");
+        assert!(
+            footer.contains("a accept │ e edit step │ ctrl+p"),
+            "{footer}"
+        );
     }
 
     #[test]
@@ -241,9 +289,19 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_states_its_exit() {
+    fn the_footer_offers_the_plans_own_keys() {
         let rows: Vec<String> = lines(&model(120)).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("esc close")));
         assert!(rows.iter().any(|row| row.contains("a accept")));
+        assert!(rows.iter().any(|row| row.contains("e edit step")));
+    }
+
+    #[test]
+    fn the_margin_note_rides_the_sheet_when_there_is_room() {
+        let rows: Vec<String> = lines(&model(120)).iter().map(text).collect();
+        assert!(rows.iter().any(|row| row.contains("parity first,")));
+        assert!(rows.iter().any(|row| row.contains("speed after")));
+
+        let narrow: Vec<String> = lines(&model(80)).iter().map(text).collect();
+        assert!(!narrow.iter().any(|row| row.contains("parity first,")));
     }
 }

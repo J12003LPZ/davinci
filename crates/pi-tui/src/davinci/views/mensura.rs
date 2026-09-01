@@ -11,7 +11,9 @@ use ratatui::text::{Line, Span};
 
 use crate::davinci::model::{Model, Proposal};
 use crate::davinci::theme::glyph;
-use crate::davinci::ui::{blank, meter, pad, run_width, span, span_strong, wrap, Surface, MEASURE};
+use crate::davinci::ui::{
+    blank, meter, pad, run_width, span, span_strong, spread, surface_rule, wrap, Surface, MEASURE,
+};
 
 /// How many cells the per-role meters take.
 const METER_CELLS: u16 = 24;
@@ -21,28 +23,28 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let width = model.width.min(MEASURE + 14);
     let meta = &model.budget_meta;
 
+    // One row: what is in use on the left, the headroom on the right (`2c`).
     let mut rows = vec![
-        Line::from(vec![
-            span("in use ", th.muted),
-            span(meta.in_use.clone(), th.text),
-            span(" of ", th.muted),
-            span(meta.window.clone(), th.text),
-        ]),
-        Line::from(vec![
-            span("headroom ", th.muted),
-            span(meta.headroom.clone(), th.text),
-            span(" · ", th.border),
-            span(meta.rate.clone(), th.muted),
-            span(" · ", th.border),
-            span(
-                format!(
-                    "{} {}%",
-                    th.pie(meta.in_use_fraction),
-                    (meta.in_use_fraction * 100.0) as u32
+        spread(
+            width,
+            vec![
+                span("in use ", th.muted),
+                span(meta.in_use.clone(), th.primary),
+                span(" of ", th.muted),
+                span(meta.window.clone(), th.muted),
+            ],
+            vec![
+                span(format!("headroom {}", meta.headroom), th.muted),
+                span(" · ", th.border),
+                span(meta.rate.clone(), th.muted),
+                span(" · ", th.border),
+                span(th.pie(meta.in_use_fraction), th.warning),
+                span(
+                    format!(" {}%", (meta.in_use_fraction * 100.0) as u32),
+                    th.muted,
                 ),
-                th.primary,
-            ),
-        ]),
+            ],
+        ),
         blank(),
     ];
 
@@ -52,12 +54,12 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         } else {
             th.secondary
         };
-        let role_color = if item.breach { th.text } else { th.muted };
+        let role_color = if item.breach { th.primary } else { th.muted };
         let note_color = if item.breach { th.warning } else { th.border };
 
         let mut row = vec![
             span(format!("{:<13}", item.role), role_color),
-            span(format!("{:>6}  ", item.tokens), color),
+            span(format!("{:>6}  ", item.tokens), th.text),
         ];
         row.extend(meter(item.fraction, METER_CELLS, th, Some(color)));
         let note = vec![span(item.note.clone(), note_color)];
@@ -76,22 +78,29 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     }
 
     rows.push(blank());
-    rows.push(Line::from(vec![
+    // A hairline, then the spend against its cap left and the governor's
+    // history right (`2c`) — on one row when both fit, or the history moves
+    // right-aligned beneath so neither fact is ever clipped.
+    rows.push(Line::from(surface_rule(width + 4, th)));
+    let spend = vec![
         span("session spend ", th.muted),
         span(meta.session_spend.clone(), th.text),
         span(" · ", th.border),
         span(format!("daily cap {}", meta.daily_cap), th.muted),
         span(" · ", th.border),
+        span(th.pie(meta.daily_fraction), th.primary),
         span(
-            format!(
-                "{} {}%",
-                th.pie(meta.daily_fraction),
-                (meta.daily_fraction * 100.0) as u32
-            ),
-            th.primary,
+            format!(" {}%", (meta.daily_fraction * 100.0) as u32),
+            th.muted,
         ),
-    ]));
-    rows.push(Line::from(vec![span(meta.history.clone(), th.muted)]));
+    ];
+    let history = vec![span(meta.history.clone(), th.muted)];
+    if run_width(&spend) + run_width(&history) < width {
+        rows.push(spread(width, spend, history));
+    } else {
+        rows.push(Line::from(spend));
+        rows.push(spread(width, Vec::new(), history));
+    }
     rows
 }
 
@@ -122,7 +131,7 @@ fn governor(model: &Model, proposal: &Proposal, width: u16) -> Vec<Line<'static>
             span_strong(glyph::FAILED, th.error, th)
         },
     ]);
-    body.push(Vec::new());
+    body.push(surface_rule(width, th));
 
     let mut actions: Vec<Span<'static>> = Vec::new();
     for (index, (key, what)) in proposal.actions.iter().enumerate() {
@@ -137,7 +146,6 @@ fn governor(model: &Model, proposal: &Proposal, width: u16) -> Vec<Line<'static>
     Surface::new(width, th)
         .border(th.warning)
         .title(vec![span("GOVERNOR", th.warning)])
-        .right(vec![span("1 proposal", th.border)])
         .rows(body)
         .lines()
 }
@@ -238,7 +246,6 @@ mod tests {
             .find(|row| text(row).contains("GOVERNOR"))
             .expect("the governor block");
         assert_eq!(top.spans[0].style.fg, Some(m.theme.warning));
-        assert!(text(top).contains("1 proposal"), "{:?}", text(top));
 
         let actions = rows
             .iter()

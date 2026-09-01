@@ -666,6 +666,7 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> 
         parent_session_id: row.get(3)?,
         source_format: 4,
         all_messages_text: String::new(),
+        message_count: 0,
     })
 }
 

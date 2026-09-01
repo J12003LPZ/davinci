@@ -71,6 +71,23 @@ impl ProjectTrustStore {
         }])
     }
 
+    /// How many projects have been decided: `(trusted, ignored)`.
+    pub fn counts(&self) -> (usize, usize) {
+        with_settings_lock(&self.trust_path, || read_trust_file(&self.trust_path))
+            .map(|data| {
+                let trusted = data
+                    .values()
+                    .filter(|value| value.as_bool() == Some(true))
+                    .count();
+                let ignored = data
+                    .values()
+                    .filter(|value| value.as_bool() == Some(false))
+                    .count();
+                (trusted, ignored)
+            })
+            .unwrap_or((0, 0))
+    }
+
     pub fn set_many(&self, decisions: &[ProjectTrustUpdate]) -> Result<(), String> {
         if let Some(parent) = self.trust_path.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;

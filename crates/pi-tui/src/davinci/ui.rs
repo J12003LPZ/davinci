@@ -113,7 +113,7 @@ pub fn truncate_run(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>>
         }
         let room = width.saturating_sub(used);
         if room > 0 {
-            let clipped = clip(span.content.as_ref(), room);
+            let clipped = clip_ellipsis(span.content.as_ref(), room);
             out.push(Span::styled(clipped, span.style));
         }
         break;
@@ -154,6 +154,36 @@ pub fn clip(text: &str, max: u16) -> String {
     out
 }
 
+/// `clip`, but a cut is marked: the last cell goes to an ellipsis so a
+/// shortened name never reads as the whole thing. Use this wherever a person
+/// is meant to read the text; bare `clip` is for cuts that are their own
+/// evidence (a wrapped word, a row against the window edge is still marked by
+/// the caller).
+pub fn clip_ellipsis(text: &str, max: u16) -> String {
+    if UnicodeWidthStr::width(text) <= max as usize {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = clip(text, max - 1);
+    out.push('…');
+    out
+}
+
+/// The first piece of an over-long word, for `wrap`. Like `clip`, except it
+/// never comes back empty: a double-width character in a one-column measure
+/// fits nowhere, and returning nothing there left `wrap` breaking the same
+/// word forever. One character overflows the measure; no character hangs the
+/// interface.
+fn break_head(word: &str, width: u16) -> String {
+    let head = clip(word, width);
+    if !head.is_empty() {
+        return head;
+    }
+    word.chars().next().map(String::from).unwrap_or_default()
+}
+
 /// Wrap prose to the measure. Words longer than the measure are broken.
 pub fn wrap(text: &str, width: u16) -> Vec<String> {
     if width == 0 {
@@ -165,7 +195,7 @@ pub fn wrap(text: &str, width: u16) -> Vec<String> {
         let mut word = word.to_string();
         if current.is_empty() {
             while UnicodeWidthStr::width(word.as_str()) > width as usize {
-                let head = clip(&word, width);
+                let head = break_head(&word, width);
                 word = word[head.len()..].to_string();
                 lines.push(head);
             }
@@ -180,7 +210,7 @@ pub fn wrap(text: &str, width: u16) -> Vec<String> {
         } else {
             lines.push(std::mem::take(&mut current));
             while UnicodeWidthStr::width(word.as_str()) > width as usize {
-                let head = clip(&word, width);
+                let head = break_head(&word, width);
                 word = word[head.len()..].to_string();
                 lines.push(head);
             }
@@ -310,7 +340,9 @@ impl Surface {
     }
 
     pub fn lines(self) -> Vec<Line<'static>> {
-        let width = self.width.saturating_sub(self.inset).max(4);
+        // An inset surface floats clear of *both* edges, as the mockups inset
+        // Instrumenta by the same margin left and right (`1d`).
+        let width = self.width.saturating_sub(self.inset * 2).max(4);
         let inner = width - 4;
         let mut out = Vec::with_capacity(self.height());
 
@@ -338,6 +370,7 @@ impl Surface {
                 .map(|line| {
                     let mut spans = vec![pad(self.inset, None)];
                     spans.extend(line.spans);
+                    spans.push(pad(self.inset, None));
                     Line::from(spans)
                 })
                 .collect()
@@ -391,7 +424,8 @@ pub fn hair_rule(width: u16, theme: &Theme, mark: &str) -> Line<'static> {
     ])
 }
 
-/// `glyph  instrument · verb   target   duration` — one line, no box (§6).
+/// `glyph  instrument · verb target  duration` — one line, no box (§6). The
+/// duration follows the call inline, as the mockups set it (`1b`, `1g`).
 pub fn tool_line(
     width: u16,
     theme: &Theme,
@@ -399,33 +433,72 @@ pub fn tool_line(
     instrument: &str,
     target: &str,
     duration: Option<&str>,
+    summary: Option<&str>,
 ) -> Line<'static> {
-    let body = width.saturating_sub(2).min(MEASURE + 4);
     let target_color = match state {
         State::Read | State::Search => theme.secondary,
         _ => theme.muted,
     };
-    let left = vec![
+    // What the call did leads the row; which instrument ran it is a fact about
+    // the shell, not about the turn, so it follows the outcome and gives way
+    // first when the row is short of room.
+    let outcome: Vec<String> = summary
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .into_iter()
+        .chain(duration.map(str::to_string))
+        .collect();
+    let tail_width = outcome
+        .iter()
+        .map(|part| part.chars().count() as u16 + 3)
+        .sum::<u16>();
+    let mut left = vec![
+        span(format!("{} ", glyph::BRANCH), theme.border),
         span_strong(
             format!("{} ", state.glyph()),
             theme.state_color(state),
             theme,
         ),
-        span(instrument.to_string(), theme.muted),
-        span(" · ", theme.border),
-        span(target.to_string(), target_color),
+        span(
+            clip_ellipsis(target, width.saturating_sub(10 + tail_width)),
+            target_color,
+        ),
     ];
-    let right = match duration {
-        Some(duration) => vec![span(duration.to_string(), theme.border)],
-        None => Vec::new(),
-    };
-    let row = spread(body, left, right);
-    indent(2, row.spans)
+    for part in outcome {
+        left.push(span(" · ", theme.border));
+        left.push(span(part, theme.border));
+    }
+    // The instrument is named only when it says something the target does not:
+    // `manus` ran a command, `memoria` recalled. The general-purpose one is
+    // the default and naming it on every row would be noise. It also gives way
+    // when the row is short of it (design.md §9).
+    let stated = run_width(&left) + instrument.chars().count() as u16 + 5;
+    if instrument != "instrumenta" && stated <= width {
+        left.push(span(" · ", theme.border));
+        left.push(span(instrument.to_string(), theme.muted));
+    }
+    indent(2, left)
 }
 
 /// Tool detail — an error body or a diff hunk — indented two further (§3).
 pub fn detail_line(theme: &Theme, text: &str) -> Line<'static> {
-    indent(6, vec![span(text.to_string(), theme.muted)])
+    indent(4, vec![span(text.to_string(), theme.muted)])
+}
+
+/// A failure detail: what went wrong in error ink, the subject in muted ink.
+/// Under `NO_COLOR` an `!` carries the state instead (`1g`, `1h`).
+pub fn failure_line(theme: &Theme, what: &str, subject: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    if theme.no_color {
+        spans.push(span_strong(
+            format!("{} ", glyph::ATTENTION),
+            theme.error,
+            theme,
+        ));
+    }
+    spans.push(span(format!("{what} "), theme.error));
+    spans.push(span(subject.to_string(), theme.muted));
+    indent(4, spans)
 }
 
 /// Whether a run carries the theme's emphasis; used by tests and by the
@@ -554,7 +627,8 @@ mod tests {
         let cut = truncate_run(run.clone(), 5);
         assert_eq!(run_width(&cut), 5);
         assert_eq!(cut.len(), 2);
-        assert_eq!(cut[1].content.as_ref(), "de");
+        // The straddling span is cut, and the cut is marked.
+        assert_eq!(cut[1].content.as_ref(), "d…");
         assert_eq!(cut[1].style.fg, Some(th.muted));
         assert!(truncate_run(run, 0).is_empty());
     }
@@ -708,21 +782,58 @@ mod tests {
             "manus",
             "cargo check -p davinci-agent",
             Some("1.84s"),
+            Some("12 lines"),
         );
         let drawn = text_of(&line);
-        assert!(drawn.starts_with("  ✓ manus · cargo check -p davinci-agent"));
-        assert!(drawn.ends_with("1.84s"));
+        assert!(
+            drawn.starts_with("  ⎿ ✓ cargo check -p davinci-agent"),
+            "got {drawn:?}"
+        );
+        // What it did, then what came back, then which instrument ran it.
+        assert!(drawn.contains("· 12 lines · 1.84s"), "got {drawn:?}");
+        assert!(drawn.ends_with("· manus"), "got {drawn:?}");
         assert_eq!(line.spans.iter().filter(|s| is_strong(s)).count(), 0);
+    }
+
+    #[test]
+    fn a_narrow_row_drops_the_instrument_before_the_outcome() {
+        let th = theme();
+        let drawn = text_of(&tool_line(
+            34,
+            &th,
+            State::Done,
+            "manus",
+            "cargo check -p davinci-agent",
+            Some("1.84s"),
+            None,
+        ));
+        assert!(!drawn.contains("manus"), "got {drawn:?}");
+        assert!(drawn.contains("1.84s"), "got {drawn:?}");
+    }
+
+    #[test]
+    fn the_general_purpose_instrument_is_never_named() {
+        let th = theme();
+        let drawn = text_of(&tool_line(
+            100,
+            &th,
+            State::Read,
+            "instrumenta",
+            "read lib.rs",
+            Some("0.01s"),
+            Some("412 lines"),
+        ));
+        assert_eq!(drawn.trim_end(), "  ⎿ ↳ read lib.rs · 412 lines · 0.01s");
     }
 
     #[test]
     fn a_read_targets_verdigris_and_a_failure_targets_muted() {
         let th = theme();
-        let read = tool_line(100, &th, State::Read, "instrumenta", "lib.rs", None);
-        assert_eq!(read.spans[4].style.fg, Some(th.secondary));
-        let failed = tool_line(100, &th, State::Failed, "manus", "cargo test", None);
-        assert_eq!(failed.spans[4].style.fg, Some(th.muted));
-        assert_eq!(failed.spans[1].style.fg, Some(th.error));
+        let read = tool_line(100, &th, State::Read, "instrumenta", "lib.rs", None, None);
+        assert_eq!(read.spans[3].style.fg, Some(th.secondary));
+        let failed = tool_line(100, &th, State::Failed, "manus", "cargo test", None, None);
+        assert_eq!(failed.spans[3].style.fg, Some(th.muted));
+        assert_eq!(failed.spans[2].style.fg, Some(th.error));
     }
 
     #[test]
@@ -745,6 +856,20 @@ mod tests {
         let drawn = text_of(&line);
         assert!(drawn.starts_with('·') && drawn.ends_with('·'), "{drawn}");
         assert!(drawn.contains(" ◦ "), "{drawn}");
+    }
+
+    #[test]
+    fn a_word_wider_than_the_measure_is_broken_rather_than_wrapped_forever() {
+        // A double-width character in a one-column measure fits nowhere.
+        // `clip` gives back nothing there, which used to leave the word
+        // unchanged and the wrap loop spinning: 100% CPU inside the alternate
+        // screen, on nothing worse than a resize and a CJK word.
+        let lines = wrap("日本語", 1);
+        assert_eq!(lines, vec!["日", "本", "語"]);
+
+        let lines = wrap("hello 日本語 there", 2);
+        assert!(lines.iter().all(|line| !line.is_empty()), "{lines:?}");
+        assert!(lines.concat().contains('日'), "{lines:?}");
     }
 
     #[test]

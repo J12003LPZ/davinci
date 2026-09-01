@@ -18,6 +18,9 @@ pub struct SessionSummary {
     pub source_format: u8,
     /// Concatenated user/assistant text matching TS `SessionInfo.allMessagesText`.
     pub all_messages_text: String,
+    /// How many message entries the file holds — the turn count a listing
+    /// shows without re-reading the file.
+    pub message_count: usize,
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -128,11 +131,14 @@ fn summarize_file(path: &Path) -> Option<SessionSummary> {
     let first_line = lines.next()?;
     if let Ok(header) = parse_header(first_line) {
         let mut summary = crate::codec::metadata_from_header(&header, path, modified_at(path));
-        summary.all_messages_text = messages_text_from_lines(lines);
+        let (text, count) = messages_text_from_lines(lines);
+        summary.all_messages_text = text;
+        summary.message_count = count;
         return Some(summary);
     }
     // Legacy v3 file: a full open performs the migration.
     let session = JsonlSession::open(path).ok()?;
+    let (legacy_text, legacy_count) = messages_text_from_entries(&session.entries);
     Some(SessionSummary {
         id: session.header.id,
         path: path.to_path_buf(),
@@ -148,7 +154,8 @@ fn summarize_file(path: &Path) -> Option<SessionSummary> {
             .map(str::to_string),
         parent_session_id: session.header.parent_session_id,
         source_format: 3,
-        all_messages_text: messages_text_from_entries(&session.entries),
+        all_messages_text: legacy_text,
+        message_count: legacy_count,
     })
 }
 
@@ -182,7 +189,8 @@ fn message_text(message: &serde_json::Value) -> Option<String> {
 }
 
 /// Digest a v4 file's already-read lines without building a full session.
-fn messages_text_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+fn messages_text_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> (String, usize) {
+    let mut count = 0usize;
     let mut parts = Vec::new();
     for line in lines {
         let line = line.trim();
@@ -198,24 +206,27 @@ fn messages_text_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String 
         {
             continue;
         }
+        count += 1;
         if let Some(text) = value.get("message").and_then(message_text) {
             parts.push(text);
         }
     }
-    parts.join(" ")
+    (parts.join(" "), count)
 }
 
-fn messages_text_from_entries(entries: &[crate::SessionEntry]) -> String {
+fn messages_text_from_entries(entries: &[crate::SessionEntry]) -> (String, usize) {
+    let mut count = 0usize;
     let mut parts = Vec::new();
     for entry in entries {
         if entry.entry_type != "message" {
             continue;
         }
+        count += 1;
         if let Some(text) = entry.message.as_ref().and_then(message_text) {
             parts.push(text);
         }
     }
-    parts.join(" ")
+    (parts.join(" "), count)
 }
 
 pub fn discover_sessions(

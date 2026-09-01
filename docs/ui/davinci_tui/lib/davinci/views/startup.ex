@@ -1,8 +1,9 @@
 defmodule Davinci.Views.Startup do
   @moduledoc """
-  1a — startup and empty state. The identity mark appears here and in the empty
-  state, nowhere else (design.md §10). The smile is the only copper stroke.
-  Below 100 columns the emblem is dropped entirely (design.md §7).
+  1a — startup and empty state. The identity mark — a line-drawn Vitruvian
+  Man — appears here and in the empty state, nowhere else (design.md §10).
+  The navel, the compass point of Leonardo's circle, is the only copper
+  stroke. Below 100 columns the emblem is dropped entirely (design.md §7).
   """
 
   import Davinci.Ui
@@ -10,24 +11,25 @@ defmodule Davinci.Views.Startup do
   alias Davinci.{Model, Theme}
 
   @emblem [
-    "      ·───────·",
-    "    ╱           ╲",
-    "   ╱  ╭───────╮  ╲",
-    "  ╱  ╱  ·   ·  ╲  ╲",
-    " │  │     ╷     │  │",
-    " │   ╲  ╰───╯  ╱   │",
-    "  ╲   ╰───────╯   ╱",
-    "   ╲             ╱",
-    "    ╲     ╷     ╱",
-    "   ╱─────────────╲",
-    "  │               │",
-    " ╱     ╰──┬──╯     ╲",
-    "·─────────────────────·"
+    "         ·───────────·",
+    "      ╱                 ╲",
+    "    ╱    ┌───────────┐    ╲",
+    "   │     │    ╭─╮    │     │",
+    "  │    ╲ │    ╰┬╯    │ ╱    │",
+    "  │     ╲├─────┼─────┤╱     │",
+    "  │      │     │     │      │",
+    "  │      │    ─·─    │      │",
+    "  │      │   ╱│ │╲   │      │",
+    "  │      │  ╱ │ │ ╲  │      │",
+    "   │     │ ╱  │ │  ╲ │     │",
+    "    ╲    │╱   │ │   ╲│    ╱",
+    "      ╲  └────┴─┴────┘  ╱",
+    "         ·───────────·"
   ]
 
-  # the smile: line 6, the ╰───╯ run
-  @smile_row 5
-  @smile "╰───╯"
+  # the navel: line 8, the ─·─ run — the compass point of the circle
+  @smile_row 7
+  @smile "─·─"
 
   def lines(model) do
     th = model.theme

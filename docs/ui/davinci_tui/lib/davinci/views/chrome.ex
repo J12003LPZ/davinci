@@ -81,6 +81,59 @@ defmodule Davinci.Views.Chrome do
           t("5 steps", th.muted)
         ]
 
+      :models ->
+        ring = Enum.count(Model.catalog(), & &1.ring)
+
+        [
+          t("cogitator", th.primary),
+          t(" · ", th.border),
+          t(model.branch, th.secondary),
+          t(" · ", th.border),
+          t("ring of #{ring}", th.muted)
+        ]
+
+      :settings ->
+        [
+          t("settings", th.primary),
+          t(" · ", th.border),
+          t(model.branch, th.secondary),
+          t(" · ", th.border),
+          t("#{length(Model.settings())} keys", th.muted)
+        ]
+
+      :thinking ->
+        levels = Model.thinking_levels()
+        level = Enum.at(levels, rem(model.thinking_index, length(levels)))
+
+        [
+          t("cogitator", th.primary),
+          t(" · ", th.border),
+          t(model.branch, th.secondary),
+          t(" · ", th.border),
+          t("thinking ", th.muted),
+          t(level.level, th.primary)
+        ]
+
+      :login ->
+        ready = Enum.count(Model.providers(), &(&1.state in [:ready, :local]))
+
+        [
+          t("cogitator", th.primary),
+          t(" · ", th.border),
+          t(model.branch, th.secondary),
+          t(" · ", th.border),
+          t("#{ready} of #{length(Model.providers())} ready", th.muted)
+        ]
+
+      :keys ->
+        [
+          t("keys", th.primary),
+          t(" · ", th.border),
+          t(model.branch, th.secondary),
+          t(" · ", th.border),
+          t("/reload re-reads them", th.muted)
+        ]
+
       _ ->
         if Model.minimal?(model) do
           [t(model.branch, th.secondary), t(" · ", th.border), t("Δ#{delta}", th.primary)]
