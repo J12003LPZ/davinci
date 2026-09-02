@@ -404,6 +404,11 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         Err(err) if err == NO_SESSION_SELECTED => return Ok(0),
         other => other?,
     };
+    // Evidence older than a week is nobody's: a `read` of its path would
+    // have happened in the session that wrote it.
+    if let Some(store) = &agent.evidence {
+        let _ = store.sweep(pi_agent::EVIDENCE_TTL);
+    }
 
     if parsed.mode == Some(Mode::Rpc) {
         let _ = tools_manager::ensure_managed_tools();
@@ -411,7 +416,9 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
             eprintln!("{RPC_FILE_ARGS_ERROR}");
             return Ok(1);
         }
-        return run_rpc(&parsed, &mut agent);
+        let code = run_rpc(&parsed, &mut agent);
+        run_stop_hooks_for(&parsed, &agent.cwd);
+        return code;
     }
 
     // Fixture: force the interactive path without a TTY so tests can inspect
@@ -424,7 +431,9 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     let stdout_tty = io::stdout().is_terminal() || force_interactive;
     if parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty {
         let _ = tools_manager::ensure_managed_tools();
-        return run_print(&parsed, &mut agent);
+        let code = run_print(&parsed, &mut agent);
+        run_stop_hooks_for(&parsed, &agent.cwd);
+        return code;
     }
     if !migrations.deprecation_warnings.is_empty() {
         migrations::show_deprecation_warnings(&migrations.deprecation_warnings);
@@ -583,8 +592,14 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         &mcp::load(&default_agent_dir(), cwd, trusted),
         cwd,
     ));
+    // Overflowing batch output is kept where the model can `read` it
+    // back, under the agent dir so a fixture dir keeps tests contained.
+    agent.evidence = Some(pi_agent::EvidenceStore::new(
+        default_agent_dir().join("evidence"),
+    ));
     let parsed_for_worker = parsed.clone();
     let cwd_for_worker = cwd.to_path_buf();
+    let mcp_for_worker = agent.tool_context.mcp.clone();
     agent.subagent_runner = Some(pi_agent::SubagentRunner::new(move |req| {
         if let Ok(fix) = std::env::var("PI_SUBAGENT_FIXTURE") {
             let path = std::path::Path::new(&fix);
@@ -593,11 +608,14 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             }
             return Ok(fix);
         }
-        run_nested_subagent(&parsed_for_worker, &cwd_for_worker, req)
+        run_nested_subagent(&parsed_for_worker, &cwd_for_worker, &mcp_for_worker, req)
     }));
     apply_discovered_resources(parsed, &mut agent);
     if !parsed.no_session {
         agent.session = Some(resolve_or_create_session(parsed, session_dir, cwd)?);
+        // A resumed session opens on the ledger it closed on, in every
+        // mode; davinci re-reads it to draw the rows.
+        agent.restore_todos();
     }
     agent.auto_compaction = settings.compaction_enabled();
     agent.compaction = settings.compaction_settings();
@@ -1413,18 +1431,53 @@ fn agent_memory_messages(agent: &Agent) -> Vec<crate::native_extensions::MemoryM
 fn run_nested_subagent(
     parsed: &Args,
     cwd: &Path,
+    mcp: &pi_agent::McpRegistry,
     req: &pi_agent::SubagentRequest,
 ) -> Result<String, String> {
-    let mut child = Agent::new(
-        "You are a scoped worker. Answer the prompt using only the tools you have. Do not call agent.",
-    );
+    let mut child = Agent::new(format!(
+        "You are a scoped worker. Answer the prompt using only the tools you have. Do not call agent. \
+         Reply with the answer itself — findings, file paths with line numbers, short quotes — not a narrative of what you did.\n{}",
+        pi_agent::TOOL_USE_STRATEGY
+    ));
     child.cwd = cwd.to_path_buf();
     child.tools = req.tools.clone();
     child.tool_registry = req.tools.clone();
     child.session = None;
-    let _ = apply_resolved_models(parsed, &mut child);
+    // A worker's output is bounded by the parent; its own overflow has
+    // nowhere useful to go.
+    child.evidence = None;
+    // The worker's tool list is already read-only; the policy says so too,
+    // so a tool that slipped the list (an extension's, an MCP server's) is
+    // refused rather than run under the library's `auto` default. There is
+    // no approver: the worker cannot ask, and never should.
+    child.permissions = Arc::new(Mutex::new(pi_agent::PermissionPolicy::new(
+        pi_agent::PermissionMode::ReadOnly,
+    )));
+    child.approver = None;
+    // `mcp_read` and read-only MCP tools need the parent's connections.
+    child.tool_context.mcp = mcp.clone();
+    child.abort_signal = req.abort.clone();
+    apply_resolved_models(parsed, &mut child)?;
+    // Follow the parent's current model, not the launch flags: `/model` and
+    // a restored session both move it.
+    if let (Some(provider), Some(model_id)) = (&req.provider, &req.model_id) {
+        if !model_id.is_empty() && (provider != &child.provider || model_id != &child.model_id) {
+            let snapshot = load_model_runtime(parsed);
+            if let Some(model) = pi_ai::find_model(&snapshot.all, provider, model_id) {
+                child.provider = model.provider.clone();
+                child.model_id = model.id.clone();
+                child.context_window = model.context_window;
+            }
+        }
+    }
     child.prompt(&req.prompt);
-    let (text, _) = complete_prompt(parsed, &mut child);
+    let (text, events) = complete_prompt(parsed, &mut child);
+    // A provider failure is prose too; report it as the failure it is
+    // instead of handing the parent an "answer".
+    let (code, error) = print_text_exit(&events);
+    if code != 0 {
+        return Err(error.unwrap_or_else(|| "subagent failed".into()));
+    }
     if text.trim().is_empty() {
         Err("subagent returned no text".into())
     } else {
@@ -1550,7 +1603,13 @@ fn complete_prompt_with_host(
         host.emit_before_agent_start(&prompt, &images);
         if let Some(prompt) = host.last_result_system_prompt() {
             agent.system_prompt = prompt.clone();
-            host.runtime_system_prompt = prompt;
+            // An extension's prompt replaces the base, not the mode: plan
+            // mode keeps its appendix.
+            if agent.plan_mode && !agent.system_prompt.contains(pi_agent::PLAN_MODE_APPENDIX) {
+                agent.system_prompt.push_str("\n\n");
+                agent.system_prompt.push_str(pi_agent::PLAN_MODE_APPENDIX);
+            }
+            host.runtime_system_prompt = agent.system_prompt.clone();
         }
         for message in host.take_before_agent_start_messages() {
             agent.record_custom_message(&message);
@@ -1616,9 +1675,25 @@ fn complete_prompt_with_host(
     let post_hooks = user_hooks;
     let session_path = agent.session.as_ref().map(|session| session.path.clone());
     agent.post_tool = Some(pi_agent::PostToolHook(Arc::new(
-        move |_tool_call_id, _cwd, name, args, result| {
-            hooks::run_post_tool(&post_hooks, name, args, &result.content);
-            hooks::append_event(session_path.as_ref(), "tool", name);
+        move |tool_call_id, _cwd, name, args, result| {
+            // A call the gate refused never ran: no post hook, and the row
+            // says `denied` so the ledger does not count it as a tool run.
+            let denied = result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("denied"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !denied {
+                hooks::run_post_tool(&post_hooks, name, args, &result.content);
+            }
+            hooks::append_event(
+                session_path.as_ref(),
+                if denied { "denied" } else { "tool" },
+                name,
+                Some(tool_call_id),
+                Some(!result.is_error),
+            );
             match post_host.lock() {
                 Ok(host) => host.native_after_tool(name, args, result),
                 Err(_) => result,
@@ -1955,10 +2030,9 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 ..
             } = event
             {
-                if result
-                    .as_str()
-                    .is_some_and(|text| text.starts_with("Permission denied"))
-                {
+                if result.as_str().is_some_and(|text| {
+                    text.starts_with("Permission denied") && text.contains("cannot ask")
+                }) {
                     eprintln!("pi: denied {tool_name} (no approver in a --print run)");
                 }
             }
@@ -2566,11 +2640,31 @@ fn finish_interactive_tui(
     }
 }
 
+/// The user's `stop` hooks, once per run end: `/quit`, the quit chord, the
+/// end of a `--print` or RPC run, and a signal exit.
+fn run_stop_hooks_for(parsed: &Args, cwd: &Path) {
+    // Once per process: `/quit` returns through the mode's exit, and a
+    // fixture signal exit returns through it too.
+    static RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RAN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let settings = load_merged_settings(&default_agent_dir(), cwd);
+    let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
+    hooks::run_stop(&hooks::load(&default_agent_dir(), cwd, trusted));
+}
+
 fn emit_session_shutdown(parsed: &Args) {
     loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
         reason: "quit".into(),
     });
     crate::js_host::shutdown_js_pool();
+    // `process::exit` follows: nothing below runs a destructor, so the
+    // children are reaped here.
+    pi_agent::jobs::kill_every_job();
+    pi_agent::McpRegistry::shutdown_all();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    run_stop_hooks_for(parsed, &cwd);
 }
 
 fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
@@ -4211,9 +4305,7 @@ fn handle_user_line(
 ) -> Result<bool, String> {
     match slash::parse_line(text) {
         SlashAction::Quit => {
-            let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
-            let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
-            hooks::run_stop(&hooks::load(&default_agent_dir(), &agent.cwd, trusted));
+            run_stop_hooks_for(parsed, &agent.cwd);
             Ok(false)
         }
         SlashAction::Prompt(prompt) => {
@@ -5443,7 +5535,7 @@ fn format_session_info(
     waste: Option<&cache_stats::CacheWasteTotals>,
 ) -> String {
     let mut info = format!(
-        "Session Info\n\nFile: {}\nID: {}\n\nMessages\nTotal: {}\nUser: {}\nAssistant: {}\nTools: {} calls, {} results\n\nTokens\nInput: {}\nOutput: {}\nCache read: {}\nCache write: {}\nTotal: {}\nCost: {}",
+        "Session Info\n\nFile: {}\nID: {}\n\nMessages\nTotal: {}\nUser: {}\nAssistant: {}\nTools: {} calls, {} results\n\nTokens\nInput: {}\nOutput: {}\nCache read: {}\nCache write: {}\nTotal: {}\nCost: {}{}",
         stats.get("sessionFile").and_then(|value| value.as_str()).unwrap_or("In-memory"),
         stats.get("sessionId").and_then(|value| value.as_str()).unwrap_or(""),
         stats.get("totalMessages").and_then(|value| value.as_u64()).unwrap_or(0),
@@ -5457,6 +5549,7 @@ fn format_session_info(
         stats["tokens"]["cacheWrite"].as_u64().unwrap_or(0),
         stats["tokens"]["total"].as_u64().unwrap_or(0),
         stats.get("cost").and_then(|value| value.as_f64()).unwrap_or(0.0),
+        format_runtime_stats(stats.get("runtime")),
     );
     if let Some(waste) = waste.filter(|item| item.missed_tokens > 0) {
         let miss_label = if waste.miss_count == 1 {
@@ -5475,6 +5568,48 @@ fn format_session_info(
         }
     }
     info
+}
+
+/// The harness counters of this run (`pi_agent::RunStats`), as a block for
+/// `/status`: turns against tool calls, batch width, time split between
+/// the model and the tools, and what pruning saved.
+fn format_runtime_stats(runtime: Option<&serde_json::Value>) -> String {
+    let Some(runtime) = runtime else {
+        return String::new();
+    };
+    let get = |key: &str| {
+        runtime
+            .get(key)
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    };
+    if get("modelTurns") == 0 {
+        return String::new();
+    }
+    let batches = get("toolBatches");
+    let mean_width = if batches == 0 {
+        0.0
+    } else {
+        get("toolCalls") as f64 / batches as f64
+    };
+    format!(
+        "\n\nRuntime (this run)\nModel turns: {}\nTool calls: {} in {} batches (mean width {:.1}, max {}, {} parallel groups)\nBatch operations: {}\nWorkers: {}\nTime: model {:.1}s, tools {:.1}s\nPeak context: {} tokens\nPruned: {} results, {} chars\nCompactions: {}\nEvidence files: {}",
+        get("modelTurns"),
+        get("toolCalls"),
+        batches,
+        mean_width,
+        get("maxBatchWidth"),
+        get("parallelGroups"),
+        get("batchOperations"),
+        get("subagents"),
+        get("modelWallMs") as f64 / 1000.0,
+        get("toolWallMs") as f64 / 1000.0,
+        get("peakContextTokens"),
+        get("prunedResults"),
+        get("prunedChars"),
+        get("compactions"),
+        get("evidenceFiles"),
+    )
 }
 
 fn apply_extension_shortcuts(

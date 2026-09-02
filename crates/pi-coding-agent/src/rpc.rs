@@ -839,6 +839,7 @@ pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
         },
         "cost": stats.cost,
         "contextUsage": context_usage,
+        "runtime": agent.run_stats(),
     })
 }
 

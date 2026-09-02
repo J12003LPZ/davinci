@@ -28,6 +28,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "notebook_edit",
     "mcp_read",
     "agent",
+    "batch",
 ];
 
 /// What the built-in tools share across calls: the background jobs and the
@@ -38,6 +39,18 @@ pub struct ToolContext {
     pub jobs: Arc<Mutex<JobBook>>,
     pub todos: Arc<Mutex<TodoList>>,
     pub mcp: crate::mcp::McpRegistry,
+    /// The turn's abort flag, when the host gave the agent one. A foreground
+    /// shell command or a `job_output` wait stops at the next poll instead
+    /// of holding the tool thread until the process ends on its own.
+    pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl ToolContext {
+    pub fn is_aborted(&self) -> bool {
+        self.abort
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    }
 }
 
 const DEFAULT_MAX_LINES: usize = 2000;
@@ -183,8 +196,13 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "agent".into(),
-            description: "Start a nested worker with a scoped read-only tool list. Pass a prompt; optionally tools (an allow-list) and a short description. The worker cannot edit, run a shell, or start another worker. Returns its last reply.".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"prompt":{"type":"string"},"tools":{"type":"array","items":{"type":"string"}},"description":{"type":"string"}},"required":["prompt"]}),
+            description: "Start nested read-only workers with their own context. Pass a prompt (one worker), or tasks: [{prompt, description?, tools?}] for up to 8 workers that run concurrently. Workers cannot edit, run a shell, or start workers; each returns its last reply. Use it for research that would otherwise fill your context: give each worker a self-contained question and ask for a short answer with file paths.".into(),
+            parameters: crate::subagent::tool_parameters(),
+        },
+        AgentTool {
+            name: "batch".into(),
+            description: crate::batch::batch_description(),
+            parameters: crate::batch::batch_parameters(),
         },
     ]
 }
@@ -217,7 +235,8 @@ pub fn execute_tool_with(
         "web_fetch" => crate::web::fetch_tool(input).map_err(ToolError::Failed),
         "web_search" => crate::web::search_tool(input).map_err(ToolError::Failed),
         "todo" => todo_tool(input, context),
-        "job_output" => crate::jobs::output_tool(&context.jobs, input).map_err(ToolError::Failed),
+        "job_output" => crate::jobs::output_tool(&context.jobs, input, context.abort.as_deref())
+            .map_err(ToolError::Failed),
         "job_kill" => crate::jobs::kill_tool(&context.jobs, input).map_err(ToolError::Failed),
         "notebook_edit" => notebook_edit_tool(cwd, input),
         "mcp_read" => mcp_read_tool(input, context),
@@ -665,7 +684,7 @@ fn shell_tool(
         serde_json::Value::Number(number) => number.to_string(),
         other => other.to_string(),
     });
-    let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref())?;
+    let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
     let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
         if !content.is_empty() {
@@ -684,6 +703,7 @@ fn wait_shell_output(
     mut child: std::process::Child,
     timeout_ms: Option<u64>,
     timeout_label: Option<&str>,
+    context: &ToolContext,
 ) -> Result<std::process::Output, ToolError> {
     use std::io::Read;
     let stdout = child.stdout.take();
@@ -702,44 +722,49 @@ fn wait_shell_output(
             buf
         })
     });
-    let status = if let Some(timeout_ms) = timeout_ms {
-        let start = std::time::Instant::now();
-        let limit = std::time::Duration::from_millis(timeout_ms);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if start.elapsed() >= limit => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let stdout = stdout_handle
-                        .map(|handle| handle.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    let stderr = stderr_handle
-                        .map(|handle| handle.join().unwrap_or_default())
-                        .unwrap_or_default();
-                    let mut content = String::from_utf8_lossy(&stdout).into_owned();
-                    if !stderr.is_empty() {
-                        if !content.is_empty() {
-                            content.push('\n');
-                        }
-                        content.push_str(&String::from_utf8_lossy(&stderr));
-                    }
-                    let seconds = timeout_label.unwrap_or("0");
-                    let status = format!("Command timed out after {seconds} seconds");
-                    return Err(ToolError::Failed(if content.is_empty() {
-                        status
-                    } else {
-                        format!("{content}\n\n{status}")
-                    }));
+    // Poll rather than block in `wait`: the turn's abort flag has to be able
+    // to end the command, timeout or not.
+    let start = std::time::Instant::now();
+    let limit = timeout_ms.map(std::time::Duration::from_millis);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let timed_out = limit.is_some_and(|limit| start.elapsed() >= limit);
+                let aborted = context.is_aborted();
+                if !timed_out && !aborted {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
                 }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(err) => return Err(ToolError::Failed(err.to_string())),
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = stdout_handle
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let stderr = stderr_handle
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let mut content = String::from_utf8_lossy(&stdout).into_owned();
+                if !stderr.is_empty() {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(&String::from_utf8_lossy(&stderr));
+                }
+                let status = if timed_out {
+                    let seconds = timeout_label.unwrap_or("0");
+                    format!("Command timed out after {seconds} seconds")
+                } else {
+                    "Command aborted".to_string()
+                };
+                return Err(ToolError::Failed(if content.is_empty() {
+                    status
+                } else {
+                    format!("{content}\n\n{status}")
+                }));
             }
+            Err(err) => return Err(ToolError::Failed(err.to_string())),
         }
-    } else {
-        child
-            .wait()
-            .map_err(|err| ToolError::Failed(err.to_string()))?
     };
     let stdout = stdout_handle
         .map(|handle| handle.join().unwrap_or_default())
@@ -789,7 +814,7 @@ fn powershell_tool(
                 .register(command, child);
             return Ok(crate::jobs::started_result(id, pid, command));
         }
-        let output = wait_shell_output(child, None, None)?;
+        let output = wait_shell_output(child, None, None, context)?;
         let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.stderr.is_empty() {
             if !content.is_empty() {
@@ -836,7 +861,13 @@ fn ls_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolErro
         .flatten()
         .map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if entry.path().is_dir() {
+            // A symlink's own type says nothing about its target; only
+            // then is the `stat` worth paying for.
+            let is_dir = match entry.file_type() {
+                Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+                _ => entry.path().is_dir(),
+            };
+            if is_dir {
                 format!("{name}/")
             } else {
                 name
@@ -1119,6 +1150,113 @@ fn grep_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
     })
 }
 
+/// How many files the native grep scans at once. Reading is the cost, and
+/// it overlaps well on the SSDs the tool runs against.
+const GREP_SCAN_THREADS: usize = 8;
+/// Below this many files a pool costs more than it saves.
+const GREP_PARALLEL_MIN_FILES: usize = 32;
+/// Bytes inspected for a NUL to decide a file is binary (what ripgrep does).
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// The compiled form of a grep pattern: built once per call, not once per
+/// line as the first version did.
+enum Matcher {
+    Literal(String),
+    LiteralIgnoreCase(String),
+    Regex(regex::Regex),
+}
+
+impl Matcher {
+    fn new(pattern: &str, ignore_case: bool, literal: bool) -> Self {
+        if literal {
+            return if ignore_case {
+                Self::LiteralIgnoreCase(pattern.to_ascii_lowercase())
+            } else {
+                Self::Literal(pattern.to_string())
+            };
+        }
+        match regex::RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+        {
+            Ok(regex) => Self::Regex(regex),
+            // An invalid regex falls back to a substring match, as before.
+            Err(_) => Self::new(pattern, ignore_case, true),
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Literal(needle) => line.contains(needle.as_str()),
+            Self::LiteralIgnoreCase(needle) => {
+                // Only lower-case a line that could match at all.
+                line.len() >= needle.len() && line.to_ascii_lowercase().contains(needle.as_str())
+            }
+            Self::Regex(regex) => regex.is_match(line),
+        }
+    }
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0)
+}
+
+/// A scanned file's rendered match lines and whether any line was cut.
+type ScannedFile = (Vec<String>, bool);
+
+/// Scan one file for the native grep. Returns the rendered match lines (with
+/// context) and whether any line was cut, or `None` for a file that is not
+/// text.
+fn grep_scan_file(
+    file: &Path,
+    matcher: &Matcher,
+    context: usize,
+    display: &str,
+    remaining: usize,
+) -> Option<(Vec<String>, bool)> {
+    let bytes = fs::read(file).ok()?;
+    if looks_binary(&bytes) {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&bytes);
+    let mut out = Vec::new();
+    let mut lines_truncated = false;
+    if context == 0 {
+        for (index, line) in body.lines().enumerate() {
+            if out.len() >= remaining {
+                break;
+            }
+            if matcher.is_match(line) {
+                let (text, truncated) = truncate_line(line);
+                lines_truncated |= truncated;
+                out.push(format!("{display}:{}: {text}", index + 1));
+            }
+        }
+        return Some((out, lines_truncated));
+    }
+    let file_lines: Vec<&str> = body.lines().collect();
+    for (index, line) in file_lines.iter().enumerate() {
+        if out.len() >= remaining {
+            break;
+        }
+        if !matcher.is_match(line) {
+            continue;
+        }
+        let start = index.saturating_sub(context);
+        let end = (index + context + 1).min(file_lines.len());
+        for (current, line) in file_lines.iter().enumerate().take(end).skip(start) {
+            let (text, truncated) = truncate_line(line);
+            lines_truncated |= truncated;
+            if current == index {
+                out.push(format!("{display}:{}: {text}", current + 1));
+            } else {
+                out.push(format!("{display}-{}- {text}", current + 1));
+            }
+        }
+    }
+    Some((out, lines_truncated))
+}
+
 fn grep_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     let pattern = required_str(input, "pattern")?;
     let search_path = resolve(
@@ -1151,48 +1289,73 @@ fn grep_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult,
         .unwrap_or(GREP_DEFAULT_LIMIT)
         .max(1);
     let is_dir = search_path.is_dir();
-    let mut matches = Vec::new();
-    let mut lines_truncated = false;
+    let matcher = Matcher::new(pattern, ignore_case, literal);
+
+    // Walk first, scan after: the walk is cheap directory metadata, the
+    // scan is the file reads, and only the scan is worth spreading out.
+    let mut files: Vec<PathBuf> = Vec::new();
     walk_files(
         &search_path,
         &IgnoreRules::load(&search_path),
         &mut |file| {
-            if matches.len() >= limit {
-                return false;
-            }
-            if let Some(glob) = glob {
-                if !path_glob_match(glob, file, &search_path) {
-                    return true;
-                }
-            }
-            let Ok(body) = fs::read_to_string(file) else {
-                return true;
-            };
-            let file_lines: Vec<&str> = body.lines().collect();
-            for (index, line) in file_lines.iter().enumerate() {
-                if line_matches(pattern, line, ignore_case, literal) {
-                    let display = format_grep_path(file, &search_path, is_dir);
-                    let start = index.saturating_sub(context);
-                    let end = (index + context + 1).min(file_lines.len());
-                    for (current, line) in file_lines.iter().enumerate().take(end).skip(start) {
-                        let (text, truncated) = truncate_line(line);
-                        if truncated {
-                            lines_truncated = true;
-                        }
-                        if current == index {
-                            matches.push(format!("{display}:{}: {text}", current + 1));
-                        } else {
-                            matches.push(format!("{display}-{}- {text}", current + 1));
-                        }
-                    }
-                    if matches.len() >= limit {
-                        break;
-                    }
-                }
+            if glob.is_none_or(|glob| path_glob_match(glob, file, &search_path)) {
+                files.push(file.to_path_buf());
             }
             true
         },
     );
+
+    let scan = |file: &Path, remaining: usize| {
+        let display = format_grep_path(file, &search_path, is_dir);
+        grep_scan_file(file, &matcher, context, &display, remaining)
+    };
+    let mut matches: Vec<String> = Vec::new();
+    let mut lines_truncated = false;
+    if files.len() < GREP_PARALLEL_MIN_FILES {
+        for file in &files {
+            if matches.len() >= limit {
+                break;
+            }
+            if let Some((lines, truncated)) = scan(file, limit - matches.len()) {
+                lines_truncated |= truncated;
+                matches.extend(lines);
+            }
+        }
+    } else {
+        // Every thread pulls the next file index; results land in the
+        // file's slot so the merged order is the walk order, exactly as
+        // the sequential scan would have produced it. `found` lets the
+        // pool stop early once the limit is clearly reached.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let found = AtomicUsize::new(0);
+        let slots: Mutex<Vec<Option<ScannedFile>>> =
+            Mutex::new((0..files.len()).map(|_| None).collect());
+        let threads = GREP_SCAN_THREADS.min(files.len());
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= files.len() || found.load(Ordering::Relaxed) >= limit {
+                        break;
+                    }
+                    if let Some(result) = scan(&files[index], limit) {
+                        found.fetch_add(result.0.len(), Ordering::Relaxed);
+                        slots.lock().unwrap_or_else(|err| err.into_inner())[index] = Some(result);
+                    }
+                });
+            }
+        });
+        for slot in slots.into_inner().unwrap_or_else(|err| err.into_inner()) {
+            if matches.len() >= limit {
+                break;
+            }
+            if let Some((lines, truncated)) = slot {
+                lines_truncated |= truncated;
+                matches.extend(lines);
+            }
+        }
+    }
     if matches.is_empty() {
         return Ok(ToolResult {
             content: "No matches found".into(),
@@ -1400,7 +1563,10 @@ fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, ToolError> {
 }
 
 struct IgnoreRules {
-    patterns: Vec<String>,
+    /// Rules without a `/`: matched against an entry's own name.
+    name_patterns: Vec<String>,
+    /// Rules with a `/`: matched against the whole path.
+    path_patterns: Vec<String>,
 }
 
 impl IgnoreRules {
@@ -1430,19 +1596,47 @@ impl IgnoreRules {
                 None => break,
             }
         }
-        Self { patterns }
+        let (path_patterns, name_patterns): (Vec<String>, Vec<String>) = patterns
+            .into_iter()
+            .partition(|pattern| pattern.contains('/'));
+        Self {
+            name_patterns,
+            path_patterns,
+        }
     }
 
+    /// The walk prunes an ignored directory before descending, so an entry
+    /// only has to be judged by its own name against the name rules
+    /// (`.git`, `target`, `*.log`); the path rules (`docs/build`) see the
+    /// whole path. Neither needs the string of every ancestor rebuilt per
+    /// entry, which the first version did.
     fn ignored(&self, path: &Path) -> bool {
+        if !self.name_patterns.is_empty() {
+            if let Some(name) = path.file_name() {
+                let name = name.to_string_lossy();
+                if self
+                    .name_patterns
+                    .iter()
+                    .any(|pattern| glob_match(pattern, &name))
+                {
+                    return true;
+                }
+            }
+        }
+        if self.path_patterns.is_empty() {
+            return false;
+        }
         let posix = path.to_string_lossy().replace('\\', "/");
-        self.patterns.iter().any(|pattern| {
-            posix.split('/').any(|part| glob_match(pattern, part))
-                || glob_match(pattern, &posix)
-                || posix.ends_with(pattern)
-        })
+        self.path_patterns
+            .iter()
+            .any(|pattern| glob_match(pattern, &posix) || posix.ends_with(pattern))
     }
 }
 
+/// Depth-first walk in a stable order (entries sorted by name, so results
+/// do not depend on the file system's iteration order). The entry's own
+/// file type is used — `read_dir` already knows it — instead of a `stat`
+/// per path, and symlinked directories are not followed.
 fn walk_files(root: &Path, ignore: &IgnoreRules, visit: &mut dyn FnMut(&Path) -> bool) {
     if root.is_file() {
         let _ = visit(root);
@@ -1453,17 +1647,34 @@ fn walk_files(root: &Path, ignore: &IgnoreRules, visit: &mut dyn FnMut(&Path) ->
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
+        let mut entries: Vec<fs::DirEntry> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        // Directories are pushed in reverse so the stack pops them in name
+        // order.
+        let mut dirs = Vec::new();
+        for entry in entries {
             let path = entry.path();
             if ignore.ignored(&path) {
                 continue;
             }
-            if path.is_dir() {
-                stack.push(path);
-            } else if !visit(&path) {
-                return;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                dirs.push(path);
+            } else if file_type.is_file() {
+                if !visit(&path) {
+                    return;
+                }
+            } else if file_type.is_symlink() {
+                // A link to a file is searched like the file; a link to a
+                // directory is not followed (cycles).
+                if path.is_file() && !visit(&path) {
+                    return;
+                }
             }
         }
+        stack.extend(dirs.into_iter().rev());
     }
 }
 
@@ -1484,32 +1695,6 @@ fn format_grep_path(file: &Path, search_path: &Path, is_dir: bool) -> String {
     file.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| file.display().to_string())
-}
-
-fn line_matches(pattern: &str, line: &str, ignore_case: bool, literal: bool) -> bool {
-    if literal {
-        return if ignore_case {
-            line.to_ascii_lowercase()
-                .contains(&pattern.to_ascii_lowercase())
-        } else {
-            line.contains(pattern)
-        };
-    }
-    let haystack = if ignore_case {
-        line.to_ascii_lowercase()
-    } else {
-        line.to_string()
-    };
-    let needle = if ignore_case {
-        pattern.to_ascii_lowercase()
-    } else {
-        pattern.to_string()
-    };
-    if let Ok(regex) = regex::Regex::new(&needle) {
-        regex.is_match(&haystack)
-    } else {
-        haystack.contains(&needle)
-    }
 }
 
 fn truncate_line(line: &str) -> (String, bool) {
@@ -1558,19 +1743,17 @@ pub(crate) fn truncate_read(
         bytes += add;
     }
     let output = out.join("\n");
-    (
-        output.clone(),
-        serde_json::json!({
-            "truncated": truncated_by.is_some(),
-            "truncatedBy": truncated_by,
-            "totalLines": lines.len(),
-            "totalBytes": content.len(),
-            "outputLines": out.len(),
-            "outputBytes": output.len(),
-            "maxLines": max_lines,
-            "maxBytes": DEFAULT_MAX_BYTES,
-        }),
-    )
+    let details = serde_json::json!({
+        "truncated": truncated_by.is_some(),
+        "truncatedBy": truncated_by,
+        "totalLines": lines.len(),
+        "totalBytes": content.len(),
+        "outputLines": out.len(),
+        "outputBytes": output.len(),
+        "maxLines": max_lines,
+        "maxBytes": DEFAULT_MAX_BYTES,
+    });
+    (output, details)
 }
 
 fn path_glob_match(pattern: &str, file: &Path, search_path: &Path) -> bool {

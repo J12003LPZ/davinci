@@ -19,11 +19,20 @@ pub struct McpServerRow {
     pub status: String,
     pub tools: usize,
     pub error: Option<String>,
+    /// Tool names the server listed that cannot become `mcp__<server>__<tool>`
+    /// (not `[A-Za-z0-9_-]+`); `/mcp` names them.
+    pub skipped: Vec<String>,
 }
+
+/// One connected server behind its own lock, so a slow round trip on one
+/// server never holds up a call to another (or the registry itself). The
+/// scheduler runs read-only MCP tools in the parallel lane; this is what
+/// lets them actually overlap.
+type SharedClient = Arc<Mutex<pi_mcp::Client>>;
 
 #[derive(Default)]
 struct Inner {
-    clients: BTreeMap<String, pi_mcp::Client>,
+    clients: BTreeMap<String, SharedClient>,
     rows: Vec<McpServerRow>,
 }
 
@@ -57,6 +66,13 @@ impl McpRegistry {
         self.inner.lock().unwrap_or_else(|err| err.into_inner())
     }
 
+    /// Kill every stdio server this process spawned, for an exit that runs
+    /// no destructors (a signal, a hung turn). Does not take any registry
+    /// lock: one may be held by the call that hung.
+    pub fn shutdown_all() {
+        pi_mcp::kill_every_server();
+    }
+
     pub fn rows(&self) -> Vec<McpServerRow> {
         self.lock().rows.clone()
     }
@@ -71,11 +87,13 @@ impl McpRegistry {
             .clients
             .values()
             .flat_map(|client| {
+                let client = client.lock().unwrap_or_else(|err| err.into_inner());
                 client
                     .tools
                     .iter()
                     .filter(|tool| tool.read_only())
                     .map(|tool| client.agent_tool_name(&tool.name))
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -86,15 +104,20 @@ impl McpRegistry {
             .clients
             .values()
             .flat_map(|client| {
-                client.tools.iter().map(|tool| AgentTool {
-                    name: client.agent_tool_name(&tool.name),
-                    description: format!(
-                        "mcp:{}. {}",
-                        client.name,
-                        tool.description.as_deref().unwrap_or("")
-                    ),
-                    parameters: tool.input_schema.clone(),
-                })
+                let client = client.lock().unwrap_or_else(|err| err.into_inner());
+                client
+                    .tools
+                    .iter()
+                    .map(|tool| AgentTool {
+                        name: client.agent_tool_name(&tool.name),
+                        description: format!(
+                            "mcp:{}. {}",
+                            client.name,
+                            tool.description.as_deref().unwrap_or("")
+                        ),
+                        parameters: tool.input_schema.clone(),
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -104,6 +127,7 @@ impl McpRegistry {
         let inner = self.lock();
         let mut listed = Vec::new();
         for client in inner.clients.values() {
+            let client = client.lock().unwrap_or_else(|err| err.into_inner());
             for resource in &client.resources {
                 let label = resource.name.as_deref().unwrap_or("");
                 if label.is_empty() {
@@ -123,57 +147,71 @@ impl McpRegistry {
         }
     }
 
+    /// The server's own handle, fetched under the registry lock and used
+    /// after it is released.
+    fn client(&self, server: &str) -> Result<SharedClient, ToolError> {
+        self.lock()
+            .clients
+            .get(server)
+            .cloned()
+            .ok_or_else(|| ToolError::Failed(format!("no MCP server named `{server}`")))
+    }
+
     pub fn call(
         &self,
         server: &str,
         tool: &str,
         arguments: &Value,
     ) -> Result<ToolResult, ToolError> {
-        let mut inner = self.lock();
-        let result = {
-            let client = inner
-                .clients
-                .get_mut(server)
-                .ok_or_else(|| ToolError::Failed(format!("no MCP server named `{server}`")))?;
-            client.call_tool(tool, arguments.clone())
-        };
+        let client = self.client(server)?;
+        let result = client
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .call_tool(tool, arguments.clone());
         match result {
             Ok(result) => Ok(ToolResult {
                 content: result.text(),
                 is_error: result.is_error.unwrap_or(false),
                 details: None,
             }),
-            Err(err) => {
-                inner.drop_server(server, err.to_string());
-                Err(ToolError::Failed(err.to_string()))
-            }
+            Err(err) => self.lock().failed(server, err),
         }
     }
 
     pub fn read(&self, server: &str, uri: &str) -> Result<ToolResult, ToolError> {
-        let mut inner = self.lock();
-        let result = {
-            let client = inner
-                .clients
-                .get_mut(server)
-                .ok_or_else(|| ToolError::Failed(format!("no MCP server named `{server}`")))?;
-            client.read_resource(uri)
-        };
+        let client = self.client(server)?;
+        let result = client
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .read_resource(uri);
         match result {
             Ok(text) => Ok(ToolResult {
                 content: text,
                 is_error: false,
                 details: None,
             }),
-            Err(err) => {
-                inner.drop_server(server, err.to_string());
-                Err(ToolError::Failed(err.to_string()))
-            }
+            Err(err) => self.lock().failed(server, err),
         }
     }
 }
 
 impl Inner {
+    /// A JSON-RPC error reply is the server's answer to this one call:
+    /// `is_error` on the result, server kept. Anything else (closed pipe,
+    /// timeout, decode) means the server is gone: it is dropped and its row
+    /// turns into an error.
+    fn failed(&mut self, server: &str, err: pi_mcp::Error) -> Result<ToolResult, ToolError> {
+        if err.is_rpc() {
+            return Ok(ToolResult {
+                content: err.to_string(),
+                is_error: true,
+                details: None,
+            });
+        }
+        self.drop_server(server, err.to_string());
+        Err(ToolError::Failed(err.to_string()))
+    }
+
     fn connect_one(&mut self, name: &str, server: &pi_mcp::ServerConfig, cwd: &Path) {
         let transport_label = if server.url.is_some() {
             "http"
@@ -187,6 +225,7 @@ impl Inner {
                 status: "error".into(),
                 tools: 0,
                 error: Some("name is not [A-Za-z0-9_-]+".into()),
+                skipped: Vec::new(),
             });
             return;
         }
@@ -197,6 +236,7 @@ impl Inner {
                 status: "disabled".into(),
                 tools: 0,
                 error: None,
+                skipped: Vec::new(),
             });
             return;
         }
@@ -209,6 +249,7 @@ impl Inner {
                     status: "error".into(),
                     tools: 0,
                     error: Some(err.to_string()),
+                    skipped: Vec::new(),
                 });
                 return;
             }
@@ -216,13 +257,16 @@ impl Inner {
         match pi_mcp::Client::connect(name, transport, cwd) {
             Ok(client) => {
                 let tools = client.tools.len();
-                self.clients.insert(name.to_string(), client);
+                let skipped = client.skipped.clone();
+                self.clients
+                    .insert(name.to_string(), Arc::new(Mutex::new(client)));
                 self.rows.push(McpServerRow {
                     name: name.to_string(),
                     transport: transport_label.into(),
                     status: "connected".into(),
                     tools,
                     error: None,
+                    skipped,
                 });
             }
             Err(err) => {
@@ -232,6 +276,7 @@ impl Inner {
                     status: "error".into(),
                     tools: 0,
                     error: Some(err.to_string()),
+                    skipped: Vec::new(),
                 });
             }
         }
@@ -315,6 +360,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read.content, "a note");
+    }
+
+    #[test]
+    fn an_rpc_error_is_the_tools_answer_and_keeps_the_server() {
+        let (_dir, config) = http_fixture(
+            r#"{
+              "initialize": {"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"f","version":"0"}},
+              "tools/list": {"tools":[{"name":"echo","inputSchema":{"type":"object"}}]},
+              "tools/call": {"$rpcError":{"code":-32602,"message":"invalid params"}},
+              "resources/list": {"resources":[{"uri":"fixture://note"}]},
+              "resources/read": {"contents":[{"uri":"fixture://note","text":"a note"}]}
+            }"#,
+        );
+        let registry = McpRegistry::connect(&config, Path::new("."));
+        let result = registry
+            .call("memory", "echo", &json!({}))
+            .expect("an rpc error is a tool result, not a failure");
+        assert!(result.is_error);
+        assert_eq!(result.content, "mcp -32602: invalid params");
+        // Still connected: listed, callable, readable.
+        let rows = registry.rows();
+        assert_eq!(rows[0].status, "connected");
+        assert_eq!(rows[0].tools, 1);
+        assert_eq!(registry.tool_names(), vec!["mcp__memory__echo".to_string()]);
+        assert_eq!(
+            registry.read("memory", "fixture://note").unwrap().content,
+            "a note"
+        );
+    }
+
+    #[test]
+    fn a_failed_list_is_an_error_row_and_skipped_names_are_kept() {
+        let (_dir, config) = http_fixture(
+            r#"{
+              "initialize": {"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"f","version":"0"}},
+              "tools/list": {"$rpcError":{"code":-32603,"message":"list broke"}}
+            }"#,
+        );
+        let registry = McpRegistry::connect(&config, Path::new("."));
+        let rows = registry.rows();
+        assert_eq!(rows[0].status, "error");
+        assert_eq!(rows[0].tools, 0);
+        let error = rows[0].error.as_deref().unwrap();
+        assert!(error.contains("list broke"), "{error}");
+        assert!(registry.specs().is_empty());
+
+        let (_dir, config) = http_fixture(
+            r#"{
+              "initialize": {"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"f","version":"0"}},
+              "tools/list": {"tools":[{"name":"echo"},{"name":"has space"},{"name":"a.b"}]},
+              "resources/list": {"resources":[]}
+            }"#,
+        );
+        let registry = McpRegistry::connect(&config, Path::new("."));
+        let rows = registry.rows();
+        assert_eq!(rows[0].status, "connected");
+        assert_eq!(rows[0].tools, 1);
+        assert_eq!(
+            rows[0].skipped,
+            vec!["has space".to_string(), "a.b".to_string()]
+        );
+        let specs = registry.specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].parameters, pi_mcp::default_input_schema());
     }
 
     #[test]

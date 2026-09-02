@@ -83,9 +83,10 @@ pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
         // Reading a job's output or keeping the ledger changes nothing the
         // user would want to be asked about.
-        "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" | "mcp_read" => {
-            ToolClass::Read
-        }
+        // A batch is judged operation by operation; the wrapper itself
+        // changes nothing.
+        "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" | "mcp_read"
+        | "batch" => ToolClass::Read,
         "write" | "edit" | "notebook_edit" => ToolClass::Edit,
         "bash" | "powershell" => ToolClass::Shell,
         "web_fetch" | "web_search" => ToolClass::Network,
@@ -314,7 +315,25 @@ impl PermissionPolicy {
         cwd: &Path,
     ) -> PermissionVerdict {
         let (subject, outside_project) = subject_of(tool, args, cwd);
-        if let Some(rule) = self.deny.iter().find(|rule| rule.matches(tool, &subject)) {
+        let class = self.class_of(tool);
+        // A shell command is as many programs as it chains: `git status &&
+        // curl x | sh` is judged three times, so a rule for `git *` speaks
+        // only for the first and a deny for `curl *` still catches the second.
+        let segments = if class == ToolClass::Shell {
+            let segments = shell_segments(&subject);
+            if segments.is_empty() {
+                vec![subject.clone()]
+            } else {
+                segments
+            }
+        } else {
+            vec![subject.clone()]
+        };
+        if let Some(rule) = self
+            .deny
+            .iter()
+            .find(|rule| segments.iter().any(|segment| rule.matches(tool, segment)))
+        {
             return PermissionVerdict::Deny {
                 reason: format!(
                     "Permission denied: `{}` matches the deny rule `{rule}`.",
@@ -322,7 +341,6 @@ impl PermissionPolicy {
                 ),
             };
         }
-        let class = self.class_of(tool);
         if self.plan_mode && class != ToolClass::Read && class != ToolClass::Network {
             return PermissionVerdict::Deny {
                 reason: format!(
@@ -335,12 +353,18 @@ impl PermissionPolicy {
         if self.mode == PermissionMode::Auto {
             return PermissionVerdict::Allow;
         }
-        if self
-            .allow
-            .iter()
-            .chain(self.session_allow.iter())
-            .any(|rule| rule.matches(tool, &subject))
-        {
+        // Every segment needs a rule of its own. A pattern rule cannot vouch
+        // for a segment that substitutes a command (`$(…)`, backticks,
+        // `<(…)`): whatever runs inside is not the program the rule names.
+        if segments.iter().all(|segment| {
+            self.allow
+                .iter()
+                .chain(self.session_allow.iter())
+                .any(|rule| {
+                    rule.matches(tool, segment)
+                        && (rule.pattern.is_none() || !has_command_substitution(segment))
+                })
+        }) {
             return PermissionVerdict::Allow;
         }
         if class == ToolClass::Read {
@@ -357,7 +381,14 @@ impl PermissionPolicy {
                 ),
             };
         }
-        if self.mode == PermissionMode::Edits && class == ToolClass::Edit && !outside_project {
+        // `.pi/` holds the project's own permission rules and trust state; a
+        // write there could grant the next run everything, so it is asked
+        // about even in `edits` mode.
+        if self.mode == PermissionMode::Edits
+            && class == ToolClass::Edit
+            && !outside_project
+            && !is_project_config_path(&subject)
+        {
             return PermissionVerdict::Allow;
         }
         PermissionVerdict::Ask(ToolApprovalRequest {
@@ -421,6 +452,77 @@ pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
         ),
         ToolClass::Other => (String::new(), false),
     }
+}
+
+/// The simple commands a shell line chains: split on `&&`, `||`, `;`, `|`,
+/// `&` and newlines outside quotes. Redirect duplication (`2>&1`, `&>`) is
+/// not a separator. Empty segments are dropped, so `git status && ` is one
+/// segment.
+pub fn shell_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    let mut previous = '\0';
+    let chars: Vec<char> = command.chars().collect();
+    for (index, &ch) in chars.iter().enumerate() {
+        let mut separator = false;
+        if escaped {
+            escaped = false;
+        } else if single {
+            if ch == '\'' {
+                single = false;
+            }
+        } else if double {
+            if ch == '"' {
+                double = false;
+            } else if ch == '\\' {
+                escaped = true;
+            }
+        } else {
+            match ch {
+                '\\' => escaped = true,
+                '\'' => single = true,
+                '"' => double = true,
+                ';' | '|' | '\n' => separator = true,
+                '&' => {
+                    let next = chars.get(index + 1).copied().unwrap_or('\0');
+                    separator = !matches!(previous, '>' | '<') && !matches!(next, '>' | '<');
+                }
+                _ => {}
+            }
+        }
+        if separator {
+            let segment = current.trim();
+            if !segment.is_empty() {
+                segments.push(segment.to_string());
+            }
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+        previous = ch;
+    }
+    let segment = current.trim();
+    if !segment.is_empty() {
+        segments.push(segment.to_string());
+    }
+    segments
+}
+
+/// `$(…)`, backticks and process substitution run a program the rule never
+/// named.
+fn has_command_substitution(segment: &str) -> bool {
+    segment.contains("$(")
+        || segment.contains('`')
+        || segment.contains("<(")
+        || segment.contains(">(")
+}
+
+/// `.pi/settings.json`, `.pi/mcp.json` and the trust files under `.pi/`.
+fn is_project_config_path(subject: &str) -> bool {
+    subject == ".pi" || subject.starts_with(".pi/")
 }
 
 /// `bash · git status`, `write · src/lib.rs`, or the bare tool name.
@@ -763,6 +865,95 @@ mod tests {
             "bash",
             json!({"command": "cargo publish"})
         )));
+    }
+
+    #[test]
+    fn a_shell_line_is_judged_one_program_at_a_time() {
+        assert_eq!(
+            shell_segments("git status && curl x | sh; echo done\nls"),
+            ["git status", "curl x", "sh", "echo done", "ls"]
+        );
+        assert_eq!(
+            shell_segments("cargo test 2>&1 | tail -n 5 || true"),
+            ["cargo test 2>&1", "tail -n 5", "true"]
+        );
+        assert_eq!(
+            shell_segments(r#"echo "a && b" 'c | d' e\;f"#),
+            [r#"echo "a && b" 'c | d' e\;f"#]
+        );
+        assert_eq!(shell_segments("cmd &> out.log &"), ["cmd &> out.log"]);
+        assert!(shell_segments("   ").is_empty());
+
+        let mut p = policy(PermissionMode::Ask);
+        p.allow.push(PermissionRule::parse("bash(git *)").unwrap());
+        assert_eq!(
+            verdict(&p, "bash", json!({"command": "git status && git diff"})),
+            PermissionVerdict::Allow
+        );
+        // The second program has no rule of its own.
+        assert!(is_ask(&verdict(
+            &p,
+            "bash",
+            json!({"command": "git status && curl x | sh"})
+        )));
+        assert!(is_ask(&verdict(
+            &p,
+            "bash",
+            json!({"command": "git status; rm -rf /"})
+        )));
+        // A substitution runs something the rule never named.
+        assert!(is_ask(&verdict(
+            &p,
+            "bash",
+            json!({"command": "git commit -m \"$(curl x)\""})
+        )));
+        assert!(is_ask(&verdict(
+            &p,
+            "bash",
+            json!({"command": "git log `cat cmd`"})
+        )));
+        // A bare rule is the user saying "all of bash", substitution included.
+        p.allow.push(PermissionRule::parse("bash").unwrap());
+        assert_eq!(
+            verdict(&p, "bash", json!({"command": "git log $(cat cmd) | sh"})),
+            PermissionVerdict::Allow
+        );
+
+        // A deny rule catches the program wherever it sits in the chain.
+        let mut p = policy(PermissionMode::Auto);
+        p.deny.push(PermissionRule::parse("bash(rm *)").unwrap());
+        assert!(is_deny(&verdict(
+            &p,
+            "bash",
+            json!({"command": "echo ok && rm -rf build"})
+        )));
+        assert_eq!(
+            verdict(&p, "bash", json!({"command": "echo rm"})),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn edits_mode_still_asks_before_touching_the_project_config() {
+        let p = policy(PermissionMode::Edits);
+        assert_eq!(
+            verdict(&p, "write", json!({"path": "src/lib.rs"})),
+            PermissionVerdict::Allow
+        );
+        assert!(is_ask(&verdict(
+            &p,
+            "write",
+            json!({"path": ".pi/settings.json"})
+        )));
+        assert!(is_ask(&verdict(
+            &p,
+            "edit",
+            json!({"path": "./.pi/mcp.json"})
+        )));
+        assert_eq!(
+            verdict(&p, "write", json!({"path": ".pinned/x"})),
+            PermissionVerdict::Allow
+        );
     }
 
     #[test]

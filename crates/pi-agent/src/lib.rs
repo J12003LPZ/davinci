@@ -1,18 +1,23 @@
 //! Agent runtime matching `@earendil-works/pi-agent-core`.
 
+mod batch;
 mod branch;
 mod compaction;
 mod context;
 mod edit_diff;
 mod events;
+mod evidence;
 mod file_mutation_queue;
 mod images;
 pub mod jobs;
 pub mod mcp;
 pub mod notebook;
 mod permission;
+mod pruning;
 mod queues;
+mod scheduler;
 mod skills;
+mod stats;
 mod subagent;
 mod templates;
 pub mod todo;
@@ -20,6 +25,7 @@ mod tools;
 mod turn;
 pub mod web;
 
+pub use batch::{BATCH_MAX_OPERATIONS, VISIBLE_PER_OPERATION, VISIBLE_TOTAL};
 pub use branch::{
     build_branch_summary_prompt, collect_entries_for_branch_summary, generate_branch_summary,
     message_from_branch_entry, navigation_target, prepare_branch_entries, BranchPreparation,
@@ -40,6 +46,7 @@ pub use compaction::{
 };
 pub use context::{load_context_files, ContextFile};
 pub use events::AgentEvent;
+pub use evidence::{EvidenceStore, EVIDENCE_TTL};
 pub use file_mutation_queue::{mutation_queue_key, with_file_mutation_queue};
 pub use images::{
     apply_block_images, convert_to_llm_for_provider, normalize_tool_result_images,
@@ -52,8 +59,11 @@ pub use permission::{
     PermissionPolicy, PermissionRule, PermissionVerdict, ToolApprovalDecision, ToolApprovalRequest,
     ToolApprover, ToolClass,
 };
+pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
+pub use scheduler::{lane_for, ToolLane, MAX_TOOL_PARALLELISM};
 pub use skills::{discover_skills, expand_skill_command, expand_user_text, Skill};
+pub use stats::{RunStats, SharedCounters};
 pub use subagent::{
     scoped_tools, SubagentRequest, SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX,
     PLAN_MODE_DENIAL,
@@ -205,6 +215,19 @@ pub struct Agent {
     /// Cross-thread interrupt: set from the UI thread while `run_loop` runs
     /// on a worker. Checked at every loop step alongside `aborted`.
     pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Counters for the run (`stats.rs`): turns, batch widths, wall time,
+    /// peak context, prunings. Read them through `run_stats`, which also
+    /// folds in the counters bumped from inside tool calls.
+    pub stats: RunStats,
+    pub counters: Arc<SharedCounters>,
+    /// When old tool output leaves the provider's view (`pruning.rs`).
+    pub prune_settings: PruneSettings,
+    /// Where overflowing output is kept for a later `read` (`evidence.rs`).
+    /// `None` means overflow is truncated with a note and nothing else.
+    pub evidence: Option<EvidenceStore>,
+    /// Tool-call ids whose results are pruned from the provider view. Only
+    /// grows; the session file keeps every body.
+    pruned_tool_results: std::collections::HashSet<String>,
     base_system_prompt: String,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -243,7 +266,8 @@ impl Agent {
             is_compacting: false,
             provider: "google".into(),
             model_id: String::new(),
-            tool_execution_mode: ToolExecutionMode::Sequential,
+            // TS `runtimeOptions.toolExecution ?? "parallel"`.
+            tool_execution_mode: ToolExecutionMode::Parallel,
             custom_tool_executor: None,
             pre_tool: None,
             post_tool: None,
@@ -261,6 +285,11 @@ impl Agent {
             reload_count: 0,
             event_sink: None,
             abort_signal: None,
+            stats: RunStats::default(),
+            counters: SharedCounters::shared(),
+            prune_settings: PruneSettings::default(),
+            evidence: None,
+            pruned_tool_results: std::collections::HashSet::new(),
             base_system_prompt: system_prompt,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -334,9 +363,10 @@ impl Agent {
         for notice in self.job_notice_messages() {
             self.messages.push(notice.clone());
             if let Some(session) = &mut self.session {
-                let _ = session.append_entry(SessionEntry::message(
+                let _ = session.append_entry(chat_entry(
                     "user",
                     serde_json::to_value(&notice.content).unwrap_or(Value::Null),
+                    &notice.extra,
                 ));
             }
             self.pending_prompt_messages.push(notice);
@@ -365,16 +395,72 @@ impl Agent {
     }
 
     pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
-        if self.ephemeral_context.is_empty() {
+        if self.ephemeral_context.is_empty() && self.pruned_tool_results.is_empty() {
             return convert_to_llm_for_provider(&self.messages, self.block_images);
         }
-        let mut messages = self.messages.clone();
+        let mut messages = pruning::project(&self.messages, &self.pruned_tool_results);
+        if self.ephemeral_context.is_empty() {
+            return convert_to_llm_for_provider(&messages, self.block_images);
+        }
         let insertion = messages
             .iter()
             .rposition(|message| message.role == "user")
             .unwrap_or(messages.len());
         messages.splice(insertion..insertion, self.ephemeral_context.iter().cloned());
         convert_to_llm_for_provider(&messages, self.block_images)
+    }
+
+    /// The run's counters, complete.
+    pub fn run_stats(&self) -> RunStats {
+        let mut stats = self.stats;
+        self.counters.fold_into(&mut stats);
+        stats
+    }
+
+    /// The token estimate for what the provider will actually be sent:
+    /// pruned tool results count as their placeholder, and an extension's
+    /// ephemeral context counts although it is not in `messages`.
+    pub fn estimated_context_tokens(&self) -> u64 {
+        pruning::estimate_projected_tokens(&self.messages, &self.pruned_tool_results)
+            + estimate_context_tokens(&self.ephemeral_context)
+    }
+
+    /// Prune old tool output from the provider view when the context has
+    /// grown past the start line. Idempotent between prune passes, so the
+    /// provider's prompt cache keeps its prefix until the next pass.
+    pub fn prune_context(&mut self) {
+        let tokens = self.estimated_context_tokens();
+        let plan = pruning::plan_prune(
+            &self.messages,
+            &self.pruned_tool_results,
+            tokens,
+            self.context_window,
+            &self.prune_settings,
+        );
+        if plan.is_empty() {
+            return;
+        }
+        let ids: std::collections::HashSet<&String> = plan.iter().collect();
+        let chars: usize = self
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == "toolResult"
+                    && message
+                        .tool_call_id
+                        .as_ref()
+                        .is_some_and(|id| ids.contains(id))
+            })
+            .map(|message| compaction::estimate_content_chars(&message.content))
+            .sum();
+        self.stats.pruned_results += plan.len() as u64;
+        self.stats.pruned_chars += chars as u64;
+        self.pruned_tool_results.extend(plan);
+    }
+
+    /// Ids of the tool results currently pruned from the provider view.
+    pub fn pruned_tool_results(&self) -> &std::collections::HashSet<String> {
+        &self.pruned_tool_results
     }
 
     fn persist_full_message(&mut self, message: &ChatMessage) {
@@ -1014,17 +1100,62 @@ pub fn default_system_prompt() -> String {
         "Keep a todo list with the todo tool on any task of three or more steps: send the whole list, mark the step you are on active, and mark steps done as you finish them.",
         "Run builds, test suites and anything that takes more than a few seconds with bash background: true; you will be told when the job finishes, and job_output reads what it printed meanwhile.",
         "Use web_search to find pages and web_fetch to read one before quoting it. Notebooks (.ipynb) read as numbered cells; edit matches inside a cell and notebook_edit changes whole cells.",
+        TOOL_USE_STRATEGY,
     ]
     .join("\n")
 }
+
+/// The orchestration rules every pi prompt carries: they are what turns a
+/// thirty-turn investigation into a six-turn one. Runtime and prompt have
+/// to agree — the scheduler overlaps independent calls (`scheduler.rs`),
+/// `batch` hides several operations behind one boundary, `agent` fans out
+/// workers — and this is the prompt's half of that agreement.
+pub const TOOL_USE_STRATEGY: &str = "\
+Tool-use strategy — every model turn is expensive, every tool call is cheap:
+- Minimize round trips. When the next several reads, searches or listings are already known, issue them all in one response, or put them in one batch call. Never do one search or read per turn when more are obviously coming.
+- Independent read-only calls in the same response run concurrently; edits and shell commands run in order. Order calls the way you need their effects.
+- Read with offset/limit around what you need instead of whole files, and do not re-read a file you already have unless it changed.
+- Search before reading: one grep across the tree beats opening files one by one.
+- Delegate research that would flood your context to agent workers (up to 8 concurrent tasks), each with a self-contained question and a request for a short answer with file paths; do not wait on them for anything you can do meanwhile.
+- Keep tool output small: use grep limit/glob, ls limit, read ranges; ask for more only when needed.";
 
 pub fn new_message_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// A session entry for one chat message, carrying the message's `extra`
+/// fields (`customType: backgroundJob`, `jobId`) so a resumed session reads
+/// a job notice back as a job notice and not as something the user typed.
+pub fn chat_entry(
+    role: &str,
+    content: Value,
+    extra: &serde_json::Map<String, Value>,
+) -> SessionEntry {
+    let mut entry = SessionEntry::message(role, content);
+    if let Some(Value::Object(message)) = &mut entry.message {
+        for (key, value) in extra {
+            message.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    entry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_entry_keeps_the_message_extras() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("customType".into(), serde_json::json!(JOB_NOTICE_TYPE));
+        extra.insert("jobId".into(), serde_json::json!(3));
+        let entry = chat_entry("user", serde_json::json!("hi"), &extra);
+        let message = entry.message.unwrap();
+        assert_eq!(message["role"], "user");
+        assert_eq!(message["content"], "hi");
+        assert_eq!(message["customType"], JOB_NOTICE_TYPE);
+        assert_eq!(message["jobId"], 3);
+    }
 
     #[test]
     fn queues_and_compaction_match_ts_modes() {
@@ -1295,6 +1426,325 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A scripted model that emits every call of one entry in a single
+    /// assistant message, then `done`.
+    fn scripted_batches(
+        batches: Vec<Vec<(&'static str, serde_json::Value)>>,
+    ) -> impl FnMut(&Agent) -> Result<pi_ai::AssistantMessage, String> {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+        let mut remaining = batches.into_iter();
+        let mut index = 0;
+        move |_current| {
+            index += 1;
+            match remaining.next() {
+                Some(calls) => Ok(AssistantMessage {
+                    id: format!("a{index}"),
+                    role: "assistant".into(),
+                    content: calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(n, (name, arguments))| ContentBlock::ToolCall {
+                            id: format!("call_{index}_{n}"),
+                            name: name.into(),
+                            arguments,
+                        })
+                        .collect(),
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::ToolUse),
+                    error_message: None,
+                }),
+                None => Ok(AssistantMessage {
+                    id: format!("a{index}"),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_workers_in_one_message_overlap_and_answer_in_order() {
+        use std::time::{Duration, Instant};
+        let mut agent = Agent::new(default_system_prompt());
+        agent.subagent_runner = Some(SubagentRunner::new(|req| {
+            std::thread::sleep(Duration::from_millis(80));
+            Ok(format!("answer:{}", req.prompt))
+        }));
+        agent.prompt("go");
+        let start = Instant::now();
+        let events = agent
+            .run_loop(scripted_batches(vec![vec![
+                ("agent", serde_json::json!({"prompt": "one"})),
+                ("agent", serde_json::json!({"prompt": "two"})),
+                ("agent", serde_json::json!({"prompt": "three"})),
+            ]]))
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "three 80 ms workers took {elapsed:?}: they ran one after another"
+        );
+        let results: Vec<String> = agent
+            .messages
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .map(|message| content_text(&message.content))
+            .collect();
+        assert_eq!(results, ["answer:one", "answer:two", "answer:three"]);
+        // Every start precedes every end, and the ends are recorded in
+        // source order even though the workers finished together.
+        let kinds: Vec<(&str, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
+                    Some(("start", tool_call_id.clone()))
+                }
+                AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                    Some(("end", tool_call_id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("start", "call_1_0".to_string()),
+                ("start", "call_1_1".to_string()),
+                ("start", "call_1_2".to_string()),
+                ("end", "call_1_0".to_string()),
+                ("end", "call_1_1".to_string()),
+                ("end", "call_1_2".to_string()),
+            ]
+        );
+        let stats = agent.run_stats();
+        assert_eq!(stats.model_turns, 2);
+        assert_eq!(stats.tool_batches, 1);
+        assert_eq!(stats.tool_calls, 3);
+        assert_eq!(stats.max_batch_width, 3);
+        assert_eq!(stats.parallel_groups, 1);
+        assert_eq!(stats.subagents, 3);
+    }
+
+    #[test]
+    fn sequential_mode_runs_workers_one_at_a_time() {
+        use std::time::{Duration, Instant};
+        let mut agent = Agent::new(default_system_prompt());
+        agent.tool_execution_mode = ToolExecutionMode::Sequential;
+        agent.subagent_runner = Some(SubagentRunner::new(|_| {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok("x".into())
+        }));
+        agent.prompt("go");
+        let start = Instant::now();
+        agent
+            .run_loop(scripted_batches(vec![vec![
+                ("agent", serde_json::json!({"prompt": "one"})),
+                ("agent", serde_json::json!({"prompt": "two"})),
+            ]]))
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(80));
+        assert_eq!(agent.run_stats().parallel_groups, 0);
+    }
+
+    #[test]
+    fn an_edit_is_a_barrier_so_the_read_after_it_sees_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before").unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.prompt("go");
+        agent
+            .run_loop(scripted_batches(vec![vec![
+                ("read", serde_json::json!({"path": "a.txt"})),
+                (
+                    "edit",
+                    serde_json::json!({"path": "a.txt", "oldText": "before", "newText": "after"}),
+                ),
+                ("read", serde_json::json!({"path": "a.txt"})),
+            ]]))
+            .unwrap();
+        let results: Vec<String> = agent
+            .messages
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .map(|message| content_text(&message.content))
+            .collect();
+        assert_eq!(results.len(), 3, "{results:?}");
+        assert!(results[0].contains("before"), "{results:?}");
+        assert!(results[2].contains("after"), "{results:?}");
+    }
+
+    #[test]
+    fn a_batch_runs_its_operations_behind_one_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\nneedle\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.prompt("go");
+        let events = agent
+            .run_loop(scripted_batches(vec![vec![(
+                "batch",
+                serde_json::json!({"operations": [
+                    {"tool": "read", "args": {"path": "a.txt"}},
+                    {"tool": "grep", "args": {"pattern": "needle", "path": "."}},
+                    {"tool": "ls", "args": {"path": "."}},
+                    {"tool": "batch", "args": {"operations": []}},
+                    {"tool": "nope", "args": {}},
+                ]}),
+            )]]))
+            .unwrap();
+        let outcomes = tool_outcomes(&events);
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        let (name, is_error, text) = &outcomes[0];
+        assert_eq!(name, "batch");
+        assert!(!is_error);
+        assert!(text.starts_with("batch: 5/5 operations ran"), "{text}");
+        assert!(text.contains("[1] read path=\"a.txt\" → ok"), "{text}");
+        assert!(text.contains("alpha"), "{text}");
+        assert!(
+            text.contains("[2] grep path=\".\" pattern=\"needle\""),
+            "{text}"
+        );
+        assert!(text.contains("a.txt:2: needle"), "{text}");
+        assert!(text.contains("[3] ls"), "{text}");
+        assert!(text.contains("b.txt"), "{text}");
+        assert!(text.contains("[4] batch operations=… → error"), "{text}");
+        assert!(text.contains("cannot run inside a batch"), "{text}");
+        assert!(text.contains("[5] nope → error"), "{text}");
+        assert!(text.contains("Unknown tool: nope"), "{text}");
+        let stats = agent.run_stats();
+        assert_eq!(stats.tool_calls, 1);
+        assert_eq!(stats.batch_operations, 5);
+        // One model-visible tool result for five operations.
+        assert_eq!(
+            agent
+                .messages
+                .iter()
+                .filter(|message| message.role == "toolResult")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_batch_operation_is_gated_like_a_direct_call() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+            PermissionMode::ReadOnly,
+        )));
+        agent.prompt("go");
+        let events = agent
+            .run_loop(scripted_batches(vec![vec![(
+                "batch",
+                serde_json::json!({"operations": [
+                    {"tool": "write", "args": {"path": "x.txt", "content": "no"}},
+                    {"tool": "ls", "args": {}},
+                ]}),
+            )]]))
+            .unwrap();
+        let outcomes = tool_outcomes(&events);
+        let text = &outcomes[0].2;
+        assert!(
+            text.contains("[1] write path=\"x.txt\" content=\"no\" → error"),
+            "{text}"
+        );
+        assert!(text.contains("read-only"), "{text}");
+        assert!(!dir.path().join("x.txt").exists());
+        assert!(text.contains("[2] ls → ok"), "{text}");
+    }
+
+    #[test]
+    fn overflowing_batch_output_goes_to_the_evidence_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "z".repeat(20 * 1024);
+        std::fs::write(dir.path().join("big.txt"), &big).unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.evidence = Some(EvidenceStore::new(dir.path().join("evidence")));
+        agent.prompt("go");
+        let events = agent
+            .run_loop(scripted_batches(vec![vec![(
+                "batch",
+                serde_json::json!({"operations": [
+                    {"tool": "read", "args": {"path": "big.txt"}},
+                ]}),
+            )]]))
+            .unwrap();
+        let text = &tool_outcomes(&events)[0].2;
+        assert!(
+            text.len() < 14 * 1024,
+            "visible result is {} bytes",
+            text.len()
+        );
+        assert!(text.contains("full output saved to"), "{text}");
+        let path = text
+            .split("full output saved to ")
+            .nth(1)
+            .and_then(|rest| rest.split(" — ").next())
+            .unwrap();
+        let saved = std::fs::read_to_string(path.trim()).unwrap();
+        assert!(saved.contains(&big));
+        assert_eq!(agent.run_stats().evidence_files, 1);
+    }
+
+    #[test]
+    fn old_tool_output_is_pruned_from_the_provider_view_but_kept_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "q".repeat(4_000);
+        std::fs::write(dir.path().join("f.txt"), &body).unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.auto_compaction = false;
+        // ~1000 tokens per read; a 6k window starts pruning past 3k.
+        agent.context_window = 6_000;
+        agent.prune_settings.keep_recent = 2;
+        agent.prompt("go");
+        let batches: Vec<Vec<(&'static str, serde_json::Value)>> = (0..6)
+            .map(|_| vec![("read", serde_json::json!({"path": "f.txt"}))])
+            .collect();
+        agent.run_loop(scripted_batches(batches)).unwrap();
+        let stats = agent.run_stats();
+        assert!(stats.pruned_results >= 2, "{stats:?}");
+        assert!(stats.pruned_chars >= 8_000, "{stats:?}");
+        // History is whole.
+        let full: Vec<&ChatMessage> = agent
+            .messages
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .collect();
+        assert_eq!(full.len(), 6);
+        assert!(full
+            .iter()
+            .all(|message| content_text(&message.content).contains(&body)));
+        // The provider view is not.
+        let projected = agent.messages_for_provider();
+        let pruned = projected
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .filter(|message| content_text(&message.content).contains("pruned to save context"))
+            .count();
+        assert_eq!(pruned as u64, stats.pruned_results);
+        // The newest results are untouched.
+        let last = projected
+            .iter()
+            .rev()
+            .find(|message| message.role == "toolResult")
+            .unwrap();
+        assert!(content_text(&last.content).contains(&body));
+        assert!(agent.estimated_context_tokens() < crate::estimate_context_tokens(&agent.messages));
     }
 
     #[test]
