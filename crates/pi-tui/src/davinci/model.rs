@@ -1116,6 +1116,13 @@ pub struct VectorIndex {
     pub extraction: String,
     pub config: String,
     pub health: Vec<(State, String)>,
+    /// `3`, `bge-small 384d`.
+    pub shards: String,
+    pub model_dims: String,
+    /// `k=6 from 60 candidates · hybrid dense + lexical`.
+    pub retrieval_note: String,
+    /// `14 chunks · 8.4k tokens`.
+    pub injected: String,
 }
 
 /// One counter of the governor's ledger (`5c`).
@@ -1145,6 +1152,11 @@ pub struct GovernorSheet {
     pub counters: Vec<GovernorCounter>,
     pub stored: Vec<GovernorStored>,
     pub store_dir: String,
+    /// `01JB2K`, `11:04`.
+    pub session_id: String,
+    pub since: String,
+    /// `31 outputs · 2.8 MB · 4 newest shown · dropped when the session ends`.
+    pub outputs_note: String,
 }
 
 /// One row of `/mcp`.
@@ -1223,6 +1235,13 @@ pub struct SecurityScan {
     pub findings: Vec<Finding>,
     pub seal: String,
     pub report: String,
+    /// `214 KB`.
+    pub report_size: String,
+    /// `s-31c8`, `draft`.
+    pub id: String,
+    pub state: String,
+    /// `(files scanned, files in the tree)`.
+    pub scanned: Option<(u64, u64)>,
 }
 
 /// One file a project would load, before it is trusted (`6a`).

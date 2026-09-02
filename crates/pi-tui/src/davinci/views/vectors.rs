@@ -6,18 +6,20 @@
 //! count with its share of the index, never a bare number (design.md §9). The
 //! destructive action says what it would destroy and that it cannot be undone.
 //!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/vectors.ex`.
+//! Mirrors artboard `5b` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::text::{Line, Span};
 
+use super::chrome::thousands;
+use super::sheet::{facts, hint, hint_dim, status_meter, Composer, SheetChrome};
 use crate::davinci::model::Model;
-use crate::davinci::ui::{blank, meter, span, span_strong, truncate_run, wrap, Surface, MEASURE};
+use crate::davinci::ui::{blank, footnote, meter, span, span_strong, truncate_run, Surface};
 
 const KIND: usize = 13;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
     let Some(index) = model.vector_index.as_ref() else {
         return vec![Line::from(vec![span(
             "the vector index is not configured — vector memory is off",
@@ -31,9 +33,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             span(index.repo.clone(), th.secondary),
             span(" holds ", th.muted),
             span(index.repo_records.clone(), th.primary),
-            span(" of ", th.muted),
-            span(index.total_records.clone(), th.text),
-            span(" records", th.muted),
+            span(" of them", th.muted),
         ]),
         Line::from(vec![
             span("retrieval automatic", th.muted),
@@ -41,9 +41,6 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             span("at most ", th.muted),
             span(index.injection_cap.clone(), th.text),
             span(" injected per turn", th.muted),
-            span(" · ", th.border),
-            span("floor ", th.muted),
-            span(index.floor.clone(), th.text),
         ]),
     ];
 
@@ -67,17 +64,17 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             vec![
                 span("embeddings ", th.muted),
                 span(index.embeddings.clone(), th.text),
-                span(format!("  {}", index.embed_host), th.border),
+                span(format!(" · {}", index.embed_host), th.border),
             ],
             vec![
                 span("vectors    ", th.muted),
                 span(index.store.clone(), th.text),
-                span(format!("  {}", index.collection), th.border),
+                span(format!(" · collection {}", index.collection), th.border),
             ],
             vec![
                 span("extraction ", th.muted),
                 span(index.extraction.clone(), th.text),
-                span("  one call per turn, off the critical path", th.border),
+                span(" · one call per turn, off the critical path", th.border),
             ],
             vec![
                 span("config     ", th.muted),
@@ -102,25 +99,35 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         )
         .lines();
 
-    let mut footer: Vec<Line<'static>> = wrap(
-        &format!(
-            "memory-clear drops this repository's {} records. It asks first, and it cannot be undone.",
-            index.repo_records
-        ),
-        MEASURE,
-    )
-    .into_iter()
-    .map(|row| Line::from(vec![span(row, th.warning)]))
-    .collect();
-    footer.push(Line::from(vec![
-        span("enter search", th.border),
-        span(" · ", th.border),
-        span("i reindex", th.border),
-        span(" · ", th.border),
-        span("t toggle automatic retrieval", th.border),
-        span(" · ", th.border),
-        span("esc close", th.border),
-    ]));
+    let mut footer: Vec<Line<'static>> = Vec::new();
+    let mut retrieval = vec![
+        span("relevance floor ", th.muted),
+        span(index.floor.clone(), th.text),
+    ];
+    if !index.retrieval_note.is_empty() {
+        retrieval.push(span(" · ", th.border));
+        retrieval.push(span(index.retrieval_note.clone(), th.border));
+    }
+    footer.push(Line::from(retrieval));
+    if !index.injected.is_empty() {
+        footer.push(Line::from(vec![
+            span("injected this session ", th.muted),
+            span(index.injected.clone(), th.text),
+            span(" · shown in the transcript as ⌕ lines", th.border),
+        ]));
+    }
+    footer.extend(footnote(
+        width,
+        vec![
+            span("memory-clear", th.warning),
+            span(
+                format!(" drops this repo's {} records", index.repo_records),
+                th.warning,
+            ),
+        ],
+        vec![span("it asks first, and it cannot be undone", th.border)],
+        th,
+    ));
 
     let mut out = head;
     out.push(blank());
@@ -132,21 +139,83 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     out.push(blank());
     out.extend(footer);
     out.into_iter()
-        .map(|line| Line::from(truncate_run(line.spans, model.width)))
+        .map(|line| Line::from(truncate_run(line.spans, width)))
         .collect()
 }
 
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
+/// `6,914` → 6914. `None` for anything that is not a count.
+fn count(text: &str) -> Option<u64> {
+    let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+    (!digits.is_empty() && text.chars().all(|c| c.is_ascii_digit() || c == ','))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// The sheet's frame (design.md §11): the index in the header, retrieval
+/// state in the status bar with this repository's share as its meter.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    let index = model.vector_index.as_ref();
+    let share = index.and_then(|index| {
+        let repo = count(&index.repo_records)?;
+        let total = count(&index.total_records)?;
+        (total > 0).then_some((repo, total))
+    });
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                index
+                    .filter(|i| !i.total_records.is_empty())
+                    .map(|i| vec![span(format!("{} records", i.total_records), th.muted)])
+                    .unwrap_or_default(),
+                index
+                    .filter(|i| !i.shards.is_empty())
+                    .map(|i| vec![span(format!("{} shards", i.shards), th.muted)])
+                    .unwrap_or_default(),
+                index
+                    .filter(|i| !i.model_dims.is_empty())
+                    .map(|i| vec![span(i.model_dims.clone(), th.muted)])
+                    .unwrap_or_default(),
+            ],
+        ),
+        status_third: index.map(|_| vec![span("retrieval on", th.muted)]),
+        status_right: share.map(|(repo, total)| {
+            status_meter(
+                th,
+                "index",
+                repo as f64 / total as f64,
+                &short(repo),
+                &short(total),
+            )
+        }),
+        hints: vec![
+            hint(th, "enter search"),
+            hint(th, "i reindex"),
+            hint(th, "t toggle automatic retrieval"),
+            hint_dim(th, "x clear this repo"),
+        ],
+        escape: Some("esc close"),
+        composer: Composer::Prompt("/memory-search interrupt handling"),
+        echo: None,
+    }
+}
+
+/// `6914` → `6.9k`, `18402` → `18.4k`: a decimal where it changes the reading.
+fn short(value: u64) -> String {
+    if (1_000..100_000).contains(&value) {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        thousands(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::model::VectorIndex;
-    use crate::davinci::theme::{ColorDepth, State, Theme};
+    use crate::davinci::fixtures;
+    use crate::davinci::model::Screen;
+    use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
 
     fn model(width: u16) -> Model {
@@ -156,40 +225,8 @@ mod tests {
             44,
             true,
         );
-        model.vector_index = Some(VectorIndex {
-            repo: "davinci-rust".into(),
-            repo_records: "6,914".into(),
-            total_records: "18,402".into(),
-            injection_cap: "1.5k tokens".into(),
-            floor: "0.70".into(),
-            kinds: vec![
-                (
-                    "decision".into(),
-                    "1,482".into(),
-                    0.48,
-                    "importance 0.9".into(),
-                ),
-                (
-                    "constraint".into(),
-                    "311".into(),
-                    0.10,
-                    "never evicted".into(),
-                ),
-            ],
-            embeddings: "ollama".into(),
-            embed_host: "127.0.0.1:11434 · bge-small 384d".into(),
-            store: "qdrant".into(),
-            collection: "collection davinci-memoria · 3 shards".into(),
-            extraction: "haiku".into(),
-            config: "%USERPROFILE%\\.davinci\\vector-memory.json".into(),
-            health: vec![
-                (State::Done, "reindexed on the last commit · 4m ago".into()),
-                (
-                    State::Attention,
-                    "7 records failed to embed · retried next reindex".into(),
-                ),
-            ],
-        });
+        model.vector_index = Some(fixtures::vector_index());
+        model.toggle_screen(Screen::Vectors);
         model
     }
 
@@ -201,55 +238,73 @@ mod tests {
     }
 
     #[test]
-    fn every_kind_row_carries_its_count_and_share() {
+    fn the_index_states_its_share_kinds_home_and_health() {
         let m = model(100);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
+        assert_eq!(rows[0], "this repository davinci-rust holds 6,914 of them");
+        assert!(rows[1].contains("at most 1.5k tokens injected per turn"));
         assert!(rows
             .iter()
-            .any(|row| row.contains("decision") && row.contains("1,482")));
+            .any(|row| row.starts_with("decision") && row.contains("importance 0.9")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("constraint") && row.contains("never evicted")));
-    }
-
-    #[test]
-    fn the_index_names_where_it_lives_and_its_health() {
-        let m = model(100);
-        let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("WHERE IT LIVES")));
+            .any(|row| row.contains("embeddings ollama · 127.0.0.1:11434")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("ollama") && row.contains("127.0.0.1:11434")));
+            .any(|row| row.contains("vectors    qdrant · collection davinci-memoria")));
         assert!(rows.iter().any(|row| row.contains("HEALTH")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("7 records failed to embed")));
+        assert!(rows.iter().any(|row| row.contains("relevance floor 0.70")));
+        assert!(rows.iter().any(|row| row
+            .contains("memory-clear drops this repo's 6,914 records")
+            && row.contains("it asks first, and it cannot be undone")));
+        assert!(!rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
-    fn the_destructive_action_states_what_it_destroys() {
-        let m = model(100);
-        let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("memory-clear drops this repository's 6,914")));
-        assert!(rows.iter().any(|row| row.contains("cannot be undone")));
-    }
-
-    #[test]
-    fn with_no_index_the_screen_says_so() {
+    fn no_index_says_memory_is_off() {
         let mut m = model(100);
         m.vector_index = None;
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].contains("not configured"));
+        assert!(rows.iter().any(|row| row.contains("vector memory is off")));
     }
 
     #[test]
-    fn no_row_overflows_the_window_at_any_width() {
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "5b");
+        let c = chrome(&m);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "18,402 records │ 3 shards │ bge-small 384d");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "retrieval on");
+        let right: String = c
+            .status_right
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(right.starts_with("index "), "{right}");
+        assert!(right.ends_with(" 6.9k/18.4k"), "{right}");
+        assert_eq!(
+            c.composer,
+            Composer::Prompt("/memory-search interrupt handling")
+        );
+        let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
+        assert!(hint.starts_with("enter search │ i reindex"), "{hint}");
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+    }
+
+    #[test]
+    fn nothing_overflows_at_any_width() {
         for width in [72u16, 80, 100, 120, 160] {
-            let m = model(width);
-            for row in lines(&m) {
+            for row in lines(&model(width)) {
                 assert!(
                     run_width(&row.spans) <= width,
                     "at {width}: {:?}",

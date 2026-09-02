@@ -6,19 +6,22 @@
 //! rather than described: nothing is deleted, the tail is on disk, and the
 //! model can ask for any range of it back.
 //!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/governor.ex`.
+//! Mirrors artboard `5c` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::style::Color;
 use ratatui::text::Line;
 
+use super::sheet::{facts, hint, hint_dim, Composer, SheetChrome};
 use crate::davinci::model::{Model, Tone};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, span, span_strong, truncate_run, wrap, Surface, MEASURE,
+    blank, clip_ellipsis, column_header, footnote, indent, run_width, span, span_strong, spread,
+    truncate_run, wrap, Surface,
 };
 
-const ID: usize = 12;
-const TOOL: usize = 12;
+const ID: u16 = 12;
+const TOOL: u16 = 12;
+const SIZE: u16 = 18;
 
 fn tone_color(tone: Tone, theme: &Theme) -> Color {
     match tone {
@@ -31,7 +34,7 @@ fn tone_color(tone: Tone, theme: &Theme) -> Color {
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
     let Some(status) = model.governor.as_ref() else {
         return vec![Line::from(vec![span(
             "the governor has nothing to report — no tool output was compressed",
@@ -39,21 +42,22 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         )])];
     };
 
-    let counters: Vec<Line<'static>> = status
-        .counters
-        .iter()
-        .map(|counter| {
-            Line::from(vec![
-                span(
-                    format!("{:>6}", counter.number),
-                    tone_color(counter.tone, th),
-                ),
-                span(format!(" {:<14}", counter.of), th.muted),
-                span(format!("{:<22}", counter.verb), th.text),
-                span(counter.note.clone(), th.border),
-            ])
-        })
-        .collect();
+    // Each counter is two rows, as the artboard sets them: the figure with
+    // its denominator, then what was done and why.
+    let mut counters: Vec<Line<'static>> = Vec::new();
+    for counter in &status.counters {
+        counters.push(Line::from(vec![
+            span(counter.number.clone(), tone_color(counter.tone, th)),
+            span(format!(" {}", counter.of), th.muted),
+        ]));
+        counters.push(indent(
+            2,
+            vec![
+                span(counter.verb.clone(), th.text),
+                span(format!("  {}", counter.note), th.border),
+            ],
+        ));
+    }
 
     let sample = Surface::new(width, th)
         .title(vec![span(
@@ -65,7 +69,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
                 span(format!("{} ", glyph::BRANCH), th.border),
                 span_strong(format!("{} ", State::Done.glyph()), th.success, th),
                 span("cargo test --workspace", th.muted),
-                span("  41.2s · manus", th.border),
+                span(" · 41.2s · manus", th.border),
             ],
             vec![span("  running 212 tests", th.border)],
             vec![
@@ -83,91 +87,143 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
                 span(". 212 passed; 0 failed", th.border),
             ],
             Vec::new(),
-            vec![span(
-                "  retrieve_output out-9f21c4 --lines 600-640",
-                th.text,
-            )],
             vec![
                 span(format!("{} ", glyph::BRANCH), th.border),
                 span_strong(format!("{} ", State::Attention.glyph()), th.warning, th),
-                span("the model asked for the middle", th.muted),
+                span("the model asked for the middle: ", th.muted),
+                span("retrieve_output out-9f21c4 --lines 600-640", th.text),
             ],
         ])
         .lines();
 
-    let header = Line::from(vec![
-        span(
-            format!("{:<width$}", "HELD ON DISK", width = ID + 1),
-            th.border,
-        ),
-        span(format!("{:<width$}", "TOOL", width = TOOL + 1), th.border),
-        span(format!("{:<30}", "CALL"), th.border),
-        span("SIZE", th.border),
-    ]);
+    let held = footnote(
+        width,
+        vec![span("held on disk, retrievable by id", th.text)],
+        if status.outputs_note.is_empty() {
+            Vec::new()
+        } else {
+            vec![span(status.outputs_note.clone(), th.border)]
+        },
+        th,
+    );
+    let header = column_header(
+        width,
+        &[
+            ("", ID, false),
+            ("TOOL", TOOL, false),
+            ("CALL", 0, false),
+            ("LINES · SIZE", SIZE, true),
+        ],
+        th,
+    );
 
     let stored: Vec<Line<'static>> = status
         .stored
         .iter()
         .map(|entry| {
             let color = if entry.stale { th.border } else { th.muted };
-            Line::from(vec![
+            let left = vec![
                 span(
-                    format!("{:<width$}", entry.id, width = ID + 1),
+                    format!("{:<w$} ", entry.id, w = ID as usize),
                     if entry.stale { th.border } else { th.warning },
                 ),
-                span(format!("{:<width$}", entry.tool, width = TOOL + 1), color),
-                span(format!("{:<31}", clip_ellipsis(&entry.call, 30)), color),
-                span(entry.size.clone(), th.border),
-            ])
+                span(format!("{:<w$} ", entry.tool, w = TOOL as usize), color),
+            ];
+            let right = vec![span(entry.size.clone(), th.border)];
+            let room = width
+                .saturating_sub(run_width(&left))
+                .saturating_sub(run_width(&right))
+                .saturating_sub(1);
+            let mut spans = left;
+            spans.push(span(clip_ellipsis(&entry.call, room), color));
+            spread(width, spans, right)
         })
         .collect();
 
-    let mut footer: Vec<Line<'static>> = wrap(
-        "compresses above 8 KB or 300 lines, keeping 40 head, 40 tail and 20 lines it judges important. Nothing is deleted.",
-        MEASURE,
-    )
-    .into_iter()
-    .map(|row| Line::from(vec![span(row, th.muted)]))
-    .collect();
-    footer.push(Line::from(vec![span(status.store_dir.clone(), th.border)]));
-    footer.push(Line::from(vec![
-        span("enter open an output", th.border),
+    let mut footer: Vec<Line<'static>> = vec![Line::from(vec![
+        span("compresses above 8 KB or 300 lines", th.muted),
         span(" · ", th.border),
-        span("d dedupe on/off", th.border),
-        span(" · ", th.border),
-        span("l anti-loop on/off", th.border),
-    ]));
-    footer.push(Line::from(vec![
-        span("r reset counters", th.border),
-        span(" · ", th.border),
-        span("esc close", th.border),
-    ]));
+        span(
+            "keeps 40 head, 40 tail, 20 lines it judges important",
+            th.border,
+        ),
+    ])];
+    for row in wrap(
+        "nothing is deleted — the full output is on disk and the model can ask \
+         for any range of it",
+        width,
+    ) {
+        footer.push(Line::from(vec![span(row, th.muted)]));
+    }
+    footer.extend(footnote(
+        width,
+        vec![span(status.store_dir.clone(), th.secondary)],
+        vec![span(
+            "governor-reset clears the counters, not the store",
+            th.border,
+        )],
+        th,
+    ));
 
     let mut out = counters;
     out.push(blank());
     out.extend(sample);
     out.push(blank());
-    out.push(header);
+    out.extend(held);
+    out.extend(header);
     out.extend(stored);
     out.push(blank());
     out.extend(footer);
     out.into_iter()
-        .map(|line| Line::from(truncate_run(line.spans, model.width)))
+        .map(|line| Line::from(truncate_run(line.spans, width)))
         .collect()
 }
 
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
+/// The sheet's frame (design.md §11): the governor and its session in the
+/// header, what it compressed in the status bar.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    let status = model.governor.as_ref();
+    let compressed = status
+        .and_then(|s| s.counters.first())
+        .map(|counter| counter.number.clone());
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                status
+                    .map(|_| vec![span("governor ", th.muted), span("on", th.text)])
+                    .unwrap_or_default(),
+                status
+                    .filter(|s| !s.session_id.is_empty())
+                    .map(|s| vec![span(format!("session {}", s.session_id), th.muted)])
+                    .unwrap_or_default(),
+                status
+                    .filter(|s| !s.since.is_empty())
+                    .map(|s| vec![span(format!("since {}", s.since), th.muted)])
+                    .unwrap_or_default(),
+            ],
+        ),
+        status_third: compressed.map(|n| vec![span(format!("{n} compressed"), th.muted)]),
+        status_right: None,
+        hints: vec![
+            hint(th, "enter open an output"),
+            hint_dim(th, "d dedupe on/off"),
+            hint_dim(th, "l anti-loop on/off"),
+            hint_dim(th, "r reset counters"),
+        ],
+        escape: Some("esc close"),
+        composer: Composer::Prompt("/governor-status"),
+        echo: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::model::{GovernorCounter, GovernorSheet, GovernorStored};
-    use crate::davinci::theme::ColorDepth;
-    use crate::davinci::ui::run_width;
+    use crate::davinci::fixtures;
+    use crate::davinci::model::Screen;
+    use crate::davinci::theme::{ColorDepth, Theme};
 
     fn model(width: u16) -> Model {
         let mut model = Model::new(
@@ -176,42 +232,8 @@ mod tests {
             44,
             true,
         );
-        model.governor = Some(GovernorSheet {
-            counters: vec![
-                GovernorCounter {
-                    number: "31".into(),
-                    of: "of 96 results".into(),
-                    verb: "compressed".into(),
-                    note: "head 40 · tail 40 · rest on disk".into(),
-                    tone: Tone::Primary,
-                },
-                GovernorCounter {
-                    number: "96.2k".into(),
-                    of: "of 200k".into(),
-                    verb: "tokens never sent".into(),
-                    note: "about $0.29 at sonnet input".into(),
-                    tone: Tone::Success,
-                },
-            ],
-            stored: vec![
-                GovernorStored {
-                    id: "out-9f21c4".into(),
-                    tool: "bash".into(),
-                    call: "cargo test --workspace".into(),
-                    size: "1,184 ln · 84 KB".into(),
-                    stale: false,
-                },
-                GovernorStored {
-                    id: "out-77b3e5".into(),
-                    tool: "powershell".into(),
-                    call: "git log --stat -n 40".into(),
-                    size: "498 ln · 22 KB".into(),
-                    stale: true,
-                },
-            ],
-            store_dir: "%USERPROFILE%\\.davinci\\outputs\\01JB2K\\ · dropped when the session ends"
-                .into(),
-        });
+        model.governor = Some(fixtures::governor_sheet());
+        model.toggle_screen(Screen::Governor);
         model
     }
 
@@ -223,59 +245,78 @@ mod tests {
     }
 
     #[test]
-    fn every_counter_carries_its_denominator() {
+    fn every_counter_is_two_rows_with_its_denominator_and_its_reason() {
+        let m = model(100);
+        let rows: Vec<String> = lines(&m).iter().map(text).collect();
+        assert_eq!(rows[0], "31 of 96 results");
+        assert!(rows[1].contains("compressed") && rows[1].contains("head 40 · tail 40"));
+        assert!(rows.iter().any(|row| row == "96.2k of 200k"));
+    }
+
+    #[test]
+    fn the_sample_and_the_store_are_visible_not_described() {
         let m = model(100);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
         assert!(rows
             .iter()
-            .any(|row| row.contains("31") && row.contains("of 96 results")));
+            .any(|row| row.contains("WHAT A COMPRESSED RESULT LOOKS LIKE")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("96.2k") && row.contains("of 200k")));
+            .any(|row| row.contains("… 1,184 lines held on disk · out-9f21c4")));
+        let held = rows
+            .iter()
+            .position(|row| row.contains("held on disk, retrievable by id"))
+            .expect("the held row");
+        assert!(rows[held..=held + 1].iter().any(|row| row
+            .contains("31 outputs · 2.8 MB · 4 newest shown · dropped when the session ends")));
+        let stored = rows
+            .iter()
+            .find(|row| row.starts_with("out-9f21c4"))
+            .expect("the stored row");
+        assert!(stored.trim_end().ends_with("1,184 ln · 84 KB"), "{stored}");
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("%USERPROFILE%\\.pi\\outputs\\01JB2K\\")
+                && row.contains("governor-reset clears the counters, not the store")));
+        assert!(!rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
-    fn the_compressed_sample_shows_the_elision_and_the_retrieval_id() {
-        let m = model(100);
-        let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("… 1,184 lines held on disk")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("retrieve_output out-9f21c4")));
-    }
-
-    #[test]
-    fn a_stale_stored_output_dims_while_a_live_one_keeps_its_id_in_warning() {
-        let m = model(100);
-        let rows = lines(&m);
-        let live = rows
-            .iter()
-            .find(|row| text(row).starts_with("out-9f21c4"))
-            .expect("live row");
-        assert_eq!(live.spans[0].style.fg, Some(m.theme.warning));
-        let stale = rows
-            .iter()
-            .find(|row| text(row).starts_with("out-77b3e5"))
-            .expect("stale row");
-        assert_eq!(stale.spans[0].style.fg, Some(m.theme.border));
-    }
-
-    #[test]
-    fn with_nothing_governed_the_screen_says_so() {
+    fn nothing_compressed_says_so() {
         let mut m = model(100);
         m.governor = None;
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].contains("nothing to report"));
+        assert!(rows.iter().any(|row| row.contains("nothing to report")));
     }
 
     #[test]
-    fn no_row_overflows_the_window_at_any_width() {
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "5c");
+        let c = chrome(&m);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "governor on │ session 01JB2K │ since 11:04");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "31 compressed");
+        assert_eq!(c.composer, Composer::Prompt("/governor-status"));
+        let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
+        assert!(
+            hint.starts_with("enter open an output │ d dedupe on/off"),
+            "{hint}"
+        );
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+    }
+
+    #[test]
+    fn nothing_overflows_at_any_width() {
         for width in [72u16, 80, 100, 120, 160] {
-            let m = model(width);
-            for row in lines(&m) {
+            for row in lines(&model(width)) {
                 assert!(
                     run_width(&row.spans) <= width,
                     "at {width}: {:?}",

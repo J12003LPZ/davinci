@@ -4608,6 +4608,7 @@ fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
             .display()
             .to_string(),
         health,
+        ..Default::default()
     }
 }
 
@@ -4673,6 +4674,7 @@ fn governor_sheet(value: &serde_json::Value) -> GovernorSheet {
         ],
         stored,
         store_dir: format!("{store_dir} · dropped when the session ends"),
+        ..Default::default()
     }
 }
 
@@ -4781,6 +4783,7 @@ fn security_sheet(value: &serde_json::Value) -> SecurityScan {
             "scanId",
         ),
         report: "report.md in the scan artifact · /sec-report".into(),
+        ..Default::default()
     }
 }
 

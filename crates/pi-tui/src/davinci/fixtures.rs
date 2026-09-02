@@ -1218,7 +1218,7 @@ pub fn vector_index() -> VectorIndex {
         embeddings: "ollama".into(),
         embed_host: "127.0.0.1:11434 · bge-small 384d".into(),
         store: "qdrant".into(),
-        collection: "collection davinci-memoria · 3 shards".into(),
+        collection: "davinci-memoria".into(),
         extraction: "haiku".into(),
         config: "%USERPROFILE%\\.pi\\vector-memory.json".into(),
         health: vec![
@@ -1230,6 +1230,10 @@ pub fn vector_index() -> VectorIndex {
             ),
             (State::Done, "no duplicate content hashes".into()),
         ],
+        shards: "3".into(),
+        model_dims: "bge-small 384d".into(),
+        retrieval_note: "k=6 from 60 candidates · hybrid dense + lexical".into(),
+        injected: "14 chunks · 8.4k tokens".into(),
     }
 }
 
@@ -1310,7 +1314,10 @@ pub fn governor_sheet() -> GovernorSheet {
                 true,
             ),
         ],
-        store_dir: "%USERPROFILE%\\.pi\\outputs\\01JB2K\\ · dropped when the session ends".into(),
+        store_dir: "%USERPROFILE%\\.pi\\outputs\\01JB2K\\".into(),
+        session_id: "01JB2K".into(),
+        since: "11:04".into(),
+        outputs_note: "31 outputs · 2.8 MB · 4 newest shown · dropped when the session ends".into(),
     }
 }
 
@@ -1395,7 +1402,11 @@ pub fn security_scan() -> SecurityScan {
             ),
         ],
         seal: "4b1f…c9e0".into(),
-        report: ".pi\\security\\s-31c8\\report.json · 214 KB".into(),
+        report: ".pi\\security\\s-31c8\\report.json".into(),
+        report_size: "214 KB".into(),
+        id: "s-31c8".into(),
+        state: "draft".into(),
+        scanned: Some((1842, 2140)),
     }
 }
 

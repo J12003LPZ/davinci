@@ -7,24 +7,27 @@
 //! criticals means nothing without how much of the tree was read and whether
 //! the scan reached the network.
 //!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/securitas.ex`.
+//! Mirrors artboard `5d` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 
+use super::sheet::{facts, hint, hint_dim, status_meter, Composer, SheetChrome};
 use crate::davinci::model::{Finding, Model, Severity};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, indent, meter, pad, run_width, span, span_on, span_strong, truncate_run,
-    MEASURE,
+    blank, clip_ellipsis, footnote, indent, meter, pad, run_width, selection_bar, span, span_on,
+    span_strong, truncate_run,
 };
 
 /// Cells the right-aligned severity word takes.
 const SEVERITY: u16 = 9;
+/// The selection bar and the state glyph.
+const LEAD: u16 = 5;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
     let Some(scan) = model.security.as_ref() else {
         return vec![Line::from(vec![span(
             "no scan has run — /sec-scan starts one",
@@ -47,7 +50,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         ),
         span("  ", th.border),
     ];
-    progress.extend(meter(scan.fraction, 18, th, None));
+    progress.extend(meter(scan.fraction, 24, th, None));
 
     let coverage = Line::from(vec![
         span(format!("{} files", scan.files), th.muted),
@@ -55,28 +58,26 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         span(format!("{} skipped", scan.skipped), th.muted),
         span(" · ", th.border),
         span(format!("{} read", scan.bytes), th.muted),
-        span(" · ", th.border),
-        span(format!("{} network not used", glyph::DONE), th.success),
     ]);
 
-    let mut chips: Vec<Span<'static>> = Vec::new();
-    for (label, count, severity) in &scan.severities {
-        chips.push(span(
-            format!(" {label} {count} "),
-            severity_color(*severity, th),
-        ));
-        chips.push(span(" ", th.border));
+    let mut tally: Vec<Span<'static>> = Vec::new();
+    for (index, (label, count, severity)) in scan.severities.iter().enumerate() {
+        if index > 0 {
+            tally.push(span("   ", th.border));
+        }
+        tally.push(span(format!("{label} "), severity_color(*severity, th)));
+        tally.push(span(count.to_string(), th.text));
     }
 
-    let mut out = vec![Line::from(progress), coverage, blank(), Line::from(chips)];
+    let mut out = vec![Line::from(progress), coverage, blank(), Line::from(tally)];
     out.push(Line::from(vec![span(
         format!("{} candidates dismissed as false positives", scan.dismissed),
         th.border,
     )]));
     out.push(blank());
 
-    // Below 88 the severity word goes, not the location: the chips above
-    // already count the severities, and a finding without its line cannot be
+    // Below 88 the severity word goes, not the location: the tally above
+    // already counts the severities, and a finding without its line cannot be
     // checked.
     let severity_column = model.width >= 88;
     let selected = if scan.findings.is_empty() {
@@ -84,34 +85,12 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     } else {
         Some(model.security_index % scan.findings.len())
     };
-    const WINDOW: usize = 10;
-    let total = scan.findings.len();
-    let around = selected.unwrap_or(0);
-    let start = around
-        .saturating_sub(WINDOW / 2)
-        .min(total.saturating_sub(WINDOW));
-    let end = (start + WINDOW).min(total);
-    if start > 0 {
-        out.push(Line::from(vec![span(
-            format!("… {start} above"),
-            th.border,
-        )]));
-    }
     for (index, finding) in scan.findings.iter().enumerate() {
-        if index < start || index >= end {
-            continue;
-        }
         let current = Some(index) == selected;
         out.push(row(finding, current, severity_column, width, th));
         if current {
-            out.extend(expansion(finding, th));
+            out.extend(expansion(finding, width, th));
         }
-    }
-    if end < total {
-        out.push(Line::from(vec![span(
-            format!("… {} more below", total - end),
-            th.border,
-        )]));
     }
 
     out.push(blank());
@@ -123,26 +102,89 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         span(" · line and evidence attached", th.border),
     ]));
     out.push(Line::from(vec![
+        span("the scan never left this machine", th.muted),
+        span(" · allow_network false", th.border),
+    ]));
+    let mut sealed = vec![
         span("report sealed ", th.muted),
         span_strong(glyph::DONE, th.success, th),
-        span(format!(" sha256 {}", scan.seal), th.border),
-        span(format!("  {}", scan.report), th.border),
-    ]));
-    out.push(Line::from(vec![
-        span("enter open the file at the line", th.border),
-        span(" · ", th.border),
-        span("f mark false positive", th.border),
-    ]));
-    out.push(Line::from(vec![
-        span("a abort scan", th.border),
-        span(" · ", th.border),
-        span("esc close", th.border),
-    ]));
+        span(format!(" sha256 {}", scan.seal), th.text),
+    ];
+    if !scan.report_size.is_empty() {
+        sealed.push(span(format!(" · {}", scan.report_size), th.border));
+    }
+    out.extend(footnote(
+        width,
+        sealed,
+        vec![span(scan.report.clone(), th.secondary)],
+        th,
+    ));
     // A long seal or report path is cut at the window, never wrapped: the
     // sheet reports one height and keeps it.
     out.into_iter()
-        .map(|line| Line::from(truncate_run(line.spans, model.width)))
+        .map(|line| Line::from(truncate_run(line.spans, width)))
         .collect()
+}
+
+/// The sheet's frame (design.md §11): the scan in the header, the critical
+/// count in the status bar with the files scanned as its meter.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    let scan = model.security.as_ref();
+    let critical = scan
+        .and_then(|s| {
+            s.severities
+                .iter()
+                .find(|(_, _, severity)| *severity == Severity::Critical)
+        })
+        .map(|(_, count, _)| *count);
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                scan.filter(|s| !s.id.is_empty())
+                    .map(|s| vec![span("scan ", th.muted), span(s.id.clone(), th.text)])
+                    .unwrap_or_default(),
+                scan.filter(|s| !s.state.is_empty())
+                    .map(|s| vec![span(s.state.clone(), th.muted)])
+                    .unwrap_or_default(),
+                scan.map(|_| {
+                    vec![
+                        span("network ", th.muted),
+                        span(format!("{} not used", glyph::DONE), th.success),
+                    ]
+                })
+                .unwrap_or_default(),
+            ],
+        ),
+        status_third: critical.map(|n| {
+            vec![span(
+                format!("{n} critical"),
+                if n > 0 { th.error } else { th.muted },
+            )]
+        }),
+        status_right: scan
+            .and_then(|s| s.scanned)
+            .filter(|(_, total)| *total > 0)
+            .map(|(done, total)| {
+                status_meter(
+                    th,
+                    "scanned",
+                    done as f64 / total as f64,
+                    &done.to_string(),
+                    &total.to_string(),
+                )
+            }),
+        hints: vec![
+            hint(th, "enter open the file at the line"),
+            hint_dim(th, "f mark false positive"),
+            hint_dim(th, "p show attack path"),
+            hint_dim(th, "a abort scan"),
+        ],
+        escape: Some("esc close"),
+        composer: Composer::Prompt("/sec-report --severity high"),
+        echo: None,
+    }
 }
 
 fn row(
@@ -153,18 +195,27 @@ fn row(
     th: &Theme,
 ) -> Line<'static> {
     let tint = selected.then_some(th.surface);
-    let color = severity_color(finding.severity, th);
+    let dismissed = finding.severity == Severity::Dismissed;
+    let ink = if dismissed { th.dim() } else { *th };
+    let color = severity_color(finding.severity, &ink);
     let state = state_for(finding.severity);
 
     // The message takes what the location and severity leave it, so the row
     // never overflows a narrow window — the line number is never given away.
     let right_width = 35 + if severity_column { SEVERITY } else { 0 };
-    let message_room = width.saturating_sub(2 + right_width + 1).clamp(10, 40);
+    let message_room = width.saturating_sub(LEAD + right_width + 1).clamp(10, 60);
     let left = vec![
+        selection_bar(selected, th),
         strong_on(format!("{} ", state.glyph()), color, tint, th),
         span_on(
             clip_ellipsis(&finding.message, message_room),
-            if selected { th.text } else { th.muted },
+            if selected {
+                th.text
+            } else if dismissed {
+                ink.muted
+            } else {
+                th.muted
+            },
             tint,
         ),
     ];
@@ -172,7 +223,7 @@ fn row(
     // rumour.
     let mut right = vec![span_on(
         format!("{:<35}", clip_ellipsis(&finding.location, 34)),
-        th.border,
+        ink.border,
         tint,
     )];
     if severity_column {
@@ -193,20 +244,32 @@ fn row(
     Line::from(spans)
 }
 
-fn expansion(finding: &Finding, th: &Theme) -> Vec<Line<'static>> {
+fn expansion(finding: &Finding, width: u16, th: &Theme) -> Vec<Line<'static>> {
     vec![
         indent(
-            2,
+            LEAD,
             vec![
                 span("rule ", th.muted),
                 span(finding.rule.clone(), th.text),
                 span(" · validated ", th.muted),
                 span_strong(glyph::DONE, th.success, th),
                 span(" · evidence ", th.muted),
-                span(clip_ellipsis(&finding.evidence, 40), th.border),
+                span(
+                    clip_ellipsis(&finding.evidence, width.saturating_sub(LEAD + 40)),
+                    th.border,
+                ),
             ],
         ),
-        indent(2, vec![span(format!("path {}", finding.path), th.border)]),
+        indent(
+            LEAD,
+            vec![
+                span("path ", th.muted),
+                span(
+                    clip_ellipsis(&finding.path, width.saturating_sub(LEAD + 5)),
+                    th.border,
+                ),
+            ],
+        ),
     ]
 }
 
@@ -253,15 +316,10 @@ fn severity_color(severity: Severity, th: &Theme) -> Color {
     }
 }
 
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::davinci::fixtures;
     use crate::davinci::model::SecurityScan;
     use crate::davinci::theme::ColorDepth;
 
@@ -296,9 +354,21 @@ mod tests {
                     evidence: "format!(\"cd {} && {}\", dir, cmd)".into(),
                     path: "bash tool → cmd.exe → any path with a space".into(),
                 },
+                Finding {
+                    message: "hard-coded test key in a fixture".into(),
+                    location: "tests\\fixtures\\auth.json:3".into(),
+                    severity: Severity::Dismissed,
+                    rule: "secret-literal".into(),
+                    evidence: "\"api_key\": \"sk-test-0000\"".into(),
+                    path: "not a real credential".into(),
+                },
             ],
             seal: "4b1f…c9e0".into(),
-            report: ".davinci\\security\\s-31c8\\report.json · 214 KB".into(),
+            report: ".pi\\security\\s-31c8\\report.json".into(),
+            report_size: "214 KB".into(),
+            id: "s-31c8".into(),
+            state: "draft".into(),
+            scanned: Some((1842, 2140)),
         }
     }
 
@@ -327,48 +397,110 @@ mod tests {
             .iter()
             .any(|row| row.contains("validating candidate 31 of 44")));
         assert!(rows.iter().any(|row| row.contains("1,842 files")));
-        assert!(rows.iter().any(|row| row.contains("network not used")));
-        assert!(rows.iter().any(|row| row.contains("bearer token written")));
-        assert!(rows.iter().any(|row| row.contains("sha256 4b1f…c9e0")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("11 candidates dismissed")));
-    }
-
-    #[test]
-    fn the_selected_finding_expands_to_rule_evidence_and_path() {
-        let mut m = model(100);
-        m.security_index = 1;
-        let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("rule shell-injection")));
+            .any(|row| row.starts_with("critical 1") && row.contains("high 3")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("path bash tool → cmd.exe")));
-        // The unselected finding stays one line.
-        assert!(!rows.iter().any(|row| row.contains("rule secret-in-log")));
+            .any(|row| row.contains("bearer token written to the transcript")
+                && row.contains("auth.rs:214")
+                && row.trim_end().ends_with("critical")));
+        assert!(rows.iter().any(|row| row.contains("rule secret-in-log")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("the scan never left this machine")));
+        assert!(rows.iter().any(
+            |row| row.contains("report sealed ✓ sha256 4b1f…c9e0 · 214 KB")
+                && row.contains(".pi\\security\\s-31c8\\report.json")
+        ));
+        assert!(!rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
-    fn the_severity_word_gives_way_below_eighty_eight_but_the_location_never() {
-        let narrow: Vec<String> = lines(&model(80)).iter().map(text).collect();
-        assert!(!narrow.iter().any(|row| row.ends_with("critical")));
-        assert!(narrow.iter().any(|row| row.contains("auth.rs:214")));
+    fn the_selected_finding_is_marked_and_expanded_and_a_dismissed_one_dims() {
+        let m = model(100);
+        let rows = lines(&m);
+        let selected = rows
+            .iter()
+            .find(|row| text(row).contains("bearer token"))
+            .unwrap();
+        assert!(text(selected).starts_with("▌  ×"), "{}", text(selected));
+        let dismissed = rows
+            .iter()
+            .find(|row| text(row).contains("hard-coded test key"))
+            .unwrap();
+        assert!(text(dismissed).starts_with("   ◌"), "{}", text(dismissed));
+        assert!(dismissed
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(m.theme.dim().muted)));
+        // Only the selected finding carries its rule and path.
+        let drawn: Vec<String> = rows.iter().map(text).collect();
+        assert!(!drawn.iter().any(|row| row.contains("rule shell-injection")));
     }
 
     #[test]
-    fn no_row_overflows_the_window_at_any_breakpoint() {
-        for width in [72u16, 80, 100, 120, 160] {
-            for row in lines(&model(width)) {
-                assert!(run_width(&row.spans) <= width, "overflow at {width}");
-            }
-        }
+    fn below_eighty_eight_columns_the_severity_word_goes_not_the_line() {
+        let rows: Vec<String> = lines(&model(80)).iter().map(text).collect();
+        let row = rows
+            .iter()
+            .find(|row| row.contains("bearer token"))
+            .unwrap();
+        assert!(row.contains("auth.rs:214"), "{row}");
+        assert!(!row.trim_end().ends_with("critical"), "{row}");
     }
 
     #[test]
-    fn a_session_with_no_scan_says_so() {
+    fn no_scan_says_how_to_start_one() {
         let mut m = model(100);
         m.security = None;
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("no scan has run")));
+        assert!(rows.iter().any(|row| row.contains("/sec-scan starts one")));
+    }
+
+    #[test]
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "5d");
+        let c = chrome(&m);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "scan s-31c8 │ draft │ network ✓ not used");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "1 critical");
+        let right: String = c
+            .status_right
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(right.starts_with("scanned "), "{right}");
+        assert!(right.ends_with(" 1842/2140"), "{right}");
+        assert_eq!(c.composer, Composer::Prompt("/sec-report --severity high"));
+        let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
+        assert!(
+            hint.starts_with("enter open the file at the line │ f mark false positive"),
+            "{hint}"
+        );
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+    }
+
+    #[test]
+    fn nothing_overflows_at_any_width() {
+        for width in [72u16, 80, 100, 120, 160] {
+            for row in lines(&model(width)) {
+                assert!(
+                    run_width(&row.spans) <= width,
+                    "at {width}: {:?}",
+                    text(&row)
+                );
+            }
+        }
     }
 }
