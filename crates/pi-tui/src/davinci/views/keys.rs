@@ -1,25 +1,26 @@
 //! `3e` — `/hotkeys`. The whole keymap, grouped by the surface a key belongs
 //! to.
 //!
-//! The mockup sets this in two columns; on a character grid one column per
-//! surface reads better and keeps every row inside the measure (design.md §3),
-//! so the groups stack and the sheet scrolls with ↑↓ instead. The point the
-//! screen has to make survives either way: a key means one thing per surface,
-//! and ctrl+d means three different things depending on what has the keyboard.
+//! The artboard sets this in two columns; on a character grid one column per
+//! surface reads better and keeps every row inside the measure (design.md
+//! §3), so the groups stack and the sheet scrolls with ↑↓ instead. The point
+//! the screen has to make survives either way: a key means one thing per
+//! surface, and ctrl+d means three different things depending on what has the
+//! keyboard.
 //!
-//! Unlike the transcript, this sheet is windowed from the top and says how
-//! much is below it — dropping the first rows of a reference sheet to fit the
-//! window would hide exactly what someone opened it to read.
-//!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/keys.ex`.
+//! Mirrors artboard `3e` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::text::Line;
 
+use super::sheet::{facts, Composer, SheetChrome};
 use crate::davinci::model::Model;
-use crate::davinci::ui::{blank, indent, span, spread, MEASURE};
+use crate::davinci::ui::{blank, footnote, indent, span, truncate_run};
 
 /// The key column, wide enough for `ctrl+d t u l a`.
 const KEY_COLUMN: usize = 18;
+/// The rows sit where a selection bar would, so the groups line up with the
+/// other sheets' tables.
+const LEAD: u16 = 5;
 
 /// The destructive bindings are marked wherever they are listed, so the sheet
 /// never reads as a flat list of equals.
@@ -27,22 +28,19 @@ fn destructive(key: &str) -> bool {
     matches!(key, "ctrl+d" | "ctrl+backspace")
 }
 
-pub fn lines(model: &Model, rows: usize) -> Vec<Line<'static>> {
+pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
 
     let mut body: Vec<Line<'static>> = Vec::new();
     for group in &model.keymap {
-        let right = if group.note.is_empty() {
-            Vec::new()
-        } else {
-            vec![span(group.note.clone(), th.border)]
-        };
-        body.push(spread(
-            width,
-            vec![span(group.title.clone(), th.primary)],
-            right,
-        ));
+        // `INSTRUMENTS · OVER THE TRANSCRIPT`: the surface, then where it is.
+        let mut title = vec![span(group.title.clone(), th.primary)];
+        if !group.note.is_empty() {
+            title.push(span(" · ", th.border));
+            title.push(span(group.note.to_uppercase(), th.border));
+        }
+        body.push(Line::from(title));
         for (key, description) in &group.rows {
             let ink = if destructive(key) {
                 th.warning
@@ -50,7 +48,7 @@ pub fn lines(model: &Model, rows: usize) -> Vec<Line<'static>> {
                 th.muted
             };
             body.push(indent(
-                2,
+                LEAD,
                 vec![
                     span(format!("{key:<KEY_COLUMN$}"), th.text),
                     span(description.clone(), ink),
@@ -67,54 +65,68 @@ pub fn lines(model: &Model, rows: usize) -> Vec<Line<'static>> {
         body.push(blank());
     }
 
-    let footer: Vec<Line<'static>> = vec![
-        Line::from(vec![span("a key means one thing per surface", th.muted)]),
-        Line::from(vec![span(
-            "ctrl+d quits here, deletes in the session list",
+    body.extend(footnote(
+        width,
+        vec![span("a key means one thing per surface", th.muted)],
+        vec![span(
+            "ctrl+d quits the shell, deletes in the session list",
             th.border,
-        )]),
-        Line::from(vec![
-            span("rebind in ", th.muted),
-            span("%USERPROFILE%\\.pi\\agent\\keybindings.json", th.secondary),
-        ]),
-        Line::from(vec![span("esc close", th.border)]),
-    ];
-
-    // Windowed from the top: the sheet keeps its first group on screen and
-    // says how much sits above and below the window.
-    let room = rows.saturating_sub(footer.len() + 1).max(4);
-    if body.len() <= room {
-        let mut out = body;
-        out.extend(footer);
-        return out;
-    }
-    let offset = model.keys_offset.min(body.len() - room);
-    let below = body.len() - offset - room;
-    let mut counts: Vec<String> = Vec::new();
-    if offset > 0 {
-        counts.push(format!("{offset} above"));
-    }
-    if below > 0 {
-        counts.push(format!("{below} below"));
-    }
-    let mut out: Vec<Line<'static>> = body[offset..offset + room].to_vec();
-    out.push(Line::from(vec![
-        span("↑↓ scrolls", th.border),
-        span(format!("  {}", counts.join(" · ")), th.muted),
+        )],
+        th,
+    ));
+    body.push(Line::from(vec![
+        span("rebind in ", th.muted),
+        span("%USERPROFILE%\\.pi\\agent\\keybindings.json", th.secondary),
     ]));
-    out.extend(footer);
-    out
+
+    body.into_iter()
+        .map(|line| Line::from(truncate_run(line.spans, width)))
+        .collect()
 }
 
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
+/// The sheet's frame (design.md §11): how many bindings over how many
+/// surfaces, where they come from, and that `/reload` re-reads them. The
+/// artboard draws no hint row beyond the exit; the sheet scrolls with ↑↓.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    // The keymap file may hold more than the sheet lists; the file's count
+    // wins when the opener read it.
+    let bindings = if model.facts.keys_count > 0 {
+        model.facts.keys_count
+    } else {
+        model.keymap.iter().map(|group| group.rows.len()).sum()
+    };
+    let surfaces = if model.facts.keys_surfaces > 0 {
+        model.facts.keys_surfaces
+    } else {
+        model.keymap.len()
+    };
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                (bindings > 0)
+                    .then(|| vec![span(format!("{bindings} bindings"), th.muted)])
+                    .unwrap_or_default(),
+                (surfaces > 0)
+                    .then(|| vec![span(format!("{surfaces} surfaces"), th.muted)])
+                    .unwrap_or_default(),
+                vec![span("keybindings.json", th.secondary)],
+            ],
+        ),
+        status_third: Some(vec![span("/reload re-reads them", th.muted)]),
+        status_right: None,
+        hints: Vec::new(),
+        escape: Some("esc close"),
+        composer: Composer::Hidden,
+        echo: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::davinci::fixtures;
     use crate::davinci::model::KeymapGroup;
     use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
@@ -164,29 +176,30 @@ mod tests {
     }
 
     #[test]
-    fn every_group_and_binding_is_listed_when_there_is_room() {
+    fn every_group_and_binding_is_listed() {
         let m = model(100);
-        let rows: Vec<String> = lines(&m, 40).iter().map(text).collect();
+        let rows: Vec<String> = lines(&m).iter().map(text).collect();
         for expected in [
-            "INSTRUMENTS",
-            "over the transcript",
+            "INSTRUMENTS · OVER THE TRANSCRIPT",
             "ctrl+p",
-            "RUN",
+            "RUN · WHILE THE AGENT WORKS",
             "COMPOSER",
             "shift+enter",
-            "esc close",
+            "a key means one thing per surface",
+            "keybindings.json",
         ] {
             assert!(
                 rows.iter().any(|row| row.contains(expected)),
                 "{expected} is missing"
             );
         }
+        assert!(!rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
     fn destructive_keys_are_marked_in_warning_ink() {
         let m = model(100);
-        let rows = lines(&m, 40);
+        let rows = lines(&m);
         let quit = rows
             .iter()
             .find(|row| text(row).contains("ctrl+d") && text(row).contains("quit"))
@@ -196,74 +209,46 @@ mod tests {
     }
 
     #[test]
-    fn the_sheet_scrolls_from_the_top_and_counts_what_is_hidden() {
-        let mut m = model(100);
-        let rows: Vec<String> = lines(&m, 10).iter().map(text).collect();
-        assert!(rows.len() <= 10, "windowed to the room it was given");
-        assert!(
-            rows.iter().any(|row| row.contains("INSTRUMENTS")),
-            "the first group stays on screen at offset 0"
-        );
-        assert!(rows.iter().any(|row| row.contains("below")), "{rows:?}");
-
-        m.keys_offset = 6;
-        let scrolled: Vec<String> = lines(&m, 10).iter().map(text).collect();
-        assert!(
-            !scrolled.iter().any(|row| row.contains("INSTRUMENTS")),
-            "the first group scrolled away"
-        );
-        assert!(
-            scrolled.iter().any(|row| row.contains("above")),
-            "{scrolled:?}"
-        );
-    }
-
-    #[test]
-    fn the_output_never_exceeds_the_rows_it_was_given() {
-        let m = model(100);
-        for rows in [8usize, 10, 12, 20] {
-            let drawn = lines(&m, rows);
-            assert!(
-                drawn.len() <= rows.max(4 + 5),
-                "{} lines for {rows} rows",
-                drawn.len()
-            );
-        }
-    }
-
-    #[test]
     fn an_empty_keymap_still_says_something() {
         let mut m = model(100);
         m.keymap.clear();
-        let rows: Vec<String> = lines(&m, 40).iter().map(text).collect();
+        let rows: Vec<String> = lines(&m).iter().map(text).collect();
         assert!(rows.iter().any(|row| row.contains("no bindings loaded")));
     }
 
     #[test]
-    fn no_row_overflows_the_window() {
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "3e");
+        let c = chrome(&m);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "39 bindings │ 4 surfaces │ keybindings.json");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "/reload re-reads them");
+        assert!(c.hints.is_empty());
+        assert_eq!(c.escape, Some("esc close"));
+        assert_eq!(c.composer, Composer::Hidden);
+        let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+        assert_eq!(hint.trim_start(), "esc close");
+    }
+
+    #[test]
+    fn nothing_overflows_at_any_width() {
         for width in [72u16, 80, 100, 120, 160] {
-            let m = model(width);
-            for row in lines(&m, 40) {
+            for row in lines(&model(width)) {
                 assert!(
                     run_width(&row.spans) <= width,
                     "at {width}: {:?}",
                     text(&row)
                 );
             }
-        }
-    }
-
-    #[test]
-    fn section_headers_are_row_exact_at_the_sheet_width() {
-        for width in [72u16, 80, 100, 120, 160] {
-            let m = model(width);
-            let sheet = width.min(MEASURE + 14);
-            let rows = lines(&m, 40);
-            let header = rows
-                .iter()
-                .find(|row| text(row).contains("INSTRUMENTS"))
-                .expect("the first group header");
-            assert_eq!(run_width(&header.spans), sheet, "at {width}");
         }
     }
 }

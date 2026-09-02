@@ -164,12 +164,6 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
     if let Some(overlay) = model.overlay {
         return overlay_body(model, overlay, height);
     }
-    // The reference sheet is the one surface that needs the height: `tail`
-    // keeps the *last* rows, right for a transcript and wrong for a sheet,
-    // where it would silently eat the first group.
-    if model.screen == Screen::Keys {
-        return panel(model, keys::lines(model, height), height);
-    }
     let screen_rows = match model.screen {
         Screen::Plan => Some(disegno::lines(model)),
         Screen::Grafo => Some(grafo::lines(model)),
@@ -193,7 +187,8 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
         Screen::Diff => Some(diff::lines(model)),
         Screen::Mcp => Some(mcp::lines(model)),
         Screen::Permissions => Some(permissions::lines(model)),
-        Screen::Agent | Screen::Keys => None,
+        Screen::Keys => Some(keys::lines(model)),
+        Screen::Agent => None,
     };
     if let Some(rows) = screen_rows {
         return panel(model, rows, height);

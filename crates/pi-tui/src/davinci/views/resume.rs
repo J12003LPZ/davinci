@@ -5,36 +5,37 @@
 //! (design.md §1), and a session whose branch no longer exists says so on the
 //! row — the thing you want to know before you resume it, not after.
 //!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/resume.ex`.
+//! Mirrors artboard `4a` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use super::sheet::{facts, hint, hint_dim, status_meter, Composer, SheetChrome};
 use crate::davinci::model::{Model, ResumeRow};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, indent, span, span_on, truncate_run, wrap, Surface, MEASURE,
+    blank, clip_ellipsis, column_header, footnote, pad, run_width, selection_bar, span, span_on,
+    spread, truncate_run, Surface,
 };
 
-const NAME: usize = 24;
-const BRANCH: usize = 9;
-const TURNS: usize = 5;
-const TOKENS: usize = 7;
-const MODEL: usize = 7;
+const BRANCH: u16 = 9;
+const TURNS: u16 = 5;
+const TOKENS: u16 = 7;
+const MODEL: u16 = 7;
+const TOUCHED: u16 = 7;
+/// The selection bar and the state glyph.
+const LEAD: u16 = 5;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
     let list = &model.resume_sessions;
 
     if list.is_empty() {
-        return vec![
-            Line::from(vec![span(
-                "no sessions on disk yet — the first turn creates one",
-                th.muted,
-            )]),
-            Line::from(vec![span("esc close", th.border)]),
-        ];
+        return vec![Line::from(vec![span(
+            "no sessions on disk yet — the first turn creates one",
+            th.muted,
+        )])];
     }
     let selected = model.resume_index % list.len();
     let current = &list[selected];
@@ -47,64 +48,67 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     };
     let mut out = Surface::new(width, th)
         .border(th.secondary)
-        .right(vec![
-            span(
-                format!("{} of {}", list.len(), model.session_count.max(list.len())),
-                th.border,
-            ),
-            span(" · ", th.border),
-            span("sort recent", th.muted),
-        ])
         .row(vec![
             span(format!("{} ", glyph::SEARCH), th.secondary),
             span("filter sessions…", th.muted),
             Span::styled(" ", caret_style),
         ])
         .lines();
+    out.push(Line::from(vec![
+        span(
+            format!(
+                "{} of {} shown",
+                list.len(),
+                model.session_count.max(list.len())
+            ),
+            th.border,
+        ),
+        span(" · ", th.border),
+        span("sort recent", th.border),
+        span(" · ", th.border),
+        span("named only off", th.border),
+    ]));
     out.push(blank());
 
-    out.push(indent(
-        2,
-        vec![
-            span(format!("{:<NAME$}", "SESSION"), th.border),
-            span(format!("{:<w$}", "BRANCH", w = BRANCH + 1), th.border),
-            span(format!("{:>TURNS$} ", "TURNS"), th.border),
-            span(format!("{:>TOKENS$} ", "TOKENS"), th.border),
-            span(format!("{:<w$}", "MODEL", w = MODEL + 1), th.border),
-            span("TOUCHED", th.border),
+    out.extend(column_header(
+        width,
+        &[
+            ("", LEAD - 1, false),
+            ("SESSION", 0, false),
+            ("BRANCH", BRANCH, false),
+            ("TURNS", TURNS, true),
+            ("TOKENS", TOKENS, true),
+            ("MODEL", MODEL, false),
+            ("TOUCHED", TOUCHED, false),
         ],
+        th,
     ));
 
-    // The sheet is tail-anchored; a long store would push its head off
-    // screen, so a window follows the selection and the rest is counted.
-    const WINDOW: usize = 12;
-    let total = list.len();
-    let start = selected
-        .saturating_sub(WINDOW / 2)
-        .min(total.saturating_sub(WINDOW));
-    let end = (start + WINDOW).min(total);
-    if start > 0 {
-        out.push(Line::from(vec![span(
-            format!("… {start} above"),
-            th.border,
-        )]));
-    }
     for (index, session) in list.iter().enumerate() {
-        if index < start || index >= end {
-            continue;
-        }
-        out.push(row(session, index == selected, th));
+        out.push(row(session, index == selected, width, th));
         if index == selected {
-            out.push(note(&session.note, th.border, th));
+            // What resuming it carries, on the tint under the row.
+            let mut note = session.note.clone();
+            if !session.commit.is_empty() {
+                note.push_str(" · ");
+                note.push_str(&session.commit);
+            }
+            let mut spans = vec![pad(LEAD, Some(th.surface))];
+            spans.push(span_on(
+                clip_ellipsis(&note, width.saturating_sub(LEAD)),
+                th.border,
+                Some(th.surface),
+            ));
+            out.push(spread(width, spans, Vec::new()));
         } else if let Some(warning) = &session.warning {
-            out.push(note(warning, th.warning, th));
+            out.push(Line::from(vec![
+                pad(LEAD, None),
+                span(
+                    clip_ellipsis(warning, width.saturating_sub(LEAD)),
+                    th.warning,
+                ),
+            ]));
         }
-    }
-    if end < total {
-        out.push(Line::from(vec![span(
-            format!("… {} more below", total - end),
-            th.border,
-        )]));
     }
 
     out.push(blank());
@@ -114,33 +118,86 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         span(" · last message ", th.muted),
         span(format!("“{}”", clip_ellipsis(&current.last, 38)), th.border),
     ]));
-    out.push(Line::from(vec![span(current.path.clone(), th.border)]));
-    for row in wrap(
-        "resuming replays the transcript, not the tools — nothing runs until \
-         you send the next turn",
-        MEASURE,
-    ) {
-        out.push(Line::from(vec![span(row, th.muted)]));
+    let mut path = vec![span(current.path.clone(), th.border)];
+    if !current.size.is_empty() {
+        path.push(span(" · ", th.border));
+        path.push(span(current.size.clone(), th.muted));
     }
-    out.push(Line::from(vec![
-        span("enter resume", th.border),
-        span(" · ", th.border),
-        span("f fork", th.border),
-        span(" · ", th.border),
-        span("ctrl+r rename", th.border),
-        span(" · ", th.border),
-        span("ctrl+s sort", th.border),
-        span(" · ", th.border),
-        span("esc close", th.border),
-    ]));
+    out.push(Line::from(path));
+    out.extend(footnote(
+        width,
+        vec![span(
+            "resuming replays the transcript, not the tools",
+            th.muted,
+        )],
+        vec![span("f forks instead of continuing", th.border)],
+        th,
+    ));
     // The loose rows outside the filter box are cut to the window, never
     // wrapped: the sheet reports one height per row and keeps it.
     out.into_iter()
-        .map(|line| Line::from(truncate_run(line.spans, model.width)))
+        .map(|line| Line::from(truncate_run(line.spans, width)))
         .collect()
 }
 
-fn row(session: &ResumeRow, selected: bool, th: &Theme) -> Line<'static> {
+/// `1288490188` → `1.2G`, `8589934592` → `8G`.
+pub fn gigabytes(bytes: u64) -> String {
+    let gb = bytes as f64 / 1_073_741_824.0;
+    if gb >= 10.0 || (gb - gb.round()).abs() < 0.05 {
+        format!("{}G", gb.round() as u64)
+    } else {
+        format!("{gb:.1}G")
+    }
+}
+
+/// The sheet's frame (design.md §11): the store in the header, its size as
+/// a meter in the status bar, no composer — the filter box is the input.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    let count = model.session_count.max(model.resume_sessions.len());
+    let disk = model.facts.sessions_disk.filter(|(_, cap)| *cap > 0);
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                vec![span("this project", th.muted)],
+                (count > 0)
+                    .then(|| vec![span(format!("{count} sessions"), th.muted)])
+                    .unwrap_or_default(),
+                disk.map(|(used, _)| {
+                    vec![span(
+                        format!("{} on disk", gigabytes(used).replace('G', " GB")),
+                        th.muted,
+                    )]
+                })
+                .unwrap_or_default(),
+            ],
+        ),
+        status_third: (count > 0).then(|| vec![span(format!("{count} sessions"), th.muted)]),
+        status_right: disk.map(|(used, cap)| {
+            status_meter(
+                th,
+                "disk",
+                used as f64 / cap as f64,
+                &gigabytes(used),
+                &gigabytes(cap),
+            )
+        }),
+        hints: vec![
+            hint(th, "enter resume"),
+            hint(th, "f fork"),
+            hint(th, "ctrl+r rename"),
+            hint(th, "ctrl+s sort"),
+            hint_dim(th, "ctrl+p paths"),
+            hint_dim(th, "ctrl+d delete"),
+        ],
+        escape: Some("esc close"),
+        composer: Composer::Hidden,
+        echo: None,
+    }
+}
+
+fn row(session: &ResumeRow, selected: bool, width: u16, th: &Theme) -> Line<'static> {
     let band = selected.then_some(th.surface);
     let state = if selected {
         State::Active
@@ -149,16 +206,17 @@ fn row(session: &ResumeRow, selected: bool, th: &Theme) -> Line<'static> {
     } else {
         State::Queued
     };
-    let name_color = if selected {
+    let name_color = if selected || session.named {
         th.text
-    } else if session.named {
-        th.muted
     } else {
-        th.border
+        th.muted
     };
     let detail = if session.named { th.muted } else { th.border };
 
-    Line::from(vec![
+    let fixed = LEAD + BRANCH + 1 + TURNS + 1 + TOKENS + 1 + MODEL + 1 + TOUCHED;
+    let name_column = width.saturating_sub(fixed).saturating_sub(1);
+    let mut spans = vec![
+        selection_bar(selected, th),
         Span::styled(
             format!("{} ", state.glyph()),
             Style::default()
@@ -168,42 +226,50 @@ fn row(session: &ResumeRow, selected: bool, th: &Theme) -> Line<'static> {
         ),
         span_on(
             format!(
-                "{:<w$}",
-                clip_ellipsis(&session.name, (NAME - 2) as u16),
-                w = NAME - 2
+                "{:<w$} ",
+                clip_ellipsis(&session.name, name_column),
+                w = name_column as usize
             ),
             name_color,
             band,
         ),
         span_on(
-            format!("{:<w$}", session.branch, w = BRANCH + 1),
+            format!("{:<w$} ", session.branch, w = BRANCH as usize),
             th.secondary,
             band,
         ),
-        span_on(format!("{:>TURNS$} ", session.turns), detail, band),
-        span_on(format!("{:>TOKENS$} ", session.tokens), detail, band),
         span_on(
-            format!("{:<w$}", session.model, w = MODEL + 1),
+            format!("{:>w$} ", session.turns, w = TURNS as usize),
             detail,
             band,
         ),
-        span_on(session.touched.clone(), detail, band),
-    ])
-}
-
-fn note(text: &str, color: ratatui::style::Color, _th: &Theme) -> Line<'static> {
-    indent(2, vec![span(clip_ellipsis(text, MEASURE), color)])
-}
-
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
+        span_on(
+            format!("{:>w$} ", session.tokens, w = TOKENS as usize),
+            detail,
+            band,
+        ),
+        span_on(
+            format!("{:<w$} ", session.model, w = MODEL as usize),
+            detail,
+            band,
+        ),
+        span_on(
+            format!("{:<w$}", session.touched, w = TOUCHED as usize),
+            detail,
+            band,
+        ),
+    ];
+    let gap = width.saturating_sub(run_width(&spans));
+    if gap > 0 {
+        spans.push(pad(gap, band));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::davinci::fixtures;
     use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
 
@@ -220,6 +286,8 @@ mod tests {
             note: "forked from provider-parity at turn 12".into(),
             last: "now fix the store.rs type error".into(),
             path: "~\\.pi\\agent\\sessions\\--dev--x\\01JB2K….jsonl".into(),
+            size: "1.8 MB".into(),
+            commit: "a3a6f31".into(),
         }
     }
 
@@ -261,15 +329,16 @@ mod tests {
             "TOKENS",
             "MODEL",
             "TOUCHED",
-            "3 of 34",
+            "3 of 34 shown · sort recent · named only off",
             "review-agent-runtime",
-            "enter resume",
+            "f forks instead of continuing",
         ] {
             assert!(
                 rows.iter().any(|row| row.contains(expected)),
                 "{expected} is missing"
             );
         }
+        assert!(!rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
@@ -280,10 +349,17 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.contains("selected") && row.contains("implement-rpc-mode")));
-        assert!(rows.iter().any(|row| row.contains("01JB2K")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("forked from provider-parity")));
+            .any(|row| row.contains("01JB2K") && row.contains("1.8 MB")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("forked from provider-parity at turn 12 · a3a6f31")));
+        let marked = rows
+            .iter()
+            .find(|row| row.contains("implement-rpc-mode"))
+            .unwrap();
+        assert!(marked.starts_with("▌  ◉"), "{marked}");
     }
 
     #[test]
@@ -311,12 +387,64 @@ mod tests {
     }
 
     #[test]
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "4a");
+        let c = chrome(&m);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "this project │ 34 sessions │ 1.2 GB on disk");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "34 sessions");
+        let right: String = c
+            .status_right
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(right.starts_with("disk "), "{right}");
+        assert!(right.ends_with(" 1.2G/8G"), "{right}");
+        assert_eq!(c.escape, Some("esc close"));
+        assert_eq!(c.composer, Composer::Hidden);
+        let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
+        assert!(
+            hint.starts_with("enter resume │ f fork │ ctrl+r rename"),
+            "{hint}"
+        );
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+    }
+
+    #[test]
+    fn without_a_disk_cap_the_meter_is_omitted_not_invented() {
+        let mut m = model(100);
+        m.facts.sessions_disk = Some((1_000, 0));
+        assert!(chrome(&m).status_right.is_none());
+        let header: String = chrome(&m)
+            .header_right
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(header, "this project │ 34 sessions");
+    }
+
+    #[test]
+    fn gigabytes_read_short() {
+        assert_eq!(gigabytes(1_288_490_188), "1.2G");
+        assert_eq!(gigabytes(8_589_934_592), "8G");
+    }
+
+    #[test]
     fn no_row_overflows_the_window_and_the_filter_box_is_row_exact() {
         for width in [72u16, 80, 100, 120, 160] {
             let m = model(width);
-            let sheet = width.min(MEASURE + 14);
             let rows = lines(&m);
-            assert_eq!(run_width(&rows[0].spans), sheet, "at {width}");
+            assert_eq!(run_width(&rows[0].spans), width, "at {width}");
             for row in &rows {
                 assert!(
                     run_width(&row.spans) <= width,

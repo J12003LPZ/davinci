@@ -831,6 +831,16 @@ pub fn resume_rows() -> Vec<ResumeRow> {
         note: note.into(),
         last: last.into(),
         path: path.into(),
+        size: if name == "review-agent-runtime" {
+            "1.8 MB".into()
+        } else {
+            String::new()
+        },
+        commit: if name == "review-agent-runtime" {
+            "a3a6f31".into()
+        } else {
+            String::new()
+        },
     };
     vec![
         row(
@@ -927,6 +937,12 @@ pub fn session_tree() -> Vec<TreeNode> {
         label: label.map(str::to_string),
         meta: meta.map(str::to_string),
         entry_id: id.unwrap_or_default().into(),
+        detail: match id {
+            Some("03") => Some("abandoned · 2 files reverted".into()),
+            Some("05") => Some("Δ 3 +42 -11 label: store-fix".into()),
+            Some("06") => Some("branched from 04 · own transcript from here".into()),
+            _ => None,
+        },
     };
     vec![
         node(
@@ -949,7 +965,7 @@ pub fn session_tree() -> Vec<TreeNode> {
             "│   └── ",
             Some(State::Failed),
             Some("03"),
-            Some("store as a trait · abandoned"),
+            Some("store as a trait"),
             Some("12:09"),
         ),
         node("│", None, None, None, None),
@@ -1838,9 +1854,25 @@ pub fn dress_screen(model: &mut Model, id: &str) {
             model.facts.auth_path = "%USERPROFILE%\\.pi\\agent\\auth.json".into();
             model.facts.auth_mode = "0600".into();
         }
-        "3e" => sheet(model, Screen::Keys),
-        "4a" => sheet(model, Screen::Resume),
-        "4b" => sheet(model, Screen::Tree),
+        "3e" => {
+            sheet(model, Screen::Keys);
+            model.facts.keys_count = 39;
+            model.facts.keys_surfaces = 4;
+        }
+        "4a" => {
+            sheet(model, Screen::Resume);
+            model.facts.sessions_disk = Some((1_288_490_188, 8_589_934_592));
+        }
+        "4b" => {
+            sheet(model, Screen::Tree);
+            model.facts.session_name = "review-agent-runtime".into();
+            model.facts.session_cost = "$0.84".into();
+            model.facts.tree_summary =
+                "4 user turns, 4 agent turns, 11 tool results · nothing compacted yet".into();
+            model.facts.tree_branch_note =
+                "branch 06 has its own 9 turns and will not merge back".into();
+            model.changes = (2, 0, 0);
+        }
         "4c" => {
             sheet(model, Screen::Compact);
             model.context = (184_200, 200_000);

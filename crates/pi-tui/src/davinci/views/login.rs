@@ -15,8 +15,8 @@ use super::sheet::{facts, hint, hint_dim, Composer, SheetChrome};
 use crate::davinci::model::{Credential, Model, ProviderRow};
 use crate::davinci::theme::{State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, column_header, footnote, pad, run_width, selection_bar, span, span_on,
-    spread, truncate_run, wrap, Surface,
+    blank, clip_ellipsis, column_header, footnote, pad, run_width, selection_bar, span, spread,
+    truncate_run, wrap, Surface,
 };
 
 /// Column widths of the provider ledger, as the artboard sets them.

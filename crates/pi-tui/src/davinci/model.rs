@@ -906,6 +906,12 @@ pub struct Facts {
     pub session_name: String,
     pub session_turns: usize,
     pub session_branches: usize,
+    /// `4b` — `cost so far $0.84`.
+    pub session_cost: String,
+    /// `4b` — `4 user turns, 4 agent turns, 11 tool results · nothing compacted yet`.
+    pub tree_summary: String,
+    /// `4b` — `branch 06 has its own 9 turns and will not merge back`.
+    pub tree_branch_note: String,
     /// `6d` — commits the branch is behind its upstream.
     pub commits_behind: Option<u32>,
     /// `6b` — `24 tools │ 37 commands │ 21.4k of schema`.
@@ -999,6 +1005,10 @@ pub struct ResumeRow {
     pub note: String,
     pub last: String,
     pub path: String,
+    /// `1.8 MB` — the jsonl on disk.
+    pub size: String,
+    /// The commit the session was last at, if known.
+    pub commit: String,
 }
 
 /// One row of the session tree (`4b`). Rows with no `id` are spacers that
@@ -1012,6 +1022,8 @@ pub struct TreeNode {
     pub meta: Option<String>,
     /// The session entry behind the row, so choosing it can navigate.
     pub entry_id: String,
+    /// A second row under the label: `abandoned · 2 files reverted`.
+    pub detail: Option<String>,
 }
 
 /// What a compaction would do, before it does it (`4c`).

@@ -3916,6 +3916,7 @@ fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
             };
             CatalogRow {
                 name: key.clone(),
+                detail: String::new(),
                 window: pi_tui::davinci::views::chrome::thousands(entry.context_window),
                 thinking: if entry.reasoning {
                     "budget".into()
@@ -4217,6 +4218,8 @@ fn open_resume_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
                     .unwrap_or_default(),
                 last,
                 path: summary.path.display().to_string(),
+                size: String::new(),
+                commit: String::new(),
             }
         })
         .collect();
@@ -4298,6 +4301,7 @@ fn open_tree_sheet(agent: &Agent, model: &mut Model) -> bool {
             label: Some(text.clone()),
             meta: Some(stamp(entry.timestamp)),
             entry_id: entry.id.clone(),
+            detail: None,
         });
     }
     model.tree_index = rows
@@ -6152,6 +6156,7 @@ mod tests {
     fn the_catalogue_opens_on_the_model_in_hand_with_usable_rows_first() {
         let row = |provider: &str, id: &str, ready: bool| CatalogRow {
             name: format!("{provider}/{id}"),
+            detail: String::new(),
             window: "200k".into(),
             thinking: "none".into(),
             price: "1.00 · 2.00".into(),
