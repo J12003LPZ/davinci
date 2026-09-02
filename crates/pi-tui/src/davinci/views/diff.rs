@@ -8,21 +8,26 @@
 //! at full size. A review screen that showed one file's diff under another
 //! file's name would be worse than showing none.
 //!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/diff.ex`.
+//! Mirrors artboard `6d` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::style::Color;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
+use super::sheet::{facts, hint, hint_dim, Composer, SheetChrome};
 use crate::davinci::model::{HunkKind, Model, ReviewFile};
 use crate::davinci::theme::{glyph, State, Theme};
-use crate::davinci::ui::{blank, clip_ellipsis, indent, span, span_on, span_strong};
+use crate::davinci::ui::{
+    blank, clip_ellipsis, footnote, indent, run_width, selection_bar, span, span_on, span_strong,
+    spread, spread_on, truncate_run, SELECTION_BAR,
+};
 
-/// Cells the path column takes, and the right-aligned tests column.
-const PATH: usize = 44;
-const TESTS: usize = 19;
+/// The right-aligned count columns and the note column.
+const COUNT: usize = 5;
+const NOTE: usize = 19;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
+    let width = model.width;
     let Some(review) = model
         .review
         .as_ref()
@@ -36,22 +41,10 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let selected = model.diff_index % review.files.len();
     let current = &review.files[selected];
 
-    let mut out = vec![
-        Line::from(vec![
-            span(format!("{} files", review.files.len()), th.muted),
-            span("   ", th.border),
-            span(format!("+{}", review.adds), th.success),
-            span(" ", th.border),
-            span(format!("-{}", review.dels), th.error),
-            span("   ", th.border),
-            span(review.branch.clone(), th.secondary),
-            span(format!(" · {}", review.behind), th.border),
-        ]),
-        blank(),
-    ];
+    let mut out: Vec<Line<'static>> = Vec::new();
 
-    // A wide working tree runs long and the sheet is tail-anchored: show a
-    // window around the selection and count the rest.
+    // A wide working tree runs long: show a window around the selection and
+    // count the rest.
     const WINDOW: usize = 10;
     let total = review.files.len();
     let start = selected
@@ -68,7 +61,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         if index < start || index >= end {
             continue;
         }
-        out.push(row(file, index == selected, model.width, th));
+        out.push(row(file, index == selected, width, th));
     }
     if end < total {
         out.push(Line::from(vec![span(
@@ -78,13 +71,31 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     }
     out.push(blank());
 
-    out.push(Line::from(vec![
+    let mut rule_left = vec![
         span_strong(format!("{} ", glyph::DELTA), th.primary, th),
         span(current.path.clone(), th.text),
-        span(format!("  {} ", plus(current.adds)), th.success),
-        span(minus(current.dels), th.error),
-        span(format!("   {} · j k to move", current.hunk_note), th.border),
-    ]));
+        span(format!(" {}", plus(current.adds)), th.success),
+        span(format!(" {}", minus(current.dels)), th.error),
+    ];
+    let mut rule_right = Vec::new();
+    if !current.hunk_note.is_empty() {
+        rule_right.push(span(current.hunk_note.clone(), th.border));
+        rule_right.push(span(" · ", th.border));
+    }
+    rule_right.push(span("j k to move", th.border));
+    if run_width(&rule_left) + run_width(&rule_right) + 1 > width {
+        rule_left.truncate(2);
+    }
+    out.push(spread(width, rule_left, rule_right));
+    if !current.hunk_header.is_empty() {
+        out.push(indent(
+            2,
+            vec![
+                span("│ ", th.border),
+                span(current.hunk_header.clone(), th.border),
+            ],
+        ));
+    }
     // Keywords, strings and numbers take their own ink on changed rows;
     // context rows stay quiet, the way the Δ block does (design.md §6).
     let language = super::highlight::language_of(&current.path);
@@ -103,41 +114,73 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     }
     out.push(blank());
 
-    out.push(Line::from(vec![
-        span_strong(format!("{} ", glyph::ATTENTION), th.warning, th),
-        span(review.warning.clone(), th.muted),
-    ]));
-    out.push(Line::from(vec![
-        span_strong(format!("{} ", glyph::DONE), th.success, th),
-        span(review.tests.clone(), th.muted),
-    ]));
-    out.push(Line::from(vec![
-        span("↑↓ file", th.border),
-        span(" · ", th.border),
-        span("j k hunk", th.border),
-        span(" · ", th.border),
-        span("enter open in codex", th.border),
-        span(" · ", th.border),
-        span("u revert hunk", th.border),
-        span(" · ", th.border),
-        span("c commit", th.border),
-    ]));
-    out.push(Line::from(vec![span(
-        "nothing here is committed until you say so",
-        th.border,
-    )]));
+    if !review.warning.is_empty() {
+        let (warning, aside) = review
+            .warning
+            .split_once(" · ")
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .unwrap_or_else(|| (review.warning.clone(), String::new()));
+        let mut left = vec![
+            span_strong(format!("{} ", glyph::ATTENTION), th.warning, th),
+            span(warning, th.text),
+        ];
+        if !aside.is_empty() {
+            left.push(span(" · ", th.border));
+            left.push(span(aside, th.border));
+        }
+        out.extend(footnote(
+            width,
+            left,
+            vec![span("revert is per file and per hunk", th.border)],
+            th,
+        ));
+    }
+    if !review.tests.is_empty() {
+        let (tests, elapsed) = review
+            .tests
+            .split_once(" · ")
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .unwrap_or_else(|| (review.tests.clone(), String::new()));
+        let mut left = vec![
+            span_strong(format!("{} ", glyph::DONE), th.success, th),
+            span(tests, th.muted),
+        ];
+        if !elapsed.is_empty() {
+            left.push(span(" · ", th.border));
+            left.push(span(elapsed, th.border));
+        }
+        out.extend(footnote(
+            width,
+            left,
+            vec![span(
+                "nothing here is committed until you say so",
+                th.border,
+            )],
+            th,
+        ));
+    }
     // Loose rows — hunk lines included — are cut at the window, never past it.
     out.into_iter()
-        .map(|line| Line::from(crate::davinci::ui::truncate_run(line.spans, model.width)))
+        .map(|line| Line::from(truncate_run(line.spans, width)))
         .collect()
 }
 
 fn row(file: &ReviewFile, selected: bool, width: u16, th: &Theme) -> Line<'static> {
     let tint = selected.then_some(th.surface);
-    // Below 100 the tests column follows the counts immediately rather than
-    // being padded to a fixed grid, so the row never overflows the window.
-    let path_column = if width >= 100 { PATH } else { PATH.min(30) };
-    let mut spans = vec![
+    let deleted = file.state == State::Failed;
+    let (base, suffix) = file.path.split_once(" · ").unwrap_or((&file.path, ""));
+    let wide = width >= 100;
+    let fixed =
+        SELECTION_BAR.chars().count() + 2 + COUNT + 1 + COUNT + if wide { 2 + NOTE } else { 0 };
+    let path_column = (width as usize).saturating_sub(fixed).saturating_sub(1);
+    let suffix_width = if suffix.is_empty() {
+        0
+    } else {
+        suffix.chars().count() + 3
+    };
+    let base_room = path_column.saturating_sub(suffix_width).max(4);
+    let mut left = vec![
+        selection_bar(selected, th),
         strong_on(
             format!("{} ", file.state.glyph()),
             th.state_color(file.state),
@@ -145,25 +188,26 @@ fn row(file: &ReviewFile, selected: bool, width: u16, th: &Theme) -> Line<'stati
             th,
         ),
         span_on(
-            format!(
-                "{:<w$}",
-                clip_ellipsis(&file.path, (path_column - 2) as u16),
-                w = path_column - 1
-            ),
-            if selected { th.text } else { th.muted },
+            clip_ellipsis(base, base_room as u16),
+            if deleted { th.muted } else { th.text },
             tint,
         ),
-        span_on(format!("{:>5} ", plus(file.adds)), th.success, tint),
-        span_on(format!("{:>5}  ", minus(file.dels)), th.error, tint),
     ];
-    if width >= 100 {
-        spans.push(span_on(
-            format!("{:>TESTS$}", clip_ellipsis(&file.tests, TESTS as u16)),
+    if !suffix.is_empty() {
+        left.push(span_on(format!(" · {suffix}"), th.border, tint));
+    }
+    let mut right = vec![
+        span_on(format!("{:>COUNT$}", plus(file.adds)), th.success, tint),
+        span_on(format!(" {:>COUNT$}", minus(file.dels)), th.error, tint),
+    ];
+    if wide {
+        right.push(span_on(
+            format!("  {:>NOTE$}", clip_ellipsis(&file.tests, NOTE as u16)),
             tests_color(file.test_state, th),
             tint,
         ));
     }
-    Line::from(spans)
+    spread_on(width, left, right, tint)
 }
 
 /// An emphasised run on a tinted row — a selected file's glyph.
@@ -172,14 +216,14 @@ fn strong_on(
     color: Color,
     background: Option<Color>,
     th: &Theme,
-) -> ratatui::text::Span<'static> {
+) -> Span<'static> {
     let mut style = ratatui::style::Style::default()
         .fg(color)
         .add_modifier(th.emphasis);
     if let Some(background) = background {
         style = style.bg(background);
     }
-    ratatui::text::Span::styled(content.into(), style)
+    Span::styled(content.into(), style)
 }
 
 /// `—` where a count does not apply: a new file deletes nothing, a deleted
@@ -223,18 +267,68 @@ fn body_color(kind: HunkKind, th: &Theme) -> Color {
     }
 }
 
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
+/// The sheet's frame (design.md §11): the file count, the totals and the
+/// branch in the header, `Δn +a -d` in the status bar, the review keys on
+/// the hint row and the composer ready for the fix.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    let review = model.review.as_ref();
+    let totals = |review: &crate::davinci::model::ReviewSheet| {
+        vec![
+            span(format!("+{}", review.adds), th.success),
+            span(format!(" -{}", review.dels), th.error),
+        ]
+    };
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                review
+                    .map(|r| vec![span(format!("{} files", r.files.len()), th.muted)])
+                    .unwrap_or_default(),
+                review.map(totals).unwrap_or_default(),
+                review
+                    .filter(|r| !r.branch.is_empty())
+                    .map(|r| {
+                        let mut run = vec![span(r.branch.clone(), th.secondary)];
+                        if !r.behind.is_empty() {
+                            run.push(span(" · ", th.border));
+                            run.push(span(r.behind.clone(), th.border));
+                        }
+                        run
+                    })
+                    .unwrap_or_default(),
+            ],
+        ),
+        status_third: review.map(|r| {
+            let mut run = vec![span(
+                format!("{}{}", glyph::DELTA, r.files.len()),
+                th.primary,
+            )];
+            run.push(span(" ", th.border));
+            run.extend(totals(r));
+            run
+        }),
+        status_right: None,
+        hints: vec![
+            hint(th, "↑↓ file"),
+            hint(th, "j k hunk"),
+            hint_dim(th, "enter open in codex"),
+            hint_dim(th, "u revert hunk"),
+            hint_dim(th, "c commit"),
+        ],
+        escape: Some("esc close"),
+        composer: Composer::Prompt("fix the two legacy.rs references, then commit"),
+        echo: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::davinci::fixtures;
     use crate::davinci::model::{Hunk, ReviewSheet};
     use crate::davinci::theme::ColorDepth;
-    use crate::davinci::ui::run_width;
 
     fn sheet() -> ReviewSheet {
         ReviewSheet {
@@ -247,6 +341,7 @@ mod tests {
                     tests: "✓ 14 tests pass".into(),
                     test_state: State::Done,
                     hunk_note: "hunk 2 of 5".into(),
+                    hunk_header: "@@ 214,7 +214,18 @@ impl OpenAiProvider".into(),
                     hunk: vec![
                         Hunk::new(HunkKind::Context, "pub async fn complete(…) {"),
                         Hunk::new(HunkKind::Del, "    let body = self.post(req).await?;"),
@@ -264,6 +359,7 @@ mod tests {
                     tests: "! 2 references left".into(),
                     test_state: State::Attention,
                     hunk_note: "88 lines removed".into(),
+                    hunk_header: String::new(),
                     hunk: vec![Hunk::new(HunkKind::Del, "pub struct LegacyProvider {")],
                 },
             ],
@@ -271,7 +367,8 @@ mod tests {
             dels: 127,
             branch: "main".into(),
             behind: "3 commits behind".into(),
-            warning: "legacy.rs is gone but 2 files still name it · the build will fail".into(),
+            warning: "legacy.rs is gone but 2 files still name it · grafo says the build will fail"
+                .into(),
             tests: "212 of 212 tests pass on the changed crates · 41.2s".into(),
         }
     }
@@ -304,6 +401,10 @@ mod tests {
             .find(|row| row.contains("j k to move"))
             .expect("a hunk header");
         assert!(header.contains("legacy.rs"), "{header}");
+        assert!(
+            header.contains("88 lines removed · j k to move"),
+            "{header}"
+        );
         assert!(rows.iter().any(|row| row.contains("LegacyProvider")));
         // The other file's hunk stays folded.
         assert!(!rows.iter().any(|row| row.contains("post_stream")));
@@ -312,20 +413,40 @@ mod tests {
     #[test]
     fn every_file_states_its_counts_and_what_the_tests_said() {
         let rows: Vec<String> = lines(&model(120)).iter().map(text).collect();
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("2 files") && row.contains("+145")));
-        assert!(rows.iter().any(|row| row.contains("openai.rs")
-            && row.contains("+64")
-            && row.contains("✓ 14 tests pass")));
+        // The summary moved to the header: the first row is a file.
+        assert!(
+            rows[0].starts_with("▌  Δ crates\\davinci-ai\\src\\openai.rs"),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[0]
+                .trim_end()
+                .ends_with("+64   -19      ✓ 14 tests pass"),
+            "{}",
+            rows[0]
+        );
         // A deleted file adds nothing: the count is an em dash, not a zero.
+        let deleted = rows
+            .iter()
+            .find(|row| row.contains("legacy.rs"))
+            .expect("the deleted row");
+        assert!(deleted.starts_with("   × "), "{deleted}");
+        assert!(deleted.contains("—   -88"), "{deleted}");
         assert!(rows
             .iter()
-            .any(|row| row.contains("legacy.rs") && row.contains("—")));
-        assert!(rows.iter().any(|row| row.contains("the build will fail")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("nothing here is committed")));
+            .any(|row| row.contains("│ @@ 214,7 +214,18 @@ impl OpenAiProvider")));
+        assert!(rows.iter().any(|row| row.starts_with(
+            "! legacy.rs is gone but 2 files still name it · grafo says the build will fail"
+        ) && row
+            .trim_end()
+            .ends_with("revert is per file and per hunk")));
+        assert!(rows.iter().any(|row| row
+            .starts_with("✓ 212 of 212 tests pass on the changed crates · 41.2s")
+            && row
+                .trim_end()
+                .ends_with("nothing here is committed until you say so")));
+        assert!(!rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
@@ -366,5 +487,33 @@ mod tests {
             }),
             "{hunk:?}"
         );
+    }
+
+    #[test]
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "6d");
+        let c = chrome(&m);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "7 files │ +145 -127 │ main · 3 commits behind");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "Δ7 +145 -127");
+        assert_eq!(c.escape, Some("esc close"));
+        assert_eq!(
+            c.composer,
+            Composer::Prompt("fix the two legacy.rs references, then commit")
+        );
+        let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
+        assert!(
+            hint.starts_with("↑↓ file │ j k hunk │ enter open in codex │ u revert hunk │ c commit"),
+            "{hint}"
+        );
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
     }
 }

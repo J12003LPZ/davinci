@@ -1309,6 +1309,8 @@ pub struct ReviewFile {
     pub tests: String,
     pub test_state: State,
     pub hunk_note: String,
+    /// `@@ 214,7 +214,18 @@ impl OpenAiProvider`; empty draws no header row.
+    pub hunk_header: String,
     pub hunk: Vec<Hunk>,
 }
 

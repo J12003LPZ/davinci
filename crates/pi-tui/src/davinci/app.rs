@@ -688,7 +688,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "until 3b wears its artboard chrome"]
     fn a_sheet_starts_under_the_header_and_ends_with_its_hint_row() {
         let mut m = model(100, 44);
         crate::davinci::fixtures::dress_screen(&mut m, "3b");

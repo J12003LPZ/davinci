@@ -1625,9 +1625,10 @@ pub fn review() -> ReviewSheet {
         tests: tests.into(),
         test_state,
         hunk_note: hunk_note.into(),
+        hunk_header: String::new(),
         hunk: hunks,
     };
-    ReviewSheet {
+    let mut sheet = ReviewSheet {
         files: vec![
             file(
                 State::Delta,
@@ -1773,9 +1774,12 @@ pub fn review() -> ReviewSheet {
         dels: 127,
         branch: "main".into(),
         behind: "3 commits behind".into(),
-        warning: "legacy.rs is gone but 2 files still name it · the build will fail".into(),
+        warning: "legacy.rs is gone but 2 files still name it · grafo says the build will fail"
+            .into(),
         tests: "212 of 212 tests pass on the changed crates · 41.2s".into(),
-    }
+    };
+    sheet.files[0].hunk_header = "@@ 214,7 +214,18 @@ impl OpenAiProvider".into();
+    sheet
 }
 
 /// A turn twelve seconds in, for the screens that show one running.

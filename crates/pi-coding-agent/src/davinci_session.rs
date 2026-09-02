@@ -4444,18 +4444,19 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
                 .collect()
         })
         .unwrap_or_default();
-    let hunk_of = |path: &str| -> (Vec<Hunk>, String) {
+    let hunk_of = |path: &str| -> (Vec<Hunk>, String, String) {
         let output = Command::new("git")
             .arg("-C")
             .arg(cwd)
             .args(["diff", "--unified=2", "HEAD", "--", path])
             .output();
         let Ok(output) = output else {
-            return (Vec::new(), String::new());
+            return (Vec::new(), String::new(), String::new());
         };
         let text = String::from_utf8_lossy(&output.stdout).to_string();
         let hunk_count = text.lines().filter(|line| line.starts_with("@@")).count();
         let mut rows = Vec::new();
+        let mut header = String::new();
         let mut inside = false;
         for line in text.lines() {
             if line.starts_with("@@") {
@@ -4463,6 +4464,9 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
                     break; // the first hunk is enough for the sheet
                 }
                 inside = true;
+                // git's `@@ -214,7 +214,18 @@`, without the minus the sheet
+                // already says with its colour.
+                header = clip(&line.replacen("@@ -", "@@ ", 1), 90);
                 continue;
             }
             if !inside {
@@ -4483,7 +4487,7 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
             1 => "hunk 1 of 1".to_string(),
             n => format!("hunk 1 of {n}"),
         };
-        (rows, note)
+        (rows, note, header)
     };
     let mut total_adds = 0u32;
     let mut total_dels = 0u32;
@@ -4499,8 +4503,12 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
             total_adds += adds.unwrap_or(0);
             total_dels += dels.unwrap_or(0);
             let untracked = change.status == "?";
-            let (hunk, hunk_note) = if untracked {
-                (Vec::new(), "new file · untracked".to_string())
+            let (hunk, hunk_note, hunk_header) = if untracked {
+                (
+                    Vec::new(),
+                    "new file · untracked".to_string(),
+                    String::new(),
+                )
             } else {
                 hunk_of(&normalized)
             };
@@ -4516,6 +4524,7 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
                 tests: "not run".into(),
                 test_state: State::Queued,
                 hunk_note,
+                hunk_header,
                 hunk,
             }
         })

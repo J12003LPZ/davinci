@@ -740,7 +740,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "until 6d wears its artboard chrome"]
     fn a_sheet_with_facts_owns_the_header_right_run_and_the_status_third() {
         let mut m = model(100);
         crate::davinci::fixtures::dress_screen(&mut m, "6d");
