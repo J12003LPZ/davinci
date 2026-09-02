@@ -2697,6 +2697,9 @@ pub fn perform(
             let native_count = crate::native_extensions::NATIVE_TOOLS.len();
             let extension_count: usize = host.js.iter().map(|ext| ext.tools.len()).sum();
             let total = (builtin + native_count + extension_count).max(1) as f64;
+            model.facts.tool_count = builtin + native_count + extension_count;
+            model.facts.command_count = model.slash_commands.len();
+            model.facts.tool_schema_tokens = schema_tokens as u64;
             model.workshop = Some(WorkshopSheet {
                 reload,
                 native,
@@ -3873,6 +3876,103 @@ fn open_sheet(model: &mut Model, screen: Screen) {
     model.screen = screen;
 }
 
+/// A path under the home directory, said the way the artboards say it:
+/// `%USERPROFILE%\.pi\agent\auth.json` on Windows, `~/.pi/agent/auth.json`
+/// elsewhere. Paths outside home are returned as they are.
+fn home_label(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    let Some(home) = pi_session::home_dir() else {
+        return text;
+    };
+    let home = home.display().to_string();
+    match text.strip_prefix(&home) {
+        Some(rest) if cfg!(windows) => format!("%USERPROFILE%{rest}"),
+        Some(rest) => format!("~{rest}"),
+        None => text,
+    }
+}
+
+/// `2h ago` for a file's age; empty when the file is not there.
+fn refreshed_label(path: &std::path::Path) -> String {
+    let age = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs());
+    match age {
+        None => String::new(),
+        Some(seconds) => age_label(seconds),
+    }
+}
+
+fn age_label(seconds: u64) -> String {
+    let text = crate::davinci_sources::humanise(seconds);
+    if text == "just now" {
+        text
+    } else {
+        format!("{text} ago")
+    }
+}
+
+/// Reasoning tokens over the session's assistant turns: what the last turn
+/// spent, and the share of output they took. Both empty/zero when no
+/// provider reported any.
+fn thinking_facts(entries: &[pi_session::SessionEntry]) -> (String, f64) {
+    let mut last = None;
+    let mut reasoning = 0u64;
+    let mut output = 0u64;
+    for entry in entries.iter().filter(|entry| entry.entry_type == "message") {
+        let Some(message) = entry.message.as_ref() else {
+            continue;
+        };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(usage) = message.get("usage") else {
+            continue;
+        };
+        let turn_output = usage
+            .get("output")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let turn_reasoning = usage.get("reasoning").and_then(serde_json::Value::as_u64);
+        output += turn_output;
+        if let Some(spent) = turn_reasoning {
+            reasoning += spent;
+            last = Some(spent);
+        }
+    }
+    let last_turn = last
+        .map(|spent| {
+            if spent >= 1_000 {
+                format!("{:.1}k tokens", spent as f64 / 1_000.0)
+            } else {
+                format!("{spent} tokens")
+            }
+        })
+        .unwrap_or_default();
+    let share = if output > 0 && reasoning > 0 {
+        reasoning as f64 / output as f64
+    } else {
+        0.0
+    };
+    (last_turn, share)
+}
+
+/// Bytes the session files take on disk; the volume total is not read, so
+/// the cap is `0` and the sheet omits the meter.
+fn sessions_disk(paths: &[std::path::PathBuf]) -> Option<(u64, u64)> {
+    if paths.is_empty() {
+        return None;
+    }
+    let used = paths
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .sum();
+    Some((used, 0))
+}
+
 fn open_mcp_sheet(agent: &Agent, model: &mut Model) {
     let servers = agent
         .tool_context
@@ -3952,6 +4052,24 @@ fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
         })
         .collect();
     model.catalog_index = order_catalog(&mut model.catalog, &agent.provider, &agent.model_id);
+    let providers: std::collections::BTreeSet<&str> = model
+        .catalog
+        .iter()
+        .map(|row| row.provider.as_str())
+        .collect();
+    let ready: std::collections::BTreeSet<&str> = model
+        .catalog
+        .iter()
+        .filter(|row| row.credential == Credential::Ready)
+        .map(|row| row.provider.as_str())
+        .collect();
+    model.facts.catalog_total = model.catalog.len();
+    model.facts.catalog_shown = model.catalog.len();
+    model.facts.providers_total = providers.len();
+    model.facts.providers_ready = ready.len();
+    let models_path = pi_ai::models_json_path(&crate::default_agent_dir());
+    model.facts.catalog_path = home_label(&models_path);
+    model.facts.catalog_refreshed = refreshed_label(&models_path);
     open_sheet(model, Screen::Models);
 }
 
@@ -4006,6 +4124,7 @@ fn open_settings_sheet(agent: &Agent, model: &mut Model) {
         })
         .collect();
     model.settings_index = 0;
+    model.facts.settings_keys = model.settings_rows.len();
     open_sheet(model, Screen::Settings);
 }
 
@@ -4057,6 +4176,15 @@ fn open_thinking_sheet(agent: &Agent, model: &mut Model) {
         .iter()
         .position(|row| row.level == agent.thinking_level.as_str())
         .unwrap_or(0);
+    let entries = agent
+        .session
+        .as_ref()
+        .map(|store| store.entries.as_slice())
+        .unwrap_or(&[]);
+    let (last_turn, share) = thinking_facts(entries);
+    model.facts.thinking_reserve = String::new();
+    model.facts.thinking_last_turn = last_turn;
+    model.facts.thinking_output_share = share;
     open_sheet(model, Screen::Thinking);
 }
 
@@ -4084,6 +4212,12 @@ fn open_login_sheet(parsed: &crate::args::Args, model: &mut Model) {
         .collect();
     model.login_index = 0;
     model.device_code = None;
+    model.facts.auth_path = home_label(&crate::default_agent_dir().join("auth.json"));
+    model.facts.auth_mode = if cfg!(unix) {
+        "0600".into()
+    } else {
+        String::new()
+    };
     open_sheet(model, Screen::Login);
 }
 
@@ -4165,6 +4299,8 @@ fn open_keys_sheet(model: &mut Model) {
                 .collect(),
         });
     }
+    model.facts.keys_count = bindings.len() + model.extension_shortcuts.len();
+    model.facts.keys_surfaces = groups.len();
     model.keymap = groups;
     model.keys_offset = 0;
     open_sheet(model, Screen::Keys);
@@ -4234,6 +4370,8 @@ fn open_resume_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
         })
         .collect();
     model.resume_index = 0;
+    let paths: Vec<std::path::PathBuf> = found.iter().map(|summary| summary.path.clone()).collect();
+    model.facts.sessions_disk = sessions_disk(&paths);
     open_sheet(model, Screen::Resume);
 }
 
@@ -4320,6 +4458,17 @@ fn open_tree_sheet(agent: &Agent, model: &mut Model) -> bool {
         .or_else(|| rows.iter().rposition(|row| row.id.is_some()))
         .unwrap_or(0);
     model.session_tree = rows;
+    model.facts.session_name = store
+        .display_name()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| store.header.id.chars().take(8).collect());
+    model.facts.session_turns = count;
+    let stats = pi_session::session_usage_stats(&store.entries);
+    model.facts.session_cost = if stats.cost > 0.0 {
+        format!("${:.2}", stats.cost)
+    } else {
+        String::new()
+    };
     open_sheet(model, Screen::Tree);
     true
 }
@@ -5906,6 +6055,91 @@ fn refresh_context(model: &mut Model, agent: &Agent) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_home_path_is_said_with_the_home_variable() {
+        let home = pi_session::home_dir().expect("a home directory");
+        let label = home_label(&home.join(".pi").join("agent").join("auth.json"));
+        if cfg!(windows) {
+            assert!(label.starts_with("%USERPROFILE%"), "{label}");
+        } else {
+            assert!(label.starts_with("~/"), "{label}");
+        }
+        assert!(label.ends_with("auth.json"), "{label}");
+        let elsewhere = std::path::Path::new("/srv/pi/auth.json");
+        assert_eq!(home_label(elsewhere), elsewhere.display().to_string());
+    }
+
+    #[test]
+    fn a_missing_models_file_has_no_refreshed_label() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(refreshed_label(&dir.path().join("models.json")), "");
+        std::fs::write(dir.path().join("models.json"), "{}").unwrap();
+        assert_eq!(refreshed_label(&dir.path().join("models.json")), "just now");
+        assert_eq!(age_label(7_200), "2h ago");
+    }
+
+    #[test]
+    fn thinking_facts_come_from_the_reported_usage() {
+        assert_eq!(thinking_facts(&[]), (String::new(), 0.0));
+        let entry = |usage: serde_json::Value| {
+            let mut entry = pi_session::SessionEntry::message("assistant", json!([]));
+            entry.message = Some(json!({"role": "assistant", "usage": usage}));
+            entry
+        };
+        let entries = vec![
+            entry(json!({"output": 1000, "reasoning": 400})),
+            entry(json!({"output": 1000})),
+            entry(json!({"output": 2000, "reasoning": 1200})),
+        ];
+        let (last, share) = thinking_facts(&entries);
+        assert_eq!(last, "1.2k tokens");
+        assert!((share - 0.4).abs() < 1e-9, "{share}");
+    }
+
+    #[test]
+    fn the_session_disk_figure_sums_the_files_and_leaves_the_cap_unknown() {
+        assert_eq!(sessions_disk(&[]), None);
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        std::fs::write(&a, "12345").unwrap();
+        std::fs::write(&b, "12").unwrap();
+        assert_eq!(
+            sessions_disk(&[a, b, dir.path().join("gone")]),
+            Some((7, 0))
+        );
+    }
+
+    #[test]
+    fn the_keys_sheet_counts_its_bindings_and_surfaces() {
+        let mut m = model();
+        open_keys_sheet(&mut m);
+        assert_eq!(m.screen, Screen::Keys);
+        assert_eq!(m.facts.keys_count, pi_tui::get_keybindings().len());
+        assert_eq!(m.facts.keys_surfaces, m.keymap.len());
+        assert!(m.facts.keys_surfaces >= 3);
+    }
+
+    #[test]
+    fn the_login_sheet_names_the_auth_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let mut m = model();
+        open_login_sheet(&crate::args::Args::default(), &mut m);
+        match previous {
+            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+        assert_eq!(m.screen, Screen::Login);
+        assert!(
+            m.facts.auth_path.ends_with("auth.json"),
+            "{}",
+            m.facts.auth_path
+        );
+        assert_eq!(m.facts.auth_mode.is_empty(), !cfg!(unix));
+    }
 
     #[test]
     fn detached_login_does_not_report_pending_oauth_as_signed_in() {
