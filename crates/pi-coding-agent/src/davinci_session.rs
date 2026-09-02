@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pi_agent::{Agent, AgentEvent, EventSink};
+use pi_agent::{
+    Agent, AgentEvent, EventSink, PermissionMode, ToolApprovalDecision, ToolApprovalRequest,
+    ToolApprover,
+};
 use pi_tui::davinci::model::{
     Ask, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
     Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
@@ -416,6 +419,66 @@ impl Turn {
         }
     }
 
+    /// The call is waiting on the user: say so on its ledger row and its
+    /// tool line, so a turn that has stopped moving reads as a question and
+    /// not as a hang.
+    fn await_approval(&mut self, model: &mut Model, request: &ToolApprovalRequest) {
+        if let Some(Entry::Studio(steps)) = self.studio.and_then(|i| model.transcript.get_mut(i)) {
+            if let Some(step) = steps
+                .iter_mut()
+                .rev()
+                .find(|step| step.state == State::Active)
+            {
+                let target = step.target.take().unwrap_or_default();
+                step.target = Some(format!("{target} · awaiting approval"));
+            }
+        }
+        if let Some(Entry::Tool { summary, .. }) = self
+            .open
+            .iter()
+            .find(|(id, _, _, _)| *id == request.tool_call_id)
+            .and_then(|(_, index, _, _)| model.transcript.get_mut(*index))
+        {
+            *summary = Some("awaiting approval".into());
+        }
+    }
+
+    /// The user has spoken: the waiting marks come off. What happened next is
+    /// the tool's own outcome — `end_tool` writes it — except a rule saved
+    /// for good, which is worth a line of its own.
+    fn settle_approval(
+        &mut self,
+        model: &mut Model,
+        request: &ToolApprovalRequest,
+        remembered: Option<&str>,
+    ) {
+        if let Some(Entry::Studio(steps)) = self.studio.and_then(|i| model.transcript.get_mut(i)) {
+            for step in steps.iter_mut() {
+                if let Some(target) = step.target.as_mut() {
+                    if let Some(bare) = target.strip_suffix(" · awaiting approval") {
+                        *target = bare.to_string();
+                    }
+                }
+            }
+        }
+        if let Some(Entry::Tool { summary, .. }) = self
+            .open
+            .iter()
+            .find(|(id, _, _, _)| *id == request.tool_call_id)
+            .and_then(|(_, index, _, _)| model.transcript.get_mut(*index))
+        {
+            *summary = None;
+        }
+        if let Some(rule) = remembered {
+            model.transcript.push(Entry::tool(
+                State::Done,
+                "instrumenta",
+                &format!("remembered {rule} · .pi/settings.json"),
+                None,
+            ));
+        }
+    }
+
     fn push_step(&mut self, model: &mut Model, tool_name: &str, args: &serde_json::Value) {
         let step = Step::new(
             State::Active,
@@ -669,15 +732,27 @@ fn run_turn(
         let _ = event_tx.send(event.clone());
     })));
 
+    let settings = crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
     let mut turn = Turn {
-        hide_thinking: crate::settings::load_merged_settings(
-            &crate::default_agent_dir(),
-            &agent.cwd,
-        )
-        .hide_thinking_block
-        .unwrap_or(false),
+        hide_thinking: settings.hide_thinking_block.unwrap_or(false),
         ..Turn::default()
     };
+    // A tool call the policy cannot decide crosses from the worker to this
+    // loop as a request with its own reply line; the worker blocks on the
+    // reply while the panel is up. Only a trusted project may be offered
+    // "always": its settings file is the one that would be read back.
+    let trusted = crate::settings::is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    let cwd = agent.cwd.clone();
+    let (approval_tx, approval_rx) =
+        mpsc::channel::<(ToolApprovalRequest, mpsc::Sender<ToolApprovalDecision>)>();
+    agent.approver = Some(ToolApprover(Arc::new(move |request| {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if approval_tx.send((request.clone(), reply_tx)).is_err() {
+            return ToolApprovalDecision::Deny;
+        }
+        reply_rx.recv().unwrap_or(ToolApprovalDecision::Deny)
+    })));
+    let mut approval: Option<(ToolApprovalRequest, mpsc::Sender<ToolApprovalDecision>)> = None;
     let mut last_tick = Instant::now();
     // The working line above the composer, for as long as the turn runs.
     let started = Instant::now();
@@ -707,6 +782,15 @@ fn run_turn(
             while let Ok(event) = event_rx.try_recv() {
                 apply(model, &mut turn, &event);
             }
+            if approval.is_none() {
+                if let Ok((request, reply)) = approval_rx.try_recv() {
+                    turn.await_approval(model, &request);
+                    model.ask = permission_ask(&request, trusted);
+                    model.ask_index = 0;
+                    model.overlay = Some(Overlay::Ask);
+                    approval = Some((request, reply));
+                }
+            }
             if let Some(working) = model.working.as_mut() {
                 working.seconds = started.elapsed().as_secs();
             }
@@ -717,6 +801,59 @@ fn run_turn(
             }
             if let Some(event) = session.poll_event(Duration::from_millis(40))? {
                 match event {
+                    crossterm::event::Event::Key(key)
+                        if key.kind != crossterm::event::KeyEventKind::Release
+                            && approval.is_some() =>
+                    {
+                        let decision = approval_key(model, key, trusted, &abort);
+                        if pi_ai::trace::enabled() {
+                            pi_ai::trace::log(&format!(
+                                "davinci permission panel: key {:?} {:?} -> {decision:?}",
+                                key.code, key.modifiers
+                            ));
+                        }
+                        if let Some(decision) = decision {
+                            let (request, reply) = approval.take().expect("checked above");
+                            let decision = match decision {
+                                ToolApprovalDecision::AllowAlways => {
+                                    match crate::permissions::remember_project_rule(
+                                        &cwd,
+                                        &request.session_rule,
+                                    ) {
+                                        Ok(_) => {
+                                            turn.settle_approval(
+                                                model,
+                                                &request,
+                                                Some(&request.session_rule),
+                                            );
+                                            ToolApprovalDecision::AllowAlways
+                                        }
+                                        // The file could not be written: the
+                                        // grant still holds for this run, and
+                                        // the user is told why it is no more.
+                                        Err(err) => {
+                                            turn.settle_approval(model, &request, None);
+                                            model.transcript.push(Entry::tool(
+                                                State::Attention,
+                                                "instrumenta",
+                                                &format!(
+                                                    "could not save {} · {err}",
+                                                    request.session_rule
+                                                ),
+                                                None,
+                                            ));
+                                            ToolApprovalDecision::AllowForSession
+                                        }
+                                    }
+                                }
+                                other => {
+                                    turn.settle_approval(model, &request, None);
+                                    other
+                                }
+                            };
+                            let _ = reply.send(decision);
+                        }
+                    }
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release =>
                     {
@@ -836,6 +973,12 @@ fn run_turn(
 
     agent.abort_signal = None;
     agent.event_sink = None;
+    agent.approver = None;
+    // A question the worker never got an answer to (it was interrupted under
+    // the panel) is closed with it.
+    if approval.take().is_some() && model.overlay == Some(Overlay::Ask) {
+        model.overlay = None;
+    }
     model.running = false;
     if model.terminal_progress {
         let _ = session.set_progress(false);
@@ -1045,6 +1188,11 @@ pub fn corpus(
     items.push(CorpusItem::new(
         "/diff",
         "review every change in the working tree",
+        "command",
+    ));
+    items.push(CorpusItem::new(
+        "/permissions",
+        "what runs without asking · read-only, ask, edits, auto",
         "command",
     ));
 
@@ -1509,6 +1657,75 @@ impl Question {
                     .collect(),
             },
         }
+    }
+}
+
+/// The `LICENTIA · PERMISSION` panel for one tool call the policy could not
+/// decide on its own (spec: trust-and-control, *davinci*). Four rows; three
+/// when the project is not trusted, because a rule written to
+/// `.pi/settings.json` would never be read back from an untrusted checkout.
+pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
+    let rule = &request.session_rule;
+    let mut items = vec![
+        PickerItem::new("allow once", "runs this call only"),
+        PickerItem::new("allow for this session", &format!("{rule} until pi exits")),
+    ];
+    if trusted {
+        items.push(PickerItem::new(
+            "always allow here",
+            &format!("{rule} saved to .pi/settings.json"),
+        ));
+    }
+    items.push(PickerItem::new("deny", "the model is told no"));
+    let mut note = request.summary.clone();
+    if request.outside_project {
+        note.push_str(" · outside the project");
+    }
+    Ask {
+        title: "LICENTIA".into(),
+        name: "PERMISSION".into(),
+        key: "/permissions".into(),
+        note,
+        items,
+    }
+}
+
+/// What the chosen row of `permission_ask` means; `None` for a row that the
+/// panel did not offer.
+pub fn permission_choice(index: usize, trusted: bool) -> Option<ToolApprovalDecision> {
+    match (index, trusted) {
+        (0, _) => Some(ToolApprovalDecision::AllowOnce),
+        (1, _) => Some(ToolApprovalDecision::AllowForSession),
+        (2, true) => Some(ToolApprovalDecision::AllowAlways),
+        (2, false) | (3, true) => Some(ToolApprovalDecision::Deny),
+        _ => None,
+    }
+}
+
+/// One key while the permission panel is up. The panel takes the keys every
+/// other panel takes — ↑↓ move, enter chooses, esc closes — and esc closing
+/// an unanswered question is a `deny`, not a shrug. `ctrl+c` raises the
+/// abort flag as it does anywhere mid-turn, and denies so the worker sees
+/// the flag promptly rather than after a call the user was refusing.
+fn approval_key(
+    model: &mut Model,
+    key: crossterm::event::KeyEvent,
+    trusted: bool,
+    abort: &Arc<AtomicBool>,
+) -> Option<ToolApprovalDecision> {
+    use pi_tui::davinci::app::{handle_key, Flow};
+    match handle_key(model, key) {
+        Flow::Choose(Choice::Ask(index)) => {
+            Some(permission_choice(index, trusted).unwrap_or(ToolApprovalDecision::Deny))
+        }
+        Flow::Interrupt | Flow::Quit => {
+            abort.store(true, Ordering::Relaxed);
+            model.interrupt();
+            model.overlay = None;
+            Some(ToolApprovalDecision::Deny)
+        }
+        Flow::Continue if model.overlay.is_none() => Some(ToolApprovalDecision::Deny),
+        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) | Flow::CycleThinking => None,
     }
 }
 
@@ -2230,6 +2447,13 @@ pub fn run(
     model.login_providers = crate::interactive_login_providers(parsed);
     model.model_names = model.models.iter().map(|item| item.name.clone()).collect();
     sync_thinking_state(agent, &mut model);
+    model.permission_mode = agent
+        .permissions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .mode
+        .as_str()
+        .to_string();
     model.model_index = model
         .models
         .iter()
@@ -4416,6 +4640,13 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
         if line.trim() == "/diff" {
             return open_diff_sheet(shell);
         }
+        // `/permissions` likewise: the mode and rules in force, or a new
+        // mode for the rest of the session.
+        if let Some(rest) = line.trim().strip_prefix("/permissions") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return permissions_command(shell, rest.trim());
+            }
+        }
     }
     match classify(line) {
         Sent::Quit => Next::Leave,
@@ -4788,6 +5019,59 @@ pub fn recall_query(model: &Model, agent: &Agent) -> String {
         .unwrap_or_default()
 }
 
+/// `/permissions` — the mode and every rule in force, by source; or, with a
+/// mode named, that mode for the rest of the session. Rules are drawn as
+/// tool rows rather than prose: `bash(git *)` is not markdown emphasis.
+fn permissions_command(shell: &mut Shell<'_>, arg: &str) -> Next {
+    if !arg.is_empty() {
+        match PermissionMode::parse(arg) {
+            Some(mode) => {
+                shell
+                    .agent
+                    .permissions
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .mode = mode;
+                shell.model.permission_mode = mode.as_str().to_string();
+                shell.say(&format!(
+                    "permission mode {} · {} · this session",
+                    mode.as_str(),
+                    mode.describe()
+                ));
+            }
+            None => shell.note(&format!(
+                "no permission mode {arg} — read-only, ask, edits or auto"
+            )),
+        }
+        return Next::Go;
+    }
+    let sources = crate::permissions::PermissionSources::load(
+        &crate::default_agent_dir(),
+        shell.cwd,
+        shell.parsed.project_trust_override,
+    );
+    let policy = shell
+        .agent
+        .permissions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    let rows = crate::permissions::describe(&sources, &policy);
+    shell.model.running = false;
+    shell.model.transcript.push(Entry::Gap);
+    for (index, row) in rows.iter().enumerate() {
+        if index == 0 {
+            shell
+                .model
+                .transcript
+                .push(Entry::tool(State::Done, "instrumenta", row, None));
+        } else {
+            shell.model.transcript.push(Entry::detail(row));
+        }
+    }
+    Next::Go
+}
+
 fn detached_login_message(provider: &str, oauth_pending: bool) -> Result<String, String> {
     if oauth_pending {
         if pi_ai::PROVIDER_SPECS
@@ -5148,6 +5432,159 @@ mod tests {
             Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
+    }
+
+    fn approval(tool: &str, subject: &str, outside: bool) -> ToolApprovalRequest {
+        ToolApprovalRequest {
+            tool_call_id: "call_1".into(),
+            tool: tool.into(),
+            args: json!({}),
+            subject: subject.into(),
+            summary: pi_agent::summary_of(tool, subject),
+            session_rule: pi_agent::session_rule_for(tool, subject).to_string(),
+            outside_project: outside,
+            mode: PermissionMode::Ask,
+        }
+    }
+
+    #[test]
+    fn the_permission_panel_offers_always_only_in_a_trusted_project() {
+        let ask = permission_ask(&approval("bash", "git status --short", false), true);
+        assert_eq!(ask.title, "LICENTIA");
+        assert_eq!(ask.name, "PERMISSION");
+        assert_eq!(ask.key, "/permissions");
+        assert_eq!(ask.note, "bash · git status --short");
+        let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "allow once",
+                "allow for this session",
+                "always allow here",
+                "deny"
+            ]
+        );
+        assert_eq!(ask.items[1].detail, "bash(git status *) until pi exits");
+        assert_eq!(
+            ask.items[2].detail,
+            "bash(git status *) saved to .pi/settings.json"
+        );
+
+        let ask = permission_ask(&approval("write", "../out.txt", true), false);
+        let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, ["allow once", "allow for this session", "deny"]);
+        assert_eq!(ask.note, "write · ../out.txt · outside the project");
+    }
+
+    #[test]
+    fn permission_rows_map_to_decisions_in_both_shapes() {
+        use ToolApprovalDecision::*;
+        assert_eq!(permission_choice(0, true), Some(AllowOnce));
+        assert_eq!(permission_choice(1, true), Some(AllowForSession));
+        assert_eq!(permission_choice(2, true), Some(AllowAlways));
+        assert_eq!(permission_choice(3, true), Some(Deny));
+        assert_eq!(permission_choice(4, true), None);
+        assert_eq!(permission_choice(2, false), Some(Deny));
+        assert_eq!(permission_choice(3, false), None);
+    }
+
+    #[test]
+    fn under_the_permission_panel_esc_denies_and_enter_chooses_the_row() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+        let abort = Arc::new(AtomicBool::new(false));
+        let open = || {
+            let mut m = model();
+            m.running = true;
+            m.ask = permission_ask(&approval("bash", "git status", false), true);
+            m.ask_index = 0;
+            m.overlay = Some(Overlay::Ask);
+            m
+        };
+
+        let mut m = open();
+        assert_eq!(
+            approval_key(&mut m, key(KeyCode::Esc), true, &abort),
+            Some(ToolApprovalDecision::Deny)
+        );
+        assert_eq!(m.overlay, None);
+        assert!(
+            !abort.load(Ordering::Relaxed),
+            "esc refuses; it does not interrupt"
+        );
+
+        let mut m = open();
+        assert_eq!(approval_key(&mut m, key(KeyCode::Down), true, &abort), None);
+        assert_eq!(
+            m.overlay,
+            Some(Overlay::Ask),
+            "moving keeps the question up"
+        );
+        assert_eq!(
+            approval_key(&mut m, key(KeyCode::Enter), true, &abort),
+            Some(ToolApprovalDecision::AllowForSession)
+        );
+        assert_eq!(m.overlay, None);
+
+        let mut m = open();
+        assert_eq!(
+            approval_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                true,
+                &abort
+            ),
+            Some(ToolApprovalDecision::Deny)
+        );
+        assert!(
+            abort.load(Ordering::Relaxed),
+            "ctrl+c interrupts the turn as well"
+        );
+    }
+
+    #[test]
+    fn a_waiting_call_says_so_on_its_ledger_row_and_is_quiet_again_once_answered() {
+        let mut m = model();
+        let mut turn = Turn::default();
+        turn.start_tool(&mut m, "call_1", "bash", &json!({"command": "git status"}));
+        let request = approval("bash", "git status", false);
+        turn.await_approval(&mut m, &request);
+        let studio_target = |m: &Model| {
+            m.transcript
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::Studio(steps) => steps.last().and_then(|step| step.target.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let tool_summary = |m: &Model| {
+            m.transcript
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::Tool { summary, .. } => Some(summary.clone()),
+                    _ => None,
+                })
+                .flatten()
+        };
+        assert!(
+            studio_target(&m).ends_with(" · awaiting approval"),
+            "{}",
+            studio_target(&m)
+        );
+        assert_eq!(tool_summary(&m).as_deref(), Some("awaiting approval"));
+
+        turn.settle_approval(&mut m, &request, Some("bash(git status *)"));
+        assert!(
+            !studio_target(&m).contains("awaiting"),
+            "{}",
+            studio_target(&m)
+        );
+        assert_eq!(tool_summary(&m), None);
+        assert!(matches!(
+            m.transcript.last(),
+            Some(Entry::Tool { target, .. }) if target == "remembered bash(git status *) · .pi/settings.json"
+        ));
     }
 
     #[test]

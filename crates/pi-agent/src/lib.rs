@@ -7,6 +7,7 @@ mod edit_diff;
 mod events;
 mod file_mutation_queue;
 mod images;
+mod permission;
 mod queues;
 mod skills;
 mod templates;
@@ -37,6 +38,11 @@ pub use file_mutation_queue::{mutation_queue_key, with_file_mutation_queue};
 pub use images::{
     apply_block_images, convert_to_llm_for_provider, normalize_tool_result_images,
     parse_rpc_images, process_image_bytes, IMAGE_READING_DISABLED,
+};
+pub use permission::{
+    glob_matches, session_rule_for, subject_of, summary_of, tool_class, PermissionMode,
+    PermissionPolicy, PermissionRule, PermissionVerdict, ToolApprovalDecision, ToolApprovalRequest,
+    ToolApprover, ToolClass,
 };
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
 pub use skills::{discover_skills, expand_skill_command, expand_user_text, Skill};
@@ -159,6 +165,13 @@ pub struct Agent {
     pub custom_tool_executor: Option<CustomToolExecutor>,
     pub pre_tool: Option<PreToolHook>,
     pub post_tool: Option<PostToolHook>,
+    /// Which tools may run without asking (`permission.rs`). Shared, because
+    /// the gate reads it from `&self` on the tool thread while the host reads
+    /// the mode for its chrome, and a granted rule is written back mid-turn.
+    pub permissions: Arc<std::sync::Mutex<PermissionPolicy>>,
+    /// Who answers when the policy says ask. `None` means the run cannot
+    /// ask, and the call is refused with a message that says so.
+    pub approver: Option<ToolApprover>,
     pub summarizer: Option<Summarizer>,
     pub block_images: bool,
     pub auto_resize_images: bool,
@@ -212,6 +225,8 @@ impl Agent {
             custom_tool_executor: None,
             pre_tool: None,
             post_tool: None,
+            permissions: Arc::new(std::sync::Mutex::new(PermissionPolicy::default())),
+            approver: None,
             summarizer: None,
             block_images: false,
             auto_resize_images: true,
@@ -1053,6 +1068,236 @@ mod tests {
         assert!(update_types.contains(&"text_delta"));
         assert_eq!(kinds.last().copied(), Some("agent_end"));
         assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+    }
+
+    /// A scripted model: one tool call per entry, then `done`.
+    fn scripted_tool_calls(
+        calls: Vec<(&'static str, serde_json::Value)>,
+    ) -> impl FnMut(&Agent) -> Result<pi_ai::AssistantMessage, String> {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+        let mut remaining = calls.into_iter();
+        let mut index = 0;
+        move |_current| {
+            index += 1;
+            match remaining.next() {
+                Some((name, arguments)) => Ok(AssistantMessage {
+                    id: format!("a{index}"),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolCall {
+                        id: format!("call_{index}"),
+                        name: name.into(),
+                        arguments,
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::ToolUse),
+                    error_message: None,
+                }),
+                None => Ok(AssistantMessage {
+                    id: format!("a{index}"),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                }),
+            }
+        }
+    }
+
+    fn tool_outcomes(events: &[AgentEvent]) -> Vec<(String, bool, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolExecutionEnd {
+                    tool_name,
+                    is_error,
+                    result,
+                    ..
+                } => Some((
+                    tool_name.clone(),
+                    *is_error,
+                    result.as_str().unwrap_or_default().to_string(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ask_mode_asks_the_approver_for_edits_and_never_for_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), "hello").unwrap();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let seen = asked.clone();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+            PermissionMode::Ask,
+        )));
+        agent.approver = Some(ToolApprover(Arc::new(move |request| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.tool, "write");
+            assert_eq!(request.summary, "write · out.txt");
+            ToolApprovalDecision::AllowForSession
+        })));
+        agent.prompt("go");
+        let events = agent
+            .run_loop(scripted_tool_calls(vec![
+                ("read", serde_json::json!({"path": "note.txt"})),
+                (
+                    "write",
+                    serde_json::json!({"path": "out.txt", "content": "a"}),
+                ),
+                (
+                    "write",
+                    serde_json::json!({"path": "out.txt", "content": "b"}),
+                ),
+            ]))
+            .unwrap();
+        let outcomes = tool_outcomes(&events);
+        assert_eq!(outcomes.len(), 3, "{outcomes:?}");
+        assert!(
+            outcomes.iter().all(|(_, is_error, _)| !is_error),
+            "{outcomes:?}"
+        );
+        // The read never asked; the first write did and the second was
+        // covered by the session rule the answer added.
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+            "b"
+        );
+        assert_eq!(
+            agent
+                .permissions
+                .lock()
+                .unwrap()
+                .session_allow
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["write"]
+        );
+    }
+
+    #[test]
+    fn read_only_refuses_an_edit_without_asking_and_the_loop_goes_on() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+            PermissionMode::ReadOnly,
+        )));
+        agent.approver = Some(ToolApprover(Arc::new(|_request| {
+            panic!("read-only never asks")
+        })));
+        agent.prompt("go");
+        let events = agent
+            .run_loop(scripted_tool_calls(vec![(
+                "write",
+                serde_json::json!({"path": "out.txt", "content": "a"}),
+            )]))
+            .unwrap();
+        let outcomes = tool_outcomes(&events);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].1, "{outcomes:?}");
+        assert!(
+            outcomes[0]
+                .2
+                .contains("not allowed in permission mode `read-only`"),
+            "{}",
+            outcomes[0].2
+        );
+        assert!(!dir.path().join("out.txt").exists());
+        assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn a_declined_call_tells_the_model_the_user_said_no() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+            PermissionMode::Ask,
+        )));
+        agent.approver = Some(ToolApprover(Arc::new(|_request| {
+            ToolApprovalDecision::Deny
+        })));
+        agent.prompt("go");
+        let events = agent
+            .run_loop(scripted_tool_calls(vec![(
+                "write",
+                serde_json::json!({"path": "out.txt", "content": "a"}),
+            )]))
+            .unwrap();
+        let outcomes = tool_outcomes(&events);
+        assert_eq!(
+            outcomes[0].2,
+            "Permission denied: the user declined `write · out.txt`."
+        );
+        assert!(!dir.path().join("out.txt").exists());
+    }
+
+    #[test]
+    fn without_an_approver_ask_mode_fails_closed_and_says_how_to_open_it() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+            PermissionMode::Ask,
+        )));
+        agent.prompt("go");
+        let events = agent
+            .run_loop(scripted_tool_calls(vec![(
+                "bash",
+                serde_json::json!({"command": "git status"}),
+            )]))
+            .unwrap();
+        let outcomes = tool_outcomes(&events);
+        assert!(outcomes[0].1);
+        assert!(
+            outcomes[0].2.starts_with(
+                "Permission denied: `bash · git status` needs approval in permission mode `ask`, and this run cannot ask."
+            ),
+            "{}",
+            outcomes[0].2
+        );
+        assert!(
+            outcomes[0].2.contains("`bash(git status *)`"),
+            "{}",
+            outcomes[0].2
+        );
+    }
+
+    #[test]
+    fn the_library_default_runs_every_tool_as_vendor_pi_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.prompt("go");
+        let events = agent
+            .run_loop(scripted_tool_calls(vec![(
+                "write",
+                serde_json::json!({"path": "out.txt", "content": "a"}),
+            )]))
+            .unwrap();
+        assert!(tool_outcomes(&events)
+            .iter()
+            .all(|(_, is_error, _)| !is_error));
+        assert!(dir.path().join("out.txt").exists());
     }
 
     #[test]

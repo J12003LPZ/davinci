@@ -1,3 +1,4 @@
+use pi_agent::PermissionMode;
 use pi_protocol::ThinkingLevel;
 use pi_tui::TuiMode;
 use std::collections::BTreeMap;
@@ -76,6 +77,8 @@ pub struct Args {
     /// `--legacy-tui`: open the previous chrome instead of the davinci shell.
     pub legacy_tui: bool,
     pub project_trust_override: Option<bool>,
+    /// `--permission-mode <mode>` or its `--sandbox <preset>` alias.
+    pub permission_mode: Option<PermissionMode>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
     pub unknown_flags: BTreeMap<String, FlagValue>,
@@ -299,6 +302,35 @@ pub fn parse_args(args: &[String]) -> Args {
             // `--davinci --screen <id>`; `--legacy-tui` asks for the old
             // chrome. Both are read from the raw argv in `main`.
             result.legacy_tui = arg == "--legacy-tui";
+        } else if arg == "--permission-mode" || arg == "--sandbox" {
+            // Two spellings of one flag: ours, and the Codex CLI's sandbox
+            // presets (`read-only`, `workspace-write`, `full-access`), which
+            // `PermissionMode::parse` maps. Neither is an OS sandbox.
+            match args.get(i + 1) {
+                None => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message: format!(
+                        "{arg} requires one of: read-only, ask, edits, auto{}",
+                        if arg == "--sandbox" {
+                            " (or read-only, workspace-write, full-access)"
+                        } else {
+                            ""
+                        }
+                    ),
+                }),
+                Some(value) => {
+                    i += 1;
+                    match PermissionMode::parse(value) {
+                        Some(mode) => result.permission_mode = Some(mode),
+                        None => result.diagnostics.push(Diagnostic {
+                            kind: "error",
+                            message: format!(
+                                "Invalid permission mode \"{value}\". Valid values: read-only, ask, edits, auto"
+                            ),
+                        }),
+                    }
+                }
+            }
         } else if arg == "--approve" || arg == "-a" {
             result.project_trust_override = Some(true);
         } else if arg == "--no-approve" || arg == "-na" {
@@ -383,6 +415,41 @@ mod tests {
         assert_eq!(davinci.messages, vec!["explain the runtime".to_string()]);
 
         assert!(!args(&["explain the runtime"]).legacy_tui);
+    }
+
+    #[test]
+    fn permission_mode_and_its_sandbox_alias_parse_the_same_modes() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            args(&["--permission-mode", "edits"]).permission_mode,
+            Some(PermissionMode::Edits)
+        );
+        assert_eq!(
+            args(&["--sandbox", "workspace-write", "hello"]).permission_mode,
+            Some(PermissionMode::Edits)
+        );
+        assert_eq!(
+            args(&["--sandbox", "full-access"]).permission_mode,
+            Some(PermissionMode::Auto)
+        );
+        assert_eq!(
+            args(&["--sandbox", "workspace-write", "hello"]).messages,
+            ["hello"]
+        );
+
+        let bad = args(&["--permission-mode", "sometimes"]);
+        assert_eq!(bad.permission_mode, None);
+        assert!(bad
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == "error"
+                && d.message.contains("Invalid permission mode \"sometimes\"")));
+        let missing = args(&["--sandbox"]);
+        assert!(missing
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("--sandbox requires")));
     }
 
     #[test]

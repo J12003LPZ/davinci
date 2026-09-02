@@ -67,10 +67,7 @@ pub fn header(model: &Model) -> Line<'static> {
             span(" │ ", th.border),
             span(format!("window {}", meta.window), th.muted),
             span(" │ ", th.border),
-            span(
-                format!("{} · {}", model.model_name, model.thinking_level),
-                th.muted,
-            ),
+            span(model_run(model), th.muted),
         ]
     } else {
         let mut right = vec![
@@ -78,10 +75,7 @@ pub fn header(model: &Model) -> Line<'static> {
             span(" │ ", th.border),
             span(model.branch.clone(), th.secondary),
             span(" │ ", th.border),
-            span(
-                format!("{} · {}", model.model_name, model.thinking_level),
-                th.muted,
-            ),
+            span(model_run(model), th.muted),
         ];
         if model.codex_open() {
             right.push(span(" │ ", th.border));
@@ -161,10 +155,7 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
             span(" · ", th.border),
             span(model.branch.clone(), th.secondary),
             span(" · ", th.border),
-            span(
-                format!("{} · {}", model.model_name, model.thinking_level),
-                th.muted,
-            ),
+            span(model_run(model), th.muted),
         ],
         Screen::Agent => {
             let mut left = vec![
@@ -406,6 +397,17 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         rows.push(hint_line(model, hint, rows_typed));
     }
     rows
+}
+
+/// The model's run in the header and status bar: `sonnet · high`, and
+/// ` · auto` after it while every tool runs unasked — the one permission
+/// mode worth a standing reminder.
+fn model_run(model: &Model) -> String {
+    let mut run = format!("{} · {}", model.model_name, model.thinking_level);
+    if model.permission_mode == "auto" {
+        run.push_str(" · auto");
+    }
+    run
 }
 
 /// Split a drawn composer row into `(before, under, after)` around the caret,
@@ -734,6 +736,18 @@ mod tests {
 
         let drawn = text(&header(&m));
         assert!(drawn.contains("sonnet · high"), "{drawn}");
+    }
+
+    #[test]
+    fn the_header_names_the_permission_mode_only_when_everything_runs_unasked() {
+        let mut m = model(100);
+        m.thinking_level = "high".into();
+        assert!(!text(&header(&m)).contains("· auto"));
+        m.permission_mode = "auto".into();
+        let drawn = text(&header(&m));
+        assert!(drawn.contains("sonnet · high · auto"), "{drawn}");
+        m.permission_mode = "edits".into();
+        assert!(!text(&header(&m)).contains("· edits"));
     }
 
     #[test]

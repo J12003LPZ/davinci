@@ -83,7 +83,7 @@ later is worth building on top of a turn that drops tool calls.
 | # | Sub-project | Outcome |
 |---|---|---|
 | 1 | **Turns that are real** (this document) | Tool calls parsed on every provider; tokens painted as they arrive; markdown transcript; thinking shown; startup and `/model` fixed. |
-| 2 | **Trust and control** | Permission modes, per-tool approval prompts in the davinci language, "always allow" persisted in `.pi/`, `--sandbox` presets. |
+| 2 | **Trust and control** (`2026-09-01-trust-and-control-design.md`) | Permission modes, per-tool approval prompts in the davinci language, "always allow" persisted in `.pi/`, `--sandbox` presets. |
 | 3 | **Tools that compete** | Background shell jobs, `web_fetch`/`web_search`, todo ledger, notebook-aware read/edit, collapsible tool output, syntax-highlighted diffs. |
 | 4 | **Native MCP client** | stdio + streamable-HTTP MCP servers from `~/.pi/agent/mcp.json`, tools and resources exposed natively, `/mcp` sheet. |
 | 5 | **Plan mode and subagents** | Plan/act toggle, native parallel subagents with scoped tools and their own transcript pane. |

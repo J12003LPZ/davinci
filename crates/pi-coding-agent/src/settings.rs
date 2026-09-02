@@ -126,11 +126,28 @@ pub struct Settings {
     pub shell_path: Option<String>,
     #[serde(default, rename = "shellCommandPrefix")]
     pub shell_command_prefix: Option<String>,
+    /// Tool permissions (`permissions.rs`): the mode and the allow/deny
+    /// rules. Not a vendor key; the project file's block is read only when
+    /// the project is trusted.
+    #[serde(default)]
+    pub permissions: Option<PermissionSettings>,
     /// Settings keys this struct does not model (for example `subagents`,
     /// written by extensions). They are carried through untouched so a rewrite
     /// by `pi install`/`pi remove` cannot silently drop another tool's config.
     #[serde(flatten, default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `permissions` in either settings file. Rules are `tool` or
+/// `tool(glob)`; see `pi_agent::PermissionRule`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PermissionSettings {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

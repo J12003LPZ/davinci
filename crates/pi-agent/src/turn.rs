@@ -513,6 +513,12 @@ impl Agent {
                     is_error: true,
                     details: None,
                 }
+            } else if let Some(reason) = self.permission_denial(cwd, id, name, args) {
+                crate::ToolResult {
+                    content: reason,
+                    is_error: true,
+                    details: None,
+                }
             } else {
                 match execute_tool(cwd, name, args) {
                     Ok(result) => result,
@@ -575,6 +581,46 @@ impl Agent {
             },
         );
         tool_result_message(id, name, result, self.auto_resize_images)
+    }
+
+    /// The permission gate: `None` lets the call run, `Some(reason)` is the
+    /// error result the model gets instead. Sits after the extension hook (a
+    /// block there wins) and after the unknown-tool check (nobody is asked
+    /// about a tool that does not exist).
+    fn permission_denial(&self, cwd: &Path, id: &str, name: &str, args: &Value) -> Option<String> {
+        use crate::{PermissionVerdict, ToolApprovalDecision};
+        let verdict = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .decide(id, name, args, cwd);
+        let request = match verdict {
+            PermissionVerdict::Allow => return None,
+            PermissionVerdict::Deny { reason } => return Some(reason),
+            PermissionVerdict::Ask(request) => request,
+        };
+        let Some(approver) = &self.approver else {
+            return Some(format!(
+                "Permission denied: `{}` needs approval in permission mode `{}`, and this run cannot ask.                  Start pi with --permission-mode auto, or add an allow rule such as `{}` to                  ~/.pi/agent/settings.json under permissions.allow.",
+                request.summary,
+                request.mode.as_str(),
+                request.session_rule
+            ));
+        };
+        match (approver.0)(&request) {
+            ToolApprovalDecision::AllowOnce => None,
+            ToolApprovalDecision::AllowForSession | ToolApprovalDecision::AllowAlways => {
+                self.permissions
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .remember(&request.session_rule);
+                None
+            }
+            ToolApprovalDecision::Deny => Some(format!(
+                "Permission denied: the user declined `{}`.",
+                request.summary
+            )),
+        }
     }
 
     fn persist_chat(&mut self, message: &ChatMessage) {

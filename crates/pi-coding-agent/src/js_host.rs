@@ -351,7 +351,10 @@ fn ui_waiter_installed() -> bool {
     UI_WAITER.with(|slot| slot.borrow().is_some())
 }
 
-fn dispatch_ui_waiter(call: &Value) -> Value {
+/// Put one UI call to whatever waiter this thread installed — the RPC loop's
+/// emit-and-wait, or nothing (`Null`) outside RPC. The permission approver
+/// uses it for its `select` from the same thread the waiter lives on.
+pub fn dispatch_ui_waiter(call: &Value) -> Value {
     UI_WAITER.with(|slot| {
         slot.borrow_mut()
             .as_mut()

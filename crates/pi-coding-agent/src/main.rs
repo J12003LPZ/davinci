@@ -86,6 +86,7 @@ mod model_resolver;
 mod native_extensions;
 mod output;
 mod packages;
+mod permissions;
 mod rpc;
 mod self_update;
 mod settings;
@@ -471,6 +472,55 @@ fn system_prompt_with_identity(agent: &Agent) -> String {
     prompt
 }
 
+/// The reply an offline run gives. `PI_OFFLINE_TOOL_CALL` is a fixture —
+/// `{"name": "bash", "arguments": {"command": "git status"}}` — that makes the
+/// first reply of a turn that tool call, so the tool path and the permission
+/// question in front of it can be driven without a provider; the reply that
+/// follows the tool result is the usual character-count stub.
+fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
+    let scripted = std::env::var("PI_OFFLINE_TOOL_CALL")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|_| {
+            current
+                .messages
+                .last()
+                .is_some_and(|message| message.role == "user")
+        });
+    let (content, stop_reason) = match scripted {
+        Some(call) => (
+            vec![ContentBlock::ToolCall {
+                id: format!("call_{}", pi_agent::new_message_id()),
+                name: call
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("bash")
+                    .to_string(),
+                arguments: call
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            }],
+            StopReason::ToolUse,
+        ),
+        None => (
+            vec![ContentBlock::Text {
+                text: format!("(offline) received {last_user} characters"),
+            }],
+            StopReason::Stop,
+        ),
+    };
+    AssistantMessage {
+        id: pi_agent::new_message_id(),
+        role: "assistant".into(),
+        content,
+        model: format!("{}/{}", current.provider, current.model_id),
+        usage: None,
+        stop_reason: Some(stop_reason),
+        error_message: None,
+    }
+}
+
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
     let mut prompt = parsed
         .system_prompt
@@ -515,6 +565,16 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         .tools
         .retain(|tool| !parsed.exclude_tools.contains(tool));
     agent.cwd = cwd.to_path_buf();
+    // The product default is `ask`; the library default (every tool runs)
+    // is only for embedders. Who answers an ask is the mode's business:
+    // davinci, RPC and the legacy chrome each install an approver, and a
+    // `--print` run fails closed.
+    agent.permissions = Arc::new(Mutex::new(permissions::policy_for(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+        parsed.permission_mode,
+    )));
     apply_discovered_resources(parsed, &mut agent);
     if !parsed.no_session {
         agent.session = Some(resolve_or_create_session(parsed, session_dir, cwd)?);
@@ -1594,17 +1654,9 @@ fn complete_prompt_with_host(
                 // fixtures expect, but a missing model or a missing credential
                 // is a fault, and a reply that only counts the characters it
                 // was handed reads like an answer while hiding one.
-                (true, ..) => Ok(CompleteOutput::from(AssistantMessage {
-                    id: pi_agent::new_message_id(),
-                    role: "assistant".into(),
-                    content: vec![ContentBlock::Text {
-                        text: format!("(offline) received {last_user} characters"),
-                    }],
-                    model: format!("{}/{}", current.provider, current.model_id),
-                    usage: None,
-                    stop_reason: Some(StopReason::Stop),
-                    error_message: None,
-                })),
+                (true, ..) => Ok(CompleteOutput::from(offline_stub_message(
+                    current, last_user,
+                ))),
                 (false, None, ..) => Err(format!(
                     "No model matched {}/{}. Run /model to choose one, or check ~/.pi/agent/models.json.",
                     current.provider, current.model_id
@@ -1831,6 +1883,27 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 let (reply, events) = complete_prompt_with_host(parsed, agent, None, json_mode);
                 last_reply = reply;
                 all_events.extend(events);
+            }
+        }
+    }
+    // A `--print` run has nobody to ask, so a call the policy could not
+    // decide was refused; `--verbose` says which, on stderr, so a script's
+    // author can add a rule or a mode rather than guess from the reply.
+    if parsed.verbose {
+        for event in &all_events {
+            if let AgentEvent::ToolExecutionEnd {
+                tool_name,
+                result,
+                is_error: true,
+                ..
+            } = event
+            {
+                if result
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Permission denied"))
+                {
+                    eprintln!("pi: denied {tool_name} (no approver in a --print run)");
+                }
             }
         }
     }
@@ -2091,6 +2164,28 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         let rx = rx.clone();
         Box::new(move |call| rpc_emit_and_wait_ui(call, &leftover, &rx))
     });
+    // A tool call the policy cannot decide is put to the client as the
+    // `select` request it already renders for extensions; the answer text is
+    // the decision. The prompt turn runs on this thread, so the waiter is
+    // the one just installed. Anything but a listed answer denies.
+    {
+        let cwd = runtime.agent.cwd.clone();
+        let trusted = settings::is_trusted(
+            &load_merged_settings(&default_agent_dir(), &cwd),
+            &cwd,
+            parsed.project_trust_override,
+        );
+        runtime.agent.approver = Some(pi_agent::ToolApprover(Arc::new(move |request| {
+            let answer = crate::js_host::dispatch_ui_waiter(&rpc_approval_call(request, trusted));
+            let decision = rpc_approval_decision(&answer, trusted);
+            if decision == pi_agent::ToolApprovalDecision::AllowAlways
+                && permissions::remember_project_rule(&cwd, &request.session_rule).is_err()
+            {
+                return pi_agent::ToolApprovalDecision::AllowForSession;
+            }
+            decision
+        })));
+    }
     loop {
         let Some(line) = rpc_next_line(&leftover, &rx) else {
             break;
@@ -2239,6 +2334,44 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     emit_session_shutdown(parsed);
     *agent = runtime.agent;
     Ok(0)
+}
+
+const RPC_APPROVAL_ONCE: &str = "allow once";
+const RPC_APPROVAL_SESSION: &str = "allow for this session";
+const RPC_APPROVAL_ALWAYS: &str = "always allow in this project";
+const RPC_APPROVAL_DENY: &str = "deny";
+
+/// The `select` an RPC client is shown for a permission question. The
+/// "always" row is offered only when the project is trusted, for the same
+/// reason davinci omits it: an untrusted project's settings are never read.
+fn rpc_approval_call(request: &pi_agent::ToolApprovalRequest, trusted: bool) -> serde_json::Value {
+    let mut options = vec![RPC_APPROVAL_ONCE, RPC_APPROVAL_SESSION];
+    if trusted {
+        options.push(RPC_APPROVAL_ALWAYS);
+    }
+    options.push(RPC_APPROVAL_DENY);
+    serde_json::json!({
+        "op": "select",
+        "title": format!("Allow {}?", request.summary),
+        "options": options,
+    })
+}
+
+/// The client's answer as a decision. Text is matched exactly; a cancelled
+/// or unknown answer is a refusal, and "always" from an untrusted project
+/// is read as "this session" because nothing would persist it.
+fn rpc_approval_decision(
+    answer: &serde_json::Value,
+    trusted: bool,
+) -> pi_agent::ToolApprovalDecision {
+    use pi_agent::ToolApprovalDecision::*;
+    match answer.as_str().map(str::trim) {
+        Some(RPC_APPROVAL_ONCE) => AllowOnce,
+        Some(RPC_APPROVAL_SESSION) => AllowForSession,
+        Some(RPC_APPROVAL_ALWAYS) if trusted => AllowAlways,
+        Some(RPC_APPROVAL_ALWAYS) => AllowForSession,
+        _ => Deny,
+    }
 }
 
 fn is_dialog_ui_call(call: &serde_json::Value) -> bool {
@@ -2706,6 +2839,23 @@ fn run_streaming_turn(
     let mut pushed_assistant = false;
     let mut verb = String::from("thinking");
     let render_host = host.clone();
+    // The legacy chrome answers a permission question with its extension
+    // confirm dialog: yes allows once, no denies. No session or project rows;
+    // this chrome is the fallback surface, davinci the product.
+    let (approval_tx, approval_rx) = std::sync::mpsc::channel::<(
+        pi_agent::ToolApprovalRequest,
+        std::sync::mpsc::Sender<pi_agent::ToolApprovalDecision>,
+    )>();
+    agent.approver = Some(pi_agent::ToolApprover(Arc::new(move |request| {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if approval_tx.send((request.clone(), reply_tx)).is_err() {
+            return pi_agent::ToolApprovalDecision::Deny;
+        }
+        reply_rx
+            .recv()
+            .unwrap_or(pi_agent::ToolApprovalDecision::Deny)
+    })));
+    let mut approval: Option<std::sync::mpsc::Sender<pi_agent::ToolApprovalDecision>> = None;
     let outcome = std::thread::scope(|scope| {
         let worker = scope.spawn(|| complete_prompt_with_host(parsed, agent, Some(host), false));
         let frames = pi_tui::glyphs::SPINNER_FRAMES;
@@ -2725,6 +2875,19 @@ fn run_streaming_turn(
                 dirty = true;
             }
             dirty |= drain_hosted_lines(session);
+            if approval.is_none() {
+                if let Ok((request, reply)) = approval_rx.try_recv() {
+                    session.open_extension_confirm(
+                        format!("Allow {}?", request.summary),
+                        format!(
+                            "permission mode {} · y runs this call once · n tells the model no",
+                            request.mode.as_str()
+                        ),
+                    );
+                    approval = Some(reply);
+                    dirty = true;
+                }
+            }
             if worker.is_finished() {
                 break;
             }
@@ -2760,12 +2923,28 @@ fn run_streaming_turn(
                         let bytes = key_event_to_bytes(&key);
                         if bytes == "\x1b" || bytes == "\x03" {
                             abort.store(true, Ordering::Relaxed);
+                            // A question left open under an interrupt is a no.
+                            if let Some(reply) = approval.take() {
+                                let _ = reply.send(pi_agent::ToolApprovalDecision::Deny);
+                                session.close_overlays();
+                            }
                             session.chrome.status =
                                 "interrupting · waiting for the current step".into();
                             sync_hosted_chrome(tui, panes, session);
                             continue;
                         }
                         match session.handle_bytes(&bytes) {
+                            pi_tui::SessionAction::ExtensionConfirm(confirmed)
+                                if approval.is_some() =>
+                            {
+                                let reply = approval.take().expect("checked above");
+                                let _ = reply.send(if confirmed {
+                                    pi_agent::ToolApprovalDecision::AllowOnce
+                                } else {
+                                    pi_agent::ToolApprovalDecision::Deny
+                                });
+                                session.chrome.status.clear();
+                            }
                             pi_tui::SessionAction::Submit(text) => {
                                 if !text.trim().is_empty() {
                                     session
@@ -2797,6 +2976,10 @@ fn run_streaming_turn(
     });
     agent.abort_signal = None;
     agent.event_sink = None;
+    agent.approver = None;
+    if approval.take().is_some() {
+        session.close_overlays();
+    }
     session.chrome.working_message = None;
     session.chrome.status.clear();
     let worker_panicked = outcome.is_err();
@@ -8323,6 +8506,95 @@ mod tests {
         .expect("stored codex credential resolves immediately");
         assert_eq!(resolved.source, "OAuth");
         assert!(resolved.api_key.is_some());
+    }
+
+    #[test]
+    fn the_offline_tool_call_fixture_scripts_one_call_then_the_usual_stub() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let mut agent = Agent::new(default_system_prompt());
+        agent.prompt("run git status");
+
+        let plain = offline_stub_message(&agent, 14);
+        assert!(
+            matches!(plain.content.first(), Some(ContentBlock::Text { text }) if text == "(offline) received 14 characters")
+        );
+        assert_eq!(plain.stop_reason, Some(StopReason::Stop));
+
+        let _fixture = EnvRestore::set(
+            "PI_OFFLINE_TOOL_CALL",
+            r#"{"name":"bash","arguments":{"command":"git status --short"}}"#,
+        );
+        let scripted = offline_stub_message(&agent, 14);
+        assert_eq!(scripted.stop_reason, Some(StopReason::ToolUse));
+        match scripted.content.first() {
+            Some(ContentBlock::ToolCall {
+                name, arguments, ..
+            }) => {
+                assert_eq!(name, "bash");
+                assert_eq!(arguments["command"], "git status --short");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // After the tool answered, the fixture steps aside.
+        agent
+            .messages
+            .push(pi_ai::ChatMessage::text("toolResult", "ok"));
+        let after = offline_stub_message(&agent, 14);
+        assert_eq!(after.stop_reason, Some(StopReason::Stop));
+    }
+
+    #[test]
+    fn rpc_permission_questions_are_a_select_and_only_listed_answers_allow() {
+        use pi_agent::ToolApprovalDecision::*;
+        let request = pi_agent::ToolApprovalRequest {
+            tool_call_id: "call_1".into(),
+            tool: "bash".into(),
+            args: serde_json::json!({"command": "git status"}),
+            subject: "git status".into(),
+            summary: "bash · git status".into(),
+            session_rule: "bash(git status *)".into(),
+            outside_project: false,
+            mode: pi_agent::PermissionMode::Ask,
+        };
+        let call = rpc_approval_call(&request, true);
+        assert_eq!(call["op"], "select");
+        assert_eq!(call["title"], "Allow bash · git status?");
+        assert_eq!(
+            call["options"],
+            serde_json::json!([
+                "allow once",
+                "allow for this session",
+                "always allow in this project",
+                "deny"
+            ])
+        );
+        assert_eq!(
+            rpc_approval_call(&request, false)["options"],
+            serde_json::json!(["allow once", "allow for this session", "deny"])
+        );
+
+        let answer = |text: &str| serde_json::Value::String(text.into());
+        assert_eq!(
+            rpc_approval_decision(&answer("allow once"), true),
+            AllowOnce
+        );
+        assert_eq!(
+            rpc_approval_decision(&answer("allow for this session"), true),
+            AllowForSession
+        );
+        assert_eq!(
+            rpc_approval_decision(&answer("always allow in this project"), true),
+            AllowAlways
+        );
+        assert_eq!(
+            rpc_approval_decision(&answer("always allow in this project"), false),
+            AllowForSession
+        );
+        assert_eq!(rpc_approval_decision(&answer("deny"), true), Deny);
+        assert_eq!(rpc_approval_decision(&answer("yes please"), true), Deny);
+        assert_eq!(rpc_approval_decision(&serde_json::Value::Null, true), Deny);
     }
 
     #[test]

@@ -1221,6 +1221,10 @@ pub struct Model {
     pub model_name: String,
     /// Active thinking/reasoning level for the model in hand (`off`, `high`, ...).
     pub thinking_level: String,
+    /// The permission mode in force (`ask`, `edits`, `auto`, `read-only`).
+    /// The header names it only when it is `auto`: the one state that is
+    /// worth a permanent reminder.
+    pub permission_mode: String,
     /// `Δn +a -d` for the status bar.
     pub changes: (u32, u32, u32),
     /// `(used, cap)` in tokens.
@@ -1356,6 +1360,7 @@ impl Model {
             branch: String::new(),
             model_name: String::new(),
             thinking_level: "off".into(),
+            permission_mode: "ask".into(),
             changes: (0, 0, 0),
             context: (0, 200_000),
             startup: Startup::default(),
