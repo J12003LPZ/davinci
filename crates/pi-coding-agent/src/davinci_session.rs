@@ -4391,8 +4391,10 @@ fn open_trust_sheet(agent: &Agent, model: &mut Model) {
     }
     let store = crate::trust::ProjectTrustStore::open(&crate::default_agent_dir());
     let (trusted, ignored) = store.counts();
+    let first_visit = store.get(cwd).is_none();
     model.project_trust = Some(ProjectTrustSheet {
         files,
+        first_visit,
         path: cwd.display().to_string(),
         trusted: format!("{trusted} projects"),
         ignored: ignored.to_string(),

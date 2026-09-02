@@ -1466,7 +1466,8 @@ pub fn project_trust() -> ProjectTrustSheet {
         path: "C:\\dev\\clones\\vendor-cli".into(),
         trusted: "14 projects".into(),
         ignored: "2".into(),
-        store: "%USERPROFILE%\\.pi\\trust.json".into(),
+        store: "%USERPROFILE%\\.pi\\agent\\trust.json".into(),
+        first_visit: true,
     }
 }
 
@@ -1920,6 +1921,9 @@ fn sheet(model: &mut Model, screen: crate::davinci::model::Screen) {
     model.running = false;
     model.overlay = None;
     model.screen = screen;
+    if model.branch.is_empty() {
+        model.branch = "main".into();
+    }
 }
 
 #[cfg(test)]

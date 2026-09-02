@@ -1261,6 +1261,8 @@ pub struct ProjectTrustSheet {
     pub trusted: String,
     pub ignored: String,
     pub store: String,
+    /// No decision is on file for this path yet.
+    pub first_visit: bool,
 }
 
 /// What `/reload` loaded, and what it cost (`6b`).
