@@ -2324,6 +2324,7 @@ pub fn perform(
                 recovers: thousands(before.saturating_sub(after)),
                 call_cost: "in the next /session stats".into(),
                 cache_cost: "the cache re-primes on the next turn".into(),
+                ..Default::default()
             });
             open_sheet(model, Screen::Compact);
             Ok(Done::Opened)
@@ -2383,6 +2384,7 @@ pub fn perform(
                 size,
                 elapsed: format!("{:.1}s", started.elapsed().as_secs_f64()),
                 gist: output.display().to_string(),
+                ..Default::default()
             });
             open_sheet(model, Screen::Export);
             let _ = said;
@@ -4910,6 +4912,7 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             number(&budgets, "maxReplans")
         ),
         artifacts: format!(".pi\\graph\\{}\\", json_str(run, "runId")),
+        ..Default::default()
     })
 }
 

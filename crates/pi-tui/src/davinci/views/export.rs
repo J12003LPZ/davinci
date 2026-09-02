@@ -6,30 +6,24 @@
 //! secret gist is not a private one, and the panel says so rather than
 //! implying it with a colour.
 //!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/export.ex`.
+//! Mirrors artboard `4d` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::text::{Line, Span};
 
+use super::sheet::{facts, Composer, SheetChrome};
 use crate::davinci::model::Model;
-use crate::davinci::theme::{glyph, State};
-use crate::davinci::ui::{
-    blank, meter, span, span_on, span_strong, truncate_run, wrap, Surface, MEASURE,
-};
+use crate::davinci::theme::State;
+use crate::davinci::ui::{blank, meter, span, span_on, span_strong, truncate_run, wrap, Surface};
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
     let Some(ledger) = model.export_ledger.as_ref() else {
         return vec![Line::from(vec![span(
             "nothing to export yet — /export writes the session once it holds a turn",
             th.muted,
         )])];
     };
-
-    let echo = Line::from(vec![
-        span(format!("{} ", glyph::USER), th.primary),
-        span("/export", th.muted),
-    ]);
 
     let formats = Line::from(vec![
         span("format ", th.border),
@@ -58,31 +52,43 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         ]
     }));
     ledger_rows.push(Vec::new());
+    let turns = if ledger.turns.is_empty() {
+        "every turn".to_string()
+    } else {
+        format!("{} of {} turns", ledger.turns, ledger.turns)
+    };
     let mut written_row = vec![
         span_strong(format!("{} ", State::Done.glyph()), th.success, th),
-        span("written in full", th.text),
+        span(format!("wrote {turns}"), th.text),
         span("  ", th.border),
     ];
-    written_row.extend(meter(1.0, 20, th, Some(th.success)));
-    written_row.push(span(format!("  {}", ledger.elapsed), th.border));
+    written_row.extend(meter(1.0, 24, th, Some(th.success)));
+    written_row.push(span(
+        format!("  {} · {}", ledger.size, ledger.elapsed),
+        th.border,
+    ));
     ledger_rows.push(written_row);
 
     let written = Surface::new(width, th)
         .title(vec![span("WHAT LEAVES THE SESSION", th.primary)])
-        .right(vec![span(ledger.size.clone(), th.border)])
         .rows(ledger_rows)
         .lines();
 
+    let uploaded = if ledger.file.is_empty() {
+        "uploaded to your GitHub account".to_string()
+    } else {
+        format!("uploaded as {} to your GitHub account", ledger.file)
+    };
     let mut share_rows: Vec<Vec<Span<'static>>> = vec![
         vec![
             span(format!("{} ", State::Read.glyph()), th.secondary),
-            span("uploaded to your GitHub account", th.muted),
-            span(format!("  {}", ledger.size), th.border),
+            span(uploaded, th.muted),
+            span(format!(" · {}", ledger.size), th.border),
         ],
         vec![
             span(format!("{} ", State::Read.glyph()), th.secondary),
             span(ledger.gist.clone(), th.text),
-            span("  copied to the clipboard", th.border),
+            span(" · copied to the clipboard", th.border),
         ],
     ];
     for row in wrap(
@@ -121,32 +127,65 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             span(" resumes it on any machine", th.muted),
         ]),
         Line::from(vec![span(
-            "exports are written next to the cwd, never into the session store",
+            "exports are written next to the cwd, never to the session store",
             th.border,
         )]),
     ];
 
-    let mut out = vec![echo, blank(), formats, blank()];
+    let mut out = vec![formats, blank()];
     out.extend(written);
     out.push(blank());
     out.extend(share);
     out.push(blank());
     out.extend(tail);
     out.into_iter()
-        .map(|line| Line::from(truncate_run(line.spans, model.width)))
+        .map(|line| Line::from(truncate_run(line.spans, width)))
         .collect()
 }
 
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
+/// The sheet's frame (design.md §11): the session leaving in the header,
+/// `exporting` in the status bar, the keys inside the share panel rather
+/// than a hint row, no composer.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    let ledger = model.export_ledger.as_ref();
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                ledger
+                    .filter(|l| !l.session.is_empty())
+                    .map(|l| vec![span(l.session.clone(), th.text)])
+                    .unwrap_or_default(),
+                ledger
+                    .filter(|l| !l.turns.is_empty())
+                    .map(|l| vec![span(format!("{} turns", l.turns), th.muted)])
+                    .unwrap_or_default(),
+                ledger
+                    .filter(|l| !l.session_bytes.is_empty())
+                    .map(|l| vec![span(format!("{} jsonl", l.session_bytes), th.muted)])
+                    .unwrap_or_default(),
+            ],
+        ),
+        status_third: ledger.map(|_| vec![span("exporting", th.muted)]),
+        status_right: None,
+        hints: Vec::new(),
+        escape: None,
+        composer: Composer::Hidden,
+        echo: Some(
+            ledger
+                .filter(|l| !l.file.is_empty())
+                .map(|l| format!("/export {}", l.file))
+                .unwrap_or_else(|| "/export".into()),
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::model::ExportLedger;
+    use crate::davinci::fixtures;
+    use crate::davinci::model::Screen;
     use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
 
@@ -157,25 +196,8 @@ mod tests {
             44,
             true,
         );
-        model.export_ledger = Some(ExportLedger {
-            included: vec![
-                "42 turns of prose and thinking".into(),
-                "31 tool calls with their output".into(),
-            ],
-            excluded: vec![
-                (
-                    State::Failed,
-                    "api keys and bearer tokens · redacted".into(),
-                ),
-                (
-                    State::Attention,
-                    "absolute paths · kept, they name your machine".into(),
-                ),
-            ],
-            size: "2.9 MB".into(),
-            elapsed: "1.4s".into(),
-            gist: "https://gist.github.com/9f21c4…a70".into(),
-        });
+        model.export_ledger = Some(fixtures::export_ledger());
+        model.toggle_screen(Screen::Export);
         model
     }
 
@@ -187,43 +209,71 @@ mod tests {
     }
 
     #[test]
-    fn the_ledger_states_what_leaves_and_what_was_redacted() {
+    fn the_ledger_says_what_leaves_what_is_redacted_and_what_was_written() {
         let m = model(100);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
+        assert!(rows[0].starts_with("format"), "{}", rows[0]);
         assert!(rows
             .iter()
             .any(|row| row.contains("WHAT LEAVES THE SESSION")));
-        assert!(rows.iter().any(|row| row.contains("42 turns of prose")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("api keys and bearer tokens")));
-        assert!(rows.iter().any(|row| row.contains("2.9 MB")));
+            .any(|row| row.contains("× api keys and bearer tokens · redacted")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("! absolute paths · kept, they name your machine")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("✓ wrote 42 of 42 turns") && row.contains("2.9 MB · 1.4s")));
     }
 
     #[test]
-    fn a_secret_gist_is_named_and_warned_about() {
+    fn the_share_panel_names_the_gist_and_warns_that_secret_is_not_private() {
         let m = model(100);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
+        assert!(rows.iter().any(|row| row.contains("SHARE · SECRET GIST")));
+        assert!(rows.iter().any(
+            |row| row.contains("uploaded as review-agent-runtime.html to your GitHub account")
+        ));
+        assert!(rows.iter().any(|row| row.contains("secret is not private")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("https://gist.github.com/9f21c4…a70")));
-        assert!(rows.iter().any(|row| row.contains("secret is not private")));
+            .any(|row| row.contains("[o] open in browser") && row.contains("[esc] done")));
+        assert!(!rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
-    fn with_nothing_to_export_the_screen_says_so() {
+    fn nothing_to_export_says_so() {
         let mut m = model(100);
         m.export_ledger = None;
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].contains("nothing to export yet"));
+        assert!(rows.iter().any(|row| row.contains("nothing to export yet")));
     }
 
     #[test]
-    fn no_row_overflows_the_window_at_any_width() {
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "4d");
+        let c = chrome(&m);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "review-agent-runtime │ 42 turns │ 1.8 MB jsonl");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "exporting");
+        assert_eq!(c.escape, None);
+        assert_eq!(c.composer, Composer::Hidden);
+        assert_eq!(c.echo.as_deref(), Some("/export review-agent-runtime.html"));
+    }
+
+    #[test]
+    fn nothing_overflows_at_any_width() {
         for width in [72u16, 80, 100, 120, 160] {
-            let m = model(width);
-            for row in lines(&m) {
+            for row in lines(&model(width)) {
                 assert!(
                     run_width(&row.spans) <= width,
                     "at {width}: {:?}",

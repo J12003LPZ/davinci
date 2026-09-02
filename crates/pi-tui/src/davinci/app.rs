@@ -243,10 +243,13 @@ fn panel(model: &Model, rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'st
     let th = &model.theme;
     let mut out = Vec::with_capacity(height);
     if let Some(echo) = &chrome.echo {
-        out.push(Line::from(vec![
-            ui::span(format!("{} ", super::theme::glyph::USER), th.muted),
-            ui::span(echo.clone(), th.muted),
-        ]));
+        out.push(Line::from(ui::truncate_run(
+            vec![
+                ui::span(format!("{} ", super::theme::glyph::USER), th.muted),
+                ui::span(echo.clone(), th.muted),
+            ],
+            model.width,
+        )));
         out.push(blank());
     }
     let hint_rows = usize::from(hint.is_some());

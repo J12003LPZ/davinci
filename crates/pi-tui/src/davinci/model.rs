@@ -1040,6 +1040,15 @@ pub struct Compaction {
     pub recovers: String,
     pub call_cost: String,
     pub cache_cost: String,
+    /// Whether auto-compaction is on, and at what threshold (`92%`).
+    pub auto: bool,
+    pub threshold: String,
+    /// The command that opened the sheet, echoed as its first row.
+    pub command: String,
+    /// `1.4k` — what the folded note itself costs.
+    pub note_cost: String,
+    /// `compacted 2× this session · last at turn 24 · recovered 88k`.
+    pub history: String,
 }
 
 /// What an export carries out of the session (`4d`).
@@ -1050,6 +1059,12 @@ pub struct ExportLedger {
     pub size: String,
     pub elapsed: String,
     pub gist: String,
+    /// The session leaving: its name, turn count and jsonl size.
+    pub session: String,
+    pub turns: String,
+    pub session_bytes: String,
+    /// The file written, `review-agent-runtime.html`.
+    pub file: String,
 }
 
 /// One worker of a graph run (`5a`).
@@ -1077,6 +1092,11 @@ pub struct GraphRunSheet {
     pub cycles: String,
     pub replans: String,
     pub artifacts: String,
+    /// `g-7f2a`, `complex`, `2 of 4`, `6m18s`.
+    pub id: String,
+    pub mode: String,
+    pub milestone: String,
+    pub elapsed: String,
 }
 
 /// The vector index itself (`5b`).

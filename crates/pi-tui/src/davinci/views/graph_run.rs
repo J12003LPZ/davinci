@@ -5,24 +5,28 @@
 //! Every worker is a child process with its own tool allowlist and its own
 //! shell policy, and the screen says which policy each one got — that is the
 //! whole safety argument, so it is on the row rather than in a manual. The
-//! phase rail and the budgets are meters with their caps (design.md §9).
+//! stage strip and the budgets are meters with their caps (design.md §9).
 //!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/graph_run.ex`.
+//! Mirrors artboard `5a` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::text::{Line, Span};
 
+use super::sheet::{facts, hint, status_meter, Composer, SheetChrome};
 use crate::davinci::model::{GraphTask, Model};
-use crate::davinci::theme::{glyph, State};
+use crate::davinci::theme::State;
 use crate::davinci::ui::{
-    blank, clip_ellipsis, meter, pad, span, span_strong, truncate_run, Surface, MEASURE,
+    blank, clip_ellipsis, column_header, footnote, meter, run_width, selection_bar, span,
+    span_strong, spread, truncate_run, Surface,
 };
 
-const ID: usize = 16;
-const POLICY: usize = 21;
+const ID: u16 = 16;
+const POLICY: u16 = 21;
+/// The selection bar and the state glyph.
+const LEAD: u16 = 5;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
     let Some(run) = model.graph_run.as_ref() else {
         return vec![Line::from(vec![span(
             "no graph run is in flight — /graph <goal> starts one",
@@ -30,19 +34,19 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         )])];
     };
 
-    let echo = Line::from(vec![
-        span(format!("{} ", glyph::USER), th.primary),
-        span(format!("/graph {}", run.goal), th.muted),
-    ]);
-
-    let mut rail_spans: Vec<Span<'static>> = Vec::new();
-    for (name, state) in &run.phases {
-        rail_spans.push(span_strong(
+    // The stage strip: every phase with its glyph, joined by connectors, the
+    // elapsed time at the right edge.
+    let mut strip: Vec<Span<'static>> = Vec::new();
+    for (index, (name, state)) in run.phases.iter().enumerate() {
+        if index > 0 {
+            strip.push(span(" ── ", th.border));
+        }
+        strip.push(span_strong(
             format!("{} ", state.glyph()),
             th.state_color(*state),
             th,
         ));
-        rail_spans.push(span(
+        strip.push(span(
             name.clone(),
             if *state == State::Active {
                 th.text
@@ -50,10 +54,19 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
                 th.muted
             },
         ));
-        rail_spans.push(span("  ", th.border));
     }
-    let rail = Line::from(rail_spans);
+    let elapsed = if run.elapsed.is_empty() {
+        Vec::new()
+    } else {
+        vec![span(format!("{} elapsed", run.elapsed), th.border)]
+    };
+    let rail = spread(width, strip, elapsed);
 
+    let blocked = run
+        .tasks
+        .iter()
+        .filter(|task| task.state == State::Failed)
+        .count();
     let graph = Surface::new(width, th)
         .title(vec![
             span("GRAFO", th.primary),
@@ -63,7 +76,12 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         .right(vec![
             span(format!("{} tasks", run.tasks.len()), th.muted),
             span(" · ", th.border),
-            span("0 blocked", th.success),
+            span(format!("{} parallel", run.parallel), th.muted),
+            span(" · ", th.border),
+            span(
+                format!("{blocked} blocked"),
+                if blocked > 0 { th.warning } else { th.success },
+            ),
         ])
         .rows(
             run.shape
@@ -73,23 +91,23 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         )
         .lines();
 
-    let header = Line::from(vec![
-        pad(2, None),
-        span(format!("{:<width$}", "WORKER", width = ID + 1), th.border),
-        span(
-            format!("{:<width$}", "SHELL POLICY", width = POLICY + 1),
-            th.border,
-        ),
-        span("ARTIFACT", th.border),
-    ]);
-
     // Below 88 the usage column goes: what a worker is doing outranks what it
     // has spent, and the run total is in the budgets below either way.
     let usage = model.width >= 88;
+    let mut columns: Vec<(&str, u16, bool)> = vec![
+        ("", LEAD - 1, false),
+        ("WORKER", ID, false),
+        ("POLICY", POLICY, false),
+        ("ARTIFACT", 0, false),
+    ];
+    if usage {
+        columns.push(("↑ ↓ $ TIME", 24, true));
+    }
+    let header = column_header(width, &columns, th);
     let tasks: Vec<Line<'static>> = run
         .tasks
         .iter()
-        .map(|task| task_row(task, model, usage))
+        .map(|task| task_row(task, model, usage, width))
         .collect();
 
     let mut cost_row = vec![
@@ -100,7 +118,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         span("  ", th.border),
     ];
     cost_row.extend(meter(run.cost_fraction, 16, th, Some(th.success)));
-    let budgets = vec![
+    let mut budgets = vec![
         Line::from(cost_row),
         Line::from(vec![
             span("workers ", th.muted),
@@ -108,60 +126,101 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             span(" · at most ", th.muted),
             span(run.parallel.clone(), th.text),
             span(" at a time", th.muted),
-            span(" · revision cycles ", th.muted),
+        ]),
+        Line::from(vec![
+            span("revision cycles ", th.muted),
             span(run.cycles.clone(), th.text),
             span(" · replans ", th.muted),
             span(run.replans.clone(), th.text),
         ]),
-        Line::from(vec![
-            span("no run deadline · per-role timeouts unlimited", th.border),
-            span(" · ", th.border),
-            span(run.artifacts.clone(), th.border),
-        ]),
+        Line::from(vec![span(
+            "no run deadline · per-role timeouts unlimited",
+            th.border,
+        )]),
     ];
+    budgets.extend(footnote(
+        width,
+        vec![
+            span("artifacts in ", th.muted),
+            span(run.artifacts.clone(), th.secondary),
+        ],
+        vec![span(
+            "ctrl+c aborts the run, keeps the artifacts",
+            th.border,
+        )],
+        th,
+    ));
 
-    let footer = vec![
-        Line::from(vec![
-            span("enter open artifact", th.border),
-            span(" · ", th.border),
-            span("v tail a worker", th.border),
-            span(" · ", th.border),
-            span("r resume a stopped run", th.border),
-        ]),
-        Line::from(vec![
-            span("a abort", th.border),
-            span(" · ", th.border),
-            span("esc close", th.border),
-        ]),
-    ];
-
-    let mut out = vec![echo, blank(), rail, blank()];
+    let mut out = vec![rail, blank()];
     out.extend(graph);
     out.push(blank());
-    out.push(header);
+    out.push(Line::from(vec![
+        span("workers", th.text),
+        span(
+            "   each one a child process · own tool allowlist · own bash policy",
+            th.border,
+        ),
+    ]));
+    out.extend(header);
     out.extend(tasks);
     out.push(blank());
     out.extend(budgets);
-    out.push(blank());
-    out.extend(footer);
     out.into_iter()
-        .map(|line| Line::from(truncate_run(line.spans, model.width)))
+        .map(|line| Line::from(truncate_run(line.spans, width)))
         .collect()
 }
 
-fn task_row(task: &GraphTask, model: &Model, usage: bool) -> Line<'static> {
+/// The sheet's frame (design.md §11): the run in the header, the phase in
+/// hand in the status bar with the run cost as its meter.
+pub fn chrome(model: &Model) -> SheetChrome {
     let th = &model.theme;
-    let glyph = if task.state == State::Active {
+    let run = model.graph_run.as_ref();
+    let phase = run.and_then(|run| {
+        run.phases
+            .iter()
+            .find(|(_, state)| *state == State::Active)
+            .map(|(name, _)| name.clone())
+    });
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                run.filter(|r| !r.id.is_empty())
+                    .map(|r| vec![span("run ", th.muted), span(r.id.clone(), th.text)])
+                    .unwrap_or_default(),
+                run.filter(|r| !r.mode.is_empty())
+                    .map(|r| vec![span(r.mode.clone(), th.muted)])
+                    .unwrap_or_default(),
+                run.filter(|r| !r.milestone.is_empty())
+                    .map(|r| vec![span(format!("milestone {}", r.milestone), th.muted)])
+                    .unwrap_or_default(),
+            ],
+        ),
+        status_third: phase.map(|phase| vec![span(phase, th.primary)]),
+        status_right: run
+            .map(|r| status_meter(th, "run cost", r.cost_fraction, &r.cost, &r.cost_cap)),
+        hints: vec![
+            hint(th, "enter open artifact"),
+            hint(th, "v tail a worker"),
+            hint(th, "r resume a stopped run"),
+            hint(th, "a abort"),
+        ],
+        escape: Some("esc close"),
+        composer: Composer::Prompt("/graph-view t6"),
+        echo: run.map(|r| format!("/graph {}", r.goal)),
+    }
+}
+
+fn task_row(task: &GraphTask, model: &Model, usage: bool, width: u16) -> Line<'static> {
+    let th = &model.theme;
+    let active = task.state == State::Active;
+    let glyph = if active {
         model.theme.spinner(model.tick, model.animate).to_string()
     } else {
         task.state.glyph().to_string()
     };
     let color = th.state_color(task.state);
-    let text_color = if task.state == State::Active {
-        th.text
-    } else {
-        th.muted
-    };
+    let text_color = if active { th.text } else { th.muted };
     let detail = if task.state == State::Queued {
         th.border
     } else {
@@ -169,30 +228,29 @@ fn task_row(task: &GraphTask, model: &Model, usage: bool) -> Line<'static> {
     };
 
     let mut spans = vec![
+        selection_bar(active, th),
         span_strong(format!("{glyph} "), color, th),
-        span(format!("{:<width$}", task.id, width = ID + 1), text_color),
-        span(
-            format!("{:<width$}", task.policy, width = POLICY + 1),
-            detail,
-        ),
-        span(format!("{:<29}", clip_ellipsis(&task.artifact, 28)), detail),
+        span(format!("{:<w$} ", task.id, w = ID as usize), text_color),
+        span(format!("{:<w$} ", task.policy, w = POLICY as usize), detail),
     ];
-    if usage {
-        spans.push(span(task.usage.clone(), th.border));
-    }
-    Line::from(spans)
-}
-
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
+    let right = if usage {
+        vec![span(task.usage.clone(), th.border)]
+    } else {
+        Vec::new()
+    };
+    let room = width
+        .saturating_sub(run_width(&spans))
+        .saturating_sub(run_width(&right))
+        .saturating_sub(1);
+    spans.push(span(clip_ellipsis(&task.artifact, room), detail));
+    spread(width, spans, right)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::model::GraphRunSheet;
+    use crate::davinci::fixtures;
+    use crate::davinci::model::Screen;
     use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
 
@@ -203,49 +261,8 @@ mod tests {
             44,
             true,
         );
-        model.graph_run = Some(GraphRunSheet {
-            goal: "add prompt-cache parity to the openai adapter --complex".into(),
-            phases: vec![
-                ("classify".into(), State::Done),
-                ("implement".into(), State::Active),
-                ("verify".into(), State::Queued),
-            ],
-            shape: vec![
-                "t1 classifier ─┬─ t2 researcher ─┐".into(),
-                "               └─ t6 writer ◉".into(),
-            ],
-            tasks: vec![
-                GraphTask {
-                    id: "t1 classifier".into(),
-                    policy: "read-only".into(),
-                    artifact: "feature · complex".into(),
-                    usage: "2.1k↑ 0.4k↓ $0.01 4s".into(),
-                    state: State::Done,
-                },
-                GraphTask {
-                    id: "t6 writer".into(),
-                    policy: "write-no-git-mutation".into(),
-                    artifact: "davinci-ai\\src\\openai.rs".into(),
-                    usage: "64k↑ 9.7k↓ $0.71 2m14s".into(),
-                    state: State::Active,
-                },
-                GraphTask {
-                    id: "t7 reviewer".into(),
-                    policy: "read-and-test".into(),
-                    artifact: "pending · waits on t6".into(),
-                    usage: "—".into(),
-                    state: State::Queued,
-                },
-            ],
-            cost: "$1.31".into(),
-            cost_cap: "$8.00".into(),
-            cost_fraction: 0.16,
-            workers: "6 of 12".into(),
-            parallel: "3".into(),
-            cycles: "0 of 2".into(),
-            replans: "0 of 1".into(),
-            artifacts: ".davinci\\graph\\g-7f2a\\".into(),
-        });
+        model.graph_run = Some(fixtures::graph_run_sheet());
+        model.toggle_screen(Screen::GraphRun);
         model
     }
 
@@ -257,78 +274,108 @@ mod tests {
     }
 
     #[test]
-    fn every_worker_states_its_shell_policy_on_its_own_row() {
+    fn the_stage_strip_joins_every_phase_and_states_the_elapsed_time() {
         let m = model(100);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("SHELL POLICY")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("t6 writer") && row.contains("write-no-git-mutation")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("t7 reviewer") && row.contains("read-and-test")));
+        assert!(
+            rows[0].starts_with("✓ classify ── ✓ investigate ── ✓ plan ── ◉ implement"),
+            "{}",
+            rows[0]
+        );
+        assert!(rows[0].trim_end().ends_with("6m18s elapsed"), "{}", rows[0]);
     }
 
     #[test]
-    fn the_cost_meter_carries_its_cap() {
+    fn every_worker_states_its_policy_artifact_and_spend() {
         let m = model(100);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
         assert!(rows
             .iter()
-            .any(|row| row.contains("$1.31") && row.contains("$8.00")));
-    }
-
-    #[test]
-    fn below_88_columns_the_usage_column_goes() {
-        let wide = model(100);
-        let rows: Vec<String> = lines(&wide).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("2m14s")));
-
-        let narrow = model(80);
-        let rows: Vec<String> = lines(&narrow).iter().map(text).collect();
-        assert!(!rows.iter().any(|row| row.contains("2m14s")));
-    }
-
-    #[test]
-    fn only_the_active_task_animates_and_stillness_freezes_it() {
-        let mut m = model(100);
-        let frame = |m: &Model| -> Vec<String> { lines(m).iter().map(text).collect() };
-        m.tick = 0;
-        let first = frame(&m);
-        m.tick = 1;
-        let second = frame(&m);
-        let moved: Vec<usize> = first
+            .any(|row| row.contains("7 tasks · 3 parallel · 0 blocked")));
+        assert!(rows
             .iter()
-            .zip(&second)
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(index, _)| index)
-            .collect();
-        assert_eq!(moved.len(), 1, "exactly one row animates: {moved:?}");
-        assert!(first[moved[0]].contains("t6 writer"));
-
-        m.animate = false;
-        m.tick = 0;
-        let still_first = frame(&m);
-        m.tick = 1;
-        let still_second = frame(&m);
-        assert_eq!(still_first, still_second, "stillness froze nothing");
+            .any(|row| row.contains("WORKER") && row.contains("POLICY")));
+        let writer = rows
+            .iter()
+            .find(|row| row.contains("t6 writer") && row.contains("write-no-git"))
+            .expect("the writer row");
+        assert!(
+            writer.starts_with("▌  "),
+            "the running worker is marked: {writer}"
+        );
+        assert!(writer.contains("write-no-git-mutation"), "{writer}");
+        assert!(
+            writer.trim_end().ends_with("64k↑ 9.7k↓ $0.71 2m14s"),
+            "{writer}"
+        );
+        assert!(rows.iter().any(|row| row.contains("cost $1.31 of $8.00")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("artifacts in .pi\\graph\\g-7f2a\\")
+                && row.contains("ctrl+c aborts the run, keeps the artifacts")));
+        assert!(!rows.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
-    fn with_no_run_in_flight_the_screen_says_so() {
+    fn below_eighty_eight_columns_the_spend_column_goes() {
+        let m = model(80);
+        let rows: Vec<String> = lines(&m).iter().map(text).collect();
+        assert!(!rows.iter().any(|row| row.contains("$0.71")));
+        assert!(rows.iter().any(|row| row.contains("t6 writer")));
+    }
+
+    #[test]
+    fn no_run_says_how_to_start_one() {
         let mut m = model(100);
         m.graph_run = None;
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].contains("no graph run is in flight"));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("/graph <goal> starts one")));
     }
 
     #[test]
-    fn no_row_overflows_the_window_at_any_width() {
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "5a");
+        let c = chrome(&m);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "run g-7f2a │ complex │ milestone 2 of 4");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "implement");
+        let right: String = c
+            .status_right
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(right.starts_with("run cost "), "{right}");
+        assert!(right.ends_with(" $1.31/$8.00"), "{right}");
+        assert_eq!(c.escape, Some("esc close"));
+        assert_eq!(c.composer, Composer::Prompt("/graph-view t6"));
+        assert_eq!(
+            c.echo.as_deref(),
+            Some("/graph add prompt-cache parity to the openai adapter --complex")
+        );
+        let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
+        assert!(
+            hint.starts_with("enter open artifact │ v tail a worker"),
+            "{hint}"
+        );
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+    }
+
+    #[test]
+    fn nothing_overflows_at_any_width() {
         for width in [72u16, 80, 100, 120, 160] {
-            let m = model(width);
-            for row in lines(&m) {
+            for row in lines(&model(width)) {
                 assert!(
                     run_width(&row.spans) <= width,
                     "at {width}: {:?}",

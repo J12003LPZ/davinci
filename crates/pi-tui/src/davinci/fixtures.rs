@@ -1020,6 +1020,11 @@ pub fn compaction() -> Compaction {
         recovers: "122.4k".into(),
         call_cost: "$0.19".into(),
         cache_cost: "$0.23".into(),
+        auto: true,
+        threshold: "92%".into(),
+        command: "/compact keep the store.rs decisions verbatim".into(),
+        note_cost: "1.4k".into(),
+        history: "compacted 2× this session · last at turn 24 · recovered 88k".into(),
     }
 }
 
@@ -1053,6 +1058,10 @@ pub fn export_ledger() -> ExportLedger {
         size: "2.9 MB".into(),
         elapsed: "1.4s".into(),
         gist: "https://gist.github.com/9f21c4…a70".into(),
+        session: "review-agent-runtime".into(),
+        turns: "42".into(),
+        session_bytes: "1.8 MB".into(),
+        file: "review-agent-runtime.html".into(),
     }
 }
 
@@ -1141,6 +1150,10 @@ pub fn graph_run_sheet() -> GraphRunSheet {
         cycles: "0 of 2".into(),
         replans: "0 of 1".into(),
         artifacts: ".pi\\graph\\g-7f2a\\".into(),
+        id: "g-7f2a".into(),
+        mode: "complex".into(),
+        milestone: "2 of 4".into(),
+        elapsed: "6m18s".into(),
     }
 }
 
