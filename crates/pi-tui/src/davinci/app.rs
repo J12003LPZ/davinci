@@ -15,6 +15,7 @@ use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOw
 use super::model::{Choice, Model, Overlay, Screen};
 use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
+use super::views::sheet::{self, Composer};
 use super::views::{
     ask, codex, cogitator, compact, diff, disegno, export, governor, grafo, graph_run, instrumenta,
     keys, login, mcp, memoria, mensura, officina, opera, permissions, recovery, resume, securitas,
@@ -112,6 +113,22 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
     // `1e`, `1g`, `2a`–`2c`).
     let untouched =
         model.transcript.is_empty() && model.composer.is_empty() && model.queued.is_empty();
+    // A command sheet says what sits under it; its hint row is the only hint
+    // row (design.md §11).
+    if let Some(sheet) = sheet::chrome(model) {
+        match sheet.composer {
+            Composer::Hidden => return Vec::new(),
+            Composer::Disabled(text) => return chrome::disabled_composer(model, text),
+            Composer::Prompt(_) => {
+                if model.queued.is_empty() {
+                    return chrome::composer(model, None, Hint::None);
+                }
+                let mut rows: Vec<String> = model.queued.clone();
+                rows.extend(model.composer.split('\n').map(str::to_string));
+                return chrome::composer(model, Some(&rows), Hint::None);
+            }
+        }
+    }
     let hint = if model.overlay.is_some() || model.minimal() || model.codex_open() {
         Hint::None
     } else {
@@ -211,18 +228,41 @@ fn empty_state(model: &Model, height: usize) -> Vec<Line<'static>> {
     pad_to(out, height)
 }
 
-/// A screen that takes over the body: the turn that produced it stays visible
-/// above, and the panel is anchored above the composer, as the mockups show
-/// (`1c`, `2a`, `2b`, `2c`).
+/// A screen that takes over the body. A command sheet (`3a`–`6d`) fills it
+/// from the header down: the command that summoned it echoed first, the
+/// rows windowed around the selection, its hint row pinned last (design.md
+/// §11). The screens with a frame of their own (`1c`, `2a`–`2c`) keep the
+/// turn that produced them visible above and anchor to the composer.
 fn panel(model: &Model, rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
-    let panel = tail(rows, height);
-    let room = height - panel.len();
-    let mut above = transcript::tail_lines(model, &model.transcript, model.width, room);
-    while above.len() < room {
-        above.insert(0, blank());
+    let Some(chrome) = sheet::chrome(model) else {
+        let panel = tail(rows, height);
+        let room = height - panel.len();
+        let mut above = transcript::tail_lines(model, &model.transcript, model.width, room);
+        while above.len() < room {
+            above.insert(0, blank());
+        }
+        above.extend(panel);
+        return above;
+    };
+    let hint = sheet::hint_row(model, &chrome);
+    let th = &model.theme;
+    let mut out = Vec::with_capacity(height);
+    if let Some(echo) = &chrome.echo {
+        out.push(Line::from(vec![
+            ui::span(format!("{} ", super::theme::glyph::USER), th.muted),
+            ui::span(echo.clone(), th.muted),
+        ]));
+        out.push(blank());
     }
-    above.extend(panel);
-    above
+    let hint_rows = usize::from(hint.is_some());
+    let room = height.saturating_sub(out.len()).saturating_sub(hint_rows);
+    out.extend(ui::window(rows, room, model.sheet_anchor(), th));
+    let mut out = pad_to(out, height.saturating_sub(hint_rows));
+    if let Some(hint) = hint {
+        out.push(hint);
+    }
+    out.truncate(height);
+    out
 }
 
 /// An instrument in hand: the transcript stays visible behind it with the ramp
@@ -643,6 +683,27 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn row_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    #[ignore = "until 3b wears its artboard chrome"]
+    fn a_sheet_starts_under_the_header_and_ends_with_its_hint_row() {
+        let mut m = model(100, 44);
+        crate::davinci::fixtures::dress_screen(&mut m, "3b");
+        let rows = compose(&m, 44);
+        let body_first = row_text(&rows[1]);
+        assert!(
+            !body_first.trim().is_empty(),
+            "first body row is blank: {body_first:?}"
+        );
+        // 3b draws no composer, so the hint row sits directly above the
+        // status bar.
+        let hint = rows.iter().rev().nth(1).map(row_text).unwrap();
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
     }
 
     fn ctrl(ch: char) -> KeyEvent {

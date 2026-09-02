@@ -195,6 +195,12 @@ fn note(text: &str, color: ratatui::style::Color, _th: &Theme) -> Line<'static> 
     indent(2, vec![span(clip_ellipsis(text, MEASURE), color)])
 }
 
+/// The sheet's frame (design.md §11). Filled in per artboard.
+pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
+    let _ = model;
+    crate::davinci::views::sheet::SheetChrome::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

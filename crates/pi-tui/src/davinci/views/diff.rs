@@ -223,6 +223,12 @@ fn body_color(kind: HunkKind, th: &Theme) -> Color {
     }
 }
 
+/// The sheet's frame (design.md §11). Filled in per artboard.
+pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
+    let _ = model;
+    crate::davinci::views::sheet::SheetChrome::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,6 +27,7 @@ pub mod recovery;
 pub mod resume;
 pub mod securitas;
 pub mod settings;
+pub mod sheet;
 pub mod startup;
 pub mod studio;
 pub mod thinking;

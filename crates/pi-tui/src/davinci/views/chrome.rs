@@ -18,6 +18,7 @@ use crate::davinci::ui::{
 };
 
 use super::instrumenta::SELECTION_BAR;
+use super::sheet::{self, Composer};
 
 /// The three cells an unmarked completion row spends to stay aligned with the
 /// marked one.
@@ -42,6 +43,13 @@ pub fn header(model: &Model) -> Line<'static> {
     if !model.minimal() {
         left.push(span(" · ", th.border));
         left.push(span(model.mode(), th.primary));
+    }
+
+    // A command sheet claims the right run for its own facts (design.md §11).
+    if let Some(chrome) = sheet::chrome(model) {
+        if !chrome.header_right.is_empty() {
+            return spread(model.width, left, chrome.header_right);
+        }
     }
 
     let right = if model.minimal() {
@@ -106,6 +114,20 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
             span(" · ", th.border),
             span(format!("{}{delta}", glyph::DELTA), th.primary),
         ];
+    }
+
+    // A command sheet: `mode · branch · third`, the third its own (§11).
+    if let Some(chrome) = sheet::chrome(model) {
+        let mut run = vec![
+            span(model.mode(), th.primary),
+            span(" · ", th.border),
+            span(model.branch.clone(), th.secondary),
+        ];
+        if let Some(third) = chrome.status_third {
+            run.push(span(" · ", th.border));
+            run.extend(third);
+        }
+        return run;
     }
 
     match model.screen {
@@ -233,6 +255,13 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
         None => {}
     }
 
+    // A command sheet with a meter of its own (§11).
+    if let Some(chrome) = sheet::chrome(model) {
+        if let Some(right) = chrome.status_right {
+            return right;
+        }
+    }
+
     if model.minimal() {
         // Still a meter, never a bare number (design.md §6, §9).
         return vec![
@@ -331,7 +360,12 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
     // the caret are the whole invitation, as in every terminal agent. An open
     // sheet is the one exception: its row suggests the command that summoned
     // it, which is a hint, not chat.
-    let placeholder = screen_placeholder(model.screen);
+    let placeholder = sheet::chrome(model)
+        .and_then(|chrome| match chrome.composer {
+            Composer::Prompt(text) => Some(text),
+            Composer::Hidden | Composer::Disabled(_) => None,
+        })
+        .or_else(|| screen_placeholder(model.screen));
     let lit = model.blink();
     let caret_style = if lit {
         Style::default().bg(th.primary).fg(th.background)
@@ -413,6 +447,20 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
 /// The model's run in the header and status bar: `sonnet · high`, and
 /// ` · auto` after it while every tool runs unasked — the one permission
 /// mode worth a standing reminder.
+/// A composer that takes no input: border rule, the sheet's reason in the dim
+/// ramp, no caret (`6a` — the composer is disabled until you decide).
+pub fn disabled_composer(model: &Model, text: &str) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let dim = th.dim();
+    Surface::new(model.width, th)
+        .border(th.border)
+        .row(vec![
+            span(format!("{} ", glyph::PROMPT), dim.border),
+            span(text.to_string(), dim.muted),
+        ])
+        .lines()
+}
+
 /// `1 job` / `2 jobs` while background commands run; nothing otherwise, so
 /// the bar says it only when there is something to know.
 fn jobs_note(model: &Model) -> Option<String> {
@@ -689,6 +737,20 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    #[ignore = "until 6d wears its artboard chrome"]
+    fn a_sheet_with_facts_owns_the_header_right_run_and_the_status_third() {
+        let mut m = model(100);
+        crate::davinci::fixtures::dress_screen(&mut m, "6d");
+        let h = text(&header(&m));
+        assert!(
+            h.ends_with("7 files │ +145 -127 │ main · 3 commits behind"),
+            "{h}"
+        );
+        let s = text(&status(&m));
+        assert!(s.starts_with("agent · main · Δ7 +145 -127"), "{s}");
     }
 
     #[test]

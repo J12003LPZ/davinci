@@ -1631,6 +1631,23 @@ impl Model {
     }
 
     /// The word under the identity mark in the header.
+    /// The row a sheet's window is kept around: its selection, or the top.
+    pub fn sheet_anchor(&self) -> usize {
+        match self.screen {
+            Screen::Models => self.catalog_index,
+            Screen::Settings => self.settings_index,
+            Screen::Thinking => self.thinking_index,
+            Screen::Login => self.login_index,
+            Screen::Keys => self.keys_offset,
+            Screen::Resume => self.resume_index,
+            Screen::Tree => self.tree_index,
+            Screen::Securitas => self.security_index,
+            Screen::Diff => self.diff_index,
+            Screen::Permissions => self.permission_index,
+            _ => 0,
+        }
+    }
+
     pub fn mode(&self) -> &'static str {
         match self.screen {
             Screen::Agent | Screen::Recovery | Screen::Diff if self.plan_mode => "plan",
