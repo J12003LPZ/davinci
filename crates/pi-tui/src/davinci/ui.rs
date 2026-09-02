@@ -502,6 +502,152 @@ pub fn failure_line(theme: &Theme, what: &str, subject: &str) -> Line<'static> {
 }
 
 /// Whether a run carries the theme's emphasis; used by tests and by the
+/// Keep `height` rows around `anchor`, folding the rest into `… n above` /
+/// `… n below` in border colour. A list that fits is returned whole
+/// (design.md §11).
+pub fn window(
+    rows: Vec<Line<'static>>,
+    height: usize,
+    anchor: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let total = rows.len();
+    if total <= height || height == 0 {
+        return rows;
+    }
+    // Two rows may be spent on the fold markers.
+    let inner = height.saturating_sub(2).max(1);
+    let start = anchor
+        .min(total.saturating_sub(1))
+        .saturating_sub(inner / 2)
+        .min(total.saturating_sub(inner));
+    let end = (start + inner).min(total);
+    let mut out = Vec::with_capacity(height);
+    if start > 0 {
+        out.push(Line::from(vec![span(
+            format!("… {start} above"),
+            theme.border,
+        )]));
+    }
+    out.extend(rows.into_iter().skip(start).take(end - start));
+    if end < total {
+        out.push(Line::from(vec![span(
+            format!("… {} below", total - end),
+            theme.border,
+        )]));
+    }
+    out
+}
+
+/// Uppercase column headers in border colour over a hair rule in the dim
+/// ramp, as the artboards draw `PROVIDER / MODEL … CREDENTIAL`. Two rows,
+/// each exactly `width`. A column of width 0 takes the slack; `true` right-
+/// aligns (design.md §11).
+pub fn column_header(
+    width: u16,
+    columns: &[(&str, u16, bool)],
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let fixed: u16 = columns
+        .iter()
+        .filter(|column| column.1 > 0)
+        .map(|column| column.1)
+        .sum::<u16>()
+        .saturating_add(columns.len().saturating_sub(1) as u16);
+    let slack = width.saturating_sub(fixed);
+    let mut spans = Vec::new();
+    for (index, (label, column_width, right)) in columns.iter().enumerate() {
+        let w = if *column_width == 0 {
+            slack
+        } else {
+            *column_width
+        };
+        let cell = if *right {
+            format!("{label:>w$}", w = w as usize)
+        } else {
+            format!("{label:<w$}", w = w as usize)
+        };
+        spans.push(span(clip(&cell, w), theme.border));
+        if index + 1 < columns.len() {
+            spans.push(span(" ", theme.border));
+        }
+    }
+    let mut header = truncate_run(spans, width);
+    let gap = width.saturating_sub(run_width(&header));
+    if gap > 0 {
+        header.push(pad(gap, None));
+    }
+    let rule = Line::from(vec![span(
+        glyph::METER_EMPTY.repeat(width as usize),
+        theme.dim().border,
+    )]);
+    vec![Line::from(header), rule]
+}
+
+/// A footnote: left in the ink given, right in border. One row where both
+/// fit at 100 columns or more, two rows (the right one indented) otherwise
+/// (design.md §11).
+pub fn footnote(
+    width: u16,
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    _theme: &Theme,
+) -> Vec<Line<'static>> {
+    if right.is_empty() {
+        return vec![Line::from(truncate_run(left, width))];
+    }
+    if width >= 100 && run_width(&left) + run_width(&right) + 3 <= width {
+        return vec![spread(width, left, right)];
+    }
+    vec![
+        Line::from(truncate_run(left, width)),
+        indent(2, truncate_run(right, width.saturating_sub(2))),
+    ]
+}
+
+/// The 3-cell copper bar that marks the selected row (design.md §6,
+/// Instrumenta). The bar is three cells wide on screen, whatever its byte
+/// length.
+pub const SELECTION_BAR: &str = "▌  ";
+const UNSELECTED_BAR: &str = "   ";
+
+/// The selection bar on the tint, or its blank.
+pub fn selection_bar(selected: bool, theme: &Theme) -> Span<'static> {
+    if selected {
+        span_on(SELECTION_BAR, theme.primary, Some(theme.surface))
+    } else {
+        span(UNSELECTED_BAR, theme.border)
+    }
+}
+
+/// The keybind row a sheet ends with: hints joined by ` │ `, the escape hint
+/// flush right. Hints drop from the end when the row is short of room; the
+/// escape hint never drops (design.md §11).
+pub fn hint_row(
+    width: u16,
+    hints: &[Vec<Span<'static>>],
+    escape: Option<&str>,
+    theme: &Theme,
+) -> Line<'static> {
+    let right: Vec<Span<'static>> = escape
+        .map(|esc| vec![span(esc, theme.border)])
+        .unwrap_or_default();
+    let room = width.saturating_sub(run_width(&right)).saturating_sub(3);
+    let mut left: Vec<Span<'static>> = Vec::new();
+    for (index, hint) in hints.iter().enumerate() {
+        let mut candidate = left.clone();
+        if index > 0 {
+            candidate.push(span(" │ ", theme.border));
+        }
+        candidate.extend(hint.iter().cloned());
+        if run_width(&candidate) > room {
+            break;
+        }
+        left = candidate;
+    }
+    spread(width, left, right)
+}
+
 /// `NO_COLOR` audit.
 pub fn is_strong(span: &Span<'_>) -> bool {
     span.style.add_modifier.contains(Modifier::BOLD)
@@ -530,6 +676,80 @@ mod tests {
     #[test]
     fn the_measure_is_seventy_four() {
         assert_eq!(MEASURE, 74);
+    }
+
+    #[test]
+    fn window_keeps_the_anchor_and_counts_both_folds() {
+        let th = theme();
+        let rows: Vec<Line<'static>> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let out = window(rows, 6, 10, &th);
+        assert_eq!(out.len(), 6);
+        assert!(text_of(&out[0]).starts_with("… "), "{:?}", text_of(&out[0]));
+        assert!(out.iter().any(|l| text_of(l) == "row 10"));
+        assert!(text_of(out.last().unwrap()).ends_with(" below"));
+    }
+
+    #[test]
+    fn window_of_a_short_list_is_the_list() {
+        let th = theme();
+        let rows: Vec<Line<'static>> = (0..3).map(|i| Line::from(format!("row {i}"))).collect();
+        assert_eq!(window(rows, 10, 0, &th).len(), 3);
+    }
+
+    #[test]
+    fn column_header_is_two_rows_of_the_width() {
+        let th = theme();
+        let rows = column_header(
+            60,
+            &[
+                ("PROVIDER / MODEL", 0, false),
+                ("WINDOW", 6, true),
+                ("CREDENTIAL", 12, false),
+            ],
+            &th,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(width_of(&rows[0]), 60);
+        assert_eq!(width_of(&rows[1]), 60);
+        assert!(text_of(&rows[0]).contains("PROVIDER / MODEL"));
+        assert!(text_of(&rows[1]).chars().all(|c| c == '─'));
+    }
+
+    #[test]
+    fn footnote_is_one_row_wide_and_two_narrow() {
+        let th = theme();
+        let left = vec![span("dimmed rows have no credential", th.text)];
+        let right = vec![span("switching keeps the transcript", th.border)];
+        assert_eq!(footnote(100, left.clone(), right.clone(), &th).len(), 1);
+        assert_eq!(footnote(80, left, right, &th).len(), 2);
+    }
+
+    #[test]
+    fn hint_row_right_aligns_the_escape_and_never_drops_it() {
+        let th = theme();
+        let hints = vec![
+            vec![span("↑↓ move", th.border)],
+            vec![span("enter select", th.border)],
+            vec![span("ctrl+p cycle ring", th.border)],
+        ];
+        let row = hint_row(40, &hints, Some("esc close"), &th);
+        let text = text_of(&row);
+        assert_eq!(width_of(&row), 40);
+        assert!(text.ends_with("esc close"));
+        assert!(text.starts_with("↑↓ move │ enter select"), "{text}");
+        assert!(!text.contains("ctrl+p"), "{text}");
+    }
+
+    #[test]
+    fn the_selection_bar_is_three_cells_on_the_tint() {
+        let th = theme();
+        let bar = selection_bar(true, &th);
+        assert_eq!(UnicodeWidthStr::width(bar.content.as_ref()), 3);
+        assert_eq!(bar.style.bg, Some(th.surface));
+        assert_eq!(
+            UnicodeWidthStr::width(selection_bar(false, &th).content.as_ref()),
+            3
+        );
     }
 
     #[test]

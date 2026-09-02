@@ -15,9 +15,7 @@ use crate::davinci::ui::{
     clip_ellipsis, pad, run_width, span, span_on, spread, surface_rule, Surface,
 };
 
-/// The 3-cell copper bar that marks the selected row.
-pub const SELECTION_BAR: &str = "▌  ";
-const UNSELECTED_BAR: &str = "   ";
+pub use crate::davinci::ui::SELECTION_BAR;
 
 pub fn lines(model: &Model, height: usize) -> Vec<Line<'static>> {
     let th = &model.theme;
@@ -134,11 +132,7 @@ fn query_row(model: &Model, inner: u16, hits: usize) -> Vec<Span<'static>> {
 
 fn row(theme: &Theme, inner: u16, item: &CorpusItem, selected: bool) -> Vec<Span<'static>> {
     let tint = if selected { Some(theme.surface) } else { None };
-    let bar = if selected {
-        span_on(SELECTION_BAR, theme.primary, tint)
-    } else {
-        span_on(UNSELECTED_BAR, theme.border, tint)
-    };
+    let bar = crate::davinci::ui::selection_bar(selected, theme);
     let name_color = if selected { theme.text } else { theme.muted };
 
     // Wide enough for the corpus's longest path, so a file row is legible in
