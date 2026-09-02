@@ -78,6 +78,7 @@ mod extension_host;
 mod extensions;
 mod external_editor;
 mod file_processor;
+mod hooks;
 mod image_convert;
 mod js_host;
 mod llama;
@@ -1554,7 +1555,16 @@ fn complete_prompt_with_host(
     };
     let hook_host = host.clone();
     let tool_state_cwd = agent.cwd.clone();
+    let user_hooks = {
+        let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+        let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+        hooks::load(&default_agent_dir(), &agent.cwd, trusted)
+    };
+    let pre_hooks = user_hooks.clone();
     agent.pre_tool = Some(pi_agent::PreToolHook(Arc::new(move |name, args| {
+        if let Some(reason) = hooks::run_pre_tool(&pre_hooks, name, args) {
+            return Some(reason);
+        }
         // A poisoned lock used to bail out of the closure with `None`, which
         // the agent reads as "not blocked": one panic anywhere holding this
         // mutex silently disabled every pre-tool guard, the security scan's
@@ -1583,10 +1593,16 @@ fn complete_prompt_with_host(
         }
     })));
     let post_host = host.clone();
+    let post_hooks = user_hooks;
+    let session_path = agent.session.as_ref().map(|session| session.path.clone());
     agent.post_tool = Some(pi_agent::PostToolHook(Arc::new(
-        move |_tool_call_id, _cwd, name, args, result| match post_host.lock() {
-            Ok(host) => host.native_after_tool(name, args, result),
-            Err(_) => result,
+        move |_tool_call_id, _cwd, name, args, result| {
+            hooks::run_post_tool(&post_hooks, name, args, &result.content);
+            hooks::append_event(session_path.as_ref(), "tool", name);
+            match post_host.lock() {
+                Ok(host) => host.native_after_tool(name, args, result),
+                Err(_) => result,
+            }
         },
     )));
     if stream_json {
@@ -4174,7 +4190,12 @@ fn handle_user_line(
     tui: Option<&mut InteractiveTui>,
 ) -> Result<bool, String> {
     match slash::parse_line(text) {
-        SlashAction::Quit => Ok(false),
+        SlashAction::Quit => {
+            let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+            let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+            hooks::run_stop(&hooks::load(&default_agent_dir(), &agent.cwd, trusted));
+            Ok(false)
+        }
         SlashAction::Prompt(prompt) => {
             submit_user_message(parsed, agent, session, &prompt, &[], tui)
         }
@@ -4486,6 +4507,20 @@ fn handle_user_line(
             agent.set_plan_mode(false);
             session.chrome.status = "act · edits and shell commands may run again".into();
             println!("{}", session.chrome.status);
+            Ok(true)
+        }
+        SlashAction::ShowCost => {
+            let text = format_session_cost(parsed, agent);
+            session.chrome.transcript.push("cost", &text);
+            session.chrome.status = "cost".into();
+            println!("{text}");
+            Ok(true)
+        }
+        SlashAction::ShowStatus => {
+            let text = format_session_status(parsed, agent);
+            session.chrome.transcript.push("status", &text);
+            session.chrome.status = "status".into();
+            println!("{text}");
             Ok(true)
         }
         SlashAction::Mcp => {
@@ -5337,6 +5372,50 @@ fn interactive_extra_autocomplete(parsed: &Args) -> Vec<ExtraAutocompleteProvide
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
+    let models = available_models(parsed);
+    let found = models
+        .iter()
+        .find(|item| item.provider == agent.provider && item.id == agent.model_id);
+    let stats = rpc::session_stats_for_agent(agent, found);
+    format!(
+        "input {} · output {} · cache read {} · cache write {} · total {} · ${:.4}",
+        stats["tokens"]["input"].as_u64().unwrap_or(0),
+        stats["tokens"]["output"].as_u64().unwrap_or(0),
+        stats["tokens"]["cacheRead"].as_u64().unwrap_or(0),
+        stats["tokens"]["cacheWrite"].as_u64().unwrap_or(0),
+        stats["tokens"]["total"].as_u64().unwrap_or(0),
+        stats
+            .get("cost")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0),
+    )
+}
+
+pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
+    let mode = agent
+        .permissions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .mode
+        .as_str();
+    let plan = if agent.plan_mode { "plan" } else { "act" };
+    let jobs = agent
+        .tool_context
+        .jobs
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .running();
+    let mcp = agent.tool_context.mcp.rows().len();
+    format!(
+        "{}/{} · {mode} · {plan} · {} jobs · {mcp} mcp · {}",
+        agent.provider,
+        agent.model_id,
+        jobs,
+        format_session_cost(parsed, agent),
+    )
 }
 
 fn format_session_info(
@@ -8787,6 +8866,14 @@ mod tests {
             slash::SlashAction::Plan
         ));
         assert!(matches!(slash::parse_line("/act"), slash::SlashAction::Act));
+        assert!(matches!(
+            slash::parse_line("/cost"),
+            slash::SlashAction::ShowCost
+        ));
+        assert!(matches!(
+            slash::parse_line("/status"),
+            slash::SlashAction::ShowStatus
+        ));
         assert!(slash::builtin_slash_commands()
             .iter()
             .any(|command| command.name == "llama"

@@ -1646,6 +1646,16 @@ pub fn corpus(
         "command",
     ));
     items.push(CorpusItem::new("/act", "leave plan mode", "command"));
+    items.push(CorpusItem::new(
+        "/cost",
+        "tokens and USD this session",
+        "command",
+    ));
+    items.push(CorpusItem::new(
+        "/status",
+        "model, permission, jobs, MCP, tokens",
+        "command",
+    ));
 
     for tool in &agent.tools {
         items.push(CorpusItem::new(tool, &tool_summary(tool), "tool"));
@@ -2763,6 +2773,8 @@ pub fn perform(
                 "act · edits and shell commands may run again".into(),
             ))
         }
+        SlashAction::ShowCost => Ok(Done::Said(crate::format_session_cost(parsed, agent))),
+        SlashAction::ShowStatus => Ok(Done::Said(crate::format_session_status(parsed, agent))),
         SlashAction::Llama => Ok(Done::Said(format!(
             "llama.cpp server {}",
             std::env::var("LLAMA_BASE_URL")
@@ -6581,6 +6593,8 @@ mod tests {
             "/mcp",
             "/plan",
             "/act",
+            "/cost",
+            "/status",
             "/thinking",
             "/thinking high",
             "/logout",
@@ -6989,6 +7003,8 @@ mod tests {
         assert!(names.contains(&"/mcp"), "{names:?}");
         assert!(names.contains(&"/plan"), "{names:?}");
         assert!(names.contains(&"/act"), "{names:?}");
+        assert!(names.contains(&"/cost"), "{names:?}");
+        assert!(names.contains(&"/status"), "{names:?}");
     }
 
     #[test]

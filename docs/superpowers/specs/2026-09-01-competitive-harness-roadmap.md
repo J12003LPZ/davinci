@@ -87,7 +87,7 @@ later is worth building on top of a turn that drops tool calls.
 | 3 | **Tools that compete** (`2026-09-01-tools-that-compete-design.md`) | Background shell jobs, `web_fetch`/`web_search`, todo ledger, notebook-aware read/edit, collapsible tool output, syntax-highlighted diffs. Landed 2026-09-02 on `rust-rewrite`. |
 | 4 | **Native MCP client** (`2026-09-01-native-mcp-design.md`) | stdio + streamable-HTTP MCP servers from `~/.pi/agent/mcp.json`, tools and resources exposed natively, `/mcp` sheet. Landed 2026-09-02 on `rust-rewrite`. |
 | 5 | **Plan mode and subagents** (`2026-09-01-plan-and-subagents-design.md`) | Plan/act toggle, native parallel subagents with scoped tools and their own transcript pane. Landed 2026-09-02 on `rust-rewrite`. |
-| 6 | **Hooks and observability** | User hooks, `/cost` and `/status`, session cost ledger, structured logs. |
+| 6 | **Hooks and observability** (`2026-09-01-hooks-and-observability-design.md`) | User hooks, `/cost` and `/status`, session cost ledger, structured logs. Landed 2026-09-02 on `rust-rewrite`. |
 
 ## Phase 1 design: turns that are real
 

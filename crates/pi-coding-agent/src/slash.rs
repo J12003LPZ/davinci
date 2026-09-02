@@ -77,6 +77,8 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             None,
         ),
         ("act", "Leave plan mode and allow edits again", None),
+        ("cost", "Tokens and USD spent this session", None),
+        ("status", "Model, permission, jobs, MCP, tokens", None),
         ("quit", "Quit pi", None),
     ]
     .into_iter()
@@ -127,6 +129,8 @@ pub enum SlashAction {
     Mcp,
     Plan,
     Act,
+    ShowCost,
+    ShowStatus,
 }
 
 pub fn parse_line(line: &str) -> SlashAction {
@@ -188,6 +192,8 @@ pub fn parse_line(line: &str) -> SlashAction {
         "mcp" => SlashAction::Mcp,
         "plan" => SlashAction::Plan,
         "act" => SlashAction::Act,
+        "cost" => SlashAction::ShowCost,
+        "status" => SlashAction::ShowStatus,
         "help" => SlashAction::Status(
             builtin_slash_commands()
                 .into_iter()
