@@ -71,14 +71,21 @@ pub enum ToolClass {
     Read,
     Edit,
     Shell,
+    /// Reaches outside the machine (`web_fetch`, `web_search`): allowed in
+    /// `read-only`, which guards the workspace and not the network; asked
+    /// in `ask` and `edits`; run in `auto`.
+    Network,
     Other,
 }
 
 pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
-        "read" | "grep" | "find" | "ls" => ToolClass::Read,
-        "write" | "edit" => ToolClass::Edit,
+        // Reading a job's output or keeping the ledger changes nothing the
+        // user would want to be asked about.
+        "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" => ToolClass::Read,
+        "write" | "edit" | "notebook_edit" => ToolClass::Edit,
         "bash" | "powershell" => ToolClass::Shell,
+        "web_fetch" | "web_search" => ToolClass::Network,
         _ => ToolClass::Other,
     }
 }
@@ -310,6 +317,9 @@ impl PermissionPolicy {
         if class == ToolClass::Read {
             return PermissionVerdict::Allow;
         }
+        if class == ToolClass::Network && self.mode == PermissionMode::ReadOnly {
+            return PermissionVerdict::Allow;
+        }
         if self.mode == PermissionMode::ReadOnly {
             return PermissionVerdict::Deny {
                 reason: format!(
@@ -359,11 +369,41 @@ pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
             let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
             project_relative(cwd, raw)
         }
+        // A fetch is judged by where it goes, a search by what it asks.
+        ToolClass::Network if tool == "web_fetch" => (
+            host_of(args.get("url").and_then(Value::as_str).unwrap_or_default()),
+            false,
+        ),
+        ToolClass::Network => (
+            args.get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            false,
+        ),
         ToolClass::Other => (String::new(), false),
     }
 }
 
 /// `bash · git status`, `write · src/lib.rs`, or the bare tool name.
+/// `docs.rs` from `https://docs.rs/similar/latest/`: the host a fetch rule
+/// names. Lower-cased, port and credentials dropped, scheme optional.
+pub fn host_of(url: &str) -> String {
+    let trimmed = url.trim();
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    host.trim().to_ascii_lowercase()
+}
+
 pub fn summary_of(tool: &str, subject: &str) -> String {
     if subject.is_empty() {
         tool.to_string()
@@ -418,6 +458,13 @@ fn slashes(path: &Path) -> String {
 /// subcommand for a shell call (`git status *`, `cargo test *`, `rm *`), the
 /// bare tool for everything else.
 pub fn session_rule_for(tool: &str, subject: &str) -> PermissionRule {
+    // A fetch grant covers the host, not the one page.
+    if tool == "web_fetch" && !subject.is_empty() {
+        return PermissionRule {
+            tool: tool.to_string(),
+            pattern: Some(subject.to_string()),
+        };
+    }
     if tool_class(tool) != ToolClass::Shell || subject.is_empty() {
         return PermissionRule {
             tool: tool.to_string(),
@@ -734,5 +781,65 @@ mod tests {
         for mode in PermissionMode::ALL {
             assert_eq!(PermissionMode::parse(mode.as_str()), Some(mode));
         }
+    }
+
+    #[test]
+    fn the_network_tools_are_asked_about_by_host_and_never_touch_the_workspace() {
+        assert_eq!(tool_class("web_fetch"), ToolClass::Network);
+        assert_eq!(tool_class("web_search"), ToolClass::Network);
+        assert_eq!(tool_class("todo"), ToolClass::Read);
+        assert_eq!(tool_class("job_output"), ToolClass::Read);
+        assert_eq!(tool_class("notebook_edit"), ToolClass::Edit);
+        assert_eq!(
+            host_of("https://user:pw@Docs.rs:443/similar/latest?x=1"),
+            "docs.rs"
+        );
+        assert_eq!(host_of("example.com/page"), "example.com");
+
+        let fetch = json!({"url": "https://docs.rs/similar/latest/"});
+        let (subject, outside) = subject_of("web_fetch", &fetch, &cwd());
+        assert_eq!(subject, "docs.rs");
+        assert!(!outside);
+        assert_eq!(
+            session_rule_for("web_fetch", &subject).to_string(),
+            "web_fetch(docs.rs)"
+        );
+        assert_eq!(
+            session_rule_for("web_search", "rust diff").to_string(),
+            "web_search"
+        );
+
+        let ask = PermissionPolicy::new(PermissionMode::Ask);
+        assert!(matches!(
+            ask.decide("c1", "web_fetch", &fetch, &cwd()),
+            PermissionVerdict::Ask(request) if request.summary == "web_fetch · docs.rs"
+        ));
+        let read_only = PermissionPolicy::new(PermissionMode::ReadOnly);
+        assert!(matches!(
+            read_only.decide("c1", "web_fetch", &fetch, &cwd()),
+            PermissionVerdict::Allow
+        ));
+        let edits = PermissionPolicy::new(PermissionMode::Edits);
+        assert!(matches!(
+            edits.decide("c1", "web_search", &json!({"query": "x"}), &cwd()),
+            PermissionVerdict::Ask(_)
+        ));
+        let mut denied = PermissionPolicy::new(PermissionMode::Auto);
+        denied.deny = vec![PermissionRule::parse("web_fetch(*.internal)").unwrap()];
+        assert!(matches!(
+            denied.decide(
+                "c1",
+                "web_fetch",
+                &json!({"url": "http://wiki.corp.internal/x"}),
+                &cwd()
+            ),
+            PermissionVerdict::Deny { .. }
+        ));
+        let mut granted = PermissionPolicy::new(PermissionMode::Ask);
+        granted.allow = vec![PermissionRule::parse("web_fetch(docs.rs)").unwrap()];
+        assert!(matches!(
+            granted.decide("c1", "web_fetch", &fetch, &cwd()),
+            PermissionVerdict::Allow
+        ));
     }
 }

@@ -7,12 +7,16 @@ mod edit_diff;
 mod events;
 mod file_mutation_queue;
 mod images;
+pub mod jobs;
+pub mod notebook;
 mod permission;
 mod queues;
 mod skills;
 mod templates;
+pub mod todo;
 mod tools;
 mod turn;
+pub mod web;
 
 pub use branch::{
     build_branch_summary_prompt, collect_entries_for_branch_summary, generate_branch_summary,
@@ -39,6 +43,7 @@ pub use images::{
     apply_block_images, convert_to_llm_for_provider, normalize_tool_result_images,
     parse_rpc_images, process_image_bytes, IMAGE_READING_DISABLED,
 };
+pub use jobs::{JobBook, JobNotice, JobStatus, JobSummary};
 pub use permission::{
     glob_matches, session_rule_for, subject_of, summary_of, tool_class, PermissionMode,
     PermissionPolicy, PermissionRule, PermissionVerdict, ToolApprovalDecision, ToolApprovalRequest,
@@ -50,7 +55,11 @@ pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, strip_frontmatter,
     substitute_args, PromptTemplate,
 };
-pub use tools::{execute_tool, tool_specs, AgentTool, ToolError, ToolResult, BUILTIN_TOOLS};
+pub use todo::{TodoItem, TodoList, TodoStatus, TODO_ENTRY_TYPE};
+pub use tools::{
+    execute_tool, execute_tool_with, tool_specs, AgentTool, ToolContext, ToolError, ToolResult,
+    BUILTIN_TOOLS,
+};
 pub use turn::retry_delay_ms;
 
 use pi_ai::{
@@ -172,6 +181,9 @@ pub struct Agent {
     /// Who answers when the policy says ask. `None` means the run cannot
     /// ask, and the call is refused with a message that says so.
     pub approver: Option<ToolApprover>,
+    /// Background shell jobs (`jobs.rs`) and the model's todo ledger
+    /// (`todo.rs`), shared with the tool thread and the shell.
+    pub tool_context: ToolContext,
     pub summarizer: Option<Summarizer>,
     pub block_images: bool,
     pub auto_resize_images: bool,
@@ -227,6 +239,7 @@ impl Agent {
             post_tool: None,
             permissions: Arc::new(std::sync::Mutex::new(PermissionPolicy::default())),
             approver: None,
+            tool_context: ToolContext::default(),
             summarizer: None,
             block_images: false,
             auto_resize_images: true,
@@ -291,6 +304,18 @@ impl Agent {
 
     pub fn prompt_with(&mut self, text: &str, images: &[pi_ai::MessageContent]) -> ChatMessage {
         self.flush_pending_bash_messages();
+        // A job that finished while the user was typing is in context
+        // before what they typed, so the model reads the news first.
+        for notice in self.job_notice_messages() {
+            self.messages.push(notice.clone());
+            if let Some(session) = &mut self.session {
+                let _ = session.append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::to_value(&notice.content).unwrap_or(Value::Null),
+                ));
+            }
+            self.pending_prompt_messages.push(notice);
+        }
         let mut content = vec![pi_ai::MessageContent::Text {
             text: text.to_string(),
         }];
@@ -412,6 +437,85 @@ impl Agent {
         for message in pending {
             self.commit_bash_message(message);
         }
+    }
+
+    /// The finished background jobs the model has not heard about, as the
+    /// user messages that tell it (`customType: backgroundJob`). Taking
+    /// them marks them announced.
+    pub fn job_notice_messages(&self) -> Vec<ChatMessage> {
+        let notices = self
+            .tool_context
+            .jobs
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take_unannounced();
+        notices
+            .iter()
+            .map(|notice| {
+                let mut extra = serde_json::Map::new();
+                extra.insert(
+                    "customType".into(),
+                    Value::String(JOB_NOTICE_TYPE.to_string()),
+                );
+                extra.insert("jobId".into(), Value::from(notice.id));
+                ChatMessage {
+                    role: "user".into(),
+                    content: vec![pi_ai::MessageContent::Text {
+                        text: notice.message_text(),
+                    }],
+                    extra,
+                    ..ChatMessage::default()
+                }
+            })
+            .collect()
+    }
+
+    /// Write the ledger to the session after the `todo` tool changed it, so
+    /// a resumed session opens on the same plan.
+    pub fn persist_todos(&mut self) {
+        let value = self
+            .tool_context
+            .todos
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .to_value();
+        if let Some(session) = &mut self.session {
+            let mut extra = serde_json::Map::new();
+            extra.insert("data".into(), value);
+            let _ = session.append_entry(SessionEntry {
+                id: String::new(),
+                entry_type: "custom".into(),
+                parent_id: None,
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: Some(TODO_ENTRY_TYPE.into()),
+                extra,
+            });
+        }
+    }
+
+    /// The ledger the session last saved, if any.
+    pub fn restore_todos(&mut self) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let Some(list) = session
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.custom_type.as_deref() == Some(TODO_ENTRY_TYPE))
+            .and_then(|entry| entry.extra.get("data"))
+            .and_then(TodoList::from_value)
+        else {
+            return false;
+        };
+        *self
+            .tool_context
+            .todos
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = list;
+        true
     }
 
     /// Persist and append a TypeScript extension `CustomMessage`.
@@ -844,8 +948,18 @@ impl From<AssistantMessage> for CompleteOutput {
     }
 }
 
+/// The `customType` of the user message that tells the model a background
+/// job finished.
+pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
+
 pub fn default_system_prompt() -> String {
-    "You are pi, a coding assistant with read, bash, edit, and write tools. Be concise and make precise edits.".into()
+    [
+        "You are pi, a coding assistant with read, bash, edit, and write tools. Be concise and make precise edits.",
+        "Keep a todo list with the todo tool on any task of three or more steps: send the whole list, mark the step you are on active, and mark steps done as you finish them.",
+        "Run builds, test suites and anything that takes more than a few seconds with bash background: true; you will be told when the job finishes, and job_output reads what it printed meanwhile.",
+        "Use web_search to find pages and web_fetch to read one before quoting it. Notebooks (.ipynb) read as numbered cells; edit matches inside a cell and notebook_edit changes whole cells.",
+    ]
+    .join("\n")
 }
 
 pub fn new_message_id() -> String {
@@ -1867,6 +1981,149 @@ mod tests {
             reloaded_custom.content.get(1),
             Some(pi_ai::MessageContent::Image { .. })
         ));
+    }
+
+    #[test]
+    fn a_background_job_is_announced_to_the_model_before_its_next_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.prompt("build it");
+        let events = agent
+            .run_loop(scripted_tool_calls(vec![
+                (
+                    "bash",
+                    serde_json::json!({"command": "echo built", "background": true}),
+                ),
+                // Give the job time to exit; the next completion sees it.
+                ("job_output", serde_json::json!({"jobId": 1, "wait": 10})),
+            ]))
+            .unwrap();
+        let outcomes = tool_outcomes(&events);
+        assert!(
+            outcomes[0]
+                .2
+                .starts_with("Started background job 1: `echo built`"),
+            "{:?}",
+            outcomes[0]
+        );
+        assert!(outcomes[1].2.contains("built"), "{:?}", outcomes[1]);
+        assert!(outcomes[1].2.contains("[job 1 exit 0"), "{:?}", outcomes[1]);
+        // The notice is a user message with its custom type, injected once,
+        // before the completion that followed the job's end.
+        let notices: Vec<&ChatMessage> = agent
+            .messages
+            .iter()
+            .filter(|message| {
+                message.extra.get("customType") == Some(&serde_json::json!(JOB_NOTICE_TYPE))
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        let text = content_text(&notices[0].content);
+        assert!(
+            text.starts_with("[background job 1 finished · exit 0 · "),
+            "{text}"
+        );
+        assert!(text.contains("] echo built\n    built"), "{text}");
+        let notice_index = agent
+            .messages
+            .iter()
+            .position(|message| message.extra.contains_key("customType"))
+            .unwrap();
+        let last_assistant = agent
+            .messages
+            .iter()
+            .rposition(|message| message.role == "assistant")
+            .unwrap();
+        assert!(
+            notice_index < last_assistant,
+            "the notice came before the final reply"
+        );
+        // Nothing left to announce, and the events carried it as a message.
+        assert!(agent.job_notice_messages().is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageStart { message } if message.extra.contains_key("customType")
+        )));
+    }
+
+    #[test]
+    fn a_job_that_ends_between_turns_is_prepended_to_the_next_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        let result = execute_tool_with(
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command": "echo later", "background": true}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        assert!(result.content.starts_with("Started background job 1"));
+        execute_tool_with(
+            dir.path(),
+            "job_output",
+            &serde_json::json!({"jobId": 1, "wait": 10}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        agent.prompt("what happened?");
+        let roles: Vec<(String, bool)> = agent
+            .messages
+            .iter()
+            .map(|message| {
+                (
+                    message.role.clone(),
+                    message.extra.contains_key("customType"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            vec![("user".to_string(), true), ("user".to_string(), false)]
+        );
+        assert_eq!(agent.pending_prompt_messages.len(), 2);
+    }
+
+    #[test]
+    fn the_todo_ledger_is_kept_on_the_agent_and_written_to_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "/tmp/project", Some("todo")).unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.session = Some(session);
+        agent.cwd = dir.path().to_path_buf();
+        agent.prompt("plan it");
+        let events = agent
+            .run_loop(scripted_tool_calls(vec![(
+                "todo",
+                serde_json::json!({"items": [
+                    {"text": "read the parser", "status": "done"},
+                    {"text": "add the branch", "status": "active"},
+                    {"text": "run the tests", "status": "pending"}
+                ]}),
+            )]))
+            .unwrap();
+        let outcomes = tool_outcomes(&events);
+        assert_eq!(
+            outcomes[0].2,
+            "3 items · 1 done · 1 active\n✓ read the parser\n◉ add the branch\n○ run the tests"
+        );
+        assert_eq!(
+            agent.tool_context.todos.lock().unwrap().summary(),
+            "1 of 3 done"
+        );
+        let path = agent.session.as_ref().unwrap().path.clone();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"customType\":\"todo\""), "{raw}");
+
+        // A fresh agent on the same session finds the ledger again.
+        let reopened = JsonlSession::open(&path).unwrap();
+        let mut again = Agent::new("x");
+        again.session = Some(reopened);
+        assert!(again.restore_todos());
+        assert_eq!(again.tool_context.todos.lock().unwrap().items.len(), 3);
+        let mut empty = Agent::new("x");
+        assert!(!empty.restore_todos());
     }
 
     #[test]

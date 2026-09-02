@@ -728,27 +728,29 @@ fn wrap_run(run: &[(&str, Face)], width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
 fn code_rows(lang: Option<&str>, text: &str, width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
     let theme = ctx.theme;
     let room = width.saturating_sub(CODE_INSET);
-    let row = |content: String, color: Color| {
-        indent(
+    let mut out = Vec::new();
+    if let Some(lang) = lang {
+        out.push(indent(
             2,
             vec![
                 span("│ ", theme.border),
-                span(clip_ellipsis(&content, room), color),
+                span(clip_ellipsis(lang, room), theme.muted),
             ],
-        )
-    };
-    let mut out = Vec::new();
-    if let Some(lang) = lang {
-        out.push(row(lang.to_string(), theme.muted));
+        ));
     }
     if text.is_empty() {
         return out;
     }
+    // The fence names the language; keywords, strings, comments and
+    // numbers take their ink from it, the rest keeps the block's.
+    let language = lang.and_then(super::highlight::language_of);
     let body = text.strip_suffix('\n').unwrap_or(text);
-    out.extend(
-        body.split('\n')
-            .map(|line| row(line.trim_end_matches('\r').replace('\t', "    "), ctx.base)),
-    );
+    out.extend(body.split('\n').map(|line| {
+        let content = clip_ellipsis(&line.trim_end_matches('\r').replace('\t', "    "), room);
+        let mut spans = vec![span("│ ", theme.border)];
+        spans.extend(super::highlight::spans(theme, language, &content, ctx.base));
+        indent(2, spans)
+    }));
     out
 }
 
@@ -995,8 +997,37 @@ mod tests {
         assert!(!shown.iter().any(|row| row.contains("```")));
         assert_eq!(span_with(&rows[0], "rust").style.fg, Some(theme().muted));
         assert_eq!(span_with(&rows[1], "│ ").style.fg, Some(theme().border));
+        // The fence names the language: `fn` takes the keyword ink, the
+        // rest of the row keeps the block's.
+        assert_eq!(span_with(&rows[1], "fn").style.fg, Some(theme().secondary));
         assert_eq!(
-            span_with(&rows[1], "fn main() {}").style.fg,
+            span_with(&rows[1], " main() {}").style.fg,
+            Some(theme().text)
+        );
+    }
+
+    #[test]
+    fn code_without_a_known_language_stays_in_one_ink() {
+        let rows = render(
+            "```
+fn main() {}
+```
+",
+            MEASURE,
+        );
+        assert_eq!(
+            span_with(&rows[0], "fn main() {}").style.fg,
+            Some(theme().text)
+        );
+        let text_rows = render(
+            "```text
+fn main() {}
+```
+",
+            MEASURE,
+        );
+        assert_eq!(
+            span_with(&text_rows[1], "fn main() {}").style.fg,
             Some(theme().text)
         );
     }

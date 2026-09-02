@@ -217,10 +217,7 @@ pub fn get_project_trust_options(
 
 /// TS `hasTrustRequiringProjectResources`.
 pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
-    let home = std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(dirs_home)
+    let home = pi_session::home_dir()
         .map(|path| canonicalize_trust_path(&path))
         .unwrap_or_default();
     let user_agents_skills = PathBuf::from(&home).join(".agents").join("skills");
@@ -247,10 +244,6 @@ pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
         }
         current = parent.to_path_buf();
     }
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 fn read_trust_file(path: &Path) -> Result<BTreeMap<String, Value>, String> {

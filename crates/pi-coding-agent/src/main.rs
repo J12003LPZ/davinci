@@ -542,6 +542,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         parsed.project_trust_override,
     );
     apply_http_proxy_settings(settings.http_proxy.as_deref());
+    crate::settings::apply_web_search_settings(settings.web_search.as_ref());
     if let Some(level) = parsed.thinking {
         agent.thinking_level = level;
     } else if let Some(level) = settings
@@ -4845,6 +4846,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "transport" => stored.transport = Some(value.to_string()),
         "http-idle-timeout" => stored.http_idle_timeout_ms = parse_http_idle_timeout(value),
         "hide-thinking" => stored.hide_thinking_block = Some(value == "true"),
+        "show-tool-output" => stored.show_tool_output = Some(value == "true"),
         "cache-miss-notices" => stored.show_cache_miss_notices = Some(value == "true"),
         "collapse-changelog" => stored.collapse_changelog = Some(value == "true"),
         "install-telemetry" => stored.enable_install_telemetry = Some(value == "true"),

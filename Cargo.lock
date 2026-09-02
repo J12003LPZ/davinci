@@ -797,6 +797,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "ureq",
+ "url",
  "uuid",
  "walkdir",
 ]

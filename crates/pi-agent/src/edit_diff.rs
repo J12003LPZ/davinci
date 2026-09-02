@@ -402,9 +402,307 @@ fn single_edit(value: &serde_json::Value) -> Option<Edit> {
     })
 }
 
+/// One run of a line diff, grouped as `Diff.diffLines` groups them: every
+/// consecutive line of the same kind in one part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffPart {
+    pub kind: DiffKind,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Equal,
+    Added,
+    Removed,
+}
+
+/// Lines of a text for diffing: a trailing newline does not make an empty
+/// last line, and `\r\n` is `\n`.
+fn diff_source_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+}
+
+/// Above this many lines the O(ND) trace is not worth its memory; the whole
+/// old text is reported removed and the new one added.
+const MYERS_LINE_LIMIT: usize = 40_000;
+
+/// A line diff (Myers, O(ND)), the pieces grouped like the `diff` package's
+/// `diffLines` so `generate_diff_string` can mirror the TypeScript function
+/// line for line.
+pub fn diff_lines(old: &str, new: &str) -> Vec<DiffPart> {
+    let a = diff_source_lines(old);
+    let b = diff_source_lines(new);
+    let ops = if a.len() + b.len() > MYERS_LINE_LIMIT {
+        let mut ops: Vec<(DiffKind, usize)> =
+            (0..a.len()).map(|i| (DiffKind::Removed, i)).collect();
+        ops.extend((0..b.len()).map(|j| (DiffKind::Added, j)));
+        ops
+    } else {
+        myers(&a, &b)
+    };
+    let mut parts: Vec<DiffPart> = Vec::new();
+    for (kind, index) in ops {
+        let line = match kind {
+            DiffKind::Added => b[index],
+            DiffKind::Equal | DiffKind::Removed => a[index],
+        };
+        match parts.last_mut() {
+            Some(part) if part.kind == kind => part.lines.push(line.to_string()),
+            _ => parts.push(DiffPart {
+                kind,
+                lines: vec![line.to_string()],
+            }),
+        }
+    }
+    parts
+}
+
+/// The classic Myers walk with a trace of every furthest-reaching frontier,
+/// walked back to recover the edit script. Equal lines carry their index in
+/// `a`; added lines their index in `b`.
+fn myers(a: &[&str], b: &[&str]) -> Vec<(DiffKind, usize)> {
+    let n = a.len() as isize;
+    let m = b.len() as isize;
+    let max = n + m;
+    if max == 0 {
+        return Vec::new();
+    }
+    let offset = max;
+    let width = (2 * max + 1) as usize;
+    let mut v = vec![0isize; width];
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut found = false;
+    for d in 0..=max {
+        trace.push(v.clone());
+        let mut k = -d;
+        while k <= d {
+            let index = (k + offset) as usize;
+            let mut x = if k == -d || (k != d && v[index - 1] < v[index + 1]) {
+                v[index + 1]
+            } else {
+                v[index - 1] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[index] = x;
+            if x >= n && y >= m {
+                found = true;
+                break;
+            }
+            k += 2;
+        }
+        if found {
+            break;
+        }
+    }
+    // Walk the trace back from the end, emitting the script in reverse.
+    let mut script: Vec<(DiffKind, usize)> = Vec::new();
+    let mut x = n;
+    let mut y = m;
+    for d in (0..trace.len() as isize).rev() {
+        let v = &trace[d as usize];
+        let k = x - y;
+        let index = (k + offset) as usize;
+        let prev_k = if k == -d || (k != d && v[index - 1] < v[index + 1]) {
+            k + 1
+        } else {
+            k - 1
+        };
+        let prev_x = v[(prev_k + offset) as usize];
+        let prev_y = prev_x - prev_k;
+        while x > prev_x && y > prev_y {
+            x -= 1;
+            y -= 1;
+            script.push((DiffKind::Equal, x as usize));
+        }
+        if d > 0 {
+            if x == prev_x {
+                y -= 1;
+                script.push((DiffKind::Added, y as usize));
+            } else {
+                x -= 1;
+                script.push((DiffKind::Removed, x as usize));
+            }
+        }
+    }
+    script.reverse();
+    script
+}
+
+/// The display diff of an edit, exactly as TypeScript's `generateDiffString`
+/// lays it out: `+NN text` / `-NN text` / ` NN text`, four lines of context
+/// each side, `...` where context is skipped, and the first changed line in
+/// the new file.
+pub fn generate_diff_string(old: &str, new: &str, context_lines: usize) -> (String, Option<usize>) {
+    let parts = diff_lines(old, new);
+    let old_total = old.split('\n').count();
+    let new_total = new.split('\n').count();
+    let width = old_total.max(new_total).to_string().len();
+    let number = |n: usize| format!("{n:>width$}");
+    let blank = " ".repeat(width);
+    let mut output: Vec<String> = Vec::new();
+    let mut old_line = 1usize;
+    let mut new_line = 1usize;
+    let mut last_was_change = false;
+    let mut first_changed = None;
+    for (index, part) in parts.iter().enumerate() {
+        let raw = &part.lines;
+        match part.kind {
+            DiffKind::Added | DiffKind::Removed => {
+                if first_changed.is_none() {
+                    first_changed = Some(new_line);
+                }
+                for line in raw {
+                    if part.kind == DiffKind::Added {
+                        output.push(format!("+{} {line}", number(new_line)));
+                        new_line += 1;
+                    } else {
+                        output.push(format!("-{} {line}", number(old_line)));
+                        old_line += 1;
+                    }
+                }
+                last_was_change = true;
+            }
+            DiffKind::Equal => {
+                let next_is_change = parts
+                    .get(index + 1)
+                    .is_some_and(|next| next.kind != DiffKind::Equal);
+                let context = |output: &mut Vec<String>,
+                               line: &str,
+                               old_line: &mut usize,
+                               new_line: &mut usize| {
+                    output.push(format!(" {} {line}", number(*old_line)));
+                    *old_line += 1;
+                    *new_line += 1;
+                };
+                if last_was_change && next_is_change {
+                    if raw.len() <= context_lines * 2 {
+                        for line in raw {
+                            context(&mut output, line, &mut old_line, &mut new_line);
+                        }
+                    } else {
+                        let skipped = raw.len() - context_lines * 2;
+                        for line in &raw[..context_lines] {
+                            context(&mut output, line, &mut old_line, &mut new_line);
+                        }
+                        output.push(format!(" {blank} ..."));
+                        old_line += skipped;
+                        new_line += skipped;
+                        for line in &raw[raw.len() - context_lines..] {
+                            context(&mut output, line, &mut old_line, &mut new_line);
+                        }
+                    }
+                } else if last_was_change {
+                    let shown = raw.len().min(context_lines);
+                    for line in &raw[..shown] {
+                        context(&mut output, line, &mut old_line, &mut new_line);
+                    }
+                    let skipped = raw.len() - shown;
+                    if skipped > 0 {
+                        output.push(format!(" {blank} ..."));
+                        old_line += skipped;
+                        new_line += skipped;
+                    }
+                } else if next_is_change {
+                    let skipped = raw.len().saturating_sub(context_lines);
+                    if skipped > 0 {
+                        output.push(format!(" {blank} ..."));
+                        old_line += skipped;
+                        new_line += skipped;
+                    }
+                    for line in &raw[skipped..] {
+                        context(&mut output, line, &mut old_line, &mut new_line);
+                    }
+                } else {
+                    old_line += raw.len();
+                    new_line += raw.len();
+                }
+                last_was_change = false;
+            }
+        }
+    }
+    (output.join("\n"), first_changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_diff_finds_inserts_deletes_and_replacements() {
+        let kinds = |old: &str, new: &str| -> Vec<(DiffKind, usize)> {
+            diff_lines(old, new)
+                .into_iter()
+                .map(|part| (part.kind, part.lines.len()))
+                .collect()
+        };
+        assert_eq!(kinds("a\nb\n", "a\nb\n"), vec![(DiffKind::Equal, 2)]);
+        assert_eq!(
+            kinds("a\nc\n", "a\nb\nc\n"),
+            vec![
+                (DiffKind::Equal, 1),
+                (DiffKind::Added, 1),
+                (DiffKind::Equal, 1)
+            ]
+        );
+        assert_eq!(
+            kinds("a\nb\nc\n", "a\nc\n"),
+            vec![
+                (DiffKind::Equal, 1),
+                (DiffKind::Removed, 1),
+                (DiffKind::Equal, 1)
+            ]
+        );
+        let replaced = diff_lines("one\ntwo\nthree\n", "one\n2\nthree\n");
+        assert_eq!(replaced.len(), 4);
+        assert_eq!(replaced[1].kind, DiffKind::Removed);
+        assert_eq!(replaced[1].lines, vec!["two"]);
+        assert_eq!(replaced[2].kind, DiffKind::Added);
+        assert_eq!(replaced[2].lines, vec!["2"]);
+        assert!(diff_lines("", "").is_empty());
+        assert_eq!(kinds("", "x\n"), vec![(DiffKind::Added, 1)]);
+        assert_eq!(kinds("x\n", ""), vec![(DiffKind::Removed, 1)]);
+    }
+
+    #[test]
+    fn the_diff_string_matches_the_typescript_layout() {
+        let old = (1..=12)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let new = old.replace("line 7", "line seven");
+        let (diff, first) = generate_diff_string(&old, &new, 4);
+        assert_eq!(first, Some(7));
+        assert_eq!(
+            diff,
+            "    ...\n  3 line 3\n  4 line 4\n  5 line 5\n  6 line 6\n- 7 line 7\n+ 7 line seven\n  8 line 8\n  9 line 9\n 10 line 10\n 11 line 11\n    ..."
+        );
+    }
+
+    #[test]
+    fn the_diff_string_of_a_fresh_file_is_all_additions() {
+        let (diff, first) = generate_diff_string("", "a\nb\n", 4);
+        assert_eq!(diff, "+1 a\n+2 b");
+        assert_eq!(first, Some(1));
+        let (same, none) = generate_diff_string("a\n", "a\n", 4);
+        assert_eq!(same, "");
+        assert_eq!(none, None);
+    }
 
     #[test]
     fn applies_multiple_disjoint_edits() {

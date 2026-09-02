@@ -1,11 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::jobs::JobBook;
+use crate::todo::TodoList;
 
 pub const BUILTIN_TOOLS: &[&str] = &[
     "read",
@@ -16,7 +20,22 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "grep",
     "find",
     "ls",
+    "web_fetch",
+    "web_search",
+    "todo",
+    "job_output",
+    "job_kill",
+    "notebook_edit",
 ];
+
+/// What the built-in tools share across calls: the background jobs and the
+/// model's ledger. Both are behind `Arc<Mutex>` because the agent loop, the
+/// tool thread and the davinci shell all read them.
+#[derive(Debug, Clone, Default)]
+pub struct ToolContext {
+    pub jobs: Arc<Mutex<JobBook>>,
+    pub todos: Arc<Mutex<TodoList>>,
+}
 
 const DEFAULT_MAX_LINES: usize = 2000;
 const DEFAULT_MAX_BYTES: usize = 50 * 1024;
@@ -101,13 +120,13 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "bash".into(),
-            description: "Execute bash commands".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}},"required":["command"]}),
+            description: "Execute bash commands. With background: true the command keeps running while you continue; the call returns a job id at once, job_output reads what it printed, job_kill stops it, and you are told when it finishes. Use background for builds, test suites and servers that take more than a few seconds.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"},"background":{"type":"boolean","description":"Run in the background and return a job id immediately (optional)"}},"required":["command"]}),
         },
         AgentTool {
             name: "powershell".into(),
-            description: "Execute PowerShell commands".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+            description: "Execute PowerShell commands. With background: true the command runs as a background job (see bash).".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"},"background":{"type":"boolean","description":"Run in the background and return a job id immediately (optional)"}},"required":["command"]}),
         },
         AgentTool {
             name: "grep".into(),
@@ -124,6 +143,36 @@ pub fn tool_specs() -> Vec<AgentTool> {
             description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles.".into(),
             parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"number"}}}),
         },
+        AgentTool {
+            name: "web_fetch".into(),
+            description: "Fetch a web page or file over http(s) and read it as text. HTML is reduced to its readable content (headings, paragraphs, lists, links as `text (url)`, code blocks); JSON and plain text pass through. Output is truncated to 2000 lines or 50KB. Fetch a search result before quoting it.".into(),
+            parameters: crate::web::fetch_parameters(),
+        },
+        AgentTool {
+            name: "web_search".into(),
+            description: "Search the web. Returns numbered results with title, url and snippet. Follow up with web_fetch on a result to read it.".into(),
+            parameters: crate::web::search_parameters(),
+        },
+        AgentTool {
+            name: "todo".into(),
+            description: "Keep your task list current. Send the whole list every time (it replaces the previous one): each item has text and a status of pending, active or done. Use it for tasks of three or more steps, mark the step you are on active, and mark steps done as you finish them.".into(),
+            parameters: crate::todo::tool_parameters(),
+        },
+        AgentTool {
+            name: "job_output".into(),
+            description: "Read the output of a background job started with bash/powershell background: true. Returns what it has printed so far and whether it is still running; wait blocks up to N seconds for it to exit; tail returns only the last N lines.".into(),
+            parameters: crate::jobs::output_parameters(),
+        },
+        AgentTool {
+            name: "job_kill".into(),
+            description: "Stop a background job and its child processes.".into(),
+            parameters: crate::jobs::kill_parameters(),
+        },
+        AgentTool {
+            name: "notebook_edit".into(),
+            description: "Replace, insert or delete one cell of a Jupyter notebook (.ipynb). Cells are numbered as `read` shows them. To change text inside a cell, `edit` also works on notebooks and matches inside cell sources.".into(),
+            parameters: crate::notebook::tool_parameters(),
+        },
     ]
 }
 
@@ -132,17 +181,52 @@ pub fn execute_tool(
     name: &str,
     input: &serde_json::Value,
 ) -> Result<ToolResult, ToolError> {
+    execute_tool_with(cwd, name, input, &ToolContext::default())
+}
+
+/// Run a built-in tool with the shared state of the run: background jobs
+/// and the todo ledger. `execute_tool` runs with fresh, throw-away state.
+pub fn execute_tool_with(
+    cwd: &Path,
+    name: &str,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
     match name {
         "read" => read_tool(cwd, input),
         "write" => write_tool(cwd, input),
         "edit" => edit_tool(cwd, input),
-        "bash" => shell_tool(cwd, input),
-        "powershell" => powershell_tool(cwd, required_str(input, "command")?),
+        "bash" => shell_tool(cwd, input, context),
+        "powershell" => powershell_tool(cwd, input, context),
         "ls" => ls_tool(cwd, input),
         "grep" => grep_tool(cwd, input),
         "find" => find_tool(cwd, input),
+        "web_fetch" => crate::web::fetch_tool(input).map_err(ToolError::Failed),
+        "web_search" => crate::web::search_tool(input).map_err(ToolError::Failed),
+        "todo" => todo_tool(input, context),
+        "job_output" => crate::jobs::output_tool(&context.jobs, input).map_err(ToolError::Failed),
+        "job_kill" => crate::jobs::kill_tool(&context.jobs, input).map_err(ToolError::Failed),
+        "notebook_edit" => notebook_edit_tool(cwd, input),
         other => Err(ToolError::Unknown(other.to_string())),
     }
+}
+
+/// `todo { items }`: the list is replaced whole and echoed back rendered.
+fn todo_tool(input: &serde_json::Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    let list = TodoList::from_args(input).map_err(ToolError::Failed)?;
+    let content = list.render();
+    let details = serde_json::json!({
+        "items": list.items,
+        "done": list.done(),
+        "total": list.items.len(),
+        "summary": list.summary(),
+    });
+    *context.todos.lock().unwrap_or_else(|err| err.into_inner()) = list;
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(details),
+    })
 }
 
 fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
@@ -152,7 +236,17 @@ fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
     if let Some(mime) = detect_image_mime(&path, &bytes) {
         return read_image(&path, &bytes, mime);
     }
-    let content = String::from_utf8_lossy(&bytes).into_owned();
+    let mut content = String::from_utf8_lossy(&bytes).into_owned();
+    let mut notebook = None;
+    if crate::notebook::is_notebook_path(&path) {
+        if let Some(parsed) = crate::notebook::parse(&content) {
+            content = crate::notebook::render(&parsed);
+            notebook = Some(serde_json::json!({
+                "cells": parsed.get("cells").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+                "language": crate::notebook::language(&parsed),
+            }));
+        }
+    }
     let offset = input
         .get("offset")
         .and_then(serde_json::Value::as_u64)
@@ -163,10 +257,14 @@ fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
         .and_then(serde_json::Value::as_u64)
         .map(|value| value as usize);
     let (content, truncation) = truncate_read(&content, offset, limit);
+    let mut details = serde_json::json!({"path": path, "truncation": truncation});
+    if let Some(notebook) = notebook {
+        details["notebook"] = notebook;
+    }
     Ok(ToolResult {
         content,
         is_error: false,
-        details: Some(serde_json::json!({"path": path, "truncation": truncation})),
+        details: Some(details),
     })
 }
 
@@ -266,11 +364,24 @@ fn write_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolE
             fs::create_dir_all(parent).map_err(|err| ToolError::Failed(err.to_string()))?;
         }
         let content = required_str(input, "content")?;
+        // The change is what the transcript shows, so the previous content
+        // is read before it is gone; a fresh file diffs against nothing.
+        let previous = fs::read_to_string(&path).unwrap_or_default();
         fs::write(&path, content).map_err(|err| ToolError::Failed(err.to_string()))?;
+        let (diff, first_changed_line) = crate::edit_diff::generate_diff_string(
+            &crate::edit_diff::normalize_to_lf(&previous),
+            &crate::edit_diff::normalize_to_lf(content),
+            4,
+        );
         Ok(ToolResult {
             content: format!("Wrote {}", path.display()),
             is_error: false,
-            details: None,
+            details: Some(serde_json::json!({
+                "path": path,
+                "diff": diff,
+                "firstChangedLine": first_changed_line,
+                "created": previous.is_empty(),
+            })),
         })
     })
 }
@@ -280,7 +391,99 @@ fn edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
         crate::edit_diff::prepare_edit_arguments(input).map_err(ToolError::Failed)?;
     let path = resolve(cwd, &display_path)?;
     crate::file_mutation_queue::with_file_mutation_queue(&path, || {
+        if crate::notebook::is_notebook_path(&path) {
+            if let Some(result) = notebook_edit_locked(&path, &display_path, &edits)? {
+                return Ok(result);
+            }
+        }
         edit_tool_locked(&path, &display_path, &edits)
+    })
+}
+
+/// `edit` on a notebook: the replacements land inside cell sources. `None`
+/// when the file is not notebook JSON, so it is edited as text.
+fn notebook_edit_locked(
+    path: &Path,
+    display_path: &str,
+    edits: &[crate::edit_diff::Edit],
+) -> Result<Option<ToolResult>, ToolError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        ToolError::Failed(format!(
+            "Could not edit file: {display_path}. Error code: {}.",
+            err.raw_os_error()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| err.to_string())
+        ))
+    })?;
+    let Some(mut notebook) = crate::notebook::parse(&raw) else {
+        return Ok(None);
+    };
+    let changes = crate::notebook::edit_in_cells(&mut notebook, edits, display_path)
+        .map_err(ToolError::Failed)?;
+    let text = crate::notebook::serialize(&notebook, crate::notebook::detect_indent(&raw));
+    fs::write(path, text).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let (diff, first_changed_line) = crate::notebook::changes_diff(&changes);
+    let cells: Vec<usize> = changes.iter().map(|change| change.index + 1).collect();
+    Ok(Some(ToolResult {
+        content: format!(
+            "Edited {display_path} (cell {})",
+            cells
+                .iter()
+                .map(|cell| cell.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        is_error: false,
+        details: Some(serde_json::json!({
+            "path": display_path,
+            "edits": edits.len(),
+            "cells": cells,
+            "diff": diff,
+            "firstChangedLine": first_changed_line,
+        })),
+    }))
+}
+
+/// `notebook_edit { path, cell, mode, source?, cellType? }`.
+fn notebook_edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    use crate::notebook::{self, EditMode};
+    let display_path = required_str(input, "path")?.to_string();
+    let path = resolve(cwd, &display_path)?;
+    let cell = input
+        .get("cell")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ToolError::Failed("Missing cell (1-based cell number)".into()))?
+        as usize;
+    let mode = input
+        .get("mode")
+        .and_then(Value::as_str)
+        .and_then(EditMode::parse)
+        .ok_or_else(|| ToolError::Failed("mode must be replace, insert or delete".into()))?;
+    let source = input.get("source").and_then(Value::as_str);
+    let cell_type = notebook::apply_kind(input.get("cellType").and_then(Value::as_str))
+        .map_err(ToolError::Failed)?;
+    crate::file_mutation_queue::with_file_mutation_queue(&path, || {
+        let raw = fs::read_to_string(&path)
+            .map_err(|err| ToolError::Failed(format!("Could not read {display_path}: {err}")))?;
+        let mut parsed = notebook::parse(&raw).ok_or_else(|| {
+            ToolError::Failed(format!("{display_path} is not a Jupyter notebook"))
+        })?;
+        let outcome =
+            notebook::structural_edit(&mut parsed, &display_path, cell, mode, source, cell_type)
+                .map_err(ToolError::Failed)?;
+        let text = notebook::serialize(&parsed, notebook::detect_indent(&raw));
+        fs::write(&path, text).map_err(|err| ToolError::Failed(err.to_string()))?;
+        Ok(ToolResult {
+            content: outcome.summary,
+            is_error: false,
+            details: Some(serde_json::json!({
+                "path": display_path,
+                "cell": cell,
+                "mode": input.get("mode").and_then(Value::as_str).unwrap_or("replace").to_ascii_lowercase(),
+                "cells": outcome.cells,
+                "diff": outcome.diff,
+            })),
+        })
     })
 }
 
@@ -311,6 +514,8 @@ fn edit_tool_locked(
         crate::edit_diff::restore_line_endings(&applied.new_content, ending)
     );
     fs::write(path, final_content).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let (diff, first_changed_line) =
+        crate::edit_diff::generate_diff_string(&applied.base_content, &applied.new_content, 4);
     Ok(ToolResult {
         content: format!("Edited {display_path}"),
         is_error: false,
@@ -318,6 +523,8 @@ fn edit_tool_locked(
             "path": display_path,
             "edits": edits.len(),
             "tokensBefore": applied.base_content.len(),
+            "diff": diff,
+            "firstChangedLine": first_changed_line,
         })),
     })
 }
@@ -348,13 +555,17 @@ fn resolve_bash_timeout_ms(input: &serde_json::Value) -> Result<Option<u64>, Too
     Ok(Some(timeout_ms as u64))
 }
 
-fn shell_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
-    let command = required_str(input, "command")?;
-    let timeout_ms = resolve_bash_timeout_ms(input)?;
-    let command = match std::env::var("PI_SHELL_COMMAND_PREFIX") {
-        Ok(prefix) if !prefix.is_empty() => format!("{prefix}; {command}"),
-        _ => command.to_string(),
-    };
+fn wants_background(input: &serde_json::Value) -> bool {
+    input
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Spawn the shell with the command, stdout and stderr piped, exactly as a
+/// foreground call would — a background job is the same process, only
+/// nobody waits for it.
+fn spawn_shell(cwd: &Path, command: &str) -> Result<std::process::Child, ToolError> {
     let custom = std::env::var("PI_SHELL")
         .ok()
         .filter(|value| !value.is_empty());
@@ -367,11 +578,17 @@ fn shell_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolE
         .stderr(std::process::Stdio::piped());
     match config.command_transport {
         pi_ai::CommandTransport::Argv => {
-            process.arg(&command).stdin(std::process::Stdio::null());
+            process.arg(command).stdin(std::process::Stdio::null());
         }
         pi_ai::CommandTransport::Stdin => {
             process.stdin(std::process::Stdio::piped());
         }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own group, so `job_kill` can take the whole tree down.
+        process.process_group(0);
     }
     let mut child = process
         .spawn()
@@ -383,6 +600,31 @@ fn shell_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolE
                 .write_all(command.as_bytes())
                 .map_err(|err| ToolError::Failed(err.to_string()))?;
         }
+    }
+    Ok(child)
+}
+
+fn shell_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let command = required_str(input, "command")?;
+    let timeout_ms = resolve_bash_timeout_ms(input)?;
+    let command = match std::env::var("PI_SHELL_COMMAND_PREFIX") {
+        Ok(prefix) if !prefix.is_empty() => format!("{prefix}; {command}"),
+        _ => command.to_string(),
+    };
+    let child = spawn_shell(cwd, &command)?;
+    if wants_background(input) {
+        let shown = required_str(input, "command")?;
+        let pid = child.id();
+        let id = context
+            .jobs
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .register(shown, child);
+        return Ok(crate::jobs::started_result(id, pid, shown));
     }
     let timeout_label = input.get("timeout").map(|value| match value {
         serde_json::Value::Number(number) => number.to_string(),
@@ -477,7 +719,12 @@ fn wait_shell_output(
     })
 }
 
-fn powershell_tool(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {
+fn powershell_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let command = required_str(input, "command")?;
     if let Ok(reply) = std::env::var("PI_POWERSHELL_REPLY") {
         return Ok(ToolResult {
             content: reply,
@@ -487,27 +734,39 @@ fn powershell_tool(cwd: &Path, command: &str) -> Result<ToolResult, ToolError> {
     }
     let wrapped = format!("{POWERSHELL_UTF8_PREFIX}{command}");
     for program in ["pwsh", "powershell"] {
-        let result = Command::new(program)
+        let spawned = Command::new(program)
             .args(["-NoProfile", "-NonInteractive", "-Command", &wrapped])
             .current_dir(cwd)
-            .output();
-        match result {
-            Ok(output) => {
-                let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
-                if !output.stderr.is_empty() {
-                    if !content.is_empty() {
-                        content.push('\n');
-                    }
-                    content.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
-                return Ok(ToolResult {
-                    content,
-                    is_error: !output.status.success(),
-                    details: Some(serde_json::json!({"exitCode": output.status.code()})),
-                });
-            }
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let child = match spawned {
+            Ok(child) => child,
             Err(_) => continue,
+        };
+        if wants_background(input) {
+            let pid = child.id();
+            let id = context
+                .jobs
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .register(command, child);
+            return Ok(crate::jobs::started_result(id, pid, command));
         }
+        let output = wait_shell_output(child, None, None)?;
+        let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.stderr.is_empty() {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        return Ok(ToolResult {
+            content,
+            is_error: !output.status.success(),
+            details: Some(serde_json::json!({"exitCode": output.status.code()})),
+        });
     }
     Err(ToolError::Failed(
         "PowerShell is not available and could not be launched".into(),
@@ -1227,7 +1486,7 @@ fn truncate_line(line: &str) -> (String, bool) {
     }
 }
 
-fn truncate_read(
+pub(crate) fn truncate_read(
     content: &str,
     offset: usize,
     limit: Option<usize>,

@@ -6,7 +6,7 @@ use pi_ai::{
 use serde_json::Value;
 
 use crate::events::AgentEvent;
-use crate::tools::execute_tool;
+use crate::tools::execute_tool_with;
 use crate::Agent;
 use crate::ToolExecutionMode;
 
@@ -91,6 +91,7 @@ impl Agent {
             }
 
             self.inject_queued(&mut events, &mut new_messages, true);
+            self.inject_job_notices(&mut events, &mut new_messages);
 
             if self.auto_compaction {
                 let tokens = crate::estimate_context_tokens(&self.messages);
@@ -215,6 +216,7 @@ impl Agent {
                                         .unwrap_or_default(),
                                 ),
                                 is_error: true,
+                                details: None,
                             },
                         );
                         self.messages.push(result.clone());
@@ -243,6 +245,7 @@ impl Agent {
                                     break;
                                 }
                                 let result = self.execute_one(&cwd, &id, &name, &args, &mut events);
+                                self.after_tool(&name, &result);
                                 self.messages.push(result.clone());
                                 self.persist_chat(&result);
                                 new_messages.push(result.clone());
@@ -268,6 +271,7 @@ impl Agent {
                                     break;
                                 }
                                 let result = self.execute_one(&cwd, &id, &name, &args, &mut events);
+                                self.after_tool(&name, &result);
                                 self.messages.push(result.clone());
                                 self.persist_chat(&result);
                                 new_messages.push(result.clone());
@@ -327,6 +331,36 @@ impl Agent {
         self.is_streaming = false;
         self.flush_pending_bash_messages();
         Ok(events)
+    }
+
+    /// Background jobs that finished since the last step are told to the
+    /// model here, between one completion and the next — never inside a
+    /// tool call, and never twice.
+    fn inject_job_notices(
+        &mut self,
+        events: &mut Vec<AgentEvent>,
+        new_messages: &mut Vec<ChatMessage>,
+    ) {
+        for notice in self.job_notice_messages() {
+            self.messages.push(notice.clone());
+            self.persist_chat(&notice);
+            new_messages.push(notice.clone());
+            self.push_event(
+                events,
+                AgentEvent::MessageStart {
+                    message: notice.clone(),
+                },
+            );
+            self.push_event(events, AgentEvent::MessageEnd { message: notice });
+        }
+    }
+
+    /// What a finished tool owes the session beyond its result: the `todo`
+    /// ledger is written after every change so a resume finds it.
+    fn after_tool(&mut self, name: &str, result: &ChatMessage) {
+        if name == "todo" && result.is_error != Some(true) {
+            self.persist_todos();
+        }
     }
 
     fn inject_queued(
@@ -520,7 +554,7 @@ impl Agent {
                     details: None,
                 }
             } else {
-                match execute_tool(cwd, name, args) {
+                match execute_tool_with(cwd, name, args, &self.tool_context) {
                     Ok(result) => result,
                     Err(crate::tools::ToolError::Unknown(_)) => {
                         if let Some(executor) = &self.custom_tool_executor {
@@ -578,6 +612,7 @@ impl Agent {
                 tool_name: name.to_string(),
                 result: Value::String(result.content.clone()),
                 is_error: result.is_error,
+                details: event_details(details.as_ref()),
             },
         );
         tool_result_message(id, name, result, self.auto_resize_images)
@@ -662,6 +697,20 @@ impl Agent {
             });
         }
     }
+}
+
+/// A tool's details as an event carries them: the same object without the
+/// image payloads, which belong in the message and not in every sink.
+fn event_details(details: Option<&Value>) -> Option<Value> {
+    let Value::Object(map) = details? else {
+        return None;
+    };
+    let kept: serde_json::Map<String, Value> = map
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "image" | "images" | "_piUpdates"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    (!kept.is_empty()).then_some(Value::Object(kept))
 }
 
 fn tool_result_message(

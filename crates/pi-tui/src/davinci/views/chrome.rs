@@ -150,13 +150,20 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
         ],
         // Before anything has changed there is no Δ to count; the model in
         // hand takes its place (`1a`).
-        Screen::Agent if delta == 0 => vec![
-            span(model.mode(), th.primary),
-            span(" · ", th.border),
-            span(model.branch.clone(), th.secondary),
-            span(" · ", th.border),
-            span(model_run(model), th.muted),
-        ],
+        Screen::Agent if delta == 0 => {
+            let mut left = vec![
+                span(model.mode(), th.primary),
+                span(" · ", th.border),
+                span(model.branch.clone(), th.secondary),
+                span(" · ", th.border),
+                span(model_run(model), th.muted),
+            ];
+            if let Some(jobs) = jobs_note(model) {
+                left.push(span(" · ", th.border));
+                left.push(span(jobs, th.muted));
+            }
+            left
+        }
         Screen::Agent => {
             let mut left = vec![
                 span(model.mode(), th.primary),
@@ -170,6 +177,10 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
             if model.codex_open() {
                 left.push(span(" · ", th.border));
                 left.push(span("codex open", th.muted));
+            }
+            if let Some(jobs) = jobs_note(model) {
+                left.push(span(" · ", th.border));
+                left.push(span(jobs, th.muted));
             }
             left
         }
@@ -402,6 +413,16 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
 /// The model's run in the header and status bar: `sonnet · high`, and
 /// ` · auto` after it while every tool runs unasked — the one permission
 /// mode worth a standing reminder.
+/// `1 job` / `2 jobs` while background commands run; nothing otherwise, so
+/// the bar says it only when there is something to know.
+fn jobs_note(model: &Model) -> Option<String> {
+    match model.jobs_running {
+        0 => None,
+        1 => Some("1 job".into()),
+        n => Some(format!("{n} jobs")),
+    }
+}
+
 fn model_run(model: &Model) -> String {
     let mut run = format!("{} · {}", model.model_name, model.thinking_level);
     if model.permission_mode == "auto" {

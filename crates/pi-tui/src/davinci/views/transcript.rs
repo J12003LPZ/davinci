@@ -76,15 +76,26 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             target,
             duration,
             summary,
-        } => vec![tool_line(
-            width,
-            th,
-            *state,
-            instrument,
-            target,
-            duration.as_deref(),
-            summary.as_deref(),
-        )],
+            output,
+        } => {
+            let mut rows = vec![tool_line(
+                width,
+                th,
+                *state,
+                instrument,
+                target,
+                duration.as_deref(),
+                summary.as_deref(),
+            )];
+            rows.extend(output_rows(
+                th,
+                *state,
+                output,
+                model.show_tool_output,
+                width,
+            ));
+            rows
+        }
 
         Entry::Detail(text) => vec![detail_line(th, text)],
 
@@ -112,10 +123,76 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                 span(format!("  +{adds}"), th.success),
                 span(format!(" -{dels}"), th.error),
             ])];
-            rows.extend(hunks.iter().map(|hunk| hunk_line(th, hunk, width)));
+            // A block from a live edit is capped like tool output: enough
+            // rows to see the shape, the rest counted (phase 3).
+            let cap = if model.show_tool_output {
+                DELTA_ROWS_EXPANDED
+            } else {
+                DELTA_ROWS_COLLAPSED
+            };
+            let language = super::highlight::language_of(path);
+            rows.extend(
+                hunks
+                    .iter()
+                    .take(cap)
+                    .map(|hunk| hunk_line(th, language, hunk, width)),
+            );
+            if hunks.len() > cap {
+                rows.push(indent(
+                    2,
+                    vec![
+                        span("│ ", th.border),
+                        span(format!("… {} more rows", hunks.len() - cap), th.border),
+                    ],
+                ));
+            }
             rows
         }
     }
+}
+
+/// Rows of a tool's result shown under its line when expanded (`ctrl+t`).
+pub const TOOL_OUTPUT_ROWS: usize = 12;
+/// Hunk rows of a live Δ block, collapsed and expanded.
+pub const DELTA_ROWS_COLLAPSED: usize = 8;
+pub const DELTA_ROWS_EXPANDED: usize = 40;
+
+/// What follows a tool line: a failure's first four rows always (design.md
+/// §6), twelve rows of any call when the transcript is expanded, and one
+/// row counting what is not shown. Collapsed and successful, nothing.
+fn output_rows(
+    theme: &Theme,
+    state: State,
+    output: &[String],
+    expanded: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let shown = if expanded {
+        TOOL_OUTPUT_ROWS
+    } else if state == State::Failed {
+        MAX_FAILURE_DETAIL_LINES
+    } else {
+        0
+    };
+    if shown == 0 || output.is_empty() {
+        return Vec::new();
+    }
+    let room = width.saturating_sub(6);
+    let mut rows: Vec<Line<'static>> = output
+        .iter()
+        .take(shown)
+        .map(|row| detail_line(theme, &clip_ellipsis(row, room)))
+        .collect();
+    if output.len() > shown {
+        rows.push(indent(
+            4,
+            vec![span(
+                format!("… {} more lines", output.len() - shown),
+                theme.border,
+            )],
+        ));
+    }
+    rows
 }
 
 /// Reasoning: while live, a `⟐ reasoning` row and the last few rows of the
@@ -183,20 +260,28 @@ pub fn first_sentence(text: &str) -> String {
 }
 
 /// Hunks sit behind a single left rule; no line numbers unless asked (§6).
-fn hunk_line(theme: &Theme, hunk: &crate::davinci::model::Hunk, width: u16) -> Line<'static> {
+/// On a changed row the sign and plain text keep the row's colour while
+/// keywords, strings, comments and numbers take theirs; a context row stays
+/// wholly muted.
+fn hunk_line(
+    theme: &Theme,
+    language: Option<super::highlight::Lang>,
+    hunk: &crate::davinci::model::Hunk,
+    width: u16,
+) -> Line<'static> {
     let (sign, color) = match hunk.kind {
         HunkKind::Add => ("+", theme.success),
         HunkKind::Del => ("-", theme.error),
         HunkKind::Context => (" ", theme.muted),
     };
-    indent(
-        2,
-        vec![
-            span("│ ", theme.border),
-            span(format!("{sign} "), color),
-            span(clip_ellipsis(&hunk.text, width.saturating_sub(10)), color),
-        ],
-    )
+    let text = clip_ellipsis(&hunk.text, width.saturating_sub(10));
+    let mut spans = vec![span("│ ", theme.border), span(format!("{sign} "), color)];
+    if hunk.kind == HunkKind::Context {
+        spans.push(span(text, color));
+    } else {
+        spans.extend(super::highlight::spans(theme, language, &text, color));
+    }
+    indent(2, spans)
 }
 
 /// A tool failure expands to at most four indented lines and keeps the exit
@@ -427,6 +512,119 @@ mod tests {
         assert!(drawn.contains("· 0.31s"), "{drawn}");
         assert!(drawn.ends_with("· manus"), "{drawn}");
         assert!(!drawn.contains('╭'));
+    }
+
+    #[test]
+    fn collapsed_success_hides_its_output() {
+        let m = model(100);
+        let entry = Entry::tool(State::Done, "manus", "cargo fmt", Some("0.31s"))
+            .with_output("ok\nfmt done");
+        assert_eq!(lines(&m, &[entry], 100).len(), 1);
+    }
+
+    #[test]
+    fn expanded_output_caps_at_twelve_and_counts_the_rest() {
+        let mut m = model(100);
+        m.show_tool_output = true;
+        let body: String = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry =
+            Entry::tool(State::Done, "manus", "cargo test", Some("1.00s")).with_output(&body);
+        let rows = lines(&m, &[entry], 100);
+        assert_eq!(rows.len(), 1 + TOOL_OUTPUT_ROWS + 1);
+        let last = text(&rows[rows.len() - 1]);
+        assert!(last.contains("… 8 more lines"), "{last}");
+        assert!(text(&rows[1]).contains("line 0"));
+    }
+
+    #[test]
+    fn a_failure_shows_four_output_rows_and_counts_the_rest() {
+        let m = model(100);
+        let body: String = (0..9)
+            .map(|i| format!("frame {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = Entry::tool(State::Failed, "manus", "cargo test", None).with_output(&body);
+        let rows = lines(&m, &[entry], 100);
+        assert_eq!(rows.len(), 1 + MAX_FAILURE_DETAIL_LINES + 1);
+        assert!(text(&rows[1]).contains("frame 0"));
+        let last = text(&rows[rows.len() - 1]);
+        assert!(last.contains("… 5 more lines"), "{last}");
+    }
+
+    #[test]
+    fn a_live_delta_caps_at_eight_collapsed_and_forty_expanded() {
+        let hunks: Vec<Hunk> = (0..10)
+            .map(|i| Hunk::new(HunkKind::Add, &format!("line {i}")))
+            .collect();
+        let entry = Entry::Delta {
+            path: "src/lib.rs".into(),
+            adds: 10,
+            dels: 0,
+            hunks,
+        };
+        let m = model(100);
+        let collapsed = lines(&m, std::slice::from_ref(&entry), 100);
+        assert_eq!(collapsed.len(), 1 + DELTA_ROWS_COLLAPSED + 1);
+        let more = text(&collapsed[collapsed.len() - 1]);
+        assert!(more.contains("… 2 more rows"), "{more}");
+
+        let mut expanded_model = model(100);
+        expanded_model.show_tool_output = true;
+        let expanded = lines(&expanded_model, &[entry], 100);
+        assert_eq!(expanded.len(), 1 + 10);
+    }
+
+    #[test]
+    fn a_delta_hunk_colours_keywords_and_the_add_sign() {
+        let m = model(100);
+        let entry = Entry::Delta {
+            path: "src/lib.rs".into(),
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk::new(HunkKind::Add, "pub fn foo() {")],
+        };
+        let rows = lines(&m, &[entry], 100);
+        let hunk = &rows[1];
+        assert!(
+            hunk.spans
+                .iter()
+                .any(|span| span.content.contains('+') && span.style.fg == Some(m.theme.success)),
+            "{hunk:?}"
+        );
+        assert!(
+            hunk.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "fn"
+                    && span.style.fg == Some(m.theme.secondary)),
+            "{hunk:?}"
+        );
+    }
+
+    #[test]
+    fn tool_glyphs_survive_no_color() {
+        let mut m = model(100);
+        m.theme = Theme::da_vinci(ColorDepth::TrueColor, true);
+        let rows = lines(
+            &m,
+            &[
+                Entry::tool(State::Done, "manus", "cargo fmt", Some("0.31s")),
+                Entry::tool(State::Failed, "manus", "cargo test", None),
+                Entry::Delta {
+                    path: "src/lib.rs".into(),
+                    adds: 1,
+                    dels: 0,
+                    hunks: vec![Hunk::new(HunkKind::Add, "x")],
+                },
+            ],
+            100,
+        );
+        let drawn: String = rows.iter().map(text).collect();
+        assert!(drawn.contains('✓'), "{drawn}");
+        assert!(drawn.contains('×'), "{drawn}");
+        assert!(drawn.contains('Δ'), "{drawn}");
     }
 
     #[test]

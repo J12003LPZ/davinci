@@ -85,15 +85,21 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         span(minus(current.dels), th.error),
         span(format!("   {} · j k to move", current.hunk_note), th.border),
     ]));
+    // Keywords, strings and numbers take their own ink on changed rows;
+    // context rows stay quiet, the way the Δ block does (design.md §6).
+    let language = super::highlight::language_of(&current.path);
     for hunk in &current.hunk {
-        out.push(indent(
-            2,
-            vec![
-                span("│ ", th.border),
-                span(marker(hunk.kind), marker_color(hunk.kind, th)),
-                span(hunk.text.clone(), body_color(hunk.kind, th)),
-            ],
-        ));
+        let mut spans = vec![
+            span("│ ", th.border),
+            span(marker(hunk.kind), marker_color(hunk.kind, th)),
+        ];
+        let body = body_color(hunk.kind, th);
+        if hunk.kind == HunkKind::Context {
+            spans.push(span(hunk.text.clone(), body));
+        } else {
+            spans.extend(super::highlight::spans(th, language, &hunk.text, body));
+        }
+        out.push(indent(2, spans));
     }
     out.push(blank());
 
@@ -331,5 +337,28 @@ mod tests {
         m.review = None;
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
         assert!(rows.iter().any(|row| row.contains("no changes to review")));
+    }
+
+    #[test]
+    fn a_changed_hunk_colours_its_keywords_and_its_add_sign() {
+        let mut m = model(120);
+        m.diff_index = 0;
+        let rows = lines(&m);
+        let hunk = rows
+            .iter()
+            .find(|row| text(row).contains("post_stream"))
+            .expect("add hunk");
+        assert!(
+            hunk.spans
+                .iter()
+                .any(|span| span.content.contains('+') && span.style.fg == Some(m.theme.success)),
+            "{hunk:?}"
+        );
+        assert!(
+            hunk.spans.iter().any(|span| {
+                span.content.as_ref() == "let" && span.style.fg == Some(m.theme.secondary)
+            }),
+            "{hunk:?}"
+        );
     }
 }

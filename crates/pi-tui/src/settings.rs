@@ -117,6 +117,8 @@ pub struct InteractiveSettingsConfig {
     pub transport: String,
     pub http_idle_timeout: String,
     pub hide_thinking: bool,
+    /// `showToolOutput`: tool lines carry their result rows (davinci).
+    pub show_tool_output: bool,
     pub cache_miss_notices: bool,
     pub collapse_changelog: bool,
     pub install_telemetry: bool,
@@ -156,6 +158,7 @@ impl Default for InteractiveSettingsConfig {
             transport: "auto".into(),
             http_idle_timeout: "5 min".into(),
             hide_thinking: false,
+            show_tool_output: false,
             cache_miss_notices: false,
             collapse_changelog: false,
             install_telemetry: false,
@@ -372,6 +375,12 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 "Hide thinking blocks in assistant responses",
                 config.hide_thinking,
             ),
+            bool_item(
+                "show-tool-output",
+                "Tool output",
+                "Show what each tool call came back with under its line (ctrl+t toggles for the session)",
+                config.show_tool_output,
+            ),
             SettingItem {
                 id: "mermaid-rendering".into(),
                 label: "Mermaid diagrams".into(),
@@ -520,4 +529,22 @@ pub fn default_interactive_settings(
         enable_analytics,
         ..InteractiveSettingsConfig::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tool_output_row_is_on_the_list_and_defaults_off() {
+        let list = interactive_settings_list(&InteractiveSettingsConfig::default());
+        let item = list
+            .items
+            .iter()
+            .find(|item| item.id == "show-tool-output")
+            .expect("show-tool-output");
+        assert_eq!(item.label, "Tool output");
+        assert_eq!(item.current_value, "false");
+        assert_eq!(item.values, vec!["true", "false"]);
+    }
 }

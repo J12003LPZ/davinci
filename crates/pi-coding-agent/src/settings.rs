@@ -70,6 +70,13 @@ pub struct Settings {
     pub http_idle_timeout_ms: Option<u64>,
     #[serde(default, rename = "hideThinkingBlock")]
     pub hide_thinking_block: Option<bool>,
+    /// davinci: tool lines show their result rows (`ctrl+t` for the
+    /// session). No TypeScript counterpart.
+    #[serde(default, rename = "showToolOutput")]
+    pub show_tool_output: Option<bool>,
+    /// `web_search` provider keys. No TypeScript counterpart.
+    #[serde(default, rename = "webSearch")]
+    pub web_search: Option<WebSearchSettings>,
     #[serde(default, rename = "showCacheMissNotices")]
     pub show_cache_miss_notices: Option<bool>,
     #[serde(default, rename = "collapseChangelog")]
@@ -136,6 +143,17 @@ pub struct Settings {
     /// by `pi install`/`pi remove` cannot silently drop another tool's config.
     #[serde(flatten, default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `webSearch` in settings: provider keys for the `web_search` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WebSearchSettings {
+    #[serde(
+        default,
+        rename = "braveApiKey",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub brave_api_key: Option<String>,
 }
 
 /// `permissions` in either settings file. Rules are `tool` or
@@ -718,6 +736,22 @@ fn deep_merge_json(mut base: serde_json::Value, overrides: serde_json::Value) ->
     }
 }
 
+/// `webSearch.braveApiKey` from settings reaches `web_search` the way the
+/// proxy does: through the environment the tool already reads, and only
+/// when the environment does not already say.
+pub fn apply_web_search_settings(web_search: Option<&WebSearchSettings>) {
+    let Some(key) = web_search
+        .and_then(|settings| settings.brave_api_key.as_deref())
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return;
+    };
+    if std::env::var_os("BRAVE_API_KEY").is_none() {
+        std::env::set_var("BRAVE_API_KEY", key);
+    }
+}
+
 pub fn apply_http_proxy_settings(http_proxy: Option<&str>) {
     let Some(proxy) = http_proxy.map(str::trim).filter(|value| !value.is_empty()) else {
         return;
@@ -1074,6 +1108,7 @@ pub fn to_interactive_config(
             settings.http_idle_timeout_ms.unwrap_or(300_000),
         ),
         hide_thinking: settings.hide_thinking_block.unwrap_or(false),
+        show_tool_output: settings.show_tool_output.unwrap_or(false),
         cache_miss_notices: settings.show_cache_miss_notices.unwrap_or(false),
         collapse_changelog: settings.collapse_changelog.unwrap_or(false),
         install_telemetry: settings.install_telemetry_enabled(),
@@ -1176,6 +1211,28 @@ mod tests {
             "dark",
         );
         assert_eq!(config.autocomplete_max_visible, 12);
+    }
+
+    #[test]
+    fn show_tool_output_round_trips_into_the_settings_list() {
+        let config = to_interactive_config(&Settings::default(), "dark");
+        assert!(!config.show_tool_output);
+        let config = to_interactive_config(
+            &Settings {
+                show_tool_output: Some(true),
+                ..Settings::default()
+            },
+            "dark",
+        );
+        assert!(config.show_tool_output);
+        let list = pi_tui::interactive_settings_list(&config);
+        let item = list
+            .items
+            .iter()
+            .find(|item| item.id == "show-tool-output")
+            .expect("show-tool-output");
+        assert_eq!(item.label, "Tool output");
+        assert_eq!(item.current_value, "true");
     }
 
     #[test]

@@ -315,6 +315,22 @@ impl Theme {
         }
     }
 
+    /// The ink a run of code takes: keywords in verdigris, strings in
+    /// success, comments muted, numbers in warning, and everything else in
+    /// the caller's `base` — the line's own colour in a Δ hunk, `text` in a
+    /// fenced block. Colour reinforces; under `NO_COLOR` every role is the
+    /// same ink and the code reads as it always did.
+    pub fn syntax(&self, token: crate::davinci::views::highlight::Token, base: Color) -> Color {
+        use crate::davinci::views::highlight::Token;
+        match token {
+            Token::Keyword => self.secondary,
+            Token::String => self.success,
+            Token::Comment => self.muted,
+            Token::Number => self.warning,
+            Token::Plain => base,
+        }
+    }
+
     /// The active Studio step's mark. Static under `--no-animation` (§8).
     pub fn spinner(&self, tick: u64, animate: bool) -> &'static str {
         if animate {

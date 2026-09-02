@@ -15,9 +15,9 @@ use pi_agent::{
 use pi_tui::davinci::model::{
     Ask, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
     Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
-    HunkKind, KeymapGroup, Model, ModelItem, Overlay, PickerItem, ProjectTrustSheet, ProviderRow,
-    ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity, Step,
-    ThinkingRow, Tone, TreeNode, TrustFile, VectorIndex, Working, WorkshopSheet,
+    HunkKind, KeymapGroup, Model, ModelItem, Overlay, PickerItem, PlanStep, ProjectTrustSheet,
+    ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity,
+    Step, ThinkingRow, Tone, TreeNode, TrustFile, VectorIndex, Working, WorkshopSheet,
 };
 use pi_tui::davinci::theme::State;
 
@@ -27,7 +27,7 @@ use crate::extension_host::ExtensionHost;
 /// Manus; everything else the agent reaches for is Instrumenta.
 pub fn instrument_of(tool_name: &str) -> &'static str {
     match tool_name {
-        "bash" | "powershell" => "manus",
+        "bash" | "powershell" | "job_output" | "job_kill" => "manus",
         name if name.starts_with("memory") => "memoria",
         name if name.starts_with("graph") => "grafo",
         _ => "instrumenta",
@@ -40,11 +40,29 @@ pub fn state_of(tool_name: &str, failed: bool) -> State {
         return State::Failed;
     }
     match tool_name {
-        "read" | "ls" => State::Read,
-        "grep" | "find" => State::Search,
+        "read" | "ls" | "job_output" => State::Read,
+        "grep" | "find" | "web_fetch" | "web_search" => State::Search,
         name if name.starts_with("memory") => State::Search,
-        "edit" | "write" => State::Delta,
+        "edit" | "write" | "notebook_edit" => State::Delta,
         _ => State::Done,
+    }
+}
+
+/// `docs.rs/similar/latest` from a URL: the scheme says nothing on a row.
+fn bare_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    without_scheme.trim_end_matches('/').to_string()
+}
+
+fn job_id_of(args: &serde_json::Value) -> String {
+    match args.get("jobId").or_else(|| args.get("id")) {
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => s.trim().trim_start_matches("job ").to_string(),
+        _ => "?".into(),
     }
 }
 
@@ -60,6 +78,10 @@ pub fn target_of(tool_name: &str, args: &serde_json::Value) -> String {
             })
             .unwrap_or_default()
     };
+    let background = args
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     match tool_name {
         "read" => format!("read {}", field("path")),
         "ls" => format!("list {}", field("path")),
@@ -67,7 +89,38 @@ pub fn target_of(tool_name: &str, args: &serde_json::Value) -> String {
         "edit" => format!("edit {}", field("path")),
         "grep" => format!("search \"{}\"", field("pattern")),
         "find" => format!("find \"{}\"", field("pattern")),
+        "bash" | "powershell" if background => format!("{} · background", field("command")),
         "bash" | "powershell" => field("command"),
+        "web_fetch" => format!(
+            "fetch {}",
+            clip(
+                &bare_url(
+                    args.get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                ),
+                60
+            )
+        ),
+        "web_search" => format!("search web \"{}\"", field("query")),
+        "todo" => {
+            let count = args
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            format!("plan · {}", plural_of(count, "item"))
+        }
+        "job_output" => format!("job {} output", job_id_of(args)),
+        "job_kill" => format!("kill job {}", job_id_of(args)),
+        "notebook_edit" => {
+            let cell = args
+                .get("cell")
+                .and_then(serde_json::Value::as_u64)
+                .map(|cell| format!(" · cell {cell}"))
+                .unwrap_or_default();
+            format!("edit {}{cell}", field("path"))
+        }
         other => {
             let detail = field("query");
             if detail.is_empty() {
@@ -82,13 +135,22 @@ pub fn target_of(tool_name: &str, args: &serde_json::Value) -> String {
 /// The verb the Studio ledger shows for a step in progress (design.md §5).
 pub fn verb_of(tool_name: &str) -> &'static str {
     match tool_name {
-        "read" | "ls" => "studying",
-        "grep" | "find" => "surveying",
-        "bash" | "powershell" => "testing",
-        "edit" | "write" => "constructing",
+        "read" | "ls" | "job_output" => "studying",
+        "grep" | "find" | "web_fetch" | "web_search" => "surveying",
+        "bash" | "powershell" | "job_kill" => "testing",
+        "edit" | "write" | "notebook_edit" => "constructing",
+        "todo" => "planning",
         name if name.starts_with("memory") => "recalling",
         name if name.starts_with("graph") => "tracing",
         _ => "working",
+    }
+}
+
+fn plural_of(count: usize, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
     }
 }
 
@@ -107,7 +169,9 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 /// A tool failure expands to at most four indented lines and keeps the exit
-/// code (design.md §6).
+/// code (design.md §6). Live drawing uses `Entry::Tool.output` and the
+/// transcript's four-row cap; this helper pins the clip for tests.
+#[cfg(test)]
 pub fn failure_lines(result: &serde_json::Value) -> Vec<String> {
     let text = match result {
         serde_json::Value::String(text) => text.clone(),
@@ -160,11 +224,71 @@ pub fn summary_of(
             format!("{count} {unit}s")
         }
     };
+    let background = args
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     match tool_name {
-        "read" => rows().map(|count| plural(count, "line")),
+        "read" | "web_fetch" => rows().map(|count| plural(count, "line")),
         "ls" => rows().map(|count| plural(count, "entry").replace("entrys", "entries")),
         "grep" | "find" => Some(plural(rows().unwrap_or(0), "match").replace("matchs", "matches")),
+        // `Started background job 3: …` — the row names the job.
+        "bash" | "powershell" if background => result_text(result)
+            .strip_prefix("Started background job ")
+            .and_then(|rest| rest.split(':').next())
+            .map(|id| format!("job {id}")),
         "bash" | "powershell" => rows().map(|count| plural(count, "line")),
+        "web_search" => {
+            let text = result_text(result);
+            let hits = text
+                .lines()
+                .filter(|line| {
+                    line.split_once(". ")
+                        .is_some_and(|(n, _)| n.chars().all(|ch| ch.is_ascii_digit()))
+                })
+                .count();
+            Some(plural(hits, "result"))
+        }
+        "todo" => {
+            let items = args.get("items")?.as_array()?;
+            let done = items
+                .iter()
+                .filter(|item| {
+                    item.get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(pi_agent::TodoStatus::parse)
+                        == Some(pi_agent::TodoStatus::Done)
+                })
+                .count();
+            Some(if items.is_empty() {
+                "cleared".into()
+            } else {
+                format!("{done} of {} done", items.len())
+            })
+        }
+        // `…\n\n[job 1 running · 12.4s]` — the lines above, and the word.
+        "job_output" => {
+            let text = result_text(result);
+            let status = text
+                .lines()
+                .last()
+                .and_then(|line| line.strip_prefix('['))
+                .and_then(|line| line.split(" · ").next())
+                .and_then(|line| line.splitn(3, ' ').nth(2))
+                .map(str::to_string);
+            let count = text
+                .lines()
+                .filter(|line| !line.trim().is_empty() && !line.starts_with("[job "))
+                .count();
+            Some(match status {
+                Some(status) => format!("{} · {status}", plural(count, "line")),
+                None => plural(count, "line"),
+            })
+        }
+        "notebook_edit" => args
+            .get("cell")
+            .and_then(serde_json::Value::as_u64)
+            .map(|cell| format!("cell {cell}")),
         // The edit tool reports the path it touched, not the shape of the
         // change, so the change is counted from what was asked for.
         "edit" => {
@@ -214,6 +338,12 @@ struct Turn {
     thinking_started: Option<Instant>,
     /// `hideThinkingBlock`: reasoning is neither shown live nor kept.
     hide_thinking: bool,
+    /// The model keeps its own ledger (`todo`): the STUDIO box shows it
+    /// instead of a synthesised step per tool, and the tool in hand is
+    /// noted on the active item.
+    ledger: bool,
+    /// The active ledger item's own target, kept while a tool's is shown.
+    ledger_target: Option<Option<String>>,
 }
 
 impl Turn {
@@ -224,6 +354,10 @@ impl Turn {
         tool_name: &str,
         args: &serde_json::Value,
     ) {
+        // A Δ block is a block of its own; the next call starts a new one.
+        if matches!(model.transcript.last(), Some(Entry::Delta { .. })) {
+            model.transcript.push(Entry::Gap);
+        }
         let index = model.transcript.len();
         model.transcript.push(Entry::tool(
             state_of(tool_name, false),
@@ -237,7 +371,33 @@ impl Turn {
             Instant::now(),
             args.clone(),
         ));
+        if tool_name == "todo" {
+            if let Ok(list) = pi_agent::TodoList::from_args(args) {
+                self.take_ledger(model, &list);
+                return;
+            }
+        }
         self.push_step(model, tool_name, args);
+    }
+
+    /// The model's list becomes the ledger: the STUDIO box and the plan
+    /// sheet both show it, and tools stop adding steps of their own.
+    fn take_ledger(&mut self, model: &mut Model, list: &pi_agent::TodoList) {
+        model.plan = plan_from_todos(list);
+        let steps = steps_from_todos(list);
+        self.ledger = !steps.is_empty();
+        self.ledger_target = None;
+        match self
+            .studio
+            .and_then(|index| model.transcript.get_mut(index))
+        {
+            Some(Entry::Studio(existing)) => *existing = steps,
+            _ if !steps.is_empty() => {
+                self.studio = Some(model.transcript.len());
+                model.transcript.push(Entry::Studio(steps));
+            }
+            _ => {}
+        }
     }
 
     fn end_tool(
@@ -247,6 +407,7 @@ impl Turn {
         tool_name: &str,
         result: &serde_json::Value,
         is_error: bool,
+        details: Option<&serde_json::Value>,
     ) {
         let Some(position) = self
             .open
@@ -268,20 +429,52 @@ impl Turn {
             state,
             duration,
             summary,
+            output,
             ..
         }) = model.transcript.get_mut(index)
         {
             *state = state_of(tool_name, is_error);
             *duration = Some(duration_of(started.elapsed()));
             *summary = outcome;
+            // What came back stays on the line: a failure draws its first
+            // rows, `ctrl+t` draws any call's.
+            *output = pi_tui::davinci::model::tool_output_rows(&result_text(result));
         }
-        if is_error {
-            // The detail belongs directly under the line that failed.
-            let mut at = index + 1;
-            for line in failure_lines(result) {
-                model.transcript.insert(at, Entry::detail(&line));
-                at += 1;
-                self.shift(index, 1);
+        // An edit shows its change as a Δ block right under its line, from
+        // the diff the tool returned (phase 3, "Highlighted diffs").
+        if !is_error {
+            if let Some(diff) = details
+                .and_then(|details| details.get("diff"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|diff| !diff.trim().is_empty())
+            {
+                let path = details
+                    .and_then(|details| details.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        args.get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                let (adds, dels, hunks) = hunks_from_diff(diff);
+                model.transcript.insert(index + 1, Entry::Gap);
+                model.transcript.insert(
+                    index + 2,
+                    Entry::Delta {
+                        path,
+                        adds,
+                        dels,
+                        hunks,
+                    },
+                );
+                self.shift(index, 2);
+                if let Some(Entry::Tool { summary, .. }) = model.transcript.get_mut(index) {
+                    if summary.is_none() {
+                        *summary = Some(format!("+{adds} -{dels}"));
+                    }
+                }
             }
         }
         self.finish_step(model);
@@ -480,6 +673,21 @@ impl Turn {
     }
 
     fn push_step(&mut self, model: &mut Model, tool_name: &str, args: &serde_json::Value) {
+        if self.ledger {
+            // The model's own ledger holds the steps; the tool in hand is
+            // noted on the active item, `◉ add the branch · edit src/x.rs`.
+            if let Some(Entry::Studio(steps)) =
+                self.studio.and_then(|i| model.transcript.get_mut(i))
+            {
+                if let Some(step) = steps.iter_mut().find(|step| step.state == State::Active) {
+                    if self.ledger_target.is_none() {
+                        self.ledger_target = Some(step.target.clone());
+                    }
+                    step.target = Some(target_of(tool_name, args));
+                }
+            }
+            return;
+        }
         let step = Step::new(
             State::Active,
             verb_of(tool_name),
@@ -505,6 +713,18 @@ impl Turn {
     }
 
     fn finish_step(&mut self, model: &mut Model) {
+        if self.ledger {
+            if let Some(original) = self.ledger_target.take() {
+                if let Some(Entry::Studio(steps)) =
+                    self.studio.and_then(|i| model.transcript.get_mut(i))
+                {
+                    if let Some(step) = steps.iter_mut().find(|step| step.state == State::Active) {
+                        step.target = original;
+                    }
+                }
+            }
+            return;
+        }
         if let Some(Entry::Studio(steps)) = self.studio.and_then(|i| model.transcript.get_mut(i)) {
             if let Some(step) = steps.last_mut() {
                 step.state = State::Done;
@@ -515,7 +735,9 @@ impl Turn {
     fn close(&mut self, model: &mut Model, interrupted: bool) {
         if let Some(Entry::Studio(steps)) = self.studio.and_then(|i| model.transcript.get_mut(i)) {
             for step in steps.iter_mut() {
-                if step.state == State::Active {
+                // The model's own ledger keeps its active item: the plan is
+                // where it stands, not where the turn stopped.
+                if step.state == State::Active && !self.ledger {
                     step.state = if interrupted {
                         State::Skipped
                     } else {
@@ -536,6 +758,116 @@ impl Turn {
 /// the same approximation `estimate_context_tokens` uses.
 fn estimate_tokens(text: &str) -> u64 {
     text.chars().count() as u64 / 4
+}
+
+/// The model's ledger as STUDIO steps: `✓` done, `◉` active, `○` pending.
+pub fn steps_from_todos(list: &pi_agent::TodoList) -> Vec<Step> {
+    list.items
+        .iter()
+        .map(|item| Step::new(todo_state(item.status), &item.text, None))
+        .collect()
+}
+
+/// The same ledger on the `1c` plan sheet, numbered.
+pub fn plan_from_todos(list: &pi_agent::TodoList) -> Vec<PlanStep> {
+    list.items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            PlanStep::new(
+                &pi_tui::davinci::views::disegno::roman(index + 1),
+                todo_state(item.status),
+                &item.text,
+                None,
+            )
+        })
+        .collect()
+}
+
+fn todo_state(status: pi_agent::TodoStatus) -> State {
+    match status {
+        pi_agent::TodoStatus::Done => State::Done,
+        pi_agent::TodoStatus::Active => State::Active,
+        pi_agent::TodoStatus::Pending => State::Queued,
+    }
+}
+
+/// The Δ block of an edit's diff, as the tool returns it (`+12 text`,
+/// `-12 text`, ` 12 text`, `    ...`): the numbers come off, additions and
+/// deletions are counted, `...` becomes a context row of its own.
+pub fn hunks_from_diff(diff: &str) -> (u32, u32, Vec<Hunk>) {
+    let mut adds = 0u32;
+    let mut dels = 0u32;
+    let mut hunks = Vec::new();
+    for line in diff.lines() {
+        let mut chars = line.chars();
+        let Some(sign) = chars.next() else {
+            continue;
+        };
+        let rest = chars.as_str();
+        // `NN text` — the number column, then one space, then the text.
+        let trimmed = rest.trim_start();
+        let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        let text = if digits > 0 {
+            trimmed[digits..]
+                .strip_prefix(' ')
+                .unwrap_or(&trimmed[digits..])
+        } else {
+            trimmed
+        };
+        let kind = match sign {
+            '+' => {
+                adds += 1;
+                HunkKind::Add
+            }
+            '-' => {
+                dels += 1;
+                HunkKind::Del
+            }
+            _ => HunkKind::Context,
+        };
+        if kind == HunkKind::Context && text.trim() == "..." {
+            hunks.push(Hunk::new(HunkKind::Context, "…"));
+        } else {
+            hunks.push(Hunk::new(kind, text));
+        }
+    }
+    (adds, dels, hunks)
+}
+
+/// A finished background job on the transcript: `⎿ ✓ job 1 finished ·
+/// cargo build · exit 0 · 31.2s`, with its last rows behind the line, so
+/// the news reaches the user before it reaches the model.
+pub fn job_row(notice: &pi_agent::JobNotice) -> Entry {
+    let state = if notice.status.succeeded() {
+        State::Done
+    } else {
+        State::Failed
+    };
+    Entry::tool(
+        state,
+        "manus",
+        &format!("job {} finished · {}", notice.id, clip(&notice.command, 50)),
+        Some(&pi_agent::jobs::format_elapsed(notice.elapsed)),
+    )
+    .summarised(&notice.status.describe())
+    .with_output(&notice.tail.join("\n"))
+}
+
+/// Finished jobs the user has not seen become rows; the count of running
+/// ones feeds the status bar. Safe mid-turn: rows go at the end.
+pub fn poll_jobs(jobs: &Arc<Mutex<pi_agent::JobBook>>, model: &mut Model) {
+    let (notices, running) = {
+        let mut book = jobs.lock().unwrap_or_else(|err| err.into_inner());
+        (book.take_unseen(), book.running())
+    };
+    model.jobs_running = running;
+    for notice in &notices {
+        if !model.running && !matches!(model.transcript.last(), Some(Entry::Tool { .. })) {
+            model.transcript.push(Entry::Gap);
+        }
+        model.transcript.push(job_row(notice));
+    }
 }
 
 /// `high`, `medium`, … for the working line. `off` says nothing, because a
@@ -559,7 +891,15 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
             tool_name,
             result,
             is_error,
-        } => turn.end_tool(model, tool_call_id, tool_name, result, *is_error),
+            details,
+        } => turn.end_tool(
+            model,
+            tool_call_id,
+            tool_name,
+            result,
+            *is_error,
+            details.as_ref(),
+        ),
 
         AgentEvent::MessageStart { message } if message.role == "assistant" => {
             turn.begin_message(model);
@@ -671,6 +1011,9 @@ fn mid_turn_key(
             return again;
         }
         KeyCode::Char('j') if ctrl => model.newline(),
+        // Tool output can be opened while the turn still runs: that is when
+        // a long read is most worth seeing.
+        KeyCode::Char('t') if ctrl => model.show_tool_output = !model.show_tool_output,
         KeyCode::Char(_) if ctrl => {}
         KeyCode::Enter
             if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -754,6 +1097,8 @@ fn run_turn(
     })));
     let mut approval: Option<(ToolApprovalRequest, mpsc::Sender<ToolApprovalDecision>)> = None;
     let mut last_tick = Instant::now();
+    // The job book, read on every tick while the worker holds the agent.
+    let jobs = agent.tool_context.jobs.clone();
     // The working line above the composer, for as long as the turn runs.
     let started = Instant::now();
     model.working = Some(Working {
@@ -881,6 +1226,7 @@ fn run_turn(
             if last_tick.elapsed() >= pi_tui::davinci::runtime::TICK {
                 model.tick = model.tick.wrapping_add(1);
                 last_tick = Instant::now();
+                poll_jobs(&jobs, model);
             }
         }
 
@@ -1034,7 +1380,15 @@ pub fn transcript_from(messages: &[pi_ai::ChatMessage]) -> Vec<Entry> {
                 if !entries.is_empty() {
                     entries.push(Entry::Gap);
                 }
-                entries.push(Entry::user(text));
+                if message.extra.get("customType")
+                    == Some(&serde_json::Value::String(
+                        pi_agent::JOB_NOTICE_TYPE.to_string(),
+                    ))
+                {
+                    entries.push(job_entry_from_notice(message, text));
+                } else {
+                    entries.push(Entry::user(text));
+                }
             }
             "assistant" => {
                 let calls: Vec<(&String, &String, &serde_json::Value)> = message
@@ -1085,27 +1439,72 @@ pub fn transcript_from(messages: &[pi_ai::ChatMessage]) -> Vec<Entry> {
                 let outcome = (!failed)
                     .then(|| summary_of(&name, &arguments, &result))
                     .flatten();
-                if let Some(Entry::Tool { state, summary, .. }) = entries.get_mut(index) {
+                if let Some(Entry::Tool {
+                    state,
+                    summary,
+                    output,
+                    ..
+                }) = entries.get_mut(index)
+                {
                     *state = state_of(&name, failed);
                     *summary = outcome;
-                }
-                if failed {
-                    let mut at = index + 1;
-                    for line in failure_lines(&result) {
-                        entries.insert(at, Entry::detail(&line));
-                        at += 1;
-                        for (_, open_index, _, _) in open.iter_mut() {
-                            if *open_index >= at {
-                                *open_index += 1;
-                            }
-                        }
-                    }
+                    // The result rides on the line, as it does live: a
+                    // failure shows its first rows, `ctrl+t` shows any.
+                    *output = pi_tui::davinci::model::tool_output_rows(text);
                 }
             }
             _ => {}
         }
     }
     entries
+}
+
+/// A persisted `customType: backgroundJob` user message as the tool row the
+/// live tick would have drawn: `job N finished · command`, not `> [background
+/// job …]`. The first line is the notice head; indented lines are the tail.
+fn job_entry_from_notice(message: &pi_ai::ChatMessage, text: &str) -> Entry {
+    let mut lines = text.lines();
+    let head = lines.next().unwrap_or(text);
+    let (meta, command) = head
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(meta, command)| (meta.trim(), command.trim()))
+        .unwrap_or(("", head));
+    let id = message
+        .extra
+        .get("jobId")
+        .and_then(|value| match value {
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            meta.strip_prefix("background job ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "?".into());
+    let mut parts = meta.split(" · ");
+    let _head = parts.next();
+    let status = parts.next().unwrap_or("finished");
+    let elapsed = parts.next().unwrap_or("");
+    let tail: Vec<&str> = lines
+        .map(str::trim_start)
+        .filter(|line| !line.is_empty() && *line != "(no output)")
+        .collect();
+    let state = if status == "exit 0" {
+        State::Done
+    } else {
+        State::Failed
+    };
+    Entry::tool(
+        state,
+        "manus",
+        &format!("job {id} finished · {}", clip(command, 50)),
+        (!elapsed.is_empty()).then_some(elapsed),
+    )
+    .summarised(status)
+    .with_output(&tail.join("\n"))
 }
 
 /// What a finished turn owes the transcript beyond what it already said.
@@ -1193,6 +1592,16 @@ pub fn corpus(
     items.push(CorpusItem::new(
         "/permissions",
         "what runs without asking · read-only, ask, edits, auto",
+        "command",
+    ));
+    items.push(CorpusItem::new(
+        "/todo",
+        "the model's ledger · /todo clear",
+        "command",
+    ));
+    items.push(CorpusItem::new(
+        "/jobs",
+        "background jobs · /jobs kill <id>",
         "command",
     ));
 
@@ -2454,6 +2863,20 @@ pub fn run(
         .mode
         .as_str()
         .to_string();
+    model.show_tool_output =
+        crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd)
+            .show_tool_output
+            .unwrap_or(false);
+    // A resumed session opens on the ledger it closed on (phase 3).
+    if agent.restore_todos() {
+        let list = agent
+            .tool_context
+            .todos
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        model.plan = plan_from_todos(&list);
+    }
     model.model_index = model
         .models
         .iter()
@@ -2943,6 +3366,9 @@ pub fn run(
         if last_tick.elapsed() >= pi_tui::davinci::runtime::TICK {
             model.tick = model.tick.wrapping_add(1);
             last_tick = Instant::now();
+            // A job that finishes between turns is news at once, not at
+            // the next prompt.
+            poll_jobs(&agent.tool_context.jobs, &mut model);
         }
     };
 
@@ -4647,6 +5073,17 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
                 return permissions_command(shell, rest.trim());
             }
         }
+        // `/todo` — the model's ledger; `/jobs` — the background jobs.
+        if let Some(rest) = line.trim().strip_prefix("/todo") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return todo_command(shell, rest.trim());
+            }
+        }
+        if let Some(rest) = line.trim().strip_prefix("/jobs") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return jobs_command(shell, rest.trim());
+            }
+        }
     }
     match classify(line) {
         Sent::Quit => Next::Leave,
@@ -4948,6 +5385,7 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
         }
         "terminal-progress" => shell.model.terminal_progress = next == "true",
         "double-escape-action" => shell.model.double_escape_action = next.clone(),
+        "show-tool-output" => shell.model.show_tool_output = next == "true",
         _ => {}
     }
     Next::Go
@@ -5017,6 +5455,120 @@ pub fn recall_query(model: &Model, agent: &Agent) -> String {
             clip(text.trim(), 120)
         })
         .unwrap_or_default()
+}
+
+/// `/todo` — the model's ledger as a STUDIO box between turns; `/todo
+/// clear` empties it (and the session's record of it).
+fn todo_command(shell: &mut Shell<'_>, arg: &str) -> Next {
+    if arg == "clear" {
+        *shell
+            .agent
+            .tool_context
+            .todos
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = pi_agent::TodoList::default();
+        shell.agent.persist_todos();
+        shell.model.plan.clear();
+        shell.model.running = false;
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(Entry::tool(
+            State::Done,
+            "instrumenta",
+            "ledger cleared",
+            None,
+        ));
+        return Next::Go;
+    }
+    if !arg.is_empty() {
+        shell.note("usage: /todo — the model's ledger · /todo clear");
+        return Next::Go;
+    }
+    let list = shell
+        .agent
+        .tool_context
+        .todos
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    shell.model.running = false;
+    shell.model.transcript.push(Entry::Gap);
+    if list.is_empty() {
+        shell.model.transcript.push(Entry::tool(
+            State::Queued,
+            "instrumenta",
+            "no ledger · the model keeps one with the todo tool on longer tasks",
+            None,
+        ));
+        return Next::Go;
+    }
+    shell.model.plan = plan_from_todos(&list);
+    shell
+        .model
+        .transcript
+        .push(Entry::Studio(steps_from_todos(&list)));
+    Next::Go
+}
+
+/// `/jobs` — every background job of the session, one row each; `/jobs
+/// kill <id>` stops one.
+fn jobs_command(shell: &mut Shell<'_>, arg: &str) -> Next {
+    let jobs = shell.agent.tool_context.jobs.clone();
+    if let Some(id) = arg.strip_prefix("kill") {
+        let Ok(id) = id.trim().parse::<u32>() else {
+            shell.note("usage: /jobs kill <id>");
+            return Next::Go;
+        };
+        let killed = jobs.lock().unwrap_or_else(|err| err.into_inner()).kill(id);
+        shell.model.running = false;
+        shell.model.transcript.push(Entry::Gap);
+        shell.model.transcript.push(match killed {
+            Some(status) => Entry::tool(
+                State::Done,
+                "manus",
+                &format!("job {id} · {}", status.describe()),
+                None,
+            ),
+            None => Entry::tool(State::Attention, "manus", &format!("no job {id}"), None),
+        });
+        return Next::Go;
+    }
+    if !arg.is_empty() {
+        shell.note("usage: /jobs — the background jobs · /jobs kill <id>");
+        return Next::Go;
+    }
+    let summaries = jobs
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .summaries();
+    shell.model.running = false;
+    shell.model.transcript.push(Entry::Gap);
+    if summaries.is_empty() {
+        shell.model.transcript.push(Entry::tool(
+            State::Queued,
+            "manus",
+            "no background jobs · bash with background: true starts one",
+            None,
+        ));
+        return Next::Go;
+    }
+    for job in summaries {
+        let state = match job.status {
+            pi_agent::JobStatus::Running => State::Active,
+            pi_agent::JobStatus::Exited(0) => State::Done,
+            pi_agent::JobStatus::Exited(_) => State::Failed,
+            pi_agent::JobStatus::Killed => State::Skipped,
+        };
+        shell.model.transcript.push(
+            Entry::tool(
+                state,
+                "manus",
+                &format!("job {} · {}", job.id, clip(&job.command, 50)),
+                Some(&pi_agent::jobs::format_elapsed(job.elapsed)),
+            )
+            .summarised(&job.status.describe()),
+        );
+    }
+    Next::Go
 }
 
 /// `/permissions` — the mode and every rule in force, by source; or, with a
@@ -5167,6 +5719,7 @@ mod tests {
             "read",
             &serde_json::Value::String("line".into()),
             false,
+            None,
         );
         assert_eq!(turn.log.len(), 1);
         assert_eq!(turn.log[0].0, State::Read);
@@ -5696,6 +6249,7 @@ mod tests {
                 tool_name: "bash".into(),
                 result: json!("ok"),
                 is_error: false,
+                details: None,
             },
         );
         match &m.transcript[0] {
@@ -5727,18 +6281,34 @@ mod tests {
                 tool_name: "bash".into(),
                 result: json!("error[E0308] mismatched types\nstore.rs:118"),
                 is_error: true,
+                details: None,
             },
         );
 
-        assert!(matches!(
-            &m.transcript[0],
+        match &m.transcript[0] {
             Entry::Tool {
                 state: State::Failed,
+                output,
                 ..
+            } => {
+                assert!(
+                    output.iter().any(|line| line.contains("E0308")),
+                    "{output:?}"
+                );
+                assert!(
+                    output.iter().any(|line| line.contains("store.rs:118")),
+                    "{output:?}"
+                );
             }
-        ));
-        assert!(matches!(&m.transcript[1], Entry::Detail(text) if text.contains("E0308")));
-        assert!(matches!(&m.transcript[2], Entry::Detail(text) if text.contains("store.rs:118")));
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !m.transcript
+                .iter()
+                .any(|entry| matches!(entry, Entry::Detail(_))),
+            "the failure rides on the tool line, not as Detail siblings: {:?}",
+            m.transcript
+        );
     }
 
     #[test]
@@ -5765,6 +6335,7 @@ mod tests {
                 tool_name: "bash".into(),
                 result: json!("ok"),
                 is_error: false,
+                details: None,
             },
         );
 
@@ -6322,6 +6893,8 @@ mod tests {
         let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
         assert!(names.contains(&"/graph-view"), "{names:?}");
         assert!(names.contains(&"/quit"), "{names:?}");
+        assert!(names.contains(&"/todo"), "{names:?}");
+        assert!(names.contains(&"/jobs"), "{names:?}");
     }
 
     #[test]
@@ -6461,17 +7034,24 @@ mod tests {
                     state,
                     target,
                     summary,
+                    output,
                     ..
-                } if target == "cargo test" => Some((*state, summary.clone())),
+                } if target == "cargo test" => Some((*state, summary.clone(), output.clone())),
                 _ => None,
             })
             .expect("the command is drawn");
-        assert_eq!(failed, (State::Failed, None), "a failure states no outcome");
+        assert_eq!(failed.0, State::Failed);
+        assert_eq!(failed.1, None, "a failure states no outcome");
         assert!(
-            entries
+            failed.2.iter().any(|line| line.contains("E0308")),
+            "the failure rides on the tool line: {:?}",
+            failed.2
+        );
+        assert!(
+            !entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Detail(text) if text.contains("E0308"))),
-            "the failure detail follows the line that failed"
+                .any(|entry| matches!(entry, Entry::Detail(_))),
+            "a resumed failure is not a Detail sibling"
         );
     }
 
@@ -6498,6 +7078,25 @@ mod tests {
             Some("+4 -2".into())
         );
         assert_eq!(summary_of("ask", &json!({}), &json!("whatever")), None);
+        assert_eq!(
+            summary_of(
+                "todo",
+                &json!({"items": [
+                    {"text": "survey", "status": "completed"},
+                    {"text": "edit", "status": "in_progress"}
+                ]}),
+                &json!("ok")
+            ),
+            Some("1 of 2 done".into())
+        );
+        assert_eq!(
+            summary_of(
+                "web_search",
+                &json!({"query": "ratatui"}),
+                &json!("1. ratatui.rs\n2. docs.rs/ratatui")
+            ),
+            Some("2 results".into())
+        );
     }
 
     #[test]
@@ -6511,5 +7110,222 @@ mod tests {
     fn durations_read_in_seconds() {
         assert_eq!(duration_of(Duration::from_millis(1_840)), "1.84s");
         assert_eq!(duration_of(Duration::from_millis(420)), "0.42s");
+    }
+
+    #[test]
+    fn an_edit_draws_its_delta_from_the_details_the_tool_returned() {
+        let mut m = model();
+        let mut turn = Turn::default();
+        apply(
+            &mut m,
+            &mut turn,
+            &AgentEvent::ToolExecutionStart {
+                tool_call_id: "1".into(),
+                tool_name: "edit".into(),
+                args: json!({"path": "src/lib.rs"}),
+            },
+        );
+        apply(
+            &mut m,
+            &mut turn,
+            &AgentEvent::ToolExecutionEnd {
+                tool_call_id: "1".into(),
+                tool_name: "edit".into(),
+                result: json!("Edited src/lib.rs"),
+                is_error: false,
+                details: Some(json!({
+                    "path": "src/lib.rs",
+                    "diff": "+ 1 pub fn foo() {\n- 1 pub fn bar() {\n"
+                })),
+            },
+        );
+        assert!(matches!(
+            &m.transcript[0],
+            Entry::Tool {
+                state: State::Delta,
+                ..
+            }
+        ));
+        assert!(matches!(m.transcript[1], Entry::Gap));
+        match &m.transcript[2] {
+            Entry::Delta {
+                path,
+                adds,
+                dels,
+                hunks,
+            } => {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!((*adds, *dels), (1, 1));
+                assert_eq!(hunks[0].kind, HunkKind::Add);
+                assert!(hunks[0].text.contains("foo"));
+                assert_eq!(hunks[1].kind, HunkKind::Del);
+                assert!(hunks[1].text.contains("bar"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_todo_call_becomes_the_studio_ledger_and_the_plan_sheet() {
+        let mut m = model();
+        let mut turn = Turn::default();
+        apply(
+            &mut m,
+            &mut turn,
+            &AgentEvent::ToolExecutionStart {
+                tool_call_id: "1".into(),
+                tool_name: "todo".into(),
+                args: json!({"items": [
+                    {"text": "survey", "status": "completed"},
+                    {"text": "edit", "status": "in_progress"},
+                    {"text": "test", "status": "pending"}
+                ]}),
+            },
+        );
+        assert!(
+            m.transcript
+                .iter()
+                .any(|entry| matches!(entry, Entry::Studio(steps) if steps.len() == 3)),
+            "{:?}",
+            m.transcript
+        );
+        assert_eq!(m.plan.len(), 3);
+        assert_eq!(m.plan[0].state, State::Done);
+        assert_eq!(m.plan[1].state, State::Active);
+        assert_eq!(m.plan[2].state, State::Queued);
+    }
+
+    #[test]
+    fn a_finished_job_is_a_manus_row_with_its_tail_behind_the_line() {
+        let ok = pi_agent::JobNotice {
+            id: 1,
+            command: "cargo build".into(),
+            status: pi_agent::JobStatus::Exited(0),
+            elapsed: Duration::from_millis(31_200),
+            tail: vec!["Compiling pi".into(), "Finished".into()],
+        };
+        match job_row(&ok) {
+            Entry::Tool {
+                state: State::Done,
+                instrument,
+                target,
+                summary,
+                output,
+                duration,
+            } => {
+                assert_eq!(instrument, "manus");
+                assert!(target.contains("job 1 finished"), "{target}");
+                assert!(target.contains("cargo build"), "{target}");
+                assert_eq!(summary.as_deref(), Some("exit 0"));
+                assert_eq!(duration.as_deref(), Some("31.2s"));
+                assert!(output.iter().any(|line| line.contains("Compiling pi")));
+            }
+            other => panic!("{other:?}"),
+        }
+        let fail = pi_agent::JobNotice {
+            id: 2,
+            command: "cargo test".into(),
+            status: pi_agent::JobStatus::Exited(1),
+            elapsed: Duration::from_millis(400),
+            tail: vec!["FAILED".into()],
+        };
+        match job_row(&fail) {
+            Entry::Tool {
+                state: State::Failed,
+                summary,
+                ..
+            } => assert_eq!(summary.as_deref(), Some("exit 1")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_tools_name_their_instrument_state_verb_and_target() {
+        assert_eq!(instrument_of("web_fetch"), "instrumenta");
+        assert_eq!(instrument_of("job_output"), "manus");
+        assert_eq!(state_of("web_fetch", false), State::Search);
+        assert_eq!(state_of("web_search", false), State::Search);
+        assert_eq!(state_of("todo", false), State::Done);
+        assert_eq!(state_of("job_output", false), State::Read);
+        assert_eq!(state_of("notebook_edit", false), State::Delta);
+        assert_eq!(verb_of("todo"), "planning");
+        assert_eq!(verb_of("web_search"), "surveying");
+        assert_eq!(verb_of("notebook_edit"), "constructing");
+        assert_eq!(
+            target_of("web_fetch", &json!({"url": "https://docs.rs/ratatui/"})),
+            "fetch docs.rs/ratatui"
+        );
+        assert_eq!(
+            target_of("web_search", &json!({"query": "myers diff"})),
+            "search web \"myers diff\""
+        );
+        assert_eq!(
+            target_of("todo", &json!({"items": [{"text": "a"}, {"text": "b"}]})),
+            "plan · 2 items"
+        );
+        assert_eq!(
+            target_of("job_output", &json!({"jobId": 3})),
+            "job 3 output"
+        );
+        assert_eq!(
+            target_of("notebook_edit", &json!({"path": "n.ipynb", "cell": 2})),
+            "edit n.ipynb · cell 2"
+        );
+    }
+
+    #[test]
+    fn a_persisted_background_job_replays_as_a_tool_row_not_a_user_echo() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("customType".into(), json!(pi_agent::JOB_NOTICE_TYPE));
+        extra.insert("jobId".into(), json!(1));
+        let notice = pi_agent::JobNotice {
+            id: 1,
+            command: "cargo build".into(),
+            status: pi_agent::JobStatus::Exited(0),
+            elapsed: Duration::from_millis(31_200),
+            tail: vec!["Finished".into()],
+        };
+        let message = pi_ai::ChatMessage {
+            role: "user".into(),
+            content: vec![pi_ai::MessageContent::Text {
+                text: notice.message_text(),
+            }],
+            extra,
+            ..pi_ai::ChatMessage::default()
+        };
+        let entries = transcript_from(&[message]);
+        match &entries[0] {
+            Entry::Tool {
+                state: State::Done,
+                instrument,
+                target,
+                summary,
+                output,
+                ..
+            } => {
+                assert_eq!(instrument, "manus");
+                assert!(target.contains("job 1 finished"), "{target}");
+                assert_eq!(summary.as_deref(), Some("exit 0"));
+                assert!(output.iter().any(|line| line.contains("Finished")));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !entries.iter().any(|entry| matches!(entry, Entry::User(_))),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
+    fn hunks_from_diff_strips_the_number_column_and_counts() {
+        let (adds, dels, hunks) = hunks_from_diff("+12 added\n- 8 removed\n  4 kept\n    ...\n");
+        assert_eq!((adds, dels), (1, 1));
+        assert_eq!(hunks[0].kind, HunkKind::Add);
+        assert_eq!(hunks[0].text, "added");
+        assert_eq!(hunks[1].kind, HunkKind::Del);
+        assert_eq!(hunks[1].text, "removed");
+        assert_eq!(hunks[2].kind, HunkKind::Context);
+        assert_eq!(hunks[2].text, "kept");
+        assert_eq!(hunks[3].text, "…");
     }
 }

@@ -62,6 +62,12 @@ pub enum AgentEvent {
         result: Value,
         #[serde(rename = "isError")]
         is_error: bool,
+        /// The tool's `details` — an edit's diff, a job's id, a read's
+        /// truncation — minus any image payload, so a host can draw the
+        /// change without re-reading the file. Absent when the tool gave
+        /// none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
     },
     #[serde(rename = "auto_retry_start")]
     AutoRetryStart {

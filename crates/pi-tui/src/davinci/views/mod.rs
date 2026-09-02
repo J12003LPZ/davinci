@@ -12,6 +12,7 @@ pub mod export;
 pub mod governor;
 pub mod grafo;
 pub mod graph_run;
+pub mod highlight;
 pub mod instrumenta;
 pub mod keys;
 pub mod login;

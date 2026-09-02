@@ -413,6 +413,10 @@ fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
         model.toggle_codex();
         return Some(Flow::Continue);
     }
+    if model.keybindings.matches(data, "davinci.tools.expand") {
+        model.show_tool_output = !model.show_tool_output;
+        return Some(Flow::Continue);
+    }
     None
 }
 

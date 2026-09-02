@@ -423,6 +423,11 @@ pub enum Entry {
         /// — `412 lines`, `8 matches`, `+31 -8`. It sits at the end of the tool
         /// line so a finished call states its outcome without a second row.
         summary: Option<String>,
+        /// The result itself, line by line, kept on the entry and drawn only
+        /// when asked: a failure shows its first four rows, `ctrl+t` shows
+        /// twelve of any call (phase 3, "Collapsible tool output"). Clipped
+        /// to `TOOL_OUTPUT_KEPT` rows on entry so a long read costs nothing.
+        output: Vec<String>,
     },
     Detail(String),
     /// A failure detail: what went wrong, then the subject — `1 failed
@@ -489,6 +494,7 @@ impl Entry {
             target: target.to_string(),
             duration: duration.map(str::to_string),
             summary: None,
+            output: Vec::new(),
         }
     }
 
@@ -499,6 +505,37 @@ impl Entry {
         }
         self
     }
+
+    /// The same tool line, carrying its result for the expanded view.
+    pub fn with_output(mut self, text: &str) -> Self {
+        if let Entry::Tool { output, .. } = &mut self {
+            *output = tool_output_rows(text);
+        }
+        self
+    }
+}
+
+/// Rows of tool output kept on an entry; a 2000-line read is clipped here
+/// and counted, not carried.
+pub const TOOL_OUTPUT_KEPT: usize = 200;
+
+/// A result's non-empty lines, trimmed at the right, clipped to
+/// `TOOL_OUTPUT_KEPT` with a last row that counts the rest.
+pub fn tool_output_rows(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let mut rows: Vec<String> = lines
+        .iter()
+        .take(TOOL_OUTPUT_KEPT)
+        .map(|line| line.to_string())
+        .collect();
+    if lines.len() > TOOL_OUTPUT_KEPT {
+        rows.push(format!("… {} more lines", lines.len() - TOOL_OUTPUT_KEPT));
+    }
+    rows
 }
 
 /// One row of the Instrumenta corpus (`1d`): tools, sessions, files, modes.
@@ -1225,6 +1262,12 @@ pub struct Model {
     /// The header names it only when it is `auto`: the one state that is
     /// worth a permanent reminder.
     pub permission_mode: String,
+    /// Whether tool lines show what they came back with (`ctrl+t`, the
+    /// `showToolOutput` setting). Off, a call is one line; on, up to twelve
+    /// rows of its output follow it.
+    pub show_tool_output: bool,
+    /// Background jobs still running, for the status bar's `· 2 jobs`.
+    pub jobs_running: usize,
     /// `Δn +a -d` for the status bar.
     pub changes: (u32, u32, u32),
     /// `(used, cap)` in tokens.
@@ -1361,6 +1404,8 @@ impl Model {
             model_name: String::new(),
             thinking_level: "off".into(),
             permission_mode: "ask".into(),
+            show_tool_output: false,
+            jobs_running: 0,
             changes: (0, 0, 0),
             context: (0, 200_000),
             startup: Startup::default(),
