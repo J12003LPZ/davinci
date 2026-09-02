@@ -70,6 +70,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             None,
         ),
         ("llama", "Manage llama.cpp router models", None),
+        ("mcp", "Connected MCP servers, tools and errors", None),
         ("quit", "Quit pi", None),
     ]
     .into_iter()
@@ -117,6 +118,7 @@ pub enum SlashAction {
     SessionInfo,
     ScopedModels,
     Llama,
+    Mcp,
 }
 
 pub fn parse_line(line: &str) -> SlashAction {
@@ -175,6 +177,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "hotkeys" => SlashAction::Hotkeys,
         "session" => SlashAction::SessionInfo,
         "llama" => SlashAction::Llama,
+        "mcp" => SlashAction::Mcp,
         "help" => SlashAction::Status(
             builtin_slash_commands()
                 .into_iter()

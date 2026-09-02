@@ -26,6 +26,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "job_output",
     "job_kill",
     "notebook_edit",
+    "mcp_read",
 ];
 
 /// What the built-in tools share across calls: the background jobs and the
@@ -35,6 +36,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
 pub struct ToolContext {
     pub jobs: Arc<Mutex<JobBook>>,
     pub todos: Arc<Mutex<TodoList>>,
+    pub mcp: crate::mcp::McpRegistry,
 }
 
 const DEFAULT_MAX_LINES: usize = 2000;
@@ -173,6 +175,11 @@ pub fn tool_specs() -> Vec<AgentTool> {
             description: "Replace, insert or delete one cell of a Jupyter notebook (.ipynb). Cells are numbered as `read` shows them. To change text inside a cell, `edit` also works on notebooks and matches inside cell sources.".into(),
             parameters: crate::notebook::tool_parameters(),
         },
+        AgentTool {
+            name: "mcp_read".into(),
+            description: "Read a resource from a connected MCP server. Pass { server, uri }.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"server":{"type":"string","description":"MCP server name"},"uri":{"type":"string","description":"Resource URI"}},"required":["server","uri"]}),
+        },
     ]
 }
 
@@ -207,8 +214,30 @@ pub fn execute_tool_with(
         "job_output" => crate::jobs::output_tool(&context.jobs, input).map_err(ToolError::Failed),
         "job_kill" => crate::jobs::kill_tool(&context.jobs, input).map_err(ToolError::Failed),
         "notebook_edit" => notebook_edit_tool(cwd, input),
+        "mcp_read" => mcp_read_tool(input, context),
+        other if other.starts_with("mcp__") => mcp_call_tool(other, input, context),
         other => Err(ToolError::Unknown(other.to_string())),
     }
+}
+
+fn mcp_read_tool(
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let server = required_str(input, "server")?;
+    let uri = required_str(input, "uri")?;
+    context.mcp.read(server, uri)
+}
+
+fn mcp_call_tool(
+    name: &str,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let Some((server, tool)) = pi_mcp::split_agent_tool_name(name) else {
+        return Err(ToolError::Unknown(name.to_string()));
+    };
+    context.mcp.call(server, tool, input)
 }
 
 /// `todo { items }`: the list is replaced whole and echoed back rendered.

@@ -81,6 +81,7 @@ mod file_processor;
 mod image_convert;
 mod js_host;
 mod llama;
+mod mcp;
 mod migrations;
 mod model_resolver;
 mod native_extensions;
@@ -576,6 +577,11 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         parsed.project_trust_override,
         parsed.permission_mode,
     )));
+    let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
+    agent.attach_mcp(pi_agent::McpRegistry::connect(
+        &mcp::load(&default_agent_dir(), cwd, trusted),
+        cwd,
+    ));
     apply_discovered_resources(parsed, &mut agent);
     if !parsed.no_session {
         agent.session = Some(resolve_or_create_session(parsed, session_dir, cwd)?);
@@ -1478,9 +1484,9 @@ fn complete_prompt_with_host(
         .lock()
         .map(|host| host.native_tool_specs())
         .unwrap_or_default();
-    let tools: Vec<ToolSpec> = pi_agent::tool_specs()
+    let tools: Vec<ToolSpec> = agent
+        .builtin_and_mcp_specs()
         .into_iter()
-        .filter(|tool| agent.tools.iter().any(|name| name == &tool.name))
         .map(|tool| ToolSpec {
             name: tool.name,
             description: tool.description,
@@ -4454,6 +4460,27 @@ fn handle_user_line(
         SlashAction::Llama => {
             session.chrome.status = "llama.cpp is available in interactive mode".into();
             println!("{}", session.chrome.status);
+            Ok(true)
+        }
+        SlashAction::Mcp => {
+            let rows = agent.tool_context.mcp.rows();
+            let text = if rows.is_empty() {
+                "no MCP servers configured — edit ~/.pi/agent/mcp.json".into()
+            } else {
+                rows.into_iter()
+                    .map(|row| {
+                        let error = row.error.map(|err| format!(" · {err}")).unwrap_or_default();
+                        format!(
+                            "{}  {}  {}  {} tools{error}",
+                            row.status, row.transport, row.name, row.tools
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            session.chrome.transcript.push("mcp", &text);
+            session.chrome.status = "mcp".into();
+            println!("{text}");
             Ok(true)
         }
     }
@@ -8728,6 +8755,7 @@ mod tests {
             slash::parse_line("/llama"),
             slash::SlashAction::Llama
         ));
+        assert!(matches!(slash::parse_line("/mcp"), slash::SlashAction::Mcp));
         assert!(slash::builtin_slash_commands()
             .iter()
             .any(|command| command.name == "llama"

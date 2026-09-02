@@ -18,6 +18,7 @@ path = "src/main.rs"
 pi-agent = { path = "../pi-agent" }
 pi-ai = { path = "../pi-ai" }
 pi-client = { path = "../pi-client" }
+pi-mcp = { path = "../pi-mcp" }
 pi-evals = { path = "../pi-evals" }
 pi-protocol = { path = "../pi-protocol" }
 pi-server = { path = "../pi-server" }

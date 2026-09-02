@@ -167,6 +167,8 @@ pub enum Screen {
     Recovery,
     /// `6d` — the Δ review (`/diff`).
     Diff,
+    /// Connected MCP servers (`/mcp`). No mockup number; phase 4.
+    Mcp,
 }
 
 /// An instrument summoned over the transcript, dismissed with esc.
@@ -1062,6 +1064,23 @@ pub struct GovernorSheet {
     pub store_dir: String,
 }
 
+/// One row of `/mcp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerRow {
+    pub name: String,
+    pub transport: String,
+    pub status: String,
+    pub tools: usize,
+    pub error: Option<String>,
+}
+
+/// `/mcp` — connected servers, one row each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpSheet {
+    pub servers: Vec<McpServerRow>,
+    pub config_path: String,
+}
+
 /// Which of the theme's inks a figure is drawn in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
@@ -1366,6 +1385,8 @@ pub struct Model {
     /// `6d` — the Δ review, and which file is in hand.
     pub review: Option<ReviewSheet>,
     pub diff_index: usize,
+    /// `/mcp` — connected MCP servers.
+    pub mcp: Option<McpSheet>,
 }
 
 impl Model {
@@ -1461,6 +1482,7 @@ impl Model {
             failed_run: None,
             review: None,
             diff_index: 0,
+            mcp: None,
         }
     }
 
@@ -1599,6 +1621,7 @@ impl Model {
             Screen::Securitas => "securitas",
             Screen::Trust => "fiducia",
             Screen::Officina => "officina",
+            Screen::Mcp => "instrumenta",
         }
     }
 

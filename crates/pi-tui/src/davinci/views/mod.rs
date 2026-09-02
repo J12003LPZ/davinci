@@ -17,6 +17,7 @@ pub mod instrumenta;
 pub mod keys;
 pub mod login;
 pub mod markdown;
+pub mod mcp;
 pub mod memoria;
 pub mod mensura;
 pub mod officina;

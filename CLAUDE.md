@@ -41,14 +41,15 @@ Toolchain is pinned to Rust 1.83.0 (`rust-toolchain.toml`). Every workspace depe
 
 ## Architecture
 
-Dependency direction is strictly bottom-up; `pi-coding-agent` is the only binary.
+Dependency direction is strictly bottom-up; `pi-coding-agent` is the product binary (`pi`). `pi-mcp` also ships `mcp-fixture`, an in-tree stdio MCP server for tests.
 
 ```
 pi-coding-agent (bin `pi`)  — CLI, TUI wiring, extensions, slash commands, auth UI
   ├── pi-tui        — terminal rendering: `davinci/` (ratatui, the interactive
   │                   default) and the legacy chrome (Component trait -> Vec<String>)
   ├── pi-agent      — agent loop, tools, compaction, skills, prompt templates
-  │     └── pi-ai   — providers, auth/OAuth, streaming, model catalog, cost
+  │     ├── pi-ai   — providers, auth/OAuth, streaming, model catalog, cost
+  │     └── pi-mcp  — native MCP client (stdio + streamable HTTP); no TS counterpart
   ├── pi-session(-sqlite) — JSONL session store + sqlite branch cache
   ├── pi-protocol   — length-prefixed CBOR wire format
   ├── pi-client / pi-server — protocol client/server over Unix socket or TCP
@@ -60,9 +61,9 @@ pi-coding-agent (bin `pi`)  — CLI, TUI wiring, extensions, slash commands, aut
 
 **Provider streaming** (`pi-ai`): every request goes through `live_complete_streaming_with_sink` (`stream.rs`), which reads the SSE body on a reader thread and hands each decoded event to a sink as it arrives; `StreamOptions::abort_signal` is polled between frames. Wire formats are decoded by `stream_decoder.rs` (Responses/Codex), `stream_decoder_completions.rs` and `stream_decoder_anthropic.rs`; APIs without a decoder are requested without `stream: true` and their events synthesised. Responses tool-call ids are stored as `call_id|item_id` and only the `call_id` half is replayed. `PI_AI_TRACE=1` (or a file path) logs every request, frame and failure — reach for it before reading code when a turn misbehaves.
 
-**Agent runtime** (`pi-agent`): built-in tools are `read, write, edit, bash, powershell, grep, find, ls, web_fetch, web_search, todo, job_output, job_kill, notebook_edit`. The last six have no TypeScript counterpart (phase 3, `docs/superpowers/specs/2026-09-01-tools-that-compete-design.md`). Extensions inject behavior through `PreToolHook` / `PostToolHook` / custom tool functions. Compaction (`compaction.rs`) and branch summarization (`branch.rs`) reproduce the TS prompts verbatim — the prompt string constants are part of the parity contract, do not reword them.
+**Agent runtime** (`pi-agent`): built-in tools are `read, write, edit, bash, powershell, grep, find, ls, web_fetch, web_search, todo, job_output, job_kill, notebook_edit, mcp_read`. Tools from phase 3 onward have no TypeScript counterpart (phase 3 spec `docs/superpowers/specs/2026-09-01-tools-that-compete-design.md`; phase 4 MCP spec `docs/superpowers/specs/2026-09-01-native-mcp-design.md`). MCP servers from `~/.pi/agent/mcp.json` (and trusted `.pi/mcp.json`) become agent tools named `mcp__<server>__<tool>`; `mcp_read` reads a listed resource. Extensions inject behavior through `PreToolHook` / `PostToolHook` / custom tool functions. Compaction (`compaction.rs`) and branch summarization (`branch.rs`) reproduce the TS prompts verbatim — the prompt string constants are part of the parity contract, do not reword them.
 
-**Tool permissions** (`pi-agent/src/permission.rs`, `pi-coding-agent/src/permissions.rs`; no TS counterpart, spec in `docs/superpowers/specs/2026-09-01-trust-and-control-design.md`): every tool call passes a gate in `Agent::execute_one` after the extension `tool_call` hook. Modes are `read-only | ask | edits | auto` (`--permission-mode`, `--sandbox` with Codex names, `permissions.mode` in settings, `/permissions <mode>` for the session); rules are `tool` or `tool(glob)` under `permissions.allow` / `permissions.deny` in the user file and, only when the project is trusted, `.pi/settings.json`. Deny rules always win. An `Ask` goes to `Agent.approver`: davinci opens the `LICENTIA · PERMISSION` panel mid-turn, RPC emits a `select` UI request, the legacy chrome uses its confirm dialog, and `--print` fails closed with a message naming the flag and rule. The library default (`Agent::new`) is `auto`, vendor behaviour; `build_agent` installs the configured policy, default `ask`.
+**Tool permissions** (`pi-agent/src/permission.rs`, `pi-coding-agent/src/permissions.rs`; no TS counterpart, spec in `docs/superpowers/specs/2026-09-01-trust-and-control-design.md`): every tool call passes a gate in `Agent::execute_one` after the extension `tool_call` hook. Modes are `read-only | ask | edits | auto` (`--permission-mode`, `--sandbox` with Codex names, `permissions.mode` in settings, `/permissions <mode>` for the session); rules are `tool` or `tool(glob)` under `permissions.allow` / `permissions.deny` in the user file and, only when the project is trusted, `.pi/settings.json`. Deny rules always win (tool-name globs such as `mcp__memory__*` match). MCP tools with `annotations.readOnlyHint` are `Read`; other `mcp__*` tools are `Other`; `mcp_read` is `Read`. An `Ask` goes to `Agent.approver`: davinci opens the `LICENTIA · PERMISSION` panel mid-turn, RPC emits a `select` UI request, the legacy chrome uses its confirm dialog, and `--print` fails closed with a message naming the flag and rule. The library default (`Agent::new`) is `auto`, vendor behaviour; `build_agent` installs the configured policy, default `ask`.
 
 **Extensions** are two-tier (`extension_host.rs`): JavaScript extensions run in a Node subprocess driven by the embedded `extension_runner.js` (`js_host.rs`, only when Node is present), while the bundled pi extensions have been ported to native Rust under `src/native_extensions/` (`vector_memory`, `token_governor`, `security_scan`, `graph`), exposed via `NATIVE_TOOLS` / `NATIVE_COMMANDS`.
 
@@ -75,7 +76,7 @@ pi-coding-agent (bin `pi`)  — CLI, TUI wiring, extensions, slash commands, aut
 ## Conventions
 
 - **Cite the TypeScript source.** Most modules open with a doc comment naming the file they mirror, e.g. `//! Project trust store matching vendor/pi/packages/coding-agent/src/core/trust-manager.ts`. Follow this for new modules; when changing behavior, read the cited TS file first and match it rather than improving on it.
-- **Tests are fixture-only and never touch the network.** Behavior that would call a provider, an installer, a browser, or an update server is instead driven by `PI_*` fixture environment variables read at the call site — `PI_OFFLINE`, `PI_DISABLE_NETWORK`, `PI_SELF_UPDATE_FIXTURE`, `PI_OAUTH_TOKEN_FIXTURE`, `PI_PACKAGE_FIXTURE`, `PI_LLAMA_*`, `PI_MANAGED_INSTALLER_REPLY`, `PI_OPEN_BROWSER_DRY_RUN`, and others. Add a fixture hook rather than a live call when a new code path needs one.
+- **Tests are fixture-only and never touch the network.** Behavior that would call a provider, an installer, a browser, or an update server is instead driven by `PI_*` fixture environment variables read at the call site — `PI_OFFLINE`, `PI_DISABLE_NETWORK`, `PI_SELF_UPDATE_FIXTURE`, `PI_OAUTH_TOKEN_FIXTURE`, `PI_PACKAGE_FIXTURE`, `PI_LLAMA_*`, `PI_MANAGED_INSTALLER_REPLY`, `PI_OPEN_BROWSER_DRY_RUN`, `PI_MCP_CONFIG`, `PI_MCP_FIXTURE`, and others. MCP HTTP tests may also use a `fixture:<path>` URL. Add a fixture hook rather than a live call when a new code path needs one.
 - Tests are inline `#[cfg(test)] mod tests` blocks (~188 of them); there are no `tests/` directories except `pi-parity/fixtures`.
 - Divergence from TS is acceptable only where the platform forces it (the `powershell` tool, the Windows `experimental` stub); document it in a comment.
 

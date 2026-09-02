@@ -17,8 +17,8 @@ use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::{
     ask, codex, cogitator, compact, diff, disegno, export, governor, grafo, graph_run, instrumenta,
-    keys, login, memoria, mensura, officina, opera, recovery, resume, securitas, settings, startup,
-    transcript, tree, trust, vectors,
+    keys, login, mcp, memoria, mensura, officina, opera, recovery, resume, securitas, settings,
+    startup, transcript, tree, trust, vectors,
 };
 
 /// What the runtime should do after a key.
@@ -174,6 +174,7 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
         Screen::Officina => Some(officina::lines(model)),
         Screen::Recovery => Some(recovery::lines(model)),
         Screen::Diff => Some(diff::lines(model)),
+        Screen::Mcp => Some(mcp::lines(model)),
         Screen::Agent | Screen::Keys => None,
     };
     if let Some(rows) = screen_rows {

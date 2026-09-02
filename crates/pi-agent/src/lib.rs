@@ -8,6 +8,7 @@ mod events;
 mod file_mutation_queue;
 mod images;
 pub mod jobs;
+pub mod mcp;
 pub mod notebook;
 mod permission;
 mod queues;
@@ -44,6 +45,7 @@ pub use images::{
     parse_rpc_images, process_image_bytes, IMAGE_READING_DISABLED,
 };
 pub use jobs::{JobBook, JobNotice, JobStatus, JobSummary};
+pub use mcp::{McpRegistry, McpServerRow};
 pub use permission::{
     glob_matches, session_rule_for, subject_of, summary_of, tool_class, PermissionMode,
     PermissionPolicy, PermissionRule, PermissionVerdict, ToolApprovalDecision, ToolApprovalRequest,
@@ -601,6 +603,37 @@ impl Agent {
                 None
             }
         })
+    }
+
+    /// Merge connected MCP tools into the active set and the permission class map.
+    pub fn attach_mcp(&mut self, registry: crate::mcp::McpRegistry) {
+        let names = registry.tool_names();
+        let read_only = registry.read_only_names();
+        self.tool_context.mcp = registry;
+        self.apply_extension_tools(&names);
+        self.permissions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .mcp_read_only = read_only;
+    }
+
+    /// Built-in specs plus live MCP tools, filtered by `self.tools`.
+    pub fn builtin_and_mcp_specs(&self) -> Vec<AgentTool> {
+        let mut specs: Vec<AgentTool> = tool_specs()
+            .into_iter()
+            .filter(|tool| self.tools.iter().any(|name| name == &tool.name))
+            .collect();
+        if let Some(spec) = specs.iter_mut().find(|tool| tool.name == "mcp_read") {
+            spec.description = self.tool_context.mcp.mcp_read_description();
+        }
+        specs.extend(
+            self.tool_context
+                .mcp
+                .specs()
+                .into_iter()
+                .filter(|tool| self.tools.iter().any(|name| name == &tool.name)),
+        );
+        specs
     }
 
     pub fn apply_extension_tools(&mut self, names: &[String]) {

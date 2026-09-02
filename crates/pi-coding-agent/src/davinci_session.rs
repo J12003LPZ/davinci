@@ -15,9 +15,10 @@ use pi_agent::{
 use pi_tui::davinci::model::{
     Ask, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
     Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
-    HunkKind, KeymapGroup, Model, ModelItem, Overlay, PickerItem, PlanStep, ProjectTrustSheet,
-    ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity,
-    Step, ThinkingRow, Tone, TreeNode, TrustFile, VectorIndex, Working, WorkshopSheet,
+    HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PickerItem, PlanStep,
+    ProjectTrustSheet, ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan,
+    SettingRow, Severity, Step, ThinkingRow, Tone, TreeNode, TrustFile, VectorIndex, Working,
+    WorkshopSheet,
 };
 use pi_tui::davinci::theme::State;
 
@@ -40,7 +41,7 @@ pub fn state_of(tool_name: &str, failed: bool) -> State {
         return State::Failed;
     }
     match tool_name {
-        "read" | "ls" | "job_output" => State::Read,
+        "read" | "ls" | "job_output" | "mcp_read" => State::Read,
         "grep" | "find" | "web_fetch" | "web_search" => State::Search,
         name if name.starts_with("memory") => State::Search,
         "edit" | "write" | "notebook_edit" => State::Delta,
@@ -56,6 +57,23 @@ fn bare_url(url: &str) -> String {
         .map(|(_, rest)| rest)
         .unwrap_or(trimmed);
     without_scheme.trim_end_matches('/').to_string()
+}
+
+fn mcp_target(tool_name: &str, args: &serde_json::Value) -> String {
+    let rest = tool_name.strip_prefix("mcp__").unwrap_or(tool_name);
+    let (server, tool) = rest.split_once("__").unwrap_or((rest, rest));
+    let first = args.as_object().and_then(|map| {
+        map.values().find_map(|value| match value {
+            serde_json::Value::String(text) if !text.is_empty() => {
+                Some(clip(text.lines().next().unwrap_or(""), 40))
+            }
+            _ => None,
+        })
+    });
+    match first {
+        Some(arg) => format!("mcp {server} {tool} {arg}"),
+        None => format!("mcp {server} {tool}"),
+    }
 }
 
 fn job_id_of(args: &serde_json::Value) -> String {
@@ -121,6 +139,8 @@ pub fn target_of(tool_name: &str, args: &serde_json::Value) -> String {
                 .unwrap_or_default();
             format!("edit {}{cell}", field("path"))
         }
+        "mcp_read" => format!("mcp {} {}", field("server"), field("uri")),
+        name if name.starts_with("mcp__") => mcp_target(name, args),
         other => {
             let detail = field("query");
             if detail.is_empty() {
@@ -135,7 +155,7 @@ pub fn target_of(tool_name: &str, args: &serde_json::Value) -> String {
 /// The verb the Studio ledger shows for a step in progress (design.md §5).
 pub fn verb_of(tool_name: &str) -> &'static str {
     match tool_name {
-        "read" | "ls" | "job_output" => "studying",
+        "read" | "ls" | "job_output" | "mcp_read" => "studying",
         "grep" | "find" | "web_fetch" | "web_search" => "surveying",
         "bash" | "powershell" | "job_kill" => "testing",
         "edit" | "write" | "notebook_edit" => "constructing",
@@ -229,7 +249,8 @@ pub fn summary_of(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     match tool_name {
-        "read" | "web_fetch" => rows().map(|count| plural(count, "line")),
+        "read" | "web_fetch" | "mcp_read" => rows().map(|count| plural(count, "line")),
+        name if name.starts_with("mcp__") => rows().map(|count| plural(count, "line")),
         "ls" => rows().map(|count| plural(count, "entry").replace("entrys", "entries")),
         "grep" | "find" => Some(plural(rows().unwrap_or(0), "match").replace("matchs", "matches")),
         // `Started background job 3: …` — the row names the job.
@@ -1604,6 +1625,11 @@ pub fn corpus(
         "background jobs · /jobs kill <id>",
         "command",
     ));
+    items.push(CorpusItem::new(
+        "/mcp",
+        "connected MCP servers · tools and errors",
+        "command",
+    ));
 
     for tool in &agent.tools {
         items.push(CorpusItem::new(tool, &tool_summary(tool), "tool"));
@@ -1634,6 +1660,9 @@ fn tool_summary(name: &str) -> String {
                 .map(|tool| tool.description)
         });
     let Some(described) = described else {
+        if let Some(rest) = name.strip_prefix("mcp__") {
+            return rest.replace("__", " ");
+        }
         // An extension's tool, whose description the host holds rather than the
         // registry. Its instrument is the only thing left worth saying, and
         // only when it is not the default one.
@@ -2700,6 +2729,10 @@ pub fn perform(
             }
         }
         SlashAction::ScopedModels => Ok(Done::Said(scoped_models_summary(parsed, agent))),
+        SlashAction::Mcp => {
+            open_mcp_sheet(agent, model);
+            Ok(Done::Opened)
+        }
         SlashAction::Llama => Ok(Done::Said(format!(
             "llama.cpp server {}",
             std::env::var("LLAMA_BASE_URL")
@@ -3758,6 +3791,30 @@ fn open_sheet(model: &mut Model, screen: Screen) {
     model.running = false;
     model.overlay = None;
     model.screen = screen;
+}
+
+fn open_mcp_sheet(agent: &Agent, model: &mut Model) {
+    let servers = agent
+        .tool_context
+        .mcp
+        .rows()
+        .into_iter()
+        .map(|row| McpServerRow {
+            name: row.name,
+            transport: row.transport,
+            status: row.status,
+            tools: row.tools,
+            error: row.error,
+        })
+        .collect();
+    model.mcp = Some(McpSheet {
+        servers,
+        config_path: crate::default_agent_dir()
+            .join("mcp.json")
+            .display()
+            .to_string(),
+    });
+    open_sheet(model, Screen::Mcp);
 }
 
 /// `3a` — the full model catalog, from the live runtime snapshot. Every
@@ -6490,6 +6547,7 @@ mod tests {
             "/session",
             "/scoped-models",
             "/llama",
+            "/mcp",
             "/thinking",
             "/thinking high",
             "/logout",
@@ -6895,6 +6953,7 @@ mod tests {
         assert!(names.contains(&"/quit"), "{names:?}");
         assert!(names.contains(&"/todo"), "{names:?}");
         assert!(names.contains(&"/jobs"), "{names:?}");
+        assert!(names.contains(&"/mcp"), "{names:?}");
     }
 
     #[test]
@@ -7270,6 +7329,22 @@ mod tests {
         assert_eq!(
             target_of("notebook_edit", &json!({"path": "n.ipynb", "cell": 2})),
             "edit n.ipynb · cell 2"
+        );
+        assert_eq!(instrument_of("mcp_read"), "instrumenta");
+        assert_eq!(instrument_of("mcp__memory__echo"), "instrumenta");
+        assert_eq!(state_of("mcp_read", false), State::Read);
+        assert_eq!(state_of("mcp__memory__echo", false), State::Done);
+        assert_eq!(verb_of("mcp_read"), "studying");
+        assert_eq!(
+            target_of(
+                "mcp_read",
+                &json!({"server": "memory", "uri": "fixture://note"})
+            ),
+            "mcp memory fixture://note"
+        );
+        assert_eq!(
+            target_of("mcp__memory__echo", &json!({"text": "hi"})),
+            "mcp memory echo hi"
         );
     }
 

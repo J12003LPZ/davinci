@@ -77,6 +77,7 @@ impl PermissionSources {
             allow: rules(|settings| &settings.allow),
             deny: rules(|settings| &settings.deny),
             session_allow: Vec::new(),
+            mcp_read_only: Default::default(),
         }
     }
 }

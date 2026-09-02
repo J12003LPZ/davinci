@@ -7,6 +7,7 @@
 //! (`turn.rs`) asks the policy before every tool call, after the extension
 //! `tool_call` hook and before the tool runs.
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -82,7 +83,9 @@ pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
         // Reading a job's output or keeping the ledger changes nothing the
         // user would want to be asked about.
-        "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" => ToolClass::Read,
+        "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" | "mcp_read" => {
+            ToolClass::Read
+        }
         "write" | "edit" | "notebook_edit" => ToolClass::Edit,
         "bash" | "powershell" => ToolClass::Shell,
         "web_fetch" | "web_search" => ToolClass::Network,
@@ -128,7 +131,7 @@ impl PermissionRule {
     }
 
     pub fn matches(&self, tool: &str, subject: &str) -> bool {
-        if self.tool != tool {
+        if !self.tool_matches(tool) {
             return false;
         }
         let Some(pattern) = &self.pattern else {
@@ -145,6 +148,17 @@ impl PermissionRule {
             }
         }
         glob_matches(&fold(pattern), &fold(subject))
+    }
+
+    fn tool_matches(&self, tool: &str) -> bool {
+        if self.tool == tool {
+            return true;
+        }
+        if self.tool.chars().any(|ch| ch == '*' || ch == '?') {
+            glob_matches(&fold(&self.tool), &fold(tool))
+        } else {
+            false
+        }
     }
 }
 
@@ -259,6 +273,8 @@ pub struct PermissionPolicy {
     pub allow: Vec<PermissionRule>,
     pub deny: Vec<PermissionRule>,
     pub session_allow: Vec<PermissionRule>,
+    /// MCP tools whose server marked `readOnlyHint`. `mcp_read` is Read by name.
+    pub mcp_read_only: BTreeSet<String>,
 }
 
 impl Default for PermissionPolicy {
@@ -271,6 +287,7 @@ impl Default for PermissionPolicy {
             allow: Vec::new(),
             deny: Vec::new(),
             session_allow: Vec::new(),
+            mcp_read_only: BTreeSet::new(),
         }
     }
 }
@@ -313,7 +330,7 @@ impl PermissionPolicy {
         {
             return PermissionVerdict::Allow;
         }
-        let class = tool_class(tool);
+        let class = self.class_of(tool);
         if class == ToolClass::Read {
             return PermissionVerdict::Allow;
         }
@@ -341,6 +358,14 @@ impl PermissionPolicy {
             outside_project,
             mode: self.mode,
         })
+    }
+
+    pub fn class_of(&self, tool: &str) -> ToolClass {
+        if self.mcp_read_only.contains(tool) {
+            ToolClass::Read
+        } else {
+            tool_class(tool)
+        }
     }
 
     /// Add a rule the user granted for the rest of the run.
@@ -790,6 +815,8 @@ mod tests {
         assert_eq!(tool_class("todo"), ToolClass::Read);
         assert_eq!(tool_class("job_output"), ToolClass::Read);
         assert_eq!(tool_class("notebook_edit"), ToolClass::Edit);
+        assert_eq!(tool_class("mcp_read"), ToolClass::Read);
+        assert_eq!(tool_class("mcp__memory__echo"), ToolClass::Other);
         assert_eq!(
             host_of("https://user:pw@Docs.rs:443/similar/latest?x=1"),
             "docs.rs"
@@ -839,6 +866,40 @@ mod tests {
         granted.allow = vec![PermissionRule::parse("web_fetch(docs.rs)").unwrap()];
         assert!(matches!(
             granted.decide("c1", "web_fetch", &fetch, &cwd()),
+            PermissionVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn mcp_read_only_hint_is_read_and_a_deny_glob_still_wins() {
+        let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+        policy.mcp_read_only.insert("mcp__memory__echo".into());
+        assert_eq!(policy.class_of("mcp__memory__echo"), ToolClass::Read);
+        assert!(matches!(
+            policy.decide("c1", "mcp__memory__echo", &json!({}), &cwd()),
+            PermissionVerdict::Allow
+        ));
+        assert!(matches!(
+            policy.decide("c1", "mcp__memory__write", &json!({}), &cwd()),
+            PermissionVerdict::Ask(_)
+        ));
+        policy.deny = vec![PermissionRule::parse("mcp__memory__*").unwrap()];
+        assert!(matches!(
+            policy.decide("c1", "mcp__memory__echo", &json!({}), &cwd()),
+            PermissionVerdict::Deny { .. }
+        ));
+        let read_only = PermissionPolicy::new(PermissionMode::ReadOnly);
+        assert!(matches!(
+            read_only.decide("c1", "mcp__docs__put", &json!({}), &cwd()),
+            PermissionVerdict::Deny { .. }
+        ));
+        assert!(matches!(
+            read_only.decide(
+                "c1",
+                "mcp_read",
+                &json!({"server":"memory","uri":"x"}),
+                &cwd()
+            ),
             PermissionVerdict::Allow
         ));
     }

@@ -789,6 +789,7 @@ dependencies = [
  "base64",
  "image",
  "pi-ai",
+ "pi-mcp",
  "pi-protocol",
  "pi-session",
  "pi-telemetry",
@@ -851,6 +852,7 @@ dependencies = [
  "pi-ai",
  "pi-client",
  "pi-evals",
+ "pi-mcp",
  "pi-protocol",
  "pi-server",
  "pi-session",
@@ -881,6 +883,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "pi-mcp"
+version = "0.85.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "ureq",
+ "url",
 ]
 
 [[package]]

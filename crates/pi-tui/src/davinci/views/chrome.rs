@@ -472,6 +472,7 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::Securitas => Some("/sec-report --severity high"),
         Screen::Officina => Some("/reload"),
         Screen::Trust => Some("decide first"),
+        Screen::Mcp => Some("/mcp"),
         Screen::Recovery | Screen::Diff | Screen::Agent | Screen::Plan | Screen::Memoria => None,
     }
 }
