@@ -115,15 +115,56 @@ fn is_running(cwd: &Path) -> bool {
         .get(cwd)
         .map(|run| {
             // No snapshot yet means the run thread has not reached its first
-            // checkpoint — starting still counts as running.
+            // checkpoint — starting still counts as running. A run whose
+            // abort was requested is running until its thread has left:
+            // its workers are still being terminated.
             !run.is_finished()
-                && !run.abort.load(Ordering::Relaxed)
                 && run
                     .snapshot()
                     .map(|snapshot| is_live(&snapshot))
                     .unwrap_or(true)
         })
         .unwrap_or(false)
+}
+
+/// `/graph`, `/graph-resume` and `graph_run` refuse while a run is live. One
+/// that is stopping is still live: starting another would put two runs on
+/// the same working tree.
+fn refuse_if_active(cwd: &Path) -> Result<(), String> {
+    if !is_running(cwd) {
+        return Ok(());
+    }
+    let stopping = active_runs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(cwd)
+        .is_some_and(|run| run.abort.load(Ordering::Relaxed));
+    Err(if stopping {
+        "The previous graph run is still stopping; wait a moment and retry.".into()
+    } else {
+        "A graph run is already active. Use /graph-abort or /graph-status first.".into()
+    })
+}
+
+/// Make `active` the project's run, joining the thread of the finished run
+/// it replaces so nothing is left dangling.
+fn register_run(cwd: &Path, active: Arc<ActiveRun>) {
+    let previous = active_runs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(cwd.to_path_buf(), active);
+    if let Some(previous) = previous {
+        if previous.is_finished() {
+            if let Some(handle) = previous
+                .handle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 /// Stop every run this process started. Called on session shutdown so a
@@ -258,19 +299,12 @@ impl GraphController {
         if parsed.goal.trim().is_empty() {
             return Err("Usage: /graph <goal> [--simple|--complex] [--dry-run]".into());
         }
-        if is_running(&self.cwd) {
-            return Err(
-                "A graph run is already active. Use /graph-abort or /graph-status first.".into(),
-            );
-        }
+        refuse_if_active(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
         let (deps, config_errors) = self.deps(parsed.dry_run, &active);
         let options = self.options(&parsed, Arc::clone(&active.abort), resume_artifacts);
         let resumed = options.resume_artifacts.len();
-        active_runs()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(self.cwd.clone(), Arc::clone(&active));
+        register_run(&self.cwd, Arc::clone(&active));
 
         let finished = Arc::clone(&active);
         let handle = thread::spawn(move || {
@@ -312,16 +346,11 @@ impl GraphController {
         if parsed.goal.trim().is_empty() {
             return Err("graph goal cannot be empty".into());
         }
-        if is_running(&self.cwd) {
-            return Err("A graph run is already active in this project.".into());
-        }
+        refuse_if_active(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
         let (deps, _config_errors) = self.deps(parsed.dry_run, &active);
         let options = self.options(&parsed, Arc::clone(&active.abort), HashMap::new());
-        active_runs()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(self.cwd.clone(), Arc::clone(&active));
+        register_run(&self.cwd, Arc::clone(&active));
         let _guard = FinishedOnDrop(Arc::clone(&active));
         Ok(run_graph(options, deps))
     }
@@ -372,11 +401,13 @@ impl GraphController {
                 resume_artifacts.insert(task.id.clone(), (artifact, task.usage));
             }
         }
+        // A dry run resumes as a dry run: its canned artifacts must never be
+        // replayed as real node outputs in front of real verification.
         self.start_background(
             ParsedGraphArgs {
                 goal: old_run.goal.clone(),
                 forced: old_run.forced,
-                dry_run: false,
+                dry_run: old_run.dry_run,
             },
             resume_artifacts,
         )

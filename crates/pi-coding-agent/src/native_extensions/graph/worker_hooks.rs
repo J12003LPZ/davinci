@@ -16,7 +16,7 @@
 use super::roles::{is_bash_command_allowed, role_bash_policy, role_tools, GRAPH_SUBMIT_TOOL};
 use super::store::write_artifact;
 use super::types::{ArtifactKind, BashPolicy, Role};
-use super::validate::validate_artifact;
+use super::validate::{artifact_contract, artifact_schema, validate_artifact};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -89,20 +89,25 @@ impl GraphWorkerContext {
         })
     }
 
+    /// The tool carries the whole contract — a typed schema and the prose —
+    /// so the worker model never has to guess a field name and burn a
+    /// validation round trip (or give up, which is what an untyped
+    /// `artifact` property used to produce).
     pub fn tool_spec(&self) -> (String, Value) {
+        let mut artifact = artifact_schema(self.expect);
+        artifact["description"] = Value::String(format!(
+            "The {} artifact as a JSON object (not a string)",
+            self.expect
+        ));
         (
             format!(
-                "Submit your final {} artifact. Call this exactly once, as your last action. \
-                 The artifact must be a JSON object matching the contract described in your instructions.",
-                self.expect
+                "Submit your final {} artifact. Call this exactly once, as your last action.\n\n{}",
+                self.expect,
+                artifact_contract(self.expect)
             ),
             json!({
                 "type": "object",
-                "properties": {
-                    "artifact": {
-                        "description": format!("The {} artifact as a JSON object", self.expect)
-                    }
-                },
+                "properties": {"artifact": artifact},
                 "required": ["artifact"],
             }),
         )

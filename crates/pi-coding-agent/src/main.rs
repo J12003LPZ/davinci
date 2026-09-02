@@ -676,6 +676,15 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         let _ = ext.handlers.as_slice();
     }
     agent.apply_extension_tools(&names);
+    // A graph worker's `--tools` is its whole allowlist: the native tools it
+    // was not handed (graph_run, sec_*, memory_search…) are not offered to
+    // its model either, rather than merely refused when called.
+    if !parsed.tools.is_empty() && crate::native_extensions::graph_worker_context().is_some() {
+        agent.tools.retain(|tool| {
+            parsed.tools.contains(tool)
+                || !crate::native_extensions::NATIVE_TOOLS.contains(&tool.as_str())
+        });
+    }
     attach_tool_executor(&mut agent, &host);
     host.emit(ExtensionEvent::SessionStart);
     let _ = host.describe_js();
@@ -1654,8 +1663,10 @@ fn complete_prompt_with_host(
             tool_name: name.to_string(),
             args: args.clone(),
         });
-        let state_hash = crate::native_extensions::repo_state_key(&tool_state_cwd);
-        if let Some(reason) = host.native_before_tool(name, args, &state_hash) {
+        // The repository state key runs git twice; the host asks for it only
+        // when a search tool is being fingerprinted.
+        let state_hash = || crate::native_extensions::repo_state_key(&tool_state_cwd);
+        if let Some(reason) = host.native_before_tool(name, args, state_hash) {
             return Some(reason);
         }
         if host.tool_call_blocked() {

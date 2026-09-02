@@ -119,7 +119,7 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
         match sheet.composer {
             Composer::Hidden => return Vec::new(),
             Composer::Disabled(text) => return chrome::disabled_composer(model, text),
-            Composer::Prompt(_) => {
+            Composer::Prompt(_) | Composer::PromptOwned(_) => {
                 if model.queued.is_empty() {
                     return chrome::composer(model, None, Hint::None);
                 }

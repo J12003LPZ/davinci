@@ -110,18 +110,27 @@ pub fn parse_worker_event(
     }
     if event_type == "tool_execution_end" {
         if let Some(tool_name) = event.get("toolName").and_then(Value::as_str) {
-            let excerpt = event
-                .pointer("/result/content")
-                .and_then(Value::as_array)
-                .map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                        .filter_map(|block| block.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default();
+            // The Rust child sends `result` as the text itself; the TS shape
+            // is `{ content: [{ type: "text", text }] }`. Read both, or a
+            // failed `graph_submit` shows as a bare ERROR with no reason.
+            let excerpt = match event.get("result") {
+                Some(Value::String(text)) => text.clone(),
+                Some(result) => result
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("text")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
             let excerpt: String = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
             let excerpt: String = excerpt.chars().take(200).collect();
             let error = if event.get("isError").and_then(Value::as_bool) == Some(true) {
@@ -227,12 +236,20 @@ pub fn build_worker_args(
     briefing_file: &Path,
     system_prompt_file: &Path,
 ) -> Vec<String> {
+    // A worker is a `--print` child: nobody can answer a permission prompt
+    // in it, and the product's default mode (`ask`) fails closed there — a
+    // writer could not write, and no role could even `graph_submit`. The
+    // worker's gate is the graph's own: the per-role `--tools` allowlist and
+    // the bash policy in `worker_hooks`, both of which the parent set. Deny
+    // rules from the user's settings still win in `auto`.
     let mut args = vec![
         "--mode".to_string(),
         "json".to_string(),
         "-p".to_string(),
         "--no-session".to_string(),
         "--no-extensions".to_string(),
+        "--permission-mode".to_string(),
+        "auto".to_string(),
     ];
     for extension in &spec.extra_extensions {
         args.push("-e".to_string());
@@ -309,8 +326,16 @@ pub fn run_worker(
     }
     let briefing_file = temp_dir.join("briefing.md");
     let system_prompt_file = temp_dir.join("system.md");
+    // The role prompt plus the artifact contract: the child's `graph_submit`
+    // repeats the contract on the tool, but a model reads its system prompt
+    // first and plans its whole turn around it.
+    let system_prompt = format!(
+        "{}\n\n{}",
+        spec.system_prompt,
+        super::validate::artifact_contract(spec.expect)
+    );
     if fs::write(&briefing_file, &spec.briefing).is_err()
-        || fs::write(&system_prompt_file, &spec.system_prompt).is_err()
+        || fs::write(&system_prompt_file, &system_prompt).is_err()
     {
         let _ = fs::remove_dir_all(&temp_dir);
         return WorkerResult {
@@ -424,6 +449,25 @@ pub fn run_worker(
         timed_out: outcome.timed_out,
         failure_reason: None,
     };
+
+    // The artifact is the node's deliverable. One that reached disk and
+    // validates is accepted even when the child then hit a provider error
+    // or the deadline while still talking after `graph_submit`: a retry
+    // would only buy the same artifact again at full cost. An abort still
+    // cancels the node.
+    if !outcome.aborted {
+        if let Some(artifact) = fs::read_to_string(&spec.artifact_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| validate_artifact(spec.expect, &value).ok())
+        {
+            return WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..base
+            };
+        }
+    }
 
     if outcome.aborted
         || outcome.timed_out

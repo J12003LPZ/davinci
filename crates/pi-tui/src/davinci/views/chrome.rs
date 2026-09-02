@@ -360,12 +360,13 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
     // the caret are the whole invitation, as in every terminal agent. An open
     // sheet is the one exception: its row suggests the command that summoned
     // it, which is a hint, not chat.
-    let placeholder = sheet::chrome(model)
+    let placeholder: Option<String> = sheet::chrome(model)
         .and_then(|chrome| match chrome.composer {
-            Composer::Prompt(text) => Some(text),
+            Composer::Prompt(text) => Some(text.to_string()),
+            Composer::PromptOwned(text) => Some(text),
             Composer::Hidden | Composer::Disabled(_) => None,
         })
-        .or_else(|| screen_placeholder(model.screen));
+        .or_else(|| screen_placeholder(model.screen).map(str::to_string));
     let lit = model.blink();
     let caret_style = if lit {
         Style::default().bg(th.primary).fg(th.background)
@@ -401,7 +402,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         };
         let caret_here = split.is_some();
         let body = if entry.is_empty() {
-            vec![span(placeholder.unwrap_or("").to_string(), th.muted)]
+            vec![span(placeholder.clone().unwrap_or_default(), th.muted)]
         } else if let Some((before, under, after)) = split {
             vec![
                 span(before, ink),

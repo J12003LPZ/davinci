@@ -151,8 +151,12 @@ impl NativeExtensionHost {
         let memory_config = agent_dir
             .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
             .unwrap_or_else(VectorMemoryConfig::from_env);
+        let governor = TokenGovernor::new(session_key.clone(), governor_config);
+        // Only the product host sweeps: other sessions' stored outputs past
+        // the retention window go, never the live session's.
+        let _ = governor.sweep_stale_outputs();
         Self {
-            governor: TokenGovernor::new(session_key.clone(), governor_config),
+            governor,
             memory: VectorMemory::with_config(cwd.to_path_buf(), memory_config),
             graph: GraphController::new(cwd.to_path_buf()),
             security: SecurityScanController::new(cwd.to_path_buf()),
@@ -170,7 +174,14 @@ impl NativeExtensionHost {
         names
     }
 
-    pub fn before_tool(&mut self, name: &str, args: &Value, state_hash: &str) -> Option<String> {
+    /// `state_hash` is only evaluated for the tools whose ledger needs it
+    /// (it runs git), so ordinary reads and edits never pay for it.
+    pub fn before_tool(
+        &mut self,
+        name: &str,
+        args: &Value,
+        state_hash: impl FnOnce() -> String,
+    ) -> Option<String> {
         // Inside a graph worker, least privilege is enforced here as well as by
         // the child's --tools allowlist: "bash" is one tool whose danger lives
         // in its command text.
@@ -235,7 +246,7 @@ impl NativeExtensionHost {
             "memory-clear" => Ok(Some(self.memory.clear().map_err(|err| err.to_string())?)),
             "governor-status" => Ok(Some(self.governor.status())),
             "governor-reset" => {
-                self.governor.session_start();
+                self.governor.reset();
                 Ok(Some(self.governor.status()))
             }
             name if name.starts_with("graph") => self.graph.command(name, args),
@@ -371,14 +382,14 @@ mod tests {
 
         // The reviewer may run tests but never mutate the repository.
         assert_eq!(
-            host.before_tool("bash", &json!({"command": "cargo test"}), "hash"),
+            host.before_tool("bash", &json!({"command": "cargo test"}), || "hash".into()),
             None
         );
         assert!(host
-            .before_tool("write", &json!({"path": "src/lib.rs"}), "hash")
+            .before_tool("write", &json!({"path": "src/lib.rs"}), || "hash".into())
             .is_some());
         assert!(host
-            .before_tool("bash", &json!({"command": "rm -rf src"}), "hash")
+            .before_tool("bash", &json!({"command": "rm -rf src"}), || "hash".into())
             .is_some());
 
         let result = host
@@ -393,7 +404,7 @@ mod tests {
 
         // Once the artifact is in, the node is done: no more work is accepted.
         assert!(host
-            .before_tool("bash", &json!({"command": "cargo test"}), "hash")
+            .before_tool("bash", &json!({"command": "cargo test"}), || "hash".into())
             .is_some());
     }
 

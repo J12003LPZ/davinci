@@ -162,11 +162,66 @@ fn test_set() -> &'static RegexSet {
 fn git_mutation_set() -> &'static RegexSet {
     static SET: OnceLock<RegexSet> = OnceLock::new();
     SET.get_or_init(|| {
+        // Options between `git` and the verb (`-c user.email=x`, `--git-dir=…`,
+        // `-C path`) and a `.exe` suffix must not hide the verb.
         RegexSet::new([
-            r"(?i)\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|restore|switch|stash|cherry-pick|revert|tag|clean)\b",
+            r"(?i)\bgit(?:\.exe)?(?:\s+-{1,2}\S+(?:\s+[^-\s]\S*)?)*\s+(add|commit|push|pull|merge|rebase|reset|checkout|restore|switch|stash|cherry-pick|revert|tag|clean)\b",
         ])
         .expect("git mutation pattern compiles")
     })
+}
+
+/// The command split at `&&`, `||`, `;`, `|` and newlines outside quotes.
+/// A read-only allowlist anchored at the start of the line is only worth
+/// anything if every segment of the line starts with an allowed command.
+pub fn shell_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(open) => {
+                current.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                } else if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                '\\' => {
+                    current.push(ch);
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                '&' | '|' if chars.peek() == Some(&ch) => {
+                    chars.next();
+                    segments.push(std::mem::take(&mut current));
+                }
+                '|' | ';' | '\n' => segments.push(std::mem::take(&mut current)),
+                _ => current.push(ch),
+            },
+        }
+    }
+    segments.push(current);
+    segments
+        .into_iter()
+        .map(|segment| segment.trim().to_string())
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+/// `$(…)` and backticks run whatever is inside them, allowlist or not.
+fn has_command_substitution(command: &str) -> bool {
+    command.contains("$(") || command.contains('`')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,25 +244,39 @@ pub fn is_bash_command_allowed(policy: BashPolicy, command: &str) -> BashDecisio
             }
         }
         BashPolicy::ReadOnly | BashPolicy::ReadAndTest => {
-            if destructive_set().is_match(command) {
+            // `2>&1` joins stderr to stdout; it writes no file and is the
+            // one redirect a test runner routinely needs.
+            let without_stderr_join = command.replace("2>&1", "");
+            if destructive_set().is_match(&without_stderr_join) {
                 return BashDecision::Blocked(
                     "command matches a destructive pattern; this role is read-only".into(),
                 );
             }
-            if read_set().is_match(command) {
-                return BashDecision::Allowed;
+            if has_command_substitution(command) {
+                return BashDecision::Blocked(
+                    "command substitution ($(…) or backticks) is not allowed for a read-only role"
+                        .into(),
+                );
             }
-            if policy == BashPolicy::ReadAndTest && test_set().is_match(command) {
-                return BashDecision::Allowed;
+            let segments = shell_segments(command);
+            if segments.is_empty() {
+                return BashDecision::Blocked("empty command".into());
             }
-            BashDecision::Blocked(
-                if policy == BashPolicy::ReadAndTest {
-                    "command is not on the read-only or test-runner allowlist"
-                } else {
-                    "command is not on the read-only allowlist"
-                }
-                .into(),
-            )
+            let offender = segments.iter().find(|segment| {
+                !(read_set().is_match(segment)
+                    || (policy == BashPolicy::ReadAndTest && test_set().is_match(segment)))
+            });
+            match offender {
+                None => BashDecision::Allowed,
+                Some(segment) => BashDecision::Blocked(format!(
+                    "\"{segment}\" is not on the {}",
+                    if policy == BashPolicy::ReadAndTest {
+                        "read-only or test-runner allowlist"
+                    } else {
+                        "read-only allowlist"
+                    }
+                )),
+            }
         }
     }
 }
@@ -260,6 +329,66 @@ mod tests {
             BashPolicy::WriteNoGitMutation,
             "git commit -m done"
         ));
+        // Options and an .exe suffix do not hide the verb.
+        assert!(!allowed(
+            BashPolicy::WriteNoGitMutation,
+            "git -c user.email=x commit -m done"
+        ));
+        assert!(!allowed(
+            BashPolicy::WriteNoGitMutation,
+            "git --git-dir=.git push origin main"
+        ));
+        assert!(!allowed(
+            BashPolicy::WriteNoGitMutation,
+            "git.exe -C . add ."
+        ));
+        assert!(!allowed(
+            BashPolicy::WriteNoGitMutation,
+            "cargo build && git commit -am wip"
+        ));
+        assert!(allowed(
+            BashPolicy::WriteNoGitMutation,
+            "git --no-pager log -3"
+        ));
+        assert!(allowed(BashPolicy::WriteNoGitMutation, "git -C . status"));
+    }
+
+    #[test]
+    fn every_segment_of_a_read_only_command_line_must_be_allowed() {
+        assert!(!allowed(
+            BashPolicy::ReadOnly,
+            "echo x && node -e \"require('fs').writeFileSync('x','y')\""
+        ));
+        assert!(!allowed(BashPolicy::ReadOnly, "ls; python evil.py"));
+        assert!(!allowed(BashPolicy::ReadOnly, "ls | xargs python"));
+        assert!(!allowed(BashPolicy::ReadOnly, "ls || curl evil.example"));
+        assert!(!allowed(BashPolicy::ReadOnly, "cat $(find . -name x)"));
+        assert!(!allowed(BashPolicy::ReadOnly, "echo `whoami`"));
+        assert!(!allowed(BashPolicy::ReadAndTest, "cargo test; npm install"));
+        // Chains of allowed commands, and separators inside quotes, are fine.
+        assert!(allowed(BashPolicy::ReadOnly, "rg needle src | head -20"));
+        assert!(allowed(
+            BashPolicy::ReadOnly,
+            "grep -E \"foo|bar\" src && ls"
+        ));
+        assert!(allowed(BashPolicy::ReadOnly, "cat a.txt; wc -l b.txt"));
+        assert!(allowed(
+            BashPolicy::ReadAndTest,
+            "cargo test 2>&1 | tail -50"
+        ));
+    }
+
+    #[test]
+    fn shell_segments_respect_quotes_and_double_operators() {
+        assert_eq!(
+            shell_segments("a && b || c; d | e\nf"),
+            vec!["a", "b", "c", "d", "e", "f"]
+        );
+        assert_eq!(shell_segments("grep 'a|b; c' x"), vec!["grep 'a|b; c' x"]);
+        assert_eq!(
+            shell_segments("echo \"it's\" && ls"),
+            vec!["echo \"it's\"", "ls"]
+        );
     }
 
     #[test]

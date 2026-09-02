@@ -1865,8 +1865,25 @@ fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
                     shell.model.graph_run = Some(sheet);
                     open_sheet(shell.model, Screen::GraphRun);
                 }
+                // `graph-view` answers with a worker transcript, not the run;
+                // the sheet is still the place to watch it from.
+                None if refresh_graph_sheet(shell.model, shell.host) => {
+                    open_sheet(shell.model, Screen::GraphRun);
+                }
                 None => push_command_result(shell.model, &name, &value),
             },
+            // A run just started (or resumed): watch it on the sheet rather
+            // than reading its first checkpoint as rows. The sheet refreshes
+            // itself every second while it is open.
+            "graph" | "graph-resume"
+                if value.get("started").and_then(serde_json::Value::as_bool) == Some(true) =>
+            {
+                if refresh_graph_sheet(shell.model, shell.host) {
+                    open_sheet(shell.model, Screen::GraphRun);
+                } else {
+                    push_command_result(shell.model, &name, &value);
+                }
+            }
             _ => push_command_result(shell.model, &name, &value),
         },
         Err(err) => shell.note(&format!("/{name}: {err}")),
@@ -3110,6 +3127,9 @@ pub fn run(
     model.height = height;
 
     let mut last_tick = Instant::now();
+    // The `5a` sheet shows a run that is progressing on its own thread; it is
+    // re-read from `graph-status` once a second while it is open.
+    let mut last_graph_refresh = Instant::now();
     // The question the `Ask` instrument is currently putting, if any. It lives
     // here rather than in the model because only this module knows what the
     // rows mean.
@@ -3207,6 +3227,12 @@ pub fn run(
         model.trim_transcript();
         // A workspace re-read that finished on the dresser's thread.
         dresser.apply_ready(&mut model);
+        if model.screen == Screen::GraphRun
+            && last_graph_refresh.elapsed() >= Duration::from_secs(1)
+        {
+            last_graph_refresh = Instant::now();
+            refresh_graph_sheet(&mut model, &host);
+        }
         if let Err(err) = terminal.draw(&model) {
             break Err(err.to_string());
         }
@@ -4801,9 +4827,40 @@ fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
             "index disabled — memory tools answer empty".to_string()
         },
     )];
-    let last_indexed = json_str(value, "lastIndexed");
-    if !last_indexed.is_empty() {
-        health.push((State::Done, format!("last indexed {last_indexed}")));
+    let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+    let inserted_this_session = number("lastIndexed").unwrap_or(0);
+    if let Some(at) = number("lastIndexedAt") {
+        health.push((
+            State::Done,
+            format!(
+                "indexed {inserted_this_session} this session · last {}",
+                sheet_time_ago(at)
+            ),
+        ));
+    } else if enabled {
+        health.push((State::Queued, "nothing indexed yet this session".into()));
+    }
+    let embedded = number("embedded").unwrap_or(0);
+    let dense_available = value
+        .get("denseAvailable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if records > 0 {
+        health.push((
+            if embedded == records {
+                State::Done
+            } else {
+                State::Attention
+            },
+            format!("{embedded} of {records} records carry a vector"),
+        ));
+    }
+    if !dense_available {
+        health.push((
+            State::Attention,
+            "dense retrieval paused — the embedding host did not answer; lexical only for 2m"
+                .into(),
+        ));
     }
     health.push((
         if automatic {
@@ -4817,63 +4874,227 @@ fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
             "retrieval on demand only — /memory-search".to_string()
         },
     ));
+    let kinds = value
+        .get("kinds")
+        .and_then(serde_json::Value::as_object)
+        .map(|kinds| {
+            let mut rows: Vec<(String, u64)> = kinds
+                .iter()
+                .map(|(name, count)| (name.replace('_', " "), count.as_u64().unwrap_or(0)))
+                .collect();
+            rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            rows.into_iter()
+                .map(|(name, count)| {
+                    let fraction = if records == 0 {
+                        0.0
+                    } else {
+                        count as f64 / records as f64
+                    };
+                    let note = match name.as_str() {
+                        "task" => "what was asked",
+                        "decision" => "what was concluded",
+                        "constraint" => "never evicted",
+                        "compaction" => "one per compaction",
+                        "conversation" => "first to go",
+                        _ => "promoted · importance 0.9",
+                    };
+                    (name, sheet_thousands(count), fraction, note.to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let model = json_str(value, "embeddingModel");
+    let dims = number("embeddingDimensions").unwrap_or(0);
+    let model_dims = if model.is_empty() {
+        String::new()
+    } else {
+        format!("{model} {dims}d")
+    };
+    let embed_host = json_str(value, "ollama")
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let result_limit = number("resultLimit").unwrap_or(0);
+    let retrieval_note = if records == 0 {
+        String::new()
+    } else if embedded > 0 && dense_available {
+        format!(
+            "k={result_limit} from {} records · hybrid dense + lexical",
+            sheet_thousands(records)
+        )
+    } else {
+        format!(
+            "k={result_limit} from {} records · lexical only",
+            sheet_thousands(records)
+        )
+    };
     VectorIndex {
-        repo: json_str(value, "repoId"),
-        repo_records: records.to_string(),
-        total_records: records.to_string(),
-        injection_cap: String::new(),
-        floor: String::new(),
-        kinds: Vec::new(),
+        repo: json_str(value, "repoId").chars().take(12).collect(),
+        repo_records: sheet_thousands(records),
+        total_records: sheet_thousands(records),
+        injection_cap: number("maxInjectedTokens")
+            .map(|tokens| format!("{} tokens", sheet_compact(tokens)))
+            .unwrap_or_default(),
+        floor: value
+            .get("minimumScore")
+            .and_then(serde_json::Value::as_f64)
+            .map(|score| format!("{score:.2}"))
+            .unwrap_or_default(),
+        kinds,
         embeddings: "ollama".into(),
-        embed_host: json_str(value, "ollama"),
+        embed_host: if model_dims.is_empty() {
+            embed_host
+        } else {
+            format!("{embed_host} · {model_dims}")
+        },
         store: "qdrant".into(),
-        collection: format!("collection {}", json_str(value, "collection")),
-        extraction: String::new(),
+        collection: json_str(value, "collection"),
+        extraction: json_str(value, "extractionModel"),
         config: crate::default_agent_dir()
             .join("vector-memory.json")
             .display()
             .to_string(),
         health,
+        model_dims,
+        retrieval_note,
         ..Default::default()
+    }
+}
+
+/// `1,482` — design.md §9: a count carries its magnitude at a glance.
+fn sheet_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// `1.5k`, `96.2k`, `2.8M` — the short form the counters use.
+fn sheet_compact(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+/// `4m ago`, `just now`, `2h ago` for a unix-millisecond stamp.
+fn sheet_time_ago(at_ms: u64) -> String {
+    let now = pi_session::now_ms();
+    let elapsed = now.saturating_sub(at_ms) / 1_000;
+    if elapsed < 60 {
+        "just now".into()
+    } else if elapsed < 3_600 {
+        format!("{}m ago", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h ago", elapsed / 3_600)
+    } else {
+        format!("{}d ago", elapsed / 86_400)
     }
 }
 
 /// `5c` — the governor's ledger, from the real `governor-status` payload plus
 /// a look into its store directory.
 fn governor_sheet(value: &serde_json::Value) -> GovernorSheet {
-    let count = |key: &str| {
+    let count_in = |value: &serde_json::Value, key: &str| {
         value
             .get(key)
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
     };
+    let count = |key: &str| count_in(value, key);
     let store_dir = json_str(value, "store");
-    let stored: Vec<GovernorStored> = std::fs::read_dir(&store_dir)
+    let size_label = |bytes: u64| {
+        if bytes >= 1_000 {
+            format!("{} KB", bytes / 1_000)
+        } else {
+            format!("{bytes} B")
+        }
+    };
+    // The governor's own manifest names the tool and call behind each id;
+    // the directory listing only covers ids left by an earlier process.
+    let manifest: Vec<GovernorStored> = value
+        .get("stored")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .take(8)
+                .map(|entry| GovernorStored {
+                    id: json_str(entry, "id"),
+                    tool: json_str(entry, "tool"),
+                    call: json_str(entry, "call"),
+                    size: format!(
+                        "{} ln · {}",
+                        sheet_thousands(count_in(entry, "lines")),
+                        size_label(count_in(entry, "bytes"))
+                    ),
+                    stale: false,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let stored: Vec<GovernorStored> = if manifest.is_empty() {
+        std::fs::read_dir(&store_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(8)
+            .map(|entry| GovernorStored {
+                id: entry
+                    .file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".txt")
+                    .to_string(),
+                tool: String::new(),
+                call: "from an earlier process".into(),
+                size: entry
+                    .metadata()
+                    .map(|meta| size_label(meta.len()))
+                    .unwrap_or_default(),
+                stale: true,
+            })
+            .collect()
+    } else {
+        manifest
+    };
+    let (on_disk, on_disk_bytes) = std::fs::read_dir(&store_dir)
         .into_iter()
         .flatten()
         .flatten()
-        .take(8)
-        .map(|entry| {
-            let size = entry
-                .metadata()
-                .map(|meta| {
-                    let bytes = meta.len();
-                    if bytes >= 1_000 {
-                        format!("{} KB", bytes / 1_000)
-                    } else {
-                        format!("{bytes} B")
-                    }
-                })
-                .unwrap_or_default();
-            GovernorStored {
-                id: entry.file_name().to_string_lossy().to_string(),
-                tool: String::new(),
-                call: String::new(),
-                size,
-                stale: false,
-            }
+        .filter_map(|entry| entry.metadata().ok())
+        .fold((0u64, 0u64), |(n, bytes), meta| (n + 1, bytes + meta.len()));
+    let outputs_note = if on_disk == 0 {
+        String::new()
+    } else {
+        format!(
+            "{on_disk} outputs · {} · {} newest shown · swept 14 days after the session's last write",
+            size_label(on_disk_bytes),
+            stored.len()
+        )
+    };
+    let tokens_withheld = count("bytesWithheld") / 4;
+    let policy = value
+        .get("thresholds")
+        .map(|thresholds| {
+            let t = |key: &str| count_in(thresholds, key);
+            format!(
+                "compresses above {} KB or {} lines · keeps {} head, {} tail, {} lines it judges important",
+                t("compressBytes") / 1024,
+                t("compressLines"),
+                t("keepHeadLines"),
+                t("keepTailLines"),
+                t("maxImportantLines")
+            )
         })
-        .collect();
+        .unwrap_or_default();
     GovernorSheet {
         counters: vec![
             GovernorCounter {
@@ -4897,9 +5118,18 @@ fn governor_sheet(value: &serde_json::Value) -> GovernorSheet {
                 note: "anti-loop · no new state".into(),
                 tone: Tone::Warning,
             },
+            GovernorCounter {
+                number: sheet_compact(tokens_withheld),
+                of: format!("of {} calls", count("toolCalls")),
+                verb: "tokens never sent".into(),
+                note: "digests and markers in place of the bytes".into(),
+                tone: Tone::Success,
+            },
         ],
         stored,
-        store_dir: format!("{store_dir} · dropped when the session ends"),
+        store_dir,
+        outputs_note,
+        policy,
         ..Default::default()
     }
 }
@@ -5013,85 +5243,288 @@ fn security_sheet(value: &serde_json::Value) -> SecurityScan {
     }
 }
 
-/// `5a` — the graph run sheet, from the real `graph-status` payload.
+/// `5a` — the graph run sheet, from the real `graph-status` payload
+/// (`native_extensions::graph::mod::status`: `run` is the persisted
+/// `GraphRun`, camelCase).
 fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
     let run = value.get("run").filter(|run| !run.is_null())?;
-    let current_phase = json_str(run, "phase");
-    let phases: Vec<(String, State)> = {
-        let order = [
-            "classify",
-            "investigate",
-            "plan",
-            "implement",
-            "verify",
-            "review",
-            "done",
-        ];
-        let at = order
-            .iter()
-            .position(|phase| *phase == current_phase)
-            .unwrap_or(0);
-        order
-            .iter()
-            .enumerate()
-            .map(|(index, phase)| {
-                let state = match index.cmp(&at) {
-                    std::cmp::Ordering::Less => State::Done,
-                    std::cmp::Ordering::Equal => {
-                        if current_phase == "done" {
-                            State::Done
-                        } else {
-                            State::Active
-                        }
-                    }
-                    std::cmp::Ordering::Greater => State::Queued,
-                };
-                (phase.to_string(), state)
-            })
-            .collect()
-    };
     let empty = Vec::new();
-    let tasks: Vec<GraphTask> = run
+    let tasks_json = run
         .get("tasks")
         .and_then(serde_json::Value::as_array)
-        .unwrap_or(&empty)
+        .unwrap_or(&empty);
+    let phase = json_str(run, "phase");
+    let stopped = matches!(phase.as_str(), "blocked" | "cancelled");
+    let number = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let now = pi_session::now_ms();
+
+    // The phase ribbon. A stopped run marks the phase it stopped in as
+    // failed; the phase order is the controller's.
+    const ORDER: [&str; 7] = [
+        "classify",
+        "investigate",
+        "plan",
+        "implement",
+        "verify",
+        "review",
+        "done",
+    ];
+    let phase_of_role = |role: &str| match role {
+        "classifier" => 0,
+        "researcher" | "test-analyzer" | "historian" => 1,
+        "planner" => 2,
+        "writer" => 3,
+        "reviewer" => 5,
+        _ => 0,
+    };
+    let verification_failed = run
+        .get("verification")
+        .and_then(|verification| verification.get("passed"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
+    let at = if phase == "done" {
+        6
+    } else if let Some(index) = ORDER.iter().position(|name| *name == phase) {
+        index
+    } else if verification_failed {
+        4
+    } else {
+        tasks_json
+            .last()
+            .map(|task| phase_of_role(&json_str(task, "role")))
+            .unwrap_or(0)
+    };
+    let phases: Vec<(String, State)> = ORDER
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let state = match index.cmp(&at) {
+                std::cmp::Ordering::Less => State::Done,
+                std::cmp::Ordering::Equal if phase == "done" => State::Done,
+                std::cmp::Ordering::Equal if stopped => State::Failed,
+                std::cmp::Ordering::Equal => State::Active,
+                std::cmp::Ordering::Greater => State::Queued,
+            };
+            (name.to_string(), state)
+        })
+        .collect();
+
+    // The rows: one per worker the run has spawned so far.
+    let policy_of_role = |role: &str| match role {
+        "test-analyzer" | "reviewer" => "read-and-test",
+        "writer" => "write-no-git-mutation",
+        _ => "read-only",
+    };
+    let clip = |text: &str, max: usize| {
+        let text = text.lines().next().unwrap_or_default().trim();
+        if text.chars().count() > max {
+            format!(
+                "{}…",
+                text.chars().take(max.saturating_sub(1)).collect::<String>()
+            )
+        } else {
+            text.to_string()
+        }
+    };
+    let classification = run.get("classification");
+    let live = !stopped && phase != "done";
+    let mode = json_str(run, "forced");
+    let mode = if mode.is_empty() {
+        classification
+            .map(|c| json_str(c, "complexity"))
+            .unwrap_or_default()
+    } else {
+        mode
+    };
+    // A trivial (or forced simple) run goes classify → implement → verify:
+    // it never investigates, plans or reviews, so those are not drawn as
+    // pending. A finished run shows only what ran.
+    let full_pipeline = !matches!(mode.as_str(), "trivial" | "simple");
+    let tasks: Vec<GraphTask> = tasks_json
         .iter()
         .map(|task| {
+            let id = json_str(task, "id");
+            let role = json_str(task, "role");
             let status = json_str(task, "status");
-            let usage = task
-                .get("usage")
-                .map(|usage| {
-                    let field = |key: &str| {
-                        usage
-                            .get(key)
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0)
-                    };
-                    format!(
-                        "{}↑ {}↓",
-                        pi_tui::davinci::views::chrome::thousands(field("inputTokens")),
-                        pi_tui::davinci::views::chrome::thousands(field("outputTokens")),
-                    )
+            let expect = json_str(task, "expect");
+            let focus = json_str(task, "focus");
+            let deps = task
+                .get("dependsOn")
+                .and_then(serde_json::Value::as_array)
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 })
                 .unwrap_or_default();
-            GraphTask {
-                id: format!("{} {}", json_str(task, "id"), json_str(task, "role")),
-                policy: json_str(task, "role"),
-                artifact: task
-                    .get("artifactFile")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("pending")
-                    .to_string(),
-                usage,
-                state: match status.as_str() {
-                    "done" | "succeeded" => State::Done,
-                    "running" | "started" => State::Active,
-                    "failed" => State::Failed,
-                    _ => State::Queued,
+            let state = match status.as_str() {
+                "succeeded" => State::Done,
+                "running" => State::Active,
+                "failed" | "cancelled" => State::Failed,
+                _ => State::Queued,
+            };
+            let artifact = match status.as_str() {
+                "succeeded" => match expect.as_str() {
+                    "classification" => classification
+                        .map(|c| {
+                            format!(
+                                "{} · {}",
+                                json_str(c, "taskClass"),
+                                json_str(c, "complexity")
+                            )
+                        })
+                        .unwrap_or_else(|| "classification".into()),
+                    _ if !focus.is_empty() => format!("{expect} · {}", clip(&focus, 40)),
+                    _ => expect.clone(),
                 },
+                "running" => {
+                    let activity = json_str(task, "lastActivity");
+                    if activity.is_empty() {
+                        format!("{expect} · working")
+                    } else {
+                        clip(&activity, 48)
+                    }
+                }
+                "failed" => format!("failed · {}", clip(&json_str(task, "error"), 44)),
+                "cancelled" => "cancelled".into(),
+                _ if !deps.is_empty() => format!("pending · waits on {deps}"),
+                _ => "pending".into(),
+            };
+            let usage = task.get("usage");
+            let input = usage.map(|u| number(u, "input")).unwrap_or(0);
+            let output = usage.map(|u| number(u, "output")).unwrap_or(0);
+            let cost = usage
+                .and_then(|u| u.get("costUsd"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let started = number(task, "startedAt");
+            let ended = number(task, "endedAt");
+            let time = if started == 0 {
+                String::new()
+            } else if ended >= started && ended > 0 {
+                sheet_duration(ended - started)
+            } else {
+                sheet_duration(now.saturating_sub(started))
+            };
+            let usage = if started == 0 && input == 0 {
+                "—".into()
+            } else {
+                format!(
+                    "{}↑ {}↓ ${cost:.2} {time}",
+                    sheet_compact(input),
+                    sheet_compact(output)
+                )
+                .trim_end()
+                .to_string()
+            };
+            GraphTask {
+                id,
+                policy: policy_of_role(&role).into(),
+                artifact,
+                usage,
+                state,
             }
         })
         .collect();
+
+    // The worker graph: classify fans out to the research workers, which
+    // join into plan → implement → review. Phases the run has not reached
+    // are drawn as pending nodes so the shape reads whole from the start.
+    let glyph = |state: State| match state {
+        State::Done => "✓",
+        State::Active => "◉",
+        State::Failed => "×",
+        _ => "○",
+    };
+    let node = |task: &GraphTask| format!("{} {}", task.id, glyph(task.state));
+    let latest = |prefix: &str| {
+        tasks
+            .iter()
+            .filter(|task| task.id == prefix || task.id.starts_with(&format!("{prefix}-")))
+            .last()
+            .map(node)
+            .unwrap_or_else(|| format!("{prefix} ○"))
+    };
+    let research: Vec<String> = tasks
+        .iter()
+        .filter(|task| task.id.starts_with("research-"))
+        .map(node)
+        .collect();
+    let has = |prefix: &str| {
+        tasks
+            .iter()
+            .any(|task| task.id == prefix || task.id.starts_with(&format!("{prefix}-")))
+    };
+    let mut chain: Vec<String> = Vec::new();
+    if has("plan") || (live && full_pipeline) {
+        chain.push(latest("plan"));
+    }
+    if has("implement") || live {
+        chain.push(latest("implement"));
+    }
+    if has("review") || (live && full_pipeline) {
+        chain.push(latest("review"));
+    }
+    let tail = chain
+        .iter()
+        .map(|node| format!("─ {node}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let head = latest("classify");
+    let shape: Vec<String> = if research.is_empty() {
+        if live && full_pipeline {
+            vec![format!("{head} ─ investigate ○ {tail}")]
+        } else if tail.is_empty() {
+            vec![head]
+        } else {
+            vec![format!("{head} {tail}")]
+        }
+    } else if research.len() == 1 {
+        vec![format!("{head} ─ {} {tail}", research[0])]
+    } else {
+        let width = research
+            .iter()
+            .map(|r| r.chars().count())
+            .max()
+            .unwrap_or(0);
+        let pad = " ".repeat(head.chars().count() + 1);
+        let last = research.len() - 1;
+        let join_row = research.len() / 2;
+        research
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let (left, right) = match index {
+                    0 => (format!("{head} ─┬─"), "─┐"),
+                    i if i == last => (format!("{pad}└─"), "─┘"),
+                    _ => (format!("{pad}├─"), "─┤"),
+                };
+                let right = if index == join_row {
+                    if index == 0 {
+                        "─┬"
+                    } else if index == last {
+                        "─┴"
+                    } else {
+                        "─┼"
+                    }
+                } else {
+                    right
+                };
+                let mut row = format!("{left} {name:<width$} {right}");
+                if index == join_row {
+                    row.push_str(&tail);
+                }
+                row
+            })
+            .collect()
+    };
+
     let counters = run.get("counters").cloned().unwrap_or_default();
     let budgets = run.get("budgets").cloned().unwrap_or_default();
     let cost = counters
@@ -5102,16 +5535,33 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
         .get("maxCostUsd")
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0);
-    let number = |value: &serde_json::Value, key: &str| {
-        value
-            .get(key)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
+    let capped = |used: u64, cap: u64| {
+        if cap == 0 {
+            format!("{used} of no cap")
+        } else {
+            format!("{used} of {cap}")
+        }
+    };
+    let started_at = number(&counters, "startedAt");
+    let elapsed_until = if live {
+        now
+    } else {
+        number(run, "updatedAt").max(started_at)
+    };
+    let milestone = match (
+        run.get("currentMilestone")
+            .and_then(serde_json::Value::as_u64),
+        run.get("milestones")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+    ) {
+        (Some(current), Some(total)) if total > 1 => format!("{current} of {total}"),
+        _ => String::new(),
     };
     Some(GraphRunSheet {
         goal: json_str(run, "goal"),
         phases,
-        shape: Vec::new(),
+        shape,
         tasks,
         cost: format!("${cost:.2}"),
         cost_cap: if cost_cap > 0.0 {
@@ -5124,25 +5574,57 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
         } else {
             0.0
         },
-        workers: format!(
-            "{} of {}",
+        workers: capped(
             number(&counters, "workersSpawned"),
-            number(&budgets, "maxWorkers")
+            number(&budgets, "maxWorkers"),
         ),
         parallel: number(&budgets, "maxParallelWorkers").to_string(),
-        cycles: format!(
-            "{} of {}",
+        cycles: capped(
             number(&counters, "revisionCycles"),
-            number(&budgets, "maxRevisionCycles")
+            number(&budgets, "maxRevisionCycles"),
         ),
-        replans: format!(
-            "{} of {}",
-            number(&counters, "replans"),
-            number(&budgets, "maxReplans")
-        ),
-        artifacts: format!(".pi\\graph\\{}\\", json_str(run, "runId")),
-        ..Default::default()
+        replans: capped(number(&counters, "replans"), number(&budgets, "maxReplans")),
+        artifacts: format!(".pi\\graph\\runs\\{}\\", json_str(run, "runId")),
+        id: json_str(run, "runId"),
+        mode,
+        milestone,
+        elapsed: if started_at == 0 {
+            String::new()
+        } else {
+            sheet_duration(elapsed_until.saturating_sub(started_at))
+        },
     })
+}
+
+/// `4s`, `1m52s`, `1h03m` for a span in milliseconds.
+fn sheet_duration(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
+/// Re-read `graph-status` and rebuild the `5a` sheet from it. `false` when
+/// there is no run to show.
+fn refresh_graph_sheet(model: &mut Model, host: &Arc<Mutex<ExtensionHost>>) -> bool {
+    let status = host
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .execute_native_command("graph-status", "");
+    match status {
+        Ok(Some(value)) => match graph_sheet(&value) {
+            Some(sheet) => {
+                model.graph_run = Some(sheet);
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// Everything a composer line or a chosen row may need. Bundled because the

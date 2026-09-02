@@ -15,9 +15,13 @@ use super::sheet::{facts, hint, hint_dim, Composer, SheetChrome};
 use crate::davinci::model::{Model, Tone};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, column_header, footnote, indent, run_width, span, span_strong, spread,
-    truncate_run, wrap, Surface,
+    blank, clip_ellipsis, column_header, footnote, indent, pad, run_width, span, span_strong,
+    spread, truncate_run, wrap, Surface,
 };
+
+/// A counter tile narrower than this cannot hold its figure and its reason;
+/// below it the counters stack as two rows each.
+const MIN_TILE: u16 = 18;
 
 const ID: u16 = 12;
 const TOOL: u16 = 12;
@@ -42,22 +46,10 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         )])];
     };
 
-    // Each counter is two rows, as the artboard sets them: the figure with
-    // its denominator, then what was done and why.
-    let mut counters: Vec<Line<'static>> = Vec::new();
-    for counter in &status.counters {
-        counters.push(Line::from(vec![
-            span(counter.number.clone(), tone_color(counter.tone, th)),
-            span(format!(" {}", counter.of), th.muted),
-        ]));
-        counters.push(indent(
-            2,
-            vec![
-                span(counter.verb.clone(), th.text),
-                span(format!("  {}", counter.note), th.border),
-            ],
-        ));
-    }
+    // The artboard sets the counters side by side, one bordered tile each:
+    // the figure with its denominator, what was done, and why. A terminal
+    // too narrow for four tiles stacks them as two rows each instead.
+    let counters = counter_tiles(status, width, th).unwrap_or_else(|| counter_rows(status, th));
 
     let sample = Surface::new(width, th)
         .title(vec![span(
@@ -140,14 +132,21 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         })
         .collect();
 
-    let mut footer: Vec<Line<'static>> = vec![Line::from(vec![
-        span("compresses above 8 KB or 300 lines", th.muted),
-        span(" · ", th.border),
-        span(
-            "keeps 40 head, 40 tail, 20 lines it judges important",
-            th.border,
-        ),
-    ])];
+    // The thresholds the governor runs with, from its status: the sheet
+    // never describes a policy the process does not have.
+    let mut footer: Vec<Line<'static>> = Vec::new();
+    if !status.policy.is_empty() {
+        let (above, keeps) = status
+            .policy
+            .split_once(" · ")
+            .unwrap_or((status.policy.as_str(), ""));
+        let mut spans = vec![span(above.to_string(), th.muted)];
+        if !keeps.is_empty() {
+            spans.push(span(" · ", th.border));
+            spans.push(span(keeps.to_string(), th.border));
+        }
+        footer.push(Line::from(spans));
+    }
     for row in wrap(
         "nothing is deleted — the full output is on disk and the model can ask \
          for any range of it",
@@ -177,6 +176,99 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     out.into_iter()
         .map(|line| Line::from(truncate_run(line.spans, width)))
         .collect()
+}
+
+/// The counters as one row of bordered tiles, `None` when the width cannot
+/// hold them.
+fn counter_tiles(
+    status: &crate::davinci::model::GovernorSheet,
+    width: u16,
+    th: &Theme,
+) -> Option<Vec<Line<'static>>> {
+    let count = status.counters.len() as u16;
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let gap = 1u16;
+    let tile = width.saturating_sub(gap * (count - 1)) / count;
+    if tile < MIN_TILE {
+        return None;
+    }
+    // Every tile has the same number of rows, so the bottom rules align.
+    let inner = tile.saturating_sub(4);
+    let mut bodies: Vec<Vec<Vec<ratatui::text::Span<'static>>>> = status
+        .counters
+        .iter()
+        .map(|counter| {
+            let mut rows = vec![
+                vec![
+                    span_strong(counter.number.clone(), tone_color(counter.tone, th), th),
+                    span(format!(" {}", counter.of), th.muted),
+                ],
+                vec![span(counter.verb.clone(), th.text)],
+            ];
+            rows.extend(
+                wrap(&counter.note, inner)
+                    .into_iter()
+                    .map(|row| vec![span(row, th.border)]),
+            );
+            rows
+        })
+        .collect();
+    let rows = bodies.iter().map(Vec::len).max().unwrap_or(0);
+    for body in &mut bodies {
+        while body.len() < rows {
+            body.push(Vec::new());
+        }
+    }
+    let tiles: Vec<Vec<Line<'static>>> = bodies
+        .into_iter()
+        .map(|body| Surface::new(tile, th).rows(body).lines())
+        .collect();
+    let height = tiles.iter().map(Vec::len).max().unwrap_or(0);
+    Some(
+        (0..height)
+            .map(|row| {
+                let mut spans = Vec::new();
+                for (index, lines) in tiles.iter().enumerate() {
+                    if index > 0 {
+                        spans.push(pad(gap, None));
+                    }
+                    match lines.get(row) {
+                        Some(line) => {
+                            let used = run_width(&line.spans);
+                            spans.extend(line.spans.iter().cloned());
+                            if used < tile {
+                                spans.push(pad(tile - used, None));
+                            }
+                        }
+                        None => spans.push(pad(tile, None)),
+                    }
+                }
+                Line::from(spans)
+            })
+            .collect(),
+    )
+}
+
+/// The counters as two rows each: the figure with its denominator, then
+/// what was done and why.
+fn counter_rows(status: &crate::davinci::model::GovernorSheet, th: &Theme) -> Vec<Line<'static>> {
+    let mut counters: Vec<Line<'static>> = Vec::new();
+    for counter in &status.counters {
+        counters.push(Line::from(vec![
+            span(counter.number.clone(), tone_color(counter.tone, th)),
+            span(format!(" {}", counter.of), th.muted),
+        ]));
+        counters.push(indent(
+            2,
+            vec![
+                span(counter.verb.clone(), th.text),
+                span(format!("  {}", counter.note), th.border),
+            ],
+        ));
+    }
+    counters
 }
 
 /// The sheet's frame (design.md §11): the governor and its session in the
@@ -245,8 +337,28 @@ mod tests {
     }
 
     #[test]
-    fn every_counter_is_two_rows_with_its_denominator_and_its_reason() {
+    fn the_counters_are_four_tiles_side_by_side() {
         let m = model(100);
+        let rows: Vec<String> = lines(&m).iter().map(text).collect();
+        let figures = rows
+            .iter()
+            .find(|row| row.contains("31 of 96 results"))
+            .expect("the figures row");
+        assert!(figures.contains("9 of 61 reads"), "{figures}");
+        assert!(figures.contains("4 of 96 calls"), "{figures}");
+        assert!(figures.contains("96.2k of 200k"), "{figures}");
+        assert!(rows.iter().any(|row| row.contains("compressed")
+            && row.contains("deduplicated")
+            && row.contains("tokens never sent")));
+        assert!(rows.iter().any(|row| row.contains("head 40 · tail 40")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("compresses above 8 KB or 300 lines")));
+    }
+
+    #[test]
+    fn a_narrow_terminal_stacks_the_counters_two_rows_each() {
+        let m = model(60);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
         assert_eq!(rows[0], "31 of 96 results");
         assert!(rows[1].contains("compressed") && rows[1].contains("head 40 · tail 40"));

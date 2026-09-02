@@ -18,10 +18,12 @@ use super::store::{
 };
 use super::types::{
     Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters, GraphRun,
-    GraphTaskState, ImplementationPlan, Phase, ResearchKind, Role, TaskStatus, Verdict,
+    GraphTaskState, ImplementationPlan, Phase, ResearchKind, Role, Severity, TaskStatus, Verdict,
     VerificationResult, WorkerSpec, WorkerUsage,
 };
-use super::verify::{collect_verify_commands, run_verification, CollectInput, VerifyExec};
+use super::verify::{
+    collect_verify_commands, nothing_ran, run_verification, CollectInput, VerifyExec,
+};
 use super::worker::WorkerRunner;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,15 +68,57 @@ pub fn default_is_git_repo(cwd: &Path) -> bool {
     cwd.join(".git").exists()
 }
 
+/// An untracked file larger than this is listed, not shown.
+const UNTRACKED_FILE_MAX_BYTES: usize = 64 * 1024;
+
+/// What the reviewer reads: every change against HEAD, plus the files the
+/// writer created. The writer may not `git add`, so a plain `git diff` never
+/// showed new files and the reviewer approved changes it had not seen.
 pub fn default_get_diff(cwd: &Path) -> String {
-    Command::new("git")
-        .arg("diff")
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    // `HEAD` includes staged changes; a repository without a commit has none.
+    let mut diff = git(&["diff", "HEAD"])
+        .or_else(|| git(&["diff"]))
+        .unwrap_or_default();
+    let untracked = git(&["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+    for file in untracked
+        .lines()
+        .map(str::trim)
+        .filter(|file| !file.is_empty())
+    {
+        let Ok(bytes) = std::fs::read(cwd.join(file)) else {
+            continue;
+        };
+        if !diff.is_empty() && !diff.ends_with('\n') {
+            diff.push('\n');
+        }
+        diff.push_str(&format!(
+            "diff --git a/{file} b/{file}\nnew file (untracked)\n--- /dev/null\n+++ b/{file}\n"
+        ));
+        if bytes.len() > UNTRACKED_FILE_MAX_BYTES || bytes.contains(&0) {
+            diff.push_str(&format!(
+                "@@ new file, {} bytes, contents not shown @@\n",
+                bytes.len()
+            ));
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        diff.push_str(&format!("@@ -0,0 +1,{} @@\n", text.lines().count()));
+        for line in text.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+    }
+    diff
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -831,13 +875,28 @@ fn deliver_goal(
             detected: &detect_verify_commands(&cwd),
             plan: plan.as_ref(),
         });
-        let verification: VerificationResult = run_verification(
+        // An unverified change is never delivered. With nothing to run there
+        // is nothing to revise either, so this blocks rather than looping.
+        if commands.is_empty() && !execution.options.dry_run {
+            execution.blocked(
+                "no verification command to run: add verifyCommands to .pi/graph.json \
+                 (or a Cargo.toml / package.json test script) so the change can be checked"
+                    .to_string(),
+            );
+            return Delivery::Stop;
+        }
+        let mut verification: VerificationResult = run_verification(
             &commands,
             &cwd,
             &execution.exec_abort,
             budgets.verify_command_timeout_ms,
             execution.deps.verify_exec.as_ref(),
         );
+        // A dry run verifies nothing by design: with no command to pretend
+        // to run, it passes instead of revising a change nobody made.
+        if execution.options.dry_run && nothing_ran(&verification) {
+            verification.passed = true;
+        }
         {
             let mut run = execution
                 .run
@@ -855,6 +914,14 @@ fn deliver_goal(
         }
 
         if !verification.passed {
+            if nothing_ran(&verification) && !execution.options.dry_run {
+                execution.blocked(
+                    "every verification command was plan-invented and does not exist; \
+                     add verifyCommands to .pi/graph.json so the change can be checked"
+                        .to_string(),
+                );
+                return Delivery::Stop;
+            }
             if revision_cycles >= budgets.max_revision_cycles {
                 execution.blocked(format!(
                     "verification still failing after {revision_cycles} revision cycles"
@@ -908,8 +975,19 @@ fn deliver_goal(
             return Delivery::Stop;
         };
 
-        if review.verdict == Verdict::Approve {
+        // An approval that lists a blocker or a major issue is a
+        // contradiction; the issues win, as they would with a human reviewer.
+        let blocking_issue = review
+            .issues
+            .iter()
+            .any(|issue| matches!(issue.severity, Severity::Blocker | Severity::Major));
+        if review.verdict == Verdict::Approve && !blocking_issue {
             return Delivery::Ok;
+        }
+        if review.verdict == Verdict::Approve {
+            execution.checkpoint(Some(
+                "review approved with blocking issues; treated as changes required",
+            ));
         }
         if revision_cycles >= budgets.max_revision_cycles {
             execution.blocked(format!(

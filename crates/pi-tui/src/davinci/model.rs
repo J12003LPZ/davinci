@@ -1157,6 +1157,9 @@ pub struct GovernorSheet {
     pub since: String,
     /// `31 outputs · 2.8 MB · 4 newest shown · dropped when the session ends`.
     pub outputs_note: String,
+    /// `compresses above 8 KB or 300 lines · keeps 40 head, 40 tail, 20 lines
+    /// it judges important` — the thresholds the governor actually runs with.
+    pub policy: String,
 }
 
 /// One row of `/mcp`.

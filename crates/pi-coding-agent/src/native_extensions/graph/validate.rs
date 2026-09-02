@@ -9,9 +9,216 @@ use super::types::{
     Artifact, ArtifactKind, Complexity, Confidence, ResearchKind, Role, Severity, TaskClass,
     Verdict,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub type ValidationResult = Result<Artifact, Vec<String>>;
+
+/// The JSON schema of one artifact kind, as `graph_submit` advertises it to
+/// the worker model. It states exactly what the validator below accepts:
+/// a worker never has to guess a field name. Keep the two in step.
+pub fn artifact_schema(kind: ArtifactKind) -> Value {
+    let strings = json!({"type": "array", "items": {"type": "string"}});
+    match kind {
+        ArtifactKind::Classification => json!({
+            "type": "object",
+            "properties": {
+                "taskClass": {"type": "string", "enum": TaskClass::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
+                "complexity": {"type": "string", "enum": Complexity::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
+                "rationale": {"type": "string", "minLength": 1},
+                "researchTasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ResearchKind::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
+                            "focus": {"type": "string", "minLength": 1, "description": "A concrete question, not a topic"}
+                        },
+                        "required": ["kind", "focus"]
+                    }
+                },
+                "milestones": {"type": "array", "items": {"type": "string"}, "description": "Empty for one deliverable; otherwise 2 to 8 ordered, independently shippable deliverables"}
+            },
+            "required": ["taskClass", "complexity", "rationale", "researchTasks", "milestones"]
+        }),
+        ArtifactKind::Evidence => json!({
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ResearchKind::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "claim": {"type": "string", "minLength": 1},
+                            "refs": {"type": "array", "items": {"type": "string"}, "description": "path:line references that support the claim"},
+                            "confidence": {"type": "string", "enum": Confidence::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()}
+                        },
+                        "required": ["claim", "refs", "confidence"]
+                    }
+                },
+                "risks": strings,
+                "gaps": strings,
+                "testBaseline": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "exitCode": {"type": "integer"},
+                        "summary": {"type": "string"}
+                    },
+                    "required": ["command", "exitCode", "summary"]
+                }
+            },
+            "required": ["kind", "findings", "risks", "gaps"]
+        }),
+        ArtifactKind::Plan => json!({
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string", "minLength": 1},
+                            "files": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["description", "files"]
+                    }
+                },
+                "testsToAdd": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"file": {"type": "string"}, "behavior": {"type": "string"}},
+                        "required": ["file", "behavior"]
+                    }
+                },
+                "testsToRun": {"type": "array", "items": {"type": "string"}, "description": "Exact shell commands runnable from the project root"},
+                "completionCriteria": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                "invariants": strings,
+                "outOfScope": strings
+            },
+            "required": ["steps", "testsToAdd", "testsToRun", "completionCriteria", "invariants", "outOfScope"]
+        }),
+        ArtifactKind::PatchReport => json!({
+            "type": "object",
+            "properties": {
+                "changedFiles": strings,
+                "summary": {"type": "string", "minLength": 1},
+                "deviations": strings,
+                "planInvalidated": {"type": "boolean"},
+                "invalidationReason": {"type": "string", "description": "Required when planInvalidated is true"}
+            },
+            "required": ["changedFiles", "summary", "deviations", "planInvalidated"]
+        }),
+        ArtifactKind::Review => json!({
+            "type": "object",
+            "properties": {
+                "verdict": {"type": "string", "enum": Verdict::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
+                "issues": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "severity": {"type": "string", "enum": Severity::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
+                            "file": {"type": "string"},
+                            "description": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["severity", "description"]
+                    }
+                },
+                "notes": {"type": "string"}
+            },
+            "required": ["verdict", "issues", "notes"]
+        }),
+    }
+}
+
+/// The same contract as prose plus one example, for the worker's system
+/// prompt: a model that has read this never needs a validation round trip.
+pub fn artifact_contract(kind: ArtifactKind) -> String {
+    let example = match kind {
+        ArtifactKind::Classification => json!({
+            "taskClass": "bug",
+            "complexity": "standard",
+            "rationale": "One subsystem, root cause unknown until the call site is read.",
+            "researchTasks": [{"kind": "code_search", "focus": "Where is the session file written, and what sets its permissions?"}],
+            "milestones": []
+        }),
+        ArtifactKind::Evidence => json!({
+            "kind": "code_search",
+            "findings": [{"claim": "Session files are opened with mode 0644.", "refs": ["src/store.rs:118"], "confidence": "high"}],
+            "risks": ["The umask may already restrict this on some hosts."],
+            "gaps": [],
+            "testBaseline": null
+        }),
+        ArtifactKind::Plan => json!({
+            "steps": [{"description": "Open session files with mode 0600.", "files": ["src/store.rs"]}],
+            "testsToAdd": [{"file": "src/store.rs", "behavior": "a new session file is not group- or world-readable"}],
+            "testsToRun": ["cargo test -p pi-session"],
+            "completionCriteria": ["cargo test -p pi-session passes", "new session files are mode 0600"],
+            "invariants": ["existing session files are not rewritten"],
+            "outOfScope": ["Windows ACLs"]
+        }),
+        ArtifactKind::PatchReport => json!({
+            "changedFiles": ["src/store.rs"],
+            "summary": "Session files are now created with mode 0600; test added.",
+            "deviations": [],
+            "planInvalidated": false
+        }),
+        ArtifactKind::Review => json!({
+            "verdict": "changes_required",
+            "issues": [{"severity": "major", "file": "src/store.rs", "description": "The mode is set after the file is created, leaving a window where it is world-readable."}],
+            "notes": "Otherwise matches the plan."
+        }),
+    };
+    let rules = match kind {
+        ArtifactKind::Classification => [
+            &format!("taskClass: one of {}", TaskClass::names()),
+            &format!("complexity: one of {}", Complexity::names()),
+            "rationale: non-empty string",
+            &format!("researchTasks: array (may be empty) of {{ kind: one of {}, focus: non-empty string }}", ResearchKind::names()),
+            "milestones: array of strings — empty for a single deliverable, otherwise 2 to 8 entries",
+        ].join("
+- "),
+        ArtifactKind::Evidence => [
+            &format!("kind: one of {}", ResearchKind::names()),
+            &format!("findings: array of {{ claim: non-empty string, refs: array of \"path:line\" strings, confidence: one of {} }}", Confidence::names()),
+            "risks: array of strings (may be empty)",
+            "gaps: array of strings (may be empty)",
+            "testBaseline: optional { command: string, exitCode: number, summary: string }",
+        ].join("
+- "),
+        ArtifactKind::Plan => [
+            "steps: non-empty array of { description: non-empty string, files: array of paths }",
+            "testsToAdd: array (may be empty) of { file: string, behavior: string }",
+            "testsToRun: array of exact shell commands runnable from the project root",
+            "completionCriteria: non-empty array of measurable statements",
+            "invariants: array of strings (may be empty)",
+            "outOfScope: array of strings (may be empty)",
+        ].join("
+- "),
+        ArtifactKind::PatchReport => [
+            "changedFiles: array of file paths (may be empty)",
+            "summary: non-empty string",
+            "deviations: array of strings (may be empty)",
+            "planInvalidated: boolean",
+            "invalidationReason: non-empty string, required when planInvalidated is true",
+        ].join("
+- "),
+        ArtifactKind::Review => [
+            &format!("verdict: one of {}", Verdict::names()),
+            &format!("issues: array of {{ severity: one of {}, file?: string, description: non-empty string }} — at least one when verdict is changes_required", Severity::names()),
+            "notes: string (may be empty)",
+        ].join("
+- "),
+    };
+    format!(
+        "## Artifact contract: \"{kind}\"\n\nFinish by calling `graph_submit` exactly once with `{{ \"artifact\": <object> }}`. \
+         The object must have exactly these fields (camelCase, no extras needed):\n- {rules}\n\nExample:\n```json\n{}\n```",
+        serde_json::to_string_pretty(&example).unwrap_or_default()
+    )
+}
 
 fn is_non_empty_string(value: Option<&Value>) -> bool {
     matches!(value, Some(Value::String(text)) if !text.is_empty())
@@ -462,6 +669,42 @@ pub fn validate_config_shape(value: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_contract_example_validates_and_every_schema_names_its_fields() {
+        for kind in [
+            ArtifactKind::Classification,
+            ArtifactKind::Evidence,
+            ArtifactKind::Plan,
+            ArtifactKind::PatchReport,
+            ArtifactKind::Review,
+        ] {
+            let contract = artifact_contract(kind);
+            let json = contract
+                .split("```json\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n```").next())
+                .expect("the contract carries an example");
+            let example: Value = serde_json::from_str(json).expect("example is JSON");
+            assert!(
+                validate_artifact(kind, &example).is_ok(),
+                "{kind}: {:?}",
+                validate_artifact(kind, &example).err()
+            );
+            let schema = artifact_schema(kind);
+            let required = schema["required"].as_array().expect("required");
+            for field in required {
+                assert!(
+                    schema["properties"].get(field.as_str().unwrap()).is_some(),
+                    "{kind}: {field} is required but has no schema"
+                );
+                assert!(
+                    example.get(field.as_str().unwrap()).is_some(),
+                    "{kind}: the example lacks required {field}"
+                );
+            }
+        }
+    }
     use serde_json::json;
 
     #[test]

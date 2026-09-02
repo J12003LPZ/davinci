@@ -1318,6 +1318,7 @@ pub fn governor_sheet() -> GovernorSheet {
         session_id: "01JB2K".into(),
         since: "11:04".into(),
         outputs_note: "31 outputs · 2.8 MB · 4 newest shown · dropped when the session ends".into(),
+        policy: "compresses above 8 KB or 300 lines · keeps 40 head, 40 tail, 20 lines it judges important".into(),
     }
 }
 

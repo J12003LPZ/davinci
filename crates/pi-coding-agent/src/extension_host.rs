@@ -337,7 +337,10 @@ impl ExtensionHost {
 
     pub fn emit(&mut self, event: ExtensionEvent) {
         self.dispatch_js(&event);
-        if let Ok(mut native) = self.native.lock() {
+        {
+            // Through the poison, like every other site: a panic that once
+            // held this lock must not stop shutdown from aborting graph runs.
+            let mut native = self.native.lock().unwrap_or_else(|err| err.into_inner());
             match event {
                 ExtensionEvent::SessionStart => native.session_start(),
                 ExtensionEvent::SessionBeforeCompact | ExtensionEvent::SessionCompact => {
@@ -376,7 +379,14 @@ impl ExtensionHost {
         }
     }
 
-    pub fn native_before_tool(&self, name: &str, args: &Value, state_hash: &str) -> Option<String> {
+    /// `state_hash` is computed lazily: only the governor's anti-loop ledger
+    /// needs the repository state, and only for search tools.
+    pub fn native_before_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        state_hash: impl FnOnce() -> String,
+    ) -> Option<String> {
         self.native
             .lock()
             .ok()
@@ -428,6 +438,21 @@ impl ExtensionHost {
             && crate::native_extensions::graph_worker_context().is_some();
         if !is_worker_submit && !NATIVE_TOOLS.iter().any(|tool| *tool == name) {
             return None;
+        }
+        // `graph_run` blocks for the whole run. It must not do so while
+        // holding the native host: every other tool call's pre-hook, the
+        // status commands and session shutdown (`abort_all_runs`) take the
+        // same lock, so the run would freeze the session and Ctrl-C could
+        // never stop it. The controller keeps its live state process-wide,
+        // so a clone runs the graph just as well.
+        if name == "graph_run" {
+            let graph = self
+                .native
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .graph
+                .clone();
+            return Some(graph.execute_tool(name, args));
         }
         Some(
             self.native

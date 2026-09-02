@@ -67,6 +67,11 @@ pub fn looks_like_missing_command(exit_code: i32, output: &str) -> bool {
     if exit_code == 127 || exit_code == 9009 {
         return true;
     }
+    // A shell that cannot find a command says so in a line or two. A real
+    // test log that happens to quote the phrase is long; it does not count.
+    if output.len() > MISSING_COMMAND_OUTPUT_MAX {
+        return false;
+    }
     let lowered = output.to_ascii_lowercase();
     [
         "is not recognized as an internal or external command",
@@ -78,6 +83,10 @@ pub fn looks_like_missing_command(exit_code: i32, output: &str) -> bool {
     .iter()
     .any(|needle| lowered.contains(needle))
 }
+
+/// Longer output than this is a program running, not a shell failing to
+/// find one.
+const MISSING_COMMAND_OUTPUT_MAX: usize = 4_096;
 
 fn tail(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -142,8 +151,10 @@ pub fn run_verification(
     exec: &VerifyExec,
 ) -> VerificationResult {
     let mut results = Vec::new();
+    let mut interrupted = false;
     for spec in commands {
         if abort.load(Ordering::Relaxed) {
+            interrupted = true;
             break;
         }
         let (exit_code, output, duration_ms) = exec(&spec.command, cwd, abort, timeout_ms);
@@ -163,13 +174,24 @@ pub fn run_verification(
             skipped,
         });
     }
-    let passed = results
-        .iter()
-        .all(|result| result.skipped || result.exit_code == 0);
+    // "Passed" means something ran and everything that ran succeeded: an
+    // empty command list, a list of plan-invented commands that all got
+    // skipped, or a list cut short by an abort verified nothing.
+    let ran = results.iter().filter(|result| !result.skipped).count();
+    let passed = !interrupted
+        && ran > 0
+        && results
+            .iter()
+            .all(|result| result.skipped || result.exit_code == 0);
     VerificationResult {
         commands: results,
         passed,
     }
+}
+
+/// True when verification could not judge the change: nothing ran.
+pub fn nothing_ran(result: &VerificationResult) -> bool {
+    result.commands.iter().all(|command| command.skipped)
 }
 
 #[cfg(test)]
@@ -262,6 +284,65 @@ mod tests {
         assert!(result.passed);
         assert!(result.commands[1].skipped);
         assert!(result.commands[1].output_tail.contains("plan-invented"));
+    }
+
+    #[test]
+    fn nothing_ran_is_not_a_pass() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let exec = |_: &str, _: &Path, _: &Arc<AtomicBool>, _: u64| (0, "ok".to_string(), 1);
+        let empty = run_verification(&[], Path::new("."), &abort, 0, &exec);
+        assert!(!empty.passed);
+        assert!(nothing_ran(&empty));
+
+        let ghost = |_: &str, _: &Path, _: &Arc<AtomicBool>, _: u64| {
+            (127, "command not found".to_string(), 1)
+        };
+        let only_invented = run_verification(
+            &[VerifyCommandSpec {
+                name: "plan-test-1".into(),
+                command: "ghost".into(),
+                from_plan: true,
+            }],
+            Path::new("."),
+            &abort,
+            0,
+            &ghost,
+        );
+        assert!(only_invented.commands[0].skipped);
+        assert!(!only_invented.passed);
+        assert!(nothing_ran(&only_invented));
+    }
+
+    #[test]
+    fn an_abort_mid_way_is_not_a_pass() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&abort);
+        let exec = move |_: &str, _: &Path, _: &Arc<AtomicBool>, _: u64| {
+            flag.store(true, Ordering::Relaxed);
+            (0, "ok".to_string(), 1)
+        };
+        let result = run_verification(
+            &[spec("a", "a"), spec("b", "b")],
+            Path::new("."),
+            &abort,
+            0,
+            &exec,
+        );
+        assert_eq!(result.commands.len(), 1);
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn a_long_log_that_quotes_command_not_found_is_a_real_failure() {
+        let log = format!(
+            "{}\nerror: command not found in PATH docs",
+            "x".repeat(5_000)
+        );
+        assert!(!looks_like_missing_command(1, &log));
+        assert!(looks_like_missing_command(
+            1,
+            "bash: ghost: command not found"
+        ));
     }
 
     #[test]

@@ -126,7 +126,11 @@ pub fn run_child(
         match receiver.try_recv() {
             Ok(Line::Stdout(line)) => on_stdout(&line),
             Ok(Line::Stderr(line)) => on_stderr(&line),
-            Err(_) => break,
+            // The pumps may still be flushing the child's last lines (the
+            // usage line a killed worker prints on its way out); wait for
+            // them, bounded by the grace period.
+            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(5)),
+            Err(mpsc::TryRecvError::Disconnected) => break,
         }
     }
     outcome.exit_code = match child.wait() {

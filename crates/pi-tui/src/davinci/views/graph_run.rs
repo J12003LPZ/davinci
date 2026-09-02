@@ -206,7 +206,13 @@ pub fn chrome(model: &Model) -> SheetChrome {
             hint(th, "a abort"),
         ],
         escape: Some("esc close"),
-        composer: Composer::Prompt("/graph-view t6"),
+        // The composer suggests tailing the worker that is running now; with
+        // none running, the run's status.
+        composer: run
+            .and_then(|r| r.tasks.iter().find(|task| task.state == State::Active))
+            .and_then(|task| task.id.split_whitespace().next().map(str::to_string))
+            .map(|id| Composer::PromptOwned(format!("/graph-view {id}")))
+            .unwrap_or(Composer::Prompt("/graph-status")),
         echo: run.map(|r| format!("/graph {}", r.goal)),
     }
 }
@@ -359,7 +365,7 @@ mod tests {
         assert!(right.starts_with("run cost "), "{right}");
         assert!(right.ends_with(" $1.31/$8.00"), "{right}");
         assert_eq!(c.escape, Some("esc close"));
-        assert_eq!(c.composer, Composer::Prompt("/graph-view t6"));
+        assert_eq!(c.composer, Composer::PromptOwned("/graph-view t6".into()));
         assert_eq!(
             c.echo.as_deref(),
             Some("/graph add prompt-cache parity to the openai adapter --complex")

@@ -85,8 +85,11 @@ pub fn tool_class(tool: &str) -> ToolClass {
         // user would want to be asked about.
         // A batch is judged operation by operation; the wrapper itself
         // changes nothing.
+        // `graph_submit` is a graph worker's one exit door: it writes the
+        // artifact file its parent named, nothing else. `memory_search` and
+        // `retrieve_output` read the memory index and the governor's store.
         "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" | "mcp_read"
-        | "batch" => ToolClass::Read,
+        | "batch" | "graph_submit" | "memory_search" | "retrieve_output" => ToolClass::Read,
         "write" | "edit" | "notebook_edit" => ToolClass::Edit,
         "bash" | "powershell" => ToolClass::Shell,
         "web_fetch" | "web_search" => ToolClass::Network,
@@ -1019,6 +1022,9 @@ mod tests {
         assert_eq!(tool_class("job_output"), ToolClass::Read);
         assert_eq!(tool_class("notebook_edit"), ToolClass::Edit);
         assert_eq!(tool_class("mcp_read"), ToolClass::Read);
+        assert_eq!(tool_class("graph_submit"), ToolClass::Read);
+        assert_eq!(tool_class("retrieve_output"), ToolClass::Read);
+        assert_eq!(tool_class("graph_run"), ToolClass::Other);
         assert_eq!(tool_class("mcp__memory__echo"), ToolClass::Other);
         assert_eq!(
             host_of("https://user:pw@Docs.rs:443/similar/latest?x=1"),

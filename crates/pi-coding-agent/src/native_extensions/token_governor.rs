@@ -4,6 +4,11 @@
 //! reversible copy of large successful tool outputs, returns a compact digest
 //! to the model, and records enough metadata for `retrieve_output` to recover
 //! the original text.  No network access is required.
+//!
+//! Only the `content` of a tool result reaches the model (`details` is for
+//! the UI and events), so everything the model needs to undo a compression —
+//! the output id and how to call `retrieve_output` — is written into the
+//! digest itself.
 
 use pi_agent::{ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
@@ -11,7 +16,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 const DEFAULT_COMPRESS_THRESHOLD_BYTES: usize = 8_192;
 const DEFAULT_COMPRESS_THRESHOLD_LINES: usize = 200;
@@ -19,6 +25,40 @@ const DEFAULT_KEEP_HEAD_LINES: usize = 15;
 const DEFAULT_KEEP_TAIL_LINES: usize = 30;
 const DEFAULT_MAX_IMPORTANT_LINES: usize = 60;
 const DEFAULT_MAX_LEDGER_ENTRIES: usize = 200;
+/// A repeated read is only replaced by a marker while the earlier output is
+/// still guaranteed to be in the provider's view. `pi_agent::PruneSettings`
+/// never prunes the newest 8 tool results, so this stays below 8: a read
+/// whose twin may already have been pruned is served again in full instead
+/// of pointing at a placeholder.
+const DEFAULT_DEDUPE_WINDOW: usize = 6;
+/// `retrieve_output` answers at most this many bytes per call and says where
+/// to continue; the whole point of the store is to not flood the context.
+const DEFAULT_RETRIEVE_MAX_BYTES: usize = 48_000;
+/// How many stored outputs the status payload lists, newest first.
+const STORED_MANIFEST_ENTRIES: usize = 64;
+/// Stored outputs of sessions untouched for this long are swept on startup.
+pub const STORE_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Tools whose output the model needs verbatim: `read` has its own
+/// offset/limit paging and `edit` must match the bytes it was shown; `batch`
+/// already caps and structures its sub-results; the rest are small or are
+/// themselves the governor's or memory's answer. These are never digested
+/// (the `read` dedupe still applies).
+const LOSSLESS_TOOLS: &[&str] = &[
+    "read",
+    "edit",
+    "write",
+    "notebook_edit",
+    "batch",
+    "todo",
+    "agent",
+    "retrieve_output",
+    "memory_search",
+];
+
+/// Tools the anti-loop ledger watches: pure queries whose answer only changes
+/// when the repository does.
+const SEARCH_TOOLS: &[&str] = &["grep", "find", "ls"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -37,8 +77,12 @@ pub struct TokenGovernorConfig {
     pub max_important_lines: usize,
     #[serde(default = "default_true")]
     pub dedupe_reads: bool,
+    #[serde(default = "default_dedupe_window")]
+    pub dedupe_window: usize,
     #[serde(default = "default_true")]
     pub anti_loop: bool,
+    #[serde(default = "default_retrieve_max_bytes")]
+    pub retrieve_max_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_dir: Option<PathBuf>,
 }
@@ -61,6 +105,12 @@ fn default_keep_tail_lines() -> usize {
 fn default_max_important_lines() -> usize {
     DEFAULT_MAX_IMPORTANT_LINES
 }
+fn default_dedupe_window() -> usize {
+    DEFAULT_DEDUPE_WINDOW
+}
+fn default_retrieve_max_bytes() -> usize {
+    DEFAULT_RETRIEVE_MAX_BYTES
+}
 
 impl Default for TokenGovernorConfig {
     fn default() -> Self {
@@ -72,7 +122,9 @@ impl Default for TokenGovernorConfig {
             keep_tail_lines: DEFAULT_KEEP_TAIL_LINES,
             max_important_lines: DEFAULT_MAX_IMPORTANT_LINES,
             dedupe_reads: true,
+            dedupe_window: DEFAULT_DEDUPE_WINDOW,
             anti_loop: true,
+            retrieve_max_bytes: DEFAULT_RETRIEVE_MAX_BYTES,
             store_dir: None,
         }
     }
@@ -85,7 +137,7 @@ impl TokenGovernorConfig {
         config
     }
 
-    pub fn from_file(path: &std::path::Path) -> Self {
+    pub fn from_file(path: &Path) -> Self {
         let mut config = fs::read(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
@@ -120,8 +172,14 @@ fn apply_env(config: &mut TokenGovernorConfig) {
     if let Some(value) = env_bool("PI_TOKEN_GOVERNOR_DEDUPE_READS") {
         config.dedupe_reads = value;
     }
+    if let Some(value) = env_usize("PI_TOKEN_GOVERNOR_DEDUPE_WINDOW") {
+        config.dedupe_window = value;
+    }
     if let Some(value) = env_bool("PI_TOKEN_GOVERNOR_ANTI_LOOP") {
         config.anti_loop = value;
+    }
+    if let Some(value) = env_usize("PI_TOKEN_GOVERNOR_RETRIEVE_MAX_BYTES") {
+        config.retrieve_max_bytes = value.max(1_024);
     }
     if let Some(value) = env_string_any(&["PI_GOVERNOR_STORE_DIR", "PI_TOKEN_GOVERNOR_DIR"]) {
         config.store_dir = Some(PathBuf::from(value));
@@ -184,6 +242,18 @@ pub struct CompressionInfo {
 pub struct CompressedOutput {
     pub content: String,
     pub info: CompressionInfo,
+}
+
+/// One entry of the status payload's `stored` manifest: what a stored output
+/// came from, so `/governor-status` can name it (`bash · cargo test`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredOutputEntry {
+    pub id: String,
+    pub tool: String,
+    pub call: String,
+    pub bytes: usize,
+    pub lines: usize,
 }
 
 pub fn call_fingerprint(tool_name: &str, args: &Value, state_hash: &str) -> String {
@@ -260,37 +330,66 @@ impl BoundedSet {
     }
 }
 
+/// What the model last saw of each read target, and at which tool call.
 #[derive(Debug, Clone, Default)]
 struct ReadLedger {
-    paths: HashMap<String, String>,
+    reads: HashMap<String, (String, usize)>,
 }
 
 impl ReadLedger {
-    fn status(&mut self, path: &str, hash: &str) -> ReadStatus {
-        let key = normalize_path(path);
-        let status = match self.paths.get(&key) {
+    /// `call_index` is the ordinal of the read being recorded; the status
+    /// says whether an identical output was served within `window` calls.
+    fn status(&mut self, key: String, hash: &str, call_index: usize, window: usize) -> ReadStatus {
+        let status = match self.reads.get(&key) {
             None => ReadStatus::New,
-            Some(previous) if previous == hash => ReadStatus::Unchanged,
+            Some((previous, at)) if previous == hash => {
+                if call_index.saturating_sub(*at) <= window {
+                    ReadStatus::Unchanged
+                } else {
+                    ReadStatus::Stale
+                }
+            }
             Some(_) => ReadStatus::Changed,
         };
-        self.paths.insert(key, hash.to_string());
+        self.reads.insert(key, (hash.to_string(), call_index));
         status
     }
 
     fn clear(&mut self) {
-        self.paths.clear();
+        self.reads.clear();
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadStatus {
     New,
+    /// Same bytes, and the earlier output is still in the model's view.
     Unchanged,
+    /// Same bytes, but the earlier output may have been pruned: serve it again.
+    Stale,
     Changed,
 }
 
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// The dedupe key: the file plus the window the model asked for. Two reads
+/// of different ranges of one file are different outputs.
+fn read_key(args: &Value) -> Option<String> {
+    let path = args.get("path").and_then(Value::as_str)?;
+    let window = |name: &str| {
+        args.get(name)
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    };
+    Some(format!(
+        "{}\0{}\0{}",
+        normalize_path(path),
+        window("offset"),
+        window("limit")
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -309,9 +408,15 @@ impl OutputStore {
             .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".pi")))
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".pi")))
             .unwrap_or_else(std::env::temp_dir)
-            .join("agent/token-governor/outputs")
+            .join("agent")
+            .join("token-governor")
+            .join("outputs")
             .join(sanitize_component(session_key));
         Self::new(base)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn save(&self, content: &str) -> Result<StoredOutputRef, ToolError> {
@@ -333,9 +438,59 @@ impl OutputStore {
         if !is_valid_output_id(id) {
             return Err(ToolError::Failed("invalid output id".into()));
         }
-        fs::read_to_string(self.root.join(format!("{id}.txt")))
-            .map_err(|err| ToolError::Failed(err.to_string()))
+        fs::read_to_string(self.root.join(format!("{id}.txt"))).map_err(|err| {
+            ToolError::Failed(format!(
+                "no stored output {id} in this session ({err}); only ids named in a compressed result can be retrieved"
+            ))
+        })
     }
+
+    /// Remove sibling session directories under the store's parent that no
+    /// file has touched for `max_age`. Nothing else ever deletes them, and a
+    /// session's outputs are useless once that session is gone. Best effort:
+    /// a failure to remove one directory is not an error. Returns how many
+    /// directories went.
+    pub fn sweep_stale_sessions(&self, max_age: Duration) -> usize {
+        let Some(parent) = self.root.parent() else {
+            return 0;
+        };
+        let Ok(entries) = fs::read_dir(parent) else {
+            return 0;
+        };
+        let now = SystemTime::now();
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == self.root || !path.is_dir() {
+                continue;
+            }
+            let Some(newest) = newest_modification(&path) else {
+                continue;
+            };
+            let stale = now
+                .duration_since(newest)
+                .map(|age| age > max_age)
+                .unwrap_or(false);
+            if stale && fs::remove_dir_all(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+
+/// The most recent mtime among a directory's files; the directory's own
+/// mtime only when it holds none.
+fn newest_modification(dir: &Path) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                newest = Some(newest.map_or(modified, |current| current.max(modified)));
+            }
+        }
+    }
+    newest.or_else(|| fs::metadata(dir).and_then(|meta| meta.modified()).ok())
 }
 
 fn sanitize_component(value: &str) -> String {
@@ -369,7 +524,19 @@ fn line_count(content: &str) -> usize {
 }
 
 /// Compress a tool result while preserving the head, tail, and notable lines.
+/// The trailer names no output id; `compress_with_reference` is what the
+/// governor uses once the original is on disk.
 pub fn compress_output(content: &str, config: &TokenGovernorConfig) -> CompressedOutput {
+    compress_with_reference(content, config, None)
+}
+
+/// Like `compress_output`, but the trailer tells the model the id under which
+/// the full text was stored and how to get it back.
+pub fn compress_with_reference(
+    content: &str,
+    config: &TokenGovernorConfig,
+    stored: Option<&StoredOutputRef>,
+) -> CompressedOutput {
     let bytes = content.len();
     let lines = line_count(content);
     let should_compress =
@@ -378,7 +545,7 @@ pub fn compress_output(content: &str, config: &TokenGovernorConfig) -> Compresse
         compressed: should_compress,
         original_bytes: bytes,
         original_lines: lines,
-        stored: None,
+        stored: stored.cloned(),
     };
     if !should_compress {
         return CompressedOutput {
@@ -393,13 +560,18 @@ pub fn compress_output(content: &str, config: &TokenGovernorConfig) -> Compresse
     let tail_start = source.len().saturating_sub(config.keep_tail_lines);
     let notable_budget = config.max_important_lines.min(source.len());
     if notable_budget > 0 {
+        let mut kept_notable = 0;
         for line in source
             .iter()
             .skip(head_end)
             .take(tail_start.saturating_sub(head_end))
         {
-            if is_notable(line) && selected.len() < head_end + notable_budget {
+            if kept_notable >= notable_budget {
+                break;
+            }
+            if is_notable(line) {
                 selected.push((*line).to_string());
+                kept_notable += 1;
             }
         }
     }
@@ -411,17 +583,28 @@ pub fn compress_output(content: &str, config: &TokenGovernorConfig) -> Compresse
                 .map(|line| (*line).to_string()),
         );
     }
-    selected = collapse_repeated_lines(selected);
+    // Lines folded by the repeat collapse were shown once, not omitted.
     let omitted = lines.saturating_sub(selected.len());
+    let selected = collapse_repeated_lines(selected);
     let mut digest = selected.join("\n");
-    if omitted > 0 {
-        digest.push_str(&format!(
-            "\n\n[… {omitted} lines omitted; use retrieve_output to inspect the full result]"
-        ));
+    if omitted > 0 || stored.is_some() {
+        digest.push_str("\n\n");
+        digest.push_str(&compression_trailer(omitted, lines, stored));
     }
     CompressedOutput {
         content: digest,
         info,
+    }
+}
+
+fn compression_trailer(omitted: usize, total: usize, stored: Option<&StoredOutputRef>) -> String {
+    match stored {
+        Some(stored) => format!(
+            "[… {omitted} of {total} lines omitted; the full output ({} bytes) is saved as {}. \
+             Call retrieve_output with id \"{}\" — optionally startLine/endLine or grep — to read what you need.]",
+            stored.bytes, stored.id, stored.id
+        ),
+        None => format!("[… {omitted} of {total} lines omitted]"),
     }
 }
 
@@ -459,6 +642,57 @@ fn collapse_repeated_lines(lines: Vec<String>) -> Vec<String> {
     output
 }
 
+/// A one-line account of a call for the stored manifest: the command for a
+/// shell, the pattern and path for a search, the normalized args otherwise.
+fn call_summary(tool: &str, args: &Value) -> String {
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let summary = match tool {
+        "bash" | "powershell" => text("command"),
+        "grep" => {
+            let path = text("path");
+            if path.is_empty() {
+                format!("\"{}\"", text("pattern"))
+            } else {
+                format!("\"{}\" in {path}", text("pattern"))
+            }
+        }
+        "find" => {
+            let path = text("path");
+            if path.is_empty() {
+                text("pattern")
+            } else {
+                format!("{} in {path}", text("pattern"))
+            }
+        }
+        "ls" | "web_fetch" | "job_output" => {
+            let value = text("path");
+            if value.is_empty() {
+                let url = text("url");
+                if url.is_empty() {
+                    text("id")
+                } else {
+                    url
+                }
+            } else {
+                value
+            }
+        }
+        _ => normalize_json(args),
+    };
+    let summary = summary.lines().next().unwrap_or_default().trim();
+    let mut clipped = summary.chars().take(72).collect::<String>();
+    if summary.chars().count() > 72 {
+        clipped.push('…');
+    }
+    clipped
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenGovernor {
     pub config: TokenGovernorConfig,
@@ -467,9 +701,14 @@ pub struct TokenGovernor {
     calls: BoundedSet,
     pending_calls: HashMap<String, VecDeque<String>>,
     reads: ReadLedger,
+    stored: VecDeque<StoredOutputEntry>,
+    tool_calls: usize,
     compressed_outputs: usize,
     deduplicated_reads: usize,
     blocked_calls: usize,
+    /// Bytes the model was not sent: the difference between each original
+    /// and what replaced it.
+    bytes_withheld: usize,
 }
 
 impl Default for TokenGovernor {
@@ -493,9 +732,12 @@ impl TokenGovernor {
             calls: BoundedSet::default(),
             pending_calls: HashMap::new(),
             reads: ReadLedger::default(),
+            stored: VecDeque::new(),
+            tool_calls: 0,
             compressed_outputs: 0,
             deduplicated_reads: 0,
             blocked_calls: 0,
+            bytes_withheld: 0,
         }
     }
 
@@ -510,6 +752,15 @@ impl TokenGovernor {
         governor
     }
 
+    /// Drop other sessions' stored outputs that have aged past the retention
+    /// window. The product host calls this once per process; the library
+    /// constructor never deletes anything.
+    pub fn sweep_stale_outputs(&self) -> usize {
+        self.store.sweep_stale_sessions(STORE_RETENTION)
+    }
+
+    /// The ledgers only: a new session, or a compaction that rewrote what the
+    /// model can see, means no earlier output is known to be in view.
     pub fn session_start(&mut self) {
         self.calls.clear();
         self.pending_calls.clear();
@@ -520,18 +771,36 @@ impl TokenGovernor {
         self.session_start();
     }
 
-    pub fn before_tool(&mut self, name: &str, args: &Value, state_hash: &str) -> Option<String> {
+    /// `/governor-reset`: the ledgers and the counters.
+    pub fn reset(&mut self) {
+        self.session_start();
+        self.stored.clear();
+        self.tool_calls = 0;
+        self.compressed_outputs = 0;
+        self.deduplicated_reads = 0;
+        self.blocked_calls = 0;
+        self.bytes_withheld = 0;
+    }
+
+    /// `state_hash` is asked for only when a search tool is being fingerprinted:
+    /// computing it means running git, which every other tool call skips.
+    pub fn before_tool(
+        &mut self,
+        name: &str,
+        args: &Value,
+        state_hash: impl FnOnce() -> String,
+    ) -> Option<String> {
         if !self.config.enabled || !self.config.anti_loop {
             return None;
         }
-        if !matches!(name, "grep" | "find" | "ls") {
+        if !SEARCH_TOOLS.contains(&name) {
             return None;
         }
-        let fingerprint = call_fingerprint(name, args, state_hash);
+        let fingerprint = call_fingerprint(name, args, &state_hash());
         if self.calls.contains(&fingerprint) {
             self.blocked_calls += 1;
             return Some(format!(
-                "Repeated {name} call blocked by token governor; change the query or inspect the previous result."
+                "Repeated {name} call blocked by token governor: the repository has not changed since the identical call, so its result still stands. Change the query or inspect the previous result."
             ));
         }
         self.pending_calls
@@ -545,11 +814,12 @@ impl TokenGovernor {
         if !self.config.enabled {
             return result;
         }
+        self.tool_calls += 1;
 
         // A call only enters the anti-loop ledger after a successful result.
         // Failed searches remain retryable, including after transient cwd or
         // provider errors.
-        if matches!(name, "grep" | "find" | "ls") {
+        if SEARCH_TOOLS.contains(&name) {
             let key = call_key(name, args);
             let fingerprint = self
                 .pending_calls
@@ -566,7 +836,6 @@ impl TokenGovernor {
         }
 
         if result.is_error
-            || matches!(name, "retrieve_output" | "memory_search")
             || result
                 .details
                 .as_ref()
@@ -577,14 +846,24 @@ impl TokenGovernor {
         {
             return result;
         }
-        let original = result.content.clone();
         if self.config.dedupe_reads && name == "read" {
-            if let Some(path) = args.get("path").and_then(Value::as_str) {
-                let hash = file_content_hash(&original);
-                if self.reads.status(path, &hash) == ReadStatus::Unchanged {
+            if let Some(key) = read_key(args) {
+                let path = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let hash = file_content_hash(&result.content);
+                let status =
+                    self.reads
+                        .status(key, &hash, self.tool_calls, self.config.dedupe_window);
+                if status == ReadStatus::Unchanged {
                     self.deduplicated_reads += 1;
-                    result.content =
-                        format!("[unchanged read: {path}; the previous output is still valid]");
+                    let marker = format!(
+                        "[unchanged read: {path} is byte-identical to the read you made a moment ago; that output is still valid]"
+                    );
+                    self.bytes_withheld += result.content.len().saturating_sub(marker.len());
+                    result.content = marker;
                     result.details = merge_details(
                         result.details,
                         json!({"tokenGovernor": {"deduplicated": true, "path": path}}),
@@ -593,27 +872,51 @@ impl TokenGovernor {
                 }
             }
         }
-        let mut compressed = compress_output(&original, &self.config);
-        if compressed.info.compressed {
-            if let Ok(reference) = self.store.save(&original) {
-                compressed.info.stored = Some(reference.clone());
-                result.content = compressed.content;
-                result.details = merge_details(
-                    result.details,
-                    json!({
-                        "tokenGovernor": {
-                            "compressed": true,
-                            "originalBytes": compressed.info.original_bytes,
-                            "originalLines": compressed.info.original_lines,
-                            "outputId": reference.id,
-                            "reference": format!("governor://{}", reference.id),
-                        }
-                    }),
-                );
-                self.compressed_outputs += 1;
-            }
+        if LOSSLESS_TOOLS.contains(&name) {
+            return result;
         }
+        let probe = compress_output(&result.content, &self.config);
+        if !probe.info.compressed {
+            return result;
+        }
+        // Fail open: if the original cannot be stored, the model keeps the
+        // whole output rather than a digest it could never expand.
+        let Ok(reference) = self.store.save(&result.content) else {
+            return result;
+        };
+        let compressed = compress_with_reference(&result.content, &self.config, Some(&reference));
+        self.remember_stored(name, args, &reference);
+        self.bytes_withheld += result
+            .content
+            .len()
+            .saturating_sub(compressed.content.len());
+        result.content = compressed.content;
+        result.details = merge_details(
+            result.details,
+            json!({
+                "tokenGovernor": {
+                    "compressed": true,
+                    "originalBytes": compressed.info.original_bytes,
+                    "originalLines": compressed.info.original_lines,
+                    "outputId": reference.id,
+                    "reference": format!("governor://{}", reference.id),
+                }
+            }),
+        );
+        self.compressed_outputs += 1;
         result
+    }
+
+    fn remember_stored(&mut self, tool: &str, args: &Value, reference: &StoredOutputRef) {
+        self.stored.retain(|entry| entry.id != reference.id);
+        self.stored.push_front(StoredOutputEntry {
+            id: reference.id.clone(),
+            tool: tool.to_string(),
+            call: call_summary(tool, args),
+            bytes: reference.bytes,
+            lines: reference.lines,
+        });
+        self.stored.truncate(STORED_MANIFEST_ENTRIES);
     }
 
     pub fn retrieve(&self, args: &Value) -> Result<ToolResult, ToolError> {
@@ -632,19 +935,54 @@ impl TokenGovernor {
             .get("endLine")
             .and_then(Value::as_u64)
             .map(|line| line as usize);
-        let mut lines = content.lines().enumerate().filter_map(|(index, line)| {
+        let pattern = args.get("grep").and_then(Value::as_str);
+        let total = line_count(&content);
+        let budget = self.config.retrieve_max_bytes;
+        let mut selected = Vec::new();
+        let mut used = 0usize;
+        let mut matched = 0usize;
+        let mut stopped_at: Option<usize> = None;
+        for (index, line) in content.lines().enumerate() {
             let line_no = index + 1;
-            (line_no >= start && end.is_none_or(|last| line_no <= last))
-                .then_some(format!("{line_no}: {line}"))
-        });
-        let mut selected = lines.by_ref().collect::<Vec<_>>();
-        if let Some(pattern) = args.get("grep").and_then(Value::as_str) {
-            selected.retain(|line| line.contains(pattern));
+            if line_no < start {
+                continue;
+            }
+            if end.is_some_and(|last| line_no > last) {
+                break;
+            }
+            if pattern.is_some_and(|pattern| !line.contains(pattern)) {
+                continue;
+            }
+            matched += 1;
+            let rendered = format!("{line_no}: {line}");
+            if used + rendered.len() + 1 > budget && !selected.is_empty() {
+                stopped_at = Some(line_no);
+                break;
+            }
+            used += rendered.len() + 1;
+            selected.push(rendered);
+        }
+        let mut text = selected.join("\n");
+        match stopped_at {
+            Some(line_no) => text.push_str(&format!(
+                "\n\n[… stopped before line {line_no} of {total} to stay under {budget} bytes; call retrieve_output again with startLine {line_no}{}]",
+                end.map(|last| format!(" and endLine {last}")).unwrap_or_default()
+            )),
+            None if matched == 0 => text.push_str(&match pattern {
+                Some(pattern) => format!("[no line of {id} matches \"{pattern}\" in that range; {total} lines total]"),
+                None => format!("[no lines in that range; {id} has {total} lines]"),
+            }),
+            None => {}
         }
         Ok(ToolResult {
-            content: selected.join("\n"),
+            content: text,
             is_error: false,
-            details: Some(json!({"tokenGovernor": {"outputId": id}})),
+            details: Some(json!({"tokenGovernor": {
+                "outputId": id,
+                "totalLines": total,
+                "returnedLines": selected.len(),
+                "truncated": stopped_at.is_some(),
+            }})),
         })
     }
 
@@ -652,10 +990,24 @@ impl TokenGovernor {
         json!({
             "enabled": self.config.enabled,
             "sessionKey": self.session_key,
+            "toolCalls": self.tool_calls,
             "compressedOutputs": self.compressed_outputs,
             "deduplicatedReads": self.deduplicated_reads,
             "blockedCalls": self.blocked_calls,
-            "store": self.store.root,
+            "bytesWithheld": self.bytes_withheld,
+            "store": self.store.root(),
+            "stored": self.stored,
+            "thresholds": {
+                "compressBytes": self.config.compress_threshold_bytes,
+                "compressLines": self.config.compress_threshold_lines,
+                "keepHeadLines": self.config.keep_head_lines,
+                "keepTailLines": self.config.keep_tail_lines,
+                "maxImportantLines": self.config.max_important_lines,
+                "dedupeReads": self.config.dedupe_reads,
+                "dedupeWindow": self.config.dedupe_window,
+                "antiLoop": self.config.anti_loop,
+                "retrieveMaxBytes": self.config.retrieve_max_bytes,
+            },
         })
     }
 }
@@ -678,6 +1030,22 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn ok(content: &str) -> ToolResult {
+        ToolResult {
+            content: content.into(),
+            is_error: false,
+            details: None,
+        }
+    }
+
+    fn tiny_thresholds() -> TokenGovernorConfig {
+        TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn fingerprint_is_stable_for_object_key_order() {
@@ -704,6 +1072,7 @@ mod tests {
             config.compress_threshold_lines,
             DEFAULT_COMPRESS_THRESHOLD_LINES
         );
+        assert_eq!(config.dedupe_window, DEFAULT_DEDUPE_WINDOW);
         assert_eq!(config.store_dir, Some(PathBuf::from("custom-store")));
     }
 
@@ -720,15 +1089,7 @@ mod tests {
         };
         let original = "head\nwarning: keep this\nnoise\ntail";
         let mut governor = TokenGovernor::with_store("test", config, OutputStore::new(dir.path()));
-        let result = governor.after_tool(
-            "bash",
-            &json!({}),
-            ToolResult {
-                content: original.into(),
-                is_error: false,
-                details: None,
-            },
-        );
+        let result = governor.after_tool("bash", &json!({}), ok(original));
         assert!(result.content.contains("head"));
         assert!(result.content.contains("warning"));
         let details = result.details.unwrap();
@@ -740,36 +1101,121 @@ mod tests {
     }
 
     #[test]
+    fn the_digest_names_its_output_id_because_details_never_reach_the_model() {
+        let dir = tempdir().unwrap();
+        let mut governor =
+            TokenGovernor::with_store("test", tiny_thresholds(), OutputStore::new(dir.path()));
+        let original = (1..=400)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = governor.after_tool("bash", &json!({"command": "ls"}), ok(&original));
+        let id = result.details.as_ref().unwrap()["tokenGovernor"]["outputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            result.content.contains(&format!("saved as {id}")),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("retrieve_output"));
+        assert!(result.content.contains("of 400 lines omitted"));
+        // The id is also in the status manifest with the call that made it.
+        let status = governor.status();
+        assert_eq!(status["stored"][0]["id"], id);
+        assert_eq!(status["stored"][0]["tool"], "bash");
+        assert_eq!(status["stored"][0]["call"], "ls");
+        assert!(status["bytesWithheld"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn omitted_count_ignores_lines_folded_by_the_repeat_collapse() {
+        let config = TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            keep_head_lines: 10,
+            keep_tail_lines: 0,
+            max_important_lines: 1,
+            ..Default::default()
+        };
+        // Ten identical head lines all "kept": nothing omitted, some folded.
+        let compressed = compress_output(&["same"; 10].join("\n"), &config);
+        assert!(
+            !compressed.content.contains("omitted;"),
+            "{}",
+            compressed.content
+        );
+        assert!(compressed.content.contains("repeated line omitted"));
+    }
+
+    #[test]
+    fn lossless_tools_are_never_digested() {
+        let dir = tempdir().unwrap();
+        let mut governor =
+            TokenGovernor::with_store("test", tiny_thresholds(), OutputStore::new(dir.path()));
+        let big = (1..=500)
+            .map(|n| format!("{n}: fn line_{n}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for tool in ["read", "edit", "write", "batch", "agent"] {
+            let result =
+                governor.after_tool(tool, &json!({"path": format!("{tool}.rs")}), ok(&big));
+            assert_eq!(result.content, big, "{tool} must stay verbatim");
+            assert!(result.details.is_none(), "{tool} must not be marked");
+        }
+        let shell = governor.after_tool("bash", &json!({"command": "cat"}), ok(&big));
+        assert_ne!(shell.content, big);
+        assert_eq!(governor.status()["compressedOutputs"], 1);
+    }
+
+    #[test]
     fn anti_loop_only_blocks_repeated_search_calls() {
         let mut governor = TokenGovernor::new("test", TokenGovernorConfig::default());
         let args = json!({"path":"src"});
-        assert!(governor.before_tool("ls", &args, "state").is_none());
-        let _ = governor.after_tool(
-            "ls",
-            &args,
-            ToolResult {
-                content: "src".into(),
-                is_error: false,
-                details: None,
-            },
-        );
-        assert!(governor.before_tool("ls", &args, "state").is_some());
-        assert!(governor.before_tool("read", &args, "state").is_none());
+        assert!(governor
+            .before_tool("ls", &args, || "state".into())
+            .is_none());
+        let _ = governor.after_tool("ls", &args, ok("src"));
+        assert!(governor
+            .before_tool("ls", &args, || "state".into())
+            .is_some());
+        assert!(governor
+            .before_tool("read", &args, || "state".into())
+            .is_none());
+    }
+
+    #[test]
+    fn the_state_hash_is_only_computed_for_search_tools() {
+        let mut governor = TokenGovernor::new("test", TokenGovernorConfig::default());
+        let mut computed = 0;
+        let _ = governor.before_tool("read", &json!({"path": "a"}), || {
+            computed += 1;
+            "state".into()
+        });
+        let _ = governor.before_tool("bash", &json!({"command": "ls"}), || {
+            computed += 1;
+            "state".into()
+        });
+        assert_eq!(computed, 0);
+        let _ = governor.before_tool("grep", &json!({"pattern": "a"}), || {
+            computed += 1;
+            "state".into()
+        });
+        assert_eq!(computed, 1);
     }
 
     #[test]
     fn failed_searches_and_retrieval_are_not_blocked_or_compressed() {
         let mut governor = TokenGovernor::with_store(
             "test",
-            TokenGovernorConfig {
-                compress_threshold_bytes: 1,
-                compress_threshold_lines: 1,
-                ..Default::default()
-            },
+            tiny_thresholds(),
             OutputStore::new(tempdir().unwrap().path()),
         );
         let args = json!({"path":"src"});
-        assert!(governor.before_tool("grep", &args, "state").is_none());
+        assert!(governor
+            .before_tool("grep", &args, || "state".into())
+            .is_none());
         let failed = governor.after_tool(
             "grep",
             &args,
@@ -780,16 +1226,14 @@ mod tests {
             },
         );
         assert!(failed.is_error);
-        assert!(governor.before_tool("grep", &args, "state").is_none());
+        assert!(governor
+            .before_tool("grep", &args, || "state".into())
+            .is_none());
 
         let retrieved = governor.after_tool(
             "retrieve_output",
             &json!({"id":"out-000000000000"}),
-            ToolResult {
-                content: "full output".into(),
-                is_error: false,
-                details: None,
-            },
+            ok("full output"),
         );
         assert_eq!(retrieved.content, "full output");
         assert!(retrieved.details.is_none());
@@ -799,26 +1243,93 @@ mod tests {
     fn repeated_reads_return_a_small_marker() {
         let mut governor = TokenGovernor::new("test", TokenGovernorConfig::default());
         let args = json!({"path":"README.md"});
-        let first = governor.after_tool(
-            "read",
-            &args,
-            ToolResult {
-                content: "same".into(),
-                is_error: false,
-                details: None,
-            },
-        );
-        let second = governor.after_tool(
-            "read",
-            &args,
-            ToolResult {
-                content: "same".into(),
-                is_error: false,
-                details: None,
-            },
-        );
+        let first = governor.after_tool("read", &args, ok("same"));
+        let second = governor.after_tool("read", &args, ok("same"));
         assert_eq!(first.content, "same");
         assert!(second.content.contains("unchanged read"));
+    }
+
+    #[test]
+    fn a_read_is_served_again_once_its_twin_may_have_been_pruned() {
+        let mut governor = TokenGovernor::new(
+            "test",
+            TokenGovernorConfig {
+                dedupe_window: 2,
+                ..Default::default()
+            },
+        );
+        let args = json!({"path":"README.md"});
+        assert_eq!(
+            governor.after_tool("read", &args, ok("same")).content,
+            "same"
+        );
+        // Two unrelated calls push the first read to the edge of the window…
+        let _ = governor.after_tool("bash", &json!({}), ok("x"));
+        let _ = governor.after_tool("bash", &json!({}), ok("x"));
+        // …a third puts it past it: the earlier output may be a placeholder
+        // by now, so the model gets the bytes back.
+        let _ = governor.after_tool("bash", &json!({}), ok("x"));
+        assert_eq!(
+            governor.after_tool("read", &args, ok("same")).content,
+            "same"
+        );
+        // And right after that, the marker again.
+        assert!(governor
+            .after_tool("read", &args, ok("same"))
+            .content
+            .contains("unchanged read"));
+        assert_eq!(governor.status()["deduplicatedReads"], 1);
+    }
+
+    #[test]
+    fn reads_of_different_ranges_are_different_outputs() {
+        let mut governor = TokenGovernor::new("test", TokenGovernorConfig::default());
+        let head = json!({"path":"a.rs", "offset": 1, "limit": 10});
+        let tail = json!({"path":"a.rs", "offset": 11, "limit": 10});
+        assert_eq!(governor.after_tool("read", &head, ok("h")).content, "h");
+        assert_eq!(governor.after_tool("read", &tail, ok("t")).content, "t");
+        assert!(governor
+            .after_tool("read", &head, ok("h"))
+            .content
+            .contains("unchanged read"));
+    }
+
+    #[test]
+    fn retrieval_is_paged_and_says_where_to_continue() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            retrieve_max_bytes: 1_024,
+            ..tiny_thresholds()
+        };
+        let mut governor = TokenGovernor::with_store("test", config, OutputStore::new(dir.path()));
+        let original = (1..=300)
+            .map(|n| format!("row {n:04} {}", "x".repeat(20)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = governor.after_tool("bash", &json!({}), ok(&original));
+        let id = result.details.unwrap()["tokenGovernor"]["outputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let page = governor.retrieve(&json!({"id": id})).unwrap();
+        assert!(page.content.len() < 1_024 + 200, "{}", page.content.len());
+        assert!(page
+            .content
+            .contains("call retrieve_output again with startLine"));
+        assert_eq!(
+            page.details.as_ref().unwrap()["tokenGovernor"]["truncated"],
+            true
+        );
+        let filtered = governor
+            .retrieve(&json!({"id": id, "grep": "row 0299"}))
+            .unwrap();
+        assert!(filtered.content.starts_with("299: row 0299"));
+        let empty = governor
+            .retrieve(&json!({"id": id, "grep": "absent"}))
+            .unwrap();
+        assert!(empty.content.contains("no line of"));
+        let missing = governor.retrieve(&json!({"id": "out-ffffffffffff"}));
+        assert!(missing.is_err());
     }
 
     #[test]
@@ -850,5 +1361,64 @@ mod tests {
         assert!(compressed.content.contains("two"));
         assert!(compressed.content.contains("three"));
         assert!(compressed.content.contains("four"));
+    }
+
+    #[test]
+    fn reset_clears_counters_but_compaction_keeps_them() {
+        let dir = tempdir().unwrap();
+        let mut governor =
+            TokenGovernor::with_store("test", tiny_thresholds(), OutputStore::new(dir.path()));
+        let _ = governor.after_tool("bash", &json!({}), ok(&"line\n".repeat(50)));
+        assert_eq!(governor.status()["compressedOutputs"], 1);
+        governor.session_compact();
+        assert_eq!(governor.status()["compressedOutputs"], 1);
+        governor.reset();
+        assert_eq!(governor.status()["compressedOutputs"], 0);
+        assert_eq!(governor.status()["stored"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stale_session_stores_are_swept_and_the_live_one_is_kept() {
+        let dir = tempdir().unwrap();
+        let outputs = dir.path().join("outputs");
+        let old = outputs.join("old-session");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("out-000000000000.txt"), "x").unwrap();
+        let stale = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(old.join("out-000000000000.txt"))
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        let fresh = outputs.join("fresh-session");
+        fs::create_dir_all(&fresh).unwrap();
+        let live = OutputStore::new(outputs.join("live-session"));
+        live.save("live").unwrap();
+
+        let removed = live.sweep_stale_sessions(STORE_RETENTION);
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(live.root().exists());
+    }
+
+    #[test]
+    fn call_summaries_name_the_command_or_query() {
+        assert_eq!(
+            call_summary("bash", &json!({"command": "cargo test --workspace\n"})),
+            "cargo test --workspace"
+        );
+        assert_eq!(
+            call_summary(
+                "grep",
+                &json!({"pattern": "SessionManager", "path": "crates"})
+            ),
+            "\"SessionManager\" in crates"
+        );
+        assert_eq!(call_summary("ls", &json!({"path": "src"})), "src");
+        let long = call_summary("bash", &json!({"command": "x".repeat(100)}));
+        assert_eq!(long.chars().count(), 73);
+        assert!(long.ends_with('…'));
     }
 }

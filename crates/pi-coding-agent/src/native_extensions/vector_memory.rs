@@ -8,11 +8,20 @@ use pi_agent::{ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// After an embedding request fails, dense retrieval stays off for this long
+/// so a stopped Ollama costs one timeout, not one per prompt.
+const DENSE_BACKOFF: Duration = Duration::from_secs(120);
+/// `memory_search` never answers more than this many hits whatever `limit`
+/// says; the tool schema states the same cap.
+pub const SEARCH_LIMIT_CAP: usize = 20;
 
 /// EmbeddingGemma uses different task prefixes for documents and queries.
 /// Keep these constants alongside the client so callers cannot accidentally
@@ -365,6 +374,10 @@ pub fn redact_secrets(input: &str) -> String {
             }
         }
     }
+    // `key = value`, `key: value`, `"key": "value"`: the separator has to
+    // follow the key (after optional quotes and spaces). A bare mention of
+    // "token" in prose followed by a colon three sentences later is not a
+    // credential, and used to lose everything up to the next space.
     for key in ["api_key", "apikey", "password", "secret", "token"] {
         let mut search = 0usize;
         loop {
@@ -373,16 +386,45 @@ pub fn redact_secrets(input: &str) -> String {
                 break;
             };
             let start = search + relative;
-            let Some(separator) = output[start..].find(['=', ':']) else {
+            let key_end = start + key.len();
+            let after = &output[key_end..];
+            let skipped = after
+                .char_indices()
+                .find(|(_, ch)| !(ch.is_whitespace() || matches!(ch, '"' | '\'')))
+                .map(|(offset, _)| offset)
+                .unwrap_or(after.len());
+            let Some(separator) = after[skipped..].chars().next() else {
                 break;
             };
-            let value_start = start + separator + 1;
+            if skipped > 3 || !matches!(separator, '=' | ':') {
+                search = key_end;
+                continue;
+            }
+            let value_start = key_end + skipped + 1;
+            // Past the spaces and one opening quote, if any.
+            let value_start = value_start
+                + output[value_start..]
+                    .char_indices()
+                    .find(|(_, ch)| !ch.is_whitespace())
+                    .map(|(offset, _)| offset)
+                    .unwrap_or(0);
+            let value_start = value_start
+                + output[value_start..]
+                    .chars()
+                    .next()
+                    .filter(|ch| matches!(ch, '"' | '\''))
+                    .map(char::len_utf8)
+                    .unwrap_or(0);
             let value_end = output[value_start..]
                 .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';'))
                 .map(|offset| value_start + offset)
                 .unwrap_or(output.len());
+            if value_start >= value_end {
+                search = key_end;
+                continue;
+            }
             output.replace_range(value_start..value_end, "[REDACTED]");
-            search = value_start + 10;
+            search = value_start + "[REDACTED]".len();
             if search >= output.len() {
                 break;
             }
@@ -391,19 +433,23 @@ pub fn redact_secrets(input: &str) -> String {
     output
 }
 
+/// The messages worth remembering are what the user asked and what the
+/// assistant concluded. Tool output, `!` shell output and injected context
+/// are transient: they describe the repository as it was, which the next
+/// session can read again, and at 4 KB a chunk they used to be most of the
+/// store and most of every lexical scan.
 pub fn extract_chunks(messages: &[MemoryMessage], max_chunk_chars: usize) -> Vec<MemoryChunk> {
     let mut chunks = Vec::new();
     for (index, message) in messages.iter().enumerate() {
+        let kind = match message.role.as_str() {
+            "user" => MemoryKind::Task,
+            "assistant" => MemoryKind::Decision,
+            _ => continue,
+        };
         let text = redact_secrets(message.content.trim());
         if text.is_empty() {
             continue;
         }
-        let kind = match message.role.as_str() {
-            "user" => MemoryKind::Task,
-            "assistant" => MemoryKind::Decision,
-            "tool" | "toolResult" => MemoryKind::Fact,
-            _ => MemoryKind::Conversation,
-        };
         let characters = text.chars().collect::<Vec<_>>();
         for (part_index, part) in characters.chunks(max_chunk_chars.max(1)).enumerate() {
             let part = part.iter().collect::<String>();
@@ -422,21 +468,42 @@ pub fn extract_chunks(messages: &[MemoryMessage], max_chunk_chars: usize) -> Vec
     chunks
 }
 
-pub fn lexical_score(query: &str, text: &str) -> f32 {
-    let query_terms = query
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|term| term.len() > 1)
-        .map(|term| term.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    if query_terms.is_empty() {
-        return 0.0;
+/// A query tokenized once, scored against many records.
+#[derive(Debug, Clone)]
+pub struct LexicalQuery {
+    terms: Vec<String>,
+}
+
+impl LexicalQuery {
+    pub fn new(query: &str) -> Self {
+        let mut terms = query
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|term| term.len() > 1)
+            .map(|term| term.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        terms.sort_unstable();
+        terms.dedup();
+        Self { terms }
     }
-    let lower = text.to_ascii_lowercase();
-    let matches = query_terms
-        .iter()
-        .filter(|term| lower.contains(term.as_str()))
-        .count();
-    matches as f32 / query_terms.len() as f32
+
+    /// The share of distinct query terms that occur in `text`.
+    pub fn score(&self, text: &str) -> f32 {
+        if self.terms.is_empty() {
+            return 0.0;
+        }
+        let lower = text.to_ascii_lowercase();
+        let matches = self
+            .terms
+            .iter()
+            .filter(|term| lower.contains(term.as_str()))
+            .count();
+        matches as f32 / self.terms.len() as f32
+    }
+}
+
+#[cfg(test)]
+pub fn lexical_score(query: &str, text: &str) -> f32 {
+    LexicalQuery::new(query).score(text)
 }
 
 pub fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
@@ -492,7 +559,18 @@ pub struct VectorMemory {
     pub cwd: PathBuf,
     pub repo_id: String,
     records: Vec<MemoryRecord>,
+    /// `kind\0content_hash` of every record, so indexing a turn is a set
+    /// probe per chunk rather than a scan of the store per chunk.
+    known: HashSet<String>,
     last_indexed: usize,
+    last_indexed_at: Option<u64>,
+    /// Set when an embedding request failed; dense retrieval and document
+    /// embedding are skipped until it passes.
+    dense_offline_until: Cell<Option<Instant>>,
+}
+
+fn known_key(kind: MemoryKind, hash: &str) -> String {
+    format!("{kind:?}\0{hash}")
 }
 
 impl Default for VectorMemory {
@@ -514,7 +592,10 @@ impl VectorMemory {
             cwd,
             repo_id,
             records: Vec::new(),
+            known: HashSet::new(),
             last_indexed: 0,
+            last_indexed_at: None,
+            dense_offline_until: Cell::new(None),
         };
         memory.load_local();
         memory
@@ -535,6 +616,11 @@ impl VectorMemory {
             .lines()
             .filter_map(|line| serde_json::from_str::<MemoryRecord>(line).ok())
             .filter(|record| record.repo_id == self.repo_id)
+            .collect();
+        self.known = self
+            .records
+            .iter()
+            .map(|record| known_key(record.kind, &record.content_hash))
             .collect();
     }
 
@@ -572,11 +658,7 @@ impl VectorMemory {
         let mut inserted_records = Vec::new();
         for chunk in chunks {
             let hash = content_hash(&chunk.text);
-            if self
-                .records
-                .iter()
-                .any(|record| record.content_hash == hash && record.kind == chunk.kind)
-            {
+            if !self.known.insert(known_key(chunk.kind, &hash)) {
                 continue;
             }
             let record = MemoryRecord {
@@ -594,14 +676,22 @@ impl VectorMemory {
             inserted_records.push(record);
             inserted += 1;
         }
+        if inserted == 0 {
+            return Ok(0);
+        }
         self.last_indexed += inserted;
+        self.last_indexed_at = Some(pi_session::now_ms());
         self.persist_local()?;
-        if !inserted_records.is_empty() {
+        if !inserted_records.is_empty() && self.dense_available() {
             let texts = inserted_records
                 .iter()
                 .map(|record| record.text.clone())
                 .collect::<Vec<_>>();
-            if let Ok(embeddings) = self.embed_documents(&texts) {
+            let embeddings = self.embed_documents(&texts);
+            if embeddings.is_err() {
+                self.mark_dense_offline();
+            }
+            if let Ok(embeddings) = embeddings {
                 if embeddings.len() == inserted_records.len() {
                     for (record, embedding) in inserted_records.iter().zip(embeddings) {
                         if let Some(stored) =
@@ -643,17 +733,22 @@ impl VectorMemory {
         // a query vector when this store actually contains indexed vectors;
         // otherwise every prompt would incur a network timeout for a store
         // that can only produce lexical scores.
-        let query_embedding = self
-            .records
-            .iter()
-            .any(|record| record.embedding.is_some())
-            .then(|| self.embed_query(query).ok())
-            .flatten();
+        let query_embedding = (self.dense_available()
+            && self.records.iter().any(|record| record.embedding.is_some()))
+        .then(|| match self.embed_query(query) {
+            Ok(vector) => Some(vector),
+            Err(_) => {
+                self.mark_dense_offline();
+                None
+            }
+        })
+        .flatten();
+        let lexical_query = LexicalQuery::new(query);
         let mut hits = self
             .records
             .iter()
             .filter_map(|record| {
-                let lexical = lexical_score(query, &record.text);
+                let lexical = lexical_query.score(&record.text);
                 let dense = query_embedding
                     .as_ref()
                     .zip(record.embedding.as_ref())
@@ -668,10 +763,23 @@ impl VectorMemory {
                 })
             })
             .collect::<Vec<_>>();
-        fuse_hits(
-            std::mem::take(&mut hits),
-            limit.min(self.config.result_limit),
-        )
+        fuse_hits(std::mem::take(&mut hits), limit.max(1))
+    }
+
+    fn dense_available(&self) -> bool {
+        match self.dense_offline_until.get() {
+            Some(until) if Instant::now() < until => false,
+            Some(_) => {
+                self.dense_offline_until.set(None);
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn mark_dense_offline(&self) {
+        self.dense_offline_until
+            .set(Some(Instant::now() + DENSE_BACKOFF));
     }
 
     pub fn search_tool(&self, args: &Value) -> Result<ToolResult, ToolError> {
@@ -682,7 +790,7 @@ impl VectorMemory {
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
-            .map(|value| value as usize)
+            .map(|value| (value as usize).clamp(1, SEARCH_LIMIT_CAP))
             .unwrap_or(self.config.result_limit);
         let hits = self.search(query, limit);
         let content = hits
@@ -704,7 +812,12 @@ impl VectorMemory {
         json!({"query": query, "count": hits.len(), "hits": hits})
     }
 
+    /// The block placed before the model's turn. Off when the configuration
+    /// says retrieval is on demand only (`/memory-search` still works).
     pub fn inject(&self, query: &str) -> Option<String> {
+        if !self.config.automatic_retrieval {
+            return None;
+        }
         let hits = self.search(query, self.config.result_limit);
         (!hits.is_empty()).then(|| format_memory_block(&hits, self.config.max_injected_tokens))
     }
@@ -716,6 +829,7 @@ impl VectorMemory {
 
     pub fn clear(&mut self) -> Result<Value, ToolError> {
         self.records.clear();
+        self.known.clear();
         let path = self.local_path();
         if path.exists() {
             fs::remove_file(path).map_err(|err| ToolError::Failed(err.to_string()))?;
@@ -724,15 +838,40 @@ impl VectorMemory {
     }
 
     pub fn status(&self) -> Value {
+        let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+        for record in &self.records {
+            let name = serde_json::to_value(record.kind)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{:?}", record.kind).to_ascii_lowercase());
+            *kinds.entry(name).or_default() += 1;
+        }
+        let embedded = self
+            .records
+            .iter()
+            .filter(|record| record.embedding.is_some())
+            .count();
         json!({
             "enabled": self.config.enabled,
             "repoId": self.repo_id,
             "collection": self.config.collection,
             "records": self.records.len(),
+            "embedded": embedded,
+            "kinds": kinds,
             "lastIndexed": self.last_indexed,
+            "lastIndexedAt": self.last_indexed_at,
             "automaticRetrieval": self.config.automatic_retrieval,
+            "denseAvailable": self.dense_available(),
             "qdrant": self.config.qdrant_url,
             "ollama": self.config.ollama_url,
+            "embeddingModel": self.config.embedding_model,
+            "embeddingDimensions": self.config.embedding_dimensions,
+            "extractionModel": self.config.extraction_model,
+            "resultLimit": self.config.result_limit,
+            "candidateLimit": self.config.candidate_limit,
+            "maxInjectedTokens": self.config.max_injected_tokens,
+            "minimumScore": self.config.minimum_score,
+            "localPath": self.local_path(),
         })
     }
 
@@ -783,7 +922,13 @@ impl VectorMemory {
                 }
                 Err(error) => ToolError::Failed(error.to_string()),
             },
-            Err(error) => ToolError::Failed(error.to_string()),
+            // Only a server that does not know `/api/embed` gets the older
+            // per-text endpoint. A host that is down or slow would fail that
+            // one too, once per text, each with the full timeout.
+            Err(ureq::Error::Status(404, _)) => {
+                ToolError::Failed("/api/embed is not served (404)".into())
+            }
+            Err(error) => return Err(ToolError::Failed(error.to_string())),
         };
 
         let mut embeddings = Vec::with_capacity(texts.len());
@@ -1006,6 +1151,126 @@ mod tests {
         assert!(!value.contains("abc123"));
         assert!(!value.contains("sk-secret"));
         assert!(!value.contains("hunter2"));
+        let json = redact_secrets(r#"{"api_key": "abc", "token":"xyz"}"#);
+        assert!(!json.contains("abc") && !json.contains("xyz"), "{json}");
+    }
+
+    #[test]
+    fn redaction_leaves_prose_that_merely_mentions_a_key_word() {
+        let prose = "Repeated grep call blocked by token governor; change the query: foo bar";
+        assert_eq!(redact_secrets(prose), prose);
+        let prose = "the secret sauce is caching. Result: 42";
+        assert_eq!(redact_secrets(prose), prose);
+    }
+
+    #[test]
+    fn only_user_and_assistant_messages_become_memory() {
+        let chunks = extract_chunks(
+            &[
+                MemoryMessage {
+                    role: "user".into(),
+                    content: "fix the scheduler".into(),
+                },
+                MemoryMessage {
+                    role: "toolResult".into(),
+                    content: "fn main() {}".repeat(50),
+                },
+                MemoryMessage {
+                    role: "bashExecution".into(),
+                    content: "total 12".into(),
+                },
+                MemoryMessage {
+                    role: "assistant".into(),
+                    content: "Decided: lanes over a queue.".into(),
+                },
+            ],
+            4_000,
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].kind, MemoryKind::Task);
+        assert_eq!(chunks[1].kind, MemoryKind::Decision);
+    }
+
+    #[test]
+    fn automatic_retrieval_off_stops_injection_but_not_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.config.promotion = false;
+        memory.config.automatic_retrieval = false;
+        memory.mark_dense_offline();
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "use the graph scheduler for lanes".into(),
+            }])
+            .unwrap();
+        assert!(memory.inject("graph scheduler lanes").is_none());
+        assert_eq!(memory.search("graph scheduler lanes", 5).len(), 1);
+        memory.config.automatic_retrieval = true;
+        assert!(memory.inject("graph scheduler lanes").is_some());
+    }
+
+    #[test]
+    fn reindexing_the_same_turn_inserts_nothing_and_status_counts_kinds() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.config.promotion = true;
+        memory.mark_dense_offline();
+        let turn = [
+            MemoryMessage {
+                role: "user".into(),
+                content: "Decision: use the graph scheduler".into(),
+            },
+            MemoryMessage {
+                role: "assistant".into(),
+                content: "Done; lanes over a queue.".into(),
+            },
+        ];
+        assert_eq!(memory.index_messages(&turn).unwrap(), 3);
+        assert_eq!(memory.index_messages(&turn).unwrap(), 0);
+        let status = memory.status();
+        assert_eq!(status["records"], 3);
+        assert_eq!(status["kinds"]["task"], 1);
+        assert_eq!(status["kinds"]["decision"], 2);
+        assert_eq!(status["embedded"], 0);
+        assert!(status["lastIndexedAt"].as_u64().is_some());
+        // A fresh load from disk knows the same records.
+        let mut reloaded = VectorMemory::new(directory.path().to_path_buf());
+        assert_eq!(reloaded.record_count(), 3);
+        reloaded.mark_dense_offline();
+        assert_eq!(reloaded.index_messages(&turn).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_failed_embedding_turns_dense_retrieval_off_for_a_while() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.config.promotion = false;
+        // A closed port: connection refused, fast.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        memory.config.ollama_url = format!("http://{address}");
+        memory.config.embed_timeout_seconds = 2;
+        assert!(memory.dense_available());
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "graph scheduler".into(),
+            }])
+            .unwrap();
+        assert!(!memory.dense_available());
+        assert_eq!(memory.status()["denseAvailable"], false);
+        // Lexical retrieval still answers.
+        assert_eq!(memory.search("graph scheduler", 3).len(), 1);
+    }
+
+    #[test]
+    fn lexical_query_scores_distinct_terms_once() {
+        let query = LexicalQuery::new("Graph graph SCHEDULER a");
+        assert_eq!(query.terms, vec!["graph", "scheduler"]);
+        assert!((query.score("the scheduler") - 0.5).abs() < f32::EPSILON);
+        assert_eq!(LexicalQuery::new("a b").score("a b"), 0.0);
     }
 
     #[test]
@@ -1125,7 +1390,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut memory = VectorMemory::new(directory.path().to_path_buf());
         memory.config.promotion = true;
-        memory.config.embed_timeout_seconds = 0;
+        memory.mark_dense_offline();
         let inserted = memory
             .index_messages(&[MemoryMessage {
                 role: "user".into(),

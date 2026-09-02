@@ -20,13 +20,16 @@ use super::{
 };
 
 /// What sits under a sheet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Composer {
     /// No composer under this sheet.
     #[default]
     Hidden,
     /// The composer with this placeholder (or the command that opened it).
     Prompt(&'static str),
+    /// The same, for a placeholder built from live state (`/graph-view t6`
+    /// naming the worker that is actually running).
+    PromptOwned(String),
     /// The composer is drawn but takes no input; the text sits in the dim ramp.
     Disabled(&'static str),
 }

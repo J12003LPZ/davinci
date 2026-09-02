@@ -17,7 +17,7 @@ use crate::davinci::model::{Finding, Model, Severity};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
     blank, clip_ellipsis, footnote, indent, meter, pad, run_width, selection_bar, span, span_on,
-    span_strong, truncate_run,
+    span_strong, truncate_run, wrap,
 };
 
 /// Cells the right-aligned severity word takes.
@@ -34,6 +34,30 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             th.muted,
         )])];
     };
+
+    // No scan has been started in this project: say how one starts rather
+    // than drawing a meter over nothing.
+    if scan.id.is_empty() && scan.candidates == 0 && scan.findings.is_empty() {
+        let mut out = vec![Line::from(vec![span(
+            "no security scan in this project yet",
+            th.text,
+        )])];
+        out.push(blank());
+        for row in wrap(
+            "ask the agent to run a security scan: it starts one with sec_scan_start, \
+             validates each candidate against the file it names, and this sheet follows \
+             along; /sec-report writes the report once the scan is complete",
+            width,
+        ) {
+            out.push(Line::from(vec![span(row, th.muted)]));
+        }
+        out.push(blank());
+        out.push(Line::from(vec![span(
+            "the scan never leaves this machine · allow_network false",
+            th.border,
+        )]));
+        return out;
+    }
 
     let mut progress = vec![
         span_strong(
