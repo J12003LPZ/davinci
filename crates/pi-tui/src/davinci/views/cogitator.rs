@@ -1,16 +1,21 @@
 //! `1f` — the model and provider picker. An overlay over a dimmed transcript;
-//! it states its own exits in its footer (design.md §9).
+//! it states its own exits in its footer (design.md §9). `catalog` is `3a`,
+//! the full picker `/model` opens.
 //!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/cogitator.ex`.
+//! `lines` mirrors `docs/ui/davinci_tui/lib/davinci/views/cogitator.ex`;
+//! `catalog` mirrors artboard `3a` of `docs/ui/Pi TUI Instruments.dc.html`.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use super::chrome::thousands;
 use super::memoria::picker_row;
+use super::sheet::{hint, Composer, SheetChrome};
 use crate::davinci::model::{CatalogRow, Credential, Model};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, pad, run_width, span, span_on, surface_rule, Surface, MEASURE,
+    blank, clip_ellipsis, column_header, footnote, pad, run_width, selection_bar, span, span_on,
+    surface_rule, Surface,
 };
 
 /// The picker is a narrow card, as the mockup draws it beside Memoria (`1f`);
@@ -70,46 +75,75 @@ pub fn lines(model: &Model, config_path: &str) -> Vec<Line<'static>> {
         .lines()
 }
 
-/// Column widths of the catalog table (`3a`), as the Elixir reference sets
-/// them.
-const NAME: u16 = 30;
-const WINDOW: usize = 6;
-const THINKING: usize = 8;
-const PRICE: usize = 14;
-const CREDENTIAL: usize = 15;
+/// Column widths of the catalog table (`3a`), as the artboard sets them.
+/// The name column takes the slack.
+const WINDOW: u16 = 6;
+const THINKING: u16 = 8;
+const PRICE: u16 = 15;
+const CREDENTIAL: u16 = 15;
+/// The selection bar and the state glyph.
+const LEAD: u16 = 5;
 
 /// `3a` — the full model catalog, the screen `/model` opens: the same list as
 /// the overlay with what each row costs you, and the rows you have no
 /// credential for kept on screen with the ramp dropped rather than hidden, so
 /// the catalog reads the same every time (design.md §2).
+///
+/// Mirrors artboard `3a` of `docs/ui/Pi TUI Instruments.dc.html`.
 pub fn catalog(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
+    let facts = &model.facts;
 
-    // The filter box the sheet opens with, caret and all.
+    // The filter box the sheet opens with, caret and all; what the filter
+    // shows of the catalog sits at its right edge.
     let caret_style = if model.blink() {
         Style::default().bg(th.secondary).fg(th.background)
     } else {
         Style::default().bg(th.background).fg(th.background)
     };
+    let count = if facts.catalog_total > 0 {
+        vec![
+            span(
+                format!("{} of {} shown", facts.catalog_shown, facts.catalog_total),
+                th.border,
+            ),
+            span(" · ", th.muted),
+            span(
+                format!(
+                    "{} of {} providers ready",
+                    facts.providers_ready, facts.providers_total
+                ),
+                th.border,
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+    let query = vec![
+        span(format!("{} ", glyph::PROMPT), th.secondary),
+        span("filter models…", th.muted),
+        Span::styled(" ", caret_style),
+    ];
+    let inner = width.saturating_sub(4);
     let mut rows = Surface::new(width, th)
         .border(th.secondary)
-        .row(vec![
-            span(format!("{} ", glyph::PROMPT), th.secondary),
-            span("filter models…", th.muted),
-            Span::styled(" ", caret_style),
-        ])
+        .row(crate::davinci::ui::spread(inner, query, count).spans)
         .lines();
     rows.push(blank());
 
-    rows.push(Line::from(vec![
-        pad(2, None),
-        span(format!("{:<31}", "PROVIDER / MODEL"), th.border),
-        span(format!("{:>WINDOW$} ", "WINDOW"), th.border),
-        span(format!("{:<w$}", "THINKING", w = THINKING + 1), th.border),
-        span(format!("{:>PRICE$} ", "$/Mtok"), th.border),
-        span("CREDENTIAL", th.border),
-    ]));
+    rows.extend(column_header(
+        width,
+        &[
+            ("", LEAD - 1, false),
+            ("PROVIDER / MODEL", 0, false),
+            ("WINDOW", WINDOW, true),
+            ("THINKING", THINKING, false),
+            ("$/Mtok in · out", PRICE, true),
+            ("CREDENTIAL", CREDENTIAL, false),
+        ],
+        th,
+    ));
 
     if model.catalog.is_empty() {
         rows.push(Line::from(vec![span(
@@ -118,70 +152,111 @@ pub fn catalog(model: &Model) -> Vec<Line<'static>> {
         )]));
     } else {
         let selected = model.catalog_index % model.catalog.len();
-        // A real catalog runs to hundreds of rows and the sheet is
-        // tail-anchored: show a window around the selection and count the
-        // rest, so the selection is always on screen.
-        const WINDOW: usize = 16;
-        let total = model.catalog.len();
-        let start = selected
-            .saturating_sub(WINDOW / 2)
-            .min(total.saturating_sub(WINDOW));
-        let end = (start + WINDOW).min(total);
-        if start > 0 {
-            rows.push(Line::from(vec![span(
-                format!("… {start} above"),
-                th.border,
-            )]));
-        }
         for (index, entry) in model.catalog.iter().enumerate() {
-            if index < start || index >= end {
-                continue;
-            }
-            rows.push(catalog_row(entry, index == selected, th));
-        }
-        if end < total {
-            rows.push(Line::from(vec![span(
-                format!("… {} more below", total - end),
-                th.border,
-            )]));
+            rows.push(catalog_row(entry, index == selected, width, th));
         }
     }
 
     rows.push(blank());
-    rows.push(Line::from(vec![
-        span(format!("{} ", glyph::ACTIVE), th.border),
-        span("is the ctrl+p ring", th.muted),
-        span(" · ", th.border),
-        span("dimmed rows have no credential", th.muted),
-        span(" · ", th.border),
-        span("/login xai", th.text),
-        span(" adds one", th.muted),
-    ]));
-    rows.push(Line::from(vec![span(
-        "switching keeps the transcript and re-primes the cache",
-        th.muted,
-    )]));
-    rows.push(Line::from(vec![
-        Span::styled(
-            format!("{} ", glyph::ATTENTION),
-            Style::default().fg(th.warning).add_modifier(th.emphasis),
-        ),
-        span("a large context will not fit a small window", th.muted),
-    ]));
-    rows.push(Line::from(vec![
-        span("↑↓ move", th.border),
-        span(" · ", th.border),
-        span("enter select", th.border),
-        span(" · ", th.border),
-        span("s scope to ring", th.border),
-        span(" · ", th.border),
-        span("esc close", th.border),
-    ]));
+    rows.extend(footnote(
+        width,
+        vec![
+            span("dimmed rows have no credential", th.muted),
+            span(" · ", th.border),
+            span("/login xai", th.text),
+            span(" to add one", th.muted),
+        ],
+        vec![
+            span("switching keeps the transcript", th.border),
+            span(" · ", th.border),
+            span("re-primes the cache", th.border),
+        ],
+        th,
+    ));
+    let mut refreshed = Vec::new();
+    if !facts.catalog_refreshed.is_empty() {
+        refreshed.push(span("catalog refreshed ", th.muted));
+        refreshed.push(span(glyph::DONE, th.success));
+        refreshed.push(span(format!(" {}", facts.catalog_refreshed), th.muted));
+    }
+    if !facts.catalog_path.is_empty() {
+        if !refreshed.is_empty() {
+            refreshed.push(span(" · ", th.border));
+        }
+        refreshed.push(span(facts.catalog_path.clone(), th.secondary));
+    }
+    let warning = window_warning(model)
+        .map(|text| {
+            vec![
+                Span::styled(
+                    format!("{} ", glyph::ATTENTION),
+                    Style::default().fg(th.warning).add_modifier(th.emphasis),
+                ),
+                span(text, th.warning),
+            ]
+        })
+        .unwrap_or_default();
+    if !refreshed.is_empty() || !warning.is_empty() {
+        rows.extend(footnote(width, refreshed, warning, th));
+    }
     // A row that would push past the sheet is cut, never wrapped, so the
     // table keeps its shape on a narrow window.
     rows.into_iter()
         .map(|line| Line::from(crate::davinci::ui::truncate_run(line.spans, width)))
         .collect()
+}
+
+/// `! 47k of context will not fit a 32k window` — said when the catalog
+/// holds a model whose window is smaller than what the session already
+/// carries, so a switch to it is a known loss before it is made.
+fn window_warning(model: &Model) -> Option<String> {
+    let (used, _) = model.context;
+    let smallest = model
+        .catalog
+        .iter()
+        .filter_map(|row| parse_tokens(&row.window))
+        .min()?;
+    (smallest < used).then(|| {
+        format!(
+            "{} of context will not fit a {} window",
+            thousands(used),
+            thousands(smallest)
+        )
+    })
+}
+
+/// `200k` → 200 000, `1m` → 1 000 000. `None` for anything else.
+fn parse_tokens(window: &str) -> Option<u64> {
+    let trimmed = window.trim();
+    let (number, unit) = trimmed.split_at(trimmed.len().checked_sub(1)?);
+    let value: f64 = number.parse().ok()?;
+    let scale = match unit {
+        "k" => 1_000.0,
+        "m" => 1_000_000.0,
+        _ => return None,
+    };
+    Some((value * scale) as u64)
+}
+
+/// The sheet's frame (design.md §11): the ring size in the status bar, the
+/// keys the sheet answers to, and no composer — the filter box is the input.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    let ring = model.catalog.iter().filter(|row| row.ring).count();
+    SheetChrome {
+        header_right: Vec::new(),
+        status_third: (ring > 0).then(|| vec![span(format!("ring of {ring}"), th.muted)]),
+        status_right: None,
+        hints: vec![
+            hint(th, "↑↓ move"),
+            hint(th, "enter select"),
+            hint(th, "ctrl+p cycle ring"),
+            hint(th, "s scope to ring"),
+        ],
+        escape: Some("esc close"),
+        composer: Composer::Hidden,
+        echo: None,
+    }
 }
 
 /// A glyph in the theme's emphasis, on the selection band when there is one.
@@ -198,9 +273,11 @@ fn strong_on(
     Span::styled(content, style)
 }
 
-fn catalog_row(entry: &CatalogRow, selected: bool, th: &Theme) -> Line<'static> {
+fn catalog_row(entry: &CatalogRow, selected: bool, width: u16, th: &Theme) -> Line<'static> {
     let absent = entry.credential == Credential::Absent;
     let band = selected.then_some(th.surface);
+    // A row with no credential drops its ramp rather than leaving the list.
+    let ink = if absent { th.dim() } else { *th };
 
     let state = if selected {
         State::Active
@@ -212,59 +289,84 @@ fn catalog_row(entry: &CatalogRow, selected: bool, th: &Theme) -> Line<'static> 
     let name_color = if selected {
         th.text
     } else if absent {
-        th.border
+        ink.muted
     } else {
-        th.muted
+        th.text
     };
-    let detail = if absent { th.border } else { th.muted };
-
-    // The ring is a second mark on the row rather than a suffix on the name:
-    // trimming a long name to fit a label made two rows read identically.
-    let ring = if entry.ring { glyph::ACTIVE } else { " " };
 
     let mut left = vec![
+        selection_bar(selected, th),
         strong_on(
             format!("{} ", state.glyph()),
             th.state_color(state),
             band,
             th,
         ),
-        span_on(clip_ellipsis(&entry.name, NAME - 2), name_color, band),
-        span_on(format!(" {ring}"), th.border, band),
     ];
-    let gap = (2 + NAME + 1).saturating_sub(run_width(&left)).max(1);
+    let fixed = LEAD + WINDOW + 1 + THINKING + 1 + PRICE + 1 + CREDENTIAL;
+    let name_column = width.saturating_sub(fixed).saturating_sub(1);
+    // The ring and a local router are said in words after the name, as the
+    // artboard writes them, in border ink so the name stays the loud part.
+    let mut suffix = String::new();
+    if entry.ring {
+        suffix.push_str(" · in ctrl+p ring");
+    }
+    if !entry.detail.is_empty() {
+        suffix.push_str(" · ");
+        suffix.push_str(&entry.detail);
+    }
+    let name = clip_ellipsis(&entry.name, name_column);
+    left.push(span_on(name.clone(), name_color, band));
+    let used = run_width(&left) - LEAD;
+    let room = name_column.saturating_sub(used);
+    if !suffix.is_empty() && room > 0 {
+        left.push(span_on(clip_ellipsis(&suffix, room), ink.border, band));
+    }
+    let gap = (LEAD + name_column + 1)
+        .saturating_sub(run_width(&left))
+        .max(1);
     left.push(pad(gap, band));
 
     let (credential_glyph, credential_color) = match entry.credential {
-        Credential::Ready | Credential::Local => (glyph::DONE, th.success),
-        Credential::Pending => (glyph::ACTIVE, th.primary),
-        Credential::Expired => (glyph::ATTENTION, th.warning),
-        Credential::Absent => (glyph::QUEUED, th.border),
+        Credential::Ready | Credential::Local => (glyph::DONE, ink.success),
+        Credential::Pending => (glyph::ACTIVE, ink.primary),
+        Credential::Expired => (glyph::ATTENTION, ink.warning),
+        Credential::Absent => (glyph::QUEUED, ink.border),
     };
+    let thinking = if entry.thinking == "none" {
+        format!("{} none", glyph::QUEUED)
+    } else {
+        entry.thinking.clone()
+    };
+    let detail = if absent { ink.muted } else { th.muted };
+    let figure = if absent { ink.muted } else { th.text };
     left.extend([
-        span_on(format!("{:>WINDOW$} ", entry.window), detail, band),
         span_on(
-            format!("{:<w$}", entry.thinking, w = THINKING + 1),
+            format!("{:>w$} ", entry.window, w = WINDOW as usize),
+            figure,
+            band,
+        ),
+        span_on(
+            format!("{:<w$} ", thinking, w = THINKING as usize),
             detail,
             band,
         ),
-        span_on(format!("{:>PRICE$} ", entry.price), detail, band),
+        span_on(
+            format!("{:>w$} ", entry.price, w = PRICE as usize),
+            figure,
+            band,
+        ),
         span_on(
             format!(
-                "{:<CREDENTIAL$}",
-                format!("{credential_glyph} {}", entry.note)
+                "{:<w$}",
+                format!("{credential_glyph} {}", entry.note),
+                w = CREDENTIAL as usize
             ),
             credential_color,
             band,
         ),
     ]);
     Line::from(left)
-}
-
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
 }
 
 #[cfg(test)]
@@ -369,6 +471,7 @@ mod tests {
         m.catalog = vec![
             CatalogRow {
                 name: "anthropic / claude-sonnet".into(),
+                detail: String::new(),
                 window: "200k".into(),
                 thinking: "budget".into(),
                 price: "3.00 · 15.00".into(),
@@ -380,6 +483,7 @@ mod tests {
             },
             CatalogRow {
                 name: "github-copilot / gpt".into(),
+                detail: String::new(),
                 window: "128k".into(),
                 thinking: "effort".into(),
                 price: "seat".into(),
@@ -391,6 +495,7 @@ mod tests {
             },
             CatalogRow {
                 name: "xai / grok".into(),
+                detail: String::new(),
                 window: "256k".into(),
                 thinking: "effort".into(),
                 price: "3.00 · 15.00".into(),
@@ -431,12 +536,12 @@ mod tests {
             .iter()
             .find(|row| text(row).contains("xai / grok"))
             .expect("the absent row stays on screen");
-        // Dropped ramp: name in border ink, credential in queued glyph.
+        // Dropped ramp: name in the dim ramp, credential in queued glyph.
         assert!(absent
             .spans
             .iter()
             .any(|span| span.content.as_ref().contains("xai / grok")
-                && span.style.fg == Some(m.theme.border)));
+                && span.style.fg == Some(m.theme.dim().muted)));
         assert!(text(absent).contains('○'));
         let expired = rows
             .iter()
@@ -453,15 +558,68 @@ mod tests {
             .iter()
             .find(|row| row.contains("anthropic / claude-sonnet"))
             .unwrap();
-        // Selection glyph at the head, ring mark after the name.
-        assert!(selected.starts_with('◉'), "{selected}");
-        assert!(
-            selected.matches('◉').count() >= 2,
-            "the ring is a second mark: {selected}"
-        );
-        // The legend explains both marks and the way in.
-        assert!(drawn.iter().any(|row| row.contains("is the ctrl+p ring")));
+        // Selection bar and glyph at the head, the ring said in words after
+        // the name, as the artboard writes it.
+        assert!(selected.starts_with("▌  ◉"), "{selected}");
+        assert!(selected.contains("· in ctrl+p ring"), "{selected}");
+        // The legend explains the dimmed rows and the way in.
+        assert!(drawn
+            .iter()
+            .any(|row| row.contains("dimmed rows have no credential")));
         assert!(drawn.iter().any(|row| row.contains("/login")));
+    }
+
+    #[test]
+    fn the_sheet_wears_its_artboard_chrome() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "3a");
+        let c = chrome(&m);
+        assert!(c.header_right.is_empty(), "3a keeps cwd │ branch │ model");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "ring of 3");
+        assert_eq!(c.escape, Some("esc close"));
+        assert_eq!(c.composer, Composer::Hidden);
+        let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
+        assert!(
+            hint.starts_with("↑↓ move │ enter select │ ctrl+p cycle ring │ s scope to ring"),
+            "{hint}"
+        );
+        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+    }
+
+    #[test]
+    fn the_catalog_opens_on_its_filter_box_and_states_what_it_shows() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 100, 44, true);
+        fixtures::dress_screen(&mut m, "3a");
+        let drawn: Vec<String> = catalog(&m).iter().map(text).collect();
+        assert!(drawn[1].contains("filter models…"), "{}", drawn[1]);
+        assert!(
+            drawn[1].contains("12 of 63 shown · 6 of 10 providers ready"),
+            "{}",
+            drawn[1]
+        );
+        assert!(drawn
+            .iter()
+            .any(|row| row.contains("PROVIDER / MODEL") && row.contains("$/Mtok in · out")));
+        assert!(drawn
+            .iter()
+            .any(|row| row.contains("qwen-coder · router :8080")));
+        assert!(drawn.iter().any(|row| row.contains("! token expired")));
+        assert!(drawn.iter().any(|row| row.contains("○ no credential")));
+        assert!(drawn
+            .iter()
+            .any(|row| row.contains("catalog refreshed ✓ 2h ago")));
+        assert!(drawn
+            .iter()
+            .any(|row| row.contains("47k of context will not fit a 32k window")));
+        // No hint line of its own: the frame draws the hint row.
+        assert!(!drawn.iter().any(|row| row.contains("esc close")));
     }
 
     #[test]
@@ -476,10 +634,9 @@ mod tests {
 
     #[test]
     fn the_catalog_never_overflows_its_sheet() {
-        use crate::davinci::ui::MEASURE;
         use unicode_width::UnicodeWidthStr;
         for width in [72u16, 80, 100, 120, 160] {
-            let cap = width.min(MEASURE + 14);
+            let cap = width;
             for row in catalog(&catalog_model(width)) {
                 assert!(
                     UnicodeWidthStr::width(text(&row).as_str()) <= cap as usize,

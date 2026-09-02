@@ -471,6 +471,11 @@ pub fn catalog() -> Vec<CatalogRow> {
                note: &str,
                ring: bool| CatalogRow {
         name: name.into(),
+        detail: if name.starts_with("llama.cpp") {
+            "router :8080".into()
+        } else {
+            String::new()
+        },
         window: window.into(),
         thinking: thinking.into(),
         price: price.into(),
@@ -550,7 +555,7 @@ pub fn catalog() -> Vec<CatalogRow> {
             "effort",
             "seat",
             Credential::Expired,
-            "expired",
+            "token expired",
             false,
         ),
         row(
@@ -559,7 +564,7 @@ pub fn catalog() -> Vec<CatalogRow> {
             "effort",
             "3.00 · 15.00",
             Credential::Absent,
-            "none",
+            "no credential",
             false,
         ),
         row(
@@ -568,7 +573,7 @@ pub fn catalog() -> Vec<CatalogRow> {
             "budget",
             "0.28 · 0.42",
             Credential::Absent,
-            "none",
+            "no credential",
             false,
         ),
         row(
@@ -577,7 +582,7 @@ pub fn catalog() -> Vec<CatalogRow> {
             "budget",
             "0.60 · 2.20",
             Credential::Absent,
-            "none",
+            "no credential",
             false,
         ),
         row(
@@ -1794,7 +1799,15 @@ pub fn dress_screen(model: &mut Model, id: &str) {
         }
         // `3a`–`6d` — the command sheets; each opens over a cleared
         // transcript with the session facts its mockup sets.
-        "3a" => sheet(model, Screen::Models),
+        "3a" => {
+            sheet(model, Screen::Models);
+            model.facts.catalog_shown = 12;
+            model.facts.catalog_total = 63;
+            model.facts.providers_ready = 6;
+            model.facts.providers_total = 10;
+            model.facts.catalog_refreshed = "2h ago".into();
+            model.facts.catalog_path = "%USERPROFILE%\\.pi\\agent\\models.json".into();
+        }
         "3b" => sheet(model, Screen::Settings),
         "3c" => sheet(model, Screen::Thinking),
         "3d" => {

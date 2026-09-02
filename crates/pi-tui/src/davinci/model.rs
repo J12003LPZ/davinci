@@ -871,11 +871,56 @@ pub enum Credential {
     Local,
 }
 
+/// The facts a command sheet states in its header, status bar and
+/// footnotes (design.md §11). Every field is optional in spirit: an empty
+/// string or zero means the fact is not known live and its segment is
+/// omitted, never invented.
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    /// `3a` — `12 of 63 shown · 6 of 10 providers ready`.
+    pub catalog_shown: usize,
+    pub catalog_total: usize,
+    pub providers_ready: usize,
+    pub providers_total: usize,
+    /// `3a` — `catalog refreshed ✓ 2h ago`.
+    pub catalog_refreshed: String,
+    /// `3a` — where the catalog lives.
+    pub catalog_path: String,
+    /// `3b` — how many keys the settings file knows.
+    pub settings_keys: usize,
+    /// `3c` — `reserve 10k`, the tokens held back from thinking.
+    pub thinking_reserve: String,
+    /// `3c` — `5.1k of 8k`, what the last turn thought.
+    pub thinking_last_turn: String,
+    /// `3c` — share of this session's output tokens spent thinking.
+    pub thinking_output_share: f64,
+    /// `3d` — where credentials are kept, and the mode they are written with.
+    pub auth_path: String,
+    pub auth_mode: String,
+    /// `3e` — `39 bindings │ 4 surfaces`.
+    pub keys_count: usize,
+    pub keys_surfaces: usize,
+    /// `4a` — `(used, cap)` bytes of the session store; cap 0 omits the meter.
+    pub sessions_disk: Option<(u64, u64)>,
+    /// `4b` — the session in hand.
+    pub session_name: String,
+    pub session_turns: usize,
+    pub session_branches: usize,
+    /// `6d` — commits the branch is behind its upstream.
+    pub commits_behind: Option<u32>,
+    /// `6b` — `24 tools │ 37 commands │ 21.4k of schema`.
+    pub tool_count: usize,
+    pub command_count: usize,
+    pub tool_schema_tokens: u64,
+}
+
 /// One row of the full model catalog (`3a`). Rows with no credential stay
 /// listed, dimmed, so the catalog reads the same every time.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogRow {
     pub name: String,
+    /// What follows the name in border ink: `router :8080` for a local model.
+    pub detail: String,
     pub window: String,
     pub thinking: String,
     pub price: String,
@@ -1409,6 +1454,8 @@ pub struct Model {
     /// `/permissions` — mode and rules.
     pub permission_rows: Vec<PermissionRow>,
     pub permission_index: usize,
+    /// What the command sheets state about the session (design.md §11).
+    pub facts: Facts,
 }
 
 impl Model {
@@ -1508,6 +1555,7 @@ impl Model {
             mcp: None,
             permission_rows: Vec::new(),
             permission_index: 0,
+            facts: Facts::default(),
         }
     }
 
