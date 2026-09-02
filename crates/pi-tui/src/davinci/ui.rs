@@ -658,7 +658,7 @@ mod tests {
         // 47k of 200k, drawn in twelve cells (screen 1b).
         let spans = meter(47.0 / 200.0, 12, &th, None);
         let drawn: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(drawn, "━━╸─────────");
+        assert_eq!(drawn, "━━◸─────────");
         assert_eq!(run_width(&spans), 12);
     }
 
@@ -674,7 +674,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(full, "━━━━━╸");
+        assert_eq!(full, "━━━━━◸");
     }
 
     #[test]

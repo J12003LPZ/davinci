@@ -39,7 +39,7 @@ pub mod glyph {
 
     /// Proportion meter, drawn as filled run + tip + empty run (design.md §9).
     pub const METER_FILLED: &str = "━";
-    pub const METER_TIP: &str = "╸";
+    pub const METER_TIP: &str = "◸";
     pub const METER_EMPTY: &str = "─";
 }
 

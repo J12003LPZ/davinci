@@ -801,7 +801,7 @@ mod tests {
         let drawn = text(&status(&model(100)));
         assert!(drawn.contains("context "), "{drawn}");
         assert!(drawn.contains("47k/200k"), "{drawn}");
-        assert!(drawn.contains('╸'), "the meter has a tip: {drawn}");
+        assert!(drawn.contains('◸'), "the meter has a tip: {drawn}");
     }
 
     #[test]
