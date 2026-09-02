@@ -135,7 +135,31 @@ pub fn remember_project_rule(cwd: &Path, rule: &str) -> Result<PathBuf, String> 
     })
 }
 
+/// Remove a rule from a settings file's `permissions.allow` or `permissions.deny`.
+pub fn forget_file_rule(path: &Path, list: &str, rule: &str) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    with_settings_lock(path, || {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())?;
+        if let Some(items) = value
+            .pointer_mut(&format!("/permissions/{list}"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            items.retain(|item| item.as_str() != Some(rule));
+        }
+        let encoded = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
+        std::fs::write(path, format!("{encoded}\n")).map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
 /// The rows `/permissions` says: the mode, then every rule by source.
+/// Kept for `/permissions` text dumps and tests; the davinci sheet builds
+/// structured rows instead.
+#[allow(dead_code)]
 pub fn describe(sources: &PermissionSources, policy: &PermissionPolicy) -> Vec<String> {
     let mut rows = vec![format!(
         "permission mode {} · {}",
@@ -280,6 +304,22 @@ mod tests {
             written["permissions"]["allow"],
             serde_json::json!(["edit", "write"])
         );
+    }
+
+    #[test]
+    fn forget_file_rule_drops_the_named_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"permissions":{"allow":["bash","edit"],"deny":["rm"]}}"#,
+        )
+        .unwrap();
+        forget_file_rule(&path, "allow", "bash").unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("\"bash\""));
+        assert!(body.contains("\"edit\""));
+        assert!(body.contains("\"rm\""));
     }
 
     #[test]

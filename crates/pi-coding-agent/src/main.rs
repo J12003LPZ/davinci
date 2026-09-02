@@ -583,7 +583,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         &mcp::load(&default_agent_dir(), cwd, trusted),
         cwd,
     ));
-    agent.subagent_runner = Some(pi_agent::SubagentRunner::new(|req| {
+    let parsed_for_worker = parsed.clone();
+    let cwd_for_worker = cwd.to_path_buf();
+    agent.subagent_runner = Some(pi_agent::SubagentRunner::new(move |req| {
         if let Ok(fix) = std::env::var("PI_SUBAGENT_FIXTURE") {
             let path = std::path::Path::new(&fix);
             if path.is_file() {
@@ -591,11 +593,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             }
             return Ok(fix);
         }
-        Ok(format!(
-            "subagent ({}) · {}",
-            req.tools.join(","),
-            req.prompt
-        ))
+        run_nested_subagent(&parsed_for_worker, &cwd_for_worker, req)
     }));
     apply_discovered_resources(parsed, &mut agent);
     if !parsed.no_session {
@@ -1410,6 +1408,28 @@ fn agent_memory_messages(agent: &Agent) -> Vec<crate::native_extensions::MemoryM
             }
         })
         .collect()
+}
+
+fn run_nested_subagent(
+    parsed: &Args,
+    cwd: &Path,
+    req: &pi_agent::SubagentRequest,
+) -> Result<String, String> {
+    let mut child = Agent::new(
+        "You are a scoped worker. Answer the prompt using only the tools you have. Do not call agent.",
+    );
+    child.cwd = cwd.to_path_buf();
+    child.tools = req.tools.clone();
+    child.tool_registry = req.tools.clone();
+    child.session = None;
+    let _ = apply_resolved_models(parsed, &mut child);
+    child.prompt(&req.prompt);
+    let (text, _) = complete_prompt(parsed, &mut child);
+    if text.trim().is_empty() {
+        Err("subagent returned no text".into())
+    } else {
+        Ok(text)
+    }
 }
 
 fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>) {

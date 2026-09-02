@@ -15,10 +15,10 @@ use pi_agent::{
 use pi_tui::davinci::model::{
     Ask, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
     Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
-    HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PickerItem, PlanStep,
-    ProjectTrustSheet, ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan,
-    SettingRow, Severity, Step, ThinkingRow, Tone, TreeNode, TrustFile, VectorIndex, Working,
-    WorkshopSheet,
+    HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow,
+    PickerItem, PlanStep, ProjectTrustSheet, ProviderRow, ResumeRow, ReviewFile, ReviewSheet,
+    Screen, SecurityScan, SettingRow, Severity, Step, ThinkingRow, Tone, TreeNode, TrustFile,
+    VectorIndex, Working, WorkshopSheet,
 };
 use pi_tui::davinci::theme::State;
 
@@ -221,6 +221,11 @@ pub fn failure_lines(result: &serde_json::Value) -> Vec<String> {
 }
 
 /// The text a tool result carries, whatever shape the event wrapped it in.
+fn gate_denied(result: &serde_json::Value) -> bool {
+    let text = result_text(result);
+    text.contains("Permission denied") || text.starts_with("plan mode:")
+}
+
 fn result_text(result: &serde_json::Value) -> String {
     match result {
         serde_json::Value::String(text) => text.clone(),
@@ -464,9 +469,18 @@ impl Turn {
             ..
         }) = model.transcript.get_mut(index)
         {
-            *state = state_of(tool_name, is_error);
+            let gated = is_error && gate_denied(result);
+            *state = if gated {
+                State::Done
+            } else {
+                state_of(tool_name, is_error)
+            };
             *duration = Some(duration_of(started.elapsed()));
-            *summary = outcome;
+            *summary = if gated {
+                Some("denied".into())
+            } else {
+                outcome
+            };
             // What came back stays on the line: a failure draws its first
             // rows, `ctrl+t` draws any call's.
             *output = pi_tui::davinci::model::tool_output_rows(&result_text(result));
@@ -3324,7 +3338,20 @@ pub fn run(
                     }
                     let was = model.screen;
                     let next = match app::handle_key(&mut model, key) {
-                        Flow::Quit => Next::Leave,
+                        Flow::Quit => {
+                            run_stop_hooks(&mut Shell {
+                                parsed,
+                                agent,
+                                model: &mut model,
+                                terminal: &mut terminal,
+                                host: &host,
+                                pending: &mut pending,
+                                cwd: &cwd,
+                                dresser: &dresser,
+                                images: &mut attached_images,
+                            });
+                            Next::Leave
+                        }
                         Flow::Submit(line) => on_line(
                             &mut Shell {
                                 parsed,
@@ -5186,7 +5213,10 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
         }
     }
     match classify(line) {
-        Sent::Quit => Next::Leave,
+        Sent::Quit => {
+            run_stop_hooks(shell);
+            Next::Leave
+        }
         Sent::Say(text) => {
             shell.say(&text);
             Next::Go
@@ -5450,7 +5480,59 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             };
             shell.finish(Done::Ask(question))
         }
+        Choice::Permission(index) => apply_permission_row(shell, index),
     }
+}
+
+fn apply_permission_row(shell: &mut Shell<'_>, index: usize) -> Next {
+    let Some(row) = shell.model.permission_rows.get(index).cloned() else {
+        return Next::Go;
+    };
+    if row.kind == "mode" {
+        if let Some(mode) = PermissionMode::parse(&row.key) {
+            shell
+                .agent
+                .permissions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .mode = mode;
+            shell.model.permission_mode = mode.as_str().to_string();
+            open_permissions_sheet(shell);
+        }
+        return Next::Go;
+    }
+    match row.source.as_str() {
+        "session" => {
+            shell
+                .agent
+                .permissions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .session_allow
+                .retain(|rule| rule.to_string() != row.key);
+        }
+        "user" => {
+            let list = if row.detail.starts_with("deny") {
+                "deny"
+            } else {
+                "allow"
+            };
+            let path = crate::settings::settings_path(&crate::default_agent_dir());
+            let _ = crate::permissions::forget_file_rule(&path, list, &row.key);
+        }
+        "project" => {
+            let list = if row.detail.starts_with("deny") {
+                "deny"
+            } else {
+                "allow"
+            };
+            let path = crate::permissions::project_settings_path(shell.cwd);
+            let _ = crate::permissions::forget_file_rule(&path, list, &row.key);
+        }
+        _ => {}
+    }
+    open_permissions_sheet(shell);
+    Next::Go
 }
 
 /// `3b` — advance a setting to the next value on its ramp, write it through
@@ -5671,6 +5753,17 @@ fn jobs_command(shell: &mut Shell<'_>, arg: &str) -> Next {
     Next::Go
 }
 
+fn run_stop_hooks(shell: &mut Shell<'_>) {
+    let settings = crate::settings::load_merged_settings(&crate::default_agent_dir(), shell.cwd);
+    let trusted =
+        crate::settings::is_trusted(&settings, shell.cwd, shell.parsed.project_trust_override);
+    crate::hooks::run_stop(&crate::hooks::load(
+        &crate::default_agent_dir(),
+        shell.cwd,
+        trusted,
+    ));
+}
+
 /// `/permissions` — the mode and every rule in force, by source; or, with a
 /// mode named, that mode for the rest of the session. Rules are drawn as
 /// tool rows rather than prose: `bash(git *)` is not markdown emphasis.
@@ -5697,6 +5790,11 @@ fn permissions_command(shell: &mut Shell<'_>, arg: &str) -> Next {
         }
         return Next::Go;
     }
+    open_permissions_sheet(shell);
+    Next::Go
+}
+
+fn open_permissions_sheet(shell: &mut Shell<'_>) {
     let sources = crate::permissions::PermissionSources::load(
         &crate::default_agent_dir(),
         shell.cwd,
@@ -5708,20 +5806,45 @@ fn permissions_command(shell: &mut Shell<'_>, arg: &str) -> Next {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .clone();
-    let rows = crate::permissions::describe(&sources, &policy);
-    shell.model.running = false;
-    shell.model.transcript.push(Entry::Gap);
-    for (index, row) in rows.iter().enumerate() {
-        if index == 0 {
-            shell
-                .model
-                .transcript
-                .push(Entry::tool(State::Done, "instrumenta", row, None));
-        } else {
-            shell.model.transcript.push(Entry::detail(row));
-        }
+    let mut rows = Vec::new();
+    for mode in PermissionMode::ALL {
+        rows.push(PermissionRow {
+            label: mode.as_str().into(),
+            detail: mode.describe().into(),
+            current: policy.mode == mode,
+            kind: "mode".into(),
+            key: mode.as_str().into(),
+            source: String::new(),
+        });
     }
-    Next::Go
+    let push_rules = |rows: &mut Vec<PermissionRow>, source: &str, list: &str, rules: &[String]| {
+        for rule in rules {
+            rows.push(PermissionRow {
+                label: rule.clone(),
+                detail: format!("{list} · {source}"),
+                current: false,
+                kind: "rule".into(),
+                key: rule.clone(),
+                source: source.into(),
+            });
+        }
+    };
+    push_rules(&mut rows, "user", "allow", &sources.user.allow);
+    push_rules(&mut rows, "user", "deny", &sources.user.deny);
+    if let Some(project) = &sources.project {
+        push_rules(&mut rows, "project", "allow", &project.allow);
+        push_rules(&mut rows, "project", "deny", &project.deny);
+    }
+    let session: Vec<String> = policy
+        .session_allow
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    push_rules(&mut rows, "session", "allow", &session);
+    let current = rows.iter().position(|row| row.current).unwrap_or(0);
+    shell.model.permission_rows = rows;
+    shell.model.permission_index = current;
+    open_sheet(shell.model, Screen::Permissions);
 }
 
 fn detached_login_message(provider: &str, oauth_pending: bool) -> Result<String, String> {
@@ -6356,6 +6479,40 @@ mod tests {
             Entry::Tool { duration, .. } => {
                 assert!(duration.as_deref().unwrap().ends_with('s'))
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_denied_call_keeps_the_done_glyph() {
+        let mut m = model();
+        let mut turn = Turn::default();
+        apply(
+            &mut m,
+            &mut turn,
+            &AgentEvent::ToolExecutionStart {
+                tool_call_id: "1".into(),
+                tool_name: "bash".into(),
+                args: json!({"command": "rm -rf /"}),
+            },
+        );
+        apply(
+            &mut m,
+            &mut turn,
+            &AgentEvent::ToolExecutionEnd {
+                tool_call_id: "1".into(),
+                tool_name: "bash".into(),
+                result: json!("Permission denied: `bash · rm -rf /` matches the deny rule `bash`."),
+                is_error: true,
+                details: None,
+            },
+        );
+        match &m.transcript[0] {
+            Entry::Tool {
+                state: State::Done,
+                summary,
+                ..
+            } => assert_eq!(summary.as_deref(), Some("denied")),
             other => panic!("{other:?}"),
         }
     }

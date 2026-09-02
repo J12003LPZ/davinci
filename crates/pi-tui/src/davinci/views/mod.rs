@@ -22,6 +22,7 @@ pub mod memoria;
 pub mod mensura;
 pub mod officina;
 pub mod opera;
+pub mod permissions;
 pub mod recovery;
 pub mod resume;
 pub mod securitas;

@@ -169,6 +169,8 @@ pub enum Screen {
     Diff,
     /// Connected MCP servers (`/mcp`). No mockup number; phase 4.
     Mcp,
+    /// `/permissions` — mode and rules.
+    Permissions,
 }
 
 /// An instrument summoned over the transcript, dismissed with esc.
@@ -241,6 +243,8 @@ pub enum Choice {
     TreeEntry(usize),
     /// Enter on the trust sheet (`6a`): read first, then decide.
     TrustDecide,
+    /// A row of the `/permissions` sheet.
+    Permission(usize),
 }
 
 /// A block of rows an extension owns. Extensions get rows, not colours and
@@ -1081,6 +1085,19 @@ pub struct McpSheet {
     pub config_path: String,
 }
 
+/// One row of `/permissions`: a mode or a rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRow {
+    pub label: String,
+    pub detail: String,
+    pub current: bool,
+    /// `mode` or `rule`.
+    pub kind: String,
+    pub key: String,
+    /// `session`, `user`, `project`, or empty for a mode.
+    pub source: String,
+}
+
 /// Which of the theme's inks a figure is drawn in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
@@ -1389,6 +1406,9 @@ pub struct Model {
     pub diff_index: usize,
     /// `/mcp` — connected MCP servers.
     pub mcp: Option<McpSheet>,
+    /// `/permissions` — mode and rules.
+    pub permission_rows: Vec<PermissionRow>,
+    pub permission_index: usize,
 }
 
 impl Model {
@@ -1486,6 +1506,8 @@ impl Model {
             review: None,
             diff_index: 0,
             mcp: None,
+            permission_rows: Vec::new(),
+            permission_index: 0,
         }
     }
 
@@ -1626,6 +1648,7 @@ impl Model {
             Screen::Trust => "fiducia",
             Screen::Officina => "officina",
             Screen::Mcp => "instrumenta",
+            Screen::Permissions => "fiducia",
         }
     }
 

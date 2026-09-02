@@ -17,8 +17,8 @@ use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::{
     ask, codex, cogitator, compact, diff, disegno, export, governor, grafo, graph_run, instrumenta,
-    keys, login, mcp, memoria, mensura, officina, opera, recovery, resume, securitas, settings,
-    startup, transcript, tree, trust, vectors,
+    keys, login, mcp, memoria, mensura, officina, opera, permissions, recovery, resume, securitas,
+    settings, startup, transcript, tree, trust, vectors,
 };
 
 /// What the runtime should do after a key.
@@ -175,6 +175,7 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
         Screen::Recovery => Some(recovery::lines(model)),
         Screen::Diff => Some(diff::lines(model)),
         Screen::Mcp => Some(mcp::lines(model)),
+        Screen::Permissions => Some(permissions::lines(model)),
         Screen::Agent | Screen::Keys => None,
     };
     if let Some(rows) = screen_rows {
@@ -532,6 +533,10 @@ fn screen_move(model: &mut Model, delta: isize) {
         Screen::Keys => {
             model.keys_offset = model.keys_offset.saturating_add_signed(delta);
         }
+        Screen::Permissions => {
+            model.permission_index =
+                wrap_index(model.permission_index, delta, model.permission_rows.len());
+        }
         _ => {}
     }
 }
@@ -558,6 +563,9 @@ fn screen_accept(model: &Model) -> Option<Choice> {
             .map(|_| Choice::TreeEntry(model.tree_index)),
         // The sheet is for reading; enter moves on to the decision.
         Screen::Trust => Some(Choice::TrustDecide),
+        Screen::Permissions => {
+            pick(model.permission_index, model.permission_rows.len()).map(Choice::Permission)
+        }
         _ => None,
     }
 }

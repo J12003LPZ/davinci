@@ -3,29 +3,25 @@
 ## Goal
 
 Turn the Rust `pi` rewrite into a harness that competes with Claude Code and
-Codex CLI. The roadmap
-`docs/superpowers/specs/2026-09-01-competitive-harness-roadmap.md` rows 1–6
-are done on `rust-rewrite`.
+Codex CLI. Roadmap rows 1–6 are done on `rust-rewrite`.
 
-## State (2026-09-02)
+## Commits
 
-Phases 1–5 committed (`2d7162e`, `8442da4`, `6c45b51`, `eeba283`, `cb43f30`).
-Phase 6 is this landing.
+- Phase 1 `2d7162e`, phase 2 `8442da4`, phase 3 `6c45b51`
+- Phase 4 `eeba283`, phase 5 `cb43f30`, phase 6 `9958f5c`
 
-## Phase 6
+## Phase-2 leftovers (this landing)
 
-- **`/cost` `/status`**: wrap `session_stats_for_agent`. Cost is tokens +
-  USD; status is model, permission, plan/act, jobs, MCP count, then cost.
-- **`hooks.json`**: user `~/.pi/agent/hooks.json`, trusted `.pi/hooks.json`.
-  `preTool` / `postTool` / `stop` are argv arrays. Non-zero `preTool` blocks
-  the call. `stop` runs on `/quit`. `PI_HOOKS_CONFIG` fixture;
-  `PI_HOOKS_DRY_RUN` skips spawn.
-- **Session events**: `<session>.events.jsonl` gets a `tool` row after each
-  call.
+- `/permissions` is a sheet: modes selectable, rules listed, enter on a
+  rule removes it (session / user / project file).
+- Denied tool rows keep the `✓` glyph and summarise `denied`.
+- `/quit` and the TUI quit chord run `stop` hooks.
+- `agent` workers run a nested `complete_prompt` (still honour
+  `PI_SUBAGENT_FIXTURE` first).
+- Live JS autocomplete loads the extension before querying, and retries
+  once if the first reply is empty.
 
-## Phase-2 leftovers still open
+## Still blocked
 
-`/permissions` sheet needs a mockup; rule editing from the panel; hooks
-answering the permission panel; ledger `✓` on denied steps; js_host
-autocomplete flake; live Codex check blocked by usage limit. The product
-`agent` runner is still fixture-or-echo (phase 5).
+Live Codex provider check — usage limit on the account. Decoder coverage
+is fixture-based in `pi-ai`.

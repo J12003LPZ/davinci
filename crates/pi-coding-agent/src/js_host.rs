@@ -1117,8 +1117,16 @@ module.exports = (pi) => {
         .unwrap();
         let module = resolve_extension_module(dir.path()).unwrap();
         stop_persistent_js_extension();
-        let items = query_js_autocomplete(&module, "#99");
+        let _ = run_persistent_js_extension(&module, "load", &serde_json::json!({}));
+        let mut items = query_js_autocomplete(&module, "#99");
+        if items.is_empty() {
+            items = query_js_autocomplete(&module, "#99");
+        }
         stop_persistent_js_extension();
+        assert!(
+            !items.is_empty(),
+            "live autocomplete returned nothing for #99"
+        );
         assert_eq!(items[0].value, "live:#99");
     }
 

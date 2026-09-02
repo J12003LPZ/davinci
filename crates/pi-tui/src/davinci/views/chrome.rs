@@ -473,6 +473,7 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::Officina => Some("/reload"),
         Screen::Trust => Some("decide first"),
         Screen::Mcp => Some("/mcp"),
+        Screen::Permissions => Some("/permissions ask"),
         Screen::Recovery | Screen::Diff | Screen::Agent | Screen::Plan | Screen::Memoria => None,
     }
 }
