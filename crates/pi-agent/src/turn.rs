@@ -553,6 +553,15 @@ impl Agent {
                     is_error: true,
                     details: None,
                 }
+            } else if name == "agent" {
+                match crate::subagent::run_tool(args, &self.tools, self.subagent_runner.as_ref()) {
+                    Ok(result) => result,
+                    Err(err) => crate::ToolResult {
+                        content: err.to_string(),
+                        is_error: true,
+                        details: None,
+                    },
+                }
             } else {
                 match execute_tool_with(cwd, name, args, &self.tool_context) {
                     Ok(result) => result,

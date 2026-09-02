@@ -582,6 +582,20 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         &mcp::load(&default_agent_dir(), cwd, trusted),
         cwd,
     ));
+    agent.subagent_runner = Some(pi_agent::SubagentRunner::new(|req| {
+        if let Ok(fix) = std::env::var("PI_SUBAGENT_FIXTURE") {
+            let path = std::path::Path::new(&fix);
+            if path.is_file() {
+                return std::fs::read_to_string(path).map_err(|err| err.to_string());
+            }
+            return Ok(fix);
+        }
+        Ok(format!(
+            "subagent ({}) · {}",
+            req.tools.join(","),
+            req.prompt
+        ))
+    }));
     apply_discovered_resources(parsed, &mut agent);
     if !parsed.no_session {
         agent.session = Some(resolve_or_create_session(parsed, session_dir, cwd)?);
@@ -4459,6 +4473,18 @@ fn handle_user_line(
         }
         SlashAction::Llama => {
             session.chrome.status = "llama.cpp is available in interactive mode".into();
+            println!("{}", session.chrome.status);
+            Ok(true)
+        }
+        SlashAction::Plan => {
+            agent.set_plan_mode(true);
+            session.chrome.status = "plan mode · mutations are off until /act".into();
+            println!("{}", session.chrome.status);
+            Ok(true)
+        }
+        SlashAction::Act => {
+            agent.set_plan_mode(false);
+            session.chrome.status = "act · edits and shell commands may run again".into();
             println!("{}", session.chrome.status);
             Ok(true)
         }
@@ -8756,6 +8782,11 @@ mod tests {
             slash::SlashAction::Llama
         ));
         assert!(matches!(slash::parse_line("/mcp"), slash::SlashAction::Mcp));
+        assert!(matches!(
+            slash::parse_line("/plan"),
+            slash::SlashAction::Plan
+        ));
+        assert!(matches!(slash::parse_line("/act"), slash::SlashAction::Act));
         assert!(slash::builtin_slash_commands()
             .iter()
             .any(|command| command.name == "llama"

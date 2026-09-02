@@ -1281,6 +1281,8 @@ pub struct Model {
     /// The header names it only when it is `auto`: the one state that is
     /// worth a permanent reminder.
     pub permission_mode: String,
+    /// `/plan` is on: mutations are frozen until `/act`.
+    pub plan_mode: bool,
     /// Whether tool lines show what they came back with (`ctrl+t`, the
     /// `showToolOutput` setting). Off, a call is one line; on, up to twelve
     /// rows of its output follow it.
@@ -1425,6 +1427,7 @@ impl Model {
             model_name: String::new(),
             thinking_level: "off".into(),
             permission_mode: "ask".into(),
+            plan_mode: false,
             show_tool_output: false,
             jobs_running: 0,
             changes: (0, 0, 0),
@@ -1608,6 +1611,7 @@ impl Model {
     /// The word under the identity mark in the header.
     pub fn mode(&self) -> &'static str {
         match self.screen {
+            Screen::Agent | Screen::Recovery | Screen::Diff if self.plan_mode => "plan",
             Screen::Agent | Screen::Recovery | Screen::Diff => "agent",
             Screen::Plan => "plan",
             Screen::Grafo | Screen::GraphRun => "grafo",
@@ -2286,6 +2290,9 @@ mod tests {
         assert_eq!(m.mode(), "plan");
         m.toggle_screen(Screen::Mensura);
         assert_eq!(m.mode(), "mensura");
+        m.screen = Screen::Agent;
+        m.plan_mode = true;
+        assert_eq!(m.mode(), "plan");
     }
 
     #[test]

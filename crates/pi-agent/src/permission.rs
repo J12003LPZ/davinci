@@ -275,6 +275,8 @@ pub struct PermissionPolicy {
     pub session_allow: Vec<PermissionRule>,
     /// MCP tools whose server marked `readOnlyHint`. `mcp_read` is Read by name.
     pub mcp_read_only: BTreeSet<String>,
+    /// Session-only freeze: mutations refused until `/act`.
+    pub plan_mode: bool,
 }
 
 impl Default for PermissionPolicy {
@@ -288,6 +290,7 @@ impl Default for PermissionPolicy {
             deny: Vec::new(),
             session_allow: Vec::new(),
             mcp_read_only: BTreeSet::new(),
+            plan_mode: false,
         }
     }
 }
@@ -319,6 +322,16 @@ impl PermissionPolicy {
                 ),
             };
         }
+        let class = self.class_of(tool);
+        if self.plan_mode && class != ToolClass::Read && class != ToolClass::Network {
+            return PermissionVerdict::Deny {
+                reason: format!(
+                    "{} (`{}`).",
+                    crate::PLAN_MODE_DENIAL,
+                    summary_of(tool, &subject)
+                ),
+            };
+        }
         if self.mode == PermissionMode::Auto {
             return PermissionVerdict::Allow;
         }
@@ -330,7 +343,6 @@ impl PermissionPolicy {
         {
             return PermissionVerdict::Allow;
         }
-        let class = self.class_of(tool);
         if class == ToolClass::Read {
             return PermissionVerdict::Allow;
         }
@@ -902,5 +914,36 @@ mod tests {
             ),
             PermissionVerdict::Allow
         ));
+    }
+
+    #[test]
+    fn plan_mode_freezes_mutations_and_keeps_reads() {
+        let mut policy = PermissionPolicy::new(PermissionMode::Auto);
+        policy.plan_mode = true;
+        assert!(matches!(
+            policy.decide("c1", "read", &json!({"path": "a.rs"}), &cwd()),
+            PermissionVerdict::Allow
+        ));
+        assert!(matches!(
+            policy.decide("c1", "todo", &json!({"items": []}), &cwd()),
+            PermissionVerdict::Allow
+        ));
+        match policy.decide(
+            "c1",
+            "write",
+            &json!({"path": "a.rs", "content": "x"}),
+            &cwd(),
+        ) {
+            PermissionVerdict::Deny { reason } => {
+                assert!(reason.contains("plan mode"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match policy.decide("c1", "agent", &json!({"prompt": "x"}), &cwd()) {
+            PermissionVerdict::Deny { reason } => {
+                assert!(reason.contains("plan mode"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -71,6 +71,12 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ),
         ("llama", "Manage llama.cpp router models", None),
         ("mcp", "Connected MCP servers, tools and errors", None),
+        (
+            "plan",
+            "Freeze mutations; the model may only read and plan",
+            None,
+        ),
+        ("act", "Leave plan mode and allow edits again", None),
         ("quit", "Quit pi", None),
     ]
     .into_iter()
@@ -119,6 +125,8 @@ pub enum SlashAction {
     ScopedModels,
     Llama,
     Mcp,
+    Plan,
+    Act,
 }
 
 pub fn parse_line(line: &str) -> SlashAction {
@@ -178,6 +186,8 @@ pub fn parse_line(line: &str) -> SlashAction {
         "session" => SlashAction::SessionInfo,
         "llama" => SlashAction::Llama,
         "mcp" => SlashAction::Mcp,
+        "plan" => SlashAction::Plan,
+        "act" => SlashAction::Act,
         "help" => SlashAction::Status(
             builtin_slash_commands()
                 .into_iter()

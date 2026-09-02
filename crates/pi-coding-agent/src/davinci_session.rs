@@ -139,6 +139,15 @@ pub fn target_of(tool_name: &str, args: &serde_json::Value) -> String {
                 .unwrap_or_default();
             format!("edit {}{cell}", field("path"))
         }
+        "agent" => {
+            let label = args
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| clip(text, 60))
+                .unwrap_or_else(|| field("prompt"));
+            format!("agent {label}")
+        }
         "mcp_read" => format!("mcp {} {}", field("server"), field("uri")),
         name if name.starts_with("mcp__") => mcp_target(name, args),
         other => {
@@ -160,6 +169,7 @@ pub fn verb_of(tool_name: &str) -> &'static str {
         "bash" | "powershell" | "job_kill" => "testing",
         "edit" | "write" | "notebook_edit" => "constructing",
         "todo" => "planning",
+        "agent" => "delegating",
         name if name.starts_with("memory") => "recalling",
         name if name.starts_with("graph") => "tracing",
         _ => "working",
@@ -1630,6 +1640,12 @@ pub fn corpus(
         "connected MCP servers · tools and errors",
         "command",
     ));
+    items.push(CorpusItem::new(
+        "/plan",
+        "freeze mutations · the model may only read",
+        "command",
+    ));
+    items.push(CorpusItem::new("/act", "leave plan mode", "command"));
 
     for tool in &agent.tools {
         items.push(CorpusItem::new(tool, &tool_summary(tool), "tool"));
@@ -2733,6 +2749,20 @@ pub fn perform(
             open_mcp_sheet(agent, model);
             Ok(Done::Opened)
         }
+        SlashAction::Plan => {
+            agent.set_plan_mode(true);
+            model.plan_mode = true;
+            Ok(Done::Said(
+                "plan mode · mutations are off until /act".into(),
+            ))
+        }
+        SlashAction::Act => {
+            agent.set_plan_mode(false);
+            model.plan_mode = false;
+            Ok(Done::Said(
+                "act · edits and shell commands may run again".into(),
+            ))
+        }
         SlashAction::Llama => Ok(Done::Said(format!(
             "llama.cpp server {}",
             std::env::var("LLAMA_BASE_URL")
@@ -2896,6 +2926,7 @@ pub fn run(
         .mode
         .as_str()
         .to_string();
+    model.plan_mode = agent.plan_mode;
     model.show_tool_output =
         crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd)
             .show_tool_output
@@ -6548,6 +6579,8 @@ mod tests {
             "/scoped-models",
             "/llama",
             "/mcp",
+            "/plan",
+            "/act",
             "/thinking",
             "/thinking high",
             "/logout",
@@ -6954,6 +6987,8 @@ mod tests {
         assert!(names.contains(&"/todo"), "{names:?}");
         assert!(names.contains(&"/jobs"), "{names:?}");
         assert!(names.contains(&"/mcp"), "{names:?}");
+        assert!(names.contains(&"/plan"), "{names:?}");
+        assert!(names.contains(&"/act"), "{names:?}");
     }
 
     #[test]
@@ -7345,6 +7380,14 @@ mod tests {
         assert_eq!(
             target_of("mcp__memory__echo", &json!({"text": "hi"})),
             "mcp memory echo hi"
+        );
+        assert_eq!(verb_of("agent"), "delegating");
+        assert_eq!(
+            target_of(
+                "agent",
+                &json!({"prompt": "scan the crate", "description": "survey"})
+            ),
+            "agent survey"
         );
     }
 

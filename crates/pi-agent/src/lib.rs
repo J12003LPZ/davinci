@@ -13,6 +13,7 @@ pub mod notebook;
 mod permission;
 mod queues;
 mod skills;
+mod subagent;
 mod templates;
 pub mod todo;
 mod tools;
@@ -53,6 +54,10 @@ pub use permission::{
 };
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
 pub use skills::{discover_skills, expand_skill_command, expand_user_text, Skill};
+pub use subagent::{
+    scoped_tools, SubagentRequest, SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX,
+    PLAN_MODE_DENIAL,
+};
 pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, strip_frontmatter,
     substitute_args, PromptTemplate,
@@ -187,6 +192,9 @@ pub struct Agent {
     /// (`todo.rs`), shared with the tool thread and the shell.
     pub tool_context: ToolContext,
     pub summarizer: Option<Summarizer>,
+    pub subagent_runner: Option<crate::subagent::SubagentRunner>,
+    /// When true, mutations are refused until `/act`.
+    pub plan_mode: bool,
     pub block_images: bool,
     pub auto_resize_images: bool,
     pub retry_aborted: bool,
@@ -243,6 +251,8 @@ impl Agent {
             approver: None,
             tool_context: ToolContext::default(),
             summarizer: None,
+            subagent_runner: None,
+            plan_mode: false,
             block_images: false,
             auto_resize_images: true,
             retry_aborted: false,
@@ -261,6 +271,19 @@ impl Agent {
     /// Restore the base prompt before each extension-aware prompt turn.
     pub fn reset_system_prompt_to_base(&mut self) {
         self.system_prompt = self.base_system_prompt.clone();
+        if self.plan_mode {
+            self.system_prompt.push_str("\n\n");
+            self.system_prompt.push_str(crate::PLAN_MODE_APPENDIX);
+        }
+    }
+
+    pub fn set_plan_mode(&mut self, on: bool) {
+        self.plan_mode = on;
+        self.permissions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .plan_mode = on;
+        self.reset_system_prompt_to_base();
     }
 
     /// Replace the ephemeral context used for the next provider request.

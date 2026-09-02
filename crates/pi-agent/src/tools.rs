@@ -27,6 +27,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "job_kill",
     "notebook_edit",
     "mcp_read",
+    "agent",
 ];
 
 /// What the built-in tools share across calls: the background jobs and the
@@ -179,6 +180,11 @@ pub fn tool_specs() -> Vec<AgentTool> {
             name: "mcp_read".into(),
             description: "Read a resource from a connected MCP server. Pass { server, uri }.".into(),
             parameters: serde_json::json!({"type":"object","properties":{"server":{"type":"string","description":"MCP server name"},"uri":{"type":"string","description":"Resource URI"}},"required":["server","uri"]}),
+        },
+        AgentTool {
+            name: "agent".into(),
+            description: "Start a nested worker with a scoped read-only tool list. Pass a prompt; optionally tools (an allow-list) and a short description. The worker cannot edit, run a shell, or start another worker. Returns its last reply.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"prompt":{"type":"string"},"tools":{"type":"array","items":{"type":"string"}},"description":{"type":"string"}},"required":["prompt"]}),
         },
     ]
 }
