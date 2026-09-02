@@ -11,8 +11,7 @@ use super::{markdown, studio};
 use crate::davinci::model::{Entry, HunkKind, Model};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, detail_line, failure_line, indent, span, span_strong, tool_line, wrap,
-    MEASURE,
+    blank, clip_ellipsis, detail_line, failure_line, indent, span, tool_line, wrap, MEASURE,
 };
 
 /// How many rows of live reasoning are shown while it streams.
@@ -65,10 +64,10 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             span(clip_ellipsis(text, width.saturating_sub(4)), th.muted),
         ])],
 
-        Entry::Agent(name) => vec![Line::from(vec![
-            span_strong(format!("{} ", glyph::AGENT), th.primary, th),
-            span(name.clone(), th.text),
-        ])],
+        // The agent's turn is not announced: the reply follows the prompt
+        // after a gap, as in claude code. The entry stays in the transcript
+        // as the anchor the streaming prose is appended after.
+        Entry::Agent(_) => Vec::new(),
 
         Entry::Tool {
             state,
@@ -467,11 +466,25 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_turn_opens_with_the_agent_mark() {
+    fn an_agent_turn_has_no_label_line() {
         let m = model(100);
-        let rows = lines(&m, &[Entry::agent("davinci")], 100);
-        assert_eq!(text(&rows[0]), "◆ davinci");
-        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.primary));
+        let rows = lines(
+            &m,
+            &[
+                Entry::user("hello"),
+                Entry::Gap,
+                Entry::agent("davinci"),
+                Entry::prose("Hello! How can I help?"),
+            ],
+            100,
+        );
+        let texts: Vec<String> = rows.iter().map(text).collect();
+        assert!(
+            !texts.iter().any(|row| row.contains("davinci")),
+            "{texts:?}"
+        );
+        assert_eq!(texts[0], "> hello");
+        assert_eq!(texts[2], "Hello! How can I help?");
     }
 
     #[test]

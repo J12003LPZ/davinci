@@ -1389,6 +1389,9 @@ pub struct Model {
     /// Rows the loaded extensions have asked for.
     pub extensions: Extensions,
     pub running: bool,
+    /// A `ctrl+c` at rest was pressed once; the next one within the window
+    /// leaves. The hint row says so while it is up.
+    pub exit_armed: bool,
     /// The working line's numbers while a turn is under way. `None` between
     /// turns, which is what takes the row off the window.
     pub working: Option<Working>,
@@ -1550,6 +1553,7 @@ impl Model {
             query: String::new(),
             transcript: Vec::new(),
             running: false,
+            exit_armed: false,
             working: None,
             palette_index: 0,
             session_index: 0,

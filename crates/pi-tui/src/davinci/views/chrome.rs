@@ -642,6 +642,9 @@ pub fn composer_height(lines: Option<&[String]>, hinted: bool) -> u16 {
 /// split by hairline bars (`1b`, `1c`).
 fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
     let th = &model.theme;
+    if model.exit_armed {
+        return Line::from(vec![span("ctrl+c again to exit", th.primary)]);
+    }
     let bar = || span(" │ ", th.border);
     let (left, right) = match hint {
         Hint::None => (Vec::new(), Vec::new()),

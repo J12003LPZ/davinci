@@ -3077,6 +3077,11 @@ pub fn run(
         .clone()
         .unwrap_or_else(|| "tree".into());
     let mut last_escape: Option<Instant> = None;
+    // `ctrl+c` at rest, as in claude code: the first press clears what was
+    // being typed and arms the exit; a second within this window leaves.
+    // Any other key disarms it.
+    const DOUBLE_CTRL_C_MS: u64 = 2_000;
+    let mut last_ctrl_c: Option<Instant> = None;
     // Images pasted with ctrl+v, sent with the next prompt so a vision model
     // is reachable from this interface.
     let mut attached_images: Vec<pi_ai::MessageContent> = Vec::new();
@@ -3367,8 +3372,43 @@ pub fn run(
                     } else {
                         last_escape = None;
                     }
+                    let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL);
+                    if !is_ctrl_c {
+                        last_ctrl_c = None;
+                        model.exit_armed = false;
+                    }
                     let was = model.screen;
                     let next = match app::handle_key(&mut model, key) {
+                        Flow::Interrupt => {
+                            let now = Instant::now();
+                            let doubled = last_ctrl_c.is_some_and(|prev| {
+                                now.duration_since(prev) < Duration::from_millis(DOUBLE_CTRL_C_MS)
+                            });
+                            if doubled {
+                                run_stop_hooks(&mut Shell {
+                                    parsed,
+                                    agent,
+                                    model: &mut model,
+                                    terminal: &mut terminal,
+                                    host: &host,
+                                    pending: &mut pending,
+                                    cwd: &cwd,
+                                    dresser: &dresser,
+                                    images: &mut attached_images,
+                                });
+                                Next::Leave
+                            } else {
+                                if !model.composer.trim().is_empty() {
+                                    let _ = model.composer.editor_mut().submit();
+                                }
+                                last_ctrl_c = Some(now);
+                                model.exit_armed = true;
+                                Next::Go
+                            }
+                        }
                         Flow::Quit => {
                             run_stop_hooks(&mut Shell {
                                 parsed,
@@ -3461,7 +3501,7 @@ pub fn run(
                             }
                             Next::Go
                         }
-                        Flow::Continue | Flow::Interrupt => Next::Go,
+                        Flow::Continue => Next::Go,
                     };
                     // Recall is a search, so it runs when the instrument is
                     // summoned rather than being kept warm behind it.
