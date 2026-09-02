@@ -8,27 +8,212 @@
 //! Tests never touch the network: `PI_WEB_FETCH_FIXTURE` and
 //! `PI_WEB_SEARCH_FIXTURE` name JSON files that answer instead, and
 //! `PI_OFFLINE` / `PI_DISABLE_NETWORK` refuse outright.
+//!
+//! The model chooses the URL, so `web_fetch` guards against server-side
+//! request forgery: local hostnames and loopback, private, link-local,
+//! unspecified, multicast and broadcast addresses (literal, DNS-resolved, or
+//! IPv4-mapped IPv6) are refused before any connection, and again on every
+//! redirect hop, which the tool follows by hand. Set
+//! `PI_WEB_FETCH_ALLOW_PRIVATE=1` to fetch from a development server on such
+//! an address.
 
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use url::Url;
+use url::{Host, Url};
 
 use crate::tools::{truncate_read, ToolResult};
 
 const USER_AGENT: &str = concat!("pi-rust/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_CAP: u64 = 10 * 1024 * 1024;
+const BODY_CAP_LABEL: &str = "10 MB";
+const MAX_REDIRECTS: usize = 5;
 const DEFAULT_RESULTS: usize = 8;
 const MAX_RESULTS: usize = 20;
 
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
+}
+
+/// `PI_WEB_FETCH_ALLOW_PRIVATE=1` lifts the address guard so a developer can
+/// point `web_fetch` at `http://localhost:3000` or a machine on the LAN. The
+/// scheme check and the redirect cap stay. Off by default; never set it in a
+/// shared or CI environment.
+fn allow_private() -> bool {
+    env_flag("PI_WEB_FETCH_ALLOW_PRIVATE")
+}
+
 fn network_disabled() -> bool {
-    ["PI_OFFLINE", "PI_DISABLE_NETWORK"].iter().any(|name| {
-        std::env::var(name)
-            .map(|value| !value.is_empty() && value != "0")
-            .unwrap_or(false)
-    })
+    ["PI_OFFLINE", "PI_DISABLE_NETWORK"]
+        .iter()
+        .any(|name| env_flag(name))
+}
+
+/// Why an address may not be fetched, or `None` when it may.
+fn ip_refusal(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => ipv4_refusal(v4),
+        IpAddr::V6(v6) => ipv6_refusal(v6),
+    }
+}
+
+fn ipv4_refusal(ip: Ipv4Addr) -> Option<&'static str> {
+    if ip.is_unspecified() {
+        Some("unspecified address")
+    } else if ip.is_loopback() {
+        Some("loopback address")
+    } else if ip.is_link_local() {
+        // 169.254/16, which includes the cloud metadata endpoint.
+        Some("link-local address")
+    } else if ip.is_private() {
+        Some("private address")
+    } else if ip.is_broadcast() {
+        Some("broadcast address")
+    } else if ip.is_multicast() {
+        Some("multicast address")
+    } else {
+        None
+    }
+}
+
+fn ipv6_refusal(ip: Ipv6Addr) -> Option<&'static str> {
+    if ip.is_unspecified() {
+        return Some("unspecified address");
+    }
+    if ip.is_loopback() {
+        return Some("loopback address");
+    }
+    if ip.is_multicast() {
+        return Some("multicast address");
+    }
+    // `::ffff:a.b.c.d` (mapped) and `::a.b.c.d` (compatible) forms of an
+    // IPv4 address are judged as that address. `to_ipv4` would also turn
+    // `::1` into `0.0.0.1`, which is why loopback is checked first.
+    if let Some(v4) = ip.to_ipv4() {
+        return ipv4_refusal(v4);
+    }
+    let first = ip.segments()[0];
+    if first & 0xfe00 == 0xfc00 {
+        // fc00::/7, unique local.
+        return Some("private address");
+    }
+    if first & 0xffc0 == 0xfe80 {
+        // fe80::/10.
+        return Some("link-local address");
+    }
+    None
+}
+
+/// A hostname that names this machine or the local network, whatever DNS
+/// says about it.
+fn local_name_refusal(name: &str) -> Option<&'static str> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name == "localhost" || name.ends_with(".localhost") {
+        Some("local hostname")
+    } else if name.ends_with(".local") {
+        Some("mDNS hostname")
+    } else {
+        None
+    }
+}
+
+/// Resolve `host:port` and refuse when any of its addresses is one the
+/// guard rejects; the caller decides whether to consult DNS at all.
+fn resolved_refusal(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| format!("could not resolve {host}: {err}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("could not resolve {host}: no addresses"));
+    }
+    for addr in &addrs {
+        if let Some(why) = ip_refusal(addr.ip()) {
+            return Err(format!("{host} resolves to {} ({why})", addr.ip()));
+        }
+    }
+    Ok(addrs)
+}
+
+/// Refuse `url` before any connection is made. `resolve` asks DNS for the
+/// host's addresses; the fixture path passes `false` so tests never resolve
+/// a name. The scheme is checked regardless of `PI_WEB_FETCH_ALLOW_PRIVATE`.
+fn guard(url: &Url, resolve: bool) -> Result<(), String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "web_fetch refused {url}: only http and https can be fetched, not {}",
+            url.scheme()
+        ));
+    }
+    if allow_private() {
+        return Ok(());
+    }
+    let refused = |why: String| Err(format!("web_fetch refused {url}: {why}"));
+    match url.host() {
+        None => refused("no host".into()),
+        Some(Host::Ipv4(ip)) => match ipv4_refusal(ip) {
+            Some(why) => refused(why.into()),
+            None => Ok(()),
+        },
+        Some(Host::Ipv6(ip)) => match ipv6_refusal(ip) {
+            Some(why) => refused(why.into()),
+            None => Ok(()),
+        },
+        Some(Host::Domain(name)) => {
+            if let Some(why) = local_name_refusal(name) {
+                return refused(why.into());
+            }
+            if resolve {
+                let port = url.port_or_known_default().unwrap_or(80);
+                if let Err(why) = resolved_refusal(name, port) {
+                    return refused(why);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The resolver the live agent connects through: it re-applies the address
+/// guard to the addresses actually dialled, so a name that changes its
+/// answer between the pre-flight check and the connection (DNS rebinding)
+/// is still refused.
+fn guarded_resolve(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+    let (host, port) = netloc
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+        .unwrap_or((netloc, 80));
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if allow_private() {
+        return netloc.to_socket_addrs().map(Iterator::collect);
+    }
+    resolved_refusal(host, port)
+        .map_err(|why| std::io::Error::new(std::io::ErrorKind::PermissionDenied, why))
+}
+
+fn build_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(TIMEOUT)
+        .redirects(0)
+        .user_agent(USER_AGENT)
+        .resolver(guarded_resolve)
+        .build()
+}
+
+/// Read at most `cap` bytes; the flag says whether more was left behind.
+fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    let over = bytes.len() as u64 > cap;
+    if over {
+        bytes.truncate(cap as usize);
+    }
+    Ok((bytes, over))
 }
 
 fn fixture(name: &str) -> Option<Value> {
@@ -43,41 +228,102 @@ struct Fetched {
     content_type: String,
     body: String,
     final_url: String,
+    /// The body hit `BODY_CAP` and the rest was not read.
+    truncated_body: bool,
 }
 
+/// One round trip: the page, or where the server sent us instead.
+enum Hop {
+    Page(Fetched),
+    Redirect(String),
+}
+
+/// Follow redirects by hand so every hop passes the guard. The fixture
+/// (`PI_WEB_FETCH_FIXTURE`) answers each hop by URL: an entry with a 3xx
+/// `status` and a `location` redirects, `truncatedBody: true` stands in for
+/// a body that hit the cap, and no name is ever resolved.
 fn fetch(url: &Url) -> Result<Fetched, String> {
-    if let Some(map) = fixture("PI_WEB_FETCH_FIXTURE") {
-        let hit = map
-            .get(url.as_str())
-            .or_else(|| map.get(url.as_str().trim_end_matches('/')))
-            .ok_or_else(|| format!("fixture has no entry for {url}"))?;
-        return Ok(Fetched {
-            status: hit.get("status").and_then(Value::as_u64).unwrap_or(200) as u16,
-            content_type: hit
-                .get("contentType")
-                .and_then(Value::as_str)
-                .unwrap_or("text/html")
-                .to_string(),
-            body: hit
-                .get("body")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            final_url: hit
-                .get("finalUrl")
-                .and_then(Value::as_str)
-                .unwrap_or(url.as_str())
-                .to_string(),
-        });
+    let fixtures = fixture("PI_WEB_FETCH_FIXTURE");
+    let agent = match fixtures {
+        Some(_) => None,
+        None if network_disabled() => {
+            return Err("network disabled (PI_OFFLINE / PI_DISABLE_NETWORK)".into());
+        }
+        None => Some(build_agent()),
+    };
+    let mut current = url.clone();
+    let mut hops = 0usize;
+    loop {
+        guard(&current, agent.is_some())?;
+        let hop = match (&fixtures, &agent) {
+            (Some(map), _) => fixture_hop(map, &current)?,
+            (None, Some(agent)) => live_hop(agent, &current)?,
+            (None, None) => unreachable!("a fetch has a fixture or an agent"),
+        };
+        let location = match hop {
+            Hop::Page(page) => return Ok(page),
+            Hop::Redirect(location) => location,
+        };
+        hops += 1;
+        if hops > MAX_REDIRECTS {
+            return Err(format!(
+                "{url} redirected more than {MAX_REDIRECTS} times (last to {location})"
+            ));
+        }
+        let next = current.join(&location).map_err(|err| {
+            format!("{current} redirected to `{location}`, which is not a URL: {err}")
+        })?;
+        if pi_ai::trace::enabled() {
+            pi_ai::trace::log(&format!("web_fetch redirect {current} → {next}"));
+        }
+        current = next;
     }
-    if network_disabled() {
-        return Err("network disabled (PI_OFFLINE / PI_DISABLE_NETWORK)".into());
+}
+
+fn fixture_hop(map: &Value, url: &Url) -> Result<Hop, String> {
+    let hit = map
+        .get(url.as_str())
+        .or_else(|| map.get(url.as_str().trim_end_matches('/')))
+        .ok_or_else(|| format!("fixture has no entry for {url}"))?;
+    let status = hit.get("status").and_then(Value::as_u64).unwrap_or(200) as u16;
+    if let Some(location) = redirect_location(status, hit.get("location").and_then(Value::as_str)) {
+        return Ok(Hop::Redirect(location));
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(TIMEOUT)
-        .redirects(5)
-        .user_agent(USER_AGENT)
-        .build();
+    Ok(Hop::Page(Fetched {
+        status,
+        content_type: hit
+            .get("contentType")
+            .and_then(Value::as_str)
+            .unwrap_or("text/html")
+            .to_string(),
+        body: hit
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        final_url: hit
+            .get("finalUrl")
+            .and_then(Value::as_str)
+            .unwrap_or(url.as_str())
+            .to_string(),
+        truncated_body: hit
+            .get("truncatedBody")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }))
+}
+
+fn redirect_location(status: u16, location: Option<&str>) -> Option<String> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    location
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+        .map(str::to_string)
+}
+
+fn live_hop(agent: &ureq::Agent, url: &Url) -> Result<Hop, String> {
     let response = match agent
         .get(url.as_str())
         .set(
@@ -101,29 +347,29 @@ fn fetch(url: &Url) -> Result<Fetched, String> {
         Err(err) => return Err(format!("could not fetch {url}: {err}")),
     };
     let status = response.status();
-    let final_url = response.get_url().to_string();
+    if let Some(location) = redirect_location(status, response.header("location")) {
+        return Ok(Hop::Redirect(location));
+    }
     let content_type = response
         .header("content-type")
         .unwrap_or("application/octet-stream")
         .to_string();
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take(BODY_CAP)
-        .read_to_end(&mut bytes)
+    let (bytes, truncated_body) = read_capped(response.into_reader(), BODY_CAP)
         .map_err(|err| format!("could not read {url}: {err}"))?;
     if pi_ai::trace::enabled() {
         pi_ai::trace::log(&format!(
-            "web_fetch GET {url} → {status} {content_type} {}k",
-            bytes.len() / 1024
+            "web_fetch GET {url} → {status} {content_type} {}k{}",
+            bytes.len() / 1024,
+            if truncated_body { " (capped)" } else { "" }
         ));
     }
-    Ok(Fetched {
+    Ok(Hop::Page(Fetched {
         status,
         content_type,
         body: String::from_utf8_lossy(&bytes).into_owned(),
-        final_url,
-    })
+        final_url: url.to_string(),
+        truncated_body,
+    }))
 }
 
 fn parse_url(raw: &str) -> Result<Url, String> {
@@ -174,31 +420,56 @@ pub fn fetch_tool(input: &Value) -> Result<ToolResult, String> {
                 "{url} is {kind}, which web_fetch cannot read as text"
             ));
         };
-    let mut body = match title {
+    let body = match title {
         Some(title) if !text.starts_with(&title) => format!("{title}\n\n{text}"),
         _ => text,
     };
-    if let Some(max) = input
+    // The read cap (2000 lines / 50 KB) applies unless the caller chose its
+    // own `maxChars`, which then stands alone.
+    let max_chars = input
         .get("maxChars")
         .and_then(Value::as_u64)
         .map(|n| n as usize)
-        .filter(|n| *n > 0)
-    {
-        if body.chars().count() > max {
-            body = body.chars().take(max).collect::<String>()
-                + &format!("\n\n[truncated to {max} characters]");
+        .filter(|n| *n > 0);
+    let (mut content, truncation) = match max_chars {
+        Some(max) => {
+            let total = body.chars().count();
+            let content = if total > max {
+                body.chars().take(max).collect::<String>()
+                    + &format!("\n\n[truncated to {max} characters]")
+            } else {
+                body
+            };
+            (
+                content,
+                json!({
+                    "truncated": total > max,
+                    "truncatedBy": if total > max { Some("maxChars") } else { None },
+                    "totalChars": total,
+                    "outputChars": total.min(max),
+                    "maxChars": max,
+                }),
+            )
         }
-    }
-    let (content, truncation) = truncate_read(&body, 1, None);
-    let mut content = content;
-    if truncation
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+        None => {
+            let (content, truncation) = truncate_read(&body, 1, None);
+            let mut content = content;
+            if truncation
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                content.push_str(&format!(
+                    "\n\n[Showing {} of {} lines. Use maxChars or ask for a section.]",
+                    truncation["outputLines"], truncation["totalLines"]
+                ));
+            }
+            (content, truncation)
+        }
+    };
+    if fetched.truncated_body {
         content.push_str(&format!(
-            "\n\n[Showing {} of {} lines. Use maxChars or ask for a section.]",
-            truncation["outputLines"], truncation["totalLines"]
+            "\n\n[Body cut at {BODY_CAP_LABEL}; the page is longer than web_fetch reads.]"
         ));
     }
     Ok(ToolResult {
@@ -210,6 +481,7 @@ pub fn fetch_tool(input: &Value) -> Result<ToolResult, String> {
             "status": fetched.status,
             "contentType": fetched.content_type,
             "truncation": truncation,
+            "truncatedBody": fetched.truncated_body,
         })),
     })
 }
@@ -320,8 +592,38 @@ fn search(query: &str, limit: usize) -> Result<(String, Vec<SearchResult>), Stri
         ));
     }
     let mut results = duckduckgo_results(&html);
+    if results.is_empty() {
+        if let Some(reason) = duckduckgo_block(&html) {
+            return Err(format!(
+                "DuckDuckGo answered `{query}` with a {reason} instead of results; \
+                 retry later or set BRAVE_API_KEY to search through Brave"
+            ));
+        }
+    }
     results.truncate(limit);
     Ok(("duckduckgo".into(), results))
+}
+
+/// DuckDuckGo's HTML endpoint sometimes answers automated traffic with an
+/// "anomaly" page — a challenge instead of a result list. A page with no
+/// `result__body` at all that carries one of those markers is that, not an
+/// empty search.
+pub fn duckduckgo_block(html: &str) -> Option<&'static str> {
+    if html.contains("result__body") {
+        return None;
+    }
+    let lower = html.to_ascii_lowercase();
+    if lower.contains("anomaly-modal") || lower.contains("anomaly_modal") {
+        Some("bot check (anomaly page)")
+    } else if lower.contains("bots use duckduckgo too") || lower.contains("challenge-form") {
+        Some("bot check (challenge page)")
+    } else if lower.contains("captcha") {
+        Some("bot check (captcha)")
+    } else if lower.contains("rate limit") || lower.contains("too many requests") {
+        Some("rate limit page")
+    } else {
+        None
+    }
 }
 
 /// `web_search { query, limit? }`.
@@ -1141,5 +1443,286 @@ and <a href="https://example.com/x">https://example.com/x</a>.</p>
         let refused = search_tool(&json!({"query": "x"})).unwrap_err();
         assert!(refused.starts_with("network disabled"), "{refused}");
         std::env::remove_var("PI_OFFLINE");
+    }
+
+    /// Point `PI_WEB_FETCH_FIXTURE` at `map` for the rest of the scope.
+    fn fixture_env(dir: &std::path::Path, map: Value) {
+        let path = dir.join("fetch.json");
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+        std::env::set_var("PI_WEB_FETCH_FIXTURE", &path);
+    }
+
+    #[test]
+    fn addresses_of_this_machine_and_its_networks_are_refused() {
+        let refused = |ip: &str| ip_refusal(ip.parse().unwrap());
+        assert_eq!(refused("127.0.0.1"), Some("loopback address"));
+        assert_eq!(refused("127.8.9.10"), Some("loopback address"));
+        assert_eq!(refused("::1"), Some("loopback address"));
+        assert_eq!(refused("10.1.2.3"), Some("private address"));
+        assert_eq!(refused("172.16.0.1"), Some("private address"));
+        assert_eq!(refused("172.31.255.255"), Some("private address"));
+        assert_eq!(refused("192.168.1.1"), Some("private address"));
+        assert_eq!(refused("fc00::1"), Some("private address"));
+        assert_eq!(refused("fdab::1"), Some("private address"));
+        assert_eq!(refused("169.254.169.254"), Some("link-local address"));
+        assert_eq!(refused("fe80::1"), Some("link-local address"));
+        assert_eq!(refused("0.0.0.0"), Some("unspecified address"));
+        assert_eq!(refused("::"), Some("unspecified address"));
+        assert_eq!(refused("224.0.0.1"), Some("multicast address"));
+        assert_eq!(refused("ff02::1"), Some("multicast address"));
+        assert_eq!(refused("255.255.255.255"), Some("broadcast address"));
+        assert_eq!(refused("::ffff:127.0.0.1"), Some("loopback address"));
+        assert_eq!(refused("::ffff:10.0.0.1"), Some("private address"));
+        assert_eq!(
+            refused("::ffff:169.254.169.254"),
+            Some("link-local address")
+        );
+        assert_eq!(refused("::ffff:192.168.0.1"), Some("private address"));
+        assert_eq!(refused("93.184.216.34"), None);
+        assert_eq!(refused("172.32.0.1"), None);
+        assert_eq!(refused("2606:2800:220:1:248:1893:25c8:1946"), None);
+        assert_eq!(refused("::ffff:93.184.216.34"), None);
+
+        assert_eq!(local_name_refusal("localhost"), Some("local hostname"));
+        assert_eq!(local_name_refusal("LocalHost."), Some("local hostname"));
+        assert_eq!(local_name_refusal("api.localhost"), Some("local hostname"));
+        assert_eq!(local_name_refusal("printer.local"), Some("mDNS hostname"));
+        assert_eq!(local_name_refusal("localhost.example.com"), None);
+        assert_eq!(local_name_refusal("example.com"), None);
+
+        // Literals and local names are judged without DNS.
+        let judge = |raw: &str| guard(&Url::parse(raw).unwrap(), false);
+        assert!(judge("https://example.com/").is_ok());
+        assert!(judge("http://8.8.8.8/").is_ok());
+        let err = judge("http://169.254.169.254/latest/meta-data/").unwrap_err();
+        assert_eq!(
+            err,
+            "web_fetch refused http://169.254.169.254/latest/meta-data/: link-local address"
+        );
+        let err = judge("http://[::1]:8080/").unwrap_err();
+        assert!(err.ends_with("loopback address"), "{err}");
+        let err = judge("http://[::ffff:10.0.0.1]/").unwrap_err();
+        assert!(err.ends_with("private address"), "{err}");
+        // The url crate folds numeric host forms into an IPv4 literal.
+        let err = judge("http://2130706433/").unwrap_err();
+        assert!(err.ends_with("loopback address"), "{err}");
+        let err = judge("http://0x7f000001/").unwrap_err();
+        assert!(err.ends_with("loopback address"), "{err}");
+        let err = judge("ftp://example.com/").unwrap_err();
+        assert!(err.contains("only http and https"), "{err}");
+    }
+
+    #[test]
+    fn fetch_refuses_loopback_link_local_private_and_localhost() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // Entries exist for every target so a refusal can only come from
+        // the guard, never from a missing fixture.
+        fixture_env(
+            dir.path(),
+            json!({
+                "http://127.0.0.1/": {"contentType": "text/plain", "body": "secret"},
+                "http://169.254.169.254/": {"contentType": "text/plain", "body": "secret"},
+                "http://10.0.0.5/": {"contentType": "text/plain", "body": "secret"},
+                "http://192.168.1.1/": {"contentType": "text/plain", "body": "secret"},
+                "http://localhost:3000/": {"contentType": "text/plain", "body": "secret"},
+                "http://app.localhost/": {"contentType": "text/plain", "body": "secret"},
+                "http://[::1]/": {"contentType": "text/plain", "body": "secret"},
+                "http://[::ffff:127.0.0.1]/": {"contentType": "text/plain", "body": "secret"},
+                "https://example.com/": {"contentType": "text/plain", "body": "public"}
+            }),
+        );
+        let refused = |raw: &str| fetch_tool(&json!({"url": raw})).unwrap_err();
+        assert_eq!(
+            refused("http://127.0.0.1/"),
+            "web_fetch refused http://127.0.0.1/: loopback address"
+        );
+        assert_eq!(
+            refused("http://169.254.169.254/"),
+            "web_fetch refused http://169.254.169.254/: link-local address"
+        );
+        assert_eq!(
+            refused("http://10.0.0.5/"),
+            "web_fetch refused http://10.0.0.5/: private address"
+        );
+        assert_eq!(
+            refused("192.168.1.1"),
+            "web_fetch refused https://192.168.1.1/: private address"
+        );
+        assert_eq!(
+            refused("http://localhost:3000/"),
+            "web_fetch refused http://localhost:3000/: local hostname"
+        );
+        assert_eq!(
+            refused("http://app.localhost/"),
+            "web_fetch refused http://app.localhost/: local hostname"
+        );
+        assert_eq!(
+            refused("http://[::1]/"),
+            "web_fetch refused http://[::1]/: loopback address"
+        );
+        let mapped = refused("http://[::ffff:127.0.0.1]/");
+        assert!(
+            mapped.starts_with("web_fetch refused http://[::ffff:")
+                && mapped.ends_with(": loopback address"),
+            "{mapped}"
+        );
+        let public = fetch_tool(&json!({"url": "https://example.com/"})).unwrap();
+        assert_eq!(public.content, "public");
+
+        // The escape hatch for local development servers.
+        std::env::set_var("PI_WEB_FETCH_ALLOW_PRIVATE", "1");
+        let local = fetch_tool(&json!({"url": "http://localhost:3000/"})).unwrap();
+        assert_eq!(local.content, "secret");
+        let scheme = fetch_tool(&json!({"url": "gopher://localhost/"})).unwrap_err();
+        assert!(scheme.contains("only http and https"), "{scheme}");
+        std::env::remove_var("PI_WEB_FETCH_ALLOW_PRIVATE");
+        std::env::remove_var("PI_WEB_FETCH_FIXTURE");
+    }
+
+    #[test]
+    fn every_redirect_hop_passes_the_guard() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fixture_env(
+            dir.path(),
+            json!({
+                // A public chain: absolute, then relative, then the page.
+                "https://a.example/start": {"status": 301, "location": "https://b.example/one"},
+                "https://b.example/one": {"status": 302, "location": "/two"},
+                "https://b.example/two": {"contentType": "text/plain", "body": "landed"},
+                // Hop 2 turns inward.
+                "https://a.example/trap": {"status": 302, "location": "https://b.example/hop"},
+                "https://b.example/hop": {"status": 307, "location": "http://10.0.0.5/admin"},
+                "http://10.0.0.5/admin": {"contentType": "text/plain", "body": "secret"},
+                // A hop to the metadata service, by relative-looking scheme swap.
+                "https://a.example/meta": {"status": 303, "location": "http://169.254.169.254/latest/"},
+                // A hop off http.
+                "https://a.example/file": {"status": 302, "location": "file:///etc/passwd"},
+                // A loop.
+                "https://a.example/loop": {"status": 302, "location": "https://a.example/loop"},
+                // A 3xx without a location is a page.
+                "https://a.example/moved": {"status": 304, "contentType": "text/plain", "body": "unchanged"}
+            }),
+        );
+        let landed = fetch_tool(&json!({"url": "https://a.example/start"})).unwrap();
+        assert_eq!(landed.content, "landed");
+        let details = landed.details.unwrap();
+        assert_eq!(details["url"], "https://a.example/start");
+        assert_eq!(details["finalUrl"], "https://b.example/two");
+        assert_eq!(details["status"], 200);
+
+        let trap = fetch_tool(&json!({"url": "https://a.example/trap"})).unwrap_err();
+        assert_eq!(
+            trap,
+            "web_fetch refused http://10.0.0.5/admin: private address"
+        );
+        let meta = fetch_tool(&json!({"url": "https://a.example/meta"})).unwrap_err();
+        assert_eq!(
+            meta,
+            "web_fetch refused http://169.254.169.254/latest/: link-local address"
+        );
+        let file = fetch_tool(&json!({"url": "https://a.example/file"})).unwrap_err();
+        assert!(file.contains("only http and https"), "{file}");
+        let looped = fetch_tool(&json!({"url": "https://a.example/loop"})).unwrap_err();
+        assert!(looped.contains("redirected more than 5 times"), "{looped}");
+        let moved = fetch_tool(&json!({"url": "https://a.example/moved"})).unwrap();
+        assert_eq!(moved.content, "unchanged");
+        std::env::remove_var("PI_WEB_FETCH_FIXTURE");
+    }
+
+    #[test]
+    fn a_body_that_hits_the_cap_is_marked() {
+        let (bytes, over) = read_capped(std::io::Cursor::new(b"0123456789"), 10).unwrap();
+        assert_eq!(bytes, b"0123456789");
+        assert!(!over);
+        let (bytes, over) = read_capped(std::io::Cursor::new(b"0123456789x"), 10).unwrap();
+        assert_eq!(bytes, b"0123456789");
+        assert!(over);
+
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fixture_env(
+            dir.path(),
+            json!({
+                "https://example.com/big": {"contentType": "text/plain", "body": "head of a huge page", "truncatedBody": true},
+                "https://example.com/small": {"contentType": "text/plain", "body": "whole"}
+            }),
+        );
+        let big = fetch_tool(&json!({"url": "https://example.com/big"})).unwrap();
+        assert!(
+            big.content
+                .starts_with("head of a huge page\n\n[Body cut at 10 MB;"),
+            "{}",
+            big.content
+        );
+        assert_eq!(big.details.unwrap()["truncatedBody"], true);
+        let small = fetch_tool(&json!({"url": "https://example.com/small"})).unwrap();
+        assert_eq!(small.content, "whole");
+        assert_eq!(small.details.unwrap()["truncatedBody"], false);
+        std::env::remove_var("PI_WEB_FETCH_FIXTURE");
+    }
+
+    #[test]
+    fn max_chars_replaces_the_read_cap() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let long = (1..=3000).fold(String::new(), |mut text, n| {
+            text.push_str(&format!("line {n}\n"));
+            text
+        });
+        fixture_env(
+            dir.path(),
+            json!({
+                "https://example.com/long": {"contentType": "text/plain", "body": long}
+            }),
+        );
+        // Without maxChars the read cap of 2000 lines applies.
+        let capped = fetch_tool(&json!({"url": "https://example.com/long"})).unwrap();
+        assert!(
+            capped.content.contains("[Showing 2000 of 3000 lines."),
+            "{}",
+            &capped.content[capped.content.len() - 200..]
+        );
+        let truncation = &capped.details.unwrap()["truncation"];
+        assert_eq!(truncation["truncatedBy"], "lines");
+
+        // With maxChars only that cut applies: all 3000 lines come through.
+        let whole =
+            fetch_tool(&json!({"url": "https://example.com/long", "maxChars": 100_000})).unwrap();
+        assert!(
+            whole.content.ends_with("line 3000\n"),
+            "{}",
+            &whole.content[whole.content.len() - 60..]
+        );
+        assert!(!whole.content.contains("[Showing"), "{}", whole.content);
+        let truncation = &whole.details.unwrap()["truncation"];
+        assert_eq!(truncation["truncated"], false);
+        assert_eq!(truncation["maxChars"], 100_000);
+        assert_eq!(truncation["totalChars"], long.chars().count());
+
+        let cut = fetch_tool(&json!({"url": "https://example.com/long", "maxChars": 7})).unwrap();
+        assert_eq!(cut.content, "line 1\n\n\n[truncated to 7 characters]");
+        let truncation = &cut.details.unwrap()["truncation"];
+        assert_eq!(truncation["truncatedBy"], "maxChars");
+        assert_eq!(truncation["outputChars"], 7);
+        std::env::remove_var("PI_WEB_FETCH_FIXTURE");
+    }
+
+    #[test]
+    fn a_duckduckgo_bot_check_is_named_not_mistaken_for_no_results() {
+        const ANOMALY: &str = r#"<!DOCTYPE html><html><head><title>DuckDuckGo</title></head>
+<body><div class="anomaly-modal__modal"><div class="anomaly-modal__title">
+Unfortunately, bots use DuckDuckGo too.</div><p>Please complete the following
+challenge to confirm this search was made by a human.</p>
+<form class="challenge-form" action="/html/"></form></div></body></html>"#;
+        assert_eq!(duckduckgo_block(ANOMALY), Some("bot check (anomaly page)"));
+        assert!(duckduckgo_results(ANOMALY).is_empty());
+        // A genuinely empty result list is not a block.
+        const EMPTY: &str = r#"<div class="results"><div class="no-results">
+No results.</div></div>"#;
+        assert_eq!(duckduckgo_block(EMPTY), None);
+        // A page with results is never a block, whatever else it says.
+        assert_eq!(duckduckgo_block(DDG), None);
     }
 }

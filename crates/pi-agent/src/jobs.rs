@@ -230,6 +230,35 @@ pub struct JobSummary {
     pub elapsed: Duration,
 }
 
+/// Every job any book in the process has started, weakly: a signal exit
+/// goes through `process::exit`, which runs no `Drop`, so the reaper walks
+/// this list instead of the books.
+static LIVE_JOBS: Mutex<Vec<(u32, std::sync::Weak<Shared>)>> = Mutex::new(Vec::new());
+
+/// Kill every job still running in this process. For exits that skip
+/// destructors (a signal, a hung turn); a normal return drops the books.
+pub fn kill_every_job() {
+    let live = std::mem::take(&mut *LIVE_JOBS.lock().unwrap_or_else(|err| err.into_inner()));
+    for (pid, weak) in live {
+        let Some(shared) = weak.upgrade() else {
+            continue;
+        };
+        if !shared
+            .status
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .is_running()
+        {
+            continue;
+        }
+        kill_tree(pid);
+        let mut guard = shared.child.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(child) = guard.as_mut() {
+            let _ = child.kill();
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct JobBook {
     jobs: Vec<Job>,
@@ -249,6 +278,11 @@ impl JobBook {
             child: Mutex::new(None),
             finished_at: Mutex::new(None),
         });
+        {
+            let mut live = LIVE_JOBS.lock().unwrap_or_else(|err| err.into_inner());
+            live.retain(|(_, weak)| weak.strong_count() > 0);
+            live.push((pid, Arc::downgrade(&shared)));
+        }
         for pipe in [
             child
                 .stdout
@@ -479,8 +513,13 @@ pub fn started_result(id: u32, pid: u32, command: &str) -> crate::ToolResult {
     }
 }
 
-/// `job_output { jobId, wait?, tail? }`.
-pub fn output_tool(book: &Arc<Mutex<JobBook>>, input: &Value) -> Result<crate::ToolResult, String> {
+/// `job_output { jobId, wait?, tail? }`. `abort` ends a wait early when the
+/// turn is interrupted; the job itself keeps running.
+pub fn output_tool(
+    book: &Arc<Mutex<JobBook>>,
+    input: &Value,
+    abort: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<crate::ToolResult, String> {
     let id = job_id(input)?;
     let wait = input
         .get("wait")
@@ -505,6 +544,7 @@ pub fn output_tool(book: &Arc<Mutex<JobBook>>, input: &Value) -> Result<crate::T
             .unwrap_or_else(|err| err.into_inner())
             .is_running()
             && Instant::now() < deadline
+            && !abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
         {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -642,7 +682,7 @@ mod tests {
     fn job_output_waits_for_an_exit_and_reports_the_status() {
         let book = Arc::new(Mutex::new(JobBook::default()));
         let id = book.lock().unwrap().register("echo one", spawn("echo one"));
-        let result = output_tool(&book, &json!({"jobId": id, "wait": 10})).unwrap();
+        let result = output_tool(&book, &json!({"jobId": id, "wait": 10}), None).unwrap();
         assert!(result.content.contains("one"), "{}", result.content);
         assert!(
             result.content.contains(&format!("[job {id} exit 0 · ")),
@@ -650,11 +690,12 @@ mod tests {
             result.content
         );
         assert_eq!(result.details.as_ref().unwrap()["exitCode"], 0);
-        let missing = output_tool(&book, &json!({"jobId": 9})).unwrap_err();
+        let missing = output_tool(&book, &json!({"jobId": 9}), None).unwrap_err();
         assert_eq!(missing, "No background job 9. Known jobs: 1.");
         let none = output_tool(
             &Arc::new(Mutex::new(JobBook::default())),
             &json!({"jobId": 1}),
+            None,
         )
         .unwrap_err();
         assert!(none.contains("no jobs have been started"));

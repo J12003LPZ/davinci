@@ -142,7 +142,20 @@ impl SseFramer {
             self.saw_done = true;
             return None;
         }
-        let parsed = serde_json::from_str::<Value>(&data).ok()?;
+        let parsed = match serde_json::from_str::<Value>(&data) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                // The frames that fail to parse are the ones a trace is
+                // read for: a truncated tail, a proxy's HTML, a stray line.
+                if crate::trace::enabled() {
+                    crate::trace::log(&format!(
+                        "sse frame dropped: {err}: {}",
+                        data.chars().take(200).collect::<String>()
+                    ));
+                }
+                return None;
+            }
+        };
         Some(SseFrame {
             event,
             data: parsed,

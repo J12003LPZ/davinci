@@ -101,8 +101,32 @@ pub fn set_cell_source(cell: &mut Value, source: &str) {
     }
 }
 
-fn new_cell(cell_type: &str, source: &str) -> Value {
+/// nbformat 4.5 and later give every cell an `id`; Jupyter warns and
+/// rewrites a notebook whose cells lack one.
+fn wants_cell_ids(notebook: &Value) -> bool {
+    notebook
+        .get("nbformat")
+        .and_then(Value::as_u64)
+        .unwrap_or(4)
+        > 4
+        || notebook
+            .get("nbformat_minor")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= 5
+}
+
+fn new_cell(cell_type: &str, source: &str, with_id: bool) -> Value {
     let mut object = Map::new();
+    if with_id {
+        let id: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect();
+        object.insert("id".into(), Value::String(id));
+    }
     object.insert("cell_type".into(), Value::String(cell_type.to_string()));
     object.insert("metadata".into(), Value::Object(Map::new()));
     object.insert("source".into(), source_value(source));
@@ -416,8 +440,9 @@ pub fn structural_edit(
                 "notebook_edit insert needs `source` — the new cell's content.".to_string()
             })?;
             let kind = cell_type.unwrap_or("code");
+            let with_id = wants_cell_ids(notebook);
             let cells = cells_mut(notebook).ok_or("not a notebook")?;
-            cells.insert(cell, new_cell(kind, source));
+            cells.insert(cell, new_cell(kind, source, with_id));
             let (diff, _) = generate_diff_string("", &normalize_to_lf(source), 4);
             Ok(StructuralEdit {
                 summary: format!(

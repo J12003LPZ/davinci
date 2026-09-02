@@ -69,7 +69,15 @@ impl PermissionSources {
             pick(&self.user)
                 .iter()
                 .chain(self.project.iter().flat_map(|project| pick(project).iter()))
-                .filter_map(|text| PermissionRule::parse(text))
+                .filter_map(|text| {
+                    let rule = PermissionRule::parse(text);
+                    // A mistyped deny that vanished silently would be a hole
+                    // the user believes is closed.
+                    if rule.is_none() {
+                        eprintln!("pi: ignoring malformed permission rule `{text}`");
+                    }
+                    rule
+                })
                 .collect()
         };
         PermissionPolicy {
@@ -130,7 +138,7 @@ pub fn remember_project_rule(cwd: &Path, rule: &str) -> Result<PathBuf, String> 
             allow.push(serde_json::Value::String(rule.to_string()));
         }
         let encoded = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
-        std::fs::write(&path, format!("{encoded}\n")).map_err(|err| err.to_string())?;
+        write_atomically(&path, &format!("{encoded}\n"))?;
         Ok(path.clone())
     })
 }
@@ -151,9 +159,21 @@ pub fn forget_file_rule(path: &Path, list: &str, rule: &str) -> Result<(), Strin
             items.retain(|item| item.as_str() != Some(rule));
         }
         let encoded = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
-        std::fs::write(path, format!("{encoded}\n")).map_err(|err| err.to_string())?;
+        write_atomically(path, &format!("{encoded}\n"))?;
         Ok(())
     })
+}
+
+/// Write a settings file through a sibling temp file and a rename, so a
+/// crash mid-write leaves the old file rather than an empty one.
+fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&temp, text).map_err(|err| err.to_string())?;
+    if let Err(err) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err.to_string());
+    }
+    Ok(())
 }
 
 /// The rows `/permissions` says: the mode, then every rule by source.

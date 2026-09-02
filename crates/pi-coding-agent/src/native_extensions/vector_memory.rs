@@ -954,8 +954,43 @@ fn promote_chunk(chunk: &MemoryChunk) -> Option<MemoryChunk> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
+
+    /// Read one HTTP/1.1 request fully: the header block and then as many
+    /// body bytes as `Content-Length` announces.
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let size = stream.read(&mut chunk).unwrap();
+            if size == 0 {
+                return String::from_utf8_lossy(&bytes).into_owned();
+            }
+            bytes.extend_from_slice(&chunk[..size]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let size = stream.read(&mut chunk).unwrap();
+            if size == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..size]);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 
     #[test]
     fn identity_is_stable_and_uuid_shaped() {
@@ -1116,9 +1151,12 @@ mod tests {
         let server = thread::spawn(move || {
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 4096];
-                let size = stream.read(&mut request).unwrap();
-                let request = String::from_utf8_lossy(&request[..size]);
+                // Drain the whole request (headers plus Content-Length body)
+                // before answering: ureq writes the JSON body in a second
+                // segment, and closing a socket with unread bytes makes the
+                // kernel reset it, which fails the client's write and sends
+                // the embed onto the legacy fallback path.
+                let request = read_http_request(&mut stream);
                 let body = if request.starts_with("POST /api/embed") {
                     r#"{"embeddings":[[1.0,0.0]]}"#
                 } else {

@@ -222,8 +222,19 @@ pub fn failure_lines(result: &serde_json::Value) -> Vec<String> {
 
 /// The text a tool result carries, whatever shape the event wrapped it in.
 fn gate_denied(result: &serde_json::Value) -> bool {
+    // The gate marks its refusals in `details.denied`; the text prefixes
+    // cover a result that arrives as a bare string (a resumed session).
+    // A command whose own stderr says `Permission denied` is a failure,
+    // not a refusal, and does not start with the gate's prefix.
+    if result
+        .pointer("/details/denied")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
     let text = result_text(result);
-    text.contains("Permission denied") || text.starts_with("plan mode:")
+    text.starts_with("Permission denied: ") || text.starts_with("plan mode:")
 }
 
 fn result_text(result: &serde_json::Value) -> String {
@@ -1491,9 +1502,16 @@ pub fn transcript_from(messages: &[pi_ai::ChatMessage]) -> Vec<Entry> {
                 let (_, index, name, arguments) = open.remove(position);
                 let failed = message.is_error.unwrap_or(false);
                 let result = serde_json::Value::String(text.to_string());
-                let outcome = (!failed)
-                    .then(|| summary_of(&name, &arguments, &result))
-                    .flatten();
+                // A refusal replays as it was drawn live: done, with the
+                // summary `denied`, not as a failed call.
+                let denied = failed && gate_denied(&result);
+                let outcome = if denied {
+                    Some("denied".to_string())
+                } else {
+                    (!failed)
+                        .then(|| summary_of(&name, &arguments, &result))
+                        .flatten()
+                };
                 if let Some(Entry::Tool {
                     state,
                     summary,
@@ -1501,7 +1519,7 @@ pub fn transcript_from(messages: &[pi_ai::ChatMessage]) -> Vec<Entry> {
                     ..
                 }) = entries.get_mut(index)
                 {
-                    *state = state_of(&name, failed);
+                    *state = state_of(&name, failed && !denied);
                     *summary = outcome;
                     // The result rides on the line, as it does live: a
                     // failure shows its first rows, `ctrl+t` shows any.
@@ -5690,28 +5708,47 @@ fn apply_permission_row(shell: &mut Shell<'_>, index: usize) -> Next {
                 .session_allow
                 .retain(|rule| rule.to_string() != row.key);
         }
-        "user" => {
+        "user" | "project" => {
             let list = if row.detail.starts_with("deny") {
                 "deny"
             } else {
                 "allow"
             };
-            let path = crate::settings::settings_path(&crate::default_agent_dir());
-            let _ = crate::permissions::forget_file_rule(&path, list, &row.key);
-        }
-        "project" => {
-            let list = if row.detail.starts_with("deny") {
-                "deny"
+            let path = if row.source == "user" {
+                crate::settings::settings_path(&crate::default_agent_dir())
             } else {
-                "allow"
+                crate::permissions::project_settings_path(shell.cwd)
             };
-            let path = crate::permissions::project_settings_path(shell.cwd);
-            let _ = crate::permissions::forget_file_rule(&path, list, &row.key);
+            if let Err(err) = crate::permissions::forget_file_rule(&path, list, &row.key) {
+                shell.note(&format!("could not drop `{}`: {err}", row.key));
+            }
+            // The file changed; the policy in force has to follow it, or the
+            // sheet shows a rule gone that the gate still applies.
+            reload_file_rules(shell);
         }
         _ => {}
     }
     open_permissions_sheet(shell);
     Next::Go
+}
+
+/// Re-read the user and project rule lists into the live policy, keeping
+/// what is session-only: the mode, session grants, plan mode, the MCP
+/// read-only set.
+fn reload_file_rules(shell: &mut Shell<'_>) {
+    let fresh = crate::permissions::PermissionSources::load(
+        &crate::default_agent_dir(),
+        shell.cwd,
+        shell.parsed.project_trust_override,
+    )
+    .policy(None);
+    let mut policy = shell
+        .agent
+        .permissions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    policy.allow = fresh.allow;
+    policy.deny = fresh.deny;
 }
 
 /// `3b` — advance a setting to the next value on its ramp, write it through

@@ -1900,6 +1900,36 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
     } else {
         Some(StopReason::Stop)
     };
+    // A 200 whose body is an error document (`{"error": …}` from a proxy or
+    // a gateway) is not the assistant's reply, and an empty body is not a
+    // reply either: report both as the failure they are.
+    // The Responses object carries `"error": null` on success.
+    let error_message = value
+        .get("error")
+        .filter(|error| !error.is_null())
+        .map(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string())
+        });
+    let error_message = error_message.or_else(|| {
+        raw.trim()
+            .is_empty()
+            .then(|| "provider returned an empty response".to_string())
+    });
+    if let Some(error) = error_message {
+        return AssistantMessage {
+            id: Uuid::new_v4().to_string(),
+            role: "assistant".into(),
+            content: Vec::new(),
+            model: format!("{}/{}", model.provider, model.id),
+            usage,
+            stop_reason: Some(StopReason::Error),
+            error_message: Some(error),
+        };
+    }
     AssistantMessage {
         id: Uuid::new_v4().to_string(),
         role: "assistant".into(),
@@ -2894,6 +2924,36 @@ mod tests {
         let usage = parsed.usage.expect("usage");
         assert_eq!(usage.cache_read, 70);
         assert_eq!(usage.cache_write, 7);
+    }
+
+    #[test]
+    fn parse_provider_response_reports_error_documents_and_empty_bodies() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-completions")
+            .expect("model");
+        let parsed = parse_provider_response(
+            &model,
+            r#"{"error":{"message":"upstream unavailable","type":"server_error"}}"#,
+        );
+        assert_eq!(parsed.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            parsed.error_message.as_deref(),
+            Some("upstream unavailable")
+        );
+        assert!(parsed.content.is_empty());
+
+        let parsed = parse_provider_response(&model, "   ");
+        assert_eq!(parsed.stop_reason, Some(StopReason::Error));
+        assert!(parsed.error_message.is_some());
+
+        // A Responses object says `"error": null` when nothing went wrong.
+        let parsed = parse_provider_response(
+            &model,
+            r#"{"error":null,"output_text":"hi","choices":[{"message":{"content":"hi"}}]}"#,
+        );
+        assert_eq!(parsed.stop_reason, Some(StopReason::Stop));
+        assert!(parsed.error_message.is_none());
     }
 
     #[test]

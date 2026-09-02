@@ -1077,6 +1077,10 @@ module.exports = (pi) => {
 "##,
         )
         .unwrap();
+        // The fixture reply is process environment: any node spawned while it
+        // is set answers `autocomplete` with it, so hold the host lock or the
+        // parallel live-autocomplete test inherits `#42` instead of its own.
+        let _persistent = persistent_host_guard();
         std::env::set_var(
             "PI_EXTENSION_AUTOCOMPLETE_REPLY",
             r##"[{"value":"#42","label":"#42","description":"[open] Login crash"}]"##,
@@ -1118,10 +1122,7 @@ module.exports = (pi) => {
         let module = resolve_extension_module(dir.path()).unwrap();
         stop_persistent_js_extension();
         let _ = run_persistent_js_extension(&module, "load", &serde_json::json!({}));
-        let mut items = query_js_autocomplete(&module, "#99");
-        if items.is_empty() {
-            items = query_js_autocomplete(&module, "#99");
-        }
+        let items = query_js_autocomplete(&module, "#99");
         stop_persistent_js_extension();
         assert!(
             !items.is_empty(),

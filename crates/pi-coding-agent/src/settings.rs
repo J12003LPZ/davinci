@@ -628,10 +628,27 @@ pub fn load_settings(agent_dir: &Path) -> Settings {
 }
 
 pub fn load_settings_file(path: &Path) -> Settings {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| parse_settings_json(&raw))
-        .unwrap_or_default()
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Settings::default();
+    };
+    match parse_settings_json(&raw) {
+        Some(settings) => settings,
+        None => {
+            // One typo would otherwise drop every deny rule and the mode
+            // without a word. Say so once per file per run: the file is
+            // re-read by every sheet that opens.
+            static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+            let mut warned = WARNED.lock().unwrap_or_else(|err| err.into_inner());
+            if !warned.iter().any(|seen| seen == path) {
+                warned.push(path.to_path_buf());
+                eprintln!(
+                    "pi: {} is not valid settings JSON; using defaults for it",
+                    path.display()
+                );
+            }
+            Settings::default()
+        }
+    }
 }
 
 pub fn load_merged_settings(agent_dir: &Path, cwd: &Path) -> Settings {
