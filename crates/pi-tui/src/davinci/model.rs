@@ -1287,8 +1287,15 @@ pub struct WorkshopSheet {
 pub struct FailedRun {
     pub prompt: String,
     pub tools: Vec<(State, String, String)>,
+    /// The provider's own words for the failure; empty falls back to the
+    /// failed tool line.
+    pub error: String,
     pub kept: String,
+    /// `0`; empty drops the segment.
+    pub files_written: String,
     pub billed: String,
+    /// `retrying in 9s`; empty draws no countdown row.
+    pub retry: String,
     pub aftermath: Vec<(State, String)>,
 }
 

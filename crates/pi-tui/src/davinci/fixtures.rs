@@ -1579,8 +1579,13 @@ pub fn failed_run() -> FailedRun {
                 "0.9s".into(),
             ),
         ],
+        error: "anthropic returned 429 mid-stream. Retry-After says 12s; this is \
+                attempt 2 of 4, backing off 2s, 6s, 12s."
+            .into(),
         kept: "1,204 tokens".into(),
+        files_written: "0".into(),
         billed: "$0.04".into(),
+        retry: "retrying in 9s".into(),
         aftermath: vec![
             (
                 State::Done,
@@ -1970,7 +1975,10 @@ pub fn dress_screen(model: &mut Model, id: &str) {
             model.facts.command_count = 37;
             model.facts.tool_schema_tokens = 21_400;
         }
-        "6c" => sheet(model, Screen::Recovery),
+        "6c" => {
+            sheet(model, Screen::Recovery);
+            model.context = (58_000, 200_000);
+        }
         "6d" => sheet(model, Screen::Diff),
         _ => {}
     }

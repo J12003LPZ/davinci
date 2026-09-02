@@ -1332,9 +1332,19 @@ fn run_turn(
             .map(|message| clip(pi_ai::content_text(&message.content).trim(), 60))
             .unwrap_or_default();
         let kept = pi_agent::estimate_context_tokens(&agent.messages);
+        let error = turn
+            .log
+            .iter()
+            .rev()
+            .find(|(state, _, _)| *state == State::Failed)
+            .map(|(_, text, _)| text.clone())
+            .unwrap_or_default();
         model.failed_run = Some(FailedRun {
             prompt,
             tools: turn.log.clone(),
+            error,
+            files_written: String::new(),
+            retry: String::new(),
             kept: format!(
                 "{} tokens in context",
                 pi_tui::davinci::views::chrome::thousands(kept)
