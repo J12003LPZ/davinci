@@ -1273,6 +1273,10 @@ pub struct WorkshopSheet {
     pub native: Vec<(State, String, String)>,
     pub javascript: Vec<(State, String, String)>,
     pub node: String,
+    /// `one process, reused`.
+    pub node_note: String,
+    /// How long the node host took to load: `318ms`.
+    pub node_elapsed: String,
     pub schema: String,
     /// `(kind, count, fraction, note)`.
     pub tools: Vec<(String, String, f64, String)>,

@@ -2622,7 +2622,7 @@ pub fn perform(
                     State::Done,
                     "vector-memory".to_string(),
                     format!(
-                        "{} tools · {} commands",
+                        "{} tools · {} cmds",
                         native_tools("memory") + 1,
                         native_commands("memory")
                     ),
@@ -2631,7 +2631,7 @@ pub fn perform(
                     State::Done,
                     "token-governor".to_string(),
                     format!(
-                        "{} tools · {} commands",
+                        "{} tools · {} cmds",
                         native_tools("retrieve"),
                         native_commands("governor")
                     ),
@@ -2640,7 +2640,7 @@ pub fn perform(
                     State::Done,
                     "graph".to_string(),
                     format!(
-                        "{} tools · {} commands",
+                        "{} tools · {} cmds",
                         native_tools("graph"),
                         native_commands("graph")
                     ),
@@ -2649,7 +2649,7 @@ pub fn perform(
                     State::Done,
                     "security-scan".to_string(),
                     format!(
-                        "{} tools · {} commands",
+                        "{} tools · {} cmds",
                         native_tools("sec"),
                         native_commands("sec")
                     ),
@@ -2666,11 +2666,7 @@ pub fn perform(
                     (
                         State::Done,
                         name,
-                        format!(
-                            "{} tools · {} commands",
-                            ext.tools.len(),
-                            ext.commands.len()
-                        ),
+                        format!("{} tools · {} cmds", ext.tools.len(), ext.commands.len()),
                     )
                 })
                 .collect();
@@ -2696,6 +2692,8 @@ pub fn perform(
                 native,
                 javascript,
                 node,
+                node_note: "one process, reused".into(),
+                node_elapsed: format!("{host_ms}ms"),
                 schema: format!(
                     "{}k · {:.0}%",
                     (schema_tokens as f64 / 1000.0).round() as u64,
@@ -2706,7 +2704,7 @@ pub fn perform(
                         "built-in tools".into(),
                         builtin.to_string(),
                         builtin as f64 / total,
-                        "read write edit grep find ls bash pwsh".into(),
+                        "read write edit bash powershell grep find ls".into(),
                     ),
                     (
                         "native tools".into(),

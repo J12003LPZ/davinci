@@ -1475,29 +1475,85 @@ pub fn project_trust() -> ProjectTrustSheet {
 pub fn workshop() -> WorkshopSheet {
     WorkshopSheet {
         reload: vec![
-            (State::Done, "keybindings · 39 bindings, 2 yours".into(), "3ms".into(), None),
-            (State::Done, "skills · 6 found, none loaded until named".into(), "11ms".into(), None),
-            (State::Done, "context files · AGENTS.md, CLAUDE.md · 4.1k".into(), "6ms".into(), None),
-            (State::Failed, "extensions · deploy.js failed to register".into(), "318ms".into(),
-             Some("TypeError: hooks.preTool is not a function · deploy.js:41 · its 3 tools are missing".into())),
+            (
+                State::Done,
+                "keybindings · 39 bindings, 2 yours".into(),
+                "3ms".into(),
+                None,
+            ),
+            (
+                State::Done,
+                "skills · 6 found, none loaded until named".into(),
+                "11ms".into(),
+                None,
+            ),
+            (
+                State::Done,
+                "context files · AGENTS.md, CLAUDE.md · 4.1k".into(),
+                "6ms".into(),
+                None,
+            ),
+            (
+                State::Failed,
+                "extensions · deploy.js failed to register".into(),
+                "318ms".into(),
+                Some(
+                    "TypeError: hooks.preTool is not a function · deploy.js:41\n\
+                     its 3 tools are not registered; everything else loaded"
+                        .into(),
+                ),
+            ),
         ],
         native: vec![
-            (State::Done, "vector-memory".into(), "4 tools · 4 commands".into()),
-            (State::Done, "token-governor".into(), "2 tools · 2 commands".into()),
-            (State::Done, "graph".into(), "1 tool · 5 commands".into()),
-            (State::Done, "security-scan".into(), "7 tools · 3 commands".into()),
+            (
+                State::Done,
+                "vector-memory".into(),
+                "4 tools · 4 cmds".into(),
+            ),
+            (
+                State::Done,
+                "token-governor".into(),
+                "2 tools · 2 cmds".into(),
+            ),
+            (State::Done, "graph".into(), "1 tool · 5 cmds".into()),
+            (
+                State::Done,
+                "security-scan".into(),
+                "7 tools · 3 cmds".into(),
+            ),
         ],
         javascript: vec![
-            (State::Done, "plan-mode".into(), "1 tool · registers --plan".into()),
-            (State::Done, "lint.js · project".into(), "1 post-tool hook".into()),
-            (State::Failed, "deploy.js · project".into(), "failed to register".into()),
+            (State::Done, "plan-mode".into(), "1 tool · --plan".into()),
+            (
+                State::Done,
+                "lint.js · project".into(),
+                "1 post-tool hook".into(),
+            ),
+            (State::Failed, "deploy.js · project".into(), "failed".into()),
         ],
         node: "node v24.19.0".into(),
+        node_note: "one process, reused".into(),
+        node_elapsed: "318ms".into(),
         schema: "21.4k · 11%".into(),
         tools: vec![
-            ("built-in tools".into(), "8".into(), 0.33, "read write edit grep find ls bash pwsh".into()),
-            ("native tools".into(), "14".into(), 0.58, "memory, governor, graph, sec".into()),
-            ("extension tools".into(), "2".into(), 0.08, "3 more if deploy.js is fixed".into()),
+            (
+                "built-in tools".into(),
+                "8".into(),
+                0.33,
+                "read write edit bash powershell grep find ls".into(),
+            ),
+            (
+                "native tools".into(),
+                "14".into(),
+                0.58,
+                "memory, governor, graph, sec".into(),
+            ),
+            (
+                "extension tools".into(),
+                "2".into(),
+                0.08,
+                "3 more if deploy.js is fixed".into(),
+            ),
         ],
     }
 }
@@ -1908,7 +1964,12 @@ pub fn dress_screen(model: &mut Model, id: &str) {
         "5c" => sheet(model, Screen::Governor),
         "5d" => sheet(model, Screen::Securitas),
         "6a" => sheet(model, Screen::Trust),
-        "6b" => sheet(model, Screen::Officina),
+        "6b" => {
+            sheet(model, Screen::Officina);
+            model.facts.tool_count = 24;
+            model.facts.command_count = 37;
+            model.facts.tool_schema_tokens = 21_400;
+        }
         "6c" => sheet(model, Screen::Recovery),
         "6d" => sheet(model, Screen::Diff),
         _ => {}
