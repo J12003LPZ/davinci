@@ -5,6 +5,7 @@
 
 use ratatui::text::Line;
 
+use super::sheet::{facts, Composer, SheetChrome};
 use crate::davinci::model::Model;
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{blank, span, span_strong, wrap, MEASURE};
@@ -18,13 +19,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         )])];
     };
 
-    let mut out = vec![
-        Line::from(vec![
-            span(format!("{} ", glyph::USER), th.primary),
-            span("/mcp", th.muted),
-        ]),
-        blank(),
-    ];
+    let mut out: Vec<Line<'static>> = Vec::new();
 
     if sheet.servers.is_empty() {
         out.push(Line::from(vec![span("no servers in mcp.json", th.muted)]));
@@ -91,10 +86,39 @@ fn row(server: &crate::davinci::model::McpServerRow, th: &Theme) -> Line<'static
     ])
 }
 
-/// The sheet's frame (design.md §11). Filled in per artboard.
-pub fn chrome(model: &Model) -> crate::davinci::views::sheet::SheetChrome {
-    let _ = model;
-    crate::davinci::views::sheet::SheetChrome::default()
+/// The sheet's frame (design.md §11): servers and tools in the header, how
+/// many answered in the status bar, the command echoed and offered again.
+pub fn chrome(model: &Model) -> SheetChrome {
+    let th = &model.theme;
+    let sheet = model.mcp.as_ref();
+    let connected = sheet.map(|s| {
+        s.servers
+            .iter()
+            .filter(|server| server.status == "connected")
+            .count()
+    });
+    let tools: usize = sheet
+        .map(|s| s.servers.iter().map(|server| server.tools).sum())
+        .unwrap_or(0);
+    SheetChrome {
+        header_right: facts(
+            th,
+            vec![
+                sheet
+                    .map(|s| vec![span(format!("{} servers", s.servers.len()), th.muted)])
+                    .unwrap_or_default(),
+                sheet
+                    .map(|_| vec![span(format!("{tools} tools"), th.muted)])
+                    .unwrap_or_default(),
+            ],
+        ),
+        status_third: connected.map(|n| vec![span(format!("{n} connected"), th.muted)]),
+        status_right: None,
+        hints: Vec::new(),
+        escape: Some("esc close"),
+        composer: Composer::Prompt("/mcp"),
+        echo: Some("/mcp".into()),
+    }
 }
 
 #[cfg(test)]
@@ -140,12 +164,26 @@ mod tests {
             })
             .collect();
         let blob = drawn.join("\n");
-        assert!(blob.contains("/mcp"), "{blob}");
+        assert!(!blob.contains("> /mcp"), "{blob}");
         assert!(blob.contains("memory"), "{blob}");
         assert!(blob.contains("3 tools"), "{blob}");
         assert!(blob.contains("docs"), "{blob}");
         assert!(blob.contains("error"), "{blob}");
         assert!(blob.contains("connection refused"), "{blob}");
         assert!(blob.contains("1 of 2 connected"), "{blob}");
+        let c = chrome(&model);
+        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(header, "2 servers │ 3 tools");
+        let third: String = c
+            .status_third
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(third, "1 connected");
+        assert_eq!(c.escape, Some("esc close"));
+        assert_eq!(c.composer, Composer::Prompt("/mcp"));
+        assert_eq!(c.echo.as_deref(), Some("/mcp"));
     }
 }
