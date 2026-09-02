@@ -178,8 +178,9 @@ blinking block caret. Grows with content; keybind hints below it in border color
 (`enter send · shift+enter newline · tab complete · esc cancel`). `ctrl+c`
 interrupts the run, never the app.
 
-**StatusBar** — left `mode · branch · Δn +a -d`, right `context ━━━━╸──── 47k/200k`
-or, when narrow, `mensura ◐ 21%`. Both forms are meters, not bare numbers.
+**StatusBar** — left `mode · branch · Δn +a -d`, right `context ━━━━◸──── 47k/200k`
+or, when narrow, `mensura ◐ 21%`. Both forms are meters, not bare numbers. The
+meter tip is `◸` everywhere; `NO_COLOR` keeps the glyph.
 
 **Instrumenta** — inset overlay (52 cols of margin at 100 cols), query line,
 result rows of `command · description · kind`, selection marked by a 3-cell
@@ -250,3 +251,65 @@ compass point of Leonardo's circle, as the only copper stroke
 motifs across the product: `Δ` for change, `◉` for the thing in hand, Roman
 numerals for plans, proportion meters instead of raw counts, and the Latin
 instrument names.
+
+---
+
+## 11. Command sheets
+
+Screens `3a`–`6d` are command sheets: `/model`, `/settings`, `/thinking`,
+`/login`, `/hotkeys`, `/resume`, `/tree`, `/compact`, `/export`, `/graph`,
+`memory-status`, `governor-status`, `sec-report`, `/trust`, `/reload`, the
+interrupt, and the `Δ` review. Their source of truth is the Instruments canvas
+(`docs/ui/Pi TUI Instruments.dc.html`, one artboard per sheet). Every sheet
+wears the same frame, described in one place (`views/sheet.rs`,
+`SheetChrome`), not in seventeen views:
+
+1. **The sheet fills the body.** Rows start directly under the header. No
+   transcript shows behind a sheet, and nothing is bottom-anchored. A sheet
+   opened by a slash command echoes that command as its first row
+   (`> /compact keep the store.rs decisions verbatim`, muted, as the
+   transcript draws a user turn): `3d`, `4c`, `4d`, `5a`, `6b`, `6c`, `6d`.
+2. **Header right run is the sheet's facts**, `│`-separated in border
+   colour, values in muted or the colour the artboard gives them. Sheets
+   with no facts of their own keep `cwd │ branch │ model`.
+3. **Status bar left is three segments**: `mode · branch · third`, the third
+   set per sheet. **Status bar right** is the sheet's own meter where the
+   artboard draws one, otherwise the context meter. Meters keep the
+   `label ━━━◸─── used/cap` shape.
+4. **The hint row is the last body row**: border colour, hints separated by
+   ` │ `, the escape hint (`esc close`, `esc cancel`, `esc done`,
+   `esc leave it`) right-aligned. When the row is too wide, hints drop from
+   the end; the escape hint never drops. The hint row never scrolls off.
+   Where the artboard draws its keys inside a panel (`4c`, `4d`, `6a`), that
+   panel's key row is the hint row and no separate row is drawn. A hint
+   whose key is not wired yet is drawn in the dim ramp.
+5. **Composer only where the artboard draws one.** Hidden on `3b`, `3d`,
+   `3e`, `4a`, `4b`, `4d`. A filter box in the body instead on `3a` (`4a` has
+   a `⌕` filter box as its first row, same shape). Prompt with the artboard's
+   placeholder or command on the rest. `6a` draws the composer disabled, its
+   text `the composer is disabled until you decide` in the dim ramp. The
+   composer's own hint row is not drawn while a sheet is open; the sheet's
+   hint row is the only hint row.
+6. **Overflow windows around the selection**, `… n above` / `… n below` in
+   border colour (`ui::window`), on every list sheet. Panels and footnotes
+   stay whole; only the list windows.
+7. **Meter tip is `◸`**, everywhere. `NO_COLOR` keeps the glyph.
+8. **Selection is the Instrumenta mark**: the 3-cell copper left bar plus a
+   `surface` tint across the row (`ui::selection_bar`), on every sheet with
+   a cursor. The `◉` state glyph stays as well; colour is never the only
+   signal.
+9. **Rows the artboard dims** (no credential on `3a`, absent providers on
+   `3d`, dismissed findings on `5d`, harmless files on `6a`) render in the
+   theme's dim ramp.
+10. **Column headers** are uppercase in border colour with a hair rule under
+    them in the dim ramp's border colour (`ui::column_header`), as the
+    artboards draw `PROVIDER / MODEL … CREDENTIAL`.
+11. **Footnotes are two columns** (`ui::footnote`): left in text or muted,
+    right in border. Below 100 columns, or when the two do not fit, the right
+    column wraps under the left.
+12. **Panels keep `╭─ LABEL ─╮`**, the terminal translation `1c` and `2c`
+    established for the artboards' CSS boxes. Labels stay uppercase.
+13. **Facts that are not known live are omitted**, never invented. A header
+    run with one missing fact drops that segment; a status third that cannot
+    be computed drops to two segments. Paths are shown as `.pi\…` with
+    `%USERPROFILE%` (or `~`) for the home directory.
