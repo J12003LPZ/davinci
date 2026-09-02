@@ -3990,6 +3990,7 @@ fn open_settings_sheet(agent: &Agent, model: &mut Model) {
                 values: item.values,
                 description: item.description.unwrap_or_default(),
                 key: item.id,
+                note: String::new(),
             }
         })
         .collect();

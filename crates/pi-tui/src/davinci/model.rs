@@ -944,6 +944,8 @@ pub struct SettingRow {
     pub description: String,
     /// The stored key behind the row, so a change knows where to land.
     pub key: String,
+    /// What follows the ramp in border ink: `cells`, `registers /skill:name`.
+    pub note: String,
 }
 
 /// One thinking level (`3c`). `fraction` is of the 64k ceiling, not of the

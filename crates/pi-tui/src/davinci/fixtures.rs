@@ -607,8 +607,9 @@ pub fn settings_rows() -> Vec<SettingRow> {
             values: values.iter().map(|value| value.to_string()).collect(),
             description: description.into(),
             key: label.to_lowercase().replace(' ', "-"),
+            note: String::new(),
         };
-    vec![
+    let mut rows = vec![
         row("Auto-compact threshold", "default", false, &["default", "90%", "75%", "50%", "25%"],
             "When auto-compaction triggers: a context percentage or an absolute token count. default is 92% of the model window."),
         row("Auto-compact", "on", false, &["on", "off"],
@@ -627,13 +628,25 @@ pub fn settings_rows() -> Vec<SettingRow> {
             "Hide thinking blocks in assistant replies."),
         row("Cache miss notices", "on", false, &["on", "off"],
             "Show a transcript notice for a significant prompt-cache miss and for what a compaction cost."),
+        row("Show images", "on", false, &["on", "off"],
+            "Render pasted and read images inline where the terminal can."),
+        row("Image width", "80", false, &["60", "80", "120"],
+            "How many cells wide an inline image may be."),
         row("Autocomplete max items", "7", false, &["3", "5", "7", "10", "15", "20"],
             "How many rows the composer's completion list may show."),
         row("Skill commands", "on", false, &["on", "off"],
             "Register every discovered skill as a /skill:name command."),
         row("Quiet startup", "on", false, &["on", "off"],
             "Skip the verbose banner when a session opens."),
-    ]
+    ];
+    for setting in &mut rows {
+        setting.note = match setting.label.as_str() {
+            "Image width" => "cells".into(),
+            "Skill commands" => "registers /skill:name".into(),
+            _ => String::new(),
+        };
+    }
+    rows
 }
 
 /// `3c` — the thinking sheet.
@@ -1808,11 +1821,22 @@ pub fn dress_screen(model: &mut Model, id: &str) {
             model.facts.catalog_refreshed = "2h ago".into();
             model.facts.catalog_path = "%USERPROFILE%\\.pi\\agent\\models.json".into();
         }
-        "3b" => sheet(model, Screen::Settings),
-        "3c" => sheet(model, Screen::Thinking),
+        "3b" => {
+            sheet(model, Screen::Settings);
+            model.facts.settings_keys = 24;
+        }
+        "3c" => {
+            sheet(model, Screen::Thinking);
+            model.thinking_index = 3;
+            model.facts.thinking_reserve = "reserve 10k".into();
+            model.facts.thinking_last_turn = "5.1k of 8k".into();
+            model.facts.thinking_output_share = 0.38;
+        }
         "3d" => {
             model.device_code = Some(device_code());
             sheet(model, Screen::Login);
+            model.facts.auth_path = "%USERPROFILE%\\.pi\\agent\\auth.json".into();
+            model.facts.auth_mode = "0600".into();
         }
         "3e" => sheet(model, Screen::Keys),
         "4a" => sheet(model, Screen::Resume),
