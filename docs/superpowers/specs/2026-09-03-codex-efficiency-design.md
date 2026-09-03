@@ -118,7 +118,7 @@ It describes support for:
 - Service tier selection.
 - Zero-data-retention-compatible behavior where applicable.
 
-Unknown capabilities default to disabled. A probe failure must not silently enable an experimental behavior.
+Unknown capabilities default to disabled. A probe failure must not silently enable an experimental behavior. Capability discovery first uses a versioned backend/model table. An optional probe must be non-generating, side-effect free, cached for the authenticated account, and incapable of delaying the first user turn by more than the configured transport timeout.
 
 The capability snapshot is persisted with the session. A change that affects request shape starts a new Responses lineage.
 
@@ -190,7 +190,7 @@ A normal turn follows this order:
 1. Resolve model, authentication, configuration, and CodexCapabilities.
 2. Compute the stable-prefix and request-shape hashes.
 3. Reuse or create the appropriate transport connection and stream lane.
-4. Prewarm stable request state with generate:false when supported and useful.
+4. For a new or invalidated request shape, send at most one generate:false prewarm only while other user-visible work is already in progress, such as permission resolution or tool execution. Never delay a ready user delta to prewarm, and never repeat an identical prewarm.
 5. Send the user delta using the current previous_response_id.
 6. Stream native response items into ResponsesLedger and generic UI events.
 7. Accumulate tool calls and validate call identifiers.
@@ -268,11 +268,12 @@ The implementation must:
 3. Reject traversal and unauthorized paths.
 4. Validate all hunks against current contents.
 5. Obtain required permissions.
-6. Stage creates and updates in temporary files.
-7. Apply mutations atomically where the platform permits.
-8. Roll back the invocation after an unexpected partial failure.
-9. Record the normalized patch digest and affected paths.
-10. Return a compact deterministic result.
+6. Build a recovery journal and stage creates and updates in temporary files.
+7. Commit the patch as one logical invocation.
+8. If any mutation fails, restore every previously changed path from the journal before returning failure.
+9. On startup, detect and resolve an incomplete journal before accepting another patch.
+10. Record the normalized patch digest and affected paths.
+11. Return a compact deterministic result.
 
 Any adapted code or grammar from openai/codex must preserve applicable MIT attribution.
 
@@ -399,6 +400,8 @@ Runs explicitly or before release. It compares:
 
 Paired runs use the same repository revision, isolated workspace, prompt, model, effort, permissions, network policy, and starting Git state. Cold-cache and warm-cache suites are separate. Execution order is randomized.
 
+A smoke run executes each task/profile pair once. A release comparison executes every task/profile pair at least three times and reports a paired bootstrap 95 percent confidence interval for median deltas. More repetitions may be configured, but a result with fewer than three release repetitions cannot pass the rollout gate.
+
 Each record includes exact model slug, backend, Pi commit, Codex commit, date, configuration hash, and verifier result. Authentication outages, provider unavailability, and exhausted rate limits are classified as infrastructure failures using predefined rules; they are never silently removed.
 
 ### 16.4 Task corpus
@@ -443,6 +446,8 @@ The optimized profile ships only when:
 - Duplicate side-effect execution is zero.
 - Cancellation and recovery suites pass.
 - At least two major efficiency dimensions improve without materially worsening another.
+
+For the rollout gate, material worsening means more than a 10 percent increase in the median of another primary efficiency metric or more than a 15 percent increase at p95. Verified success is stricter: the optimized profile must complete at least as many paired verified runs as the generic profile, and it may not introduce a new deterministic task failure.
 
 Initial live-suite targets are:
 
