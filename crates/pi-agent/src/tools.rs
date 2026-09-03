@@ -230,7 +230,7 @@ pub fn execute_tool_with(
         "bash" => shell_tool(cwd, input, context),
         "powershell" => powershell_tool(cwd, input, context),
         "ls" => ls_tool(cwd, input),
-        "grep" => grep_tool(cwd, input),
+        "grep" => grep_tool(cwd, input, context),
         "find" => find_tool(cwd, input),
         "web_fetch" => crate::web::fetch_tool(input).map_err(ToolError::Failed),
         "web_search" => crate::web::search_tool(input).map_err(ToolError::Failed),
@@ -994,7 +994,167 @@ fn run_managed_tool(
     }
 }
 
-fn grep_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+/// One `match` event out of ripgrep's `--json` stream: file, line number
+/// and the line's text when ripgrep sent it.
+type RgMatch = (PathBuf, usize, Option<String>);
+
+/// Parse a `--json` match event. Anything that is not a complete match
+/// (summaries, `begin`/`end` markers, a malformed line) yields `None`.
+fn parse_rg_match(line: &str) -> Option<RgMatch> {
+    let event = serde_json::from_str::<Value>(line).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("match") {
+        return None;
+    }
+    let data = event.get("data")?;
+    let file = data.get("path")?.get("text")?.as_str()?;
+    let line_number = data.get("line_number")?.as_u64()?;
+    let line_text = data
+        .get("lines")
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some((PathBuf::from(file), line_number as usize, line_text))
+}
+
+/// What reading a ripgrep stream ended with.
+struct RgStream {
+    matches: Vec<RgMatch>,
+    /// `limit` matches are in hand; the caller stops the child rather
+    /// than waiting for it to finish walking the tree.
+    limit_reached: bool,
+    /// The turn's abort flag was raised while the stream was still open.
+    aborted: bool,
+}
+
+/// Read ripgrep's `--json` output as it arrives (grep.ts reads it line by
+/// line through `readline` for the same reason): the read stops the moment
+/// `limit` matches have been collected or the turn is aborted, so the
+/// caller can kill ripgrep instead of waiting for it to visit every file
+/// under the search path. Before this the tool sat in `Command::output`
+/// for as long as ripgrep took — a worker that grepped its home directory
+/// held its turn for half an hour with the matches already in the pipe.
+///
+/// The pipe is drained on its own thread and handed over a channel so the
+/// abort flag can be polled while nothing arrives.
+fn stream_rg_matches<R: std::io::Read + Send + 'static>(
+    pipe: R,
+    limit: usize,
+    context: &ToolContext,
+) -> RgStream {
+    use std::io::BufRead;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    let (sender, receiver) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(pipe).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut stream = RgStream {
+        matches: Vec::new(),
+        limit_reached: false,
+        aborted: false,
+    };
+    loop {
+        match receiver.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(line) => {
+                if let Some(found) = parse_rg_match(&line) {
+                    stream.matches.push(found);
+                    if stream.matches.len() >= limit {
+                        stream.limit_reached = true;
+                        break;
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if context.is_aborted() {
+                    stream.aborted = true;
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    stream
+}
+
+/// Run ripgrep and collect up to `limit` matches from its stream, killing
+/// it as soon as they are in hand. `None` when ripgrep is not installed,
+/// which sends the caller to the native walk.
+fn run_rg_streaming(
+    args: &[String],
+    limit: usize,
+    context: &ToolContext,
+) -> Result<Option<(Vec<RgMatch>, bool)>, ToolError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let program = std::env::var("PI_RG_PATH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "rg".to_string());
+    let mut child = match Command::new(&program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(ToolError::Failed(format!("Failed to run ripgrep: {err}")));
+        }
+    };
+    // stderr is drained on its own thread so a chatty ripgrep (permission
+    // errors under a home directory) can never block on a full pipe.
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stream = match child.stdout.take() {
+        Some(pipe) => stream_rg_matches(pipe, limit, context),
+        None => RgStream {
+            matches: Vec::new(),
+            limit_reached: false,
+            aborted: false,
+        },
+    };
+    if stream.limit_reached || stream.aborted {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|err| ToolError::Failed(format!("Failed to run ripgrep: {err}")))?;
+    let stderr = stderr_handle
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    if stream.aborted {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let code = status.code().unwrap_or(-1);
+    if !stream.limit_reached && code != 0 && code != 1 {
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(ToolError::Failed(if stderr.is_empty() {
+            format!("ripgrep exited with code {code}")
+        } else {
+            stderr
+        }));
+    }
+    Ok(Some((stream.matches, stream.limit_reached)))
+}
+
+fn grep_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    tool_context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
     let pattern = required_str(input, "pattern")?;
     let search_path = resolve(
         cwd,
@@ -1005,6 +1165,9 @@ fn grep_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
             "Path not found: {}",
             search_path.display()
         )));
+    }
+    if tool_context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
     }
     let glob = input.get("glob").and_then(Value::as_str);
     let ignore_case = input
@@ -1023,58 +1186,11 @@ fn grep_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
         .unwrap_or(GREP_DEFAULT_LIMIT)
         .max(1);
     let args = build_rg_args(pattern, &search_path, glob, ignore_case, literal);
-    let Some(output) = run_managed_tool("PI_RG_PATH", "rg", &args)? else {
-        return grep_tool_native(cwd, input);
+    let Some((raw_matches, match_limit_reached)) = run_rg_streaming(&args, limit, tool_context)?
+    else {
+        return grep_tool_native(cwd, input, tool_context);
     };
-    let code = output.status.code().unwrap_or(-1);
-    if code != 0 && code != 1 {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(ToolError::Failed(if stderr.is_empty() {
-            format!("ripgrep exited with code {code}")
-        } else {
-            stderr
-        }));
-    }
     let is_dir = search_path.is_dir();
-    let mut raw_matches = Vec::<(PathBuf, usize, Option<String>)>::new();
-    let mut match_limit_reached = false;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if event.get("type").and_then(Value::as_str) != Some("match") {
-            continue;
-        }
-        if raw_matches.len() >= limit {
-            match_limit_reached = true;
-            break;
-        }
-        let Some(file) = event
-            .get("data")
-            .and_then(|value| value.get("path"))
-            .and_then(|value| value.get("text"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let Some(line_number) = event
-            .get("data")
-            .and_then(|value| value.get("line_number"))
-            .and_then(Value::as_u64)
-        else {
-            continue;
-        };
-        let line_text = event
-            .get("data")
-            .and_then(|value| value.get("lines"))
-            .and_then(|value| value.get("text"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        raw_matches.push((PathBuf::from(file), line_number as usize, line_text));
-        if raw_matches.len() >= limit {
-            match_limit_reached = true;
-        }
-    }
     if raw_matches.is_empty() {
         return Ok(ToolResult {
             content: "No matches found".into(),
@@ -1257,7 +1373,11 @@ fn grep_scan_file(
     Some((out, lines_truncated))
 }
 
-fn grep_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+fn grep_tool_native(
+    cwd: &Path,
+    input: &serde_json::Value,
+    tool_context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
     let pattern = required_str(input, "pattern")?;
     let search_path = resolve(
         cwd,
@@ -1301,9 +1421,14 @@ fn grep_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult,
             if glob.is_none_or(|glob| path_glob_match(glob, file, &search_path)) {
                 files.push(file.to_path_buf());
             }
-            true
+            // A large tree is abandoned at the next file once the turn is
+            // aborted, like the ripgrep path.
+            !tool_context.is_aborted()
         },
     );
+    if tool_context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
 
     let scan = |file: &Path, remaining: usize| {
         let display = format_grep_path(file, &search_path, is_dir);
@@ -1987,6 +2112,119 @@ mod tests {
         let not_dir =
             execute_tool(dir.path(), "ls", &serde_json::json!({"path":"src/app.ts"})).unwrap_err();
         assert!(not_dir.to_string().starts_with("Not a directory:"));
+    }
+
+    /// A ripgrep stdout that never ends: one match event per read, forever.
+    struct EndlessRg(usize);
+
+    impl std::io::Read for EndlessRg {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            let line = format!(
+                "{{\"type\":\"match\",\"data\":{{\"path\":{{\"text\":\"f{}.rs\"}},\"line_number\":{},\"lines\":{{\"text\":\"needle\\n\"}}}}}}\n",
+                self.0, self.0
+            );
+            let bytes = line.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+    }
+
+    /// A ripgrep stdout that produces nothing and never closes, like a
+    /// walk over a huge tree that has found nothing yet.
+    struct SilentRg {
+        receiver: std::sync::mpsc::Receiver<u8>,
+        /// Held so the receiver blocks instead of seeing a closed channel.
+        _sender: std::sync::mpsc::Sender<u8>,
+    }
+
+    impl std::io::Read for SilentRg {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.receiver.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn grep_stops_reading_ripgrep_at_the_match_limit() {
+        let stream = stream_rg_matches(EndlessRg(0), 5, &ToolContext::default());
+        assert_eq!(stream.matches.len(), 5);
+        assert!(stream.limit_reached);
+        assert!(!stream.aborted);
+        assert_eq!(stream.matches[4].0, PathBuf::from("f5.rs"));
+        assert_eq!(stream.matches[4].1, 5);
+    }
+
+    #[test]
+    fn grep_stops_reading_ripgrep_when_the_turn_is_aborted() {
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let context = ToolContext {
+            abort: Some(abort.clone()),
+            ..ToolContext::default()
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let abort = abort.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                abort.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let started = std::time::Instant::now();
+        let stream = stream_rg_matches(
+            SilentRg {
+                receiver,
+                _sender: sender,
+            },
+            5,
+            &context,
+        );
+        assert!(stream.aborted);
+        assert!(stream.matches.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn grep_honours_the_limit_and_the_abort_flag_end_to_end() {
+        let dir = tempdir().unwrap();
+        for index in 0..6 {
+            fs::write(
+                dir.path().join(format!("file{index}.txt")),
+                "needle one\nneedle two\n",
+            )
+            .unwrap();
+        }
+        let limited = execute_tool(
+            dir.path(),
+            "grep",
+            &serde_json::json!({"pattern":"needle","limit":2}),
+        )
+        .unwrap();
+        let match_lines = limited
+            .content
+            .lines()
+            .filter(|line| line.contains(": needle"))
+            .count();
+        assert_eq!(match_lines, 2, "{}", limited.content);
+        assert!(limited.content.contains("2 matches limit reached"));
+        assert_eq!(
+            limited
+                .details
+                .and_then(|d| d.get("matchLimitReached").cloned()),
+            Some(serde_json::json!(2))
+        );
+        let aborted = execute_tool_with(
+            dir.path(),
+            "grep",
+            &serde_json::json!({"pattern":"needle"}),
+            &ToolContext {
+                abort: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+                ..ToolContext::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(aborted.to_string(), "Operation aborted");
     }
 
     #[test]
