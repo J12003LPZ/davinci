@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub use super::replay::ReplayFingerprint;
+
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -490,6 +492,9 @@ pub struct GraphTaskState {
     /// Live view: last tool call or turn reported by the worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    /// Replay compatibility fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<ReplayFingerprint>,
 }
 
 impl GraphTaskState {
@@ -514,6 +519,7 @@ impl GraphTaskState {
             started_at: None,
             ended_at: None,
             last_activity: None,
+            fingerprint: None,
         }
     }
 

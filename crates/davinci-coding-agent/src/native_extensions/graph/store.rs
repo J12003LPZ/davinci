@@ -195,6 +195,31 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     Ok(())
 }
 
+pub fn write_task_fingerprint(
+    cwd: &Path,
+    run_id: &str,
+    task_id: &str,
+    fingerprint: &super::replay::ReplayFingerprint,
+) -> std::io::Result<()> {
+    let path = run_dir(cwd, run_id).join("artifacts").join(format!("{task_id}.fingerprint.json"));
+    let content = serde_json::to_vec_pretty(fingerprint)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    atomic_write(&path, &content)
+}
+
+pub fn read_task_fingerprint(
+    cwd: &Path,
+    run_id: &str,
+    task_id: &str,
+) -> Option<super::replay::ReplayFingerprint> {
+    if !is_safe_run_id(run_id) {
+        return None;
+    }
+    let path = run_dir(cwd, run_id).join("artifacts").join(format!("{task_id}.fingerprint.json"));
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
     if !is_safe_run_id(run_id) {
         return None;
@@ -203,6 +228,11 @@ pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
     let mut run: GraphRun = serde_json::from_str(&raw).ok()?;
     if run.definition.is_none() {
         run.definition = load_graph_definition(cwd, run_id);
+    }
+    for task in &mut run.tasks {
+        if task.fingerprint.is_none() {
+            task.fingerprint = read_task_fingerprint(cwd, run_id, &task.id);
+        }
     }
     (run.version == 1).then_some(run)
 }

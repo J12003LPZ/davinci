@@ -11,10 +11,11 @@ use super::briefings::{
     ReviewInput,
 };
 use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
+use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
 use super::roles::{role_for_research_kind, role_tools};
 use super::store::{
     artifact_path, create_run_dir, new_run_id, now_ms, save_run, transcript_path, write_artifact,
-    write_graph_definition, write_log,
+    write_graph_definition, write_log, write_task_fingerprint,
 };
 use super::topology::{
     build_definition, ready_nodes, validate_definition, GraphMode, GraphRunState,
@@ -64,7 +65,7 @@ pub struct RunOptions {
     /// original usage is credited so totals stay cumulative); the controller
     /// replays deterministically until the first uncached task, then continues
     /// live. Verification always re-runs.
-    pub resume_artifacts: HashMap<String, (Artifact, WorkerUsage)>,
+    pub resume_artifacts: HashMap<String, (Artifact, WorkerUsage, Option<ReplayFingerprint>)>,
 }
 
 pub fn default_is_git_repo(cwd: &Path) -> bool {
@@ -322,21 +323,57 @@ impl GraphExecution {
             run.tasks.push(task.clone());
         }
 
-        if let Some((artifact, usage)) = self.options.resume_artifacts.get(&task_id) {
-            {
-                let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-                let cwd = PathBuf::from(&run.cwd);
-                let run_id = run.run_id.clone();
-                if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
-                    task.started_at = Some(now_ms());
-                    task.artifact_file = Some(format!("artifacts/{task_id}.json"));
+        if let Some((artifact, usage, stored_fingerprint)) = self.options.resume_artifacts.get(&task_id) {
+            let (run_version, cwd) = {
+                let run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+                (
+                    run.definition.as_ref().map(|d| d.version).unwrap_or(run.version),
+                    PathBuf::from(&run.cwd),
+                )
+            };
+            let current_fingerprint =
+                ReplayFingerprint::for_task(&cwd, run_version, &briefing, task.expect);
+
+            let is_compatible = match stored_fingerprint {
+                Some(stored) => {
+                    if replay_compatible(stored, &current_fingerprint) {
+                        true
+                    } else {
+                        let reason = incompatibility_reason(stored, &current_fingerprint)
+                            .unwrap_or_else(|| "replay fingerprint mismatch".to_string());
+                        self.checkpoint(Some(&format!(
+                            "{task_id}: replay refused ({reason}), re-executing"
+                        )));
+                        false
+                    }
                 }
-                let _ = write_artifact(&artifact_path(&cwd, &run_id, &task_id), artifact);
+                None => {
+                    self.checkpoint(Some(&format!(
+                        "{task_id}: replay refused (missing fingerprint), re-executing"
+                    )));
+                    false
+                }
+            };
+
+            if is_compatible {
+                {
+                    let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+                    let run_id = run.run_id.clone();
+                    if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                        task_entry.started_at = Some(now_ms());
+                        task_entry.artifact_file = Some(format!("artifacts/{task_id}.json"));
+                        task_entry.fingerprint = stored_fingerprint.clone();
+                    }
+                    let _ = write_artifact(&artifact_path(&cwd, &run_id, &task_id), artifact);
+                    if let Some(fp) = stored_fingerprint {
+                        let _ = write_task_fingerprint(&cwd, &run_id, &task_id, fp);
+                    }
+                }
+                self.add_usage(&task_id, usage);
+                self.end_task(&task_id, TaskStatus::Succeeded, None);
+                self.checkpoint(Some(&format!("{task_id}: reused from previous run")));
+                return Some(artifact.clone());
             }
-            self.add_usage(&task_id, usage);
-            self.end_task(&task_id, TaskStatus::Succeeded, None);
-            self.checkpoint(Some(&format!("{task_id}: reused from previous run")));
-            return Some(artifact.clone());
         }
 
         let mut last_failure: Option<String> = None;
@@ -453,12 +490,26 @@ impl GraphExecution {
             }
             if result.ok {
                 if let Some(artifact) = result.artifact {
-                    {
+                    let (run_version, cwd, run_id) = {
                         let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-                        if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
-                            task.artifact_file = Some(format!("artifacts/{task_id}.json"));
+                        let run_version = run
+                            .definition
+                            .as_ref()
+                            .map(|d| d.version)
+                            .unwrap_or(run.version);
+                        let cwd = PathBuf::from(&run.cwd);
+                        let run_id = run.run_id.clone();
+                        let fingerprint =
+                            ReplayFingerprint::for_task(&cwd, run_version, &briefing, task.expect);
+                        if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                            task_entry.artifact_file = Some(format!("artifacts/{task_id}.json"));
+                            task_entry.fingerprint = Some(fingerprint.clone());
                         }
-                    }
+                        (run_version, cwd, run_id)
+                    };
+                    let fingerprint =
+                        ReplayFingerprint::for_task(&cwd, run_version, &briefing, task.expect);
+                    let _ = write_task_fingerprint(&cwd, &run_id, &task_id, &fingerprint);
                     self.end_task(&task_id, TaskStatus::Succeeded, None);
                     self.checkpoint(Some(&format!("{task_id}: succeeded")));
                     return Some(artifact);

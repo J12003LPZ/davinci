@@ -22,6 +22,7 @@ pub(crate) mod controller;
 pub(crate) mod process;
 pub(crate) mod render;
 pub(crate) mod roles;
+pub(crate) mod replay;
 pub(crate) mod store;
 pub(crate) mod topology;
 pub(crate) mod types;
@@ -30,6 +31,8 @@ pub(crate) mod verify;
 pub(crate) mod worker;
 pub(crate) mod worker_hooks;
 
+#[allow(unused_imports)]
+pub use replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
 #[allow(unused_imports)]
 pub use topology::{
     build_definition, ready_nodes, validate_definition, EdgeCondition, EdgeDefinition,
@@ -285,7 +288,7 @@ impl GraphController {
         &self,
         parsed: &ParsedGraphArgs,
         abort: Arc<AtomicBool>,
-        resume_artifacts: HashMap<String, (Artifact, WorkerUsage)>,
+        resume_artifacts: HashMap<String, (Artifact, WorkerUsage, Option<ReplayFingerprint>)>,
     ) -> RunOptions {
         RunOptions {
             goal: parsed.goal.clone(),
@@ -301,7 +304,7 @@ impl GraphController {
     fn start_background(
         &self,
         parsed: ParsedGraphArgs,
-        resume_artifacts: HashMap<String, (Artifact, WorkerUsage)>,
+        resume_artifacts: HashMap<String, (Artifact, WorkerUsage, Option<ReplayFingerprint>)>,
     ) -> Result<Value, String> {
         if parsed.goal.trim().is_empty() {
             return Err("Usage: /graph <goal> [--simple|--complex] [--dry-run]".into());
@@ -405,7 +408,11 @@ impl GraphController {
             if let Ok(artifact) =
                 store::read_artifact(&self.cwd, &old_run.run_id, &task.id, task.expect)
             {
-                resume_artifacts.insert(task.id.clone(), (artifact, task.usage));
+                let fp = task
+                    .fingerprint
+                    .clone()
+                    .or_else(|| store::read_task_fingerprint(&self.cwd, &old_run.run_id, &task.id));
+                resume_artifacts.insert(task.id.clone(), (artifact, task.usage, fp));
             }
         }
         // A dry run resumes as a dry run: its canned artifacts must never be
