@@ -15,10 +15,10 @@ $target = Join-Path $binDir 'davinci.exe'
 
 Push-Location $repo
 try {
-    cargo build --release -p pi-coding-agent
+    cargo build --release -p davinci-coding-agent
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
-    $built = Join-Path $repo 'target\release\pi.exe'
+    $built = Join-Path $repo 'target\release\davinci.exe'
 
     # A running davinci holds its own image open, so replace rather than
     # overwrite: the delete succeeds once the old process has exited.

@@ -1,0 +1,28 @@
+[package]
+name = "davinci-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agent runtime matching @earendil-works/pi-agent-core"
+
+[dependencies]
+davinci-ai = { path = "../davinci-ai" }
+davinci-mcp = { path = "../davinci-mcp" }
+davinci-protocol = { path = "../davinci-protocol" }
+davinci-session = { path = "../davinci-session" }
+davinci-telemetry = { path = "../davinci-telemetry" }
+base64.workspace = true
+image.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+url.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

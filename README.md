@@ -1,10 +1,10 @@
-# pi (Rust)
+# davinci (Rust)
 
 A terminal coding agent: a product-equivalent Rust rewrite of the TypeScript CLI [`pi`](https://github.com/earendil-works/pi) (vendor pin `853a80d26c90a14c1886f0ebb8ffaae133ca2185`).
 
 Same flags, same `~/.pi` sessions, same provider credentials, same `--print` and `--mode rpc` — one static binary, no Node runtime required (Node is optional, and only for JavaScript extensions).
 
-The interactive terminal UI is the one place this deliberately diverges: `pi` opens the davinci shell described below. `--legacy-tui` keeps the original.
+The interactive terminal UI opens the davinci shell described below. `--legacy-tui` keeps the original.
 
 The TypeScript sources under `vendor/pi` are reference-only. Do not delete them.
 
@@ -15,23 +15,23 @@ The TypeScript sources under `vendor/pi` are reference-only. Do not delete them.
 Requires Rust 1.83.0 (pinned in `rust-toolchain.toml`).
 
 ```bash
-make install          # cargo install --path crates/pi-coding-agent --force
+make install          # cargo install --path crates/davinci-coding-agent --force
 # or
-make build            # cargo build -p pi-coding-agent  ->  ./target/debug/pi
+make build            # cargo build -p davinci-coding-agent  ->  ./target/debug/davinci
 ```
 
 ## Quick start
 
 ```bash
-pi                                  # interactive TUI
-pi "List all .ts files in src/"     # interactive, with an opening prompt
-pi -p "explain src/main.rs"         # print mode: run, print, exit
-pi --mode json -p "fix the build"   # newline-delimited JSON event stream
-pi --mode rpc                       # JSON-RPC over stdio, for embedding
-pi @notes.md @screenshot.png "what changed?"
+davinci                                  # interactive TUI
+davinci "List all .ts files in src/"     # interactive, with an opening prompt
+davinci -p "explain src/main.rs"         # print mode: run, print, exit
+davinci --mode json -p "fix the build"   # newline-delimited JSON event stream
+davinci --mode rpc                       # JSON-RPC over stdio, for embedding
+davinci @notes.md @screenshot.png "what changed?"
 ```
 
-Print mode is also selected automatically when stdin or stdout is not a TTY, so `pi` composes in pipelines.
+Print mode is also selected automatically when stdin or stdout is not a TTY, so `davinci` composes in pipelines.
 
 ---
 
@@ -64,7 +64,7 @@ Sessions are JSONL files under `~/.pi/agent/sessions/`, grouped by a cwd-encoded
 
 ### Terminal UI
 
-`pi` opens the **davinci shell** (`crates/pi-tui/src/davinci/`, built on
+`davinci` opens the **davinci shell** (`crates/davinci-tui/src/davinci/`, built on
 ratatui). Its visual language is specified in `docs/ui/design.md` and drawn in
 `docs/ui/Pi TUI Mockups.dc.html` across eleven screens: a truecolor
 copper/verdigris palette where copper carries state and verdigris carries
@@ -243,27 +243,27 @@ Fourteen `sec_*` tools drive the lifecycle (start, scope, progress, candidate re
 
 ## Workspace
 
-Dependencies flow strictly bottom-up; `pi-coding-agent` is the only binary.
+Dependencies flow strictly bottom-up; `davinci-coding-agent` is the only binary.
 
 | Crate | Role |
 | --- | --- |
-| `pi-ai` | providers, auth/OAuth, streaming, model catalog, cost |
-| `pi-agent` | agent loop, tools, compaction, skills, prompt templates |
-| `pi-tui` | terminal rendering |
-| `pi-session` / `pi-session-sqlite` | JSONL session store, SQLite branch cache |
-| `pi-protocol` / `pi-client` / `pi-server` | length-prefixed CBOR wire format and its endpoints |
-| `pi-telemetry`, `pi-evals` | telemetry, evaluation harness |
-| `pi-parity` | golden fixtures, optional diffing against the TypeScript binary |
-| `pi-coding-agent` | the `pi` binary: CLI, davinci shell wiring, extensions, slash commands |
+| `davinci-ai` | providers, auth/OAuth, streaming, model catalog, cost |
+| `davinci-agent` | agent loop, tools, compaction, skills, prompt templates |
+| `davinci-tui` | terminal rendering |
+| `davinci-session` / `davinci-session-sqlite` | JSONL session store, SQLite branch cache |
+| `davinci-protocol` / `davinci-client` / `davinci-server` | length-prefixed CBOR wire format and its endpoints |
+| `davinci-telemetry`, `davinci-evals` | telemetry, evaluation harness |
+| `davinci-parity` | golden fixtures, optional diffing against the TypeScript binary |
+| `davinci-coding-agent` | the `davinci` binary: CLI, davinci shell wiring, extensions, slash commands |
 
 ## Development
 
 ```bash
-make build     # cargo build -p pi-coding-agent
-make test      # cargo test --workspace         (1046 tests)
+make build     # cargo build -p davinci-coding-agent
+make test      # cargo test --workspace
 make fmt       # cargo fmt --check
 make clippy    # cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p pi-parity                            # golden-fixture parity corpora
+cargo run -p davinci-parity                            # golden-fixture parity corpora
 ```
 
 Tests are fixture-only and never touch the network: anything that would call a provider, an installer, a browser, or an update server is driven by a `PI_*` fixture environment variable read at the call site.

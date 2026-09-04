@@ -1,0 +1,45 @@
+[package]
+name = "davinci-coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Coding agent CLI matching @earendil-works/pi-coding-agent"
+
+[lib]
+name = "davinci_coding_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "davinci"
+path = "src/main.rs"
+
+[dependencies]
+davinci-agent = { path = "../davinci-agent" }
+davinci-ai = { path = "../davinci-ai" }
+davinci-client = { path = "../davinci-client" }
+davinci-mcp = { path = "../davinci-mcp" }
+davinci-evals = { path = "../davinci-evals" }
+davinci-protocol = { path = "../davinci-protocol" }
+davinci-server = { path = "../davinci-server" }
+davinci-session = { path = "../davinci-session" }
+davinci-session-sqlite = { path = "../davinci-session-sqlite" }
+davinci-telemetry = { path = "../davinci-telemetry" }
+davinci-tui = { path = "../davinci-tui" }
+crossterm.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+base64.workspace = true
+ureq.workspace = true
+url.workspace = true
+image.workspace = true
+signal-hook.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

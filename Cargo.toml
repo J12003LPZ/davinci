@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/pi-protocol",
-    "crates/pi-mcp",
-    "crates/pi-session",
-    "crates/pi-session-sqlite",
-    "crates/pi-ai",
-    "crates/pi-agent",
-    "crates/pi-tui",
-    "crates/pi-client",
-    "crates/pi-server",
-    "crates/pi-telemetry",
-    "crates/pi-evals",
-    "crates/pi-coding-agent",
-    "crates/pi-parity",
+    "crates/davinci-protocol",
+    "crates/davinci-mcp",
+    "crates/davinci-session",
+    "crates/davinci-session-sqlite",
+    "crates/davinci-ai",
+    "crates/davinci-agent",
+    "crates/davinci-tui",
+    "crates/davinci-client",
+    "crates/davinci-server",
+    "crates/davinci-telemetry",
+    "crates/davinci-evals",
+    "crates/davinci-coding-agent",
+    "crates/davinci-parity",
 ]
 
 [workspace.package]

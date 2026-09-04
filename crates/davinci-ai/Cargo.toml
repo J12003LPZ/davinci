@@ -1,0 +1,29 @@
+[package]
+name = "davinci-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Unified multi-provider LLM API matching @earendil-works/pi-ai"
+
+[dependencies]
+davinci-protocol = { path = "../davinci-protocol" }
+davinci-telemetry = { path = "../davinci-telemetry" }
+base64.workspace = true
+regex.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+url.workspace = true
+uuid.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
+sha1 = { workspace = true }
+sha2.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

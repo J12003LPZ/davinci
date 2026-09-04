@@ -298,6 +298,216 @@ dependencies = [
 ]
 
 [[package]]
+name = "davinci-agent"
+version = "0.85.0"
+dependencies = [
+ "base64",
+ "davinci-ai",
+ "davinci-mcp",
+ "davinci-protocol",
+ "davinci-session",
+ "davinci-telemetry",
+ "image",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "ureq",
+ "url",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "davinci-ai"
+version = "0.85.0"
+dependencies = [
+ "base64",
+ "davinci-protocol",
+ "davinci-telemetry",
+ "regex",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "ureq",
+ "url",
+ "uuid",
+ "webpki-roots",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
+name = "davinci-client"
+version = "0.85.0"
+dependencies = [
+ "davinci-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "davinci-coding-agent"
+version = "0.85.0"
+dependencies = [
+ "base64",
+ "clap",
+ "crossterm",
+ "davinci-agent",
+ "davinci-ai",
+ "davinci-client",
+ "davinci-evals",
+ "davinci-mcp",
+ "davinci-protocol",
+ "davinci-server",
+ "davinci-session",
+ "davinci-session-sqlite",
+ "davinci-telemetry",
+ "davinci-tui",
+ "image",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook",
+ "tempfile",
+ "thiserror",
+ "ureq",
+ "url",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "davinci-evals"
+version = "0.85.0"
+dependencies = [
+ "davinci-agent",
+ "davinci-ai",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "davinci-mcp"
+version = "0.85.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "ureq",
+ "url",
+]
+
+[[package]]
+name = "davinci-parity"
+version = "0.85.0"
+dependencies = [
+ "clap",
+ "davinci-agent",
+ "davinci-ai",
+ "davinci-client",
+ "davinci-protocol",
+ "davinci-server",
+ "davinci-session",
+ "davinci-session-sqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "davinci-protocol"
+version = "0.85.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "davinci-server"
+version = "0.85.0"
+dependencies = [
+ "davinci-agent",
+ "davinci-ai",
+ "davinci-client",
+ "davinci-protocol",
+ "davinci-session",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "davinci-session"
+version = "0.85.0"
+dependencies = [
+ "davinci-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "davinci-session-sqlite"
+version = "0.85.0"
+dependencies = [
+ "davinci-session",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "davinci-telemetry"
+version = "0.85.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "davinci-tui"
+version = "0.85.0"
+dependencies = [
+ "base64",
+ "crossterm",
+ "fancy-regex",
+ "icu_segmenter",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -781,216 +991,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "pi-agent"
-version = "0.85.0"
-dependencies = [
- "base64",
- "image",
- "pi-ai",
- "pi-mcp",
- "pi-protocol",
- "pi-session",
- "pi-telemetry",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "ureq",
- "url",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "pi-ai"
-version = "0.85.0"
-dependencies = [
- "base64",
- "pi-protocol",
- "pi-telemetry",
- "regex",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "tempfile",
- "thiserror",
- "ureq",
- "url",
- "uuid",
- "webpki-roots",
- "zeroize",
- "zstd",
-]
-
-[[package]]
-name = "pi-client"
-version = "0.85.0"
-dependencies = [
- "pi-protocol",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "pi-coding-agent"
-version = "0.85.0"
-dependencies = [
- "base64",
- "clap",
- "crossterm",
- "image",
- "pi-agent",
- "pi-ai",
- "pi-client",
- "pi-evals",
- "pi-mcp",
- "pi-protocol",
- "pi-server",
- "pi-session",
- "pi-session-sqlite",
- "pi-telemetry",
- "pi-tui",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "signal-hook",
- "tempfile",
- "thiserror",
- "ureq",
- "url",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "pi-evals"
-version = "0.85.0"
-dependencies = [
- "pi-agent",
- "pi-ai",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "pi-mcp"
-version = "0.85.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "ureq",
- "url",
-]
-
-[[package]]
-name = "pi-parity"
-version = "0.85.0"
-dependencies = [
- "clap",
- "pi-agent",
- "pi-ai",
- "pi-client",
- "pi-protocol",
- "pi-server",
- "pi-session",
- "pi-session-sqlite",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "pi-protocol"
-version = "0.85.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "pi-server"
-version = "0.85.0"
-dependencies = [
- "pi-agent",
- "pi-ai",
- "pi-client",
- "pi-protocol",
- "pi-session",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "pi-session"
-version = "0.85.0"
-dependencies = [
- "pi-protocol",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "pi-session-sqlite"
-version = "0.85.0"
-dependencies = [
- "pi-session",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "pi-telemetry"
-version = "0.85.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "pi-tui"
-version = "0.85.0"
-dependencies = [
- "base64",
- "crossterm",
- "fancy-regex",
- "icu_segmenter",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "serde_json",
- "tempfile",
- "unicode-segmentation",
- "unicode-width 0.2.0",
-]
 
 [[package]]
 name = "pkg-config"
