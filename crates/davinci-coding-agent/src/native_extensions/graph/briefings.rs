@@ -448,6 +448,7 @@ pub struct ReviewInput<'a> {
     pub chunk: Option<&'a ReviewChunk>,
     pub chunk_summaries: Option<&'a [String]>,
     pub required_chunk_ids: Option<&'a [String]>,
+    pub security: Option<&'a crate::native_extensions::ecosystem::verification::SecurityVerification>,
 }
 
 pub fn review_briefing(input: &ReviewInput<'_>) -> String {
@@ -530,6 +531,30 @@ pub fn review_briefing(input: &ReviewInput<'_>) -> String {
         } else {
             verification_lines.join("\n")
         },
+    ]);
+
+    if let Some(sec) = input.security {
+        parts.extend([
+            String::new(),
+            "## Security verification".to_string(),
+            match sec {
+                crate::native_extensions::ecosystem::verification::SecurityVerification::NotRequired => {
+                    "- Security scan: not required for this change".to_string()
+                }
+                crate::native_extensions::ecosystem::verification::SecurityVerification::Passed { scan_id } => {
+                    format!("- Security scan: PASSED (scan ID: {scan_id})")
+                }
+                crate::native_extensions::ecosystem::verification::SecurityVerification::Failed { scan_id, blockers } => {
+                    format!("- Security scan: FAILED with {blockers} blocker(s) (scan ID: {scan_id})")
+                }
+                crate::native_extensions::ecosystem::verification::SecurityVerification::Unavailable { reason } => {
+                    format!("- Security scan: UNAVAILABLE ({reason})")
+                }
+            },
+        ]);
+    }
+
+    parts.extend([
         String::new(),
         "## Your judgment".to_string(),
         "Judge whether the change satisfies the goal and plan. Look for: correctness bugs, plan deviations,".to_string(),
@@ -545,6 +570,7 @@ pub fn review_briefing(input: &ReviewInput<'_>) -> String {
 pub fn revision_notes_from(
     verification: Option<&VerificationResult>,
     review: Option<&ReviewDecision>,
+    security: Option<&crate::native_extensions::ecosystem::verification::SecurityVerification>,
 ) -> String {
     let mut notes: Vec<String> = Vec::new();
     if let Some(verification) = verification.filter(|verification| !verification.passed) {
@@ -556,6 +582,11 @@ pub fn revision_notes_from(
                 ));
             }
         }
+    }
+    if let Some(crate::native_extensions::ecosystem::verification::SecurityVerification::Failed { scan_id, blockers }) = security {
+        notes.push(format!(
+            "Security verification failed: {blockers} blocker(s) found (scan ID: {scan_id}). Clean sensitive credentials, dangerous evaluations, or forbidden patterns before proceeding."
+        ));
     }
     if let Some(review) = review.filter(|review| review.verdict == Verdict::ChangesRequired) {
         for issue in &review.issues {
@@ -687,7 +718,7 @@ mod tests {
             notes: String::new(),
             reviewed_chunk_ids: vec![],
         };
-        let notes = revision_notes_from(Some(&verification), Some(&review));
+        let notes = revision_notes_from(Some(&verification), Some(&review), None);
         assert!(notes.contains("cargo test"));
         assert!(notes.contains("unsound"));
         assert!(!notes.contains("naming"));
@@ -699,7 +730,19 @@ mod tests {
             commands: vec![],
             passed: true,
         };
-        assert!(revision_notes_from(Some(&verification), None).is_empty());
+        assert!(revision_notes_from(Some(&verification), None, None).is_empty());
+    }
+
+    #[test]
+    fn revision_notes_include_security_blockers() {
+        let sec = crate::native_extensions::ecosystem::verification::SecurityVerification::Failed {
+            scan_id: "scan-99".into(),
+            blockers: 2,
+        };
+        let notes = revision_notes_from(None, None, Some(&sec));
+        assert!(notes.contains("Security verification failed"));
+        assert!(notes.contains("2 blocker(s)"));
+        assert!(notes.contains("scan-99"));
     }
 
     #[test]

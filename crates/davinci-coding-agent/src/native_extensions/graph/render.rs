@@ -256,6 +256,7 @@ mod tests {
                 None,
             )],
             verification: None,
+            verification_bundle: None,
             review_coverage: None,
             budgets: GraphBudgets::default(),
             counters: GraphCounters {

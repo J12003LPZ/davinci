@@ -22,6 +22,8 @@ use super::store::{
 use super::topology::{
     build_definition, ready_nodes, validate_definition, GraphMode, GraphRunState,
 };
+use crate::native_extensions::ecosystem::risk::ChangeRisk;
+use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, SecurityVerification};
 use super::types::{
     Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters, GraphRun,
     GraphTaskState, ImplementationPlan, Phase, ResearchKind, ReviewIssue, Role, Severity,
@@ -747,6 +749,7 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         current_milestone: None,
         tasks: Vec::new(),
         verification: None,
+        verification_bundle: None,
         review_coverage: None,
         budgets,
         counters: GraphCounters {
@@ -1190,7 +1193,109 @@ fn deliver_goal(
                 .unwrap_or_else(|error| error.into_inner())
                 .counters
                 .revision_cycles += 1;
-            revision_notes = Some(revision_notes_from(Some(&verification), None));
+            revision_notes = Some(revision_notes_from(Some(&verification), None, None));
+            continue;
+        }
+
+        let changed_files: Vec<String> = if !cumulative_delta.files.is_empty() {
+            cumulative_delta
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect()
+        } else {
+            patch.changed_files.clone()
+        };
+
+        let policy_mode = execution.deps.config.security_verification;
+        let risk = cumulative_delta.assess_risk();
+        let should_scan = match policy_mode {
+            SecurityPolicyMode::Off => false,
+            SecurityPolicyMode::Risk => risk.level == ChangeRisk::High,
+            SecurityPolicyMode::Always => {
+                !cumulative_delta.files.is_empty() || !changed_files.is_empty()
+            }
+        };
+
+        let security_verification = if should_scan {
+            execution.set_phase(Phase::Verify);
+            let run_id = execution.snapshot().run_id;
+            let mut sec_controller =
+                crate::native_extensions::SecurityScanController::new(cwd.clone());
+            let req = crate::native_extensions::SecurityVerifyRequest {
+                cwd: &cwd,
+                changed_files: &changed_files,
+                graph_run_id: &run_id,
+            };
+            let outcome = match sec_controller.verify_changed_surface(req) {
+                Ok(sec) => sec,
+                Err(reason) => SecurityVerification::Unavailable { reason },
+            };
+
+            let mut sec_task = GraphTaskState::new(
+                format!("security-{}", indices.implement),
+                Role::TestAnalyzer,
+                ArtifactKind::Evidence,
+                vec![format!("implement-{}", indices.implement)],
+                Some("security verification".to_string()),
+            );
+            sec_task.started_at = Some(now_ms());
+            sec_task.ended_at = Some(now_ms());
+            if matches!(outcome, SecurityVerification::Passed { .. }) {
+                sec_task.mark_succeeded();
+            } else {
+                sec_task.mark_failed(format!("{outcome:?}"));
+            }
+            {
+                let mut run = execution
+                    .run
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                run.tasks.push(sec_task);
+            }
+            outcome
+        } else {
+            SecurityVerification::NotRequired
+        };
+
+        let bundle = verification.to_bundle(
+            changed_files.clone(),
+            Some(execution.snapshot().run_id),
+            security_verification.clone(),
+        );
+
+        {
+            let mut run = execution
+                .run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            run.verification_bundle = Some(bundle.clone());
+        }
+
+        let security_eligible = if execution.options.dry_run {
+            !matches!(security_verification, SecurityVerification::Failed { .. })
+        } else {
+            bundle.approval_eligible(policy_mode)
+        };
+        if !security_eligible {
+            if revision_cycles >= budgets.max_revision_cycles {
+                execution.blocked(format!(
+                    "security verification still failing after {revision_cycles} revision cycles: {security_verification:?}"
+                ));
+                return Delivery::Stop;
+            }
+            revision_cycles += 1;
+            execution
+                .run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .counters
+                .revision_cycles += 1;
+            revision_notes = Some(revision_notes_from(
+                Some(&verification),
+                None,
+                Some(&security_verification),
+            ));
             continue;
         }
 
@@ -1201,15 +1306,6 @@ fn deliver_goal(
         execution.set_phase(Phase::Review);
         indices.review += 1;
         let graph_diff = cumulative_delta.diff();
-        let changed_files: Vec<String> = if !cumulative_delta.files.is_empty() {
-            cumulative_delta
-                .files
-                .iter()
-                .map(|f| f.path.clone())
-                .collect()
-        } else {
-            patch.changed_files.clone()
-        };
 
         let chunks = chunk_graph_mutation(&cumulative_delta, DIFF_MAX_CHARS);
         let required_chunk_ids: Vec<String> = chunks.iter().map(|c| c.id.clone()).collect();
@@ -1242,6 +1338,7 @@ fn deliver_goal(
                             chunk: Some(chunk),
                             chunk_summaries: None,
                             required_chunk_ids: Some(&req_ids),
+                            security: Some(&security_verification),
                         }),
                     )
                     .and_then(|artifact| artifact.as_review().cloned());
@@ -1289,6 +1386,7 @@ fn deliver_goal(
                         chunk: None,
                         chunk_summaries: Some(&chunk_summaries),
                         required_chunk_ids: None,
+                        security: Some(&security_verification),
                     }),
                 )
                 .and_then(|artifact| artifact.as_review().cloned());
@@ -1334,6 +1432,7 @@ fn deliver_goal(
                         chunk: single_chunk,
                         chunk_summaries: None,
                         required_chunk_ids: req_ids.as_deref(),
+                        security: Some(&security_verification),
                     }),
                 )
                 .and_then(|artifact| artifact.as_review().cloned());
@@ -1388,10 +1487,26 @@ fn deliver_goal(
             .issues
             .iter()
             .any(|issue| matches!(issue.severity, Severity::Blocker | Severity::Major));
-        if review.verdict == Verdict::Approve && !blocking_issue && is_coverage_complete {
+        let can_approve = if execution.options.dry_run {
+            !matches!(security_verification, SecurityVerification::Failed { .. })
+        } else {
+            bundle.approval_eligible(policy_mode)
+        };
+        if review.verdict == Verdict::Approve && !blocking_issue && is_coverage_complete && can_approve {
             return Delivery::Ok;
         }
         if review.verdict == Verdict::Approve {
+            if !can_approve {
+                review.verdict = Verdict::ChangesRequired;
+                review.issues.push(ReviewIssue {
+                    severity: Severity::Blocker,
+                    file: None,
+                    description: format!(
+                        "Security verification rejected approval: {:?}",
+                        bundle.security
+                    ),
+                });
+            }
             execution.checkpoint(Some(
                 "review approved with blocking issues or incomplete coverage; treated as changes required",
             ));
@@ -1409,7 +1524,7 @@ fn deliver_goal(
             .unwrap_or_else(|error| error.into_inner())
             .counters
             .revision_cycles += 1;
-        revision_notes = Some(revision_notes_from(None, Some(&review)));
+        revision_notes = Some(revision_notes_from(None, Some(&review), Some(&security_verification)));
     }
 }
 
@@ -1749,6 +1864,7 @@ mod tests {
                         },
                     ],
                 }),
+                verification_bundle: None,
                 review_coverage: None,
                 budgets: GraphBudgets::default(),
                 counters: GraphCounters {
@@ -1782,4 +1898,372 @@ mod tests {
         assert_eq!(record.success_count, 1);
         assert_eq!(record.failure_count, 0);
     }
+
+    #[test]
+    fn graph_security_gate_blocks_approval_on_high_risk_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_file = dir.path().join("src").join("auth.rs");
+        std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        std::fs::write(&auth_file, "pub fn key() -> &'static str { \"initial\" }\n").unwrap();
+
+        let auth_file_clone = auth_file.clone();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(
+                    Classification {
+                        task_class: TaskClass::Feature,
+                        complexity: Complexity::Standard,
+                        rationale: "auth change".into(),
+                        research_tasks: vec![ResearchRequest {
+                            kind: ResearchKind::CodeSearch,
+                            focus: "find key".into(),
+                        }],
+                        milestones: None,
+                    },
+                ),
+                ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
+                    kind: ResearchKind::CodeSearch,
+                    findings: vec![EvidenceFinding {
+                        claim: "found key".into(),
+                        refs: vec!["src/auth.rs:1".into()],
+                        confidence: Confidence::High,
+                    }],
+                    risks: vec![],
+                    gaps: vec![],
+                    test_baseline: None,
+                })),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![PlanStep {
+                        description: "update key".into(),
+                        files: vec!["src/auth.rs".into()],
+                    }],
+                    tests_to_add: vec![],
+                    tests_to_run: vec!["true".into()],
+                    completion_criteria: vec!["done".into()],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => {
+                    std::fs::write(
+                        &auth_file_clone,
+                        "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+                    )
+                    .unwrap();
+                    Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec!["src/auth.rs".into()],
+                        summary: "added secret key".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
+                ArtifactKind::Review => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "reviewer approves".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+            };
+
+            let _ = write_artifact(&spec.artifact_path, &artifact);
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let verify_exec: Arc<VerifyExec> = Arc::new(|_, _, _, _| (0, String::new(), 0));
+        let config = GraphConfig {
+            security_verification: SecurityPolicyMode::Risk,
+            verify_commands: vec![VerifyCommandSpec {
+                command: "echo test".into(),
+                name: "test".into(),
+                from_plan: false,
+            }],
+            budgets: GraphBudgets {
+                max_revision_cycles: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec,
+            config,
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+        };
+
+        let options = RunOptions {
+            goal: "update auth key".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+
+        let run = run_graph(options, deps);
+        assert_eq!(run.phase, Phase::Blocked);
+        let blocked = run.blocked_reason.expect("must be blocked");
+        assert!(
+            blocked.contains("security verification still failing"),
+            "unexpected blocked reason: {blocked}"
+        );
+        let bundle = run
+            .verification_bundle
+            .expect("verification bundle must be present");
+        assert!(matches!(bundle.security, SecurityVerification::Failed { .. }));
+        assert!(!bundle.approval_eligible(SecurityPolicyMode::Risk));
+    }
+
+    #[test]
+    fn graph_security_gate_passes_clean_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui_file = dir.path().join("src").join("ui.rs");
+        std::fs::create_dir_all(ui_file.parent().unwrap()).unwrap();
+        std::fs::write(&ui_file, "pub fn render() {}\n").unwrap();
+
+        let ui_file_clone = ui_file.clone();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(
+                    Classification {
+                        task_class: TaskClass::Feature,
+                        complexity: Complexity::Standard,
+                        rationale: "clean ui change".into(),
+                        research_tasks: vec![ResearchRequest {
+                            kind: ResearchKind::CodeSearch,
+                            focus: "find render".into(),
+                        }],
+                        milestones: None,
+                    },
+                ),
+                ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
+                    kind: ResearchKind::CodeSearch,
+                    findings: vec![EvidenceFinding {
+                        claim: "found render".into(),
+                        refs: vec!["src/ui.rs:1".into()],
+                        confidence: Confidence::High,
+                    }],
+                    risks: vec![],
+                    gaps: vec![],
+                    test_baseline: None,
+                })),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![PlanStep {
+                        description: "update render".into(),
+                        files: vec!["src/ui.rs".into()],
+                    }],
+                    tests_to_add: vec![],
+                    tests_to_run: vec!["true".into()],
+                    completion_criteria: vec!["done".into()],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => {
+                    std::fs::write(
+                        &ui_file_clone,
+                        "pub fn render() { println!(\"Hello clean UI\"); }\n",
+                    )
+                    .unwrap();
+                    Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec!["src/ui.rs".into()],
+                        summary: "updated render".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
+                ArtifactKind::Review => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "looks great".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+            };
+
+            let _ = write_artifact(&spec.artifact_path, &artifact);
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let verify_exec: Arc<VerifyExec> = Arc::new(|_, _, _, _| (0, String::new(), 0));
+        let config = GraphConfig {
+            security_verification: SecurityPolicyMode::Always,
+            verify_commands: vec![VerifyCommandSpec {
+                command: "echo test".into(),
+                name: "test".into(),
+                from_plan: false,
+            }],
+            budgets: GraphBudgets {
+                max_revision_cycles: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec,
+            config,
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+        };
+
+        let options = RunOptions {
+            goal: "clean ui update".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+
+        let run = run_graph(options, deps);
+        assert_eq!(run.phase, Phase::Done);
+        assert!(run.blocked_reason.is_none());
+        let bundle = run
+            .verification_bundle
+            .expect("verification bundle must be present");
+        assert!(matches!(bundle.security, SecurityVerification::Passed { .. }));
+        assert!(bundle.approval_eligible(SecurityPolicyMode::Always));
+    }
+
+    #[test]
+    fn graph_security_policy_off_allows_risky_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_file = dir.path().join("src").join("auth.rs");
+        std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        std::fs::write(&auth_file, "pub fn key() -> &'static str { \"initial\" }\n").unwrap();
+
+        let auth_file_clone = auth_file.clone();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(
+                    Classification {
+                        task_class: TaskClass::Feature,
+                        complexity: Complexity::Standard,
+                        rationale: "auth change".into(),
+                        research_tasks: vec![ResearchRequest {
+                            kind: ResearchKind::CodeSearch,
+                            focus: "find key".into(),
+                        }],
+                        milestones: None,
+                    },
+                ),
+                ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
+                    kind: ResearchKind::CodeSearch,
+                    findings: vec![EvidenceFinding {
+                        claim: "found key".into(),
+                        refs: vec!["src/auth.rs:1".into()],
+                        confidence: Confidence::High,
+                    }],
+                    risks: vec![],
+                    gaps: vec![],
+                    test_baseline: None,
+                })),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![PlanStep {
+                        description: "update key".into(),
+                        files: vec!["src/auth.rs".into()],
+                    }],
+                    tests_to_add: vec![],
+                    tests_to_run: vec!["true".into()],
+                    completion_criteria: vec!["done".into()],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => {
+                    std::fs::write(
+                        &auth_file_clone,
+                        "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+                    )
+                    .unwrap();
+                    Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec!["src/auth.rs".into()],
+                        summary: "added secret key".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
+                ArtifactKind::Review => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "reviewer approves".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+            };
+
+            let _ = write_artifact(&spec.artifact_path, &artifact);
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let verify_exec: Arc<VerifyExec> = Arc::new(|_, _, _, _| (0, String::new(), 0));
+        let config = GraphConfig {
+            security_verification: SecurityPolicyMode::Off,
+            verify_commands: vec![VerifyCommandSpec {
+                command: "echo test".into(),
+                name: "test".into(),
+                from_plan: false,
+            }],
+            budgets: GraphBudgets {
+                max_revision_cycles: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec,
+            config,
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+        };
+
+        let options = RunOptions {
+            goal: "update auth key".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+
+        let run = run_graph(options, deps);
+        assert_eq!(run.phase, Phase::Done);
+        assert!(run.blocked_reason.is_none());
+        let bundle = run
+            .verification_bundle
+            .expect("verification bundle must be present");
+        assert!(matches!(bundle.security, SecurityVerification::NotRequired));
+        assert!(bundle.approval_eligible(SecurityPolicyMode::Off));
+    }
 }
+

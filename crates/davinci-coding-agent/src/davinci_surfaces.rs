@@ -512,6 +512,7 @@ mod tests {
             current_milestone: None,
             tasks: Vec::new(),
             verification: None,
+            verification_bundle: None,
             review_coverage: None,
             budgets: GraphBudgets::default(),
             counters: GraphCounters {

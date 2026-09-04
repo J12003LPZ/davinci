@@ -607,6 +607,8 @@ pub struct GraphRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_bundle: Option<crate::native_extensions::ecosystem::verification::VerificationBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_coverage: Option<ReviewCoverage>,
     pub budgets: GraphBudgets,
     pub counters: GraphCounters,
@@ -994,6 +996,7 @@ mod tests {
                 ),
             ],
             verification: None,
+            verification_bundle: None,
             review_coverage: None,
             budgets: GraphBudgets::default(),
             counters: GraphCounters {

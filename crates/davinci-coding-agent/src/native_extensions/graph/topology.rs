@@ -364,6 +364,19 @@ pub fn build_definition(mode: GraphMode, classification: &Classification) -> Gra
             });
 
             nodes.push(NodeDefinition {
+                id: "security-1".to_string(),
+                role: Role::TestAnalyzer,
+                expect: ArtifactKind::Evidence,
+                required: false,
+                allows_mutation: false,
+            });
+            edges.push(EdgeDefinition {
+                from: "implement-1".to_string(),
+                to: "security-1".to_string(),
+                condition: EdgeCondition::OnSuccess,
+            });
+
+            nodes.push(NodeDefinition {
                 id: "review-1".to_string(),
                 role: Role::Reviewer,
                 expect: ArtifactKind::Review,
@@ -455,6 +468,20 @@ pub fn build_definition(mode: GraphMode, classification: &Classification) -> Gra
                 edges.push(EdgeDefinition {
                     from: prev_head,
                     to: impl_id.clone(),
+                    condition: EdgeCondition::OnSuccess,
+                });
+
+                let sec_id = format!("security-{m}");
+                nodes.push(NodeDefinition {
+                    id: sec_id.clone(),
+                    role: Role::TestAnalyzer,
+                    expect: ArtifactKind::Evidence,
+                    required: false,
+                    allows_mutation: false,
+                });
+                edges.push(EdgeDefinition {
+                    from: impl_id.clone(),
+                    to: sec_id.clone(),
                     condition: EdgeCondition::OnSuccess,
                 });
 

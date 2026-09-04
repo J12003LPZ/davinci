@@ -439,6 +439,7 @@ mod tests {
                 },
             ],
             verification: None,
+            verification_bundle: None,
             review_coverage: None,
             budgets: Default::default(),
             counters: GraphCounters {
