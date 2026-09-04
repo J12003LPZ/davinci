@@ -234,11 +234,22 @@ impl GraphExecution {
     fn end_task(&self, task_id: &str, status: TaskStatus, error: Option<String>) {
         let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id) {
-            task.status = status;
             task.ended_at = Some(now_ms());
             task.last_activity = None;
-            if error.is_some() {
-                task.error = error;
+            match status {
+                TaskStatus::Succeeded => task.mark_succeeded(),
+                TaskStatus::Failed => {
+                    let err = error
+                        .or_else(|| task.error.clone())
+                        .unwrap_or_else(|| "task failed".to_string());
+                    task.mark_failed(err);
+                }
+                _ => {
+                    task.status = status;
+                    if let Some(err) = error {
+                        task.error = Some(err);
+                    }
+                }
             }
         }
     }

@@ -514,6 +514,16 @@ impl GraphTaskState {
             last_activity: None,
         }
     }
+
+    pub fn mark_succeeded(&mut self) {
+        self.status = TaskStatus::Succeeded;
+        self.error = None;
+    }
+
+    pub fn mark_failed(&mut self, error: String) {
+        self.status = TaskStatus::Failed;
+        self.error = Some(error);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -908,5 +918,27 @@ mod tests {
             None,
         );
         assert_eq!(run.unmet_dependencies(&orphan), vec!["missing"]);
+    }
+
+    #[test]
+    fn successful_retry_clears_prior_error() {
+        let mut task = GraphTaskState::new("test-task", Role::Writer, ArtifactKind::PatchReport, vec![], None);
+        // Attempt 1 fails
+        task.attempts = 1;
+        task.mark_failed("exit 1; compiler error".to_string());
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(task.error.is_some());
+
+        // Attempt 2 succeeds
+        task.attempts = 2;
+        task.mark_succeeded();
+        assert_eq!(task.status, TaskStatus::Succeeded);
+        assert!(task.error.is_none(), "successful task must have no error");
+
+        // Invariant holds through serde roundtrip
+        let serialized = serde_json::to_string(&task).expect("serializes");
+        let deserialized: GraphTaskState = serde_json::from_str(&serialized).expect("deserializes");
+        assert_eq!(deserialized.status, TaskStatus::Succeeded);
+        assert!(deserialized.error.is_none());
     }
 }
