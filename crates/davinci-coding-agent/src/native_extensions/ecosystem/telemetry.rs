@@ -69,6 +69,55 @@ impl EcosystemStats {
             && self.learning_reviews_skipped == 0
             && self.learned_artifacts_applied == 0
     }
+
+    #[allow(dead_code)]
+    pub fn record_context_packet(
+        &mut self,
+        packet: &crate::native_extensions::ecosystem::ContextPacket,
+    ) {
+        if !packet.is_empty() {
+            self.memory_hits += packet.memory_refs.len() as u64;
+            self.memory_injected_tokens += packet.memory_tokens as u64;
+            self.skill_candidates_considered += packet.skill_candidates_considered as u64;
+            self.skills_injected += packet.skill_refs.len() as u64;
+            self.skill_injected_tokens += packet.skill_tokens as u64;
+            self.context_packet_tokens += packet.estimated_tokens as u64;
+            self.context_fingerprint = Some(packet.fingerprint.clone());
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn record_governor(&mut self, stats: &crate::native_extensions::GovernorStats) {
+        self.governor_bytes_omitted = stats.bytes_withheld;
+        self.governor_retrievals = stats.retrievals;
+        self.prunings = stats.prunings;
+    }
+
+    #[allow(dead_code)]
+    pub fn record_worker_usage(
+        &mut self,
+        usage: &crate::native_extensions::graph::types::WorkerUsage,
+    ) {
+        self.cache_read_tokens += usage.cache_read;
+        self.cache_write_tokens += usage.cache_write;
+        self.graph_cost_usd += usage.cost_usd;
+    }
+
+    #[allow(dead_code)]
+    pub fn record_security_gate(&mut self, triggered: bool, result: Option<String>) {
+        self.security_gate_triggered = triggered;
+        self.security_result = result;
+    }
+
+    #[allow(dead_code)]
+    pub fn record_learning_stats(
+        &mut self,
+        stats: &crate::native_extensions::learning::LearningStats,
+    ) {
+        self.learning_reviews_dispatched = stats.reviews_dispatched;
+        self.learning_reviews_skipped = stats.reviews_skipped;
+        self.learned_artifacts_applied = stats.candidates_approved;
+    }
 }
 
 #[cfg(test)]
@@ -157,5 +206,137 @@ mod tests {
         assert_eq!(run.ecosystem_stats, EcosystemStats::default());
         assert_eq!(run.ecosystem_stats.memory_hits, 0);
         assert!(run.ecosystem_stats.is_empty());
+    }
+
+    #[test]
+    fn ecosystem_telemetry_deterministic_aggregation_fixture() {
+        let mut stats = EcosystemStats::default();
+
+        // 1. memory packet: 3 hits / 700 tokens, skills: 2 candidates / 1 injected / 320 tokens
+        let packet = crate::native_extensions::ecosystem::ContextPacket {
+            text: "mock context text".into(),
+            memory_refs: vec!["m1".into(), "m2".into(), "m3".into()],
+            skill_refs: vec![crate::native_extensions::ecosystem::SkillContextRef {
+                name: "test-skill".into(),
+                version: 1,
+                content_hash: "hash123".into(),
+            }],
+            estimated_tokens: 1020,
+            fingerprint: "ctx-fp-xyz".into(),
+            memory_tokens: 700,
+            skill_tokens: 320,
+            skill_candidates_considered: 2,
+        };
+        stats.record_context_packet(&packet);
+
+        // 2. governor: 18 KB omitted / 1 retrieve_output, pruning: 1
+        let gov_stats = crate::native_extensions::GovernorStats {
+            bytes_withheld: 18 * 1024,
+            retrievals: 1,
+            compressed_outputs: 1,
+            deduplicated_reads: 0,
+            blocked_calls: 0,
+            prunings: 1,
+        };
+        stats.record_governor(&gov_stats);
+
+        // 3. provider: 4,000 cache-read / 400 cache-write tokens
+        stats.graph_workers += 1;
+        let worker_usage = crate::native_extensions::graph::types::WorkerUsage {
+            input: 5000,
+            output: 200,
+            cache_read: 4000,
+            cache_write: 400,
+            cost_usd: 0.05,
+            turns: 2,
+        };
+        stats.record_worker_usage(&worker_usage);
+
+        // 4. security: triggered + passed
+        stats.record_security_gate(true, Some("passed".into()));
+
+        // 5. learning: 1 dispatched / 1 artifact applied
+        let learn_stats = crate::native_extensions::learning::LearningStats {
+            reviews_dispatched: 1,
+            reviews_skipped: 0,
+            candidates_approved: 1,
+            ..Default::default()
+        };
+        stats.record_learning_stats(&learn_stats);
+
+        // Assert every EcosystemStats field exactly
+        assert_eq!(stats.memory_hits, 3);
+        assert_eq!(stats.memory_injected_tokens, 700);
+        assert_eq!(stats.skill_candidates_considered, 2);
+        assert_eq!(stats.skills_injected, 1);
+        assert_eq!(stats.skill_injected_tokens, 320);
+        assert_eq!(stats.context_packet_tokens, 1020);
+        assert_eq!(stats.context_fingerprint, Some("ctx-fp-xyz".into()));
+        assert_eq!(stats.governor_bytes_omitted, 18432);
+        assert_eq!(stats.governor_retrievals, 1);
+        assert_eq!(stats.prunings, 1);
+        assert_eq!(stats.cache_read_tokens, 4000);
+        assert_eq!(stats.cache_write_tokens, 400);
+        assert_eq!(stats.graph_workers, 1);
+        assert!((stats.graph_cost_usd - 0.05).abs() < 1e-6);
+        assert!(stats.security_gate_triggered);
+        assert_eq!(stats.security_result, Some("passed".into()));
+        assert_eq!(stats.learning_reviews_dispatched, 1);
+        assert_eq!(stats.learning_reviews_skipped, 0);
+        assert_eq!(stats.learned_artifacts_applied, 1);
+    }
+
+    #[test]
+    fn ecosystem_telemetry_resumed_nodes_do_not_double_count_workers_or_cost() {
+        use crate::native_extensions::graph::types::*;
+        let mut stats = EcosystemStats::default();
+
+        // Historical reused node: contributes to task status but current-run worker counters are NOT incremented
+        let _reused_task = GraphTaskState {
+            id: "classify".into(),
+            role: Role::Classifier,
+            expect: ArtifactKind::Classification,
+            depends_on: vec![],
+            focus: None,
+            status: TaskStatus::Succeeded,
+            attempts: 1,
+            artifact_file: Some("artifacts/classify.json".into()),
+            error: None,
+            usage: WorkerUsage {
+                input: 2000,
+                output: 100,
+                cache_read: 1500,
+                cache_write: 100,
+                cost_usd: 0.02,
+                turns: 1,
+            },
+            started_at: Some(100),
+            ended_at: Some(200),
+            last_activity: None,
+            fingerprint: None,
+            mutation: None,
+            context_fingerprint: None,
+            context_tokens: 0,
+            memory_refs: vec![],
+            skill_refs: vec![],
+        };
+
+        // Live newly executed worker
+        stats.graph_workers += 1;
+        let live_usage = WorkerUsage {
+            input: 1000,
+            output: 50,
+            cache_read: 800,
+            cache_write: 50,
+            cost_usd: 0.01,
+            turns: 1,
+        };
+        stats.record_worker_usage(&live_usage);
+
+        // Reused task didn't increment workers or cost
+        assert_eq!(stats.graph_workers, 1);
+        assert_eq!(stats.cache_read_tokens, 800);
+        assert_eq!(stats.cache_write_tokens, 50);
+        assert!((stats.graph_cost_usd - 0.01).abs() < 1e-6);
     }
 }

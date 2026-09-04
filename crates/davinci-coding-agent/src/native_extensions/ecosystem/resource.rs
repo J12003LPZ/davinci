@@ -54,9 +54,9 @@ impl ResourceSnapshot {
             cache_write_tokens += task.usage.cache_write;
         }
 
-        let (governor_bytes_omitted, governor_retrievals) = governor_stats
-            .map(|g| (g.bytes_withheld, g.retrievals))
-            .unwrap_or((0, 0));
+        let (governor_bytes_omitted, governor_retrievals, prunings) = governor_stats
+            .map(|g| (g.bytes_withheld, g.retrievals, g.prunings))
+            .unwrap_or((0, 0, 0));
 
         Self {
             cost_usd,
@@ -66,7 +66,7 @@ impl ResourceSnapshot {
             cache_write_tokens,
             governor_bytes_omitted,
             governor_retrievals,
-            prunings: 0,
+            prunings,
         }
     }
 }
@@ -121,6 +121,7 @@ mod tests {
             compressed_outputs: 3,
             deduplicated_reads: 1,
             blocked_calls: 0,
+            prunings: 0,
         };
 
         let snapshot = ResourceSnapshot::collect(&[t1, t2], Some(&gov_stats));

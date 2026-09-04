@@ -589,6 +589,14 @@ pub fn format_memory_context(hits: &[MemoryContextHit]) -> String {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorMemoryStats {
+    pub total_records: usize,
+    pub last_indexed: usize,
+    pub last_indexed_at: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct VectorMemory {
     pub config: VectorMemoryConfig,
@@ -863,6 +871,15 @@ impl VectorMemory {
     pub fn mark_dense_offline(&self) {
         if let Ok(mut guard) = self.dense_offline_until.lock() {
             *guard = Some(Instant::now() + DENSE_BACKOFF);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn stats(&self) -> VectorMemoryStats {
+        VectorMemoryStats {
+            total_records: self.records.len(),
+            last_indexed: self.last_indexed,
+            last_indexed_at: self.last_indexed_at,
         }
     }
 

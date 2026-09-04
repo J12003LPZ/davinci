@@ -61,6 +61,12 @@ pub struct ContextPacket {
     pub skill_refs: Vec<SkillContextRef>,
     pub estimated_tokens: usize,
     pub fingerprint: String,
+    #[serde(default)]
+    pub memory_tokens: usize,
+    #[serde(default)]
+    pub skill_tokens: usize,
+    #[serde(default)]
+    pub skill_candidates_considered: usize,
 }
 
 #[allow(dead_code)]
@@ -146,6 +152,7 @@ pub fn build_context_packet(
     } else {
         Vec::new()
     };
+    let skill_candidates_considered = skill_candidates.len();
 
     if memory_hits.is_empty() && skill_candidates.is_empty() {
         return ContextPacket::empty();
@@ -213,6 +220,8 @@ pub fn build_context_packet(
         return ContextPacket::empty();
     }
 
+    let memory_tokens: usize = memory_hits.iter().map(|m| m.estimated_tokens).sum();
+    let skill_tokens: usize = skill_candidates.iter().map(|s| s.estimated_tokens).sum();
     let memory_refs = memory_hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
     let skill_refs = skill_candidates
         .into_iter()
@@ -230,6 +239,9 @@ pub fn build_context_packet(
         skill_refs,
         estimated_tokens: est_tokens,
         fingerprint,
+        memory_tokens,
+        skill_tokens,
+        skill_candidates_considered,
     }
 }
 

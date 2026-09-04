@@ -709,6 +709,8 @@ pub struct GovernorStats {
     pub compressed_outputs: u64,
     pub deduplicated_reads: u64,
     pub blocked_calls: u64,
+    #[serde(default)]
+    pub prunings: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -728,6 +730,7 @@ pub struct TokenGovernor {
     /// and what replaced it.
     bytes_withheld: usize,
     retrievals: Arc<AtomicU64>,
+    prunings: usize,
 }
 
 impl Default for TokenGovernor {
@@ -758,6 +761,7 @@ impl TokenGovernor {
             blocked_calls: 0,
             bytes_withheld: 0,
             retrievals: Arc::new(AtomicU64::new(0)),
+            prunings: 0,
         }
     }
 
@@ -768,7 +772,18 @@ impl TokenGovernor {
             compressed_outputs: self.compressed_outputs as u64,
             deduplicated_reads: self.deduplicated_reads as u64,
             blocked_calls: self.blocked_calls as u64,
+            prunings: self.prunings as u64,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn record_pruning(&mut self) {
+        self.prunings += 1;
+    }
+
+    #[allow(dead_code)]
+    pub fn prunings(&self) -> u64 {
+        self.prunings as u64
     }
 
     #[cfg(test)]

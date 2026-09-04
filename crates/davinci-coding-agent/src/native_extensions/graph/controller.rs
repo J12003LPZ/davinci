@@ -165,10 +165,16 @@ impl GraphExecution {
         // implementation that re-locks the run must not deadlock.
         let snapshot = {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            let gov_stats = self.deps.governor.as_ref().map(|g| g.stats());
+            if let Some(ref gs) = gov_stats {
+                run.ecosystem_stats.governor_bytes_omitted = gs.bytes_withheld;
+                run.ecosystem_stats.governor_retrievals = gs.retrievals;
+                run.ecosystem_stats.prunings = gs.prunings;
+            }
             run.resource_snapshot = Some(
                 crate::native_extensions::ecosystem::ResourceSnapshot::collect(
                     &run.tasks,
-                    self.deps.governor.as_ref().map(|g| g.stats()).as_ref(),
+                    gov_stats.as_ref(),
                 ),
             );
             let _ = save_run(&mut run);
@@ -439,6 +445,16 @@ impl GraphExecution {
                 t.skill_refs = context_packet.skill_refs.clone();
             }
             if !context_packet.is_empty() {
+                run.ecosystem_stats.memory_hits += context_packet.memory_refs.len() as u64;
+                run.ecosystem_stats.memory_injected_tokens += context_packet.memory_tokens as u64;
+                run.ecosystem_stats.skill_candidates_considered +=
+                    context_packet.skill_candidates_considered as u64;
+                run.ecosystem_stats.skills_injected += context_packet.skill_refs.len() as u64;
+                run.ecosystem_stats.skill_injected_tokens += context_packet.skill_tokens as u64;
+                run.ecosystem_stats.context_packet_tokens +=
+                    context_packet.estimated_tokens as u64;
+                run.ecosystem_stats.context_fingerprint = Some(context_packet.fingerprint.clone());
+
                 let _ = super::store::write_task_context_packet(
                     &cwd,
                     &run_id,
@@ -464,6 +480,7 @@ impl GraphExecution {
                     Some(reason) => Some(reason),
                     None => {
                         run.counters.workers_spawned += 1;
+                        run.ecosystem_stats.graph_workers += 1;
                         if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                             task.status = TaskStatus::Running;
                             task.attempts = attempt;
@@ -524,6 +541,9 @@ impl GraphExecution {
                     self.add_usage(&task_id, &delta);
                     {
                         let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+                        run.ecosystem_stats.graph_cost_usd += delta.cost_usd;
+                        run.ecosystem_stats.cache_read_tokens += delta.cache_read;
+                        run.ecosystem_stats.cache_write_tokens += delta.cache_write;
                         if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                             task.last_activity = Some(line.to_string());
                         }
@@ -537,6 +557,12 @@ impl GraphExecution {
                 WorkerUsage::delta(&result.usage, &reported)
             };
             self.add_usage(&task_id, &trailing);
+            {
+                let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+                run.ecosystem_stats.graph_cost_usd += trailing.cost_usd;
+                run.ecosystem_stats.cache_read_tokens += trailing.cache_read;
+                run.ecosystem_stats.cache_write_tokens += trailing.cache_write;
+            }
 
             let run = self.snapshot();
             write_log(
@@ -713,6 +739,12 @@ impl GraphExecution {
                 }
             }
         }
+        {
+            let mut run_mut = self.run.lock().unwrap_or_else(|e| e.into_inner());
+            run_mut.ecosystem_stats.learning_reviews_dispatched = learning.stats.reviews_dispatched;
+            run_mut.ecosystem_stats.learning_reviews_skipped = learning.stats.reviews_skipped;
+            run_mut.ecosystem_stats.learned_artifacts_applied = learning.stats.candidates_approved;
+        }
     }
 }
 
@@ -793,7 +825,7 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
     finished.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     execution.record_skill_outcomes(&result);
-    result
+    execution.snapshot()
 }
 
 fn drive(execution: &GraphExecution) -> GraphRun {
@@ -1276,6 +1308,17 @@ fn deliver_goal(
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             run.verification_bundle = Some(bundle.clone());
+            if should_scan {
+                run.ecosystem_stats.security_gate_triggered = true;
+                run.ecosystem_stats.security_result = Some(match &security_verification {
+                    SecurityVerification::Passed { .. } => "passed".to_string(),
+                    SecurityVerification::Failed { .. } => "failed".to_string(),
+                    SecurityVerification::Unavailable { reason } => {
+                        format!("unavailable: {reason}")
+                    }
+                    SecurityVerification::NotRequired => "not_required".to_string(),
+                });
+            }
         }
 
         let security_eligible = if execution.options.dry_run {
