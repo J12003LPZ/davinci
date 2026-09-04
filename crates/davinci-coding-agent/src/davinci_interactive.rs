@@ -5611,6 +5611,16 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
         } else {
             sheet_duration(elapsed_until.saturating_sub(started_at))
         },
+        ecosystem: run
+            .get("ecosystemStats")
+            .and_then(|v| {
+                serde_json::from_value::<
+                    crate::native_extensions::ecosystem::EcosystemStats,
+                >(v.clone())
+                .ok()
+            })
+            .map(|stats| stats.render_compact_lines())
+            .unwrap_or_default(),
     })
 }
 

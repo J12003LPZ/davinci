@@ -164,6 +164,12 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     out.extend(header);
     out.extend(tasks);
     out.push(blank());
+    if !run.ecosystem.is_empty() {
+        for line in &run.ecosystem {
+            out.push(Line::from(vec![span(line.clone(), th.muted)]));
+        }
+        out.push(blank());
+    }
     out.extend(budgets);
     out.into_iter()
         .map(|line| Line::from(truncate_run(line.spans, width)))

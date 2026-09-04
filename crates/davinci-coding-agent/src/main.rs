@@ -5658,13 +5658,22 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         .unwrap_or_else(|err| err.into_inner())
         .running();
     let mcp = agent.tool_context.mcp.rows().len();
-    format!(
+    let mut text = format!(
         "{}/{} · {mode} · {plan} · {} jobs · {mcp} mcp · {}",
         agent.provider,
         agent.model_id,
         jobs,
         format_session_cost(parsed, agent),
-    )
+    );
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Some(run) = crate::native_extensions::graph::active_run(&cwd).and_then(|r| r.snapshot()) {
+        let compact = run.ecosystem_stats.render_compact_lines();
+        if !compact.is_empty() {
+            text.push('\n');
+            text.push_str(&compact.join("\n"));
+        }
+    }
+    text
 }
 
 fn format_session_info(
@@ -9177,6 +9186,20 @@ mod tests {
         assert_eq!(
             slash::parse_line("/skill:test explain this"),
             slash::SlashAction::Prompt("/skill:test explain this".into())
+        );
+    }
+
+    #[test]
+    fn status_text_not_automatically_appended_to_model_context() {
+        let agent = Agent::new("sys");
+        let initial_len = agent.messages.len();
+        let parsed = Args::default();
+        let status = format_session_status(&parsed, &agent);
+        assert!(!status.is_empty());
+        assert_eq!(
+            agent.messages.len(),
+            initial_len,
+            "status output must not append to agent messages"
         );
     }
 

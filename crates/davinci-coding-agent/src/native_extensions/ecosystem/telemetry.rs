@@ -118,6 +118,121 @@ impl EcosystemStats {
         self.learning_reviews_skipped = stats.reviews_skipped;
         self.learned_artifacts_applied = stats.candidates_approved;
     }
+
+    /// Formats compact operator lines for status sheets and run summaries.
+    /// Only non-zero participation lines are returned; zero-state rows are omitted.
+    pub fn render_compact_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        // 1. Context: memory / skills · tokens
+        if self.memory_hits > 0 || self.skills_injected > 0 || self.context_packet_tokens > 0 {
+            let mut parts = Vec::new();
+            if self.memory_hits > 0 {
+                parts.push(format!("{} memory", self.memory_hits));
+            }
+            if self.skills_injected > 0 {
+                parts.push(format!(
+                    "{} skill{}",
+                    self.skills_injected,
+                    if self.skills_injected == 1 { "" } else { "s" }
+                ));
+            }
+            let base = if parts.is_empty() {
+                String::new()
+            } else {
+                parts.join(" / ")
+            };
+            let tok = if self.context_packet_tokens > 0 {
+                if base.is_empty() {
+                    format!("{} tok", self.context_packet_tokens)
+                } else {
+                    format!("{base} · {} tok", self.context_packet_tokens)
+                }
+            } else {
+                base
+            };
+            if !tok.is_empty() {
+                lines.push(format!("{:<8} {}", "context", tok));
+            }
+        }
+
+        // 2. Cache: read / write tokens
+        if self.cache_read_tokens > 0 || self.cache_write_tokens > 0 {
+            let read = format_compact_k(self.cache_read_tokens);
+            let write = format_compact_k(self.cache_write_tokens);
+            lines.push(format!("{:<8} {} read / {} write", "cache", read, write));
+        }
+
+        // 3. Compact: governor omitted · retrievals · prunings
+        if self.governor_bytes_omitted > 0 || self.governor_retrievals > 0 || self.prunings > 0 {
+            let mut parts = Vec::new();
+            if self.governor_bytes_omitted > 0 {
+                let kb = (self.governor_bytes_omitted as f64 / 1024.0).round() as u64;
+                if kb > 0 {
+                    parts.push(format!("{kb} KB governed"));
+                } else {
+                    parts.push(format!("{} B governed", self.governor_bytes_omitted));
+                }
+            }
+            if self.governor_retrievals > 0 {
+                parts.push(format!("{} recovered", self.governor_retrievals));
+            }
+            if self.prunings > 0 {
+                parts.push(format!(
+                    "{} pruning{}",
+                    self.prunings,
+                    if self.prunings == 1 { "" } else { "s" }
+                ));
+            }
+            if !parts.is_empty() {
+                lines.push(format!("{:<8} {}", "compact", parts.join(" · ")));
+            }
+        }
+
+        // 4. Verify: tests / security
+        if self.security_gate_triggered || self.security_result.is_some() {
+            let sec_str = match self.security_result.as_deref() {
+                Some("passed") => "security pass",
+                Some("failed") => "security fail",
+                Some(other) => other,
+                None => "security not triggered",
+            };
+            lines.push(format!("{:<8} tests pass · {}", "verify", sec_str));
+        }
+
+        // 5. Learn: reviews · artifacts applied
+        if self.learning_reviews_dispatched > 0
+            || self.learned_artifacts_applied > 0
+            || self.learning_reviews_skipped > 0
+        {
+            let mut parts = Vec::new();
+            if self.learning_reviews_dispatched > 0 {
+                parts.push(format!(
+                    "{} review{}",
+                    self.learning_reviews_dispatched,
+                    if self.learning_reviews_dispatched == 1 { "" } else { "s" }
+                ));
+            } else if self.learning_reviews_skipped > 0 {
+                parts.push(format!(
+                    "{} review{} skipped",
+                    self.learning_reviews_skipped,
+                    if self.learning_reviews_skipped == 1 { "" } else { "s" }
+                ));
+            }
+            if self.learned_artifacts_applied > 0 {
+                parts.push(format!("{} applied", self.learned_artifacts_applied));
+            }
+            if !parts.is_empty() {
+                lines.push(format!("{:<8} {}", "learn", parts.join(" · ")));
+            }
+        }
+
+        lines
+    }
+}
+
+fn format_compact_k(tokens: u64) -> String {
+    format!("{:.1}k", tokens as f64 / 1000.0)
 }
 
 #[cfg(test)]
@@ -338,5 +453,44 @@ mod tests {
         assert_eq!(stats.cache_read_tokens, 800);
         assert_eq!(stats.cache_write_tokens, 50);
         assert!((stats.graph_cost_usd - 0.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ecosystem_telemetry_render_non_zero_participation() {
+        let stats = EcosystemStats {
+            memory_hits: 3,
+            memory_injected_tokens: 700,
+            skills_injected: 1,
+            skill_injected_tokens: 320,
+            context_packet_tokens: 1020,
+            cache_read_tokens: 18400,
+            cache_write_tokens: 700,
+            governor_bytes_omitted: 18432,
+            governor_retrievals: 1,
+            prunings: 1,
+            security_gate_triggered: true,
+            security_result: Some("passed".into()),
+            learning_reviews_dispatched: 1,
+            learned_artifacts_applied: 1,
+            ..Default::default()
+        };
+
+        let lines = stats.render_compact_lines();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "context  3 memory / 1 skill · 1020 tok");
+        assert_eq!(lines[1], "cache    18.4k read / 0.7k write");
+        assert_eq!(lines[2], "compact  18 KB governed · 1 recovered · 1 pruning");
+        assert_eq!(lines[3], "verify   tests pass · security pass");
+        assert_eq!(lines[4], "learn    1 review · 1 applied");
+    }
+
+    #[test]
+    fn ecosystem_telemetry_zero_state_omits_meaningless_zero_rows() {
+        let stats = EcosystemStats::default();
+        let lines = stats.render_compact_lines();
+        assert!(
+            lines.is_empty(),
+            "zero state must omit meaningless rows, got: {lines:?}"
+        );
     }
 }

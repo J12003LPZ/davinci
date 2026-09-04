@@ -1097,6 +1097,7 @@ pub struct GraphRunSheet {
     pub mode: String,
     pub milestone: String,
     pub elapsed: String,
+    pub ecosystem: Vec<String>,
 }
 
 /// The vector index itself (`5b`).

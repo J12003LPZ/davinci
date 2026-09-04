@@ -142,6 +142,10 @@ pub fn render_run_lines(run: &GraphRun, now: u64) -> Vec<String> {
     if let Some(reason) = &run.blocked_reason {
         lines.push(format!("blocked: {reason}"));
     }
+    let ecosystem = run.ecosystem_stats.render_compact_lines();
+    if !ecosystem.is_empty() {
+        lines.extend(ecosystem);
+    }
     lines
 }
 
@@ -221,6 +225,13 @@ pub fn render_run_summary(run: &GraphRun) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     lines.push(format!("- tasks: {tasks}"));
+    let ecosystem = run.ecosystem_stats.render_compact_lines();
+    if !ecosystem.is_empty() {
+        lines.push("- ecosystem:".to_string());
+        for line in ecosystem {
+            lines.push(format!("  - {line}"));
+        }
+    }
     lines.join("\n")
 }
 

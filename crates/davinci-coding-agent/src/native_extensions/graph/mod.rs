@@ -76,7 +76,7 @@ const START_REPORT_WAIT: Duration = Duration::from_millis(2000);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
-struct ActiveRun {
+pub(crate) struct ActiveRun {
     abort: Arc<AtomicBool>,
     snapshot: Mutex<Option<GraphRun>>,
     /// Set once the run thread has left, whatever its outcome. A run whose
@@ -87,7 +87,7 @@ struct ActiveRun {
 }
 
 impl ActiveRun {
-    fn snapshot(&self) -> Option<GraphRun> {
+    pub(crate) fn snapshot(&self) -> Option<GraphRun> {
         self.snapshot
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -116,7 +116,7 @@ fn active_runs() -> &'static Mutex<HashMap<PathBuf, Arc<ActiveRun>>> {
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn active_run(cwd: &Path) -> Option<Arc<ActiveRun>> {
+pub(crate) fn active_run(cwd: &Path) -> Option<Arc<ActiveRun>> {
     let runs = active_runs()
         .lock()
         .unwrap_or_else(|error| error.into_inner());

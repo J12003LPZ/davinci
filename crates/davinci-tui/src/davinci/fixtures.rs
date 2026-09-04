@@ -1154,6 +1154,7 @@ pub fn graph_run_sheet() -> GraphRunSheet {
         mode: "complex".into(),
         milestone: "2 of 4".into(),
         elapsed: "6m18s".into(),
+        ecosystem: Vec::new(),
     }
 }
 
