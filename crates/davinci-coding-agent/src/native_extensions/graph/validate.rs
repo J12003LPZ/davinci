@@ -864,8 +864,16 @@ pub fn validate_config_shape(value: &Value) -> Vec<String> {
             for key in BUDGET_KEYS {
                 match budgets.get(*key) {
                     None | Some(Value::Null) => {}
-                    Some(value) if value.as_f64().is_some_and(|number| number >= 0.0) => {}
-                    Some(_) => errors.push(format!("budgets.{key} must be a non-negative number")),
+                    Some(value) if *key == "maxCostUsd" => {
+                        if !value.as_f64().is_some_and(|number| number >= 0.0) {
+                            errors.push(format!("budgets.{key} must be a non-negative number"));
+                        }
+                    }
+                    Some(value) => {
+                        if super::config::parse_u64_budget(value, key).is_err() {
+                            errors.push(format!("budgets.{key} must be a non-negative whole integer"));
+                        }
+                    }
                 }
             }
             match budgets.get("workerTimeoutMs") {
@@ -879,9 +887,9 @@ pub fn validate_config_shape(value: &Value) -> Vec<String> {
                         );
                         push_if(
                             &mut errors,
-                            !timeout.as_f64().is_some_and(|number| number >= 0.0),
+                            super::config::parse_u64_budget(timeout, role).is_err(),
                             format!(
-                                "budgets.workerTimeoutMs.{role} must be a non-negative number (0 = no timeout)"
+                                "budgets.workerTimeoutMs.{role} must be a non-negative whole integer (0 = no timeout)"
                             ),
                         );
                     }

@@ -43,6 +43,18 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub fn parse_u64_budget(value: &Value, name: &str) -> Result<u64, String> {
+    value
+        .as_u64()
+        .ok_or_else(|| format!("{name} must be a non-negative whole integer"))
+}
+
+#[allow(dead_code)]
+pub fn parse_usize_budget(value: &Value, name: &str) -> Result<usize, String> {
+    let n = parse_u64_budget(value, name)?;
+    usize::try_from(n).map_err(|_| format!("{name} exceeds maximum usize"))
+}
+
 pub fn load_config(cwd: &Path) -> LoadedConfig {
     let mut loaded = LoadedConfig::default();
     let config_path = cwd.join(CONFIG_DIR).join("graph.json");
@@ -69,44 +81,53 @@ pub fn load_config(cwd: &Path) -> LoadedConfig {
 
     if let Some(budgets) = object.get("budgets").and_then(Value::as_object) {
         let target = &mut loaded.config.budgets;
-        // JSON has one number type: `3` and `3.0` must mean the same budget.
-        let whole = |value: Option<&Value>| -> Option<u64> {
-            value
-                .and_then(Value::as_f64)
-                .filter(|n| *n >= 0.0)
-                .map(|n| n as u64)
-        };
-        if let Some(value) = whole(budgets.get("maxResearchers")) {
-            target.max_researchers = value as u32;
+        if let Some(val) = budgets.get("maxResearchers") {
+            if let Ok(value) = parse_u64_budget(val, "budgets.maxResearchers") {
+                target.max_researchers = value as u32;
+            }
         }
-        if let Some(value) = whole(budgets.get("maxParallelWorkers")) {
-            target.max_parallel_workers = value.max(1) as u32;
+        if let Some(val) = budgets.get("maxParallelWorkers") {
+            if let Ok(value) = parse_u64_budget(val, "budgets.maxParallelWorkers") {
+                target.max_parallel_workers = value.max(1) as u32;
+            }
         }
-        if let Some(value) = whole(budgets.get("maxWorkers")) {
-            target.max_workers = value as u32;
+        if let Some(val) = budgets.get("maxWorkers") {
+            if let Ok(value) = parse_u64_budget(val, "budgets.maxWorkers") {
+                target.max_workers = value as u32;
+            }
         }
-        if let Some(value) = whole(budgets.get("maxRevisionCycles")) {
-            target.max_revision_cycles = value as u32;
+        if let Some(val) = budgets.get("maxRevisionCycles") {
+            if let Ok(value) = parse_u64_budget(val, "budgets.maxRevisionCycles") {
+                target.max_revision_cycles = value as u32;
+            }
         }
-        if let Some(value) = whole(budgets.get("maxReplans")) {
-            target.max_replans = value as u32;
+        if let Some(val) = budgets.get("maxReplans") {
+            if let Ok(value) = parse_u64_budget(val, "budgets.maxReplans") {
+                target.max_replans = value as u32;
+            }
         }
-        if let Some(value) = budgets.get("maxCostUsd").and_then(Value::as_f64) {
-            target.max_cost_usd = value;
+        if let Some(val) = budgets.get("maxCostUsd") {
+            if let Some(value) = val.as_f64().filter(|n| *n >= 0.0) {
+                target.max_cost_usd = value;
+            }
         }
-        if let Some(value) = whole(budgets.get("runDeadlineMs")) {
-            target.run_deadline_ms = value;
+        if let Some(val) = budgets.get("runDeadlineMs") {
+            if let Ok(value) = parse_u64_budget(val, "budgets.runDeadlineMs") {
+                target.run_deadline_ms = value;
+            }
         }
-        if let Some(value) = budgets
-            .get("verifyCommandTimeoutMs")
-            .and_then(Value::as_u64)
-        {
-            target.verify_command_timeout_ms = value;
+        if let Some(val) = budgets.get("verifyCommandTimeoutMs") {
+            if let Ok(value) = parse_u64_budget(val, "budgets.verifyCommandTimeoutMs") {
+                target.verify_command_timeout_ms = value;
+            }
         }
         if let Some(timeouts) = budgets.get("workerTimeoutMs").and_then(Value::as_object) {
             for (role, timeout) in timeouts {
-                if let (Some(role), Some(timeout)) = (Role::parse(role), whole(Some(timeout))) {
-                    target.worker_timeout_ms.set(role, timeout);
+                if let (Some(role), Ok(t)) = (
+                    Role::parse(role),
+                    parse_u64_budget(timeout, &format!("budgets.workerTimeoutMs.{role}")),
+                ) {
+                    target.worker_timeout_ms.set(role, t);
                 }
             }
         }
@@ -290,5 +311,15 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, vec!["check", "npm-test"]);
+    }
+
+    #[test]
+    fn integer_budget_rejects_fractional_value() {
+        assert!(parse_u64_budget(&serde_json::json!(3.7), "maxWorkers").is_err());
+    }
+
+    #[test]
+    fn integer_budget_rejects_negative_value() {
+        assert!(parse_u64_budget(&serde_json::json!(-1), "maxWorkers").is_err());
     }
 }
