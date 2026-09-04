@@ -6,6 +6,7 @@
 use super::store::CONFIG_DIR;
 use super::types::{GraphBudgets, Role, VerifyCommandSpec};
 use super::validate::validate_config_shape;
+use crate::native_extensions::ecosystem::verification::SecurityPolicyMode;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,6 +23,8 @@ pub struct GraphConfig {
     pub worker_extensions: Vec<String>,
     /// Extra tool names those extensions register, added to every allowlist.
     pub worker_extra_tools: Vec<String>,
+    /// Security verification policy mode; defaults to Risk.
+    pub security_verification: SecurityPolicyMode,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,6 +161,14 @@ pub fn load_config(cwd: &Path) -> LoadedConfig {
     }
     loaded.config.worker_extensions = string_array(object.get("workerExtensions"));
     loaded.config.worker_extra_tools = string_array(object.get("workerExtraTools"));
+    if let Some(val) = object.get("securityVerification").and_then(Value::as_str) {
+        match val {
+            "off" => loaded.config.security_verification = SecurityPolicyMode::Off,
+            "risk" => loaded.config.security_verification = SecurityPolicyMode::Risk,
+            "always" => loaded.config.security_verification = SecurityPolicyMode::Always,
+            _ => {}
+        }
+    }
     loaded
 }
 
@@ -321,5 +332,45 @@ mod tests {
     #[test]
     fn integer_budget_rejects_negative_value() {
         assert!(parse_u64_budget(&serde_json::json!(-1), "maxWorkers").is_err());
+    }
+
+    #[test]
+    fn graph_security_verification_defaults_to_risk() {
+        assert_eq!(
+            GraphConfig::default().security_verification,
+            SecurityPolicyMode::Risk
+        );
+    }
+
+    #[test]
+    fn graph_security_verification_loads_valid_values() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            ".pi/graph.json",
+            r#"{"securityVerification": "always"}"#,
+        );
+        let loaded = load_config(dir.path());
+        assert!(loaded.errors.is_empty());
+        assert_eq!(
+            loaded.config.security_verification,
+            SecurityPolicyMode::Always
+        );
+    }
+
+    #[test]
+    fn graph_security_verification_malformed_reports_error_and_preserves_default() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            ".pi/graph.json",
+            r#"{"securityVerification": "invalid_mode"}"#,
+        );
+        let loaded = load_config(dir.path());
+        assert!(!loaded.errors.is_empty());
+        assert_eq!(
+            loaded.config.security_verification,
+            SecurityPolicyMode::Risk
+        );
     }
 }

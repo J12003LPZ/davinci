@@ -970,6 +970,13 @@ pub fn validate_config_shape(value: &Value) -> Vec<String> {
             Some(_) => errors.push(format!("{key} must be an array of strings")),
         }
     }
+    match object.get("securityVerification") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(mode)) if matches!(mode.as_str(), "off" | "risk" | "always") => {}
+        Some(_) => {
+            errors.push("securityVerification must be \"off\", \"risk\", or \"always\"".into());
+        }
+    }
     errors
 }
 
