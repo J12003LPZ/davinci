@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[allow(unused_imports)]
+pub use crate::native_extensions::vector_memory::{format_memory_context, MemoryContextHit};
+
 pub const DEFAULT_GRAPH_CONTEXT_TOKENS: usize = 2_500;
 pub const DEFAULT_GRAPH_MEMORY_TOKENS: usize = 1_200;
 pub const DEFAULT_GRAPH_MEMORY_HITS: usize = 4;

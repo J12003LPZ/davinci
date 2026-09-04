@@ -567,6 +567,28 @@ pub fn format_memory_block(hits: &[MemoryHit], max_tokens: usize) -> String {
     output
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryContextHit {
+    pub id: String,
+    pub text: String,
+    pub score: f32,
+    pub estimated_tokens: usize,
+}
+
+/// Format concise memory context block with provenance IDs for graph context packet.
+pub fn format_memory_context(hits: &[MemoryContextHit]) -> String {
+    if hits.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<memory>\n");
+    for hit in hits {
+        out.push_str(&format!("- [{}] {}\n", hit.id, hit.text));
+    }
+    out.push_str("</memory>");
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct VectorMemory {
     pub config: VectorMemoryConfig,
@@ -784,6 +806,38 @@ impl VectorMemory {
             })
             .collect::<Vec<_>>();
         fuse_hits(std::mem::take(&mut hits), limit.max(1))
+    }
+
+    /// Retrieve bounded memory context hits for a graph worker query.
+    /// Reuses hybrid ranking from `search`, strictly respects `max_hits` and `token_cap`,
+    /// redacts secrets, and omits low-scoring hits below minimum threshold.
+    pub fn context_hits(
+        &self,
+        query: &str,
+        max_hits: usize,
+        token_cap: usize,
+    ) -> Vec<MemoryContextHit> {
+        let hits = self.search(query, max_hits);
+        let mut results = Vec::new();
+        let mut accumulated_tokens = 0;
+        for hit in hits {
+            let text = redact_secrets(&hit.record.text);
+            let estimated_tokens = (text.chars().count() + 3) / 4;
+            if accumulated_tokens + estimated_tokens > token_cap {
+                break;
+            }
+            accumulated_tokens += estimated_tokens;
+            results.push(MemoryContextHit {
+                id: hit.record.id,
+                text,
+                score: hit.score,
+                estimated_tokens,
+            });
+            if results.len() >= max_hits {
+                break;
+            }
+        }
+        results
     }
 
     pub fn dense_available(&self) -> bool {
@@ -1588,5 +1642,63 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!((hits[0].dense_score - 1.0).abs() < f32::EPSILON);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn graph_memory_context_caps_and_weak_match_emptiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.35,
+                ..VectorMemoryConfig::default()
+            },
+        );
+
+        // Add 10 relevant records
+        for i in 0..10 {
+            let rec = MemoryRecord {
+                id: format!("mem-test-{:03}", i),
+                repo_id: memory.repo_id.clone(),
+                kind: MemoryKind::Discovery,
+                text: format!("Authentication service config details for database {}", i),
+                source: "user".into(),
+                content_hash: format!("hash-{}", i),
+                importance: 0.8,
+                created_at: 1000 + i as u64,
+                embedding: None,
+                confidence: None,
+                source_session_id: None,
+                source_turn: None,
+                verification: None,
+                use_count: 0,
+                last_used_at: None,
+            };
+            memory.records.push(rec);
+        }
+
+        // Query matching all 10 records: bounded to 4 hits and 1,200 tokens
+        let hits = memory.context_hits("Authentication service config details", 4, 1_200);
+        assert!(!hits.is_empty());
+        assert_eq!(hits.len(), 4);
+        let total_tokens: usize = hits.iter().map(|h| h.estimated_tokens).sum();
+        assert!(total_tokens <= 1_200);
+
+        // Weak/unrelated query below minimum score returns empty:
+        let weak_hits = memory.context_hits("completely unrelated quantum teleportation", 4, 1_200);
+        assert!(weak_hits.is_empty());
+
+        // Token cap trimming:
+        let tiny_cap_hits = memory.context_hits("Authentication service config details", 4, 5);
+        assert!(tiny_cap_hits.len() <= 1);
+        if !tiny_cap_hits.is_empty() {
+            assert!(tiny_cap_hits[0].estimated_tokens <= 5);
+        }
+
+        // Section formatting
+        let section = format_memory_context(&hits);
+        assert!(section.starts_with("<memory>\n"));
+        assert!(section.ends_with("</memory>"));
+        assert!(section.contains("mem-test-000"));
     }
 }
