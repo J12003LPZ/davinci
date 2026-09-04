@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  PI_OFFLINE: "1"
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Ecosystem integration
+        run: cargo test -p davinci-coding-agent ecosystem_loop_ -- --nocapture
+      - name: Ecosystem invariants
+        run: cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
+      - name: Workspace tests
+        run: cargo test --workspace
