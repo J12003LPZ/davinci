@@ -3,6 +3,7 @@
 pub mod cache_affinity;
 pub mod context;
 pub mod resource;
+pub mod risk;
 pub mod verification;
 
 #[allow(unused_imports)]
@@ -11,6 +12,8 @@ pub use cache_affinity::*;
 pub use context::*;
 #[allow(unused_imports)]
 pub use resource::*;
+#[allow(unused_imports)]
+pub use risk::*;
 #[allow(unused_imports)]
 pub use verification::*;
 

@@ -77,6 +77,10 @@ impl GraphMutation {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    pub fn assess_risk(&self) -> crate::native_extensions::ecosystem::risk::RiskAssessment {
+        crate::native_extensions::ecosystem::risk::assess_change_risk(self)
+    }
 }
 
 pub fn normalize_rel_path(path: &str) -> String {
