@@ -24,6 +24,7 @@ pub(crate) mod process;
 pub(crate) mod render;
 pub(crate) mod roles;
 pub(crate) mod replay;
+pub(crate) mod review_coverage;
 pub(crate) mod store;
 pub(crate) mod topology;
 pub(crate) mod types;
@@ -39,6 +40,10 @@ pub use mutation::{
 };
 #[allow(unused_imports)]
 pub use replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
+#[allow(unused_imports)]
+pub use review_coverage::{
+    chunk_graph_mutation, coverage_complete, ReviewChunk, ReviewCoverage,
+};
 #[allow(unused_imports)]
 pub use topology::{
     build_definition, ready_nodes, validate_definition, EdgeCondition, EdgeDefinition,

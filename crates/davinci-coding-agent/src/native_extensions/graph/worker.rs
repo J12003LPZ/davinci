@@ -599,6 +599,7 @@ pub fn canned_artifact(expect: ArtifactKind) -> Artifact {
             verdict: Verdict::Approve,
             issues: vec![],
             notes: "dry-run canned approval".into(),
+            reviewed_chunk_ids: vec![],
         })),
     }
 }

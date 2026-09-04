@@ -256,6 +256,7 @@ mod tests {
                 None,
             )],
             verification: None,
+            review_coverage: None,
             budgets: GraphBudgets::default(),
             counters: GraphCounters {
                 workers_spawned: 1,

@@ -512,6 +512,7 @@ mod tests {
             current_milestone: None,
             tasks: Vec::new(),
             verification: None,
+            review_coverage: None,
             budgets: GraphBudgets::default(),
             counters: GraphCounters {
                 workers_spawned: 0,

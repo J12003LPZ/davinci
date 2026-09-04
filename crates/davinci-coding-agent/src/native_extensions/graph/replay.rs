@@ -429,6 +429,7 @@ mod tests {
                 },
             ],
             verification: None,
+            review_coverage: None,
             budgets: Default::default(),
             counters: GraphCounters {
                 workers_spawned: 3,

@@ -317,6 +317,13 @@ static REVIEW_FIELDS: &[FieldRule] = &[
         kind: FieldKind::String { min_length: 0 },
         description: None,
     },
+    FieldRule {
+        name: "reviewedChunkIds",
+        required: false,
+        allow_null: true,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: Some("IDs of review chunks covered by this review"),
+    },
 ];
 
 const CLASSIFICATION_EXAMPLE: &str = r#"{
@@ -803,6 +810,16 @@ fn validate_review(value: &serde_json::Map<String, Value>, errors: &mut Vec<Stri
         !value.get("notes").is_some_and(Value::is_string),
         "notes must be a string (may be empty)",
     );
+    match value.get("reviewedChunkIds") {
+        None | Some(Value::Null) => {}
+        Some(chunks) => {
+            push_if(
+                errors,
+                !is_string_array(Some(chunks)),
+                "reviewedChunkIds must be an array of strings",
+            );
+        }
+    }
 }
 
 pub fn validate_artifact(expect: ArtifactKind, value: &Value) -> ValidationResult {

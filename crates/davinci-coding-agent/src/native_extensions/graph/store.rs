@@ -377,6 +377,7 @@ mod tests {
             current_milestone: None,
             tasks: Vec::new(),
             verification: None,
+            review_coverage: None,
             budgets: GraphBudgets::default(),
             counters: GraphCounters {
                 workers_spawned: 0,
@@ -445,6 +446,7 @@ mod tests {
             verdict: Verdict::Approve,
             issues: Vec::new(),
             notes: "fine".into(),
+            reviewed_chunk_ids: Vec::new(),
         }));
         write_artifact(&artifact_path(dir.path(), &run_id, "review-1"), &artifact).unwrap();
         let loaded =

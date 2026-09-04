@@ -13,6 +13,8 @@ pub use super::mutation::{
 };
 #[allow(unused_imports)]
 pub use super::replay::ReplayFingerprint;
+#[allow(unused_imports)]
+pub use super::review_coverage::{ReviewChunk, ReviewCoverage};
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
@@ -579,6 +581,8 @@ pub struct GraphRun {
     pub tasks: Vec<GraphTaskState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_coverage: Option<ReviewCoverage>,
     pub budgets: GraphBudgets,
     pub counters: GraphCounters,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -732,6 +736,8 @@ pub struct ReviewDecision {
     pub issues: Vec<ReviewIssue>,
     #[serde(default)]
     pub notes: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewed_chunk_ids: Vec<String>,
 }
 
 /// A validated node output. The variant is chosen by the node's `expect`.
@@ -961,6 +967,7 @@ mod tests {
                 ),
             ],
             verification: None,
+            review_coverage: None,
             budgets: GraphBudgets::default(),
             counters: GraphCounters {
                 workers_spawned: 0,

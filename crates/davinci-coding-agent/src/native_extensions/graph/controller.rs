@@ -13,6 +13,7 @@ use super::briefings::{
 use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
 use super::mutation::{capture_baseline, capture_graph_delta, GraphMutation};
 use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
+use super::review_coverage::{chunk_graph_mutation, coverage_complete, ReviewCoverage};
 use super::roles::{role_for_research_kind, role_tools};
 use super::store::{
     artifact_path, create_run_dir, new_run_id, now_ms, save_run, transcript_path, write_artifact,
@@ -23,8 +24,8 @@ use super::topology::{
 };
 use super::types::{
     Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters, GraphRun,
-    GraphTaskState, ImplementationPlan, Phase, ResearchKind, Role, Severity, TaskStatus, Verdict,
-    VerificationResult, WorkerSpec, WorkerUsage,
+    GraphTaskState, ImplementationPlan, Phase, ResearchKind, ReviewIssue, Role, Severity,
+    TaskStatus, Verdict, VerificationResult, WorkerSpec, WorkerUsage,
 };
 use super::verify::{
     collect_verify_commands, nothing_ran, run_verification, CollectInput, VerifyExec,
@@ -623,6 +624,7 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         current_milestone: None,
         tasks: Vec::new(),
         verification: None,
+        review_coverage: None,
         budgets,
         counters: GraphCounters {
             workers_spawned: 0,
@@ -1069,44 +1071,182 @@ fn deliver_goal(
         execution.set_phase(Phase::Review);
         indices.review += 1;
         let graph_diff = cumulative_delta.diff();
-        let diff = if !graph_diff.is_empty() {
-            truncate(&graph_diff, DIFF_MAX_CHARS)
-        } else {
-            truncate(&default_get_diff(&cwd), DIFF_MAX_CHARS)
-        };
         let changed_files: Vec<String> = if !cumulative_delta.files.is_empty() {
             cumulative_delta.files.iter().map(|f| f.path.clone()).collect()
         } else {
             patch.changed_files.clone()
         };
-        let task = GraphTaskState::new(
-            format!("review-{}", indices.review),
-            Role::Reviewer,
-            ArtifactKind::Review,
-            vec![],
-            None,
-        );
-        let review = execution
-            .execute_node(
-                task,
-                review_briefing(&ReviewInput {
-                    goal: goal_text,
-                    plan: plan.as_ref(),
-                    diff: &diff,
-                    changed_files: &changed_files,
-                    verification: &verification,
-                }),
-            )
-            .and_then(|artifact| artifact.as_review().cloned());
-        if execution.cancelled_if_aborted() {
-            return Delivery::Stop;
+
+        let chunks = chunk_graph_mutation(&cumulative_delta, DIFF_MAX_CHARS);
+        let required_chunk_ids: Vec<String> = chunks.iter().map(|c| c.id.clone()).collect();
+        let mut coverage = ReviewCoverage::new(required_chunk_ids);
+
+        let review = if chunks.len() > 1 {
+            // Large diff: review individual chunks, then aggregate findings compactly
+            let mut all_issues = Vec::new();
+            let mut chunk_summaries = Vec::new();
+
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let chunk_task_id = format!("review-{}-chunk-{}", indices.review, idx + 1);
+                let task = GraphTaskState::new(
+                    chunk_task_id,
+                    Role::Reviewer,
+                    ArtifactKind::Review,
+                    vec![],
+                    None,
+                );
+                let req_ids = vec![chunk.id.clone()];
+                let chunk_review = execution
+                    .execute_node(
+                        task,
+                        review_briefing(&ReviewInput {
+                            goal: goal_text,
+                            plan: plan.as_ref(),
+                            diff: &chunk.patch,
+                            changed_files: &changed_files,
+                            verification: &verification,
+                            chunk: Some(chunk),
+                            chunk_summaries: None,
+                            required_chunk_ids: Some(&req_ids),
+                        }),
+                    )
+                    .and_then(|artifact| artifact.as_review().cloned());
+
+                if execution.cancelled_if_aborted() {
+                    return Delivery::Stop;
+                }
+                let Some(chunk_review) = chunk_review else {
+                    execution.blocked(
+                        execution.task_failure_reason(&format!("chunk review {} failed", chunk.id)),
+                    );
+                    return Delivery::Stop;
+                };
+
+                if !chunk_review.reviewed_chunk_ids.is_empty() {
+                    coverage.record_reviewed(&chunk_review.reviewed_chunk_ids);
+                } else {
+                    coverage.record_reviewed(&[chunk.id.clone()]);
+                }
+                let issues_count = chunk_review.issues.len();
+                all_issues.extend(chunk_review.issues);
+                chunk_summaries.push(format!(
+                    "Chunk {} ({}): verdict={}, {} issue(s): {}",
+                    chunk.id,
+                    chunk.file,
+                    chunk_review.verdict,
+                    issues_count,
+                    chunk_review.notes
+                ));
+            }
+
+            // Final holistic review summarizing all chunk reviews
+            let task = GraphTaskState::new(
+                format!("review-{}", indices.review),
+                Role::Reviewer,
+                ArtifactKind::Review,
+                vec![],
+                None,
+            );
+            let final_review = execution
+                .execute_node(
+                    task,
+                    review_briefing(&ReviewInput {
+                        goal: goal_text,
+                        plan: plan.as_ref(),
+                        diff: "",
+                        changed_files: &changed_files,
+                        verification: &verification,
+                        chunk: None,
+                        chunk_summaries: Some(&chunk_summaries),
+                        required_chunk_ids: None,
+                    }),
+                )
+                .and_then(|artifact| artifact.as_review().cloned());
+
+            if execution.cancelled_if_aborted() {
+                return Delivery::Stop;
+            }
+            let Some(mut final_review) = final_review else {
+                execution.blocked(
+                    execution.task_failure_reason("review failed (a run is never approved by default)"),
+                );
+                return Delivery::Stop;
+            };
+
+            final_review.issues.extend(all_issues);
+            Some(final_review)
+        } else {
+            // Single chunk or no graph diff
+            let diff = if !graph_diff.is_empty() {
+                truncate(&graph_diff, DIFF_MAX_CHARS)
+            } else {
+                truncate(&default_get_diff(&cwd), DIFF_MAX_CHARS)
+            };
+            let single_chunk = chunks.first();
+            let req_ids = single_chunk.map(|c| vec![c.id.clone()]);
+            let task = GraphTaskState::new(
+                format!("review-{}", indices.review),
+                Role::Reviewer,
+                ArtifactKind::Review,
+                vec![],
+                None,
+            );
+            let review = execution
+                .execute_node(
+                    task,
+                    review_briefing(&ReviewInput {
+                        goal: goal_text,
+                        plan: plan.as_ref(),
+                        diff: &diff,
+                        changed_files: &changed_files,
+                        verification: &verification,
+                        chunk: single_chunk,
+                        chunk_summaries: None,
+                        required_chunk_ids: req_ids.as_deref(),
+                    }),
+                )
+                .and_then(|artifact| artifact.as_review().cloned());
+
+            if execution.cancelled_if_aborted() {
+                return Delivery::Stop;
+            }
+            if let (Some(r), Some(c)) = (&review, single_chunk) {
+                if !r.reviewed_chunk_ids.is_empty() {
+                    coverage.record_reviewed(&r.reviewed_chunk_ids);
+                } else {
+                    coverage.record_reviewed(&[c.id.clone()]);
+                }
+            }
+            review
+        };
+
+        {
+            let mut run = execution.run.lock().unwrap_or_else(|error| error.into_inner());
+            run.review_coverage = Some(coverage.clone());
         }
-        let Some(review) = review else {
+
+        let Some(mut review) = review else {
             execution.blocked(
                 execution.task_failure_reason("review failed (a run is never approved by default)"),
             );
             return Delivery::Stop;
         };
+
+        let is_coverage_complete = coverage_complete(&coverage);
+        if !is_coverage_complete {
+            let missing = coverage.missing_chunk_ids().join(", ");
+            execution.checkpoint(Some(&format!(
+                "review coverage incomplete: missing chunks [{missing}]"
+            )));
+            if review.verdict == Verdict::Approve {
+                review.verdict = Verdict::ChangesRequired;
+                review.issues.push(ReviewIssue {
+                    severity: Severity::Blocker,
+                    file: None,
+                    description: format!("Incomplete review coverage: missing chunks [{missing}]"),
+                });
+            }
+        }
 
         // An approval that lists a blocker or a major issue is a
         // contradiction; the issues win, as they would with a human reviewer.
@@ -1114,12 +1254,12 @@ fn deliver_goal(
             .issues
             .iter()
             .any(|issue| matches!(issue.severity, Severity::Blocker | Severity::Major));
-        if review.verdict == Verdict::Approve && !blocking_issue {
+        if review.verdict == Verdict::Approve && !blocking_issue && is_coverage_complete {
             return Delivery::Ok;
         }
         if review.verdict == Verdict::Approve {
             execution.checkpoint(Some(
-                "review approved with blocking issues; treated as changes required",
+                "review approved with blocking issues or incomplete coverage; treated as changes required",
             ));
         }
         if revision_cycles >= budgets.max_revision_cycles {
@@ -1192,5 +1332,115 @@ mod tests {
         assert_eq!(run.blocked_reason.as_deref(), Some("run deadline exceeded"));
         let task = run.tasks.last().unwrap();
         assert_eq!(task.error.as_deref(), Some("run deadline exceeded"));
+    }
+
+    #[test]
+    fn graph_review_coverage_approval_impossible_when_one_chunk_is_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("code.rs");
+        std::fs::write(&file_path, "fn initial() {}\n").unwrap();
+
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(crate::native_extensions::graph::types::Classification {
+                    task_class: crate::native_extensions::graph::types::TaskClass::Feature,
+                    complexity: Complexity::Standard,
+                    rationale: "standard test".into(),
+                    research_tasks: vec![crate::native_extensions::graph::types::ResearchRequest {
+                        kind: ResearchKind::CodeSearch,
+                        focus: "find code".into(),
+                    }],
+                    milestones: None,
+                }),
+                ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
+                    kind: ResearchKind::CodeSearch,
+                    findings: vec![crate::native_extensions::graph::types::EvidenceFinding {
+                        claim: "found code".into(),
+                        refs: vec!["code.rs:1".into()],
+                        confidence: crate::native_extensions::graph::types::Confidence::High,
+                    }],
+                    risks: vec![],
+                    gaps: vec![],
+                    test_baseline: None,
+                })),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![crate::native_extensions::graph::types::PlanStep {
+                        description: "step 1".into(),
+                        files: vec!["code.rs".into()],
+                    }],
+                    tests_to_add: vec![],
+                    tests_to_run: vec!["true".into()],
+                    completion_criteria: vec!["done".into()],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => {
+                    std::fs::write(&file_path, "fn initial() {}\nfn added() {}\n").unwrap();
+                    Artifact::PatchReport(Box::new(crate::native_extensions::graph::types::PatchReport {
+                        changed_files: vec!["code.rs".into()],
+                        summary: "added function".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
+                ArtifactKind::Review => {
+                    // Reviewer approves BUT omits the required chunk!
+                    Artifact::Review(Box::new(crate::native_extensions::graph::types::ReviewDecision {
+                        verdict: Verdict::Approve,
+                        issues: vec![],
+                        notes: "looks fine".into(),
+                        reviewed_chunk_ids: vec!["some_other_file#chunk-0".into()],
+                    }))
+                }
+            };
+
+            let _ = write_artifact(&spec.artifact_path, &artifact);
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let verify_exec: Arc<VerifyExec> = Arc::new(|_, _, _, _| (0, String::new(), 0));
+        let config = GraphConfig {
+            verify_commands: vec![crate::native_extensions::graph::types::VerifyCommandSpec {
+                command: "echo test".into(),
+                name: "test".into(),
+                from_plan: false,
+            }],
+            budgets: GraphBudgets {
+                max_revision_cycles: 0, // No retries allowed
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec,
+            config,
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+        };
+
+        let options = RunOptions {
+            goal: "test coverage requirement".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+
+        let run = run_graph(options, deps);
+        assert_eq!(run.phase, Phase::Blocked);
+        assert!(run.blocked_reason.as_deref().unwrap().contains("reviewer still requires changes"));
+        let coverage = run.review_coverage.expect("review coverage must be tracked");
+        assert!(!coverage_complete(&coverage), "coverage must NOT be complete");
+        assert!(coverage.missing_chunk_ids().contains(&"code.rs#chunk-0".to_string()));
     }
 }

@@ -425,12 +425,17 @@ pub fn implement_briefing(
     parts.join("\n")
 }
 
+use super::review_coverage::ReviewChunk;
+
 pub struct ReviewInput<'a> {
     pub goal: &'a str,
     pub plan: Option<&'a ImplementationPlan>,
     pub diff: &'a str,
     pub changed_files: &'a [String],
     pub verification: &'a VerificationResult,
+    pub chunk: Option<&'a ReviewChunk>,
+    pub chunk_summaries: Option<&'a [String]>,
+    pub required_chunk_ids: Option<&'a [String]>,
 }
 
 pub fn review_briefing(input: &ReviewInput<'_>) -> String {
@@ -466,14 +471,46 @@ pub fn review_briefing(input: &ReviewInput<'_>) -> String {
         String::new(),
         "## Changed files".to_string(),
         bullet_list(input.changed_files, "- (none reported)"),
-        String::new(),
-        "## Diff".to_string(),
-        if input.diff.is_empty() {
-            "(no git diff available - not a git repository; review the changed files by reading them)"
-                .to_string()
-        } else {
-            format!("```diff\n{}\n```", input.diff)
-        },
+    ]);
+
+    if let Some(chunk) = input.chunk {
+        parts.extend([
+            String::new(),
+            format!("## Review chunk: {} (file: {})", chunk.id, chunk.file),
+            if chunk.patch.is_empty() {
+                "(empty patch for this file)".to_string()
+            } else {
+                format!("```diff\n{}\n```", chunk.patch)
+            },
+        ]);
+    } else if let Some(summaries) = input.chunk_summaries {
+        parts.extend([
+            String::new(),
+            "## Prior chunk review summaries".to_string(),
+            bullet_list(summaries, "- none"),
+        ]);
+    } else {
+        parts.extend([
+            String::new(),
+            "## Diff".to_string(),
+            if input.diff.is_empty() {
+                "(no git diff available - not a git repository; review the changed files by reading them)"
+                    .to_string()
+            } else {
+                format!("```diff\n{}\n```", input.diff)
+            },
+        ]);
+    }
+
+    if let Some(req) = input.required_chunk_ids {
+        parts.extend([
+            String::new(),
+            "## Required review chunk IDs".to_string(),
+            bullet_list(req, "- none"),
+        ]);
+    }
+
+    parts.extend([
         String::new(),
         "## Deterministic verification results".to_string(),
         if verification_lines.is_empty() {
@@ -488,6 +525,7 @@ pub fn review_briefing(input: &ReviewInput<'_>) -> String {
         "commands yourself to confirm. Severity: blocker = must not ship; major = should not ship; minor = note.".to_string(),
         "Budget your time: start from the diff above, open only files it touches or directly references,".to_string(),
         "and submit your verdict as soon as you have judged every changed file - do not explore beyond the change.".to_string(),
+        "Include `reviewedChunkIds` in your submission matching the chunk IDs you reviewed.".to_string(),
     ]);
     parts.join("\n")
 }
@@ -635,6 +673,7 @@ mod tests {
                 },
             ],
             notes: String::new(),
+            reviewed_chunk_ids: vec![],
         };
         let notes = revision_notes_from(Some(&verification), Some(&review));
         assert!(notes.contains("cargo test"));
