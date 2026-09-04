@@ -38,6 +38,14 @@ pub fn cache_retention_from_options(options: &StreamOptions) -> CacheRetention {
     )
 }
 
+/// Resolve the effective prompt cache key: explicit `cache_key` first, then fallback to `session_id`.
+pub fn effective_prompt_cache_key(options: &StreamOptions) -> Option<&str> {
+    options
+        .cache_key
+        .as_deref()
+        .or(options.session_id.as_deref())
+}
+
 /// TS `OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH` (openai-prompt-cache.ts).
 pub const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
 
@@ -403,5 +411,25 @@ mod tests {
             bedrock_cache_point(CacheRetention::Long),
             Some(json!({"cachePoint": {"type": "default", "ttl": "1h"}}))
         );
+    }
+
+    #[test]
+    fn explicit_cache_key_wins_over_session_id() {
+        let options = StreamOptions {
+            session_id: Some("session-a".into()),
+            cache_key: Some("graph-role-a".into()),
+            ..StreamOptions::default()
+        };
+        assert_eq!(effective_prompt_cache_key(&options), Some("graph-role-a"));
+    }
+
+    #[test]
+    fn session_id_remains_fallback_cache_key() {
+        let options = StreamOptions {
+            session_id: Some("session-a".into()),
+            cache_key: None,
+            ..StreamOptions::default()
+        };
+        assert_eq!(effective_prompt_cache_key(&options), Some("session-a"));
     }
 }

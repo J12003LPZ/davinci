@@ -25,12 +25,15 @@ pub struct StreamOptions {
     pub websocket_connect_timeout_ms: Option<u64>,
     pub transport: Option<String>,
     pub session_id: Option<String>,
+    pub cache_key: Option<String>,
     pub cache_retention: Option<String>,
     pub install_telemetry: Option<bool>,
     /// Set from another thread to stop a live stream between frames. The
     /// message then closes with `StopReason::Aborted`.
     pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
+
+pub use crate::cache::effective_prompt_cache_key;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -960,9 +963,7 @@ fn openai_responses_body(
         body["parallel_tool_calls"] = Value::Bool(true);
     }
     let retention = crate::cache::cache_retention_from_options(options);
-    let session_key = options
-        .session_id
-        .as_deref()
+    let session_key = crate::cache::effective_prompt_cache_key(options)
         .filter(|id| !id.is_empty())
         .map(crate::cache::clamp_openai_prompt_cache_key);
     match model.api.as_str() {
@@ -1248,8 +1249,10 @@ fn mistral_body(
     body["stream"] = Value::Bool(false);
     let retention = crate::cache::cache_retention_from_options(options);
     if retention != crate::cache::CacheRetention::None {
-        if let Some(session_id) = options.session_id.as_deref().filter(|id| !id.is_empty()) {
-            body["prompt_cache_key"] = Value::String(session_id.to_string());
+        if let Some(key) =
+            crate::cache::effective_prompt_cache_key(options).filter(|id| !id.is_empty())
+        {
+            body["prompt_cache_key"] = Value::String(key.to_string());
         }
     }
     body
@@ -1373,9 +1376,7 @@ fn openai_body(
         .unwrap_or("https://api.openai.com/v1")
         .contains("api.openai.com");
     if (is_openai_host && retention != crate::cache::CacheRetention::None) || long_supported {
-        if let Some(key) = options
-            .session_id
-            .as_deref()
+        if let Some(key) = crate::cache::effective_prompt_cache_key(options)
             .filter(|id| !id.is_empty())
             .map(crate::cache::clamp_openai_prompt_cache_key)
         {
@@ -2583,6 +2584,33 @@ mod tests {
         );
         assert_eq!(azure_body["prompt_cache_key"], "sess-azure");
         assert!(azure_body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn bodies_carry_explicit_cache_key_over_session_id() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-responses")
+            .expect("openai responses model");
+        let options = StreamOptions {
+            session_id: Some("sess-ignore".into()),
+            cache_key: Some("cache-explicit".into()),
+            ..StreamOptions::default()
+        };
+        let body = request_body_with(&model, &[], None, &[], &options);
+        assert_eq!(body["prompt_cache_key"], "cache-explicit");
+
+        // Codex
+        let mut codex = model.clone();
+        codex.api = "openai-codex-responses".into();
+        let codex_body = request_body_with(&codex, &[], None, &[], &options);
+        assert_eq!(codex_body["prompt_cache_key"], "cache-explicit");
+
+        // Azure
+        let mut azure = model.clone();
+        azure.api = "azure-openai-responses".into();
+        let azure_body = request_body_with(&azure, &[], None, &[], &options);
+        assert_eq!(azure_body["prompt_cache_key"], "cache-explicit");
     }
 
     #[test]

@@ -801,6 +801,7 @@ fn complete_simple_summarization(
             .websocket_connect_timeout_ms,
         transport: load_settings(&default_agent_dir()).transport.clone(),
         session_id: None,
+        cache_key: None,
         cache_retention: Some("none".into()),
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
         abort_signal: None,
@@ -1789,6 +1790,7 @@ fn complete_prompt_with_host(
                                 .session
                                 .as_ref()
                                 .map(|session| session.header.id.clone()),
+                            cache_key: None,
                             cache_retention: None,
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
