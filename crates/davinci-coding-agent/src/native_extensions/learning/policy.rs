@@ -31,12 +31,16 @@ pub fn evaluate_candidate(
         return CandidateDecision::Reject;
     }
 
+    // Procedural skills require command verification, whereas declarative memory facts
+    // derived from conversation or inspection can auto-apply with sufficient confidence.
+    let requires_commands = !matches!(candidate.artifact, LearningArtifact::Memory { .. });
+
     // Check verification
-    if candidate.evidence.commands_ran == 0 {
+    if requires_commands && candidate.evidence.commands_ran == 0 {
         return CandidateDecision::KeepCandidate;
     }
 
-    if !candidate.evidence.passed {
+    if requires_commands && !candidate.evidence.passed {
         return CandidateDecision::KeepCandidate;
     }
 
@@ -336,13 +340,14 @@ mod tests {
     }
 
     #[test]
-    fn global_auto_write_is_off_by_default() {
+    fn global_auto_write_is_off_when_disabled() {
         let config = LearningConfig {
             shadow_mode: false,
             auto_apply_project: true,
+            auto_apply_global: false,
             ..Default::default()
         };
-        assert!(!config.auto_apply_global); // off by default!
+        assert!(!config.auto_apply_global);
 
         let candidate = fixture_candidate(
             LearningScope::Global,
@@ -364,6 +369,58 @@ mod tests {
 
         let decision = evaluate_candidate(&candidate, &config, true, None);
         assert_eq!(decision, CandidateDecision::StageForApproval);
+    }
+
+    #[test]
+    fn global_auto_write_applies_by_default() {
+        let config = LearningConfig::default();
+        assert!(config.auto_apply_global);
+
+        let candidate = fixture_candidate(
+            LearningScope::Global,
+            LearningArtifact::SkillCreate {
+                name: "debug-sqlx".into(),
+                description: "desc".into(),
+                body: "body".into(),
+            },
+            0.92,
+            VerificationEvidence {
+                graph_run_id: Some("run-1".into()),
+                commands_ran: 1,
+                passed: true,
+                user_accepted: false,
+                user_corrected: false,
+                permission_denied: false,
+            },
+        );
+
+        let decision = evaluate_candidate(&candidate, &config, true, None);
+        assert_eq!(decision, CandidateDecision::AutoApply);
+    }
+
+    #[test]
+    fn memory_fact_auto_applies_without_command_execution() {
+        let config = LearningConfig::default();
+        let candidate = fixture_candidate(
+            LearningScope::Project,
+            LearningArtifact::Memory {
+                memory_kind: "convention".into(),
+                text: "always use forward slashes in config".into(),
+                importance: 0.9,
+            },
+            0.88,
+            VerificationEvidence {
+                graph_run_id: None,
+                commands_ran: 0,
+                passed: false,
+                user_accepted: false,
+                user_corrected: false,
+                permission_denied: false,
+            },
+        );
+
+        let decision = evaluate_candidate(&candidate, &config, true, None);
+        assert_eq!(decision, CandidateDecision::AutoApply);
     }
 
     #[test]

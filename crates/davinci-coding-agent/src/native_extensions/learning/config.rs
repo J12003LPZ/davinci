@@ -20,9 +20,9 @@ impl Default for LearningConfig {
         Self {
             enabled: true,
             background_review: true,
-            shadow_mode: true,
-            auto_apply_project: false,
-            auto_apply_global: false,
+            shadow_mode: false,
+            auto_apply_project: true,
+            auto_apply_global: true,
             max_candidates_per_review: 3,
             max_review_input_tokens: 12_000,
             max_review_iterations: 6,
@@ -41,9 +41,9 @@ mod tests {
         let config = LearningConfig::default();
         assert!(config.enabled);
         assert!(config.background_review);
-        assert!(config.shadow_mode);
-        assert!(!config.auto_apply_project);
-        assert!(!config.auto_apply_global);
+        assert!(!config.shadow_mode);
+        assert!(config.auto_apply_project);
+        assert!(config.auto_apply_global);
         assert_eq!(config.max_candidates_per_review, 3);
         assert_eq!(config.max_review_input_tokens, 12_000);
         assert_eq!(config.max_review_iterations, 6);

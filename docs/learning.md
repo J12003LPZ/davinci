@@ -23,14 +23,15 @@ Davinci maintains a strict distinction between declarative facts and procedural 
 - If a new foreground turn begins while a background review is running, the active review is immediately cancelled via cooperative cancellation (`AtomicBool`).
 - Review can be completely disabled by setting `PI_LEARNING_DISABLE_BACKGROUND=1`.
 
-### Safe Defaults
-- **Shadow Mode Enabled by Default**: The system records candidate artifacts and verifies evidence, but does not automatically write or modify skills until evaluated or approved.
-- **Auto-Apply Guardrails**:
-  - `auto_apply_project`: Disabled by default (`false`). Only applies when explicitly enabled *and* the target project directory is trusted in project trust settings.
-  - `auto_apply_global`: Disabled by default (`false`). Modifying global skills requires explicit configuration or manual approval.
-- **Deterministic Verification Required**:
-  - Auto-promotion from candidate to active skill requires verified command execution (e.g. tests or build verification commands that exited with code 0).
-  - Turns with zero command executions, failed verification, or user corrections cannot auto-promote.
+### Automatic Learning by Default (Zero User Interaction Required)
+- **Automatic Application Enabled**: The system operates with `shadowMode = false`, `autoApplyProject = true`, and `autoApplyGlobal = true` by default. Proven procedural workflows and declarative facts are automatically persisted and activated without requiring manual `/learning-approve` commands or user prompts.
+- **Autonomous Auto-Promotion**:
+  - `auto_apply_project`: Enabled by default (`true`). When project tasks are verified, learned procedural workflows are automatically committed to `.pi/skills/<name>/SKILL.md`.
+  - `auto_apply_global`: Enabled by default (`true`). Global skills and facts are automatically maintained without user intervention.
+  - `auto_promote_verified_uses`: Skills that start as candidates are automatically promoted to `active` once verified in 2 independent successful executions without failures.
+- **Declarative vs. Procedural Verification**:
+  - Declarative memory facts (architecture decisions, conventions, constraints) auto-apply directly to vector memory upon high confidence (≥ 0.80) without requiring command execution.
+  - Procedural workflows require command verification (e.g. tests or build verification commands that exited with code 0) before autonomous activation.
 - **Read-Before-Write Hash Verification & Path Traversal Prevention**:
   - Patching existing skills checks that the current file content matches the expected hash before applying changes.
   - Rejects attempts to escape skill directories or overwrite user-authored / imported skills.
@@ -122,9 +123,9 @@ Learning configuration is specified under the `"learning"` key in settings:
   "learning": {
     "enabled": true,
     "backgroundReview": true,
-    "shadowMode": true,
-    "autoApplyProject": false,
-    "autoApplyGlobal": false,
+    "shadowMode": false,
+    "autoApplyProject": true,
+    "autoApplyGlobal": true,
     "maxCandidatesPerReview": 3,
     "maxReviewInputTokens": 12000,
     "maxReviewIterations": 6,
@@ -138,5 +139,5 @@ Learning configuration is specified under the `"learning"` key in settings:
 - **Fail-open**: Learning failures never fail normal turns.
 - **Review disablement**: Setting `PI_LEARNING_DISABLE_BACKGROUND=1` immediately short-circuits background review execution.
 - **Fallback to lexical**: If Ollama or Qdrant are unavailable, skill retrieval cleanly falls back to lexical matching.
-- **Untrusted projects**: Projects that are untrusted receive no autonomous project writes.
-- **Global protection**: Global autonomous writes are disabled by default.
+- **Untrusted projects**: Projects that are explicitly untrusted receive no autonomous project writes.
+- **Self-improving autonomy**: Without user interaction, high-confidence memories and verified skills are automatically promoted and activated.

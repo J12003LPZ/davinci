@@ -532,12 +532,45 @@ impl LearningController {
         let modified = p || g;
         if modified {
             match outcome {
-                SkillOutcome::VerifiedSuccess => self.stats.verified_skill_successes += 1,
+                SkillOutcome::VerifiedSuccess => {
+                    self.stats.verified_skill_successes += 1;
+                    self.auto_promote_if_threshold_met(name);
+                }
                 SkillOutcome::VerifiedFailure => self.stats.verified_skill_failures += 1,
                 SkillOutcome::Neutral => {}
             }
         }
         Ok(modified)
+    }
+
+    pub fn auto_promote_if_threshold_met(&mut self, name: &str) -> bool {
+        let mut promoted = false;
+        if let Some(mut record) = self.project_store.skill(name).cloned() {
+            if record.status != ArtifactStatus::Active
+                && verified_use_threshold_met(&record, &self.config)
+            {
+                record.status = ArtifactStatus::Active;
+                let _ = self.project_store.upsert_skill(record);
+                promoted = true;
+            }
+        }
+        if let Some(mut record) = self.global_store.skill(name).cloned() {
+            if record.status != ArtifactStatus::Active
+                && verified_use_threshold_met(&record, &self.config)
+            {
+                record.status = ArtifactStatus::Active;
+                let _ = self.global_store.upsert_skill(record);
+                promoted = true;
+            }
+        }
+        if promoted {
+            self.stats.candidates_approved += 1;
+            self.notifications.push(format!(
+                "learning · skill auto-promoted after verified uses: {}",
+                name
+            ));
+        }
+        promoted
     }
 
     pub fn status_command(&self) -> Value {
@@ -970,7 +1003,7 @@ mod tests {
 
         let status = controller.status_command();
         assert_eq!(status["enabled"], true);
-        assert_eq!(status["shadowMode"], true);
+        assert_eq!(status["shadowMode"], false);
 
         // Stage a candidate for approval
         let cand = LearningCandidate {
@@ -1052,7 +1085,12 @@ mod tests {
     fn learning_e2e_shadow_mode() {
         let _lock = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
-        let mut controller = LearningController::new(dir.path(), None, None);
+        let config = LearningConfig {
+            shadow_mode: true,
+            auto_apply_project: false,
+            ..Default::default()
+        };
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
         controller.set_project_trusted(true);
 
         let fixture_json = json!({
@@ -1535,5 +1573,41 @@ mod tests {
             std::fs::read_to_string(written_file).unwrap(),
             "{\"version\": 1}"
         );
+    }
+
+    #[test]
+    fn test_auto_promote_skill_on_verified_use() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), None, None);
+        let skill_record = SkillLedgerRecord {
+            skill_id: "candidate-skill".into(),
+            name: "auto-test".into(),
+            scope: LearningScope::Project,
+            origin: SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Candidate,
+            path: dir.path().join("SKILL.md"),
+            content_hash: "hash".into(),
+            version: 1,
+            success_count: 1,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            pinned: false,
+        };
+        controller.project_store.upsert_skill(skill_record).unwrap();
+
+        // 2nd verified success reaches auto_promote_verified_uses (default 2)
+        controller
+            .record_skill_outcome("auto-test", SkillOutcome::VerifiedSuccess)
+            .unwrap();
+
+        let updated = controller.project_store.skill("auto-test").unwrap();
+        assert_eq!(updated.status, ArtifactStatus::Active);
+        let notifs = controller.drain_notifications();
+        assert!(notifs
+            .iter()
+            .any(|n| n.contains("auto-promoted after verified uses")));
     }
 }
