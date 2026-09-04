@@ -34,6 +34,8 @@ Comprehensive specifications detailing the design contracts and algorithms:
 | [`2026-09-01-trust-and-control-design.md`](superpowers/specs/2026-09-01-trust-and-control-design.md) | Permission gates (`auto`, `ask`, `edits`, `read-only`), allow/deny rules, and interactive approval. |
 | [`2026-08-31-provider-prompt-cache-parity-design.md`](superpowers/specs/2026-08-31-provider-prompt-cache-parity-design.md) | Prompt caching parity with Anthropic, OpenAI, and Bedrock. |
 | [`2026-09-01-hooks-and-observability-design.md`](superpowers/specs/2026-09-01-hooks-and-observability-design.md) | Lifecycle hooks (`pre_tool`, `post_tool`, `stop`) and event streaming. |
+| [`2026-09-03-davinci-self-improving-learning-design.md`](superpowers/specs/2026-09-03-davinci-self-improving-learning-design.md) | Self-improving learning system: settled turn review, durable memory, and skills ledger. |
+| [`learning.md`](learning.md) | User and operator guide to Davinci self-improving learning, commands, and policy. |
 
 ---
 
@@ -43,7 +45,7 @@ Phased engineering execution plans that drove the TypeScript-to-Rust migration a
 
 - **Migration Phases**: [`Phase 1`](superpowers/plans/2026-08-27-rust-rewrite-phase-1.md) through [`Phase 8`](superpowers/plans/2026-08-27-rust-rewrite-phase-8-cutover.md) detailing protocol, storage, agent loop, TUI, and conformance testing.
 - **Master Plan**: [`2026-08-27-rust-rewrite-program.md`](superpowers/plans/2026-08-27-rust-rewrite-program.md).
-- **Feature Plans**: Provider prompt caching, native MCP, trust & control, and instruments fidelity.
+- **Feature Plans**: Provider prompt caching, native MCP, trust & control, instruments fidelity, and [`Self-Improving Learning`](superpowers/plans/2026-09-03-davinci-self-improving-learning-plan.md).
 
 ---
 

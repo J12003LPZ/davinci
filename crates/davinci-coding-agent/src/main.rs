@@ -1634,6 +1634,7 @@ fn complete_prompt_with_host(
         if let Some(memory) = host.native_memory_inject(&prompt) {
             agent.set_ephemeral_context(vec![davinci_ai::ChatMessage::text("custom", memory)]);
         }
+        host.native_cancel_learning_review();
         host.emit(ExtensionEvent::AgentStart);
         host.emit(ExtensionEvent::TurnStart);
         host.emit(ExtensionEvent::BeforeProviderRequest {
@@ -1866,6 +1867,102 @@ fn complete_prompt_with_host(
         host.emit(ExtensionEvent::AgentSettled);
         let memory_messages = agent_memory_messages(agent);
         let _ = host.native_index_messages(&memory_messages);
+
+        let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+        let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+        host.set_project_trusted(trusted);
+
+        let mut commands_ran = 0u32;
+        let mut all_commands_passed = true;
+        let mut graph_run_id = None;
+        for ev in &events {
+            if let AgentEvent::ToolExecutionEnd {
+                tool_name,
+                is_error,
+                details,
+                ..
+            } = ev
+            {
+                if tool_name == "bash"
+                    || tool_name == "powershell"
+                    || tool_name == "execute_command"
+                {
+                    commands_ran += 1;
+                    if *is_error {
+                        all_commands_passed = false;
+                    }
+                } else if tool_name == "graph_run" {
+                    if let Some(details) = details {
+                        if let Some(graph) = details.get("graph") {
+                            if let Some(id) = graph.get("runId").and_then(|v| v.as_str()) {
+                                graph_run_id = Some(id.to_string());
+                            }
+                            if let Some(v) = graph.get("verification") {
+                                if let Ok(vr) = serde_json::from_value::<
+                                    crate::native_extensions::graph::types::VerificationResult,
+                                >(v.clone())
+                                {
+                                    for cmd in &vr.commands {
+                                        if !cmd.skipped {
+                                            commands_ran += 1;
+                                            if cmd.exit_code != 0 {
+                                                all_commands_passed = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let verification = crate::native_extensions::learning::VerificationEvidence {
+            graph_run_id,
+            commands_ran,
+            passed: all_commands_passed && commands_ran > 0,
+            user_accepted: false,
+            user_corrected: false,
+            permission_denied: false,
+        };
+
+        let skill_outcome = if verification.passed && verification.commands_ran > 0 {
+            crate::native_extensions::learning::SkillOutcome::VerifiedSuccess
+        } else if !verification.passed && verification.commands_ran > 0 {
+            crate::native_extensions::learning::SkillOutcome::VerifiedFailure
+        } else {
+            crate::native_extensions::learning::SkillOutcome::Neutral
+        };
+
+        let (latest_user_text, _) = latest_user_prompt(agent);
+        for skill in &agent.skills {
+            let tag = format!("<skill name=\"{}\"", skill.name);
+            if latest_user_text.contains(&tag) {
+                host.native_record_skill_outcome(&skill.name, skill_outcome);
+            }
+        }
+
+        let learning_evidence = crate::native_extensions::learning::build_learning_evidence(
+            crate::native_extensions::learning::BuildEvidenceInput {
+                session_id: agent
+                    .session
+                    .as_ref()
+                    .map(|s| s.path.display().to_string())
+                    .unwrap_or_else(|| "default-session".to_string()),
+                repo_id: crate::native_extensions::vector_memory::repo_id(&agent.cwd),
+                turn: agent.messages.len() as u64,
+                messages: &memory_messages,
+                events: &events,
+                run_stats: agent.run_stats(),
+                verification,
+            },
+        );
+        let _ = host.native_review_settled_turn(learning_evidence);
+        if fresh_host {
+            for notice in host.drain_learning_notifications() {
+                println!("{notice}");
+            }
+        }
         for event in &events {
             match event {
                 AgentEvent::MessageStart { message } => {
@@ -4213,7 +4310,10 @@ fn prepare_user_input(
     let mut images = images.to_vec();
     if text.starts_with('/') {
         let (name, args) = parse_extension_command(&text);
-        if let Some(session) = session.as_mut() {
+        if name == "learn" {
+            let req = crate::native_extensions::learning::parse_learn_args(&args)?;
+            text = crate::native_extensions::learning::build_learn_prompt(&req);
+        } else if let Some(session) = session.as_mut() {
             if try_extension_slash(parsed, agent, session, &name, &args)? {
                 return Ok(PreparedInput::Handled);
             }

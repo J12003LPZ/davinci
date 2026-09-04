@@ -1,11 +1,13 @@
 //! Native Rust ports of the bundled pi extensions.
 
 pub mod graph;
+pub mod learning;
 mod security_scan;
 mod token_governor;
 pub mod vector_memory;
 
 pub use graph::*;
+pub use learning::*;
 pub use security_scan::*;
 pub use token_governor::*;
 pub use vector_memory::*;
@@ -33,6 +35,9 @@ pub const NATIVE_TOOLS: &[&str] = &[
     "sec_policy_resolve",
     "sec_tracking_validate",
     "sec_deep_scan",
+    "skill_list",
+    "skill_view",
+    "skill_manage",
 ];
 
 pub const NATIVE_COMMANDS: &[&str] = &[
@@ -50,6 +55,12 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "sec-status",
     "sec-report",
     "sec-abort",
+    "learning-status",
+    "learning-pending",
+    "learning-approve",
+    "learning-reject",
+    "skill-list",
+    "skill-view",
 ];
 
 /// Metadata shared by the interactive and RPC command discovery surfaces.
@@ -103,6 +114,36 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         ("sec-status", "Show the active security scan status.", None),
         ("sec-report", "Show the active security scan report.", None),
         ("sec-abort", "Cancel the active security scan.", None),
+        (
+            "learning-status",
+            "Show learning subsystem status and statistics.",
+            None,
+        ),
+        (
+            "learning-pending",
+            "List candidates awaiting user approval.",
+            None,
+        ),
+        (
+            "learning-approve",
+            "Approve a learning candidate to activate it as a skill.",
+            Some("<candidateId|all>"),
+        ),
+        (
+            "learning-reject",
+            "Reject a learning candidate.",
+            Some("<candidateId|all> [reason]"),
+        ),
+        (
+            "skill-list",
+            "List compact reusable skill descriptors.",
+            Some("[query]"),
+        ),
+        (
+            "skill-view",
+            "Read the full content of a skill.",
+            Some("<name> [file]"),
+        ),
     ]
 }
 
@@ -136,6 +177,7 @@ pub struct NativeExtensionHost {
     pub memory: VectorMemory,
     pub graph: GraphController,
     pub security: SecurityScanController,
+    pub learning: LearningController,
 }
 
 impl NativeExtensionHost {
@@ -155,11 +197,15 @@ impl NativeExtensionHost {
         // Only the product host sweeps: other sessions' stored outputs past
         // the retention window go, never the live session's.
         let _ = governor.sweep_stale_outputs();
+        let learning_config =
+            agent_dir.and_then(|dir| crate::settings::load_merged_settings(dir, cwd).learning);
+        let learning = LearningController::new(cwd, agent_dir, learning_config);
         Self {
             governor,
             memory: VectorMemory::with_config(cwd.to_path_buf(), memory_config),
             graph: GraphController::new(cwd.to_path_buf()),
             security: SecurityScanController::new(cwd.to_path_buf()),
+            learning,
         }
     }
 
@@ -221,6 +267,90 @@ impl NativeExtensionHost {
     /// A background graph run must not outlive the session that started it.
     pub fn session_shutdown(&mut self) {
         graph::abort_all_runs();
+        self.learning.cancel_active_review();
+    }
+
+    pub fn sync_active_learning_memories(&mut self) {
+        let mut to_sync = Vec::new();
+        for c in self.learning.project_store.candidates() {
+            if c.status == ArtifactStatus::Active {
+                to_sync.push(c.clone());
+            }
+        }
+        for c in self.learning.global_store.candidates() {
+            if c.status == ArtifactStatus::Active {
+                to_sync.push(c.clone());
+            }
+        }
+
+        for candidate in to_sync {
+            match &candidate.artifact {
+                LearningArtifact::Memory {
+                    memory_kind,
+                    text,
+                    importance,
+                } => {
+                    let kind = match memory_kind.to_ascii_lowercase().as_str() {
+                        "decision" => vector_memory::MemoryKind::Decision,
+                        "architecture" => vector_memory::MemoryKind::Architecture,
+                        "discovery" => vector_memory::MemoryKind::Discovery,
+                        "bug" => vector_memory::MemoryKind::Bug,
+                        "fix" => vector_memory::MemoryKind::Fix,
+                        "constraint" => vector_memory::MemoryKind::Constraint,
+                        "task_result" => vector_memory::MemoryKind::TaskResult,
+                        "compaction" => vector_memory::MemoryKind::Compaction,
+                        "fact" => vector_memory::MemoryKind::Fact,
+                        "task" => vector_memory::MemoryKind::Task,
+                        "summary" => vector_memory::MemoryKind::Summary,
+                        "conversation" => vector_memory::MemoryKind::Conversation,
+                        _ => vector_memory::MemoryKind::Fact,
+                    };
+                    let _ = self.memory.index_learning_memory(
+                        text,
+                        kind,
+                        *importance,
+                        candidate.confidence,
+                        &candidate.source_session_id,
+                        candidate.source_turn,
+                        candidate.evidence.graph_run_id.as_deref(),
+                    );
+                }
+                LearningArtifact::FailureLesson { text, importance } => {
+                    let _ = self.memory.index_learning_memory(
+                        text,
+                        vector_memory::MemoryKind::Bug,
+                        *importance,
+                        candidate.confidence,
+                        &candidate.source_session_id,
+                        candidate.source_turn,
+                        candidate.evidence.graph_run_id.as_deref(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn review_settled_turn(&mut self, evidence: LearningEvidence) -> Option<String> {
+        let result = self.learning.review_settled_turn(evidence);
+        self.sync_active_learning_memories();
+        result
+    }
+
+    pub fn cancel_active_learning_review(&mut self) {
+        self.learning.cancel_active_review();
+    }
+
+    pub fn record_skill_outcome(&mut self, name: &str, outcome: SkillOutcome) {
+        let _ = self.learning.record_skill_outcome(name, outcome);
+    }
+
+    pub fn set_learning_project_trusted(&mut self, trusted: bool) {
+        self.learning.set_project_trusted(trusted);
+    }
+
+    pub fn drain_learning_notifications(&mut self) -> Vec<String> {
+        self.learning.drain_notifications()
     }
 
     pub fn execute_tool(
@@ -232,6 +362,21 @@ impl NativeExtensionHost {
         match name {
             "memory_search" => self.memory.search_tool(args),
             "retrieve_output" => self.governor.retrieve(args),
+            "skill_list" => {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                let query_embedding = if !query.trim().is_empty() && self.memory.dense_available() {
+                    self.memory.embed_query_text(query).ok()
+                } else {
+                    None
+                };
+                self.learning.skill_list_tool_with_query_embedding(
+                    _cwd,
+                    args,
+                    query_embedding.as_deref(),
+                )
+            }
+            "skill_view" => self.learning.skill_view_tool(_cwd, args),
+            "skill_manage" => self.learning.skill_manage_tool(_cwd, args),
             name if name.starts_with("sec_") => self.security.execute_tool(name, args),
             "graph_status" | "graph_run" | GRAPH_SUBMIT_TOOL => self.graph.execute_tool(name, args),
             _ => Err(ToolError::Unknown(name.to_string())),
@@ -249,6 +394,16 @@ impl NativeExtensionHost {
                 self.governor.reset();
                 Ok(Some(self.governor.status()))
             }
+            "learning-status" => Ok(Some(self.learning.status_command())),
+            "learning-pending" => Ok(Some(self.learning.pending_command())),
+            "learning-approve" => {
+                let res = self.learning.approve_command(args);
+                self.sync_active_learning_memories();
+                res.map(Some)
+            }
+            "learning-reject" => self.learning.reject_command(args).map(Some),
+            "skill-list" => self.learning.skill_list_command(args).map(Some),
+            "skill-view" => self.learning.skill_view_command(args).map(Some),
             name if name.starts_with("graph") => self.graph.command(name, args),
             name if name.starts_with("sec-") => self.security.command(name, args),
             _ => Ok(None),
@@ -272,6 +427,49 @@ impl NativeExtensionHost {
             "graph_run" => (
                 "Solve a coding task as an execution graph of isolated, least-privileged worker processes (classify, research, plan, implement, verify, review) and return the outcome. Runs to completion, which can take a long time.",
                 json!({"type":"object","properties":{"goal":{"type":"string","minLength":1},"mode":{"type":"string","enum":["simple","complex"]},"dryRun":{"type":"boolean"}},"required":["goal"]}),
+            ),
+            "skill_list" => (
+                "List compact reusable skill descriptors relevant to a task without loading full skill bodies.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "scope": {"type": "string", "enum": ["project", "global", "all"]},
+                        "status": {"type": "string", "enum": ["candidate", "pending_approval", "active", "archived", "all"]},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+                    }
+                }),
+            ),
+            "skill_view" => (
+                "Read the current full SKILL.md or an allowed supporting file for one skill.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "file": {"type": "string"}
+                    },
+                    "required": ["name"]
+                }),
+            ),
+            "skill_manage" => (
+                "Safely create, patch, support, or archive agent skills with verification and ownership guards.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["create", "patch", "write_file", "archive", "activate", "reject"]},
+                        "name": {"type": "string"},
+                        "scope": {"type": "string", "enum": ["project", "global"]},
+                        "description": {"type": "string"},
+                        "body": {"type": "string"},
+                        "oldText": {"type": "string"},
+                        "newText": {"type": "string"},
+                        "expectedHash": {"type": "string"},
+                        "filePath": {"type": "string"},
+                        "content": {"type": "string"},
+                        "candidateId": {"type": "string"}
+                    },
+                    "required": ["action", "name"]
+                }),
             ),
             name if name.starts_with("sec_") => security_scan::tool_spec(name),
             // Only a graph worker child sees this tool; it is the worker's one
@@ -427,5 +625,56 @@ mod tests {
                 && command["source"] == "native"
                 && command["argumentHint"] == "<query>"
         }));
+    }
+
+    #[test]
+    fn native_learning_commands_dispatch() {
+        let mut host = NativeExtensionHost::default();
+        let status = host
+            .command("learning-status", "")
+            .unwrap()
+            .expect("status value");
+        assert_eq!(status["enabled"], true);
+
+        let pending = host
+            .command("learning-pending", "")
+            .unwrap()
+            .expect("pending value");
+        assert!(pending["pending"].is_array());
+    }
+
+    #[test]
+    fn test_sync_active_learning_memories_into_vector_memory() {
+        let mut host = NativeExtensionHost::default();
+        let cand = LearningCandidate {
+            id: "cand-mem-1".into(),
+            scope: LearningScope::Project,
+            status: ArtifactStatus::Active,
+            artifact: LearningArtifact::Memory {
+                memory_kind: "constraint".into(),
+                text: "PostgreSQL pool must not exceed 20 connections in staging".into(),
+                importance: 0.85,
+            },
+            confidence: 0.9,
+            source_session_id: "sess-sync".into(),
+            source_repo_id: host.memory.repo_id.clone(),
+            source_turn: 1,
+            created_at_ms: 1000,
+            evidence: VerificationEvidence::default(),
+            rationale: "reusable DB constraint".into(),
+        };
+        host.learning.project_store.upsert_candidate(cand).unwrap();
+        host.sync_active_learning_memories();
+
+        let search_res = host.memory.search("PostgreSQL pool connections", 5);
+        assert!(!search_res.is_empty());
+        assert!(search_res[0]
+            .record
+            .text
+            .contains("PostgreSQL pool must not exceed 20"));
+        assert_eq!(
+            search_res[0].record.kind,
+            vector_memory::MemoryKind::Constraint
+        );
     }
 }

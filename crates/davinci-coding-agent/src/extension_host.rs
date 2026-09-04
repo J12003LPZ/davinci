@@ -376,6 +376,7 @@ impl ExtensionHost {
             native
                 .graph
                 .set_session_context(model, thinking, project_trusted);
+            native.learning.set_project_trusted(project_trusted);
         }
     }
 
@@ -426,6 +427,45 @@ impl ExtensionHost {
             .lock()
             .map_err(|err| davinci_agent::ToolError::Failed(err.to_string()))?
             .memory_index_messages(messages)
+    }
+
+    pub fn native_review_settled_turn(
+        &self,
+        evidence: crate::native_extensions::LearningEvidence,
+    ) -> Result<Option<String>, davinci_agent::ToolError> {
+        self.native
+            .lock()
+            .map_err(|err| davinci_agent::ToolError::Failed(err.to_string()))
+            .map(|mut native| native.review_settled_turn(evidence))
+    }
+
+    pub fn native_cancel_learning_review(&self) {
+        if let Ok(mut native) = self.native.lock() {
+            native.cancel_active_learning_review();
+        }
+    }
+
+    pub fn native_record_skill_outcome(
+        &self,
+        name: &str,
+        outcome: crate::native_extensions::learning::SkillOutcome,
+    ) {
+        if let Ok(mut native) = self.native.lock() {
+            native.record_skill_outcome(name, outcome);
+        }
+    }
+
+    pub fn set_project_trusted(&self, trusted: bool) {
+        if let Ok(mut native) = self.native.lock() {
+            native.set_learning_project_trusted(trusted);
+        }
+    }
+
+    pub fn drain_learning_notifications(&self) -> Vec<String> {
+        self.native
+            .lock()
+            .map(|mut native| native.drain_learning_notifications())
+            .unwrap_or_default()
     }
 
     pub fn execute_native_tool(
@@ -1484,5 +1524,41 @@ mod tests {
         host.filter_models(&mut models);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].provider, "openai");
+    }
+
+    #[test]
+    fn settled_turn_indexes_memory_and_reviews_without_failing_foreground() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ExtensionHost::load_with_cwd(dir.path(), &[], dir.path());
+
+        let memory_messages = vec![
+            crate::native_extensions::MemoryMessage {
+                role: "user".into(),
+                content: "how to build the project".into(),
+            },
+            crate::native_extensions::MemoryMessage {
+                role: "assistant".into(),
+                content: "run cargo test".into(),
+            },
+        ];
+
+        let indexed = host.native_index_messages(&memory_messages);
+        assert!(indexed.is_ok());
+
+        let evidence = crate::native_extensions::learning::build_learning_evidence(
+            crate::native_extensions::learning::BuildEvidenceInput {
+                session_id: "test-sess".into(),
+                repo_id: "test-repo".into(),
+                turn: 1,
+                messages: &memory_messages,
+                events: &[],
+                run_stats: davinci_agent::RunStats::default(),
+                verification: crate::native_extensions::learning::VerificationEvidence::default(),
+            },
+        );
+        let review_res = host.native_review_settled_turn(evidence);
+        assert!(review_res.is_ok());
+
+        host.native_cancel_learning_review();
     }
 }

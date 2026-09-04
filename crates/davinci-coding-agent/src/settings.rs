@@ -138,6 +138,8 @@ pub struct Settings {
     /// the project is trusted.
     #[serde(default)]
     pub permissions: Option<PermissionSettings>,
+    #[serde(default)]
+    pub learning: Option<crate::native_extensions::learning::LearningConfig>,
     /// Settings keys this struct does not model (for example `subagents`,
     /// written by extensions). They are carried through untouched so a rewrite
     /// by `pi install`/`pi remove` cannot silently drop another tool's config.
@@ -1590,5 +1592,11 @@ mod tests {
         assert_eq!(skipped.theme.as_deref(), Some("dark"));
         let forced = load_merged_settings_with_override(&agent_dir, &project, Some(true));
         assert_eq!(forced.theme.as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn settings_without_learning_still_deserialize() {
+        let settings: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(settings.learning.is_none());
     }
 }

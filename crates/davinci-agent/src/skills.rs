@@ -16,6 +16,29 @@ pub struct Skill {
     pub base_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillDescriptor {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+    pub base_dir: PathBuf,
+}
+
+impl From<&Skill> for SkillDescriptor {
+    fn from(skill: &Skill) -> Self {
+        Self {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            path: skill.path.clone(),
+            base_dir: skill.base_dir.clone(),
+        }
+    }
+}
+
+pub fn describe_skill(skill: &Skill) -> SkillDescriptor {
+    SkillDescriptor::from(skill)
+}
+
 pub fn discover_skills(roots: &[PathBuf]) -> Vec<Skill> {
     let mut skills = Vec::new();
     for root in roots {
@@ -122,13 +145,45 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedUserText {
+    pub text: String,
+    pub skills: Vec<String>,
+}
+
+/// Expand `/skill:name` then prompt templates, returning the final text and injected skill names.
+pub fn expand_user_text_with_metadata(
+    text: &str,
+    skills: &[Skill],
+    templates: &[crate::PromptTemplate],
+) -> ExpandedUserText {
+    let mut matched_skills = Vec::new();
+    let after_skill = if let Some(rest) = text.strip_prefix("/skill:") {
+        let (skill_name, _) = match rest.find(' ') {
+            Some(index) => (&rest[..index], rest[index + 1..].trim()),
+            None => (rest, ""),
+        };
+        if skills.iter().any(|item| item.name == skill_name) {
+            matched_skills.push(skill_name.to_string());
+        }
+        expand_skill_command(text, skills)
+    } else {
+        text.to_string()
+    };
+    let text = crate::expand_prompt_template(&after_skill, templates);
+    ExpandedUserText {
+        text,
+        skills: matched_skills,
+    }
+}
+
 /// Expand `/skill:name` then prompt templates. Used by AgentSession.prompt.
 pub fn expand_user_text(
     text: &str,
     skills: &[Skill],
     templates: &[crate::PromptTemplate],
 ) -> String {
-    crate::expand_prompt_template(&expand_skill_command(text, skills), templates)
+    expand_user_text_with_metadata(text, skills, templates).text
 }
 
 #[cfg(test)]
@@ -177,5 +232,41 @@ mod tests {
             expand_user_text("/review src/index.ts", &[], &templates),
             "Review this code: src/index.ts"
         );
+    }
+
+    #[test]
+    fn explicit_skill_expansion_remains_backward_compatible() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: my-skill\ndescription: Test skill description\n---\n\n## Instructions\nDo something useful.\n",
+        )
+        .unwrap();
+        let skills = discover_skills(&[skill_dir]);
+        assert_eq!(skills.len(), 1);
+        let expanded = expand_skill_command("/skill:my-skill do it", &skills);
+        assert!(expanded.contains("<skill name=\"my-skill\""));
+        assert!(expanded.contains("Do something useful."));
+        assert!(expanded.contains("do it"));
+    }
+
+    #[test]
+    fn expand_user_text_with_metadata_captures_injected_skills() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("debug-sqlx");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: debug-sqlx\ndescription: Debug SQLx\n---\n\n## Instructions\nFix sqlx.\n",
+        )
+        .unwrap();
+        let skills = discover_skills(&[skill_dir]);
+        let res = expand_user_text_with_metadata("/skill:debug-sqlx run check", &skills, &[]);
+        assert_eq!(res.skills, vec!["debug-sqlx".to_string()]);
+        assert!(res.text.contains("Fix sqlx."));
     }
 }

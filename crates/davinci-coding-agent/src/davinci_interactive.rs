@@ -1141,6 +1141,11 @@ fn run_turn(
     // reply while the panel is up. Only a trusted project may be offered
     // "always": its settings file is the one that would be read back.
     let trusted = crate::settings::is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    {
+        let host_guard = host.lock().unwrap_or_else(|err| err.into_inner());
+        host_guard.native_cancel_learning_review();
+        host_guard.set_project_trusted(trusted);
+    }
     let cwd = agent.cwd.clone();
     let (approval_tx, approval_rx) =
         mpsc::channel::<(ToolApprovalRequest, mpsc::Sender<ToolApprovalDecision>)>();
@@ -1400,6 +1405,12 @@ fn run_turn(
     // rather than reading it is what keeps a `notify` from being replayed into
     // the transcript on every later turn.
     drain_ui_calls(model, &host);
+    {
+        let host_guard = host.lock().unwrap_or_else(|err| err.into_inner());
+        for notice in host_guard.drain_learning_notifications() {
+            model.transcript.push(Entry::Detail(notice));
+        }
+    }
     apply_cache_miss_notices(model, agent);
     Ok(())
 }
@@ -1782,6 +1793,8 @@ pub fn instrument_of_command(name: &str) -> &'static str {
         name if name.starts_with("governor") => "mensura",
         name if name.starts_with("graph") => "grafo",
         name if name.starts_with("sec") => "speculum",
+        name if name.starts_with("learning") => "doctrina",
+        name if name.starts_with("skill") => "ars",
         _ => "instrumenta",
     }
 }
@@ -5909,6 +5922,21 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
     // it, so `/graph-view` and every other extension command was sent to the
     // provider as literal text and came back as "the model returned no text".
     if line.trim_start().starts_with('/') {
+        if line.trim_start().starts_with("/learn") {
+            let (name, args) = crate::parse_extension_command(line);
+            if name == "learn" {
+                match crate::native_extensions::learning::parse_learn_args(&args) {
+                    Ok(req) => {
+                        let prompt = crate::native_extensions::learning::build_learn_prompt(&req);
+                        return submit_prompt(shell, &prompt, &[]);
+                    }
+                    Err(err) => {
+                        shell.note(&err);
+                        return Next::Go;
+                    }
+                }
+            }
+        }
         if let Some(next) = run_extension_command(shell, line) {
             return next;
         }

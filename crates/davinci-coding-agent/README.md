@@ -19,6 +19,7 @@
   - **Token Governor (`token_governor.rs`)**: Output digestion, large output offloading, and deduplication of repeated reads within a rolling window.
   - **Security Scanner (`security_scan.rs`)**: Static threat analysis scanning tool runs, paths, and repositories offline.
   - **Graph Engine (`graph/`)**: Multi-worker task graph executor running scoped `--print` subagent workers.
+  - **Learning (`learning/`)**: Fail-open turn review, candidate artifact evaluation, safe procedural skill creation (`SKILL.md`), progressive disclosure notices, and `/learn` command.
 - **JavaScript Extensions (`extension_host.rs`, `js_host.rs`)**:
   - Embedded runner (`extension_runner.js`) driving custom JS plugins in a subprocess when Node.js is installed.
 - **Trust & Permissions (`trust.rs`, `permissions.rs`)**:

@@ -247,6 +247,18 @@ pub struct MemoryRecord {
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub source_session_id: Option<String>,
+    #[serde(default)]
+    pub source_turn: Option<u64>,
+    #[serde(default)]
+    pub verification: Option<String>,
+    #[serde(default)]
+    pub use_count: u64,
+    #[serde(default)]
+    pub last_used_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -301,6 +313,8 @@ pub fn hash_to_uuid(hash: &str) -> String {
         &value[20..32]
     )
 }
+
+pub use resolve_repo_id as repo_id;
 
 pub fn resolve_repo_id(cwd: &Path) -> String {
     let remote = Command::new("git")
@@ -671,6 +685,12 @@ impl VectorMemory {
                 importance: chunk.importance,
                 created_at: davinci_session::now_ms(),
                 embedding: None,
+                confidence: None,
+                source_session_id: None,
+                source_turn: None,
+                verification: None,
+                use_count: 0,
+                last_used_at: None,
             };
             self.records.push(record.clone());
             inserted_records.push(record);
@@ -766,7 +786,7 @@ impl VectorMemory {
         fuse_hits(std::mem::take(&mut hits), limit.max(1))
     }
 
-    fn dense_available(&self) -> bool {
+    pub fn dense_available(&self) -> bool {
         match self.dense_offline_until.get() {
             Some(until) if Instant::now() < until => false,
             Some(_) => {
@@ -986,6 +1006,74 @@ impl VectorMemory {
             .map_err(|err| ToolError::Failed(err.to_string()))?;
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub fn index_learning_memory(
+        &mut self,
+        text: &str,
+        kind: MemoryKind,
+        importance: f32,
+        confidence: f32,
+        source_session_id: &str,
+        source_turn: u64,
+        verification: Option<&str>,
+    ) -> Result<String, ToolError> {
+        let text_redacted = redact_secrets(text);
+        let hash = content_hash(&text_redacted);
+        let id = hash_to_uuid(&sha256_hex(format!("{}\0{}", self.repo_id, hash)));
+        if !self.known.insert(known_key(kind, &hash)) {
+            return Ok(id);
+        }
+        let record = MemoryRecord {
+            id: id.clone(),
+            repo_id: self.repo_id.clone(),
+            kind,
+            text: text_redacted.clone(),
+            source: format!("learning-turn-{}", source_turn),
+            content_hash: hash,
+            importance,
+            created_at: davinci_session::now_ms(),
+            embedding: None,
+            confidence: Some(confidence),
+            source_session_id: Some(source_session_id.to_string()),
+            source_turn: Some(source_turn),
+            verification: verification.map(str::to_string),
+            use_count: 0,
+            last_used_at: None,
+        };
+        self.records.push(record.clone());
+        self.last_indexed += 1;
+        self.last_indexed_at = Some(davinci_session::now_ms());
+        self.persist_local()?;
+        if self.dense_available() {
+            if let Ok(embeddings) = self.embed_documents(&[text_redacted]) {
+                if let Some(emb) = embeddings.into_iter().next() {
+                    if let Some(stored) = self.records.iter_mut().find(|item| item.id == id) {
+                        stored.embedding = Some(emb.clone());
+                    }
+                    let _ = self.persist_local();
+                    let _ = self.upsert_remote(&[MemoryRecord {
+                        embedding: Some(emb),
+                        ..record
+                    }]);
+                }
+            }
+        }
+        Ok(id)
+    }
+
+    #[allow(dead_code)]
+    pub fn embed_document_text(&self, text: &str) -> Result<Vec<f32>, ToolError> {
+        let mut results = self.embed_documents(&[text.to_string()])?;
+        results
+            .pop()
+            .ok_or_else(|| ToolError::Failed("empty embedding result".into()))
+    }
+
+    #[allow(dead_code)]
+    pub fn embed_query_text(&self, text: &str) -> Result<Vec<f32>, ToolError> {
+        self.embed_query(text)
+    }
 }
 
 fn parse_embedding_response(
@@ -1135,6 +1223,48 @@ mod tests {
             bytes.extend_from_slice(&chunk[..size]);
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn old_memory_record_without_learning_fields_still_loads() {
+        let value = serde_json::json!({
+            "id": "1",
+            "repoId": "repo",
+            "kind": "fact",
+            "text": "uses pnpm",
+            "source": "turn 1",
+            "contentHash": "abc",
+            "importance": 0.8,
+            "createdAt": 1
+        });
+        let record: MemoryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(record.use_count, 0);
+        assert!(record.verification.is_none());
+        assert!(record.confidence.is_none());
+    }
+
+    #[test]
+    fn index_learning_memory_records_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.mark_dense_offline();
+        let id = memory
+            .index_learning_memory(
+                "Use SQLx offline mode for Docker builds",
+                MemoryKind::Fact,
+                0.9,
+                0.95,
+                "sess-123",
+                4,
+                Some("graph_pass"),
+            )
+            .unwrap();
+        let record = memory.records.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(record.confidence, Some(0.95));
+        assert_eq!(record.source_session_id, Some("sess-123".to_string()));
+        assert_eq!(record.source_turn, Some(4));
+        assert_eq!(record.verification, Some("graph_pass".to_string()));
+        assert_eq!(record.use_count, 0);
     }
 
     #[test]

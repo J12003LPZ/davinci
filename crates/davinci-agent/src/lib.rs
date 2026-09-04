@@ -64,7 +64,10 @@ pub use permission::{
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
 pub use scheduler::{lane_for, ToolLane, MAX_TOOL_PARALLELISM};
-pub use skills::{discover_skills, expand_skill_command, expand_user_text, Skill};
+pub use skills::{
+    describe_skill, discover_skills, expand_skill_command, expand_user_text,
+    expand_user_text_with_metadata, ExpandedUserText, Skill, SkillDescriptor,
+};
 pub use stats::{RunStats, SharedCounters};
 pub use subagent::{
     scoped_tools, SubagentRequest, SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX,
