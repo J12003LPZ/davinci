@@ -36,6 +36,7 @@ Comprehensive specifications detailing the design contracts and algorithms:
 | [`2026-09-01-hooks-and-observability-design.md`](superpowers/specs/2026-09-01-hooks-and-observability-design.md) | Lifecycle hooks (`pre_tool`, `post_tool`, `stop`) and event streaming. |
 | [`2026-09-03-davinci-self-improving-learning-design.md`](superpowers/specs/2026-09-03-davinci-self-improving-learning-design.md) | Self-improving learning system: settled turn review, durable memory, and skills ledger. |
 | [`learning.md`](learning.md) | User and operator guide to Davinci self-improving learning, commands, and policy. |
+| [`ecosystem.md`](ecosystem.md) | Closed ecosystem integration architecture connecting Graph, Token Governor, Vector Memory, Learning, and Security. |
 
 ---
 
