@@ -21,7 +21,27 @@ const DRAIN_GRACE: Duration = Duration::from_millis(250);
 pub struct ChildOutcome {
     pub exit_code: i32,
     pub timed_out: bool,
+    pub run_deadline_exceeded: bool,
     pub aborted: bool,
+    pub pid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkerDeadline {
+    pub run_deadline: Option<Instant>,
+    pub role_timeout: Option<Duration>,
+}
+
+impl WorkerDeadline {
+    pub fn effective_deadline(&self, started: Instant) -> Option<Instant> {
+        let role_deadline = self.role_timeout.map(|d| started + d);
+        match (self.run_deadline, role_deadline) {
+            (Some(run), Some(role)) => Some(run.min(role)),
+            (Some(run), None) => Some(run),
+            (None, Some(role)) => Some(role),
+            (None, None) => None,
+        }
+    }
 }
 
 enum Line {
@@ -48,7 +68,7 @@ fn pump<R: Read + Send + 'static>(reader: R, sender: mpsc::Sender<Line>, wrap: f
     });
 }
 
-fn terminate(child: &mut Child) {
+pub fn terminate(child: &mut Child) {
     // A worker or verify command is usually a shell/`pi` process with its own
     // children (cargo, node, rustc). Killing only the immediate child leaves
     // that tree running, still holding e.g. the `target/` lock, so on Windows
@@ -66,12 +86,35 @@ fn terminate(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Run `command` to completion, feeding every stdout line to `on_stdout` and
-/// every stderr line to `on_stderr` as they arrive.
-pub fn run_child(
+#[allow(dead_code)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output();
+        match output {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                text.lines().any(|line| {
+                    line.split_whitespace().any(|word| word == pid.to_string().as_str())
+                })
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+/// Run `command` to completion with a composite deadline (run deadline + role timeout),
+/// streaming every line and terminating the process tree if either deadline expires.
+pub fn run_child_with_deadline(
     mut command: Command,
     abort: &Arc<AtomicBool>,
-    timeout_ms: u64,
+    deadline: WorkerDeadline,
     mut on_stdout: impl FnMut(&str),
     mut on_stderr: impl FnMut(&str),
 ) -> std::io::Result<ChildOutcome> {
@@ -81,13 +124,8 @@ pub fn run_child(
         .stderr(Stdio::piped())
         .spawn()?;
 
+    let child_pid = child.id();
     let (sender, receiver) = mpsc::channel();
-    // The pumps are deliberately never joined. A grandchild that inherited the
-    // child's stdout can hold the write end open after the child itself is
-    // gone, and `read_until` on that pipe would block forever — joining here
-    // would wedge the whole run past the point where abort and the deadline
-    // can still act. Dropping the receiver instead makes the next `send` fail
-    // and the pump return on its own.
     if let Some(stdout) = child.stdout.take() {
         pump(stdout, sender.clone(), Line::Stdout);
     }
@@ -97,8 +135,11 @@ pub fn run_child(
     drop(sender);
 
     let started = Instant::now();
-    let deadline = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
-    let mut outcome = ChildOutcome::default();
+    let effective_deadline = deadline.effective_deadline(started);
+    let mut outcome = ChildOutcome {
+        pid: child_pid,
+        ..ChildOutcome::default()
+    };
 
     loop {
         match receiver.recv_timeout(POLL_INTERVAL) {
@@ -112,34 +153,60 @@ pub fn run_child(
             terminate(&mut child);
             break;
         }
-        if deadline.is_some_and(|deadline| started.elapsed() > deadline) {
-            outcome.timed_out = true;
-            terminate(&mut child);
-            break;
+        let now = Instant::now();
+        if let Some(effective) = effective_deadline {
+            if now >= effective {
+                if deadline.run_deadline.is_some_and(|rd| rd <= effective) {
+                    outcome.run_deadline_exceeded = true;
+                } else {
+                    outcome.timed_out = true;
+                }
+                terminate(&mut child);
+                break;
+            }
         }
     }
 
-    // Drain what the pumps already queued, bounded so a pump that is still
-    // being fed by a surviving grandchild cannot hold the run open.
-    let drain_until = Instant::now() + DRAIN_GRACE;
-    while Instant::now() < drain_until {
-        match receiver.try_recv() {
-            Ok(Line::Stdout(line)) => on_stdout(&line),
-            Ok(Line::Stderr(line)) => on_stderr(&line),
-            // The pumps may still be flushing the child's last lines (the
-            // usage line a killed worker prints on its way out); wait for
-            // them, bounded by the grace period.
-            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(5)),
-            Err(mpsc::TryRecvError::Disconnected) => break,
+    if !outcome.run_deadline_exceeded && !outcome.aborted {
+        let drain_until = Instant::now() + DRAIN_GRACE;
+        while Instant::now() < drain_until {
+            match receiver.try_recv() {
+                Ok(Line::Stdout(line)) => on_stdout(&line),
+                Ok(Line::Stderr(line)) => on_stderr(&line),
+                Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(5)),
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
         }
     }
     outcome.exit_code = match child.wait() {
         Ok(status) => status
             .code()
-            .unwrap_or(if outcome.aborted { 130 } else { 1 }),
+            .unwrap_or(if outcome.aborted || outcome.run_deadline_exceeded { 130 } else { 1 }),
         Err(_) => 1,
     };
     Ok(outcome)
+}
+
+/// Run `command` to completion, feeding every stdout line to `on_stdout` and
+/// every stderr line to `on_stderr` as they arrive.
+pub fn run_child(
+    command: Command,
+    abort: &Arc<AtomicBool>,
+    timeout_ms: u64,
+    on_stdout: impl FnMut(&str),
+    on_stderr: impl FnMut(&str),
+) -> std::io::Result<ChildOutcome> {
+    let role_timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
+    run_child_with_deadline(
+        command,
+        abort,
+        WorkerDeadline {
+            run_deadline: None,
+            role_timeout,
+        },
+        on_stdout,
+        on_stderr,
+    )
 }
 
 /// Build the platform's shell invocation for a free-form command string.

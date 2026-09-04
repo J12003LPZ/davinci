@@ -143,6 +143,7 @@ pub struct GraphExecution {
     /// or a session shutdown all funnel here.
     exec_abort: Arc<AtomicBool>,
     budget_abort_reason: Mutex<Option<String>>,
+    run_deadline: Option<std::time::Instant>,
 }
 
 impl GraphExecution {
@@ -204,10 +205,7 @@ impl GraphExecution {
         if budgets.run_deadline_ms > 0
             && now.saturating_sub(run.counters.started_at) > budgets.run_deadline_ms
         {
-            return Some(format!(
-                "run deadline exceeded ({} minutes)",
-                budgets.run_deadline_ms / 60_000
-            ));
+            return Some("run deadline exceeded".to_string());
         }
         // max_workers is sized for one deliverable; a decomposed run gets that
         // allowance per milestone. Cost cap and deadline stay global on purpose.
@@ -277,6 +275,7 @@ impl GraphExecution {
             tools,
             extra_extensions: self.deps.config.worker_extensions.clone(),
             timeout_ms: run.budgets.worker_timeout_ms.get(role),
+            run_deadline: self.run_deadline,
             artifact_path: artifact_path(Path::new(&run.cwd), &run.run_id, &task.id),
             transcript_path: Some(transcript_path(Path::new(&run.cwd), &run.run_id, &task.id)),
             project_trusted: self.deps.project_trusted,
@@ -418,6 +417,14 @@ impl GraphExecution {
                 ),
             );
 
+            if result.run_deadline_exceeded || result.failure_reason.as_deref() == Some("run deadline exceeded") {
+                let reason = "run deadline exceeded".to_string();
+                self.budget_abort(reason.clone());
+                self.end_task(&task_id, TaskStatus::Cancelled, Some(reason));
+                self.checkpoint(Some(&format!("{task_id}: run deadline exceeded")));
+                return None;
+            }
+
             if let Some(reason) = self.budget_abort_reason() {
                 self.end_task(&task_id, TaskStatus::Cancelled, Some(reason));
                 self.checkpoint(Some(&format!("{task_id}: stopped by budget")));
@@ -526,6 +533,9 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
     let run_id = new_run_id();
     let _ = create_run_dir(&options.cwd, &run_id);
     let budgets: GraphBudgets = deps.config.budgets.clone();
+    let run_deadline = (budgets.run_deadline_ms > 0).then(|| {
+        std::time::Instant::now() + Duration::from_millis(budgets.run_deadline_ms)
+    });
     let run = GraphRun {
         version: 1,
         run_id: run_id.clone(),
@@ -565,6 +575,7 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         options,
         exec_abort,
         budget_abort_reason: Mutex::new(None),
+        run_deadline,
     };
     execution.checkpoint(Some("run created"));
     let result = drive(&execution);
@@ -1014,5 +1025,61 @@ fn deliver_goal(
             .counters
             .revision_cycles += 1;
         revision_notes = Some(revision_notes_from(None, Some(&review)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_extensions::graph::types::WorkerResult;
+
+    #[test]
+    fn graph_deadline_controller_aborts_run_when_worker_exceeds_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let budgets = GraphBudgets {
+            run_deadline_ms: 50,
+            ..Default::default()
+        };
+
+        let runner: Arc<WorkerRunner> = Arc::new(|_spec, _abort, _on_progress| {
+            std::thread::sleep(Duration::from_millis(60));
+            WorkerResult {
+                ok: false,
+                run_deadline_exceeded: true,
+                failure_reason: Some("run deadline exceeded".to_string()),
+                ..WorkerResult::default()
+            }
+        });
+
+        let verify_exec: Arc<VerifyExec> = Arc::new(|_, _, _, _| (0, String::new(), 0));
+        let config = GraphConfig {
+            budgets,
+            ..Default::default()
+        };
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec,
+            config,
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+        };
+
+        let options = RunOptions {
+            goal: "test deadline".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+
+        let run = run_graph(options, deps);
+        assert_eq!(run.phase, Phase::Blocked);
+        assert_eq!(run.blocked_reason.as_deref(), Some("run deadline exceeded"));
+        let task = run.tasks.last().unwrap();
+        assert_eq!(task.error.as_deref(), Some("run deadline exceeded"));
     }
 }

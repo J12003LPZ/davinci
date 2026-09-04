@@ -141,6 +141,7 @@ impl FieldKind {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_json_schema(&self, description: Option<&'static str>) -> serde_json::Value {
         let mut schema = match self {
             FieldKind::String { min_length } => {
@@ -278,6 +279,7 @@ impl ArtifactContract {
         true
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_json_schema(&self) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
@@ -800,6 +802,30 @@ pub struct VerificationResult {
 // Workers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum WorkerError {
+    RunDeadlineExceeded,
+    RoleTimedOut,
+    Aborted,
+    SpawnFailed(String),
+    ExecutionFailed(String),
+}
+
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerError::RunDeadlineExceeded => write!(f, "run deadline exceeded"),
+            WorkerError::RoleTimedOut => write!(f, "role timed out"),
+            WorkerError::Aborted => write!(f, "worker aborted"),
+            WorkerError::SpawnFailed(err) => write!(f, "worker spawn failed: {err}"),
+            WorkerError::ExecutionFailed(err) => write!(f, "worker execution failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkerError {}
+
 #[derive(Debug, Clone)]
 pub struct WorkerSpec {
     pub task_id: String,
@@ -818,6 +844,8 @@ pub struct WorkerSpec {
     pub extra_extensions: Vec<String>,
     /// 0 = no timeout.
     pub timeout_ms: u64,
+    /// Absolute run deadline; when reached, the worker and its children are killed.
+    pub run_deadline: Option<std::time::Instant>,
     pub artifact_path: std::path::PathBuf,
     /// Human-readable live transcript the runner appends to.
     pub transcript_path: Option<std::path::PathBuf>,
@@ -835,8 +863,30 @@ pub struct WorkerResult {
     pub stderr: String,
     pub usage: WorkerUsage,
     pub timed_out: bool,
+    pub run_deadline_exceeded: bool,
     /// Structured reason for a failed child, when the process did not explain it.
     pub failure_reason: Option<String>,
+    #[allow(dead_code)]
+    pub child_pid: Option<u32>,
+}
+
+impl WorkerResult {
+    #[allow(dead_code)]
+    pub fn into_result(self) -> Result<Self, WorkerError> {
+        if self.run_deadline_exceeded {
+            Err(WorkerError::RunDeadlineExceeded)
+        } else if self.timed_out {
+            Err(WorkerError::RoleTimedOut)
+        } else if let Some(reason) = &self.failure_reason {
+            if reason.contains("aborted") {
+                Err(WorkerError::Aborted)
+            } else {
+                Err(WorkerError::ExecutionFailed(reason.clone()))
+            }
+        } else {
+            Ok(self)
+        }
+    }
 }
 
 #[cfg(test)]

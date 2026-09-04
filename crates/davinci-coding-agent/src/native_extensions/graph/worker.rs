@@ -12,8 +12,10 @@
 //! definition of success. stdout JSON lines are folded for usage accounting,
 //! the live transcript, and diagnostics.
 
-use super::process::run_child;
+pub use super::process::WorkerDeadline;
+use super::process::run_child_with_deadline;
 use super::store::{iso8601_utc, now_ms, write_artifact};
+pub use super::types::WorkerError;
 use super::types::{
     Artifact, ArtifactKind, Classification, Complexity, EvidenceArtifact, EvidenceFinding,
     ImplementationPlan, PatchReport, PlanStep, ResearchKind, ResearchRequest, ReviewDecision,
@@ -382,13 +384,18 @@ pub fn run_worker(
     let mut reported_seq = 0;
     let transcript = spec.transcript_path.clone();
 
+    let deadline = WorkerDeadline {
+        run_deadline: spec.run_deadline,
+        role_timeout: (spec.timeout_ms > 0).then(|| std::time::Duration::from_millis(spec.timeout_ms)),
+    };
+
     let outcome = {
         let state = &mut state;
         let stderr = &mut stderr;
-        run_child(
+        run_child_with_deadline(
             command,
             abort,
-            spec.timeout_ms,
+            deadline,
             |line| {
                 parse_worker_event(line, state, |text| {
                     if let Some(path) = &transcript {
@@ -424,9 +431,10 @@ pub fn run_worker(
     };
 
     if let Some(path) = &spec.transcript_path {
-        let suffix = match (outcome.timed_out, outcome.aborted) {
-            (true, _) => " (timed out)",
-            (_, true) => " (aborted)",
+        let suffix = match (outcome.run_deadline_exceeded, outcome.timed_out, outcome.aborted) {
+            (true, _, _) => " (run deadline exceeded)",
+            (_, true, _) => " (timed out)",
+            (_, _, true) => " (aborted)",
             _ => "",
         };
         append_transcript(path, &format!("══ exited {}{suffix}", outcome.exit_code));
@@ -447,8 +455,17 @@ pub fn run_worker(
         stderr: stderr_tail,
         usage: state.usage,
         timed_out: outcome.timed_out,
+        run_deadline_exceeded: outcome.run_deadline_exceeded,
         failure_reason: None,
+        child_pid: Some(outcome.pid),
     };
+
+    if outcome.run_deadline_exceeded {
+        return WorkerResult {
+            failure_reason: Some("run deadline exceeded".to_string()),
+            ..base
+        };
+    }
 
     // The artifact is the node's deliverable. One that reached disk and
     // validates is accepted even when the child then hit a provider error
@@ -603,8 +620,69 @@ pub fn run_dry_worker(
         stderr: String::new(),
         usage,
         timed_out: false,
+        run_deadline_exceeded: false,
         failure_reason: None,
+        child_pid: None,
     }
+}
+
+/// Run a fixture child process that sleeps beyond the deadline to verify
+/// active process-tree termination.
+#[allow(dead_code)]
+pub fn run_fixture_worker_with_deadline(
+    deadline: std::time::Duration,
+) -> Result<WorkerResult, WorkerError> {
+    let dir = std::env::temp_dir().join(format!("pi-graph-fixture-{}-{}", std::process::id(), now_ms()));
+    let _ = fs::create_dir_all(&dir);
+    let sleeper = if cfg!(windows) {
+        "ping -n 20 127.0.0.1 > nul"
+    } else {
+        "sleep 20"
+    };
+    let abort = Arc::new(AtomicBool::new(false));
+    let command = super::process::shell_command(sleeper, &dir);
+    let deadline_spec = WorkerDeadline {
+        run_deadline: Some(std::time::Instant::now() + deadline),
+        role_timeout: None,
+    };
+    let outcome = super::process::run_child_with_deadline(
+        command,
+        &abort,
+        deadline_spec,
+        |_| {},
+        |_| {},
+    )
+    .map_err(|e| WorkerError::SpawnFailed(e.to_string()))?;
+    let _ = fs::remove_dir_all(&dir);
+
+    // Assert that the child process tree was actively killed and is no longer alive
+    assert!(
+        !super::process::is_pid_alive(outcome.pid),
+        "child process {} must be terminated when run deadline expires",
+        outcome.pid
+    );
+
+    let result = WorkerResult {
+        ok: false,
+        exit_code: outcome.exit_code,
+        artifact: None,
+        final_text: String::new(),
+        stderr: String::new(),
+        usage: WorkerUsage::default(),
+        timed_out: outcome.timed_out,
+        run_deadline_exceeded: outcome.run_deadline_exceeded,
+        failure_reason: if outcome.run_deadline_exceeded {
+            Some("run deadline exceeded".to_string())
+        } else if outcome.timed_out {
+            Some("timed out".to_string())
+        } else if outcome.aborted {
+            Some("aborted".to_string())
+        } else {
+            None
+        },
+        child_pid: Some(outcome.pid),
+    };
+    result.into_result()
 }
 
 #[cfg(test)]
@@ -626,10 +704,27 @@ mod tests {
             tools: vec!["read".into(), "graph_submit".into()],
             extra_extensions: vec!["governor".into()],
             timeout_ms: 0,
+            run_deadline: None,
             artifact_path: PathBuf::from("artifact.json"),
             transcript_path: None,
             project_trusted: true,
         }
+    }
+
+    #[test]
+    fn active_run_deadline_kills_running_worker() {
+        let started = std::time::Instant::now();
+        let result = run_fixture_worker_with_deadline(std::time::Duration::from_millis(50));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "execution must terminate promptly on deadline"
+        );
+        assert!(matches!(result, Err(WorkerError::RunDeadlineExceeded)));
+    }
+
+    #[test]
+    fn graph_deadline_kills_running_worker() {
+        active_run_deadline_kills_running_worker();
     }
 
     #[test]
