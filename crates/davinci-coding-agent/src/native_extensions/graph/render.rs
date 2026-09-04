@@ -268,6 +268,7 @@ mod tests {
             },
             blocked_reason: None,
             resource_snapshot: None,
+            ecosystem_stats: Default::default(),
             updated_at: 120_000,
         }
     }

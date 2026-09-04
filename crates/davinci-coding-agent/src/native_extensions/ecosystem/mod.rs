@@ -4,6 +4,7 @@ pub mod cache_affinity;
 pub mod context;
 pub mod resource;
 pub mod risk;
+pub mod telemetry;
 pub mod verification;
 
 #[allow(unused_imports)]
@@ -14,6 +15,8 @@ pub use context::*;
 pub use resource::*;
 #[allow(unused_imports)]
 pub use risk::*;
+#[allow(unused_imports)]
+pub use telemetry::*;
 #[allow(unused_imports)]
 pub use verification::*;
 

@@ -766,6 +766,7 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         },
         blocked_reason: None,
         resource_snapshot: None,
+        ecosystem_stats: Default::default(),
         updated_at: 0,
     };
 
@@ -1889,6 +1890,7 @@ mod tests {
                 },
                 blocked_reason: None,
                 resource_snapshot: None,
+                ecosystem_stats: Default::default(),
                 updated_at: 0,
             }),
             learning: Mutex::new(deps.learning.clone()),

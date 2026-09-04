@@ -617,6 +617,8 @@ pub struct GraphRun {
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_snapshot: Option<crate::native_extensions::ecosystem::ResourceSnapshot>,
+    #[serde(default)]
+    pub ecosystem_stats: crate::native_extensions::ecosystem::telemetry::EcosystemStats,
     pub updated_at: u64,
 }
 
@@ -1009,6 +1011,7 @@ mod tests {
             },
             blocked_reason: None,
             resource_snapshot: None,
+            ecosystem_stats: Default::default(),
             updated_at: 0,
         };
         let planner = run.tasks[2].clone();
