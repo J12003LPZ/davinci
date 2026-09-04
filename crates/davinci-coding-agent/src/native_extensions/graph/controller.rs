@@ -406,8 +406,13 @@ impl GraphExecution {
                 .unwrap_or_else(|error| error.into_inner());
             match (&self.deps.memory, guard.as_ref()) {
                 (Some(mem), Some(learn)) => {
+                    let prompt = if !self.options.goal.trim().is_empty() {
+                        &self.options.goal
+                    } else {
+                        &briefing
+                    };
                     let req =
-                        crate::native_extensions::ecosystem::ContextPacketRequest::new(&briefing)
+                        crate::native_extensions::ecosystem::ContextPacketRequest::new(prompt)
                             .with_role(role)
                             .with_token_cap(
                                 crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
@@ -2265,5 +2270,261 @@ mod tests {
         assert!(matches!(bundle.security, SecurityVerification::NotRequired));
         assert!(bundle.approval_eligible(SecurityPolicyMode::Off));
     }
+
+    #[test]
+    fn graph_learning_feedback_closed_loop_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let agent_dir = dir.path().join("agent_isolated");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        let db_file = cwd.join("src").join("db.rs");
+        std::fs::create_dir_all(db_file.parent().unwrap()).unwrap();
+        std::fs::write(&db_file, "pub fn connect() -> bool { false }\n").unwrap();
+
+        let worker_calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls_clone = Arc::clone(&worker_calls);
+        let db_file_clone = db_file.clone();
+
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
+            worker_calls_clone.fetch_add(1, Ordering::SeqCst);
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Feature,
+                    complexity: Complexity::Standard,
+                    rationale: "db operation".into(),
+                    research_tasks: vec![ResearchRequest {
+                        kind: ResearchKind::CodeSearch,
+                        focus: "find db connect".into(),
+                    }],
+                    milestones: None,
+                }),
+                ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
+                    kind: ResearchKind::CodeSearch,
+                    findings: vec![EvidenceFinding {
+                        claim: "found connect".into(),
+                        refs: vec!["src/db.rs:1".into()],
+                        confidence: Confidence::High,
+                    }],
+                    risks: vec![],
+                    gaps: vec![],
+                    test_baseline: None,
+                })),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![PlanStep {
+                        description: "update connect".into(),
+                        files: vec!["src/db.rs".into()],
+                    }],
+                    tests_to_add: vec![],
+                    tests_to_run: vec!["true".into()],
+                    completion_criteria: vec!["done".into()],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => {
+                    std::fs::write(
+                        &db_file_clone,
+                        "pub fn connect() -> bool { true }\n",
+                    )
+                    .unwrap();
+                    Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec!["src/db.rs".into()],
+                        summary: "updated connect".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
+                ArtifactKind::Review => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "reviewer approves".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+            };
+
+            let _ = write_artifact(&spec.artifact_path, &artifact);
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let verify_exec: Arc<VerifyExec> = Arc::new(|_, _, _, _| (0, String::new(), 0));
+        let config = GraphConfig {
+            security_verification: SecurityPolicyMode::Risk,
+            verify_commands: vec![VerifyCommandSpec {
+                command: "echo test".into(),
+                name: "test".into(),
+                from_plan: false,
+            }],
+            budgets: GraphBudgets {
+                max_revision_cycles: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut learning =
+            crate::native_extensions::LearningController::new(&cwd, Some(&agent_dir), None);
+        learning.set_project_trusted(true);
+
+        let mut vector_mem = crate::native_extensions::VectorMemory::new(cwd.clone());
+        vector_mem.mark_dense_offline();
+
+        // --- Step 1: Run #1 receives no learned skill, executes cleanly ---
+        let deps1 = ControllerDeps {
+            runner: Arc::clone(&runner),
+            verify_exec: Arc::clone(&verify_exec),
+            config: config.clone(),
+            session_model: None,
+            session_thinking: None,
+            project_trusted: true,
+            on_update: Arc::new(|_, _| {}),
+            memory: Some(vector_mem.clone()),
+            learning: Some(learning.clone()),
+            governor: None,
+        };
+
+        let options1 = RunOptions {
+            goal: "Initial database setup".into(),
+            cwd: cwd.clone(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+
+        let run1 = run_graph(options1, deps1);
+        assert_eq!(run1.phase, Phase::Done);
+        assert!(run1.tasks.iter().all(|t| t.skill_refs.is_empty()));
+        assert_eq!(worker_calls.load(Ordering::SeqCst), 5);
+
+        // --- Step 2: Persist deterministic memory and skill from Run #1 ---
+        let memory_id = vector_mem
+            .index_learning_memory(
+                "Apply database migration and check schema.",
+                crate::native_extensions::vector_memory::MemoryKind::Fact,
+                0.9,
+                0.95,
+                &run1.run_id,
+                1,
+                Some("graph_pass"),
+            )
+            .expect("memory indexing should succeed");
+
+        let fixture_json = serde_json::json!({
+            "candidates": [
+                {
+                    "scope": "project",
+                    "confidence": 0.95,
+                    "rationale": "Learned database migration procedure",
+                    "artifact": {
+                        "kind": "skill_create",
+                        "name": "database-migration",
+                        "description": "Apply database migration and verify schema",
+                        "body": "---\nname: database-migration\ndescription: Apply database migration and verify schema\n---\n\nRun cargo sqlx migrate run and verify schema.\n"
+                    }
+                }
+            ]
+        }).to_string();
+
+        std::env::set_var("PI_LEARNING_REVIEW_FIXTURE", &fixture_json);
+        let bundle1 = run1.verification.as_ref().unwrap().to_bundle(
+            vec!["src/db.rs".into()],
+            Some(run1.run_id.clone()),
+            SecurityVerification::NotRequired,
+        );
+        let evidence1 = crate::native_extensions::learning::types::LearningEvidence {
+            session_id: "sess-loop-1".into(),
+            repo_id: vector_mem.repo_id.clone(),
+            turn: 1,
+            messages: vec![crate::native_extensions::vector_memory::MemoryMessage {
+                role: "assistant".into(),
+                content: "Completed database setup".into(),
+            }],
+            tools: vec![],
+            run_stats: davinci_agent::RunStats::default(),
+            verification: crate::native_extensions::learning::evidence::verification_evidence_from_bundle(&bundle1),
+        };
+        learning.review_settled_turn(evidence1);
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+
+        // Assert persistence after Run #1
+        let skill_v1 = learning
+            .project_store
+            .skill("database-migration")
+            .expect("database-migration skill must exist in store")
+            .clone();
+        assert_eq!(skill_v1.version, 1);
+        assert_eq!(skill_v1.success_count, 0);
+        assert_eq!(skill_v1.failure_count, 0);
+        assert!(skill_v1.path.exists(), "SKILL.md must be written to disk");
+        assert!(vector_mem.records().iter().any(|r| r.id == memory_id));
+
+        // --- Step 3 & 4: Run #2 with related goal retrieves exact provenance ---
+        let deps2 = ControllerDeps {
+            runner: Arc::clone(&runner),
+            verify_exec: Arc::clone(&verify_exec),
+            config: config.clone(),
+            session_model: None,
+            session_thinking: None,
+            project_trusted: true,
+            on_update: Arc::new(|_, _| {}),
+            memory: Some(vector_mem.clone()),
+            learning: Some(learning.clone()),
+            governor: None,
+        };
+
+        let options2 = RunOptions {
+            goal: "Apply database migration".into(),
+            cwd: cwd.clone(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+
+        let run2 = run_graph(options2, deps2);
+        assert_eq!(run2.phase, Phase::Done);
+
+        // Assert exact provenance in Run #2 metadata
+        let tasks_with_skills: Vec<_> = run2
+            .tasks
+            .iter()
+            .filter(|t| !t.skill_refs.is_empty())
+            .collect();
+        assert!(
+            !tasks_with_skills.is_empty(),
+            "at least one task must carry retrieved skill refs"
+        );
+        let first_with_skill = tasks_with_skills[0];
+        assert_eq!(first_with_skill.skill_refs[0].name, "database-migration");
+        assert_eq!(first_with_skill.skill_refs[0].version, 1);
+        assert_eq!(
+            first_with_skill.skill_refs[0].content_hash,
+            skill_v1.content_hash
+        );
+        assert!(first_with_skill.memory_refs.contains(&memory_id));
+
+        // --- Step 5 & 6: Assert exact skill version success count increments ---
+        let reloaded_learning =
+            crate::native_extensions::LearningController::new(&cwd, Some(&agent_dir), None);
+        let updated_record = reloaded_learning
+            .project_store
+            .skill_version("database-migration", 1)
+            .expect("database-migration v1 must exist in reloaded store");
+        assert_eq!(
+            updated_record.success_count, 1,
+            "skill version success count must increment"
+        );
+        assert_eq!(updated_record.failure_count, 0);
+
+        // --- Step 7: Assert no extra coordinator model invocation ---
+        // 5 tasks in Run #1 + 5 tasks in Run #2 = 10 total worker runner calls
+        assert_eq!(worker_calls.load(Ordering::SeqCst), 10);
+    }
 }
+
 

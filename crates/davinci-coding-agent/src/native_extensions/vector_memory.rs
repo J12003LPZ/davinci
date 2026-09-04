@@ -767,6 +767,10 @@ impl VectorMemory {
         self.records.len()
     }
 
+    pub fn records(&self) -> &[MemoryRecord] {
+        &self.records
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<MemoryHit> {
         if !self.config.enabled || query.trim().is_empty() {
             return Vec::new();
@@ -855,7 +859,7 @@ impl VectorMemory {
         }
     }
 
-    fn mark_dense_offline(&self) {
+    pub fn mark_dense_offline(&self) {
         if let Ok(mut guard) = self.dense_offline_until.lock() {
             *guard = Some(Instant::now() + DENSE_BACKOFF);
         }
