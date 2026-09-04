@@ -6,218 +6,478 @@
 //! correct its own `graph_submit` call without a respawn.
 
 use super::types::{
-    Artifact, ArtifactKind, Complexity, Confidence, ResearchKind, Role, Severity, TaskClass,
-    Verdict,
+    Artifact, ArtifactContract, ArtifactKind, Complexity, Confidence, FieldKind, FieldRule,
+    ResearchKind, Role, Severity, TaskClass, Verdict,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 
 pub type ValidationResult = Result<Artifact, Vec<String>>;
 
-/// The JSON schema of one artifact kind, as `graph_submit` advertises it to
-/// the worker model. It states exactly what the validator below accepts:
-/// a worker never has to guess a field name. Keep the two in step.
-pub fn artifact_schema(kind: ArtifactKind) -> Value {
-    let strings = json!({"type": "array", "items": {"type": "string"}});
+static RESEARCH_TASK_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "kind",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Enum(&["code_search", "test_baseline", "history", "docs"]),
+        description: None,
+    },
+    FieldRule {
+        name: "focus",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 1 },
+        description: Some("A concrete question, not a topic"),
+    },
+];
+
+static CLASSIFICATION_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "taskClass",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Enum(&["trivial", "bug", "feature", "refactor", "investigation"]),
+        description: None,
+    },
+    FieldRule {
+        name: "complexity",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Enum(&["trivial", "standard", "complex"]),
+        description: None,
+    },
+    FieldRule {
+        name: "rationale",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 1 },
+        description: None,
+    },
+    FieldRule {
+        name: "researchTasks",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::ObjectArray(RESEARCH_TASK_FIELDS, 0),
+        description: None,
+    },
+    FieldRule {
+        name: "milestones",
+        required: false,
+        allow_null: true,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: Some("Empty for one deliverable; otherwise 2 to 8 ordered, independently shippable deliverables"),
+    },
+];
+
+static FINDING_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "claim",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 1 },
+        description: None,
+    },
+    FieldRule {
+        name: "refs",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: Some("path:line references that support the claim"),
+    },
+    FieldRule {
+        name: "confidence",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Enum(&["high", "medium", "low"]),
+        description: None,
+    },
+];
+
+static TEST_BASELINE_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "command",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 0 },
+        description: None,
+    },
+    FieldRule {
+        name: "exitCode",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Integer,
+        description: None,
+    },
+    FieldRule {
+        name: "summary",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 0 },
+        description: None,
+    },
+];
+
+static EVIDENCE_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "kind",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Enum(&["code_search", "test_baseline", "history", "docs"]),
+        description: None,
+    },
+    FieldRule {
+        name: "findings",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::ObjectArray(FINDING_FIELDS, 0),
+        description: None,
+    },
+    FieldRule {
+        name: "risks",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: None,
+    },
+    FieldRule {
+        name: "gaps",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: None,
+    },
+    FieldRule {
+        name: "testBaseline",
+        required: false,
+        allow_null: true,
+        kind: FieldKind::Object(TEST_BASELINE_FIELDS),
+        description: None,
+    },
+];
+
+static PLAN_STEP_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "description",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 1 },
+        description: None,
+    },
+    FieldRule {
+        name: "files",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: None,
+    },
+];
+
+static TEST_TO_ADD_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "file",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 0 },
+        description: None,
+    },
+    FieldRule {
+        name: "behavior",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 0 },
+        description: None,
+    },
+];
+
+static PLAN_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "steps",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::ObjectArray(PLAN_STEP_FIELDS, 1),
+        description: None,
+    },
+    FieldRule {
+        name: "testsToAdd",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::ObjectArray(TEST_TO_ADD_FIELDS, 0),
+        description: None,
+    },
+    FieldRule {
+        name: "testsToRun",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: Some("Exact shell commands runnable from the project root"),
+    },
+    FieldRule {
+        name: "completionCriteria",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 1 },
+        description: None,
+    },
+    FieldRule {
+        name: "invariants",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: None,
+    },
+    FieldRule {
+        name: "outOfScope",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: None,
+    },
+];
+
+static PATCH_REPORT_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "changedFiles",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: None,
+    },
+    FieldRule {
+        name: "summary",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 1 },
+        description: None,
+    },
+    FieldRule {
+        name: "deviations",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::StringArray { min_items: 0 },
+        description: None,
+    },
+    FieldRule {
+        name: "planInvalidated",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Boolean,
+        description: None,
+    },
+    FieldRule {
+        name: "invalidationReason",
+        required: false,
+        allow_null: true,
+        kind: FieldKind::String { min_length: 1 },
+        description: Some("Required when planInvalidated is true"),
+    },
+];
+
+static REVIEW_ISSUE_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "severity",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Enum(&["blocker", "major", "minor"]),
+        description: None,
+    },
+    FieldRule {
+        name: "file",
+        required: false,
+        allow_null: true,
+        kind: FieldKind::String { min_length: 0 },
+        description: None,
+    },
+    FieldRule {
+        name: "description",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 1 },
+        description: None,
+    },
+];
+
+static REVIEW_FIELDS: &[FieldRule] = &[
+    FieldRule {
+        name: "verdict",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::Enum(&["approve", "changes_required"]),
+        description: None,
+    },
+    FieldRule {
+        name: "issues",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::ObjectArray(REVIEW_ISSUE_FIELDS, 0),
+        description: None,
+    },
+    FieldRule {
+        name: "notes",
+        required: true,
+        allow_null: false,
+        kind: FieldKind::String { min_length: 0 },
+        description: None,
+    },
+];
+
+const CLASSIFICATION_EXAMPLE: &str = r#"{
+  "taskClass": "bug",
+  "complexity": "standard",
+  "rationale": "One subsystem, root cause unknown until the call site is read.",
+  "researchTasks": [
+    {
+      "kind": "code_search",
+      "focus": "Where is the session file written, and what sets its permissions?"
+    }
+  ],
+  "milestones": []
+}"#;
+
+const EVIDENCE_EXAMPLE: &str = r#"{
+  "kind": "code_search",
+  "findings": [
+    {
+      "claim": "Session files are opened with mode 0644.",
+      "refs": [
+        "src/store.rs:118"
+      ],
+      "confidence": "high"
+    }
+  ],
+  "risks": [
+    "The umask may already restrict this on some hosts."
+  ],
+  "gaps": [],
+  "testBaseline": null
+}"#;
+
+const PLAN_EXAMPLE: &str = r#"{
+  "steps": [
+    {
+      "description": "Open session files with mode 0600.",
+      "files": [
+        "src/store.rs"
+      ]
+    }
+  ],
+  "testsToAdd": [
+    {
+      "file": "src/store.rs",
+      "behavior": "a new session file is not group- or world-readable"
+    }
+  ],
+  "testsToRun": [
+    "cargo test -p pi-session"
+  ],
+  "completionCriteria": [
+    "cargo test -p pi-session passes",
+    "new session files are mode 0600"
+  ],
+  "invariants": [
+    "existing session files are not rewritten"
+  ],
+  "outOfScope": [
+    "Windows ACLs"
+  ]
+}"#;
+
+const PATCH_REPORT_EXAMPLE: &str = r#"{
+  "changedFiles": [
+    "src/store.rs"
+  ],
+  "summary": "Session files are now created with mode 0600; test added.",
+  "deviations": [],
+  "planInvalidated": false
+}"#;
+
+const REVIEW_EXAMPLE: &str = r#"{
+  "verdict": "changes_required",
+  "issues": [
+    {
+      "severity": "major",
+      "file": "src/store.rs",
+      "description": "The mode is set after the file is created, leaving a window where it is world-readable."
+    }
+  ],
+  "notes": "Otherwise matches the plan."
+}"#;
+
+static CLASSIFICATION_PROMPT_RULES: &[&str] = &[
+    "taskClass: one of trivial|bug|feature|refactor|investigation",
+    "complexity: one of trivial|standard|complex",
+    "rationale: non-empty string",
+    "researchTasks: array (may be empty) of { kind: one of code_search|test_baseline|history|docs, focus: non-empty string }",
+    "milestones: array of strings — empty for a single deliverable, otherwise 2 to 8 entries",
+];
+
+static EVIDENCE_PROMPT_RULES: &[&str] = &[
+    "kind: one of code_search|test_baseline|history|docs",
+    "findings: array of { claim: non-empty string, refs: non-empty array of \"path:line\" strings, confidence: one of high|medium|low }",
+    "risks: array of strings (may be empty)",
+    "gaps: array of strings (may be empty)",
+    "testBaseline: optional { command: string, exitCode: number, summary: string }",
+];
+
+static PLAN_PROMPT_RULES: &[&str] = &[
+    "steps: non-empty array of { description: non-empty string, files: array of paths }",
+    "testsToAdd: array (may be empty) of { file: string, behavior: string }",
+    "testsToRun: array of exact shell commands runnable from the project root",
+    "completionCriteria: non-empty array of measurable statements",
+    "invariants: array of strings (may be empty)",
+    "outOfScope: array of strings (may be empty)",
+];
+
+static PATCH_REPORT_PROMPT_RULES: &[&str] = &[
+    "changedFiles: array of file paths (may be empty)",
+    "summary: non-empty string",
+    "deviations: array of strings (may be empty)",
+    "planInvalidated: boolean",
+    "invalidationReason: non-empty string, required when planInvalidated is true",
+];
+
+static REVIEW_PROMPT_RULES: &[&str] = &[
+    "verdict: one of approve|changes_required",
+    "issues: array of { severity: one of blocker|major|minor, file?: string, description: non-empty string } — at least one when verdict is changes_required",
+    "notes: string (may be empty)",
+];
+
+pub fn artifact_contract(kind: ArtifactKind) -> ArtifactContract {
     match kind {
-        ArtifactKind::Classification => json!({
-            "type": "object",
-            "properties": {
-                "taskClass": {"type": "string", "enum": TaskClass::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
-                "complexity": {"type": "string", "enum": Complexity::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
-                "rationale": {"type": "string", "minLength": 1},
-                "researchTasks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "kind": {"type": "string", "enum": ResearchKind::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
-                            "focus": {"type": "string", "minLength": 1, "description": "A concrete question, not a topic"}
-                        },
-                        "required": ["kind", "focus"]
-                    }
-                },
-                "milestones": {"type": "array", "items": {"type": "string"}, "description": "Empty for one deliverable; otherwise 2 to 8 ordered, independently shippable deliverables"}
-            },
-            "required": ["taskClass", "complexity", "rationale", "researchTasks", "milestones"]
-        }),
-        ArtifactKind::Evidence => json!({
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": ResearchKind::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "claim": {"type": "string", "minLength": 1},
-                            "refs": {"type": "array", "items": {"type": "string"}, "description": "path:line references that support the claim"},
-                            "confidence": {"type": "string", "enum": Confidence::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()}
-                        },
-                        "required": ["claim", "refs", "confidence"]
-                    }
-                },
-                "risks": strings,
-                "gaps": strings,
-                "testBaseline": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "exitCode": {"type": "integer"},
-                        "summary": {"type": "string"}
-                    },
-                    "required": ["command", "exitCode", "summary"]
-                }
-            },
-            "required": ["kind", "findings", "risks", "gaps"]
-        }),
-        ArtifactKind::Plan => json!({
-            "type": "object",
-            "properties": {
-                "steps": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string", "minLength": 1},
-                            "files": {"type": "array", "items": {"type": "string"}}
-                        },
-                        "required": ["description", "files"]
-                    }
-                },
-                "testsToAdd": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {"file": {"type": "string"}, "behavior": {"type": "string"}},
-                        "required": ["file", "behavior"]
-                    }
-                },
-                "testsToRun": {"type": "array", "items": {"type": "string"}, "description": "Exact shell commands runnable from the project root"},
-                "completionCriteria": {"type": "array", "minItems": 1, "items": {"type": "string"}},
-                "invariants": strings,
-                "outOfScope": strings
-            },
-            "required": ["steps", "testsToAdd", "testsToRun", "completionCriteria", "invariants", "outOfScope"]
-        }),
-        ArtifactKind::PatchReport => json!({
-            "type": "object",
-            "properties": {
-                "changedFiles": strings,
-                "summary": {"type": "string", "minLength": 1},
-                "deviations": strings,
-                "planInvalidated": {"type": "boolean"},
-                "invalidationReason": {"type": "string", "description": "Required when planInvalidated is true"}
-            },
-            "required": ["changedFiles", "summary", "deviations", "planInvalidated"]
-        }),
-        ArtifactKind::Review => json!({
-            "type": "object",
-            "properties": {
-                "verdict": {"type": "string", "enum": Verdict::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
-                "issues": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "severity": {"type": "string", "enum": Severity::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()},
-                            "file": {"type": "string"},
-                            "description": {"type": "string", "minLength": 1}
-                        },
-                        "required": ["severity", "description"]
-                    }
-                },
-                "notes": {"type": "string"}
-            },
-            "required": ["verdict", "issues", "notes"]
-        }),
+        ArtifactKind::Classification => ArtifactContract {
+            kind,
+            fields: CLASSIFICATION_FIELDS,
+            example: CLASSIFICATION_EXAMPLE,
+            prompt_rules: CLASSIFICATION_PROMPT_RULES,
+        },
+        ArtifactKind::Evidence => ArtifactContract {
+            kind,
+            fields: EVIDENCE_FIELDS,
+            example: EVIDENCE_EXAMPLE,
+            prompt_rules: EVIDENCE_PROMPT_RULES,
+        },
+        ArtifactKind::Plan => ArtifactContract {
+            kind,
+            fields: PLAN_FIELDS,
+            example: PLAN_EXAMPLE,
+            prompt_rules: PLAN_PROMPT_RULES,
+        },
+        ArtifactKind::PatchReport => ArtifactContract {
+            kind,
+            fields: PATCH_REPORT_FIELDS,
+            example: PATCH_REPORT_EXAMPLE,
+            prompt_rules: PATCH_REPORT_PROMPT_RULES,
+        },
+        ArtifactKind::Review => ArtifactContract {
+            kind,
+            fields: REVIEW_FIELDS,
+            example: REVIEW_EXAMPLE,
+            prompt_rules: REVIEW_PROMPT_RULES,
+        },
     }
 }
 
-/// The same contract as prose plus one example, for the worker's system
-/// prompt: a model that has read this never needs a validation round trip.
-pub fn artifact_contract(kind: ArtifactKind) -> String {
-    let example = match kind {
-        ArtifactKind::Classification => json!({
-            "taskClass": "bug",
-            "complexity": "standard",
-            "rationale": "One subsystem, root cause unknown until the call site is read.",
-            "researchTasks": [{"kind": "code_search", "focus": "Where is the session file written, and what sets its permissions?"}],
-            "milestones": []
-        }),
-        ArtifactKind::Evidence => json!({
-            "kind": "code_search",
-            "findings": [{"claim": "Session files are opened with mode 0644.", "refs": ["src/store.rs:118"], "confidence": "high"}],
-            "risks": ["The umask may already restrict this on some hosts."],
-            "gaps": [],
-            "testBaseline": null
-        }),
-        ArtifactKind::Plan => json!({
-            "steps": [{"description": "Open session files with mode 0600.", "files": ["src/store.rs"]}],
-            "testsToAdd": [{"file": "src/store.rs", "behavior": "a new session file is not group- or world-readable"}],
-            "testsToRun": ["cargo test -p pi-session"],
-            "completionCriteria": ["cargo test -p pi-session passes", "new session files are mode 0600"],
-            "invariants": ["existing session files are not rewritten"],
-            "outOfScope": ["Windows ACLs"]
-        }),
-        ArtifactKind::PatchReport => json!({
-            "changedFiles": ["src/store.rs"],
-            "summary": "Session files are now created with mode 0600; test added.",
-            "deviations": [],
-            "planInvalidated": false
-        }),
-        ArtifactKind::Review => json!({
-            "verdict": "changes_required",
-            "issues": [{"severity": "major", "file": "src/store.rs", "description": "The mode is set after the file is created, leaving a window where it is world-readable."}],
-            "notes": "Otherwise matches the plan."
-        }),
-    };
-    let rules = match kind {
-        ArtifactKind::Classification => [
-            &format!("taskClass: one of {}", TaskClass::names()),
-            &format!("complexity: one of {}", Complexity::names()),
-            "rationale: non-empty string",
-            &format!("researchTasks: array (may be empty) of {{ kind: one of {}, focus: non-empty string }}", ResearchKind::names()),
-            "milestones: array of strings — empty for a single deliverable, otherwise 2 to 8 entries",
-        ].join("
-- "),
-        ArtifactKind::Evidence => [
-            &format!("kind: one of {}", ResearchKind::names()),
-            &format!("findings: array of {{ claim: non-empty string, refs: array of \"path:line\" strings, confidence: one of {} }}", Confidence::names()),
-            "risks: array of strings (may be empty)",
-            "gaps: array of strings (may be empty)",
-            "testBaseline: optional { command: string, exitCode: number, summary: string }",
-        ].join("
-- "),
-        ArtifactKind::Plan => [
-            "steps: non-empty array of { description: non-empty string, files: array of paths }",
-            "testsToAdd: array (may be empty) of { file: string, behavior: string }",
-            "testsToRun: array of exact shell commands runnable from the project root",
-            "completionCriteria: non-empty array of measurable statements",
-            "invariants: array of strings (may be empty)",
-            "outOfScope: array of strings (may be empty)",
-        ].join("
-- "),
-        ArtifactKind::PatchReport => [
-            "changedFiles: array of file paths (may be empty)",
-            "summary: non-empty string",
-            "deviations: array of strings (may be empty)",
-            "planInvalidated: boolean",
-            "invalidationReason: non-empty string, required when planInvalidated is true",
-        ].join("
-- "),
-        ArtifactKind::Review => [
-            &format!("verdict: one of {}", Verdict::names()),
-            &format!("issues: array of {{ severity: one of {}, file?: string, description: non-empty string }} — at least one when verdict is changes_required", Severity::names()),
-            "notes: string (may be empty)",
-        ].join("
-- "),
-    };
-    format!(
-        "## Artifact contract: \"{kind}\"\n\nFinish by calling `graph_submit` exactly once with `{{ \"artifact\": <object> }}`. \
-         The object must have exactly these fields (camelCase, no extras needed):\n- {rules}\n\nExample:\n```json\n{}\n```",
-        serde_json::to_string_pretty(&example).unwrap_or_default()
-    )
+/// The JSON schema of one artifact kind, generated directly from ArtifactContract.
+pub fn artifact_schema(kind: ArtifactKind) -> Value {
+    artifact_contract(kind).to_json_schema()
 }
 
 fn is_non_empty_string(value: Option<&Value>) -> bool {
@@ -312,6 +572,14 @@ fn validate_classification(value: &serde_json::Map<String, Value>, errors: &mut 
     }
 }
 
+fn validate_non_empty_refs(value: &serde_json::Value) -> Result<(), String> {
+    let refs = value.as_array().ok_or_else(|| "refs must be an array".to_string())?;
+    if refs.is_empty() || refs.iter().any(|v| v.as_str().map_or(true, |s| s.trim().is_empty())) {
+        return Err("evidence finding requires at least one non-empty ref".into());
+    }
+    Ok(())
+}
+
 fn validate_evidence(value: &serde_json::Map<String, Value>, errors: &mut Vec<String>) {
     push_if(
         errors,
@@ -332,13 +600,19 @@ fn validate_evidence(value: &serde_json::Map<String, Value>, errors: &mut Vec<St
                     !is_non_empty_string(finding.get("claim")),
                     format!("findings[{index}].claim must be a non-empty string"),
                 );
-                push_if(
-                    errors,
-                    !is_string_array(finding.get("refs")),
-                    format!(
+                if let Some(refs) = finding.get("refs") {
+                    if !is_string_array(Some(refs)) {
+                        errors.push(format!(
+                            "findings[{index}].refs must be an array of \"path:line\" strings (evidence without refs is not evidence)"
+                        ));
+                    } else if let Err(msg) = validate_non_empty_refs(refs) {
+                        errors.push(format!("findings[{index}].refs: {msg}"));
+                    }
+                } else {
+                    errors.push(format!(
                         "findings[{index}].refs must be an array of \"path:line\" strings (evidence without refs is not evidence)"
-                    ),
-                );
+                    ));
+                }
                 push_if(
                     errors,
                     !is_enum_member(finding.get("confidence"), |text| {
@@ -680,7 +954,8 @@ mod tests {
             ArtifactKind::Review,
         ] {
             let contract = artifact_contract(kind);
-            let json = contract
+            let contract_str = contract.to_string();
+            let json = contract_str
                 .split("```json\n")
                 .nth(1)
                 .and_then(|rest| rest.split("\n```").next())
@@ -790,5 +1065,61 @@ mod tests {
         let errors = validate_config_shape(&value);
         assert!(errors.iter().any(|error| error.contains("maxCostUsd")));
         assert!(errors.iter().any(|error| error.contains("unknown role")));
+    }
+
+    #[test]
+    fn classification_schema_and_runtime_acceptance_match_for_milestones() {
+        let artifact = serde_json::json!({
+            "complexity": "simple",
+            "reason": "small change"
+        });
+        let contract = artifact_contract(ArtifactKind::Classification);
+        assert_eq!(
+            contract.accepts(&artifact),
+            validate_artifact(ArtifactKind::Classification, &artifact).is_ok()
+        );
+    }
+
+    #[test]
+    fn artifact_schema_and_runtime_acceptance_parity_for_all_kinds() {
+        for kind in [
+            ArtifactKind::Classification,
+            ArtifactKind::Evidence,
+            ArtifactKind::Plan,
+            ArtifactKind::PatchReport,
+            ArtifactKind::Review,
+        ] {
+            let contract = artifact_contract(kind);
+            let contract_str = contract.to_string();
+            let json = contract_str
+                .split("```json\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n```").next())
+                .expect("the contract carries an example");
+            let valid_example: Value = serde_json::from_str(json).expect("valid JSON example");
+
+            assert!(contract.accepts(&valid_example), "{kind} contract should accept example");
+            assert!(validate_artifact(kind, &valid_example).is_ok(), "{kind} validator should accept example");
+
+            let empty = json!({});
+            assert!(!contract.accepts(&empty), "{kind} contract should reject empty object");
+            assert!(validate_artifact(kind, &empty).is_err(), "{kind} validator should reject empty object");
+        }
+    }
+
+    #[test]
+    fn evidence_finding_rejects_empty_refs() {
+        let value = serde_json::json!({
+            "findings": [{"summary": "auth lives here", "refs": []}]
+        });
+        assert!(validate_artifact(ArtifactKind::Evidence, &value).is_err());
+    }
+
+    #[test]
+    fn evidence_finding_rejects_blank_ref() {
+        let value = serde_json::json!({
+            "findings": [{"summary": "auth lives here", "refs": ["  "]}]
+        });
+        assert!(validate_artifact(ArtifactKind::Evidence, &value).is_err());
     }
 }

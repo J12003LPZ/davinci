@@ -86,6 +86,232 @@ string_enum!(ArtifactKind {
     Review => "review",
 });
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum FieldKind {
+    String { min_length: usize },
+    Enum(&'static [&'static str]),
+    Boolean,
+    Integer,
+    Number,
+    StringArray { min_items: usize },
+    ObjectArray(&'static [FieldRule], usize),
+    Object(&'static [FieldRule]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldRule {
+    pub name: &'static str,
+    pub required: bool,
+    pub allow_null: bool,
+    pub kind: FieldKind,
+    pub description: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactContract {
+    pub kind: ArtifactKind,
+    pub fields: &'static [FieldRule],
+    pub example: &'static str,
+    pub prompt_rules: &'static [&'static str],
+}
+
+#[allow(dead_code)]
+impl FieldKind {
+    pub fn matches(&self, value: &serde_json::Value) -> bool {
+        match self {
+            FieldKind::String { min_length } => {
+                matches!(value, serde_json::Value::String(s) if s.chars().count() >= *min_length)
+            }
+            FieldKind::Enum(allowed) => {
+                matches!(value, serde_json::Value::String(s) if allowed.contains(&s.as_str()))
+            }
+            FieldKind::Boolean => matches!(value, serde_json::Value::Bool(_)),
+            FieldKind::Integer => {
+                matches!(value, serde_json::Value::Number(n) if n.is_i64() || n.is_u64())
+            }
+            FieldKind::Number => matches!(value, serde_json::Value::Number(_)),
+            FieldKind::StringArray { min_items } => {
+                matches!(value, serde_json::Value::Array(items) if items.len() >= *min_items && items.iter().all(serde_json::Value::is_string))
+            }
+            FieldKind::ObjectArray(subrules, min_items) => {
+                matches!(value, serde_json::Value::Array(items) if items.len() >= *min_items && items.iter().all(|item| check_object_matches(item, subrules)))
+            }
+            FieldKind::Object(subrules) => check_object_matches(value, subrules),
+        }
+    }
+
+    pub fn to_json_schema(&self, description: Option<&'static str>) -> serde_json::Value {
+        let mut schema = match self {
+            FieldKind::String { min_length } => {
+                if *min_length > 0 {
+                    serde_json::json!({
+                        "type": "string",
+                        "minLength": min_length
+                    })
+                } else {
+                    serde_json::json!({"type": "string"})
+                }
+            }
+            FieldKind::Enum(allowed) => {
+                serde_json::json!({
+                    "type": "string",
+                    "enum": allowed
+                })
+            }
+            FieldKind::Boolean => serde_json::json!({"type": "boolean"}),
+            FieldKind::Integer => serde_json::json!({"type": "integer"}),
+            FieldKind::Number => serde_json::json!({"type": "number"}),
+            FieldKind::StringArray { min_items } => {
+                if *min_items > 0 {
+                    serde_json::json!({
+                        "type": "array",
+                        "minItems": min_items,
+                        "items": {"type": "string"}
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "array",
+                        "items": {"type": "string"}
+                    })
+                }
+            }
+            FieldKind::ObjectArray(subrules, min_items) => {
+                let mut sub_props = serde_json::Map::new();
+                let mut sub_req = Vec::new();
+                for rule in *subrules {
+                    sub_props.insert(rule.name.to_string(), rule.kind.to_json_schema(rule.description));
+                    if rule.required {
+                        sub_req.push(serde_json::Value::String(rule.name.to_string()));
+                    }
+                }
+                let mut items = serde_json::json!({
+                    "type": "object",
+                    "properties": sub_props
+                });
+                if !sub_req.is_empty() {
+                    items["required"] = serde_json::Value::Array(sub_req);
+                }
+                if *min_items > 0 {
+                    serde_json::json!({
+                        "type": "array",
+                        "minItems": min_items,
+                        "items": items
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "array",
+                        "items": items
+                    })
+                }
+            }
+            FieldKind::Object(subrules) => {
+                let mut sub_props = serde_json::Map::new();
+                let mut sub_req = Vec::new();
+                for rule in *subrules {
+                    sub_props.insert(rule.name.to_string(), rule.kind.to_json_schema(rule.description));
+                    if rule.required {
+                        sub_req.push(serde_json::Value::String(rule.name.to_string()));
+                    }
+                }
+                let mut obj = serde_json::json!({
+                    "type": "object",
+                    "properties": sub_props
+                });
+                if !sub_req.is_empty() {
+                    obj["required"] = serde_json::Value::Array(sub_req);
+                }
+                obj
+            }
+        };
+        if let Some(desc) = description {
+            schema["description"] = serde_json::Value::String(desc.to_string());
+        }
+        schema
+    }
+}
+
+#[allow(dead_code)]
+fn check_object_matches(value: &serde_json::Value, subrules: &[FieldRule]) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    for rule in subrules {
+        let field_val = obj.get(rule.name);
+        match field_val {
+            None | Some(serde_json::Value::Null) => {
+                if rule.required && !rule.allow_null {
+                    return false;
+                }
+            }
+            Some(v) => {
+                if !rule.kind.matches(v) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[allow(dead_code)]
+impl ArtifactContract {
+    pub fn accepts(&self, value: &serde_json::Value) -> bool {
+        let Some(obj) = value.as_object() else {
+            return false;
+        };
+        for rule in self.fields {
+            let field_val = obj.get(rule.name);
+            match field_val {
+                None | Some(serde_json::Value::Null) => {
+                    if rule.required && !rule.allow_null {
+                        return false;
+                    }
+                }
+                Some(v) => {
+                    if !rule.kind.matches(v) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    pub fn to_json_schema(&self) -> serde_json::Value {
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for rule in self.fields {
+            properties.insert(rule.name.to_string(), rule.kind.to_json_schema(rule.description));
+            if rule.required {
+                required.push(serde_json::Value::String(rule.name.to_string()));
+            }
+        }
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": properties
+        });
+        if !required.is_empty() {
+            schema["required"] = serde_json::Value::Array(required);
+        }
+        schema
+    }
+}
+
+impl std::fmt::Display for ArtifactContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rules = self.prompt_rules.join("\n- ");
+        write!(
+            f,
+            "## Artifact contract: \"{}\"\n\nFinish by calling `graph_submit` exactly once with `{{ \"artifact\": <object> }}`. \
+             The object must have exactly these fields (camelCase, no extras needed):\n- {}\n\nExample:\n```json\n{}\n```",
+            self.kind,
+            rules,
+            self.example.trim()
+        )
+    }
+}
+
 string_enum!(Phase {
     Classify => "classify",
     Investigate => "investigate",

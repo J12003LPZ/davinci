@@ -25,7 +25,7 @@ pub fn role_system_prompt(role: Role) -> String {
         }
         Role::Researcher => {
             "You are a read-only code researcher in a graph-engineered coding pipeline. \
-             You gather evidence: verifiable claims with file:line references. \
+             You gather evidence: verifiable claims with file:line references (every finding requires at least one concrete reference). \
              You cannot and must not modify anything (read-only role). Do not propose a patch; report what IS. "
         }
         Role::TestAnalyzer => {
@@ -160,7 +160,7 @@ pub fn research_briefing(goal: &str, kind: ResearchKind, focus: &str) -> String 
         focus,
         "",
         "## Bar for findings",
-        "Every finding needs file:line refs a stranger could open and verify. State confidence honestly.",
+        "Every finding requires at least one concrete reference. State confidence honestly.",
         "List real risks you noticed and real gaps you could not answer. Do not propose a patch.",
     ]
     .join("\n")
