@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod config;
 pub mod evidence;
 pub mod policy;
@@ -8,6 +9,8 @@ pub mod skill_manager;
 pub mod store;
 pub mod types;
 
+#[allow(unused_imports)]
+pub use benchmark::LearningBenchmarkResult;
 pub use config::*;
 pub use evidence::*;
 pub use policy::*;
