@@ -8,7 +8,7 @@ A Rust reimplementation of the TypeScript agent CLI [`pi`](https://github.com/ea
 
 `vendor/pi` holds the authoritative TypeScript source (~1,169 `.ts` files). It is reference-only — read it constantly, never delete or edit it. `packages/*` holds a handful of stale TypeScript stubs from the early phases; they are not the reference.
 
-Phase plans describing the rewrite are in `docs/superpowers/plans/`. Comprehensive documentation index is in `docs/README.md` and crate architecture is in `crates/README.md`.
+Phase plans describing the rewrite are in `docs/superpowers/plans/`. The ecosystem integration roadmap and its design plus execution plans are in `docs/superpowers/plans/2026-09-04-davinci-ecosystem-integration-roadmap.md`, `docs/superpowers/specs/2026-09-04-davinci-ecosystem-integration-design.md`, and the dated ecosystem A–D plan files. Comprehensive documentation index is in `docs/README.md` and crate architecture is in `crates/README.md`.
 
 ## Commands
 
@@ -56,6 +56,8 @@ davinci-coding-agent (bin `davinci`) — CLI, TUI wiring, extensions, slash comm
   ├── davinci-evals, davinci-telemetry
   └── davinci-parity     — golden fixtures, optional diff against the TS binary
 ```
+
+**Ecosystem integration plan**: The roadmap coordinates four bounded workstreams: graph execution hardening, runtime integration with the token governor and vector memory, learning/security feedback, and proof plus CI hygiene. Treat the design document as the contract and the A–D plans as the execution order. Preserve worker isolation, deterministic/offline verification, explicit provenance, bounded context and resource budgets, and fail-closed security approval as cross-cutting acceptance criteria.
 
 **Entrypoint dispatch** (`crates/davinci-coding-agent/src/main.rs`, ~7k lines): `run()` picks a mode — `run_rpc` (`--mode rpc`), `run_print` (`--print` / `--mode json` / non-TTY stdin or stdout), otherwise `run_interactive`, which opens the davinci shell (`davinci_interactive::run`) unless `--legacy-tui` or `PI_DAVINCI=0` asks for the old chrome. Unix-only `experimental` subcommands (`server`, `client`) are stubbed out on Windows by an inline `mod experimental` in `main.rs`.
 
