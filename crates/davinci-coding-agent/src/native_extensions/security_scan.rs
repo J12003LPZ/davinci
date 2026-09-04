@@ -5,6 +5,7 @@
 //! that repository. It is intentionally deterministic so a later deep worker
 //! can consume the same manifest and candidate ledger.
 
+use crate::native_extensions::ecosystem::verification::SecurityVerification;
 use davinci_agent::{ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,6 +15,13 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
+
+#[derive(Debug, Clone)]
+pub struct SecurityVerifyRequest<'a> {
+    pub cwd: &'a Path,
+    pub changed_files: &'a [String],
+    pub graph_run_id: &'a str,
+}
 
 const SECURITY_SCHEMA_VERSION: u32 = 1;
 const SEALED_ARTIFACTS: [&str; 4] = [
@@ -651,6 +659,122 @@ impl SecurityScanController {
             _ => Ok(None),
         }
     }
+
+    pub fn verify_changed_surface(
+        &mut self,
+        request: SecurityVerifyRequest<'_>,
+    ) -> Result<SecurityVerification, String> {
+        self.cwd = request.cwd.to_path_buf();
+        let repo_id = repo_id(&self.cwd);
+        let now = now_ms();
+        let sanitized_run = request
+            .graph_run_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(32)
+            .collect::<String>();
+        let base_id = format_scan_id(&repo_id, now, now_nanos());
+        let scan_id = if sanitized_run.is_empty() {
+            base_id
+        } else {
+            format!("{base_id}-{sanitized_run}")
+        };
+
+        let mut files_to_scan = Vec::new();
+        for file in request.changed_files {
+            let rel = Path::new(file);
+            let Ok(norm) = normalize_relative_path(rel) else {
+                continue;
+            };
+            if is_ignored(&norm, &self.config) {
+                continue;
+            }
+            let full = request.cwd.join(&norm);
+            if full.is_file() {
+                files_to_scan.push(norm);
+            }
+        }
+        files_to_scan.sort();
+        files_to_scan.dedup();
+
+        let scope_digest = sha256_hex(
+            files_to_scan
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .as_bytes(),
+        );
+
+        let mut scan = SecurityScan {
+            manifest: SecurityScanManifest {
+                scan_id: scan_id.clone(),
+                repo_id: repo_id.clone(),
+                root: self.cwd.to_string_lossy().into_owned(),
+                status: ScanStatus::Started,
+                started_at: now,
+                completed_at: None,
+                allow_network: self.config.allow_network,
+                scope_digest,
+                artifact_digest: None,
+                sealed_at: None,
+                artifacts: None,
+            },
+            coverage: SecurityCoverage {
+                files_scanned: 0,
+                files_skipped: 0,
+                bytes_scanned: 0,
+                candidate_count: 0,
+                finding_count: 0,
+                network_used: false,
+            },
+            candidates: Vec::new(),
+            findings: Vec::new(),
+        };
+
+        for path in &files_to_scan {
+            match scan_file(&self.cwd, path, &self.config, &mut scan) {
+                Ok(()) => scan.coverage.files_scanned += 1,
+                Err(_) => scan.coverage.files_skipped += 1,
+            }
+        }
+        scan.coverage.candidate_count = scan.candidates.len();
+        scan.coverage.finding_count = scan.findings.len();
+
+        let artifact = SecurityArtifactStore::new(&repo_id, &scan_id)
+            .map_err(|e| format!("failed to initialize security store: {e}"))?;
+        scan.manifest.status = ScanStatus::Completed;
+        scan.manifest.completed_at = Some(now_ms());
+        scan.manifest.sealed_at = Some(now_ms());
+
+        let digest = artifact
+            .write_scan(&scan)
+            .map_err(|e| format!("failed to write scan: {e}"))?;
+        scan.manifest.artifact_digest = Some(digest);
+        scan.manifest.artifacts = Some(
+            artifact
+                .seal_artifacts()
+                .map_err(|e| format!("failed to seal artifacts: {e}"))?,
+        );
+        artifact
+            .write_manifest(&scan)
+            .map_err(|e| format!("failed to write manifest: {e}"))?;
+
+        self.artifact = Some(artifact);
+        self.current = Some(scan.clone());
+
+        let blockers = scan
+            .findings
+            .iter()
+            .filter(|finding| !finding.false_positive)
+            .count();
+
+        if blockers > 0 {
+            Ok(SecurityVerification::Failed { scan_id, blockers })
+        } else {
+            Ok(SecurityVerification::Passed { scan_id })
+        }
+    }
 }
 
 fn ensure_draft(scan: &SecurityScan) -> Result<(), ToolError> {
@@ -1255,5 +1379,56 @@ mod tests {
                 ["region"]["startLine"],
             3
         );
+    }
+
+    #[test]
+    fn verify_changed_surface_detects_blockers_on_sensitive_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_file = tmp.path().join("src/auth.rs");
+        fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        fs::write(
+            &auth_file,
+            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+        )
+        .unwrap();
+
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let request = SecurityVerifyRequest {
+            cwd: tmp.path(),
+            changed_files: &["src/auth.rs".to_string()],
+            graph_run_id: "run-test-1",
+        };
+
+        let result = controller.verify_changed_surface(request).unwrap();
+        match result {
+            SecurityVerification::Failed { scan_id, blockers } => {
+                assert!(scan_id.starts_with("scan-"));
+                assert!(blockers > 0);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_changed_surface_passes_clean_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clean_file = tmp.path().join("src/ui.rs");
+        fs::create_dir_all(clean_file.parent().unwrap()).unwrap();
+        fs::write(&clean_file, "pub fn render() { println!(\"Hello\"); }\n").unwrap();
+
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let request = SecurityVerifyRequest {
+            cwd: tmp.path(),
+            changed_files: &["src/ui.rs".to_string()],
+            graph_run_id: "run-test-2",
+        };
+
+        let result = controller.verify_changed_surface(request).unwrap();
+        match result {
+            SecurityVerification::Passed { scan_id } => {
+                assert!(scan_id.starts_with("scan-"));
+            }
+            other => panic!("expected Passed, got {other:?}"),
+        }
     }
 }
