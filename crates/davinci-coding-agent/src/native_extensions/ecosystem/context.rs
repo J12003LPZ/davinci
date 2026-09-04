@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[allow(unused_imports)]
+pub use crate::native_extensions::learning::{
+    format_skill_context, select_graph_skill_candidates, SkillContextCandidate,
+};
+#[allow(unused_imports)]
 pub use crate::native_extensions::vector_memory::{format_memory_context, MemoryContextHit};
 
 pub const DEFAULT_GRAPH_CONTEXT_TOKENS: usize = 2_500;

@@ -130,6 +130,17 @@ pub struct SkillLedgerRecord {
     pub pinned: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillContextCandidate {
+    pub name: String,
+    pub version: u64,
+    pub content_hash: String,
+    pub body: String,
+    pub score: f32,
+    pub estimated_tokens: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LearningStats {

@@ -420,6 +420,23 @@ impl LearningController {
         })
     }
 
+    #[allow(dead_code)]
+    pub fn graph_skill_candidates(
+        &self,
+        query: &str,
+        role: crate::native_extensions::graph::Role,
+        max_skills: usize,
+        token_cap: usize,
+    ) -> Vec<SkillContextCandidate> {
+        let discovered = davinci_agent::discover_skills(&[
+            self.project_skills_dir.clone(),
+            self.global_skills_dir.clone(),
+        ]);
+        let mut ledger = self.project_store.skills();
+        ledger.extend(self.global_store.skills());
+        select_graph_skill_candidates(query, role, &discovered, &ledger, max_skills, token_cap)
+    }
+
     pub fn skill_view_tool(&self, _cwd: &Path, args: &Value) -> Result<ToolResult, ToolError> {
         let name = args
             .get("name")

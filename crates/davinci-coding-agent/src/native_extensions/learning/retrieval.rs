@@ -3,7 +3,10 @@ use std::collections::HashSet;
 
 use davinci_agent::{describe_skill, Skill, SkillDescriptor};
 
-use crate::native_extensions::learning::types::{ArtifactStatus, LearningScope, SkillLedgerRecord};
+use crate::native_extensions::graph::Role;
+use crate::native_extensions::learning::types::{
+    ArtifactStatus, LearningScope, SkillContextCandidate, SkillLedgerRecord,
+};
 use crate::native_extensions::vector_memory::cosine_similarity;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +157,189 @@ pub fn rank_skills_with_embeddings(
     }
 
     matches
+}
+
+pub fn role_bias(role: Role, skill_name: &str, skill_desc: &str) -> f32 {
+    let text = format!("{} {}", skill_name, skill_desc).to_lowercase();
+    let keywords: &[&str] = match role {
+        Role::Classifier => &["classify", "triage", "scope", "complexity", "label"],
+        Role::Researcher => &[
+            "research",
+            "investigate",
+            "explore",
+            "search",
+            "docs",
+            "documentation",
+            "reference",
+            "find",
+        ],
+        Role::TestAnalyzer => &[
+            "test",
+            "testing",
+            "benchmark",
+            "verify",
+            "verification",
+            "assert",
+            "coverage",
+            "reproduce",
+            "baseline",
+        ],
+        Role::Historian => &[
+            "git",
+            "history",
+            "commit",
+            "log",
+            "blame",
+            "changelog",
+            "diff",
+            "regression",
+        ],
+        Role::Planner => &[
+            "plan",
+            "design",
+            "architecture",
+            "strategy",
+            "roadmap",
+            "spec",
+            "breakdown",
+        ],
+        Role::Writer => &[
+            "code",
+            "implement",
+            "refactor",
+            "patch",
+            "fix",
+            "write",
+            "build",
+            "edit",
+            "rust",
+        ],
+        Role::Reviewer => &[
+            "review", "audit", "critique", "quality", "lint", "security", "syntax", "check",
+        ],
+    };
+    if keywords.iter().any(|kw| text.contains(kw)) {
+        0.12
+    } else {
+        0.0
+    }
+}
+
+pub fn select_graph_skill_candidates(
+    query: &str,
+    role: Role,
+    skills: &[Skill],
+    ledger: &[SkillLedgerRecord],
+    max_skills: usize,
+    token_cap: usize,
+) -> Vec<SkillContextCandidate> {
+    if query.trim().is_empty() || max_skills == 0 || token_cap == 0 {
+        return Vec::new();
+    }
+
+    let matches = rank_skills_with_embeddings(query, None, skills, None, ledger, 0);
+
+    const MIN_SKILL_RELEVANCE: f32 = 0.35;
+
+    struct ScoredCandidate<'a> {
+        skill: &'a Skill,
+        version: u64,
+        content_hash: String,
+        score: f32,
+    }
+
+    let mut candidates: Vec<ScoredCandidate<'_>> = Vec::new();
+
+    for m in &matches {
+        if m.score < MIN_SKILL_RELEVANCE {
+            continue;
+        }
+
+        let Some(skill) = skills.iter().find(|s| s.name == m.descriptor.name) else {
+            continue;
+        };
+
+        let record = ledger.iter().find(|r| r.name == skill.name);
+        let version = record.map(|r| r.version as u64).unwrap_or(1);
+        let content_hash = record
+            .map(|r| r.content_hash.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| crate::native_extensions::vector_memory::content_hash(&skill.body));
+
+        let role_boost = role_bias(role, &skill.name, &skill.description);
+        let final_score = (m.score + role_boost).clamp(0.0, 1.0);
+
+        candidates.push(ScoredCandidate {
+            skill,
+            version,
+            content_hash,
+            score: final_score,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.skill.name.cmp(&b.skill.name))
+    });
+
+    let mut accumulated_tokens = 0;
+    let mut selected = Vec::new();
+
+    for c in candidates {
+        if selected.len() >= max_skills {
+            break;
+        }
+        let est_tokens = (c.skill.body.chars().count() + 3) / 4;
+        if accumulated_tokens + est_tokens > token_cap {
+            let remaining = token_cap.saturating_sub(accumulated_tokens);
+            if remaining > 0 {
+                let char_cap = remaining.saturating_mul(4);
+                let truncated: String = c.skill.body.chars().take(char_cap).collect();
+                let est_trunc = (truncated.chars().count() + 3) / 4;
+                selected.push(SkillContextCandidate {
+                    name: c.skill.name.clone(),
+                    version: c.version,
+                    content_hash: c.content_hash,
+                    body: truncated,
+                    score: c.score,
+                    estimated_tokens: est_trunc,
+                });
+            }
+            break;
+        }
+        accumulated_tokens += est_tokens;
+        selected.push(SkillContextCandidate {
+            name: c.skill.name.clone(),
+            version: c.version,
+            content_hash: c.content_hash,
+            body: c.skill.body.clone(),
+            score: c.score,
+            estimated_tokens: est_tokens,
+        });
+    }
+
+    selected
+}
+
+pub fn format_skill_context(skills: &[SkillContextCandidate]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (i, s) in skills.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
+            s.name,
+            s.version,
+            s.body.trim()
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -375,5 +561,128 @@ mod tests {
             10,
         );
         assert_eq!(matches[0].descriptor.name, "skill-a");
+    }
+
+    #[test]
+    fn graph_skill_context_respects_max_count_and_token_cap() {
+        let mut skills = Vec::new();
+        for i in 1..=5 {
+            let body = format!(
+                "# procedure-{}\nDetail content for procedure {}.\n{}",
+                i,
+                i,
+                "procedure detail step text ".repeat(80)
+            );
+            skills.push(Skill {
+                name: format!("procedure-{}", i),
+                description: "Procedure for test verification".into(),
+                path: PathBuf::from(format!("/skills/p{}/SKILL.md", i)),
+                body,
+                base_dir: PathBuf::from("."),
+            });
+        }
+
+        // Request max 2 skills, cap 1000 tokens
+        let selected = select_graph_skill_candidates(
+            "procedure verification",
+            Role::TestAnalyzer,
+            &skills,
+            &[],
+            2,
+            1000,
+        );
+        assert_eq!(selected.len(), 2);
+        let total_tokens: usize = selected.iter().map(|s| s.estimated_tokens).sum();
+        assert!(total_tokens <= 1000);
+
+        // Small token cap enforces truncation
+        let tiny = select_graph_skill_candidates(
+            "procedure verification",
+            Role::TestAnalyzer,
+            &skills,
+            &[],
+            2,
+            50,
+        );
+        assert_eq!(tiny.len(), 1);
+        assert!(tiny[0].estimated_tokens <= 50);
+    }
+
+    #[test]
+    fn graph_skill_context_omits_irrelevant_skills() {
+        let skills = vec![
+            fixture_skill(
+                "deploy-flyio",
+                "Deploy app to flyio cloud",
+                "/skills/deploy/SKILL.md",
+            ),
+            fixture_skill(
+                "baking-bread",
+                "Baking sourdough bread at home",
+                "/skills/bread/SKILL.md",
+            ),
+            fixture_skill(
+                "gardening-tips",
+                "Pruning rose bushes and trees",
+                "/skills/garden/SKILL.md",
+            ),
+        ];
+
+        let selected =
+            select_graph_skill_candidates("flyio deployment", Role::Writer, &skills, &[], 2, 1000);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "deploy-flyio");
+    }
+
+    #[test]
+    fn graph_skill_context_empty_on_blank_query() {
+        let skills = vec![fixture_skill(
+            "deploy-flyio",
+            "Deploy app to flyio cloud",
+            "/skills/deploy/SKILL.md",
+        )];
+
+        let selected = select_graph_skill_candidates("   ", Role::Writer, &skills, &[], 2, 1000);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn graph_skill_context_role_compatibility_bias() {
+        let skills = vec![
+            fixture_skill(
+                "pipeline-audit",
+                "review and audit pull request quality",
+                "/skills/audit/SKILL.md",
+            ),
+            fixture_skill(
+                "pipeline-patch",
+                "write and patch code defects",
+                "/skills/patch/SKILL.md",
+            ),
+        ];
+
+        let rev_selected =
+            select_graph_skill_candidates("pipeline", Role::Reviewer, &skills, &[], 2, 1000);
+        assert_eq!(rev_selected[0].name, "pipeline-audit");
+
+        let wrt_selected =
+            select_graph_skill_candidates("pipeline", Role::Writer, &skills, &[], 2, 1000);
+        assert_eq!(wrt_selected[0].name, "pipeline-patch");
+    }
+
+    #[test]
+    fn graph_skill_context_format_produces_valid_tags() {
+        let skills = vec![SkillContextCandidate {
+            name: "test-skill".into(),
+            version: 2,
+            content_hash: "hash123".into(),
+            body: "# Test Skill\nInstructions here.".into(),
+            score: 0.9,
+            estimated_tokens: 10,
+        }];
+        let formatted = format_skill_context(&skills);
+        assert!(formatted.starts_with("<skill name=\"test-skill\" version=\"2\">"));
+        assert!(formatted.ends_with("</skill>"));
+        assert!(formatted.contains("Instructions here."));
     }
 }
