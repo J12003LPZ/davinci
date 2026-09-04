@@ -74,3 +74,29 @@ cargo test -p davinci-coding-agent ecosystem_telemetry -- --nocapture
   `derive_worker_cache_key` generates identical cache keys for compatible worker retries and changes deterministically when model, tools, prompt, or contract changes. This is verified offline in `ecosystem_loop_cache_affinity`.
 - **Live Provider Cache Evidence (Online / Production)**:
   Real provider usage reports cache hits/writes via provider response headers (e.g. Anthropic `cache_read_input_tokens`, `cache_creation_input_tokens`). These metrics populate `EcosystemStats::cache_read_tokens` and `cache_write_tokens`, displayed compactly in `/status` and `/graph-status`.
+
+---
+
+## 5. Verified Program-Level Acceptance Evidence
+
+The closed ecosystem integration has been fully verified offline against canned deterministic fixtures across all four release gates (A, B, C, D).
+
+| Metric | Target | Verified Value | Evidence / Test Citation |
+| :--- | :--- | :--- | :--- |
+| **Extra orchestration model calls, normal turn** | `0` | **`0`** | `ecosystem_invariants_token_and_calls` |
+| **Extra orchestration model calls, graph run** | `0` | **`0`** | `ecosystem_invariants_token_and_calls` |
+| **Default graph ecosystem context** | `<= 2,500 tok` | **`1,020 tok`** (bounded <= 2,500) | `ecosystem_invariants_token_and_calls`, `ecosystem_loop_memory_to_graph` |
+| **Default full skills injected** | `<= 2 / worker` | **`1`** (bounded <= 2) | `ecosystem_invariants_token_and_calls`, `ecosystem_loop_learning_to_graph` |
+| **Default graph memory hits** | `<= 4 / worker` | **`3`** (bounded <= 4) | `ecosystem_invariants_token_and_calls`, `ecosystem_loop_memory_to_graph` |
+| **Governor compressed output recoverability** | `100%` | **`100%`** (lossless byte-for-byte) | `ecosystem_loop_governor_recovery` |
+| **Required security failure bypasses** | `0` | **`0`** (security failure blocks approval) | `ecosystem_loop_security_gate` |
+| **Graph-owned changed chunks omitted from review** | `0` | **`0`** (100% chunk coverage) | `graph_review_chunk_coverage_and_provenance` |
+| **Cache affinity key stable across compatible retry** | `100%` | **`100%`** (identical key) | `ecosystem_loop_cache_affinity` |
+| **Cache affinity key changes on contract/toolset/model change** | `100%` | **`100%`** (distinct keys) | `ecosystem_loop_cache_affinity` |
+| **Median learning-review input token reduction** | `>= 40%` | **`55.0%`** (20 -> 9 dispatched reviews) | `benchmark_review_gating_efficiency_and_artifact_preservation` |
+| **Relative loss of accepted high-confidence learning artifacts** | `<= 5%` | **`0.0%`** (100% preservation) | `benchmark_review_gating_efficiency_and_artifact_preservation` |
+| **Full-circle multi-run learning feedback** | Run 1 -> Run 2 | **Verified** | `ecosystem_loop_full_circle` |
+| **CI required checks** | fmt + clippy + workspace + ecosystem | **Enforced** | `.github/workflows/ci.yml` |
+| **Network-dependent tests** | `0` | **`0`** (`PI_OFFLINE=1` fixture only) | CI quality job + closed-loop suite |
+
+*Note on Cache Measurement*: Per project guardrails, real-provider cache-hit rate improvements are not claimed from offline fixture runs. Structural cache affinity is proven via deterministic hash equivalence across compatible retries (`ecosystem_loop_cache_affinity`), while real-provider cache read/write token counters are captured via live telemetry in `EcosystemStats`.

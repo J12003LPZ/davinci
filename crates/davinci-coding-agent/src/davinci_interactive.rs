@@ -5614,9 +5614,9 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
         ecosystem: run
             .get("ecosystemStats")
             .and_then(|v| {
-                serde_json::from_value::<
-                    crate::native_extensions::ecosystem::EcosystemStats,
-                >(v.clone())
+                serde_json::from_value::<crate::native_extensions::ecosystem::EcosystemStats>(
+                    v.clone(),
+                )
                 .ok()
             })
             .map(|stats| stats.render_compact_lines())

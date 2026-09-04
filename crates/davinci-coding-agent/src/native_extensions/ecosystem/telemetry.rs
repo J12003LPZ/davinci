@@ -210,13 +210,21 @@ impl EcosystemStats {
                 parts.push(format!(
                     "{} review{}",
                     self.learning_reviews_dispatched,
-                    if self.learning_reviews_dispatched == 1 { "" } else { "s" }
+                    if self.learning_reviews_dispatched == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
                 ));
             } else if self.learning_reviews_skipped > 0 {
                 parts.push(format!(
                     "{} review{} skipped",
                     self.learning_reviews_skipped,
-                    if self.learning_reviews_skipped == 1 { "" } else { "s" }
+                    if self.learning_reviews_skipped == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
                 ));
             }
             if self.learned_artifacts_applied > 0 {
@@ -479,7 +487,10 @@ mod tests {
         assert_eq!(lines.len(), 5);
         assert_eq!(lines[0], "context  3 memory / 1 skill · 1020 tok");
         assert_eq!(lines[1], "cache    18.4k read / 0.7k write");
-        assert_eq!(lines[2], "compact  18 KB governed · 1 recovered · 1 pruning");
+        assert_eq!(
+            lines[2],
+            "compact  18 KB governed · 1 recovered · 1 pruning"
+        );
         assert_eq!(lines[3], "verify   tests pass · security pass");
         assert_eq!(lines[4], "learn    1 review · 1 applied");
     }

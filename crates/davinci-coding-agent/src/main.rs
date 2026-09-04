@@ -5666,7 +5666,8 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         format_session_cost(parsed, agent),
     );
     let cwd = std::env::current_dir().unwrap_or_default();
-    if let Some(run) = crate::native_extensions::graph::active_run(&cwd).and_then(|r| r.snapshot()) {
+    if let Some(run) = crate::native_extensions::graph::active_run(&cwd).and_then(|r| r.snapshot())
+    {
         let compact = run.ecosystem_stats.render_compact_lines();
         if !compact.is_empty() {
             text.push('\n');

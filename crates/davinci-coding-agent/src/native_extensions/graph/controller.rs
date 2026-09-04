@@ -451,8 +451,7 @@ impl GraphExecution {
                     context_packet.skill_candidates_considered as u64;
                 run.ecosystem_stats.skills_injected += context_packet.skill_refs.len() as u64;
                 run.ecosystem_stats.skill_injected_tokens += context_packet.skill_tokens as u64;
-                run.ecosystem_stats.context_packet_tokens +=
-                    context_packet.estimated_tokens as u64;
+                run.ecosystem_stats.context_packet_tokens += context_packet.estimated_tokens as u64;
                 run.ecosystem_stats.context_fingerprint = Some(context_packet.fingerprint.clone());
 
                 let _ = super::store::write_task_context_packet(

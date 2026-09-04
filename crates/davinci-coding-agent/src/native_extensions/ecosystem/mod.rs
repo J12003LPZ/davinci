@@ -218,7 +218,10 @@ mod tests {
             prompt,
             ArtifactKind::Evidence,
         );
-        assert_ne!(key1, key_version, "Changed graph version must change cache key");
+        assert_ne!(
+            key1, key_version,
+            "Changed graph version must change cache key"
+        );
 
         // Changed contract => different key
         let key_contract = derive_worker_cache_key(
@@ -334,7 +337,9 @@ mod tests {
         assert_eq!(packet.memory_refs[0], "mem-settled-001");
         assert!(packet.estimated_tokens <= DEFAULT_GRAPH_CONTEXT_TOKENS);
         assert!(packet.memory_tokens <= DEFAULT_GRAPH_MEMORY_TOKENS);
-        assert!(packet.text.contains("Always enforce token governor budgets"));
+        assert!(packet
+            .text
+            .contains("Always enforce token governor budgets"));
     }
 
     /// Task 4 Step 5: ecosystem_loop_learning_to_graph
@@ -344,14 +349,19 @@ mod tests {
         let dir = tempdir().unwrap();
 
         // 1. Create skill file on disk in .pi/skills/cache-optimization/SKILL.md
-        let skills_dir = dir.path().join(".pi").join("skills").join("cache-optimization");
+        let skills_dir = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("cache-optimization");
         std::fs::create_dir_all(&skills_dir).unwrap();
         let content = "---\nname: cache-optimization\ndescription: Cache optimization guidelines for compiler workers\nroles: [researcher, writer]\n---\n# Cache Optimization\nEnsure prompt prefix stability for key reuse.\n";
         let skill_path = skills_dir.join("SKILL.md");
         std::fs::write(&skill_path, content).unwrap();
 
         // 2. Learning controller with verified skill record in project store
-        let mut learning = crate::native_extensions::LearningController::new(dir.path(), None, None);
+        let mut learning =
+            crate::native_extensions::LearningController::new(dir.path(), None, None);
         let record = SkillLedgerRecord {
             skill_id: "skill-cache-opt-01".into(),
             name: "cache-optimization".into(),
@@ -504,13 +514,18 @@ mod tests {
         let dir = tempdir().unwrap();
 
         // 1. Initial candidate skill persisted and approved (representing Run #1 outcome)
-        let skill_dir = dir.path().join(".pi").join("skills").join("full-circle-skill");
+        let skill_dir = dir
+            .path()
+            .join(".pi")
+            .join("skills")
+            .join("full-circle-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let content = "---\nname: full-circle-skill\ndescription: Full circle offline ecosystem integration skill\nroles: [writer]\n---\n# Full Circle\nFollow strict integration verification.\n";
         let skill_file = skill_dir.join("SKILL.md");
         std::fs::write(&skill_file, content).unwrap();
 
-        let mut learning = crate::native_extensions::LearningController::new(dir.path(), None, None);
+        let mut learning =
+            crate::native_extensions::LearningController::new(dir.path(), None, None);
         learning.set_project_trusted(true);
         let record = SkillLedgerRecord {
             skill_id: "skill-fc-01".into(),
@@ -694,7 +709,9 @@ mod tests {
             packet.skill_refs.len()
         );
         assert!(
-            packet.text.starts_with("<context source=\"davinci\" untrusted=\"true\">"),
+            packet
+                .text
+                .starts_with("<context source=\"davinci\" untrusted=\"true\">"),
             "Context XML wrapper header required"
         );
         assert!(
