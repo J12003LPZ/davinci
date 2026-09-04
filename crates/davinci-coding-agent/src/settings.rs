@@ -283,7 +283,9 @@ pub fn clear_compaction_threshold(settings: &mut Settings) {
     }
 }
 
-pub fn format_compaction_threshold(threshold: Option<davinci_agent::CompactionThreshold>) -> String {
+pub fn format_compaction_threshold(
+    threshold: Option<davinci_agent::CompactionThreshold>,
+) -> String {
     match threshold {
         Some(davinci_agent::CompactionThreshold::Percent(percent)) => format!("{percent}%"),
         Some(davinci_agent::CompactionThreshold::Tokens(tokens)) => format_token_count(tokens),
@@ -954,9 +956,11 @@ impl Settings {
     }
 
     pub fn session_dir_normalized(&self) -> Option<String> {
-        self.session_dir
-            .as_deref()
-            .map(|dir| davinci_session::expand_tilde(dir).to_string_lossy().into_owned())
+        self.session_dir.as_deref().map(|dir| {
+            davinci_session::expand_tilde(dir)
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 
     /// `jsonl` (default, TS coding-agent) or `sqlite`.

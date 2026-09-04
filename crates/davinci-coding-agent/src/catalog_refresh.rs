@@ -206,7 +206,8 @@ fn refresh_provider(
     if !force {
         if let Some(entry) = &stored {
             if let (Some(checked), Some(_)) = (entry.checked_at, entry.last_modified) {
-                if davinci_ai::now_ms().saturating_sub(checked) < REMOTE_CATALOG_REFRESH_INTERVAL_MS {
+                if davinci_ai::now_ms().saturating_sub(checked) < REMOTE_CATALOG_REFRESH_INTERVAL_MS
+                {
                     return Ok(entry.models.clone());
                 }
             }

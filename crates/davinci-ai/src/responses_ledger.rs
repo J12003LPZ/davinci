@@ -275,12 +275,20 @@ impl ResponsesLedger {
             return None;
         }
         let delta_items = &self.items[boundary.item_index_end..];
-        Some(delta_items.iter().map(ResponsesItem::to_json_value).collect())
+        Some(
+            delta_items
+                .iter()
+                .map(ResponsesItem::to_json_value)
+                .collect(),
+        )
     }
 
     /// Serializes all items as native Responses API input array for full replay.
     pub fn full_replay(&self) -> Vec<Value> {
-        self.items.iter().map(ResponsesItem::to_json_value).collect()
+        self.items
+            .iter()
+            .map(ResponsesItem::to_json_value)
+            .collect()
     }
 
     pub fn start_new_lineage(&mut self, new_lineage_id: impl Into<String>) {

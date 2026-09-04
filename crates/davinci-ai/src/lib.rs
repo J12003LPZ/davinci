@@ -11,8 +11,6 @@ pub mod codex_telemetry;
 pub mod codex_transport;
 mod codex_ws;
 mod deferred;
-pub mod request_shape;
-pub mod responses_ledger;
 mod http_proxy;
 mod images;
 mod model_config;
@@ -23,6 +21,8 @@ mod oauth_callback;
 mod oauth_providers;
 mod provider_retry;
 mod providers;
+pub mod request_shape;
+pub mod responses_ledger;
 mod retry;
 mod shell;
 mod stream;
@@ -44,7 +44,6 @@ pub use catalog::{
     load_radius_models, models_from_provider_config, openrouter_image_models,
     radius_models_from_config, Model, ModelCost, KNOWN_PROVIDERS,
 };
-pub use codex_flags::CodexFeatureFlags;
 pub use codex::{
     build_cached_websocket_request_body, build_sse_headers, build_websocket_headers,
     close_openai_codex_websocket_sessions, compress_request_body_zstd, connect_codex_websocket,
@@ -62,6 +61,7 @@ pub use codex::{
     SESSION_WEBSOCKET_MAX_AGE_MS, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
     WEBSOCKET_CONNECTION_LIMIT_REACHED, WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
 };
+pub use codex_flags::CodexFeatureFlags;
 pub use deferred::{
     cancel_deferred, fetch_deferred, DeferredFetchOptions, DeferredFetchResult, DeferredHandle,
 };

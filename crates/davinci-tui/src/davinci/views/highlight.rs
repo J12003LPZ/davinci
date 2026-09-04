@@ -1149,7 +1149,10 @@ mod tests {
 
     #[test]
     fn languages_come_from_paths_and_fence_tags() {
-        assert_eq!(language_of("crates/davinci-agent/src/lib.rs"), Some(Lang::Rust));
+        assert_eq!(
+            language_of("crates/davinci-agent/src/lib.rs"),
+            Some(Lang::Rust)
+        );
         assert_eq!(language_of("rust"), Some(Lang::Rust));
         assert_eq!(language_of("app.tsx"), Some(Lang::TypeScript));
         assert_eq!(language_of("py"), Some(Lang::Python));

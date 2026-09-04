@@ -760,7 +760,11 @@ fn wants_background(input: &serde_json::Value) -> bool {
 /// Spawn the shell with the command, stdout and stderr piped, exactly as a
 /// foreground call would — a background job is the same process, only
 /// nobody waits for it.
-fn spawn_shell(cwd: &Path, command: &str, background: bool) -> Result<std::process::Child, ToolError> {
+fn spawn_shell(
+    cwd: &Path,
+    command: &str,
+    background: bool,
+) -> Result<std::process::Child, ToolError> {
     let custom = std::env::var("PI_SHELL")
         .ok()
         .filter(|value| !value.is_empty());
@@ -792,7 +796,10 @@ fn spawn_shell(cwd: &Path, command: &str, background: bool) -> Result<std::proce
     let mut child = process
         .spawn()
         .map_err(|err| ToolError::Failed(err.to_string()))?;
-    if matches!(config.command_transport, davinci_ai::CommandTransport::Stdin) {
+    if matches!(
+        config.command_transport,
+        davinci_ai::CommandTransport::Stdin
+    ) {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin
@@ -2472,10 +2479,18 @@ mod tests {
 *** Add File: test.txt
 +Hello Codex
 *** End Patch"#;
-        let res = execute_tool(dir.path(), "apply_patch", &serde_json::json!({ "input": patch })).unwrap();
+        let res = execute_tool(
+            dir.path(),
+            "apply_patch",
+            &serde_json::json!({ "input": patch }),
+        )
+        .unwrap();
         assert!(!res.is_error);
         assert!(res.content.contains("1 added"));
-        assert_eq!(std::fs::read_to_string(dir.path().join("test.txt")).unwrap(), "Hello Codex\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("test.txt")).unwrap(),
+            "Hello Codex\n"
+        );
     }
 
     #[test]
@@ -2484,19 +2499,36 @@ mod tests {
         let context = ToolContext::default();
 
         // Missing job_id
-        let res = execute_tool_with(dir.path(), "write_stdin", &serde_json::json!({ "input": "test" }), &context).unwrap();
+        let res = execute_tool_with(
+            dir.path(),
+            "write_stdin",
+            &serde_json::json!({ "input": "test" }),
+            &context,
+        )
+        .unwrap();
         assert!(res.is_error);
         assert!(res.content.contains("Missing jobId"));
 
         // Missing input
-        let res = execute_tool_with(dir.path(), "write_stdin", &serde_json::json!({ "job_id": 1 }), &context).unwrap();
+        let res = execute_tool_with(
+            dir.path(),
+            "write_stdin",
+            &serde_json::json!({ "job_id": 1 }),
+            &context,
+        )
+        .unwrap();
         assert!(res.is_error);
         assert!(res.content.contains("Missing required parameter: input"));
 
         // Non-existent job
-        let res = execute_tool_with(dir.path(), "write_stdin", &serde_json::json!({ "job_id": 42, "input": "test" }), &context).unwrap();
+        let res = execute_tool_with(
+            dir.path(),
+            "write_stdin",
+            &serde_json::json!({ "job_id": 42, "input": "test" }),
+            &context,
+        )
+        .unwrap();
         assert!(res.is_error);
         assert!(res.content.contains("No background job 42"));
     }
 }
-

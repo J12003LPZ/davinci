@@ -212,8 +212,7 @@ pub fn evaluate_release_gate(comparisons: &[PairedTaskComparison]) -> PairedDelt
         improvements += 1;
     }
     // 4. No material worsening (no metric > +10%)
-    let no_material_worsening =
-        median_wall <= 10.0 && median_resp <= 10.0 && median_tokens <= 10.0;
+    let no_material_worsening = median_wall <= 10.0 && median_resp <= 10.0 && median_tokens <= 10.0;
 
     let meets_gate = success_ok && side_effects_ok && (improvements >= 2) && no_material_worsening;
 
@@ -298,8 +297,8 @@ mod tests {
                 },
                 optimized_metrics: CodexBenchmarkRunMetrics {
                     success: true,
-                    wall_time_ms: 7_500, // -25%
-                    model_responses: 7,  // -30%
+                    wall_time_ms: 7_500,          // -25%
+                    model_responses: 7,           // -30%
                     uncached_input_tokens: 3_750, // -25%
                     duplicate_side_effects: 0,
                     ..Default::default()

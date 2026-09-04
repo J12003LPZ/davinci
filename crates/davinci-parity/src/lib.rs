@@ -1,7 +1,9 @@
 //! Golden fixtures for writer-leases, session entries, protocol hello/CBOR, assistant+usage, agent events, print/RPC.
 
 use davinci_ai::{replay_sse_events, AssistantMessageEvent};
-use davinci_protocol::{encode_cbor, encode_client_message, CborValue, ClientMessage, PROTOCOL_VERSION};
+use davinci_protocol::{
+    encode_cbor, encode_client_message, CborValue, ClientMessage, PROTOCOL_VERSION,
+};
 use davinci_session::{JsonlSession, SessionEntry};
 use davinci_session_sqlite::{now_ms_i64, SqliteSessionStore};
 use serde_json::Value;

@@ -363,7 +363,11 @@ impl Agent {
         self.prompt_with(text, &[])
     }
 
-    pub fn prompt_with(&mut self, text: &str, images: &[davinci_ai::MessageContent]) -> ChatMessage {
+    pub fn prompt_with(
+        &mut self,
+        text: &str,
+        images: &[davinci_ai::MessageContent],
+    ) -> ChatMessage {
         self.flush_pending_bash_messages();
         // A job that finished while the user was typing is in context
         // before what they typed, so the model reads the news first.
@@ -529,7 +533,10 @@ impl Agent {
         extra.insert("exitCode".into(), exit_code);
         extra.insert("cancelled".into(), Value::Bool(cancelled));
         extra.insert("truncated".into(), Value::Bool(truncated));
-        extra.insert("timestamp".into(), serde_json::json!(davinci_session::now_ms()));
+        extra.insert(
+            "timestamp".into(),
+            serde_json::json!(davinci_session::now_ms()),
+        );
         extra.insert(
             "excludeFromContext".into(),
             Value::Bool(exclude_from_context),
@@ -639,7 +646,9 @@ impl Agent {
     /// Persist and append a TypeScript extension `CustomMessage`.
     pub fn record_custom_message(&mut self, raw: &Value) -> ChatMessage {
         let content = match raw.get("content") {
-            Some(Value::String(text)) => vec![davinci_ai::MessageContent::Text { text: text.clone() }],
+            Some(Value::String(text)) => {
+                vec![davinci_ai::MessageContent::Text { text: text.clone() }]
+            }
             Some(Value::Array(_)) => {
                 serde_json::from_value(raw["content"].clone()).unwrap_or_default()
             }
@@ -2698,7 +2707,9 @@ mod tests {
                 Ok(AssistantMessage {
                     id: "a2".into(),
                     role: "assistant".into(),
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                     model: "fixture".into(),
                     usage: None,
                     stop_reason: Some(StopReason::Stop),

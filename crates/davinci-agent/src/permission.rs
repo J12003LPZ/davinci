@@ -1185,4 +1185,3 @@ mod tests {
         assert!(is_out_bad);
     }
 }
-

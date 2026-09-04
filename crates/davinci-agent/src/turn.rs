@@ -148,7 +148,8 @@ impl Agent {
             } else {
                 self.push_event(&mut events, start);
             }
-            let updates = stream_events.unwrap_or_else(|| davinci_ai::events_from_complete(&assistant));
+            let updates =
+                stream_events.unwrap_or_else(|| davinci_ai::events_from_complete(&assistant));
             let shared_chat = std::sync::Arc::new(chat.clone());
             for assistant_message_event in updates {
                 let update = AgentEvent::MessageUpdate {
@@ -547,9 +548,7 @@ impl Agent {
                     run: Box::new(move || {
                         let result = match preparation {
                             Preparation::Immediate(result) => result,
-                            Preparation::Wait { call_id, .. } => {
-                                agent.wait_for_tool_call(&call_id)
-                            }
+                            Preparation::Wait { call_id, .. } => agent.wait_for_tool_call(&call_id),
                             Preparation::Ready { .. } => {
                                 agent.run_prepared_call(cwd, &id, &name, &args, 0)
                             }

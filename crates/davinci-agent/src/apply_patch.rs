@@ -14,17 +14,9 @@ const JOURNAL_FILE_NAME: &str = ".pi_patch_journal.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileAction {
-    Add {
-        path: String,
-        content: String,
-    },
-    Delete {
-        path: String,
-    },
-    Update {
-        path: String,
-        hunks: Vec<Hunk>,
-    },
+    Add { path: String, content: String },
+    Delete { path: String },
+    Update { path: String, hunks: Vec<Hunk> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,9 +101,13 @@ pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<P
     }
 
     // Symlink escape check: ensure resolved path (or existing ancestors) never escape workspace root
-    if let (Ok(root_canon), Ok(target_canon)) = (workspace_root.canonicalize(), resolved.canonicalize()) {
+    if let (Ok(root_canon), Ok(target_canon)) =
+        (workspace_root.canonicalize(), resolved.canonicalize())
+    {
         if !target_canon.starts_with(&root_canon) {
-            return Err(format!("Symlink traversal outside workspace root rejected: {raw_path}"));
+            return Err(format!(
+                "Symlink traversal outside workspace root rejected: {raw_path}"
+            ));
         }
     } else if let Ok(root_canon) = workspace_root.canonicalize() {
         let mut ancestor = resolved.as_path();
@@ -119,7 +115,9 @@ pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<P
             if parent.exists() {
                 if let Ok(parent_canon) = parent.canonicalize() {
                     if !parent_canon.starts_with(&root_canon) {
-                        return Err(format!("Symlink traversal outside workspace root rejected: {raw_path}"));
+                        return Err(format!(
+                            "Symlink traversal outside workspace root rejected: {raw_path}"
+                        ));
                     }
                 }
                 break;
@@ -355,10 +353,10 @@ pub fn recover_incomplete_journal_if_any(workspace_root: &Path) -> Result<(), St
         return Ok(());
     }
 
-    let raw = fs::read_to_string(&journal_path)
-        .map_err(|e| format!("Failed reading journal: {e}"))?;
-    let journal: PatchJournal = serde_json::from_str(&raw)
-        .map_err(|e| format!("Corrupt journal file: {e}"))?;
+    let raw =
+        fs::read_to_string(&journal_path).map_err(|e| format!("Failed reading journal: {e}"))?;
+    let journal: PatchJournal =
+        serde_json::from_str(&raw).map_err(|e| format!("Corrupt journal file: {e}"))?;
 
     for entry in journal.entries {
         let Ok(file_path) = sanitize_relative_path(workspace_root, &entry.relative_path) else {
@@ -453,13 +451,12 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
     // Step 3: Apply mutations transactionally
     let mut applied_so_far: Vec<&JournalEntry> = Vec::new();
     for (target, new_content) in planned_mutations {
-        let entry = journal
-            .entries
-            .iter()
-            .find(|e| match sanitize_relative_path(workspace_root, &e.relative_path) {
+        let entry = journal.entries.iter().find(|e| {
+            match sanitize_relative_path(workspace_root, &e.relative_path) {
                 Ok(p) => p == target,
                 Err(_) => false,
-            });
+            }
+        });
 
         let mutation_result = match new_content {
             Some(content) => {
@@ -477,7 +474,8 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
                 applied_so_far.push(e);
             }
             for entry in applied_so_far {
-                if let Ok(file_path) = sanitize_relative_path(workspace_root, &entry.relative_path) {
+                if let Ok(file_path) = sanitize_relative_path(workspace_root, &entry.relative_path)
+                {
                     match &entry.original_content {
                         Some(orig) => {
                             let _ = fs::write(&file_path, orig);
@@ -529,9 +527,15 @@ mod tests {
 
         let parsed = parse_codex_patch(patch).unwrap();
         assert_eq!(parsed.actions.len(), 3);
-        assert!(matches!(&parsed.actions[0], FileAction::Add { path, .. } if path == "src/new_file.txt"));
-        assert!(matches!(&parsed.actions[1], FileAction::Update { path, .. } if path == "src/main.rs"));
-        assert!(matches!(&parsed.actions[2], FileAction::Delete { path } if path == "obsolete.txt"));
+        assert!(
+            matches!(&parsed.actions[0], FileAction::Add { path, .. } if path == "src/new_file.txt")
+        );
+        assert!(
+            matches!(&parsed.actions[1], FileAction::Update { path, .. } if path == "src/main.rs")
+        );
+        assert!(
+            matches!(&parsed.actions[2], FileAction::Delete { path } if path == "obsolete.txt")
+        );
     }
 
     #[test]
@@ -665,4 +669,3 @@ mod tests {
         );
     }
 }
-

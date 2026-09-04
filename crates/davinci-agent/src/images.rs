@@ -2,8 +2,8 @@
 //! `vendor/pi/packages/coding-agent/src/utils/tool-result-images.ts`.
 
 use base64::Engine;
-use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use davinci_ai::{ChatMessage, MessageContent};
+use image::{imageops::FilterType, DynamicImage, ImageFormat};
 
 pub const IMAGE_READING_DISABLED: &str = "Image reading is disabled.";
 const DEFAULT_MAX_WIDTH: u32 = 2000;

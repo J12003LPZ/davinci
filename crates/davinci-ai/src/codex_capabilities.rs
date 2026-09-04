@@ -1,8 +1,8 @@
 //! Codex Capabilities snapshot and discovery matching §6.1.
 //! Immutable per-lineage snapshot derived from authenticated backend, model metadata, and conservative probes.
 
-use serde::{Deserialize, Serialize};
 use crate::catalog::Model;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,7 +159,8 @@ mod tests {
     #[test]
     fn resolves_oauth_codex_profile() {
         let model = test_model("openai-codex-responses");
-        let caps = CodexCapabilities::resolve(&model, Some("https://chatgpt.com/backend-api"), true);
+        let caps =
+            CodexCapabilities::resolve(&model, Some("https://chatgpt.com/backend-api"), true);
         assert!(caps.responses_items);
         assert!(caps.websocket_transport);
         assert!(caps.incremental_continuation);

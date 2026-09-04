@@ -8,7 +8,7 @@ A Rust reimplementation of the TypeScript agent CLI [`pi`](https://github.com/ea
 
 `vendor/pi` holds the authoritative TypeScript source (~1,169 `.ts` files). It is reference-only — read it constantly, never delete or edit it. `packages/*` holds a handful of stale TypeScript stubs from the early phases; they are not the reference.
 
-Phase plans describing the rewrite are in `docs/superpowers/plans/`.
+Phase plans describing the rewrite are in `docs/superpowers/plans/`. Comprehensive documentation index is in `docs/README.md` and crate architecture is in `crates/README.md`.
 
 ## Commands
 

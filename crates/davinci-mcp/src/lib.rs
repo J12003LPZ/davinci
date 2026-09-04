@@ -426,7 +426,14 @@ mod tests {
                 };
                 let mut build = std::process::Command::new(cargo);
                 build
-                    .args(["build", "-p", "davinci-mcp", "--bin", "mcp-fixture", "--quiet"])
+                    .args([
+                        "build",
+                        "-p",
+                        "davinci-mcp",
+                        "--bin",
+                        "mcp-fixture",
+                        "--quiet",
+                    ])
                     .current_dir(env!("CARGO_MANIFEST_DIR"));
                 if profile == "release" {
                     build.arg("--release");

@@ -149,7 +149,12 @@ impl CodexTransportPool {
     /// Sends `generate: false` request only for new or invalidated request shape
     /// while user-visible work (permissions/tool calls) is already underway.
     /// Never delays user input.
-    pub fn should_send_prewarm(&mut self, account_id: &str, base_url: &str, shape_hash: &str) -> bool {
+    pub fn should_send_prewarm(
+        &mut self,
+        account_id: &str,
+        base_url: &str,
+        shape_hash: &str,
+    ) -> bool {
         let conn = self.get_or_create_connection(account_id, base_url);
         if conn.prewarmed_shape_hash.as_deref() == Some(shape_hash) {
             return false;
@@ -224,8 +229,7 @@ impl CodexTransportPool {
                 return false;
             }
         }
-        self.refreshing_accounts
-            .insert(account_id.to_string(), now);
+        self.refreshing_accounts.insert(account_id.to_string(), now);
         true
     }
 

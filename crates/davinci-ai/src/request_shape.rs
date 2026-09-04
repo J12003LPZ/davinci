@@ -1,8 +1,8 @@
 //! Request-shape and stable-prefix hashing matching §8 and §12.
 //! Detects when model, tool schema, instructions, or permissions invalidate cached provider state.
 
-use sha2::{Digest, Sha256};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestShapeParams<'a> {

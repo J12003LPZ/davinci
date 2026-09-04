@@ -786,7 +786,8 @@ fn complete_simple_summarization(
         return Err("Summarization failed: no credentials".into());
     }
     let options = StreamOptions {
-        thinking_level: if model.reasoning && thinking_level != davinci_protocol::ThinkingLevel::Off {
+        thinking_level: if model.reasoning && thinking_level != davinci_protocol::ThinkingLevel::Off
+        {
             Some(thinking_level)
         } else {
             None
@@ -907,7 +908,8 @@ fn persist_selected_backend(session: &JsonlSession, session_dir: &Path) {
     if backend != "sqlite" {
         return;
     }
-    if let Ok(store) = davinci_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db"))
+    if let Ok(store) =
+        davinci_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db"))
     {
         let _ = store.upsert_session(session);
     }
@@ -1614,9 +1616,15 @@ fn complete_prompt_with_host(
             agent.system_prompt = prompt.clone();
             // An extension's prompt replaces the base, not the mode: plan
             // mode keeps its appendix.
-            if agent.plan_mode && !agent.system_prompt.contains(davinci_agent::PLAN_MODE_APPENDIX) {
+            if agent.plan_mode
+                && !agent
+                    .system_prompt
+                    .contains(davinci_agent::PLAN_MODE_APPENDIX)
+            {
                 agent.system_prompt.push_str("\n\n");
-                agent.system_prompt.push_str(davinci_agent::PLAN_MODE_APPENDIX);
+                agent
+                    .system_prompt
+                    .push_str(davinci_agent::PLAN_MODE_APPENDIX);
             }
             host.runtime_system_prompt = agent.system_prompt.clone();
         }
@@ -2257,10 +2265,12 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     {
         let host = host.lock().unwrap_or_else(|err| err.into_inner());
         for provider in host.registered_providers() {
-            runtime.models.extend(davinci_ai::models_from_provider_config(
-                &provider.name,
-                &provider.config,
-            ));
+            runtime
+                .models
+                .extend(davinci_ai::models_from_provider_config(
+                    &provider.name,
+                    &provider.config,
+                ));
         }
         runtime.invocable_commands = slash::invocable_commands(
             &host
@@ -2486,7 +2496,10 @@ const RPC_APPROVAL_DENY: &str = "deny";
 /// The `select` an RPC client is shown for a permission question. The
 /// "always" row is offered only when the project is trusted, for the same
 /// reason davinci omits it: an untrusted project's settings are never read.
-fn rpc_approval_call(request: &davinci_agent::ToolApprovalRequest, trusted: bool) -> serde_json::Value {
+fn rpc_approval_call(
+    request: &davinci_agent::ToolApprovalRequest,
+    trusted: bool,
+) -> serde_json::Value {
     let mut options = vec![RPC_APPROVAL_ONCE, RPC_APPROVAL_SESSION];
     if trusted {
         options.push(RPC_APPROVAL_ALWAYS);
@@ -3999,7 +4012,9 @@ fn apply_session_action(
         SessionAction::CycleThinking => {
             sync_session_thinking(session, agent);
             if session.supports_thinking {
-                if let Some(level) = davinci_protocol::ThinkingLevel::parse(session.current_thinking()) {
+                if let Some(level) =
+                    davinci_protocol::ThinkingLevel::parse(session.current_thinking())
+                {
                     agent.thinking_level = level;
                 }
             }
@@ -5284,8 +5299,11 @@ fn login_provider_with_wait(
                 println!("Waiting for browser callback on {}", server.redirect_uri()?);
                 let response = server.accept_one()?;
                 if let Some(code) = response.code {
-                    let tokens =
-                        davinci_ai::exchange_authorization_code(provider, &code, request.pkce.as_ref())?;
+                    let tokens = davinci_ai::exchange_authorization_code(
+                        provider,
+                        &code,
+                        request.pkce.as_ref(),
+                    )?;
                     return store_oauth_tokens(&mut storage, provider, tokens);
                 }
                 return Err("OAuth callback did not include an authorization code.".into());
@@ -9477,7 +9495,8 @@ mod tests {
         persist_selected_backend(&session, &session_dir);
         std::env::remove_var("PI_SESSION_BACKEND");
         let store =
-            davinci_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db")).unwrap();
+            davinci_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db"))
+                .unwrap();
         let listed = store.list_sessions(None).unwrap();
         assert!(listed.iter().any(|item| item.id == session.header.id));
     }

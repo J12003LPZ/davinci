@@ -769,11 +769,13 @@ mod tests {
                     Command::Prompt { session_id, text } => {
                         let mut session = server.sessions[&session_id].clone();
                         session.revision = server.revision;
-                        session.transcript.push(davinci_protocol::TranscriptItem::User {
-                            id: format!("u{}", session.revision),
-                            content: vec![davinci_protocol::TextOrImage::Text { text }],
-                            timestamp: session.revision,
-                        });
+                        session
+                            .transcript
+                            .push(davinci_protocol::TranscriptItem::User {
+                                id: format!("u{}", session.revision),
+                                content: vec![davinci_protocol::TextOrImage::Text { text }],
+                                timestamp: session.revision,
+                            });
                         server.sessions.insert(session_id, session.clone());
                         CommandResult::Prompt { session }
                     }

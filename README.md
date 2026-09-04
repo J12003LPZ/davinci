@@ -1,4 +1,4 @@
-# davinci (Rust)
+# Davinci Agent Harness
 
 A terminal coding agent: a product-equivalent Rust rewrite of the TypeScript CLI [`pi`](https://github.com/earendil-works/pi) (vendor pin `853a80d26c90a14c1886f0ebb8ffaae133ca2185`).
 
@@ -241,20 +241,46 @@ Fourteen `sec_*` tools drive the lifecycle (start, scope, progress, candidate re
 
 ---
 
-## Workspace
+## Repository Structure & Navigation
 
-Dependencies flow strictly bottom-up; `davinci-coding-agent` is the only binary.
+The repository is organized into distinct functional domains:
 
-| Crate | Role |
-| --- | --- |
-| `davinci-ai` | providers, auth/OAuth, streaming, model catalog, cost |
-| `davinci-agent` | agent loop, tools, compaction, skills, prompt templates |
-| `davinci-tui` | terminal rendering |
-| `davinci-session` / `davinci-session-sqlite` | JSONL session store, SQLite branch cache |
-| `davinci-protocol` / `davinci-client` / `davinci-server` | length-prefixed CBOR wire format and its endpoints |
-| `davinci-telemetry`, `davinci-evals` | telemetry, evaluation harness |
-| `davinci-parity` | golden fixtures, optional diffing against the TypeScript binary |
-| `davinci-coding-agent` | the `davinci` binary: CLI, davinci shell wiring, extensions, slash commands |
+```
+pi-rust/
+├── crates/             # 13 production Rust crates (the active implementation)
+│   └── README.md       # Crate architecture & dependency guide
+├── docs/               # Architecture specs, plans, UI mockups & security reviews
+│   └── README.md       # Full documentation index & navigation hub
+├── scripts/            # Build & installation scripts (pwsh, bash)
+├── packages/           # Legacy TypeScript monorepo stubs from initial porting
+│   └── README.md       # Legacy package context
+├── vendor/             # Upstream behavioral reference source (vendor/pi)
+├── Cargo.toml          # Cargo workspace root configuration
+├── Makefile            # Standard developer commands (build, test, fmt, clippy)
+├── CLAUDE.md           # Instructions for AI coding assistants
+└── README.md           # Product overview and user documentation
+```
+
+### Workspace Crates
+
+Dependencies flow strictly bottom-up; `davinci-coding-agent` is the primary executable binary. See [`crates/README.md`](crates/README.md) for the detailed architecture.
+
+| Crate | Role | Documentation |
+| :--- | :--- | :--- |
+| `davinci-coding-agent` | CLI entry point (`davinci`), interactive shell, extensions | [`crates/davinci-coding-agent/README.md`](crates/davinci-coding-agent/README.md) |
+| `davinci-agent` | Agent loop, tool execution engine, permissions, scheduler | [`crates/davinci-agent/README.md`](crates/davinci-agent/README.md) |
+| `davinci-ai` | Providers, auth/OAuth, streaming, model catalog, cost | [`crates/davinci-ai/README.md`](crates/davinci-ai/README.md) |
+| `davinci-tui` | Terminal UI (Ratatui), instruments, sheets, themes | [`crates/davinci-tui/README.md`](crates/davinci-tui/README.md) |
+| `davinci-session` | JSONL session store, discovery, turn history | [`crates/davinci-session/README.md`](crates/davinci-session/README.md) |
+| `davinci-session-sqlite` | SQLite branch cache and session indexing | [`crates/davinci-session-sqlite/README.md`](crates/davinci-session-sqlite/README.md) |
+| `davinci-mcp` | Native Model Context Protocol (MCP) client & transports | [`crates/davinci-mcp/README.md`](crates/davinci-mcp/README.md) |
+| `davinci-protocol` | Length-prefixed CBOR wire framing and RPC types | [`crates/davinci-protocol/README.md`](crates/davinci-protocol/README.md) |
+| `davinci-client` | Client SDK for communicating with the agent daemon | [`crates/davinci-client/README.md`](crates/davinci-client/README.md) |
+| `davinci-server` | Standalone background RPC daemon server | [`crates/davinci-server/README.md`](crates/davinci-server/README.md) |
+| `davinci-telemetry` | Telemetry events, OpenTelemetry, metrics | [`crates/davinci-telemetry/README.md`](crates/davinci-telemetry/README.md) |
+| `davinci-evals` | Automated evaluation harness and benchmark runners | [`crates/davinci-evals/README.md`](crates/davinci-evals/README.md) |
+| `davinci-parity` | Golden fixtures and differential parity testing | [`crates/davinci-parity/README.md`](crates/davinci-parity/README.md) |
+
 
 ## Development
 

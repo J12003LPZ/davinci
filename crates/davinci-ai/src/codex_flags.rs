@@ -37,7 +37,10 @@ impl CodexFeatureFlags {
             prewarming: Self::env_bool("PI_CODEX_PREWARMING", true),
             hot_tools: Self::env_bool("PI_CODEX_HOT_TOOLS", true),
             telemetry: Self::env_bool("PI_CODEX_TELEMETRY", true),
-            caching_prefix_optimization: Self::env_bool("PI_CODEX_CACHING_PREFIX_OPTIMIZATION", true),
+            caching_prefix_optimization: Self::env_bool(
+                "PI_CODEX_CACHING_PREFIX_OPTIMIZATION",
+                true,
+            ),
         }
     }
 

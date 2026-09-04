@@ -1223,4 +1223,3 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         assert_eq!(decoder.raw_items()[0]["name"], "read");
     }
 }
-

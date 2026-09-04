@@ -131,7 +131,8 @@ impl PiServer {
                     });
                 }
                 AgentEvent::MessageUpdate {
-                    assistant_message_event: davinci_ai::AssistantMessageEvent::TextDelta { delta, .. },
+                    assistant_message_event:
+                        davinci_ai::AssistantMessageEvent::TextDelta { delta, .. },
                     ..
                 } if !delta.is_empty() => {
                     self.pending_events.push(ServerEvent::SessionProgress {

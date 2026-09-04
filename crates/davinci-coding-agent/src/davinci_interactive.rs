@@ -2620,7 +2620,10 @@ pub fn perform(
             let reload = vec![
                 (
                     State::Done,
-                    format!("keybindings · {} bindings", davinci_tui::get_keybindings().len()),
+                    format!(
+                        "keybindings · {} bindings",
+                        davinci_tui::get_keybindings().len()
+                    ),
                     format!("{keybindings_ms}ms"),
                     None,
                 ),
@@ -3371,7 +3374,9 @@ pub fn run(
                         });
                         if doubled {
                             last_escape = None;
-                            match davinci_tui::DoubleEscapeAction::parse(&model.double_escape_action) {
+                            match davinci_tui::DoubleEscapeAction::parse(
+                                &model.double_escape_action,
+                            ) {
                                 davinci_tui::DoubleEscapeAction::Fork => {
                                     let mut shell = Shell {
                                         parsed,
@@ -4180,12 +4185,12 @@ fn open_settings_sheet(agent: &Agent, model: &mut Model) {
     let dir = crate::default_agent_dir();
     let user = crate::settings::load_settings(&dir);
     let merged = crate::settings::load_merged_settings(&dir, &agent.cwd);
-    let user_list = davinci_tui::interactive_settings_list(&crate::settings::to_interactive_config(
-        &user, "davinci",
-    ));
-    let merged_list = davinci_tui::interactive_settings_list(&crate::settings::to_interactive_config(
-        &merged, "davinci",
-    ));
+    let user_list = davinci_tui::interactive_settings_list(
+        &crate::settings::to_interactive_config(&user, "davinci"),
+    );
+    let merged_list = davinci_tui::interactive_settings_list(
+        &crate::settings::to_interactive_config(&merged, "davinci"),
+    );
     model.settings_rows = merged_list
         .items
         .into_iter()
@@ -5988,7 +5993,8 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
 
     // `prompt` is what writes the user turn to the session file;
     // pushing onto `messages` directly would lose it on restart.
-    let expanded = davinci_agent::expand_user_text(&text, &shell.agent.skills, &shell.agent.templates);
+    let expanded =
+        davinci_agent::expand_user_text(&text, &shell.agent.skills, &shell.agent.templates);
     // A line that is nothing but a `/word` nobody claims — not a
     // command, not an extension's, not a skill or a template, since
     // expansion left it alone — has nothing the model can do with it.

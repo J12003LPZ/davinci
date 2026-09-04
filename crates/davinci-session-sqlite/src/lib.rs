@@ -361,7 +361,9 @@ impl SqliteSessionStore {
         item: &davinci_session::LogItem,
     ) -> Result<(), SessionError> {
         match item {
-            davinci_session::LogItem::Entry { entry, .. } => self.insert_entry(session_id, entry)?,
+            davinci_session::LogItem::Entry { entry, .. } => {
+                self.insert_entry(session_id, entry)?
+            }
             davinci_session::LogItem::Record { record, .. } => {
                 let payload = serde_json::to_string(record).map_err(|err| {
                     SessionError::storage(format!("Unable to encode record: {err}"))
@@ -634,10 +636,12 @@ impl SqliteSessionStore {
             order
                 .into_iter()
                 .filter_map(|lane| {
-                    stored.get(&lane).map(|leaf_id| davinci_session::LanePointer {
-                        lane,
-                        leaf_id: leaf_id.clone(),
-                    })
+                    stored
+                        .get(&lane)
+                        .map(|leaf_id| davinci_session::LanePointer {
+                            lane,
+                            leaf_id: leaf_id.clone(),
+                        })
                 })
                 .collect(),
         );

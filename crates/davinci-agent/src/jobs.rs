@@ -373,7 +373,13 @@ impl JobBook {
                             .lock()
                             .unwrap_or_else(|err| err.into_inner()) = Some(Instant::now());
                     }
-                    drop(shared.stdin.lock().unwrap_or_else(|err| err.into_inner()).take());
+                    drop(
+                        shared
+                            .stdin
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .take(),
+                    );
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -839,9 +845,21 @@ mod tests {
     fn write_stdin_rejects_null_or_closed_stdin() {
         let book = Arc::new(Mutex::new(JobBook::default()));
         // Spawn with Stdio::null()
-        let id = book.lock().unwrap().register("echo null_stdin", spawn("echo null_stdin"));
-        let err = book.lock().unwrap().write_stdin(id, "test input\n").unwrap_err();
-        assert!(err.contains("does not support stdin") || err.contains("already exited") || err.contains("null or closed"), "{err}");
+        let id = book
+            .lock()
+            .unwrap()
+            .register("echo null_stdin", spawn("echo null_stdin"));
+        let err = book
+            .lock()
+            .unwrap()
+            .write_stdin(id, "test input\n")
+            .unwrap_err();
+        assert!(
+            err.contains("does not support stdin")
+                || err.contains("already exited")
+                || err.contains("null or closed"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -850,7 +868,10 @@ mod tests {
         let err = book.lock().unwrap().write_stdin(999, "test").unwrap_err();
         assert!(err.contains("No background job 999"), "{err}");
 
-        let id = book.lock().unwrap().register("echo quick", spawn("echo quick"));
+        let id = book
+            .lock()
+            .unwrap()
+            .register("echo quick", spawn("echo quick"));
         wait_for_exit(&book, id);
         let err_exited = book.lock().unwrap().write_stdin(id, "test").unwrap_err();
         assert!(err_exited.contains("has already exited"), "{err_exited}");
@@ -883,10 +904,17 @@ mod tests {
         };
 
         let book = Arc::new(Mutex::new(JobBook::default()));
-        let id = book.lock().unwrap().register("interactive", spawn_interactive(script));
+        let id = book
+            .lock()
+            .unwrap()
+            .register("interactive", spawn_interactive(script));
 
         // Use stdin_tool to deliver the input
-        let res = stdin_tool(&book, &json!({"job_id": id, "input": "hello_interactive\n"})).unwrap();
+        let res = stdin_tool(
+            &book,
+            &json!({"job_id": id, "input": "hello_interactive\n"}),
+        )
+        .unwrap();
         assert!(res.content.contains("Sent"));
         assert!(!res.is_error);
 

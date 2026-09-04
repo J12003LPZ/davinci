@@ -83,7 +83,8 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(max_frame_length: Option<u64>) -> Result<Self, ClientError> {
-        let value = max_frame_length.unwrap_or(u64::from(davinci_protocol::DEFAULT_MAX_FRAME_LENGTH));
+        let value =
+            max_frame_length.unwrap_or(u64::from(davinci_protocol::DEFAULT_MAX_FRAME_LENGTH));
         if value == 0 || value > MAX_UINT32 {
             return Err(ClientError::Protocol(format!(
                 "PiClient maxFrameLength must be an integer between 1 and {MAX_UINT32}"

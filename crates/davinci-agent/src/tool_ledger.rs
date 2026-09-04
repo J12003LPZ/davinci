@@ -1,12 +1,12 @@
 //! Exactly-once tool-call ledger matching §9.
 //! Prevents duplicate side effects during transport recovery, reconnects, or continuation replay.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,9 +58,7 @@ pub fn normalize_arguments(args: &Value) -> Value {
             }
             Value::Object(obj)
         }
-        Value::Array(arr) => {
-            Value::Array(arr.iter().map(normalize_arguments).collect())
-        }
+        Value::Array(arr) => Value::Array(arr.iter().map(normalize_arguments).collect()),
         other => other.clone(),
     }
 }
@@ -174,7 +172,9 @@ impl ToolCallLedger {
         }
         if rec.status == ToolExecutionStatus::Completed {
             Ok(rec.output.clone().map(|out| (out, rec.is_error)))
-        } else if rec.status == ToolExecutionStatus::Failed || rec.status == ToolExecutionStatus::Blocked {
+        } else if rec.status == ToolExecutionStatus::Failed
+            || rec.status == ToolExecutionStatus::Blocked
+        {
             Ok(rec.output.clone().map(|out| (out, true)))
         } else {
             Ok(None)
@@ -258,12 +258,10 @@ impl ToolCallLedger {
             match rec.status {
                 ToolExecutionStatus::Completed
                 | ToolExecutionStatus::Failed
-                | ToolExecutionStatus::Blocked => {
-                    BeginOutcome::Replay {
-                        output: rec.output.clone().unwrap_or_default(),
-                        is_error: rec.is_error,
-                    }
-                }
+                | ToolExecutionStatus::Blocked => BeginOutcome::Replay {
+                    output: rec.output.clone().unwrap_or_default(),
+                    is_error: rec.is_error,
+                },
                 ToolExecutionStatus::Executing => BeginOutcome::WaitForInFlight,
                 ToolExecutionStatus::Pending => {
                     rec.status = ToolExecutionStatus::Executing;
@@ -339,15 +337,11 @@ impl ToolCallLedger {
         let arg_digest = canonical_arguments_digest(arguments);
         if let Some(entry) = self.records.get_mut(call_id) {
             // Preserve terminal results without allowing record_start to overwrite them!
-            match entry.status {
-                ToolExecutionStatus::Completed
-                | ToolExecutionStatus::Failed
-                | ToolExecutionStatus::Blocked => {
-                    return;
-                }
-                ToolExecutionStatus::Pending | ToolExecutionStatus::Executing => {
-                    entry.status = ToolExecutionStatus::Executing;
-                }
+            if matches!(
+                entry.status,
+                ToolExecutionStatus::Pending | ToolExecutionStatus::Executing
+            ) {
+                entry.status = ToolExecutionStatus::Executing;
             }
         } else {
             self.records.insert(
@@ -415,9 +409,15 @@ mod tests {
         assert_eq!(classify_side_effect("grep"), ToolSideEffect::ReadOnly);
         assert_eq!(classify_side_effect("find"), ToolSideEffect::ReadOnly);
         assert_eq!(classify_side_effect("ls"), ToolSideEffect::ReadOnly);
-        assert_eq!(classify_side_effect("apply_patch"), ToolSideEffect::Mutating);
+        assert_eq!(
+            classify_side_effect("apply_patch"),
+            ToolSideEffect::Mutating
+        );
         assert_eq!(classify_side_effect("bash"), ToolSideEffect::Mutating);
-        assert_eq!(classify_side_effect("exec_command"), ToolSideEffect::Mutating);
+        assert_eq!(
+            classify_side_effect("exec_command"),
+            ToolSideEffect::Mutating
+        );
     }
 
     #[test]
@@ -540,9 +540,8 @@ mod tests {
 
         // Spawn a thread waiting on the in-flight call
         let l2 = Arc::clone(&ledger);
-        let handle = std::thread::spawn(move || {
-            ToolCallLedger::wait_for_terminal(&l2, call_id, None)
-        });
+        let handle =
+            std::thread::spawn(move || ToolCallLedger::wait_for_terminal(&l2, call_id, None));
 
         // Small sleep to ensure follower thread is waiting
         std::thread::sleep(Duration::from_millis(50));
@@ -558,4 +557,3 @@ mod tests {
         assert_eq!(res, ("hi\n".to_string(), false));
     }
 }
-
