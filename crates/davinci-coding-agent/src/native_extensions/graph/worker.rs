@@ -353,6 +353,15 @@ pub fn run_worker(
             ..WorkerResult::default()
         };
     };
+    let cache_key = crate::native_extensions::ecosystem::cache_affinity::derive_worker_cache_key(
+        &spec.cwd.to_string_lossy(),
+        1,
+        spec.role,
+        spec.model.as_deref(),
+        &spec.tools,
+        &spec.system_prompt,
+        spec.expect,
+    );
     let mut command = Command::new(executable);
     command
         .args(build_worker_args(spec, &briefing_file, &system_prompt_file))
@@ -360,7 +369,8 @@ pub fn run_worker(
         .env("PI_GRAPH_ROLE", spec.role.as_str())
         .env("PI_GRAPH_EXPECT", spec.expect.as_str())
         .env("PI_GRAPH_ARTIFACT_PATH", &spec.artifact_path)
-        .env("PI_GRAPH_EXTRA_TOOLS", spec.tools.join(","));
+        .env("PI_GRAPH_EXTRA_TOOLS", spec.tools.join(","))
+        .env("PI_GRAPH_CACHE_KEY", &cache_key);
 
     if let Some(path) = &spec.transcript_path {
         let model = spec
@@ -932,5 +942,46 @@ mod tests {
             validate_artifact(*kind, &value)
                 .unwrap_or_else(|errors| panic!("{kind} canned artifact invalid: {errors:?}"));
         }
+    }
+
+    #[test]
+    fn worker_args_and_env_establish_cache_affinity_without_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let briefing_file = dir.path().join("briefing.md");
+        let system_file = dir.path().join("system.md");
+        let mut test_spec = spec();
+        test_spec.tools = vec!["read".into(), "grep".into(), "graph_submit".into()];
+        let args = build_worker_args(&test_spec, &briefing_file, &system_file);
+
+        // Child process must be explicitly told not to create or persist sessions
+        assert!(args.contains(&"--no-session".to_string()));
+        assert!(args.contains(&"--no-skills".to_string()));
+        assert!(args.contains(&"--no-extensions".to_string()));
+
+        // Derive the cache key for this spec
+        let key = crate::native_extensions::ecosystem::cache_affinity::derive_worker_cache_key(
+            &test_spec.cwd.to_string_lossy(),
+            1,
+            test_spec.role,
+            test_spec.model.as_deref(),
+            &test_spec.tools,
+            &test_spec.system_prompt,
+            test_spec.expect,
+        );
+        assert!(!key.is_empty());
+        assert!(key.starts_with("gw-reviewer-"));
+
+        // Simulate the child worker environment where PI_GRAPH_CACHE_KEY is passed
+        let simulated_options = davinci_ai::StreamOptions {
+            session_id: None, // Because child has --no-session
+            cache_key: Some(key.clone()),
+            ..davinci_ai::StreamOptions::default()
+        };
+        assert_eq!(simulated_options.session_id, None);
+        assert_eq!(simulated_options.cache_key.as_deref(), Some(key.as_str()));
+        assert_eq!(
+            davinci_ai::cache::effective_prompt_cache_key(&simulated_options),
+            Some(key.as_str())
+        );
     }
 }

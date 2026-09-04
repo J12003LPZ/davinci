@@ -33,6 +33,7 @@ pub struct StreamOptions {
     pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
+#[allow(unused_imports)]
 pub use crate::cache::effective_prompt_cache_key;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

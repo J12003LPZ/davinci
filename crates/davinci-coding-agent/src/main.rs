@@ -1790,7 +1790,9 @@ fn complete_prompt_with_host(
                                 .session
                                 .as_ref()
                                 .map(|session| session.header.id.clone()),
-                            cache_key: None,
+                            cache_key: std::env::var("PI_GRAPH_CACHE_KEY")
+                                .ok()
+                                .filter(|s| !s.is_empty()),
                             cache_retention: None,
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
