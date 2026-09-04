@@ -164,6 +164,10 @@ pub struct LearningStats {
     pub skills_retrieved: u64,
     pub verified_skill_successes: u64,
     pub verified_skill_failures: u64,
+    #[serde(default)]
+    pub reviews_skipped: u64,
+    #[serde(default)]
+    pub reviews_dispatched: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -133,6 +133,13 @@ impl LearningController {
             return None;
         }
 
+        if !should_review_evidence(&evidence) {
+            self.stats.reviews_skipped += 1;
+            return None;
+        }
+
+        self.stats.reviews_dispatched += 1;
+
         self.cancel_active_review();
 
         let run = ReviewRun::new(format!("rev-{}", evidence.turn));
@@ -1648,5 +1655,77 @@ mod tests {
         assert!(notifs
             .iter()
             .any(|n| n.contains("auto-promoted after verified uses")));
+    }
+
+    #[test]
+    fn test_read_only_turn_skips_learning_review_zero_completer_calls() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let config = LearningConfig {
+            enabled: true,
+            background_review: true,
+            shadow_mode: false,
+            auto_apply_project: true,
+            ..Default::default()
+        };
+
+        // If review were invoked, fixture would create a candidate, but it must be skipped
+        std::env::set_var(
+            "PI_LEARNING_REVIEW_FIXTURE",
+            json!({
+                "candidates": [{
+                    "scope": "project",
+                    "confidence": 0.9,
+                    "rationale": "should never be created",
+                    "artifact": {
+                        "kind": "skill_create",
+                        "name": "ghost-skill",
+                        "description": "should not exist",
+                        "body": "ghost"
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
+        let read_only_evidence = LearningEvidence {
+            session_id: "sess-readonly".into(),
+            repo_id: "repo-readonly".into(),
+            turn: 1,
+            messages: vec![
+                MemoryMessage {
+                    role: "user".into(),
+                    content: "how does the architecture work?".into(),
+                },
+                MemoryMessage {
+                    role: "assistant".into(),
+                    content: "it is composed of nodes and edges".into(),
+                },
+            ],
+            tools: vec![ToolEvidence {
+                name: "view_file".into(),
+                is_error: false,
+                args_summary: "src/lib.rs".into(),
+                result_summary: "code".into(),
+                permission_denied: false,
+            }],
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence::default(),
+        };
+
+        let run_id = controller.review_settled_turn(read_only_evidence);
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+
+        assert!(run_id.is_none());
+        assert_eq!(controller.stats.reviews_skipped, 1);
+        assert_eq!(controller.stats.reviews_dispatched, 0);
+        assert_eq!(controller.stats.reviews_started, 0);
+        assert_eq!(controller.project_store.candidates().len(), 0);
+        assert!(!controller
+            .project_skills_dir
+            .join("ghost-skill")
+            .join("SKILL.md")
+            .exists());
     }
 }

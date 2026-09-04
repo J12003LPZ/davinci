@@ -172,6 +172,90 @@ pub fn build_learning_evidence(input: BuildEvidenceInput<'_>) -> LearningEvidenc
     }
 }
 
+pub fn should_review_evidence(evidence: &LearningEvidence) -> bool {
+    // 1. Explicit /learn request
+    if evidence.messages.iter().any(|m| {
+        m.role == "user"
+            && (m.content.contains("/learn") || m.content.to_lowercase().starts_with("learn:"))
+    }) {
+        return true;
+    }
+
+    // 2. User correction or rejection signal exists
+    if evidence.verification.user_corrected || evidence.verification.permission_denied {
+        return true;
+    }
+    if evidence.messages.iter().any(|m| {
+        if m.role == "user" {
+            let lower = m.content.to_lowercase();
+            lower.contains("that's wrong")
+                || lower.contains("thats wrong")
+                || lower.contains("no, don't")
+                || lower.contains("no, that is not")
+                || lower.starts_with("correction:")
+                || lower.contains("revert")
+                || lower.contains("undo")
+        } else {
+            false
+        }
+    }) {
+        return true;
+    }
+
+    // 3. Graph run completed or failed
+    if evidence.verification.graph_run_id.is_some()
+        || evidence.tools.iter().any(|t| t.name == "graph_run")
+    {
+        return true;
+    }
+
+    // 4. Deterministic verification commands ran
+    if evidence.verification.commands_ran > 0 {
+        return true;
+    }
+
+    // 5. Injected skill received verified outcome
+    if evidence.verification.user_accepted {
+        return true;
+    }
+    if evidence
+        .messages
+        .iter()
+        .any(|m| m.content.contains("<skill name="))
+        && (evidence.verification.commands_ran > 0 || evidence.verification.passed)
+    {
+        return true;
+    }
+
+    // 6. Files mutated (non-error mutating tool calls)
+    let mutating_tool_executed = evidence.tools.iter().any(|t| {
+        if t.is_error {
+            return false;
+        }
+        let lower = t.name.to_lowercase();
+        lower.contains("write")
+            || lower.contains("edit")
+            || lower.contains("patch")
+            || lower.contains("create")
+            || lower.contains("delete")
+            || lower.contains("modify")
+            || lower.contains("append")
+            || lower.contains("replace")
+            || lower == "save"
+    });
+    if mutating_tool_executed {
+        return true;
+    }
+
+    // 7. Repeated tool failures meet failure-lesson threshold (>= 2 failed tools)
+    let failed_tools = evidence.tools.iter().filter(|t| t.is_error).count();
+    if failed_tools >= 2 {
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +352,162 @@ mod tests {
         let ev4 = verification_evidence_from_graph(None, Some(&res4));
         assert!(!ev4.passed);
         assert_eq!(ev4.commands_ran, 1);
+    }
+
+    struct ReviewGateCase {
+        name: &'static str,
+        evidence: LearningEvidence,
+        expected: bool,
+    }
+
+    fn review_gate_cases() -> Vec<ReviewGateCase> {
+        let base = || LearningEvidence {
+            session_id: "s1".into(),
+            repo_id: "r1".into(),
+            turn: 1,
+            messages: vec![
+                MemoryMessage {
+                    role: "user".into(),
+                    content: "explain how foo works".into(),
+                },
+                MemoryMessage {
+                    role: "assistant".into(),
+                    content: "foo is a utility function".into(),
+                },
+            ],
+            tools: vec![ToolEvidence {
+                name: "view_file".into(),
+                is_error: false,
+                args_summary: "foo.rs".into(),
+                result_summary: "content".into(),
+                permission_denied: false,
+            }],
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence::default(),
+        };
+
+        vec![
+            ReviewGateCase {
+                name: "read_only_explanatory_turn_skipped",
+                evidence: base(),
+                expected: false,
+            },
+            ReviewGateCase {
+                name: "files_mutated_dispatches",
+                evidence: {
+                    let mut e = base();
+                    e.tools.push(ToolEvidence {
+                        name: "write_to_file".into(),
+                        is_error: false,
+                        args_summary: "bar.rs".into(),
+                        result_summary: "written".into(),
+                        permission_denied: false,
+                    });
+                    e
+                },
+                expected: true,
+            },
+            ReviewGateCase {
+                name: "deterministic_verification_ran_dispatches",
+                evidence: {
+                    let mut e = base();
+                    e.verification.commands_ran = 1;
+                    e
+                },
+                expected: true,
+            },
+            ReviewGateCase {
+                name: "graph_run_dispatches",
+                evidence: {
+                    let mut e = base();
+                    e.verification.graph_run_id = Some("run-42".into());
+                    e
+                },
+                expected: true,
+            },
+            ReviewGateCase {
+                name: "injected_skill_verified_dispatches",
+                evidence: {
+                    let mut e = base();
+                    e.messages.push(MemoryMessage {
+                        role: "user".into(),
+                        content: "use <skill name=\"debug-sqlx\"/>".into(),
+                    });
+                    e.verification.passed = true;
+                    e
+                },
+                expected: true,
+            },
+            ReviewGateCase {
+                name: "user_correction_dispatches",
+                evidence: {
+                    let mut e = base();
+                    e.verification.user_corrected = true;
+                    e
+                },
+                expected: true,
+            },
+            ReviewGateCase {
+                name: "repeated_tool_failures_dispatches",
+                evidence: {
+                    let mut e = base();
+                    e.tools.push(ToolEvidence {
+                        name: "bash".into(),
+                        is_error: true,
+                        args_summary: "cmd1".into(),
+                        result_summary: "err1".into(),
+                        permission_denied: false,
+                    });
+                    e.tools.push(ToolEvidence {
+                        name: "bash".into(),
+                        is_error: true,
+                        args_summary: "cmd2".into(),
+                        result_summary: "err2".into(),
+                        permission_denied: false,
+                    });
+                    e
+                },
+                expected: true,
+            },
+            ReviewGateCase {
+                name: "single_tool_failure_without_other_signal_skipped",
+                evidence: {
+                    let mut e = base();
+                    e.tools.push(ToolEvidence {
+                        name: "bash".into(),
+                        is_error: true,
+                        args_summary: "cmd1".into(),
+                        result_summary: "err1".into(),
+                        permission_denied: false,
+                    });
+                    e
+                },
+                expected: false,
+            },
+            ReviewGateCase {
+                name: "explicit_learn_request_dispatches",
+                evidence: {
+                    let mut e = base();
+                    e.messages.push(MemoryMessage {
+                        role: "user".into(),
+                        content: "/learn save this pattern".into(),
+                    });
+                    e
+                },
+                expected: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn learning_review_gate_matches_durable_signal_policy() {
+        for case in review_gate_cases() {
+            assert_eq!(
+                should_review_evidence(&case.evidence),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
     }
 }
