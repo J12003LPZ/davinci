@@ -375,6 +375,7 @@ dependencies = [
  "davinci-telemetry",
  "davinci-tui",
  "image",
+ "libc",
  "regex",
  "serde",
  "serde_json",
