@@ -51,13 +51,7 @@ impl<'a> ContextPacketRequest<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillContextRef {
-    pub name: String,
-    pub version: u64,
-    pub content_hash: String,
-}
+pub use crate::native_extensions::learning::types::SkillVersionRef as SkillContextRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]

@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::native_extensions::learning::types::{
-    ArtifactStatus, LearningCandidate, SkillLedgerRecord, SkillOutcome,
+    ArtifactStatus, LearningCandidate, SkillLedgerRecord, SkillOutcome, SkillVersionRef,
 };
 
 #[derive(Debug, Clone)]
@@ -12,6 +12,7 @@ pub struct LearningStore {
     root: PathBuf,
     candidates: BTreeMap<String, LearningCandidate>,
     skills: BTreeMap<String, SkillLedgerRecord>,
+    skill_versions: BTreeMap<(String, u64), SkillLedgerRecord>,
     #[allow(dead_code)]
     diagnostics: Vec<String>,
 }
@@ -24,7 +25,8 @@ impl LearningStore {
         }
 
         let mut candidates = BTreeMap::new();
-        let mut skills = BTreeMap::new();
+        let mut skills: BTreeMap<String, SkillLedgerRecord> = BTreeMap::new();
+        let mut skill_versions = BTreeMap::new();
         let mut diagnostics = Vec::new();
 
         let candidates_path = root.join("candidates.jsonl");
@@ -61,7 +63,15 @@ impl LearningStore {
                     }
                     match serde_json::from_str::<SkillLedgerRecord>(trimmed) {
                         Ok(skill) => {
-                            skills.insert(skill.name.clone(), skill);
+                            skill_versions
+                                .insert((skill.name.clone(), skill.version as u64), skill.clone());
+                            if let Some(existing) = skills.get(&skill.name) {
+                                if skill.version >= existing.version {
+                                    skills.insert(skill.name.clone(), skill);
+                                }
+                            } else {
+                                skills.insert(skill.name.clone(), skill);
+                            }
                         }
                         Err(err) => {
                             diagnostics.push(format!(
@@ -79,6 +89,7 @@ impl LearningStore {
             root,
             candidates,
             skills,
+            skill_versions,
             diagnostics,
         })
     }
@@ -146,7 +157,15 @@ impl LearningStore {
     }
 
     pub fn upsert_skill(&mut self, skill: SkillLedgerRecord) -> Result<(), String> {
-        self.skills.insert(skill.name.clone(), skill.clone());
+        self.skill_versions
+            .insert((skill.name.clone(), skill.version as u64), skill.clone());
+        if let Some(existing) = self.skills.get(&skill.name) {
+            if skill.version >= existing.version {
+                self.skills.insert(skill.name.clone(), skill.clone());
+            }
+        } else {
+            self.skills.insert(skill.name.clone(), skill.clone());
+        }
         let skills_path = self.root.join("skills.jsonl");
         let line = serde_json::to_string(&skill).map_err(|e| e.to_string())?;
         let mut file = OpenOptions::new()
@@ -158,6 +177,10 @@ impl LearningStore {
             .map_err(|e| format!("failed to append to {:?}: {}", skills_path, e))?;
         let _ = self.save_state();
         Ok(())
+    }
+
+    pub fn skill_version(&self, name: &str, version: u64) -> Option<&SkillLedgerRecord> {
+        self.skill_versions.get(&(name.to_string(), version))
     }
 
     pub fn record_skill_outcome(
@@ -184,6 +207,45 @@ impl LearningStore {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    pub fn record_skill_version_outcome(
+        &mut self,
+        skill: &SkillVersionRef,
+        outcome: SkillOutcome,
+    ) -> Result<(), String> {
+        let key = (skill.name.clone(), skill.version);
+        if let Some(mut record) = self.skill_versions.get(&key).cloned() {
+            if record.content_hash != skill.content_hash {
+                self.diagnostics.push(format!(
+                    "skill version content hash mismatch for {}: expected {}, found {}",
+                    skill.name, skill.content_hash, record.content_hash
+                ));
+                return Ok(());
+            }
+            match outcome {
+                SkillOutcome::VerifiedSuccess => {
+                    record.success_count += 1;
+                }
+                SkillOutcome::VerifiedFailure => {
+                    record.failure_count += 1;
+                }
+                SkillOutcome::Neutral => {
+                    record.neutral_count += 1;
+                }
+            }
+            let now = crate::native_extensions::learning::types::now_ms();
+            record.last_used_at_ms = Some(now);
+            record.updated_at_ms = now;
+            self.upsert_skill(record)?;
+            Ok(())
+        } else {
+            self.diagnostics.push(format!(
+                "skill version not found for outcome: {} v{}",
+                skill.name, skill.version
+            ));
+            Ok(())
         }
     }
 
@@ -239,7 +301,7 @@ impl LearningStore {
                 .truncate(true)
                 .open(&skills_tmp)
                 .map_err(|e| format!("failed to open {:?}: {}", skills_tmp, e))?;
-            for sk in self.skills.values() {
+            for sk in self.skill_versions.values() {
                 let line = serde_json::to_string(sk).map_err(|e| e.to_string())?;
                 writeln!(file, "{}", line).map_err(|e| format!("failed to write line: {}", e))?;
             }
@@ -279,7 +341,15 @@ impl LearningStore {
                         continue;
                     }
                     if let Ok(skill) = serde_json::from_str::<SkillLedgerRecord>(trimmed) {
-                        self.skills.insert(skill.name.clone(), skill);
+                        self.skill_versions
+                            .insert((skill.name.clone(), skill.version as u64), skill.clone());
+                        if let Some(existing) = self.skills.get(&skill.name) {
+                            if skill.version >= existing.version {
+                                self.skills.insert(skill.name.clone(), skill);
+                            }
+                        } else {
+                            self.skills.insert(skill.name.clone(), skill);
+                        }
                     }
                 }
             }
@@ -287,7 +357,6 @@ impl LearningStore {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
     }
@@ -442,5 +511,95 @@ mod tests {
         store.upsert_candidate(c2).unwrap();
         store2.reload().unwrap();
         assert!(store2.candidate("cand-2").is_some());
+    }
+
+    #[test]
+    fn skill_version_outcome_attribution_only_affects_targeted_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        let v1 = SkillLedgerRecord {
+            skill_id: "skill-refactor".into(),
+            name: "refactor".into(),
+            scope: LearningScope::Project,
+            origin: crate::native_extensions::learning::types::SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Active,
+            path: dir.path().join("SKILL.md"),
+            content_hash: "hash-v1".into(),
+            version: 1,
+            success_count: 0,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            pinned: false,
+        };
+        let v2 = SkillLedgerRecord {
+            skill_id: "skill-refactor".into(),
+            name: "refactor".into(),
+            scope: LearningScope::Project,
+            origin: crate::native_extensions::learning::types::SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Active,
+            path: dir.path().join("SKILL.md"),
+            content_hash: "hash-v2".into(),
+            version: 2,
+            success_count: 0,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 2000,
+            updated_at_ms: 2000,
+            pinned: false,
+        };
+        store.upsert_skill(v1).unwrap();
+        store.upsert_skill(v2).unwrap();
+
+        let v1_ref = SkillVersionRef {
+            name: "refactor".into(),
+            version: 1,
+            content_hash: "hash-v1".into(),
+        };
+
+        store
+            .record_skill_version_outcome(&v1_ref, SkillOutcome::VerifiedSuccess)
+            .unwrap();
+
+        let rec_v1 = store.skill_version("refactor", 1).unwrap();
+        assert_eq!(rec_v1.success_count, 1);
+        assert_eq!(rec_v1.failure_count, 0);
+
+        let rec_v2 = store.skill_version("refactor", 2).unwrap();
+        assert_eq!(rec_v2.success_count, 0);
+        assert_eq!(rec_v2.failure_count, 0);
+
+        // Hash mismatch records diagnostic and does not attribute to newer or older version
+        let mismatched_ref = SkillVersionRef {
+            name: "refactor".into(),
+            version: 2,
+            content_hash: "wrong-hash".into(),
+        };
+        store
+            .record_skill_version_outcome(&mismatched_ref, SkillOutcome::VerifiedSuccess)
+            .unwrap();
+        let rec_v2_after = store.skill_version("refactor", 2).unwrap();
+        assert_eq!(rec_v2_after.success_count, 0);
+        assert!(store
+            .diagnostics()
+            .iter()
+            .any(|d| d.contains("content hash mismatch")));
+
+        // Non-existent version
+        let missing_ref = SkillVersionRef {
+            name: "refactor".into(),
+            version: 99,
+            content_hash: "hash-99".into(),
+        };
+        store
+            .record_skill_version_outcome(&missing_ref, SkillOutcome::VerifiedSuccess)
+            .unwrap();
+        assert!(store
+            .diagnostics()
+            .iter()
+            .any(|d| d.contains("not found for outcome")));
     }
 }

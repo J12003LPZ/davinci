@@ -147,6 +147,7 @@ enum Delivery {
 pub struct GraphExecution {
     run: Mutex<GraphRun>,
     deps: ControllerDeps,
+    pub learning: Mutex<Option<crate::native_extensions::LearningController>>,
     options: RunOptions,
     /// Watched by every child process: the operator's abort, a budget abort,
     /// or a session shutdown all funnel here.
@@ -396,17 +397,24 @@ impl GraphExecution {
             }
         }
 
-        let context_packet = match (&self.deps.memory, &self.deps.learning) {
-            (Some(mem), Some(learn)) => {
-                let req = crate::native_extensions::ecosystem::ContextPacketRequest::new(&briefing)
-                    .with_role(role)
-                    .with_token_cap(
-                        crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
-                    )
-                    .with_skills(true);
-                crate::native_extensions::ecosystem::build_context_packet(mem, learn, req)
+        let context_packet = {
+            let guard = self
+                .learning
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match (&self.deps.memory, guard.as_ref()) {
+                (Some(mem), Some(learn)) => {
+                    let req =
+                        crate::native_extensions::ecosystem::ContextPacketRequest::new(&briefing)
+                            .with_role(role)
+                            .with_token_cap(
+                                crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
+                            )
+                            .with_skills(true);
+                    crate::native_extensions::ecosystem::build_context_packet(mem, learn, req)
+                }
+                _ => crate::native_extensions::ecosystem::ContextPacket::empty(),
             }
-            _ => crate::native_extensions::ecosystem::ContextPacket::empty(),
         };
 
         {
@@ -648,6 +656,57 @@ impl GraphExecution {
         self.checkpoint(Some("cancelled"));
         true
     }
+
+    pub fn record_skill_outcomes(&self, run: &GraphRun) {
+        let Some(ref verification) = run.verification else {
+            return;
+        };
+        let mut guard = self.learning.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(learning) = guard.as_mut() else {
+            return;
+        };
+
+        let changed_files: Vec<String> = run
+            .tasks
+            .iter()
+            .filter_map(|t| t.artifact_file.clone())
+            .collect();
+        let bundle = verification.to_bundle(
+            changed_files,
+            Some(run.run_id.clone()),
+            crate::native_extensions::ecosystem::verification::SecurityVerification::NotRequired,
+        );
+
+        let outcome = if bundle.commands_ran > 0
+            && bundle.approval_eligible(
+                crate::native_extensions::ecosystem::verification::SecurityPolicyMode::Risk,
+            )
+            && run.phase == Phase::Done
+        {
+            crate::native_extensions::learning::types::SkillOutcome::VerifiedSuccess
+        } else if bundle.commands_ran > 0
+            && (!bundle.deterministic_passed || bundle.commands_failed > 0)
+        {
+            crate::native_extensions::learning::types::SkillOutcome::VerifiedFailure
+        } else {
+            crate::native_extensions::learning::types::SkillOutcome::Neutral
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        for task in &run.tasks {
+            for s in &task.skill_refs {
+                let key = (s.name.clone(), s.version, s.content_hash.clone());
+                if seen.insert(key) {
+                    let version_ref = crate::native_extensions::learning::types::SkillVersionRef {
+                        name: s.name.clone(),
+                        version: s.version,
+                        content_hash: s.content_hash.clone(),
+                    };
+                    let _ = learning.record_skill_version_outcome(&version_ref, outcome);
+                }
+            }
+        }
+    }
 }
 
 /// Mirror the operator's abort into the execution flag so children stop even
@@ -710,9 +769,11 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         Arc::clone(&finished),
     );
 
+    let learning = Mutex::new(deps.learning.clone());
     let execution = GraphExecution {
         run: Mutex::new(run),
         deps,
+        learning,
         options,
         exec_abort,
         budget_abort_reason: Mutex::new(None),
@@ -722,6 +783,7 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
     let result = drive(&execution);
     finished.store(true, Ordering::Relaxed);
     let _ = watcher.join();
+    execution.record_skill_outcomes(&result);
     result
 }
 
@@ -1354,7 +1416,7 @@ fn deliver_goal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_extensions::graph::types::WorkerResult;
+    use crate::native_extensions::graph::types::*;
 
     #[test]
     fn graph_deadline_controller_aborts_run_when_worker_exceeds_deadline() {
@@ -1539,5 +1601,185 @@ mod tests {
         assert!(coverage
             .missing_chunk_ids()
             .contains(&"code.rs#chunk-0".to_string()));
+    }
+
+    #[test]
+    fn graph_skill_outcome_attributed_to_injected_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let learning_dir = dir.path().join(".pi").join("learning");
+        std::fs::create_dir_all(&learning_dir).unwrap();
+        let mut learning =
+            crate::native_extensions::LearningController::new(dir.path(), None, None);
+
+        let skill_v1 = crate::native_extensions::learning::types::SkillLedgerRecord {
+            skill_id: "skill-fix".into(),
+            name: "fix-skill".into(),
+            scope: crate::native_extensions::learning::types::LearningScope::Project,
+            origin: crate::native_extensions::learning::types::SkillOrigin::LearnedReview,
+            status: crate::native_extensions::learning::types::ArtifactStatus::Active,
+            path: dir.path().join("SKILL.md"),
+            content_hash: "hash-v1".into(),
+            version: 1,
+            success_count: 0,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            pinned: false,
+        };
+        learning.project_store.upsert_skill(skill_v1).unwrap();
+
+        let verify_exec: Arc<VerifyExec> = Arc::new(|_, _, _, _| (0, "ok".to_string(), 10));
+        let runner: Arc<WorkerRunner> = Arc::new(|spec, _, _| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Bug,
+                    complexity: Complexity::Trivial,
+                    rationale: "fix".into(),
+                    research_tasks: vec![],
+                    milestones: None,
+                }),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![],
+                    tests_to_add: vec![],
+                    tests_to_run: vec!["cargo test".into()],
+                    completion_criteria: vec![],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => Artifact::PatchReport(Box::new(PatchReport {
+                    changed_files: vec!["main.rs".into()],
+                    summary: "ok".into(),
+                    deviations: vec![],
+                    plan_invalidated: false,
+                    invalidation_reason: None,
+                })),
+                _ => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "ok".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+            };
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec,
+            config: GraphConfig {
+                verify_commands: vec![crate::native_extensions::graph::types::VerifyCommandSpec {
+                    command: "cargo test".into(),
+                    name: "test".into(),
+                    from_plan: false,
+                }],
+                ..Default::default()
+            },
+            session_model: None,
+            session_thinking: None,
+            project_trusted: true,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: Some(learning),
+            governor: None,
+        };
+
+        let options = RunOptions {
+            goal: "fix a bug".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: Some(Complexity::Trivial),
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+
+        let execution = GraphExecution {
+            run: Mutex::new(GraphRun {
+                version: 1,
+                run_id: "test-run-1".into(),
+                goal: options.goal.clone(),
+                cwd: options.cwd.to_string_lossy().into_owned(),
+                phase: Phase::Done,
+                forced: options.forced,
+                dry_run: options.dry_run,
+                definition: None,
+                classification: None,
+                milestones: None,
+                current_milestone: None,
+                tasks: vec![GraphTaskState {
+                    id: "task-1".into(),
+                    role: Role::Writer,
+                    expect: ArtifactKind::PatchReport,
+                    depends_on: vec![],
+                    focus: None,
+                    status: TaskStatus::Succeeded,
+                    attempts: 1,
+                    artifact_file: Some("main.rs".into()),
+                    error: None,
+                    usage: WorkerUsage::default(),
+                    started_at: None,
+                    ended_at: None,
+                    last_activity: None,
+                    fingerprint: None,
+                    mutation: None,
+                    context_fingerprint: None,
+                    context_tokens: 100,
+                    memory_refs: vec![],
+                    skill_refs: vec![crate::native_extensions::ecosystem::SkillContextRef {
+                        name: "fix-skill".into(),
+                        version: 1,
+                        content_hash: "hash-v1".into(),
+                    }],
+                }],
+                verification: Some(VerificationResult {
+                    passed: true,
+                    commands: vec![
+                        crate::native_extensions::graph::types::VerificationCommandResult {
+                            name: "test".into(),
+                            command: "cargo test".into(),
+                            exit_code: 0,
+                            duration_ms: 10,
+                            output_tail: "ok".into(),
+                            skipped: false,
+                        },
+                    ],
+                }),
+                review_coverage: None,
+                budgets: GraphBudgets::default(),
+                counters: GraphCounters {
+                    workers_spawned: 1,
+                    revision_cycles: 0,
+                    replans: 0,
+                    cost_usd: 0.0,
+                    started_at: now_ms(),
+                },
+                blocked_reason: None,
+                resource_snapshot: None,
+                updated_at: 0,
+            }),
+            learning: Mutex::new(deps.learning.clone()),
+            deps,
+            options,
+            exec_abort: Arc::new(AtomicBool::new(false)),
+            budget_abort_reason: Mutex::new(None),
+            run_deadline: None,
+        };
+
+        let snapshot = execution.snapshot();
+        execution.record_skill_outcomes(&snapshot);
+
+        let guard = execution.learning.lock().unwrap();
+        let updated_learning = guard.as_ref().unwrap();
+        let record = updated_learning
+            .project_store
+            .skill_version("fix-skill", 1)
+            .unwrap();
+        assert_eq!(record.success_count, 1);
+        assert_eq!(record.failure_count, 0);
     }
 }

@@ -43,6 +43,14 @@ pub struct SkillUse {
     pub outcome: SkillOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillVersionRef {
+    pub name: String,
+    pub version: u64,
+    pub content_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct VerificationEvidence {

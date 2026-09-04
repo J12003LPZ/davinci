@@ -560,6 +560,28 @@ impl LearningController {
         Ok(modified)
     }
 
+    pub fn record_skill_version_outcome(
+        &mut self,
+        skill: &SkillVersionRef,
+        outcome: SkillOutcome,
+    ) -> Result<(), String> {
+        self.project_store
+            .record_skill_version_outcome(skill, outcome)?;
+        self.global_store
+            .record_skill_version_outcome(skill, outcome)?;
+        match outcome {
+            SkillOutcome::VerifiedSuccess => {
+                self.stats.verified_skill_successes += 1;
+                self.auto_promote_if_threshold_met(&skill.name);
+            }
+            SkillOutcome::VerifiedFailure => {
+                self.stats.verified_skill_failures += 1;
+            }
+            SkillOutcome::Neutral => {}
+        }
+        Ok(())
+    }
+
     pub fn auto_promote_if_threshold_met(&mut self, name: &str) -> bool {
         let mut promoted = false;
         if let Some(mut record) = self.project_store.skill(name).cloned() {
