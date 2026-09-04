@@ -163,13 +163,36 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     }
 }
 
+pub fn write_graph_definition(cwd: &Path, run_id: &str, definition: &super::topology::GraphDefinition) -> std::io::Result<()> {
+    let path = run_dir(cwd, run_id).join("graph.json");
+    let content = serde_json::to_vec_pretty(definition)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    atomic_write(&path, &content)
+}
+
+pub fn load_graph_definition(cwd: &Path, run_id: &str) -> Option<super::topology::GraphDefinition> {
+    if !is_safe_run_id(run_id) {
+        return None;
+    }
+    let raw = fs::read_to_string(run_dir(cwd, run_id).join("graph.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     run.updated_at = now_ms();
     let cwd = PathBuf::from(&run.cwd);
     let state_path = run_dir(&cwd, &run.run_id).join("state.json");
     let content = serde_json::to_vec_pretty(run)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    atomic_write(&state_path, &content)
+    atomic_write(&state_path, &content)?;
+
+    if let Some(definition) = &run.definition {
+        let graph_path = run_dir(&cwd, &run.run_id).join("graph.json");
+        if !graph_path.exists() {
+            let _ = write_graph_definition(&cwd, &run.run_id, definition);
+        }
+    }
+    Ok(())
 }
 
 pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
@@ -177,7 +200,10 @@ pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
         return None;
     }
     let raw = fs::read_to_string(run_dir(cwd, run_id).join("state.json")).ok()?;
-    let run: GraphRun = serde_json::from_str(&raw).ok()?;
+    let mut run: GraphRun = serde_json::from_str(&raw).ok()?;
+    if run.definition.is_none() {
+        run.definition = load_graph_definition(cwd, run_id);
+    }
     (run.version == 1).then_some(run)
 }
 
@@ -287,6 +313,7 @@ mod tests {
             phase: Phase::Classify,
             forced: None,
             dry_run: false,
+            definition: None,
             classification: None,
             milestones: None,
             current_milestone: None,
@@ -393,5 +420,40 @@ mod tests {
     fn an_unsafe_run_id_never_reaches_the_filesystem() {
         let dir = tempdir().unwrap();
         assert!(load_run(dir.path(), "../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn graph_definition_roundtrips_through_disk_and_sibling_file() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+
+        let classification = crate::native_extensions::graph::types::Classification {
+            task_class: crate::native_extensions::graph::types::TaskClass::Feature,
+            complexity: crate::native_extensions::graph::types::Complexity::Standard,
+            rationale: "test".into(),
+            research_tasks: vec![crate::native_extensions::graph::types::ResearchRequest {
+                kind: crate::native_extensions::graph::types::ResearchKind::CodeSearch,
+                focus: "search".into(),
+            }],
+            milestones: None,
+        };
+
+        let def = crate::native_extensions::graph::topology::build_definition(
+            crate::native_extensions::graph::topology::GraphMode::Standard,
+            &classification,
+        );
+
+        let mut run = sample_run(dir.path(), &run_id, "test def roundtrip");
+        run.definition = Some(def.clone());
+        save_run(&mut run).unwrap();
+
+        // 1. Verify graph.json sibling file was created
+        let sibling_def = load_graph_definition(dir.path(), &run_id).expect("graph.json exists");
+        assert_eq!(sibling_def, def);
+
+        // 2. Verify state.json loaded run carries the definition
+        let reloaded = load_run(dir.path(), &run_id).expect("run loaded");
+        assert_eq!(reloaded.definition.as_ref(), Some(&def));
     }
 }

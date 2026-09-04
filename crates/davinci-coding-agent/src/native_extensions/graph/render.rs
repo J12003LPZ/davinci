@@ -244,6 +244,7 @@ mod tests {
             phase: Phase::Implement,
             forced: None,
             dry_run: false,
+            definition: None,
             classification: None,
             milestones: None,
             current_milestone: None,

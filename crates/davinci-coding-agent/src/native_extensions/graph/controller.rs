@@ -14,7 +14,10 @@ use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
 use super::roles::{role_for_research_kind, role_tools};
 use super::store::{
     artifact_path, create_run_dir, new_run_id, now_ms, save_run, transcript_path, write_artifact,
-    write_log,
+    write_graph_definition, write_log,
+};
+use super::topology::{
+    build_definition, ready_nodes, validate_definition, GraphMode, GraphRunState,
 };
 use super::types::{
     Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters, GraphRun,
@@ -298,6 +301,24 @@ impl GraphExecution {
                 self.checkpoint(Some(&format!("{task_id}: dependencies not satisfied")));
                 return None;
             }
+
+            if let Some(def) = &run.definition {
+                if def.node(&task_id).is_some() {
+                    let state = GraphRunState::from_run(&run);
+                    let ready = ready_nodes(def, &state);
+                    if !ready.contains(&task_id) {
+                        let mut refused = task.clone();
+                        refused.status = TaskStatus::Cancelled;
+                        refused.ended_at = Some(now_ms());
+                        refused.error = Some(format!("node not ready in execution graph: {task_id}"));
+                        run.tasks.push(refused);
+                        drop(run);
+                        self.checkpoint(Some(&format!("{task_id}: not ready in topology")));
+                        return None;
+                    }
+                }
+            }
+
             run.tasks.push(task.clone());
         }
 
@@ -544,6 +565,7 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         phase: Phase::Classify,
         forced: options.forced,
         dry_run: options.dry_run,
+        definition: None,
         classification: None,
         milestones: None,
         current_milestone: None,
@@ -620,6 +642,12 @@ fn drive(execution: &GraphExecution) -> GraphRun {
         .options
         .forced
         .unwrap_or(classification.complexity);
+    let mode = GraphMode::from(complexity);
+    let definition = build_definition(mode, &classification);
+    if let Err(err) = validate_definition(&definition) {
+        execution.blocked(format!("invalid graph topology: {err}"));
+        return execution.snapshot();
+    }
     let milestones: Vec<String> = classification
         .milestones
         .clone()
@@ -635,10 +663,13 @@ fn drive(execution: &GraphExecution) -> GraphRun {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         run.classification = Some(classification.clone());
+        run.definition = Some(definition.clone());
         if complexity != Complexity::Trivial && milestones.len() > 1 {
             run.milestones = Some(milestones.clone());
         }
     }
+    let run_id = execution.snapshot().run_id;
+    let _ = write_graph_definition(&cwd, &run_id, &definition);
     let milestone_note = if milestones.len() > 1 && complexity != Complexity::Trivial {
         format!(", {} milestones", milestones.len())
     } else {

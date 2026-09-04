@@ -522,6 +522,7 @@ mod tests {
             },
             blocked_reason: None,
             updated_at: 0,
+            definition: None,
         }
     }
 }

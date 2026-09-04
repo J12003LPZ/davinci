@@ -23,11 +23,18 @@ pub(crate) mod process;
 pub(crate) mod render;
 pub(crate) mod roles;
 pub(crate) mod store;
+pub(crate) mod topology;
 pub(crate) mod types;
 pub(crate) mod validate;
 pub(crate) mod verify;
 pub(crate) mod worker;
 pub(crate) mod worker_hooks;
+
+#[allow(unused_imports)]
+pub use topology::{
+    build_definition, ready_nodes, validate_definition, EdgeCondition, EdgeDefinition,
+    GraphDefinition, GraphMode, GraphTopologyError, NodeDefinition,
+};
 
 use config::load_config;
 use controller::{run_graph, ControllerDeps, RunOptions};

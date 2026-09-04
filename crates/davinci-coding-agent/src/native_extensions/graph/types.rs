@@ -550,6 +550,8 @@ pub struct GraphRun {
     pub forced: Option<Complexity>,
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<super::topology::GraphDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification: Option<Classification>,
     /// Present only when the run was decomposed into 2+ milestones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -927,6 +929,7 @@ mod tests {
             phase: Phase::Investigate,
             forced: None,
             dry_run: false,
+            definition: None,
             classification: None,
             milestones: None,
             current_milestone: None,
