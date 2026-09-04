@@ -9,7 +9,7 @@
 //! job outlives the session.
 
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -86,7 +86,9 @@ struct Shared {
     status: Mutex<JobStatus>,
     output: Mutex<OutputBuffer>,
     child: Mutex<Option<Child>>,
+    stdin: Mutex<Option<ChildStdin>>,
     finished_at: Mutex<Option<Instant>>,
+    supports_stdin: bool,
 }
 
 pub struct Job {
@@ -140,6 +142,34 @@ impl Job {
         }
     }
 
+    pub fn write_stdin(&self, text: &str) -> Result<usize, String> {
+        if !self.status().is_running() {
+            return Err(format!("Job {} has already exited.", self.id));
+        }
+        if !self.shared.supports_stdin {
+            return Err(format!(
+                "Job {} does not support stdin: stdin is null or closed.",
+                self.id
+            ));
+        }
+        let mut guard = self
+            .shared
+            .stdin
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| format!("Job {} stdin is null or closed.", self.id))?;
+        use std::io::Write;
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("Failed to write to stdin for job {}: {err}", self.id))?;
+        stdin
+            .flush()
+            .map_err(|err| format!("Failed to flush stdin for job {}: {err}", self.id))?;
+        Ok(text.len())
+    }
+
     fn kill(&self) -> bool {
         let mut child = self
             .shared
@@ -151,6 +181,12 @@ impl Job {
         };
         kill_tree(self.pid);
         let _ = child.kill();
+        let mut stdin = self
+            .shared
+            .stdin
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        drop(stdin.take());
         let mut status = self
             .shared
             .status
@@ -272,11 +308,15 @@ impl JobBook {
         self.next_id += 1;
         let id = self.next_id;
         let pid = child.id();
+        let stdin = child.stdin.take();
+        let supports_stdin = stdin.is_some();
         let shared = Arc::new(Shared {
             status: Mutex::new(JobStatus::Running),
             output: Mutex::new(OutputBuffer::default()),
             child: Mutex::new(None),
+            stdin: Mutex::new(stdin),
             finished_at: Mutex::new(None),
+            supports_stdin,
         });
         {
             let mut live = LIVE_JOBS.lock().unwrap_or_else(|err| err.into_inner());
@@ -333,6 +373,7 @@ impl JobBook {
                             .lock()
                             .unwrap_or_else(|err| err.into_inner()) = Some(Instant::now());
                     }
+                    drop(shared.stdin.lock().unwrap_or_else(|err| err.into_inner()).take());
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -376,6 +417,11 @@ impl JobBook {
         let job = self.jobs.iter().find(|job| job.id == id)?;
         job.kill();
         Some(job.status())
+    }
+
+    pub fn write_stdin(&self, id: u32, text: &str) -> Result<usize, String> {
+        let job = self.get(id).ok_or_else(|| unknown_job(self, id))?;
+        job.write_stdin(text)
     }
 
     pub fn kill_all(&mut self) {
@@ -467,9 +513,10 @@ pub fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-fn job_id(input: &Value) -> Result<u32, String> {
+pub fn job_id(input: &Value) -> Result<u32, String> {
     let raw = input
         .get("jobId")
+        .or_else(|| input.get("job_id"))
         .or_else(|| input.get("id"))
         .or_else(|| input.get("job"))
         .ok_or("Missing jobId")?;
@@ -626,6 +673,33 @@ pub fn kill_parameters() -> Value {
     })
 }
 
+/// `write_stdin { jobId / job_id, input }`.
+pub fn stdin_tool(book: &Arc<Mutex<JobBook>>, input: &Value) -> Result<crate::ToolResult, String> {
+    let id = job_id(input)?;
+    let text = input
+        .get("input")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Missing required parameter: input".to_string())?;
+    let book = book.lock().unwrap_or_else(|err| err.into_inner());
+    let bytes = book.write_stdin(id, text)?;
+    Ok(crate::ToolResult {
+        content: format!("Sent {bytes} bytes to stdin"),
+        is_error: false,
+        details: Some(json!({ "jobId": id, "bytes": bytes })),
+    })
+}
+
+pub fn stdin_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "integer", "description": "The job ID returned when the background command started"},
+            "input": {"type": "string", "description": "The input text to send to stdin"}
+        },
+        "required": ["job_id", "input"]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +831,67 @@ mod tests {
     fn job_ids_come_as_numbers_or_words() {
         assert_eq!(job_id(&json!({"jobId": 3})).unwrap(), 3);
         assert_eq!(job_id(&json!({"jobId": "job 4"})).unwrap(), 4);
+        assert_eq!(job_id(&json!({"job_id": 5})).unwrap(), 5);
         assert!(job_id(&json!({})).unwrap_err().contains("Missing jobId"));
+    }
+
+    #[test]
+    fn write_stdin_rejects_null_or_closed_stdin() {
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        // Spawn with Stdio::null()
+        let id = book.lock().unwrap().register("echo null_stdin", spawn("echo null_stdin"));
+        let err = book.lock().unwrap().write_stdin(id, "test input\n").unwrap_err();
+        assert!(err.contains("does not support stdin") || err.contains("already exited") || err.contains("null or closed"), "{err}");
+    }
+
+    #[test]
+    fn write_stdin_returns_error_on_missing_or_exited_job() {
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        let err = book.lock().unwrap().write_stdin(999, "test").unwrap_err();
+        assert!(err.contains("No background job 999"), "{err}");
+
+        let id = book.lock().unwrap().register("echo quick", spawn("echo quick"));
+        wait_for_exit(&book, id);
+        let err_exited = book.lock().unwrap().write_stdin(id, "test").unwrap_err();
+        assert!(err_exited.contains("has already exited"), "{err_exited}");
+    }
+
+    #[test]
+    fn write_stdin_delivers_bytes_to_interactive_process() {
+        fn spawn_interactive(script: &str) -> Child {
+            let mut command = if cfg!(windows) {
+                let mut c = Command::new("powershell");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+                c
+            } else {
+                let mut c = Command::new("sh");
+                c.args(["-c", script]);
+                c
+            };
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap()
+        }
+
+        let script = if cfg!(windows) {
+            "$line = [Console]::In.ReadLine(); Write-Output \"observed: $line\""
+        } else {
+            "read line && echo \"observed: $line\""
+        };
+
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        let id = book.lock().unwrap().register("interactive", spawn_interactive(script));
+
+        // Use stdin_tool to deliver the input
+        let res = stdin_tool(&book, &json!({"job_id": id, "input": "hello_interactive\n"})).unwrap();
+        assert!(res.content.contains("Sent"));
+        assert!(!res.is_error);
+
+        wait_for_exit(&book, id);
+        let out = book.lock().unwrap().get(id).unwrap().output(None);
+        assert!(out.contains("observed: hello_interactive"), "{out}");
     }
 }

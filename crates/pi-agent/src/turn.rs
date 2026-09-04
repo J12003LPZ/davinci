@@ -15,6 +15,11 @@ pub(crate) enum Preparation {
     /// The call never runs; this is its result (a block, an unknown tool,
     /// a permission refusal).
     Immediate(crate::ToolResult),
+    /// A duplicate in-flight call waiting for the leader's result.
+    Wait {
+        call_id: String,
+        lane: crate::scheduler::ToolLane,
+    },
     /// The call runs, in this lane.
     Ready { lane: crate::scheduler::ToolLane },
 }
@@ -533,6 +538,7 @@ impl Agent {
                 let preparation = agent.prepare_tool_call(cwd, id, name, args, 0);
                 let lane = match &preparation {
                     Preparation::Ready { lane } => *lane,
+                    Preparation::Wait { lane, .. } => *lane,
                     Preparation::Immediate(_) => crate::scheduler::ToolLane::Parallel,
                 };
                 let (id, name, args) = (id.clone(), name.clone(), args.clone());
@@ -541,6 +547,9 @@ impl Agent {
                     run: Box::new(move || {
                         let result = match preparation {
                             Preparation::Immediate(result) => result,
+                            Preparation::Wait { call_id, .. } => {
+                                agent.wait_for_tool_call(&call_id)
+                            }
                             Preparation::Ready { .. } => {
                                 agent.run_prepared_call(cwd, &id, &name, &args, 0)
                             }
@@ -584,6 +593,25 @@ impl Agent {
         messages
     }
 
+    pub(crate) fn wait_for_tool_call(&self, call_id: &str) -> crate::ToolResult {
+        match crate::tool_ledger::ToolCallLedger::wait_for_terminal(
+            &self.tool_ledger,
+            call_id,
+            self.abort_signal.as_deref(),
+        ) {
+            Ok((cached, is_error)) => crate::ToolResult {
+                content: cached,
+                is_error,
+                details: Some(serde_json::json!({ "replayed_from_ledger": true })),
+            },
+            Err(err) => crate::ToolResult {
+                content: err,
+                is_error: true,
+                details: None,
+            },
+        }
+    }
+
     /// Stage one of a tool call. `depth` is 0 for a call the model made and
     /// 1 for an operation inside a `batch`.
     pub(crate) fn prepare_tool_call(
@@ -607,15 +635,57 @@ impl Agent {
                 false,
             );
         }
+        if let Ok(mut ledger) = self.tool_ledger.lock() {
+            match ledger.reserve_call(id, name, args) {
+                Err(collision_err) => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: collision_err,
+                        is_error: true,
+                        details: Some(serde_json::json!({ "collision": true })),
+                    });
+                }
+                Ok(crate::tool_ledger::ReservationOutcome::Replay { output, is_error }) => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: output,
+                        is_error,
+                        details: Some(serde_json::json!({ "replayed_from_ledger": true })),
+                    });
+                }
+                Ok(crate::tool_ledger::ReservationOutcome::WaitForInFlight) => {
+                    let class = self
+                        .permissions
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .class_of(name);
+                    let lane = crate::scheduler::lane_for(name, class);
+                    return Preparation::Wait {
+                        call_id: id.to_string(),
+                        lane,
+                    };
+                }
+                Ok(crate::tool_ledger::ReservationOutcome::Reserved) => {
+                    // Identity reserved as Pending; proceed to check pre_tool / permissions
+                }
+            }
+        }
         if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.cancel_reservation(id);
+            }
             return immediate(reason, false);
         }
         if !self.tools.iter().any(|tool| tool == name) {
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.cancel_reservation(id);
+            }
             return immediate(format!("Unknown tool: {name}"), false);
         }
         if let Some(reason) = self.permission_denial(cwd, id, name, args) {
             // `denied` marks a call that never ran, for the hosts' rows
             // and the post-tool hooks, without sniffing the text.
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &reason);
+            }
             return immediate(reason, true);
         }
         let class = self
@@ -633,7 +703,7 @@ impl Agent {
     }
 
     /// Stage two: the call itself. Takes `&self` only, so it may run on a
-    /// worker thread next to its siblings.
+    /// worker thread when the turn executes calls in parallel.
     pub(crate) fn run_prepared_call(
         &self,
         cwd: &Path,
@@ -642,7 +712,33 @@ impl Agent {
         args: &Value,
         depth: usize,
     ) -> crate::ToolResult {
-        if name == "agent" {
+        if let Ok(mut ledger) = self.tool_ledger.lock() {
+            match ledger.begin_execution(id, name, args) {
+                crate::tool_ledger::BeginOutcome::Collision(collision_err) => {
+                    return crate::ToolResult {
+                        content: collision_err,
+                        is_error: true,
+                        details: Some(serde_json::json!({ "collision": true })),
+                    };
+                }
+                crate::tool_ledger::BeginOutcome::Replay { output, is_error } => {
+                    return crate::ToolResult {
+                        content: output,
+                        is_error,
+                        details: Some(serde_json::json!({ "replayed_from_ledger": true })),
+                    };
+                }
+                crate::tool_ledger::BeginOutcome::WaitForInFlight => {
+                    drop(ledger);
+                    return self.wait_for_tool_call(id);
+                }
+                crate::tool_ledger::BeginOutcome::Execute => {
+                    // Ready to execute tool as leader
+                }
+            }
+        }
+
+        let outcome = if name == "agent" {
             let workers = args
                 .get("tasks")
                 .and_then(Value::as_array)
@@ -655,7 +751,7 @@ impl Agent {
                 model_id: Some(self.model_id.clone()),
                 abort: self.abort_signal.clone(),
             };
-            return match crate::subagent::run_tool(
+            match crate::subagent::run_tool(
                 args,
                 &self.tools,
                 self.subagent_runner.as_ref(),
@@ -667,41 +763,49 @@ impl Agent {
                     is_error: true,
                     details: None,
                 },
-            };
-        }
-        if name == "batch" && depth == 0 {
-            return self.run_batch(cwd, id, args);
-        }
-        // The tool sees the turn's abort flag so a long shell command
-        // or a `job_output` wait ends when the user interrupts.
-        let mut context = self.tool_context.clone();
-        context.abort = self.abort_signal.clone();
-        match execute_tool_with(cwd, name, args, &context) {
-            Ok(result) => result,
-            Err(crate::tools::ToolError::Unknown(_)) => {
-                if let Some(executor) = &self.custom_tool_executor {
-                    match executor.execute(cwd, name, args) {
-                        Ok(result) => result,
-                        Err(err) => crate::ToolResult {
-                            content: err.to_string(),
+            }
+        } else if name == "batch" && depth == 0 {
+            self.run_batch(cwd, id, args)
+        } else {
+            // The tool sees the turn's abort flag so a long shell command
+            // or a `job_output` wait ends when the user interrupts.
+            let mut context = self.tool_context.clone();
+            context.abort = self.abort_signal.clone();
+            match execute_tool_with(cwd, name, args, &context) {
+                Ok(result) => result,
+                Err(crate::tools::ToolError::Unknown(_)) => {
+                    if let Some(executor) = &self.custom_tool_executor {
+                        match executor.execute(cwd, name, args) {
+                            Ok(result) => result,
+                            Err(err) => crate::ToolResult {
+                                content: err.to_string(),
+                                is_error: true,
+                                details: None,
+                            },
+                        }
+                    } else {
+                        crate::ToolResult {
+                            content: format!("Unknown tool: {name}"),
                             is_error: true,
                             details: None,
-                        },
-                    }
-                } else {
-                    crate::ToolResult {
-                        content: format!("Unknown tool: {name}"),
-                        is_error: true,
-                        details: None,
+                        }
                     }
                 }
+                Err(err) => crate::ToolResult {
+                    content: err.to_string(),
+                    is_error: true,
+                    details: None,
+                },
             }
-            Err(err) => crate::ToolResult {
-                content: err.to_string(),
-                is_error: true,
-                details: None,
-            },
+        };
+        if let Ok(mut ledger) = self.tool_ledger.lock() {
+            if outcome.is_error {
+                ledger.record_failure(id, &outcome.content);
+            } else {
+                ledger.record_completion(id, &outcome.content, false);
+            }
         }
+        outcome
     }
 
     /// Stage three: the post hook, the events (sent to the sink now, and

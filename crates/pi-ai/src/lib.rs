@@ -5,8 +5,14 @@ mod auth;
 pub mod cache;
 mod catalog;
 mod codex;
+pub mod codex_capabilities;
+pub mod codex_flags;
+pub mod codex_telemetry;
+pub mod codex_transport;
 mod codex_ws;
 mod deferred;
+pub mod request_shape;
+pub mod responses_ledger;
 mod http_proxy;
 mod images;
 mod model_config;
@@ -38,6 +44,7 @@ pub use catalog::{
     load_radius_models, models_from_provider_config, openrouter_image_models,
     radius_models_from_config, Model, ModelCost, KNOWN_PROVIDERS,
 };
+pub use codex_flags::CodexFeatureFlags;
 pub use codex::{
     build_cached_websocket_request_body, build_sse_headers, build_websocket_headers,
     close_openai_codex_websocket_sessions, compress_request_body_zstd, connect_codex_websocket,

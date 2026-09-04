@@ -163,6 +163,7 @@ impl Agent {
                 self.prepare_tool_call(cwd, &op_id, &operation.tool, &operation.args, 1);
             let lane = match &preparation {
                 crate::turn::Preparation::Ready { lane } => *lane,
+                crate::turn::Preparation::Wait { lane, .. } => *lane,
                 crate::turn::Preparation::Immediate(_) => crate::scheduler::ToolLane::Parallel,
             };
             let agent: &Agent = self;
@@ -172,6 +173,9 @@ impl Agent {
                 run: Box::new(move || {
                     let mut result = match preparation {
                         crate::turn::Preparation::Immediate(result) => result,
+                        crate::turn::Preparation::Wait { call_id, .. } => {
+                            agent.wait_for_tool_call(&call_id)
+                        }
                         crate::turn::Preparation::Ready { .. } => {
                             agent.run_prepared_call(cwd, &op_id, &tool, &args, 1)
                         }

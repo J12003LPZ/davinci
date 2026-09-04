@@ -1,6 +1,7 @@
 //! Fixture-driven eval harness matching `@earendil-works/pi-evals`.
 
 pub mod artifacts;
+pub mod codex_eval;
 pub mod harness_table;
 pub mod reporter;
 pub mod summary;

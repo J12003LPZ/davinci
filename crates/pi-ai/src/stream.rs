@@ -1003,8 +1003,10 @@ fn openai_responses_body(
         }
     }
     if !tools.is_empty() {
+        let mut sorted_tools = tools.to_vec();
+        sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
         body["tools"] = Value::Array(
-            tools
+            sorted_tools
                 .iter()
                 .map(|tool| {
                     let mut function = serde_json::json!({

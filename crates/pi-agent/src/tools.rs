@@ -29,6 +29,24 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "mcp_read",
     "agent",
     "batch",
+    "apply_patch",
+    "exec_command",
+    "write_stdin",
+    "update_plan",
+    "tool_search",
+];
+
+pub const CODEX_HOT_TOOLS: &[&str] = &[
+    "exec_command",
+    "write_stdin",
+    "apply_patch",
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "update_plan",
+    "agent",
+    "tool_search",
 ];
 
 /// What the built-in tools share across calls: the background jobs and the
@@ -204,6 +222,54 @@ pub fn tool_specs() -> Vec<AgentTool> {
             description: crate::batch::batch_description(),
             parameters: crate::batch::batch_parameters(),
         },
+        AgentTool {
+            name: "apply_patch".into(),
+            description: "Apply a patch using the Codex patch format (*** Begin Patch ... *** End Patch). Supports Add File, Update File with hunks, and Delete File.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "The patch text enclosed in *** Begin Patch and *** End Patch"
+                    }
+                },
+                "required": ["input"]
+            }),
+        },
+        AgentTool {
+            name: "exec_command".into(),
+            description: "Start a bounded shell command using the platform-appropriate shell (PowerShell on Windows, bash/sh on Unix).".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "timeout": { "type": "number", "description": "Timeout in seconds (optional)" },
+                    "background": { "type": "boolean", "description": "Run in background (optional)" }
+                },
+                "required": ["command"]
+            }),
+        },
+        AgentTool {
+            name: "write_stdin".into(),
+            description: "Send input text to an interactive process or background job.".into(),
+            parameters: crate::jobs::stdin_parameters(),
+        },
+        AgentTool {
+            name: "update_plan".into(),
+            description: "Adapt and update task plan items (alias for todo ledger).".into(),
+            parameters: crate::todo::tool_parameters(),
+        },
+        AgentTool {
+            name: "tool_search".into(),
+            description: "Discover deferred tools and namespaces by keyword query.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Keyword query for tool discovery" }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -227,6 +293,9 @@ pub fn execute_tool_with(
         "read" => read_tool(cwd, input),
         "write" => write_tool(cwd, input),
         "edit" => edit_tool(cwd, input),
+        "apply_patch" => apply_patch_tool(cwd, input),
+        "exec_command" => exec_command_tool(cwd, input, context),
+        "write_stdin" => write_stdin_tool(input, context),
         "bash" => shell_tool(cwd, input, context),
         "powershell" => powershell_tool(cwd, input, context),
         "ls" => ls_tool(cwd, input),
@@ -234,7 +303,8 @@ pub fn execute_tool_with(
         "find" => find_tool(cwd, input),
         "web_fetch" => crate::web::fetch_tool(input).map_err(ToolError::Failed),
         "web_search" => crate::web::search_tool(input).map_err(ToolError::Failed),
-        "todo" => todo_tool(input, context),
+        "todo" | "update_plan" => todo_tool(input, context),
+        "tool_search" => tool_search_tool(input, context),
         "job_output" => crate::jobs::output_tool(&context.jobs, input, context.abort.as_deref())
             .map_err(ToolError::Failed),
         "job_kill" => crate::jobs::kill_tool(&context.jobs, input).map_err(ToolError::Failed),
@@ -243,6 +313,77 @@ pub fn execute_tool_with(
         other if other.starts_with("mcp__") => mcp_call_tool(other, input, context),
         other => Err(ToolError::Unknown(other.to_string())),
     }
+}
+
+fn apply_patch_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    let patch = input
+        .get("input")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::Failed("Missing `input` argument for apply_patch".into()))?;
+    match crate::apply_patch::execute_apply_patch(cwd, patch) {
+        Ok(msg) => Ok(ToolResult {
+            content: msg,
+            is_error: false,
+            details: None,
+        }),
+        Err(err) => Ok(ToolResult {
+            content: err,
+            is_error: true,
+            details: None,
+        }),
+    }
+}
+
+fn exec_command_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if cfg!(windows) {
+        powershell_tool(cwd, input, context)
+    } else {
+        shell_tool(cwd, input, context)
+    }
+}
+
+fn write_stdin_tool(
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    match crate::jobs::stdin_tool(&context.jobs, input) {
+        Ok(result) => Ok(result),
+        Err(err) => Ok(ToolResult {
+            content: err,
+            is_error: true,
+            details: None,
+        }),
+    }
+}
+
+fn tool_search_tool(
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+    let mcp_tools = context.mcp.tool_names();
+    let matches: Vec<String> = mcp_tools
+        .into_iter()
+        .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
+        .collect();
+    let content = if matches.is_empty() {
+        format!("No tools found matching query `{query}`")
+    } else {
+        format!("Found tools: {}", matches.join(", "))
+    };
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: None,
+    })
 }
 
 fn mcp_read_tool(
@@ -619,7 +760,7 @@ fn wants_background(input: &serde_json::Value) -> bool {
 /// Spawn the shell with the command, stdout and stderr piped, exactly as a
 /// foreground call would — a background job is the same process, only
 /// nobody waits for it.
-fn spawn_shell(cwd: &Path, command: &str) -> Result<std::process::Child, ToolError> {
+fn spawn_shell(cwd: &Path, command: &str, background: bool) -> Result<std::process::Child, ToolError> {
     let custom = std::env::var("PI_SHELL")
         .ok()
         .filter(|value| !value.is_empty());
@@ -632,7 +773,11 @@ fn spawn_shell(cwd: &Path, command: &str) -> Result<std::process::Child, ToolErr
         .stderr(std::process::Stdio::piped());
     match config.command_transport {
         pi_ai::CommandTransport::Argv => {
-            process.arg(command).stdin(std::process::Stdio::null());
+            if background {
+                process.arg(command).stdin(std::process::Stdio::piped());
+            } else {
+                process.arg(command).stdin(std::process::Stdio::null());
+            }
         }
         pi_ai::CommandTransport::Stdin => {
             process.stdin(std::process::Stdio::piped());
@@ -669,8 +814,9 @@ fn shell_tool(
         Ok(prefix) if !prefix.is_empty() => format!("{prefix}; {command}"),
         _ => command.to_string(),
     };
-    let child = spawn_shell(cwd, &command)?;
-    if wants_background(input) {
+    let background = wants_background(input);
+    let child = spawn_shell(cwd, &command, background)?;
+    if background {
         let shown = required_str(input, "command")?;
         let pid = child.id();
         let id = context
@@ -793,11 +939,17 @@ fn powershell_tool(
         });
     }
     let wrapped = format!("{POWERSHELL_UTF8_PREFIX}{command}");
+    let background = wants_background(input);
     for program in ["pwsh", "powershell"] {
+        let stdin = if background {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        };
         let spawned = Command::new(program)
             .args(["-NoProfile", "-NonInteractive", "-Command", &wrapped])
             .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
+            .stdin(stdin)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn();
@@ -805,7 +957,7 @@ fn powershell_tool(
             Ok(child) => child,
             Err(_) => continue,
         };
-        if wants_background(input) {
+        if background {
             let pid = child.id();
             let id = context
                 .jobs
@@ -2312,4 +2464,39 @@ mod tests {
             "src/app.ts"
         );
     }
+
+    #[test]
+    fn execute_tool_apply_patch_works() {
+        let dir = tempdir().unwrap();
+        let patch = r#"*** Begin Patch
+*** Add File: test.txt
++Hello Codex
+*** End Patch"#;
+        let res = execute_tool(dir.path(), "apply_patch", &serde_json::json!({ "input": patch })).unwrap();
+        assert!(!res.is_error);
+        assert!(res.content.contains("1 added"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("test.txt")).unwrap(), "Hello Codex\n");
+    }
+
+    #[test]
+    fn write_stdin_tool_reports_error_on_missing_args_or_invalid_job() {
+        let dir = tempdir().unwrap();
+        let context = ToolContext::default();
+
+        // Missing job_id
+        let res = execute_tool_with(dir.path(), "write_stdin", &serde_json::json!({ "input": "test" }), &context).unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("Missing jobId"));
+
+        // Missing input
+        let res = execute_tool_with(dir.path(), "write_stdin", &serde_json::json!({ "job_id": 1 }), &context).unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("Missing required parameter: input"));
+
+        // Non-existent job
+        let res = execute_tool_with(dir.path(), "write_stdin", &serde_json::json!({ "job_id": 42, "input": "test" }), &context).unwrap();
+        assert!(res.is_error);
+        assert!(res.content.contains("No background job 42"));
+    }
 }
+

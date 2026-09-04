@@ -1,5 +1,6 @@
 //! Agent runtime matching `@earendil-works/pi-agent-core`.
 
+pub mod apply_patch;
 mod batch;
 mod branch;
 mod compaction;
@@ -21,6 +22,7 @@ mod stats;
 mod subagent;
 mod templates;
 pub mod todo;
+pub mod tool_ledger;
 mod tools;
 mod turn;
 pub mod web;
@@ -73,9 +75,12 @@ pub use templates::{
     substitute_args, PromptTemplate,
 };
 pub use todo::{TodoItem, TodoList, TodoStatus, TODO_ENTRY_TYPE};
+pub use tool_ledger::{
+    classify_side_effect, ToolCallLedger, ToolCallRecord, ToolExecutionStatus, ToolSideEffect,
+};
 pub use tools::{
     execute_tool, execute_tool_with, tool_specs, AgentTool, ToolContext, ToolError, ToolResult,
-    BUILTIN_TOOLS,
+    BUILTIN_TOOLS, CODEX_HOT_TOOLS,
 };
 pub use turn::retry_delay_ms;
 
@@ -225,6 +230,7 @@ pub struct Agent {
     /// Where overflowing output is kept for a later `read` (`evidence.rs`).
     /// `None` means overflow is truncated with a note and nothing else.
     pub evidence: Option<EvidenceStore>,
+    pub tool_ledger: Arc<std::sync::Mutex<ToolCallLedger>>,
     /// Tool-call ids whose results are pruned from the provider view. Only
     /// grows; the session file keeps every body.
     pruned_tool_results: std::collections::HashSet<String>,
@@ -289,6 +295,7 @@ impl Agent {
             counters: SharedCounters::shared(),
             prune_settings: PruneSettings::default(),
             evidence: None,
+            tool_ledger: Arc::new(std::sync::Mutex::new(ToolCallLedger::default())),
             pruned_tool_results: std::collections::HashSet::new(),
             base_system_prompt: system_prompt,
             pending_bash_messages: Vec::new(),
@@ -2642,5 +2649,110 @@ mod tests {
         agent.set_active_tools_by_name(&["bash".into(), "read".into()]);
         assert_eq!(agent.tools, vec!["bash".to_string(), "read".to_string()]);
         assert!(agent.tool_registry.contains(&"ticket".into()));
+    }
+
+    #[test]
+    fn batch_duplicate_mutating_calls_executes_once() {
+        use pi_ai::{AssistantMessage, ContentBlock, StopReason};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+        let mut agent = Agent::new(default_system_prompt());
+        agent.custom_tool_executor = Some(CustomToolExecutor::new(move |_cwd, _tool, _args| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ToolResult {
+                content: "mutated".into(),
+                is_error: false,
+                details: None,
+            })
+        }));
+        agent.tools.push("custom_mutating".into());
+        agent.prompt("run duplicate batch");
+
+        let mut turn = 0;
+        let _ = agent.run_loop(|_| {
+            turn += 1;
+            if turn == 1 {
+                Ok(AssistantMessage {
+                    id: "a1".into(),
+                    role: "assistant".into(),
+                    content: vec![
+                        ContentBlock::ToolCall {
+                            id: "dup_call_1".into(),
+                            name: "custom_mutating".into(),
+                            arguments: serde_json::json!({"action": "write"}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "dup_call_1".into(),
+                            name: "custom_mutating".into(),
+                            arguments: serde_json::json!({"action": "write"}),
+                        },
+                    ],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::ToolUse),
+                    error_message: None,
+                })
+            } else {
+                Ok(AssistantMessage {
+                    id: "a2".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                })
+            }
+        });
+
+        // The mutating custom tool must have executed exactly once!
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_identical_calls_followers_receive_terminal_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+        let mut agent = Agent::new(default_system_prompt());
+        agent.custom_tool_executor = Some(CustomToolExecutor::new(move |_cwd, _tool, _args| {
+            c.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(crate::ToolResult {
+                content: "finished_concurrent".into(),
+                is_error: false,
+                details: None,
+            })
+        }));
+        agent.tools.push("custom_slow".into());
+        let agent = Arc::new(agent);
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let a = Arc::clone(&agent);
+            handles.push(std::thread::spawn(move || {
+                let cwd = std::path::PathBuf::from(".");
+                a.run_prepared_call(
+                    &cwd,
+                    "concurrent_call_id",
+                    "custom_slow",
+                    &serde_json::json!({"test": 1}),
+                    0,
+                )
+            }));
+        }
+
+        for h in handles {
+            let res = h.join().unwrap();
+            assert_eq!(res.content, "finished_concurrent");
+            assert!(!res.is_error);
+        }
+
+        // Executed exactly once!
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }

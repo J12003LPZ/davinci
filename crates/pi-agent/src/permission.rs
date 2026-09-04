@@ -89,9 +89,10 @@ pub fn tool_class(tool: &str) -> ToolClass {
         // artifact file its parent named, nothing else. `memory_search` and
         // `retrieve_output` read the memory index and the governor's store.
         "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" | "mcp_read"
-        | "batch" | "graph_submit" | "memory_search" | "retrieve_output" => ToolClass::Read,
-        "write" | "edit" | "notebook_edit" => ToolClass::Edit,
-        "bash" | "powershell" => ToolClass::Shell,
+        | "batch" | "graph_submit" | "memory_search" | "retrieve_output" | "update_plan"
+        | "tool_search" => ToolClass::Read,
+        "write" | "edit" | "notebook_edit" | "apply_patch" => ToolClass::Edit,
+        "bash" | "powershell" | "exec_command" | "write_stdin" => ToolClass::Shell,
         "web_fetch" | "web_search" => ToolClass::Network,
         _ => ToolClass::Other,
     }
@@ -437,6 +438,27 @@ pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
             false,
         ),
         ToolClass::Read | ToolClass::Edit => {
+            if tool == "apply_patch" {
+                if let Some(input) = args.get("input").and_then(Value::as_str) {
+                    if let Ok(parsed) = crate::apply_patch::parse_codex_patch(input) {
+                        let mut outside = false;
+                        let mut paths = Vec::new();
+                        for action in parsed.actions {
+                            let p = match action {
+                                crate::apply_patch::FileAction::Add { path, .. } => path,
+                                crate::apply_patch::FileAction::Update { path, .. } => path,
+                                crate::apply_patch::FileAction::Delete { path } => path,
+                            };
+                            let (rel, is_out) = project_relative(cwd, &p);
+                            if is_out {
+                                outside = true;
+                            }
+                            paths.push(rel);
+                        }
+                        return (paths.join(", "), outside);
+                    }
+                }
+            }
             let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
             project_relative(cwd, raw)
         }
@@ -1143,4 +1165,24 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+
+    #[test]
+    fn apply_patch_subject_reports_modified_paths_and_detects_outside() {
+        let root = cwd();
+        let patch = r#"*** Begin Patch
+*** Add File: src/inside.rs
++fn inside() {}
+*** End Patch"#;
+        let (subject, is_out) = subject_of("apply_patch", &json!({"input": patch}), &root);
+        assert_eq!(subject, "src/inside.rs");
+        assert!(!is_out);
+
+        let patch_outside = r#"*** Begin Patch
+*** Add File: ../outside.rs
++fn outside() {}
+*** End Patch"#;
+        let (_, is_out_bad) = subject_of("apply_patch", &json!({"input": patch_outside}), &root);
+        assert!(is_out_bad);
+    }
 }
+

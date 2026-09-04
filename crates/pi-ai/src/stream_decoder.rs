@@ -217,6 +217,8 @@ pub struct ResponsesDecoder {
     slots: HashMap<u64, Slot>,
     started: bool,
     done: bool,
+    pub raw_items: Vec<Value>,
+    pub last_response_id: Option<String>,
 }
 
 impl ResponsesDecoder {
@@ -227,7 +229,17 @@ impl ResponsesDecoder {
             slots: HashMap::new(),
             started: false,
             done: false,
+            raw_items: Vec::new(),
+            last_response_id: None,
         }
+    }
+
+    pub fn raw_items(&self) -> &[Value] {
+        &self.raw_items
+    }
+
+    pub fn last_response_id(&self) -> Option<&str> {
+        self.last_response_id.as_deref()
     }
 
     fn start(&mut self, out: &mut Vec<AssistantMessageEvent>) {
@@ -728,7 +740,15 @@ impl StreamDecoder for ResponsesDecoder {
         self.start(out);
         let output_index = Self::output_index(event);
         match event_type {
-            "response.created" | "response.in_progress" | "response.queued" => {}
+            "response.created" | "response.in_progress" | "response.queued" => {
+                if let Some(id) = event
+                    .pointer("/response/id")
+                    .or_else(|| event.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.last_response_id = Some(id.to_string());
+                }
+            }
             "response.output_item.added" => {
                 if let Some(item) = event.get("item") {
                     self.create_slot(output_index, item, out);
@@ -813,6 +833,9 @@ impl StreamDecoder for ResponsesDecoder {
             }
             "response.output_item.done" => {
                 let item = event.get("item");
+                if let Some(item) = item {
+                    self.raw_items.push(item.clone());
+                }
                 if !self.slots.contains_key(&output_index) {
                     if let Some(item) = item {
                         self.create_slot(output_index, item, out);
@@ -822,6 +845,13 @@ impl StreamDecoder for ResponsesDecoder {
             }
             "response.completed" | "response.done" | "response.incomplete" => {
                 let response = event.get("response").cloned();
+                if let Some(id) = response
+                    .as_ref()
+                    .and_then(|r| r.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.last_response_id = Some(id.to_string());
+                }
                 self.finalize(response.as_ref(), out);
             }
             "response.failed" => {
@@ -1160,4 +1190,37 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         assert!(message.content.is_empty());
         assert_eq!(names(&out), ["start", "done"]);
     }
+
+    #[test]
+    fn records_raw_items_and_response_id() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut out = Vec::new();
+        decoder.feed(
+            &serde_json::json!({"type":"response.created","response":{"id":"resp_123"}}),
+            &mut out,
+        );
+        decoder.feed(
+            &serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{\"path\":\"README.md\"}"
+                }
+            }),
+            &mut out,
+        );
+        decoder.feed(
+            &serde_json::json!({"type":"response.completed","response":{"id":"resp_123","status":"completed"}}),
+            &mut out,
+        );
+
+        assert_eq!(decoder.last_response_id(), Some("resp_123"));
+        assert_eq!(decoder.raw_items().len(), 1);
+        assert_eq!(decoder.raw_items()[0]["name"], "read");
+    }
 }
+
