@@ -1632,8 +1632,12 @@ fn complete_prompt_with_host(
         for message in host.take_before_agent_start_messages() {
             agent.record_custom_message(&message);
         }
-        if let Some(memory) = host.native_memory_inject(&prompt) {
-            agent.set_ephemeral_context(vec![davinci_ai::ChatMessage::text("custom", memory)]);
+        let suppress_memory = std::env::var_os("PI_GRAPH_SUPPRESS_MEMORY_INJECT").is_some()
+            || std::env::var_os("PI_GRAPH_ROLE").is_some();
+        if !suppress_memory {
+            if let Some(memory) = host.native_memory_inject(&prompt) {
+                agent.set_ephemeral_context(vec![davinci_ai::ChatMessage::text("custom", memory)]);
+            }
         }
         host.native_cancel_learning_review();
         host.emit(ExtensionEvent::AgentStart);

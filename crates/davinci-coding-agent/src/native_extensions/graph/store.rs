@@ -257,6 +257,37 @@ pub fn read_task_mutation(
     serde_json::from_str(&raw).ok()
 }
 
+#[allow(dead_code)]
+pub fn write_task_context_packet(
+    cwd: &Path,
+    run_id: &str,
+    task_id: &str,
+    packet: &crate::native_extensions::ecosystem::ContextPacket,
+) -> std::io::Result<()> {
+    let path = run_dir(cwd, run_id)
+        .join("artifacts")
+        .join(format!("{task_id}.context.json"));
+    let content = serde_json::to_vec_pretty(packet)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    atomic_write(&path, &content)
+}
+
+#[allow(dead_code)]
+pub fn read_task_context_packet(
+    cwd: &Path,
+    run_id: &str,
+    task_id: &str,
+) -> Option<crate::native_extensions::ecosystem::ContextPacket> {
+    if !is_safe_run_id(run_id) {
+        return None;
+    }
+    let path = run_dir(cwd, run_id)
+        .join("artifacts")
+        .join(format!("{task_id}.context.json"));
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
     if !is_safe_run_id(run_id) {
         return None;

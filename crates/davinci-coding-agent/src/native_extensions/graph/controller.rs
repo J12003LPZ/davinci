@@ -53,6 +53,8 @@ pub struct ControllerDeps {
     pub session_thinking: Option<String>,
     pub project_trusted: bool,
     pub on_update: Arc<UpdateSink>,
+    pub memory: Option<crate::native_extensions::VectorMemory>,
+    pub learning: Option<crate::native_extensions::LearningController>,
 }
 
 pub struct RunOptions {
@@ -387,6 +389,43 @@ impl GraphExecution {
             }
         }
 
+        let context_packet = match (&self.deps.memory, &self.deps.learning) {
+            (Some(mem), Some(learn)) => {
+                let req = crate::native_extensions::ecosystem::ContextPacketRequest::new(&briefing)
+                    .with_role(role)
+                    .with_token_cap(
+                        crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
+                    )
+                    .with_skills(true);
+                crate::native_extensions::ecosystem::build_context_packet(mem, learn, req)
+            }
+            _ => crate::native_extensions::ecosystem::ContextPacket::empty(),
+        };
+
+        {
+            let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            let run_id = run.run_id.clone();
+            let cwd = PathBuf::from(&run.cwd);
+            if let Some(t) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                t.context_fingerprint = if context_packet.is_empty() {
+                    None
+                } else {
+                    Some(context_packet.fingerprint.clone())
+                };
+                t.context_tokens = context_packet.estimated_tokens;
+                t.memory_refs = context_packet.memory_refs.clone();
+                t.skill_refs = context_packet.skill_refs.clone();
+            }
+            if !context_packet.is_empty() {
+                let _ = super::store::write_task_context_packet(
+                    &cwd,
+                    &run_id,
+                    &task_id,
+                    &context_packet,
+                );
+            }
+        }
+
         let mut last_failure: Option<String> = None;
         for attempt in 1..=NODE_ATTEMPTS {
             if self.exec_abort.load(Ordering::Relaxed) {
@@ -437,7 +476,13 @@ impl GraphExecution {
                 )
             };
 
-            let mut spec = self.worker_spec(&task, attempt_briefing);
+            let effective_briefing = if context_packet.text.is_empty() {
+                attempt_briefing
+            } else {
+                format!("{}\n\n{}", context_packet.text, attempt_briefing)
+            };
+
+            let mut spec = self.worker_spec(&task, effective_briefing);
             // A retry after a timeout gets double time — but only when a
             // timeout was configured at all; 0 stays unlimited.
             if timed_out_before && spec.timeout_ms > 0 {
@@ -1335,6 +1380,8 @@ mod tests {
             session_thinking: None,
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
         };
 
         let options = RunOptions {
@@ -1452,6 +1499,8 @@ mod tests {
             session_thinking: None,
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
         };
 
         let options = RunOptions {

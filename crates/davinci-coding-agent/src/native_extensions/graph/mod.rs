@@ -231,6 +231,8 @@ pub struct GraphController {
     session_model: Option<String>,
     session_thinking: Option<String>,
     project_trusted: bool,
+    pub memory: Option<crate::native_extensions::VectorMemory>,
+    pub learning: Option<crate::native_extensions::LearningController>,
 }
 
 impl Default for GraphController {
@@ -246,6 +248,8 @@ impl GraphController {
             session_model: None,
             session_thinking: None,
             project_trusted: false,
+            memory: None,
+            learning: None,
         }
     }
 
@@ -289,6 +293,8 @@ impl GraphController {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(run.clone());
             }),
+            memory: self.memory.clone(),
+            learning: self.learning.clone(),
         };
         (deps, loaded.errors)
     }

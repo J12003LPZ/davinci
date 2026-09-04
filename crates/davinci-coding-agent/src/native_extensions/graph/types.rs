@@ -515,6 +515,18 @@ pub struct GraphTaskState {
     /// Graph-owned mutation delta.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation: Option<GraphMutation>,
+    /// Context packet fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_fingerprint: Option<String>,
+    /// Estimated context tokens.
+    #[serde(default)]
+    pub context_tokens: usize,
+    /// Referenced memory IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_refs: Vec<String>,
+    /// Referenced skills.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_refs: Vec<crate::native_extensions::ecosystem::SkillContextRef>,
 }
 
 impl GraphTaskState {
@@ -541,6 +553,10 @@ impl GraphTaskState {
             last_activity: None,
             fingerprint: None,
             mutation: None,
+            context_fingerprint: None,
+            context_tokens: 0,
+            memory_refs: Vec::new(),
+            skill_refs: Vec::new(),
         }
     }
 

@@ -370,7 +370,8 @@ pub fn run_worker(
         .env("PI_GRAPH_EXPECT", spec.expect.as_str())
         .env("PI_GRAPH_ARTIFACT_PATH", &spec.artifact_path)
         .env("PI_GRAPH_EXTRA_TOOLS", spec.tools.join(","))
-        .env("PI_GRAPH_CACHE_KEY", &cache_key);
+        .env("PI_GRAPH_CACHE_KEY", &cache_key)
+        .env("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1");
 
     if let Some(path) = &spec.transcript_path {
         let model = spec
@@ -757,6 +758,14 @@ mod tests {
         assert!(joined.contains("-e governor"));
         assert!(joined.contains("-a"));
         assert!(args.last().unwrap().starts_with('@'));
+    }
+
+    #[test]
+    fn worker_child_environment_suppresses_memory_injection() {
+        let args = build_worker_args(&spec(), Path::new("brief.md"), Path::new("system.md"));
+        assert!(args.contains(&"--no-session".to_string()));
+        assert!(args.contains(&"--no-extensions".to_string()));
+        assert!(args.contains(&"--no-skills".to_string()));
     }
 
     #[test]

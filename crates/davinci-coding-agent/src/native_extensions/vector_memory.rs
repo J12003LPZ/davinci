@@ -8,12 +8,12 @@ use davinci_agent::{ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// After an embedding request fails, dense retrieval stays off for this long
@@ -602,7 +602,7 @@ pub struct VectorMemory {
     last_indexed_at: Option<u64>,
     /// Set when an embedding request failed; dense retrieval and document
     /// embedding are skipped until it passes.
-    dense_offline_until: Cell<Option<Instant>>,
+    dense_offline_until: Arc<Mutex<Option<Instant>>>,
 }
 
 fn known_key(kind: MemoryKind, hash: &str) -> String {
@@ -631,7 +631,7 @@ impl VectorMemory {
             known: HashSet::new(),
             last_indexed: 0,
             last_indexed_at: None,
-            dense_offline_until: Cell::new(None),
+            dense_offline_until: Arc::new(Mutex::new(None)),
         };
         memory.load_local();
         memory
@@ -841,10 +841,14 @@ impl VectorMemory {
     }
 
     pub fn dense_available(&self) -> bool {
-        match self.dense_offline_until.get() {
+        let mut guard = self
+            .dense_offline_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match *guard {
             Some(until) if Instant::now() < until => false,
             Some(_) => {
-                self.dense_offline_until.set(None);
+                *guard = None;
                 true
             }
             None => true,
@@ -852,8 +856,9 @@ impl VectorMemory {
     }
 
     fn mark_dense_offline(&self) {
-        self.dense_offline_until
-            .set(Some(Instant::now() + DENSE_BACKOFF));
+        if let Ok(mut guard) = self.dense_offline_until.lock() {
+            *guard = Some(Instant::now() + DENSE_BACKOFF);
+        }
     }
 
     pub fn search_tool(&self, args: &Value) -> Result<ToolResult, ToolError> {

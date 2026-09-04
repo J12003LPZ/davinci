@@ -110,6 +110,135 @@ pub fn compute_context_fingerprint(
     format!("{:x}", hasher.finalize())
 }
 
+pub fn assemble_packet_text(
+    memory_hits: &[MemoryContextHit],
+    skill_candidates: &[SkillContextCandidate],
+) -> String {
+    if memory_hits.is_empty() && skill_candidates.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<context source=\"davinci\" untrusted=\"true\">\n");
+    if !memory_hits.is_empty() {
+        out.push_str(&format_memory_context(memory_hits));
+        out.push('\n');
+    }
+    if !skill_candidates.is_empty() {
+        out.push_str(&format_skill_context(skill_candidates));
+        out.push('\n');
+    }
+    out.push_str("</context>");
+    out
+}
+
+pub fn build_context_packet(
+    memory: &crate::native_extensions::VectorMemory,
+    learning: &crate::native_extensions::LearningController,
+    request: ContextPacketRequest<'_>,
+) -> ContextPacket {
+    if request.token_cap == 0 || request.prompt.trim().is_empty() {
+        return ContextPacket::empty();
+    }
+
+    let memory_cap = DEFAULT_GRAPH_MEMORY_TOKENS.min(request.token_cap);
+    let skill_cap = DEFAULT_GRAPH_SKILL_TOKENS.min(request.token_cap);
+
+    let mut memory_hits =
+        memory.context_hits(request.prompt, DEFAULT_GRAPH_MEMORY_HITS, memory_cap);
+    let mut skill_candidates = if request.include_skills {
+        let role = request
+            .role
+            .unwrap_or(crate::native_extensions::graph::Role::Writer);
+        learning.graph_skill_candidates(request.prompt, role, DEFAULT_GRAPH_SKILL_COUNT, skill_cap)
+    } else {
+        Vec::new()
+    };
+
+    if memory_hits.is_empty() && skill_candidates.is_empty() {
+        return ContextPacket::empty();
+    }
+
+    let mut text = assemble_packet_text(&memory_hits, &skill_candidates);
+    let mut est_tokens = (text.chars().count() + 3) / 4;
+
+    // Enforce aggregate token_cap: trimming order is lowest-ranked context first
+    while est_tokens > request.token_cap
+        && (!memory_hits.is_empty() || !skill_candidates.is_empty())
+    {
+        match (memory_hits.last(), skill_candidates.last()) {
+            (Some(m), Some(s)) => {
+                if m.score <= s.score {
+                    memory_hits.pop();
+                } else {
+                    skill_candidates.pop();
+                }
+            }
+            (Some(_), None) => {
+                if memory_hits.len() > 1 {
+                    memory_hits.pop();
+                } else {
+                    break;
+                }
+            }
+            (None, Some(_)) => {
+                if skill_candidates.len() > 1 {
+                    skill_candidates.pop();
+                } else {
+                    break;
+                }
+            }
+            (None, None) => break,
+        }
+        text = assemble_packet_text(&memory_hits, &skill_candidates);
+        est_tokens = (text.chars().count() + 3) / 4;
+    }
+
+    // If still over cap with 1 item remaining, truncate the remaining item
+    if est_tokens > request.token_cap {
+        let char_budget = request.token_cap.saturating_mul(4);
+        if char_budget < 60 {
+            return ContextPacket::empty();
+        }
+        if let Some(s) = skill_candidates.last_mut() {
+            let inner_cap = char_budget.saturating_sub(60);
+            let truncated: String = s.body.chars().take(inner_cap).collect();
+            s.body = truncated;
+            s.estimated_tokens = (s.body.chars().count() + 3) / 4;
+            text = assemble_packet_text(&memory_hits, &skill_candidates);
+            est_tokens = (text.chars().count() + 3) / 4;
+        } else if let Some(m) = memory_hits.last_mut() {
+            let inner_cap = char_budget.saturating_sub(60);
+            let truncated: String = m.text.chars().take(inner_cap).collect();
+            m.text = truncated;
+            m.estimated_tokens = (m.text.chars().count() + 3) / 4;
+            text = assemble_packet_text(&memory_hits, &skill_candidates);
+            est_tokens = (text.chars().count() + 3) / 4;
+        }
+    }
+
+    if memory_hits.is_empty() && skill_candidates.is_empty() {
+        return ContextPacket::empty();
+    }
+
+    let memory_refs = memory_hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+    let skill_refs = skill_candidates
+        .into_iter()
+        .map(|s| SkillContextRef {
+            name: s.name,
+            version: s.version,
+            content_hash: s.content_hash,
+        })
+        .collect::<Vec<_>>();
+    let fingerprint = compute_context_fingerprint(&text, &memory_refs, &skill_refs);
+
+    ContextPacket {
+        text,
+        memory_refs,
+        skill_refs,
+        estimated_tokens: est_tokens,
+        fingerprint,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +264,60 @@ mod tests {
 
         // Empty returns empty
         assert_eq!(compute_context_fingerprint("", &[], &[]), "");
+    }
+
+    #[test]
+    fn test_assemble_packet_text_format() {
+        let mem = vec![MemoryContextHit {
+            id: "m1".into(),
+            text: "indexed memory fact".into(),
+            score: 0.8,
+            estimated_tokens: 5,
+        }];
+        let skills = vec![SkillContextCandidate {
+            name: "test-skill".into(),
+            version: 1,
+            content_hash: "hash".into(),
+            body: "# Test\nAction instructions.".into(),
+            score: 0.9,
+            estimated_tokens: 6,
+        }];
+
+        let text = assemble_packet_text(&mem, &skills);
+        assert!(text.starts_with("<context source=\"davinci\" untrusted=\"true\">"));
+        assert!(text.ends_with("</context>"));
+        assert!(text.contains("<memory>"));
+        assert!(text.contains("<skill name=\"test-skill\" version=\"1\">"));
+
+        // Empty returns empty string
+        assert_eq!(assemble_packet_text(&[], &[]), "");
+    }
+
+    #[test]
+    fn test_empty_packet_has_zero_tokens_and_empty_text() {
+        let packet = ContextPacket::empty();
+        assert!(packet.is_empty());
+        assert_eq!(packet.estimated_tokens, 0);
+        assert_eq!(packet.text, "");
+        assert_eq!(packet.fingerprint, "");
+    }
+
+    #[test]
+    fn test_build_context_packet_enforces_aggregate_cap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let memory = crate::native_extensions::VectorMemory::new(temp_dir.path().to_path_buf());
+        let learning =
+            crate::native_extensions::LearningController::new(temp_dir.path(), None, None);
+
+        // Blank query produces empty packet
+        let req_blank = ContextPacketRequest::new("   ");
+        let empty_pkt = build_context_packet(&memory, &learning, req_blank);
+        assert!(empty_pkt.is_empty());
+        assert_eq!(empty_pkt.estimated_tokens, 0);
+
+        // Cap of 0 produces empty packet
+        let req_zero = ContextPacketRequest::new("test prompt").with_token_cap(0);
+        let zero_pkt = build_context_packet(&memory, &learning, req_zero);
+        assert!(zero_pkt.is_empty());
     }
 }

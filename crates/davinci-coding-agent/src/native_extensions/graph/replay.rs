@@ -306,6 +306,8 @@ mod tests {
             session_thinking: None,
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
         };
 
         // Candidate with incompatible repo_state_hash
@@ -387,6 +389,10 @@ mod tests {
                     last_activity: None,
                     fingerprint: Some(sample_fingerprint()),
                     mutation: None,
+                    context_fingerprint: None,
+                    context_tokens: 0,
+                    memory_refs: Vec::new(),
+                    skill_refs: Vec::new(),
                 },
                 GraphTaskState {
                     id: "plan-1".into(),
@@ -404,6 +410,10 @@ mod tests {
                     last_activity: None,
                     fingerprint: Some(sample_fingerprint()),
                     mutation: None,
+                    context_fingerprint: None,
+                    context_tokens: 0,
+                    memory_refs: Vec::new(),
+                    skill_refs: Vec::new(),
                 },
                 GraphTaskState {
                     id: "implement-1".into(),
@@ -421,6 +431,10 @@ mod tests {
                     last_activity: None,
                     fingerprint: Some(sample_fingerprint()),
                     mutation: None,
+                    context_fingerprint: None,
+                    context_tokens: 0,
+                    memory_refs: Vec::new(),
+                    skill_refs: Vec::new(),
                 },
             ],
             verification: None,

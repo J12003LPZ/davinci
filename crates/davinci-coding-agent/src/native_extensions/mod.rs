@@ -203,10 +203,14 @@ impl NativeExtensionHost {
         let learning_config =
             agent_dir.and_then(|dir| crate::settings::load_merged_settings(dir, cwd).learning);
         let learning = LearningController::new(cwd, agent_dir, learning_config);
+        let memory = VectorMemory::with_config(cwd.to_path_buf(), memory_config);
+        let mut graph = GraphController::new(cwd.to_path_buf());
+        graph.memory = Some(memory.clone());
+        graph.learning = Some(learning.clone());
         Self {
             governor,
-            memory: VectorMemory::with_config(cwd.to_path_buf(), memory_config),
-            graph: GraphController::new(cwd.to_path_buf()),
+            memory,
+            graph,
             security: SecurityScanController::new(cwd.to_path_buf()),
             learning,
         }
