@@ -55,6 +55,7 @@ pub struct ControllerDeps {
     pub on_update: Arc<UpdateSink>,
     pub memory: Option<crate::native_extensions::VectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
+    pub governor: Option<crate::native_extensions::TokenGovernor>,
 }
 
 pub struct RunOptions {
@@ -161,6 +162,12 @@ impl GraphExecution {
         // implementation that re-locks the run must not deadlock.
         let snapshot = {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            run.resource_snapshot = Some(
+                crate::native_extensions::ecosystem::ResourceSnapshot::collect(
+                    &run.tasks,
+                    self.deps.governor.as_ref().map(|g| g.stats()).as_ref(),
+                ),
+            );
             let _ = save_run(&mut run);
             run.clone()
         };
@@ -691,6 +698,7 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
             started_at: now_ms(),
         },
         blocked_reason: None,
+        resource_snapshot: None,
         updated_at: 0,
     };
 
@@ -1382,6 +1390,7 @@ mod tests {
             on_update: Arc::new(|_, _| {}),
             memory: None,
             learning: None,
+            governor: None,
         };
 
         let options = RunOptions {
@@ -1501,6 +1510,7 @@ mod tests {
             on_update: Arc::new(|_, _| {}),
             memory: None,
             learning: None,
+            governor: None,
         };
 
         let options = RunOptions {

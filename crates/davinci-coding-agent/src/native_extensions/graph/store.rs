@@ -430,6 +430,7 @@ mod tests {
                 started_at: now_ms(),
             },
             blocked_reason: None,
+            resource_snapshot: None,
             updated_at: 0,
         }
     }

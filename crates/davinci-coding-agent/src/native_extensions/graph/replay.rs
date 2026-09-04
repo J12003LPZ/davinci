@@ -308,6 +308,7 @@ mod tests {
             on_update: Arc::new(|_, _| {}),
             memory: None,
             learning: None,
+            governor: None,
         };
 
         // Candidate with incompatible repo_state_hash
@@ -448,6 +449,7 @@ mod tests {
                 started_at: 0,
             },
             blocked_reason: None,
+            resource_snapshot: None,
             updated_at: 0,
             definition: None,
         };

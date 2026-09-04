@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 const DEFAULT_COMPRESS_THRESHOLD_BYTES: usize = 8_192;
@@ -699,6 +701,16 @@ fn call_summary(tool: &str, args: &Value) -> String {
     clipped
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernorStats {
+    pub bytes_withheld: u64,
+    pub retrievals: u64,
+    pub compressed_outputs: u64,
+    pub deduplicated_reads: u64,
+    pub blocked_calls: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenGovernor {
     pub config: TokenGovernorConfig,
@@ -715,6 +727,7 @@ pub struct TokenGovernor {
     /// Bytes the model was not sent: the difference between each original
     /// and what replaced it.
     bytes_withheld: usize,
+    retrievals: Arc<AtomicU64>,
 }
 
 impl Default for TokenGovernor {
@@ -744,6 +757,17 @@ impl TokenGovernor {
             deduplicated_reads: 0,
             blocked_calls: 0,
             bytes_withheld: 0,
+            retrievals: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn stats(&self) -> GovernorStats {
+        GovernorStats {
+            bytes_withheld: self.bytes_withheld as u64,
+            retrievals: self.retrievals.load(Ordering::Relaxed),
+            compressed_outputs: self.compressed_outputs as u64,
+            deduplicated_reads: self.deduplicated_reads as u64,
+            blocked_calls: self.blocked_calls as u64,
         }
     }
 
@@ -786,6 +810,7 @@ impl TokenGovernor {
         self.deduplicated_reads = 0;
         self.blocked_calls = 0;
         self.bytes_withheld = 0;
+        self.retrievals.store(0, Ordering::Relaxed);
     }
 
     /// `state_hash` is asked for only when a search tool is being fingerprinted:
@@ -932,6 +957,7 @@ impl TokenGovernor {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::Failed("retrieve_output requires id".into()))?;
         let content = self.store.load(id)?;
+        self.retrievals.fetch_add(1, Ordering::Relaxed);
         let start = args
             .get("startLine")
             .and_then(Value::as_u64)

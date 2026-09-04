@@ -233,6 +233,7 @@ pub struct GraphController {
     project_trusted: bool,
     pub memory: Option<crate::native_extensions::VectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
+    pub governor: Option<crate::native_extensions::TokenGovernor>,
 }
 
 impl Default for GraphController {
@@ -250,6 +251,7 @@ impl GraphController {
             project_trusted: false,
             memory: None,
             learning: None,
+            governor: None,
         }
     }
 
@@ -295,6 +297,7 @@ impl GraphController {
             }),
             memory: self.memory.clone(),
             learning: self.learning.clone(),
+            governor: self.governor.clone(),
         };
         (deps, loaded.errors)
     }

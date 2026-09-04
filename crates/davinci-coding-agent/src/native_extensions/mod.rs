@@ -207,6 +207,7 @@ impl NativeExtensionHost {
         let mut graph = GraphController::new(cwd.to_path_buf());
         graph.memory = Some(memory.clone());
         graph.learning = Some(learning.clone());
+        graph.governor = Some(governor.clone());
         Self {
             governor,
             memory,

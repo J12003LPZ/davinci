@@ -522,6 +522,7 @@ mod tests {
                 started_at: 0,
             },
             blocked_reason: None,
+            resource_snapshot: None,
             updated_at: 0,
             definition: None,
         }

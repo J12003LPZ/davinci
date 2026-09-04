@@ -612,6 +612,8 @@ pub struct GraphRun {
     pub counters: GraphCounters,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_snapshot: Option<crate::native_extensions::ecosystem::ResourceSnapshot>,
     pub updated_at: u64,
 }
 
@@ -1002,6 +1004,7 @@ mod tests {
                 started_at: 0,
             },
             blocked_reason: None,
+            resource_snapshot: None,
             updated_at: 0,
         };
         let planner = run.tasks[2].clone();
