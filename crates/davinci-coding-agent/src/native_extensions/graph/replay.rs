@@ -26,12 +26,7 @@ pub struct ReplayFingerprint {
 }
 
 impl ReplayFingerprint {
-    pub fn for_task(
-        cwd: &Path,
-        graph_version: u32,
-        briefing: &str,
-        expect: ArtifactKind,
-    ) -> Self {
+    pub fn for_task(cwd: &Path, graph_version: u32, briefing: &str, expect: ArtifactKind) -> Self {
         Self {
             graph_version,
             config_hash: compute_config_hash(cwd),

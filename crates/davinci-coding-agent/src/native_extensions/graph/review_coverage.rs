@@ -53,7 +53,11 @@ impl ReviewCoverage {
 
 /// Returns true if every required chunk in the coverage has been reviewed.
 pub fn coverage_complete(coverage: &ReviewCoverage) -> bool {
-    let reviewed: HashSet<&str> = coverage.reviewed_chunk_ids.iter().map(String::as_str).collect();
+    let reviewed: HashSet<&str> = coverage
+        .reviewed_chunk_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
     coverage
         .required_chunk_ids
         .iter()

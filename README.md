@@ -170,6 +170,13 @@ Runs are persisted under `.pi/graph/runs/<runId>/` (`state.json`, `artifacts/`, 
 
 Everything is bounded, and every budget is off by default rather than silently guessing: `maxResearchers` (3), `maxParallelWorkers` (3), `maxWorkers`, `maxRevisionCycles` (3), `maxReplans` (2), `maxCostUsd`, `runDeadlineMs`, and per-role worker timeouts. Per-role model pins let a cheap model classify and an expensive one write. A background run never outlives its session: session shutdown aborts every run and kills the worker process tree.
 
+**Hardened Invariants:**
+- **Explicit execution topology**: Runs execute against a validated, persisted DAG definition (`GraphDefinition`). DAG validation strictly forbids cycles, review bypass, missing verification, and concurrent mutation-capable writers.
+- **Active run deadlines**: Enforces `run_deadline_ms` across the run and per worker, actively terminating long-running child processes when wall-clock limits expire.
+- **Deterministic replay fingerprints**: Completed tasks persist a `ReplayFingerprint` (graph version, config hash, repo state, briefing hash, contract hash). Incompatible cached nodes are rejected and re-executed with explicit diagnostics; tasks superseded by a revision cycle are never replayed.
+- **Graph-owned mutation provenance**: Changes made by writer nodes are captured deterministically against a pre-mutation baseline, excluding pre-existing uncommitted user edits and preserving Git index integrity.
+- **Complete review coverage**: Large mutations exceeding review context thresholds are deterministically split into line-bounded `ReviewChunk`s with stable IDs. `ReviewCoverage` ensures every chunk is reviewed before final approval is possible.
+
 Configure in `.pi/graph.json` (no file means all defaults and no errors; a malformed file reports the problem and proceeds on defaults):
 
 ```json

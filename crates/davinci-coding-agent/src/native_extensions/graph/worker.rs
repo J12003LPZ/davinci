@@ -12,8 +12,8 @@
 //! definition of success. stdout JSON lines are folded for usage accounting,
 //! the live transcript, and diagnostics.
 
-pub use super::process::WorkerDeadline;
 use super::process::run_child_with_deadline;
+pub use super::process::WorkerDeadline;
 use super::store::{iso8601_utc, now_ms, write_artifact};
 pub use super::types::WorkerError;
 use super::types::{
@@ -386,7 +386,8 @@ pub fn run_worker(
 
     let deadline = WorkerDeadline {
         run_deadline: spec.run_deadline,
-        role_timeout: (spec.timeout_ms > 0).then(|| std::time::Duration::from_millis(spec.timeout_ms)),
+        role_timeout: (spec.timeout_ms > 0)
+            .then(|| std::time::Duration::from_millis(spec.timeout_ms)),
     };
 
     let outcome = {
@@ -431,7 +432,11 @@ pub fn run_worker(
     };
 
     if let Some(path) = &spec.transcript_path {
-        let suffix = match (outcome.run_deadline_exceeded, outcome.timed_out, outcome.aborted) {
+        let suffix = match (
+            outcome.run_deadline_exceeded,
+            outcome.timed_out,
+            outcome.aborted,
+        ) {
             (true, _, _) => " (run deadline exceeded)",
             (_, true, _) => " (timed out)",
             (_, _, true) => " (aborted)",
@@ -633,7 +638,11 @@ pub fn run_dry_worker(
 pub fn run_fixture_worker_with_deadline(
     deadline: std::time::Duration,
 ) -> Result<WorkerResult, WorkerError> {
-    let dir = std::env::temp_dir().join(format!("pi-graph-fixture-{}-{}", std::process::id(), now_ms()));
+    let dir = std::env::temp_dir().join(format!(
+        "pi-graph-fixture-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
     let _ = fs::create_dir_all(&dir);
     let sleeper = if cfg!(windows) {
         "ping -n 20 127.0.0.1 > nul"
@@ -646,14 +655,9 @@ pub fn run_fixture_worker_with_deadline(
         run_deadline: Some(std::time::Instant::now() + deadline),
         role_timeout: None,
     };
-    let outcome = super::process::run_child_with_deadline(
-        command,
-        &abort,
-        deadline_spec,
-        |_| {},
-        |_| {},
-    )
-    .map_err(|e| WorkerError::SpawnFailed(e.to_string()))?;
+    let outcome =
+        super::process::run_child_with_deadline(command, &abort, deadline_spec, |_| {}, |_| {})
+            .map_err(|e| WorkerError::SpawnFailed(e.to_string()))?;
     let _ = fs::remove_dir_all(&dir);
 
     // Assert that the child process tree was actively killed and is no longer alive

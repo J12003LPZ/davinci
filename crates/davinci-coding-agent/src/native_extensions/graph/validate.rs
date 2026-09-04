@@ -580,8 +580,14 @@ fn validate_classification(value: &serde_json::Map<String, Value>, errors: &mut 
 }
 
 fn validate_non_empty_refs(value: &serde_json::Value) -> Result<(), String> {
-    let refs = value.as_array().ok_or_else(|| "refs must be an array".to_string())?;
-    if refs.is_empty() || refs.iter().any(|v| v.as_str().map_or(true, |s| s.trim().is_empty())) {
+    let refs = value
+        .as_array()
+        .ok_or_else(|| "refs must be an array".to_string())?;
+    if refs.is_empty()
+        || refs
+            .iter()
+            .any(|v| v.as_str().map_or(true, |s| s.trim().is_empty()))
+    {
         return Err("evidence finding requires at least one non-empty ref".into());
     }
     Ok(())
@@ -888,7 +894,9 @@ pub fn validate_config_shape(value: &Value) -> Vec<String> {
                     }
                     Some(value) => {
                         if super::config::parse_u64_budget(value, key).is_err() {
-                            errors.push(format!("budgets.{key} must be a non-negative whole integer"));
+                            errors.push(format!(
+                                "budgets.{key} must be a non-negative whole integer"
+                            ));
                         }
                     }
                 }
@@ -1123,12 +1131,24 @@ mod tests {
                 .expect("the contract carries an example");
             let valid_example: Value = serde_json::from_str(json).expect("valid JSON example");
 
-            assert!(contract.accepts(&valid_example), "{kind} contract should accept example");
-            assert!(validate_artifact(kind, &valid_example).is_ok(), "{kind} validator should accept example");
+            assert!(
+                contract.accepts(&valid_example),
+                "{kind} contract should accept example"
+            );
+            assert!(
+                validate_artifact(kind, &valid_example).is_ok(),
+                "{kind} validator should accept example"
+            );
 
             let empty = json!({});
-            assert!(!contract.accepts(&empty), "{kind} contract should reject empty object");
-            assert!(validate_artifact(kind, &empty).is_err(), "{kind} validator should reject empty object");
+            assert!(
+                !contract.accepts(&empty),
+                "{kind} contract should reject empty object"
+            );
+            assert!(
+                validate_artifact(kind, &empty).is_err(),
+                "{kind} validator should reject empty object"
+            );
         }
     }
 

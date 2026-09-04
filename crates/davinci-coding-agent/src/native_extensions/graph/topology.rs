@@ -92,7 +92,9 @@ impl std::fmt::Display for GraphTopologyError {
             Self::CycleDetected => write!(f, "cycle detected in graph topology"),
             Self::UnreachableRequiredNode(id) => write!(f, "required node is unreachable: {id}"),
             Self::ReviewBypassed => write!(f, "topology allows mutation without review"),
-            Self::MissingVerificationNode => write!(f, "verify-success edge without verification node"),
+            Self::MissingVerificationNode => {
+                write!(f, "verify-success edge without verification node")
+            }
             Self::ConcurrentWritersPossible => {
                 write!(f, "two mutation-capable writers can be ready concurrently")
             }
@@ -129,7 +131,10 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
     }
     for edge in &definition.edges {
         *in_degrees.get_mut(edge.to.as_str()).unwrap() += 1;
-        adjacency.get_mut(edge.from.as_str()).unwrap().push(edge.to.as_str());
+        adjacency
+            .get_mut(edge.from.as_str())
+            .unwrap()
+            .push(edge.to.as_str());
     }
 
     let mut queue: VecDeque<&str> = in_degrees
@@ -588,7 +593,10 @@ mod tests {
             condition: EdgeCondition::Always,
         });
         let err = validate_definition(&def).unwrap_err();
-        assert_eq!(err, GraphTopologyError::UnknownNodeInEdge("unknown-node".into()));
+        assert_eq!(
+            err,
+            GraphTopologyError::UnknownNodeInEdge("unknown-node".into())
+        );
     }
 
     #[test]
@@ -625,7 +633,8 @@ mod tests {
         let mut def = build_definition(GraphMode::Standard, &test_classification());
         // Remove review node and edge
         def.nodes.retain(|n| n.id != "review-1");
-        def.edges.retain(|e| e.to != "review-1" && e.from != "review-1");
+        def.edges
+            .retain(|e| e.to != "review-1" && e.from != "review-1");
         let err = validate_definition(&def).unwrap_err();
         assert_eq!(err, GraphTopologyError::ReviewBypassed);
     }

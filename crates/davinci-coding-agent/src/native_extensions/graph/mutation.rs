@@ -176,7 +176,10 @@ pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
 }
 
 /// Compute graph-owned delta against a captured baseline.
-pub fn capture_graph_delta(cwd: &Path, baseline: &MutationBaseline) -> Result<GraphMutation, String> {
+pub fn capture_graph_delta(
+    cwd: &Path,
+    baseline: &MutationBaseline,
+) -> Result<GraphMutation, String> {
     let current_paths = list_workspace_files(cwd);
     let mut current_map = BTreeMap::new();
 
@@ -345,9 +348,8 @@ fn format_modified_file_diff(file: &str, old_bytes: &[u8], new_bytes: &[u8]) -> 
         j += 1;
     }
 
-    let mut diff = format!(
-        "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1,{n} +1,{m} @@\n"
-    );
+    let mut diff =
+        format!("diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1,{n} +1,{m} @@\n");
     for (op, line) in ops {
         diff.push(op);
         diff.push_str(line);
@@ -399,7 +401,11 @@ mod tests {
             .unwrap();
 
         // 2. Pre-existing dirty uncommitted user edit
-        std::fs::write(&file_a, "initial content for a\nuser dirty uncommitted edit\n").unwrap();
+        std::fs::write(
+            &file_a,
+            "initial content for a\nuser dirty uncommitted edit\n",
+        )
+        .unwrap();
 
         // 3. Baseline captured immediately before writer mutation
         let baseline = capture_baseline(dir.path()).expect("baseline captured");
@@ -442,10 +448,18 @@ mod tests {
         let delta = capture_graph_delta(dir.path(), &baseline).expect("delta");
         assert_eq!(delta.files.len(), 2);
 
-        let mod_entry = delta.files.iter().find(|f| f.path == "modify_me.txt").unwrap();
+        let mod_entry = delta
+            .files
+            .iter()
+            .find(|f| f.path == "modify_me.txt")
+            .unwrap();
         assert_eq!(mod_entry.status, "modified");
 
-        let del_entry = delta.files.iter().find(|f| f.path == "delete_me.txt").unwrap();
+        let del_entry = delta
+            .files
+            .iter()
+            .find(|f| f.path == "delete_me.txt")
+            .unwrap();
         assert_eq!(del_entry.status, "deleted");
 
         let diff = delta.diff();

@@ -313,7 +313,8 @@ impl GraphExecution {
                         let mut refused = task.clone();
                         refused.status = TaskStatus::Cancelled;
                         refused.ended_at = Some(now_ms());
-                        refused.error = Some(format!("node not ready in execution graph: {task_id}"));
+                        refused.error =
+                            Some(format!("node not ready in execution graph: {task_id}"));
                         run.tasks.push(refused);
                         drop(run);
                         self.checkpoint(Some(&format!("{task_id}: not ready in topology")));
@@ -325,11 +326,16 @@ impl GraphExecution {
             run.tasks.push(task.clone());
         }
 
-        if let Some((artifact, usage, stored_fingerprint)) = self.options.resume_artifacts.get(&task_id) {
+        if let Some((artifact, usage, stored_fingerprint)) =
+            self.options.resume_artifacts.get(&task_id)
+        {
             let (run_version, cwd) = {
                 let run = self.run.lock().unwrap_or_else(|error| error.into_inner());
                 (
-                    run.definition.as_ref().map(|d| d.version).unwrap_or(run.version),
+                    run.definition
+                        .as_ref()
+                        .map(|d| d.version)
+                        .unwrap_or(run.version),
                     PathBuf::from(&run.cwd),
                 )
             };
@@ -361,7 +367,8 @@ impl GraphExecution {
                 {
                     let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
                     let run_id = run.run_id.clone();
-                    if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                    if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id)
+                    {
                         task_entry.started_at = Some(now_ms());
                         task_entry.artifact_file = Some(format!("artifacts/{task_id}.json"));
                         task_entry.fingerprint = stored_fingerprint.clone();
@@ -477,7 +484,9 @@ impl GraphExecution {
                 ),
             );
 
-            if result.run_deadline_exceeded || result.failure_reason.as_deref() == Some("run deadline exceeded") {
+            if result.run_deadline_exceeded
+                || result.failure_reason.as_deref() == Some("run deadline exceeded")
+            {
                 let reason = "run deadline exceeded".to_string();
                 self.budget_abort(reason.clone());
                 self.end_task(&task_id, TaskStatus::Cancelled, Some(reason));
@@ -503,7 +512,9 @@ impl GraphExecution {
                         let run_id = run.run_id.clone();
                         let fingerprint =
                             ReplayFingerprint::for_task(&cwd, run_version, &briefing, task.expect);
-                        if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                        if let Some(task_entry) =
+                            run.tasks.iter_mut().find(|entry| entry.id == task_id)
+                        {
                             task_entry.artifact_file = Some(format!("artifacts/{task_id}.json"));
                             task_entry.fingerprint = Some(fingerprint.clone());
                         }
@@ -607,9 +618,8 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
     let run_id = new_run_id();
     let _ = create_run_dir(&options.cwd, &run_id);
     let budgets: GraphBudgets = deps.config.budgets.clone();
-    let run_deadline = (budgets.run_deadline_ms > 0).then(|| {
-        std::time::Instant::now() + Duration::from_millis(budgets.run_deadline_ms)
-    });
+    let run_deadline = (budgets.run_deadline_ms > 0)
+        .then(|| std::time::Instant::now() + Duration::from_millis(budgets.run_deadline_ms));
     let run = GraphRun {
         version: 1,
         run_id: run_id.clone(),
@@ -949,7 +959,10 @@ fn deliver_goal(
         let attempt_delta = capture_graph_delta(&cwd, &attempt_baseline).unwrap_or_default();
         cumulative_delta = capture_graph_delta(&cwd, &milestone_baseline).unwrap_or_default();
         {
-            let mut run = execution.run.lock().unwrap_or_else(|error| error.into_inner());
+            let mut run = execution
+                .run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let run_id = run.run_id.clone();
             if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                 task_entry.mutation = Some(attempt_delta.clone());
@@ -1072,7 +1085,11 @@ fn deliver_goal(
         indices.review += 1;
         let graph_diff = cumulative_delta.diff();
         let changed_files: Vec<String> = if !cumulative_delta.files.is_empty() {
-            cumulative_delta.files.iter().map(|f| f.path.clone()).collect()
+            cumulative_delta
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect()
         } else {
             patch.changed_files.clone()
         };
@@ -1131,11 +1148,7 @@ fn deliver_goal(
                 all_issues.extend(chunk_review.issues);
                 chunk_summaries.push(format!(
                     "Chunk {} ({}): verdict={}, {} issue(s): {}",
-                    chunk.id,
-                    chunk.file,
-                    chunk_review.verdict,
-                    issues_count,
-                    chunk_review.notes
+                    chunk.id, chunk.file, chunk_review.verdict, issues_count, chunk_review.notes
                 ));
             }
 
@@ -1168,7 +1181,8 @@ fn deliver_goal(
             }
             let Some(mut final_review) = final_review else {
                 execution.blocked(
-                    execution.task_failure_reason("review failed (a run is never approved by default)"),
+                    execution
+                        .task_failure_reason("review failed (a run is never approved by default)"),
                 );
                 return Delivery::Stop;
             };
@@ -1221,7 +1235,10 @@ fn deliver_goal(
         };
 
         {
-            let mut run = execution.run.lock().unwrap_or_else(|error| error.into_inner());
+            let mut run = execution
+                .run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             run.review_coverage = Some(coverage.clone());
         }
 
@@ -1342,16 +1359,20 @@ mod tests {
 
         let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
             let artifact = match spec.expect {
-                ArtifactKind::Classification => Artifact::Classification(crate::native_extensions::graph::types::Classification {
-                    task_class: crate::native_extensions::graph::types::TaskClass::Feature,
-                    complexity: Complexity::Standard,
-                    rationale: "standard test".into(),
-                    research_tasks: vec![crate::native_extensions::graph::types::ResearchRequest {
-                        kind: ResearchKind::CodeSearch,
-                        focus: "find code".into(),
-                    }],
-                    milestones: None,
-                }),
+                ArtifactKind::Classification => Artifact::Classification(
+                    crate::native_extensions::graph::types::Classification {
+                        task_class: crate::native_extensions::graph::types::TaskClass::Feature,
+                        complexity: Complexity::Standard,
+                        rationale: "standard test".into(),
+                        research_tasks: vec![
+                            crate::native_extensions::graph::types::ResearchRequest {
+                                kind: ResearchKind::CodeSearch,
+                                focus: "find code".into(),
+                            },
+                        ],
+                        milestones: None,
+                    },
+                ),
                 ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
                     kind: ResearchKind::CodeSearch,
                     findings: vec![crate::native_extensions::graph::types::EvidenceFinding {
@@ -1376,22 +1397,26 @@ mod tests {
                 })),
                 ArtifactKind::PatchReport => {
                     std::fs::write(&file_path, "fn initial() {}\nfn added() {}\n").unwrap();
-                    Artifact::PatchReport(Box::new(crate::native_extensions::graph::types::PatchReport {
-                        changed_files: vec!["code.rs".into()],
-                        summary: "added function".into(),
-                        deviations: vec![],
-                        plan_invalidated: false,
-                        invalidation_reason: None,
-                    }))
+                    Artifact::PatchReport(Box::new(
+                        crate::native_extensions::graph::types::PatchReport {
+                            changed_files: vec!["code.rs".into()],
+                            summary: "added function".into(),
+                            deviations: vec![],
+                            plan_invalidated: false,
+                            invalidation_reason: None,
+                        },
+                    ))
                 }
                 ArtifactKind::Review => {
                     // Reviewer approves BUT omits the required chunk!
-                    Artifact::Review(Box::new(crate::native_extensions::graph::types::ReviewDecision {
-                        verdict: Verdict::Approve,
-                        issues: vec![],
-                        notes: "looks fine".into(),
-                        reviewed_chunk_ids: vec!["some_other_file#chunk-0".into()],
-                    }))
+                    Artifact::Review(Box::new(
+                        crate::native_extensions::graph::types::ReviewDecision {
+                            verdict: Verdict::Approve,
+                            issues: vec![],
+                            notes: "looks fine".into(),
+                            reviewed_chunk_ids: vec!["some_other_file#chunk-0".into()],
+                        },
+                    ))
                 }
             };
 
@@ -1438,9 +1463,20 @@ mod tests {
 
         let run = run_graph(options, deps);
         assert_eq!(run.phase, Phase::Blocked);
-        assert!(run.blocked_reason.as_deref().unwrap().contains("reviewer still requires changes"));
-        let coverage = run.review_coverage.expect("review coverage must be tracked");
-        assert!(!coverage_complete(&coverage), "coverage must NOT be complete");
-        assert!(coverage.missing_chunk_ids().contains(&"code.rs#chunk-0".to_string()));
+        assert!(run
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("reviewer still requires changes"));
+        let coverage = run
+            .review_coverage
+            .expect("review coverage must be tracked");
+        assert!(
+            !coverage_complete(&coverage),
+            "coverage must NOT be complete"
+        );
+        assert!(coverage
+            .missing_chunk_ids()
+            .contains(&"code.rs#chunk-0".to_string()));
     }
 }

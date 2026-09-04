@@ -163,7 +163,11 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     }
 }
 
-pub fn write_graph_definition(cwd: &Path, run_id: &str, definition: &super::topology::GraphDefinition) -> std::io::Result<()> {
+pub fn write_graph_definition(
+    cwd: &Path,
+    run_id: &str,
+    definition: &super::topology::GraphDefinition,
+) -> std::io::Result<()> {
     let path = run_dir(cwd, run_id).join("graph.json");
     let content = serde_json::to_vec_pretty(definition)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -201,7 +205,9 @@ pub fn write_task_fingerprint(
     task_id: &str,
     fingerprint: &super::replay::ReplayFingerprint,
 ) -> std::io::Result<()> {
-    let path = run_dir(cwd, run_id).join("artifacts").join(format!("{task_id}.fingerprint.json"));
+    let path = run_dir(cwd, run_id)
+        .join("artifacts")
+        .join(format!("{task_id}.fingerprint.json"));
     let content = serde_json::to_vec_pretty(fingerprint)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     atomic_write(&path, &content)
@@ -215,7 +221,9 @@ pub fn read_task_fingerprint(
     if !is_safe_run_id(run_id) {
         return None;
     }
-    let path = run_dir(cwd, run_id).join("artifacts").join(format!("{task_id}.fingerprint.json"));
+    let path = run_dir(cwd, run_id)
+        .join("artifacts")
+        .join(format!("{task_id}.fingerprint.json"));
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
@@ -226,7 +234,9 @@ pub fn write_task_mutation(
     task_id: &str,
     mutation: &super::mutation::GraphMutation,
 ) -> std::io::Result<()> {
-    let path = run_dir(cwd, run_id).join("artifacts").join(format!("{task_id}.mutation.json"));
+    let path = run_dir(cwd, run_id)
+        .join("artifacts")
+        .join(format!("{task_id}.mutation.json"));
     let content = serde_json::to_vec_pretty(mutation)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     atomic_write(&path, &content)
@@ -240,7 +250,9 @@ pub fn read_task_mutation(
     if !is_safe_run_id(run_id) {
         return None;
     }
-    let path = run_dir(cwd, run_id).join("artifacts").join(format!("{task_id}.mutation.json"));
+    let path = run_dir(cwd, run_id)
+        .join("artifacts")
+        .join(format!("{task_id}.mutation.json"));
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }

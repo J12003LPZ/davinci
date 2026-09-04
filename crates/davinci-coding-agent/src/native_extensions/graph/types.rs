@@ -191,7 +191,10 @@ impl FieldKind {
                 let mut sub_props = serde_json::Map::new();
                 let mut sub_req = Vec::new();
                 for rule in *subrules {
-                    sub_props.insert(rule.name.to_string(), rule.kind.to_json_schema(rule.description));
+                    sub_props.insert(
+                        rule.name.to_string(),
+                        rule.kind.to_json_schema(rule.description),
+                    );
                     if rule.required {
                         sub_req.push(serde_json::Value::String(rule.name.to_string()));
                     }
@@ -220,7 +223,10 @@ impl FieldKind {
                 let mut sub_props = serde_json::Map::new();
                 let mut sub_req = Vec::new();
                 for rule in *subrules {
-                    sub_props.insert(rule.name.to_string(), rule.kind.to_json_schema(rule.description));
+                    sub_props.insert(
+                        rule.name.to_string(),
+                        rule.kind.to_json_schema(rule.description),
+                    );
                     if rule.required {
                         sub_req.push(serde_json::Value::String(rule.name.to_string()));
                     }
@@ -294,7 +300,10 @@ impl ArtifactContract {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
         for rule in self.fields {
-            properties.insert(rule.name.to_string(), rule.kind.to_json_schema(rule.description));
+            properties.insert(
+                rule.name.to_string(),
+                rule.kind.to_json_schema(rule.description),
+            );
             if rule.required {
                 required.push(serde_json::Value::String(rule.name.to_string()));
             }
@@ -998,7 +1007,13 @@ mod tests {
 
     #[test]
     fn successful_retry_clears_prior_error() {
-        let mut task = GraphTaskState::new("test-task", Role::Writer, ArtifactKind::PatchReport, vec![], None);
+        let mut task = GraphTaskState::new(
+            "test-task",
+            Role::Writer,
+            ArtifactKind::PatchReport,
+            vec![],
+            None,
+        );
         // Attempt 1 fails
         task.attempts = 1;
         task.mark_failed("exit 1; compiler error".to_string());

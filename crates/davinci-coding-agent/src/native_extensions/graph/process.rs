@@ -97,7 +97,8 @@ pub fn is_pid_alive(pid: u32) -> bool {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout);
                 text.lines().any(|line| {
-                    line.split_whitespace().any(|word| word == pid.to_string().as_str())
+                    line.split_whitespace()
+                        .any(|word| word == pid.to_string().as_str())
                 })
             }
             Err(_) => false,
@@ -179,9 +180,15 @@ pub fn run_child_with_deadline(
         }
     }
     outcome.exit_code = match child.wait() {
-        Ok(status) => status
-            .code()
-            .unwrap_or(if outcome.aborted || outcome.run_deadline_exceeded { 130 } else { 1 }),
+        Ok(status) => {
+            status
+                .code()
+                .unwrap_or(if outcome.aborted || outcome.run_deadline_exceeded {
+                    130
+                } else {
+                    1
+                })
+        }
         Err(_) => 1,
     };
     Ok(outcome)
