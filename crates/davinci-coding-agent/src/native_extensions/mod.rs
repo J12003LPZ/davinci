@@ -1,11 +1,14 @@
 //! Native Rust ports of the bundled pi extensions.
 
+pub mod ecosystem;
 pub mod graph;
 pub mod learning;
 mod security_scan;
 mod token_governor;
 pub mod vector_memory;
 
+#[allow(unused_imports)]
+pub use ecosystem::*;
 pub use graph::*;
 pub use learning::*;
 pub use security_scan::*;
