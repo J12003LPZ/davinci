@@ -194,6 +194,30 @@ pub fn nothing_ran(result: &VerificationResult) -> bool {
     result.commands.iter().all(|command| command.skipped)
 }
 
+impl VerificationResult {
+    pub fn to_bundle(
+        &self,
+        changed_files: Vec<String>,
+        graph_run_id: Option<String>,
+        security: crate::native_extensions::ecosystem::verification::SecurityVerification,
+    ) -> crate::native_extensions::ecosystem::verification::VerificationBundle {
+        let commands_ran = self.commands.iter().filter(|c| !c.skipped).count();
+        let commands_failed = self
+            .commands
+            .iter()
+            .filter(|c| !c.skipped && c.exit_code != 0)
+            .count();
+        crate::native_extensions::ecosystem::verification::VerificationBundle {
+            commands_ran,
+            commands_failed,
+            deterministic_passed: self.passed && commands_ran > 0 && commands_failed == 0,
+            security,
+            changed_files,
+            graph_run_id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

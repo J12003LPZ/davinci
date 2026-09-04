@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use davinci_agent::AgentEvent;
 use serde_json::Value;
 
+use crate::native_extensions::ecosystem::verification::{SecurityVerification, VerificationBundle};
 use crate::native_extensions::graph::types::VerificationResult;
 use crate::native_extensions::learning::types::{
     LearningEvidence, ToolEvidence, VerificationEvidence,
@@ -32,22 +33,35 @@ pub struct BuildEvidenceInput<'a> {
     pub verification: VerificationEvidence,
 }
 
+pub fn verification_evidence_from_bundle(bundle: &VerificationBundle) -> VerificationEvidence {
+    VerificationEvidence {
+        graph_run_id: bundle.graph_run_id.clone(),
+        commands_ran: bundle.commands_ran as u32,
+        passed: bundle.deterministic_passed,
+        user_accepted: false,
+        user_corrected: false,
+        permission_denied: false,
+    }
+}
+
 #[allow(dead_code)]
 pub fn verification_evidence_from_graph(
     run_id: Option<String>,
     result: Option<&VerificationResult>,
 ) -> VerificationEvidence {
-    let commands_ran = result
-        .map(|r| r.commands.iter().filter(|c| !c.skipped).count() as u32)
-        .unwrap_or(0);
-    let passed = result.map(|r| r.passed).unwrap_or(false) && commands_ran > 0;
-    VerificationEvidence {
-        graph_run_id: run_id,
-        commands_ran,
-        passed,
-        user_accepted: false,
-        user_corrected: false,
-        permission_denied: false,
+    match result {
+        Some(r) => {
+            let bundle = r.to_bundle(Vec::new(), run_id, SecurityVerification::NotRequired);
+            verification_evidence_from_bundle(&bundle)
+        }
+        None => VerificationEvidence {
+            graph_run_id: run_id,
+            commands_ran: 0,
+            passed: false,
+            user_accepted: false,
+            user_corrected: false,
+            permission_denied: false,
+        },
     }
 }
 
