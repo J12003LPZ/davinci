@@ -13,7 +13,10 @@
 //! back as tool errors, so the worker model fixes its own output inside its
 //! own loop — no respawn, no prose parsing.
 
-use super::roles::{is_bash_command_allowed, role_bash_policy, role_tools, GRAPH_SUBMIT_TOOL};
+use super::roles::{
+    ensure_governor_recovery_tool, is_bash_command_allowed, role_bash_policy, role_tools,
+    GRAPH_SUBMIT_TOOL,
+};
 use super::store::write_artifact;
 use super::types::{ArtifactKind, BashPolicy, Role};
 use super::validate::{artifact_contract, artifact_schema, validate_artifact};
@@ -73,13 +76,15 @@ impl GraphWorkerContext {
         let role = Role::parse(role?)?;
         let expect = ArtifactKind::parse(expect?)?;
         let artifact_path = artifact_path.filter(|path| !path.is_empty())?;
-        let mut allowed_tools: BTreeSet<String> = role_tools(role).into_iter().collect();
+        let mut tools = role_tools(role);
         for tool in extra_tools.unwrap_or_default().split(',') {
             let tool = tool.trim();
             if !tool.is_empty() {
-                allowed_tools.insert(tool.to_string());
+                tools.push(tool.to_string());
             }
         }
+        ensure_governor_recovery_tool(&mut tools);
+        let allowed_tools: BTreeSet<String> = tools.into_iter().collect();
         Some(Self {
             role,
             expect,

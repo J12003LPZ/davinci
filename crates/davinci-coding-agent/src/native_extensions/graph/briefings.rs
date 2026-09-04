@@ -17,7 +17,18 @@ const SUBMIT_RULE: &str =
 That call is your entire deliverable; prose outside it is ignored. \
 If graph_submit reports a validation error, fix the listed fields and call it again.";
 
+const RECOVERY_RULE: &str =
+    "Large tool output may be compacted; use retrieve_output only when the omitted detail is needed. ";
+
+#[allow(dead_code)]
 pub fn role_system_prompt(role: Role) -> String {
+    let has_recovery = super::roles::role_tools(role)
+        .iter()
+        .any(|t| t == "retrieve_output");
+    role_system_prompt_with_recovery(role, has_recovery)
+}
+
+pub fn role_system_prompt_with_recovery(role: Role, has_recovery: bool) -> String {
     let body = match role {
         Role::Classifier => {
             "You are the task classifier in a graph-engineered coding pipeline. \
@@ -64,7 +75,8 @@ pub fn role_system_prompt(role: Role) -> String {
              Approve only if the change satisfies the goal and plan without blocker or major issues. "
         }
     };
-    format!("{body}{SUBMIT_RULE}")
+    let recovery = if has_recovery { RECOVERY_RULE } else { "" };
+    format!("{body}{recovery}{SUBMIT_RULE}")
 }
 
 pub struct ClassifyInput<'a> {
@@ -688,5 +700,19 @@ mod tests {
             passed: true,
         };
         assert!(revision_notes_from(Some(&verification), None).is_empty());
+    }
+
+    #[test]
+    fn role_system_prompt_includes_recovery_sentence_when_recovery_is_present() {
+        let researcher_prompt = role_system_prompt(Role::Researcher);
+        assert!(
+            researcher_prompt.contains("Large tool output may be compacted; use retrieve_output")
+        );
+
+        let classifier_prompt = role_system_prompt(Role::Classifier);
+        assert!(!classifier_prompt.contains("Large tool output may be compacted"));
+
+        let classifier_prompt_with_rec = role_system_prompt_with_recovery(Role::Classifier, true);
+        assert!(classifier_prompt_with_rec.contains("Large tool output may be compacted"));
     }
 }

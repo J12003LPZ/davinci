@@ -19,6 +19,18 @@ const READ_TOOLS: &[&str] = &["read", "grep", "find", "ls"];
 
 pub const GRAPH_SUBMIT_TOOL: &str = "graph_submit";
 
+/// Guarantees that if any tool in the list can generate compressible output under
+/// the token governor, `retrieve_output` is automatically included so the worker
+/// never loses access to compressed data.
+pub fn ensure_governor_recovery_tool(tools: &mut Vec<String>) {
+    let has_compressible = tools
+        .iter()
+        .any(|t| crate::native_extensions::tool_may_be_compressed(t));
+    if has_compressible && !tools.iter().any(|t| t == "retrieve_output") {
+        tools.push("retrieve_output".into());
+    }
+}
+
 pub fn role_tools(role: Role) -> Vec<String> {
     let names: Vec<&str> = match role {
         Role::Classifier => vec![GRAPH_SUBMIT_TOOL],
@@ -40,7 +52,9 @@ pub fn role_tools(role: Role) -> Vec<String> {
             tools
         }
     };
-    names.into_iter().map(str::to_string).collect()
+    let mut tools: Vec<String> = names.into_iter().map(str::to_string).collect();
+    ensure_governor_recovery_tool(&mut tools);
+    tools
 }
 
 pub fn role_bash_policy(role: Role) -> BashPolicy {
@@ -412,5 +426,86 @@ mod tests {
             role_for_research_kind(ResearchKind::CodeSearch),
             Role::Researcher
         );
+    }
+
+    #[test]
+    fn researcher_with_compressible_tools_always_gets_retrieve_output() {
+        let tools = role_tools(Role::Researcher);
+        assert!(tools.contains(&"grep".into()));
+        assert!(tools.contains(&"retrieve_output".into()));
+    }
+
+    #[test]
+    fn governor_recovery_tool_always_supplied_when_compressible_tools_present() {
+        for role in &[
+            Role::Researcher,
+            Role::TestAnalyzer,
+            Role::Historian,
+            Role::Planner,
+            Role::Writer,
+            Role::Reviewer,
+        ] {
+            let tools = role_tools(*role);
+            assert!(
+                tools.contains(&"retrieve_output".to_string()),
+                "Role {:?} should have retrieve_output",
+                role
+            );
+        }
+
+        // Classifier has only lossless graph_submit by default, so it doesn't get retrieve_output
+        let classifier_tools = role_tools(Role::Classifier);
+        assert!(!classifier_tools.contains(&"retrieve_output".to_string()));
+
+        // When a compressible tool is added to Classifier, ensure_governor_recovery_tool adds retrieve_output
+        let mut custom_classifier = classifier_tools.clone();
+        custom_classifier.push("grep".to_string());
+        ensure_governor_recovery_tool(&mut custom_classifier);
+        assert!(custom_classifier.contains(&"retrieve_output".to_string()));
+    }
+
+    #[test]
+    fn governor_recovery_e2e_fixture_compresses_and_retrieves_output() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let store = crate::native_extensions::OutputStore::new(dir.path());
+        let mut gov = crate::native_extensions::TokenGovernor::with_store(
+            "graph-test-session",
+            crate::native_extensions::TokenGovernorConfig {
+                compress_threshold_bytes: 50,
+                compress_threshold_lines: 5,
+                ..Default::default()
+            },
+            store.clone(),
+        );
+
+        // Verify role toolset includes retrieve_output
+        let tools = role_tools(Role::Researcher);
+        assert!(tools.contains(&"retrieve_output".to_string()));
+
+        // Oversized output from bash
+        let oversized = "line of output\n".repeat(20);
+        let result = davinci_agent::ToolResult {
+            content: oversized.clone(),
+            details: None,
+            is_error: false,
+        };
+        let processed = gov.after_tool(
+            "bash",
+            &serde_json::json!({"command": "cat big.txt"}),
+            result,
+        );
+        assert!(processed.content.contains("retrieve_output"));
+        let output_id = processed
+            .details
+            .as_ref()
+            .and_then(|d| d.get("tokenGovernor"))
+            .and_then(|g| g.get("outputId"))
+            .and_then(serde_json::Value::as_str)
+            .expect("must contain outputId");
+
+        // Now retrieve original content via store
+        let recovered = store.load(output_id).expect("store must have original");
+        assert_eq!(recovered, oversized);
     }
 }

@@ -7,14 +7,14 @@
 
 use super::briefings::{
     build_evidence_digest, classify_briefing, implement_briefing, milestone_goal, plan_briefing,
-    research_briefing, review_briefing, revision_notes_from, role_system_prompt, ClassifyInput,
-    ReviewInput,
+    research_briefing, review_briefing, revision_notes_from, role_system_prompt_with_recovery,
+    ClassifyInput, ReviewInput,
 };
 use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
 use super::mutation::{capture_baseline, capture_graph_delta, GraphMutation};
 use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
 use super::review_coverage::{chunk_graph_mutation, coverage_complete, ReviewCoverage};
-use super::roles::{role_for_research_kind, role_tools};
+use super::roles::{ensure_governor_recovery_tool, role_for_research_kind, role_tools};
 use super::store::{
     artifact_path, create_run_dir, new_run_id, now_ms, save_run, transcript_path, write_artifact,
     write_graph_definition, write_log, write_task_fingerprint, write_task_mutation,
@@ -264,12 +264,14 @@ impl GraphExecution {
         let configured_model = self.deps.config.models.get(&role).cloned();
         let mut tools = role_tools(role);
         tools.extend(self.deps.config.worker_extra_tools.iter().cloned());
+        ensure_governor_recovery_tool(&mut tools);
+        let has_recovery = tools.iter().any(|t| t == "retrieve_output");
         WorkerSpec {
             task_id: task.id.clone(),
             role,
             expect: task.expect,
             briefing,
-            system_prompt: role_system_prompt(role),
+            system_prompt: role_system_prompt_with_recovery(role, has_recovery),
             cwd: PathBuf::from(&run.cwd),
             model: configured_model
                 .clone()

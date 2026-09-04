@@ -54,7 +54,13 @@ const LOSSLESS_TOOLS: &[&str] = &[
     "agent",
     "retrieve_output",
     "memory_search",
+    "graph_submit",
 ];
+
+/// Returns whether a tool's output may be compressed by the token governor.
+pub fn tool_may_be_compressed(name: &str) -> bool {
+    !LOSSLESS_TOOLS.contains(&name)
+}
 
 /// Tools the anti-loop ledger watches: pure queries whose answer only changes
 /// when the repository does.
