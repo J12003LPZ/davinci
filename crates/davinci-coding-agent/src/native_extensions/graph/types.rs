@@ -607,7 +607,8 @@ pub struct GraphRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_bundle: Option<crate::native_extensions::ecosystem::verification::VerificationBundle>,
+    pub verification_bundle:
+        Option<crate::native_extensions::ecosystem::verification::VerificationBundle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_coverage: Option<ReviewCoverage>,
     pub budgets: GraphBudgets,

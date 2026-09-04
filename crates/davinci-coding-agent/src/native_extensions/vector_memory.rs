@@ -767,6 +767,7 @@ impl VectorMemory {
         self.records.len()
     }
 
+    #[allow(dead_code)]
     pub fn records(&self) -> &[MemoryRecord] {
         &self.records
     }

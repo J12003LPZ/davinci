@@ -230,8 +230,10 @@ Fourteen `sec_*` tools drive the lifecycle (start, scope, progress, candidate re
 Turn settled agent turns into durable memory and reusable procedural skills (`SKILL.md`) with a fail-open background review loop.
 
 - **Fail-open & Non-blocking:** Background reviews run on asynchronous worker threads and are cancelled cooperatively when a new turn begins. Normal agent execution never fails due to learning operations.
-- **Safe by Default:** Shadow mode is on by default (`shadowMode: true`). Staged candidates require manual approval via `/learning-approve` unless `autoApplyProject: true` is explicitly configured for a trusted repository.
-- **Deterministic Verification:** Only procedures backed by real command executions (e.g. clean test passes) are eligible for promotion; unverified turns cannot auto-promote.
+- **Review Gating:** Evaluates turn evidence with `should_review_evidence`, skipping low-signal read-only turns to cut reviewer input tokens by >= 40% while preserving 100% of accepted high-confidence artifacts. Memory indexing remains active.
+- **Exact Version Attribution:** Skills carry explicit `SkillVersionRef (name, version, content_hash)`. Graph execution outcomes (`VerifiedSuccess`, `VerifiedFailure`, `Neutral`) update only the specific targeted version ledger record.
+- **Closed-Loop Graph Learning:** Verified graph completions persist high-confidence memories and project skills. Later runs with related goals automatically retrieve these exact skill versions and memories into worker context, and successful verification increments the skill version's success counter.
+- **Conditional Security Gate:** Graph changes undergo deterministic change-risk classification (`assess_change_risk`); high-risk mutations or `always` policy trigger non-interactive security verification (`verify_changed_surface`) before review, blocking approval on unmitigated blockers.
 - **Commands:** `/learn` to distill procedures in the foreground; `/learning-status`, `/learning-pending`, `/learning-approve <id>`, `/learning-reject <id>`, `/skill-list`, and `/skill-view <name>`.
 - Full documentation in [`docs/learning.md`](docs/learning.md).
 

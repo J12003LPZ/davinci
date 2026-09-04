@@ -448,7 +448,8 @@ pub struct ReviewInput<'a> {
     pub chunk: Option<&'a ReviewChunk>,
     pub chunk_summaries: Option<&'a [String]>,
     pub required_chunk_ids: Option<&'a [String]>,
-    pub security: Option<&'a crate::native_extensions::ecosystem::verification::SecurityVerification>,
+    pub security:
+        Option<&'a crate::native_extensions::ecosystem::verification::SecurityVerification>,
 }
 
 pub fn review_briefing(input: &ReviewInput<'_>) -> String {
@@ -583,7 +584,11 @@ pub fn revision_notes_from(
             }
         }
     }
-    if let Some(crate::native_extensions::ecosystem::verification::SecurityVerification::Failed { scan_id, blockers }) = security {
+    if let Some(crate::native_extensions::ecosystem::verification::SecurityVerification::Failed {
+        scan_id,
+        blockers,
+    }) = security
+    {
         notes.push(format!(
             "Security verification failed: {blockers} blocker(s) found (scan ID: {scan_id}). Clean sensitive credentials, dangerous evaluations, or forbidden patterns before proceeding."
         ));

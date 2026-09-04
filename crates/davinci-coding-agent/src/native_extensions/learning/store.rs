@@ -179,6 +179,7 @@ impl LearningStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn skill_version(&self, name: &str, version: u64) -> Option<&SkillLedgerRecord> {
         self.skill_versions.get(&(name.to_string(), version))
     }
@@ -357,6 +358,7 @@ impl LearningStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
     }

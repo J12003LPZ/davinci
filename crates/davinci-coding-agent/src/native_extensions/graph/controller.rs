@@ -22,8 +22,6 @@ use super::store::{
 use super::topology::{
     build_definition, ready_nodes, validate_definition, GraphMode, GraphRunState,
 };
-use crate::native_extensions::ecosystem::risk::ChangeRisk;
-use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, SecurityVerification};
 use super::types::{
     Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters, GraphRun,
     GraphTaskState, ImplementationPlan, Phase, ResearchKind, ReviewIssue, Role, Severity,
@@ -33,6 +31,8 @@ use super::verify::{
     collect_verify_commands, nothing_ran, run_verification, CollectInput, VerifyExec,
 };
 use super::worker::WorkerRunner;
+use crate::native_extensions::ecosystem::risk::ChangeRisk;
+use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, SecurityVerification};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1497,7 +1497,11 @@ fn deliver_goal(
         } else {
             bundle.approval_eligible(policy_mode)
         };
-        if review.verdict == Verdict::Approve && !blocking_issue && is_coverage_complete && can_approve {
+        if review.verdict == Verdict::Approve
+            && !blocking_issue
+            && is_coverage_complete
+            && can_approve
+        {
             return Delivery::Ok;
         }
         if review.verdict == Verdict::Approve {
@@ -1529,7 +1533,11 @@ fn deliver_goal(
             .unwrap_or_else(|error| error.into_inner())
             .counters
             .revision_cycles += 1;
-        revision_notes = Some(revision_notes_from(None, Some(&review), Some(&security_verification)));
+        revision_notes = Some(revision_notes_from(
+            None,
+            Some(&review),
+            Some(&security_verification),
+        ));
     }
 }
 
@@ -1914,18 +1922,16 @@ mod tests {
         let auth_file_clone = auth_file.clone();
         let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
             let artifact = match spec.expect {
-                ArtifactKind::Classification => Artifact::Classification(
-                    Classification {
-                        task_class: TaskClass::Feature,
-                        complexity: Complexity::Standard,
-                        rationale: "auth change".into(),
-                        research_tasks: vec![ResearchRequest {
-                            kind: ResearchKind::CodeSearch,
-                            focus: "find key".into(),
-                        }],
-                        milestones: None,
-                    },
-                ),
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Feature,
+                    complexity: Complexity::Standard,
+                    rationale: "auth change".into(),
+                    research_tasks: vec![ResearchRequest {
+                        kind: ResearchKind::CodeSearch,
+                        focus: "find key".into(),
+                    }],
+                    milestones: None,
+                }),
                 ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
                     kind: ResearchKind::CodeSearch,
                     findings: vec![EvidenceFinding {
@@ -2025,7 +2031,10 @@ mod tests {
         let bundle = run
             .verification_bundle
             .expect("verification bundle must be present");
-        assert!(matches!(bundle.security, SecurityVerification::Failed { .. }));
+        assert!(matches!(
+            bundle.security,
+            SecurityVerification::Failed { .. }
+        ));
         assert!(!bundle.approval_eligible(SecurityPolicyMode::Risk));
     }
 
@@ -2039,18 +2048,16 @@ mod tests {
         let ui_file_clone = ui_file.clone();
         let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
             let artifact = match spec.expect {
-                ArtifactKind::Classification => Artifact::Classification(
-                    Classification {
-                        task_class: TaskClass::Feature,
-                        complexity: Complexity::Standard,
-                        rationale: "clean ui change".into(),
-                        research_tasks: vec![ResearchRequest {
-                            kind: ResearchKind::CodeSearch,
-                            focus: "find render".into(),
-                        }],
-                        milestones: None,
-                    },
-                ),
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Feature,
+                    complexity: Complexity::Standard,
+                    rationale: "clean ui change".into(),
+                    research_tasks: vec![ResearchRequest {
+                        kind: ResearchKind::CodeSearch,
+                        focus: "find render".into(),
+                    }],
+                    milestones: None,
+                }),
                 ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
                     kind: ResearchKind::CodeSearch,
                     findings: vec![EvidenceFinding {
@@ -2146,7 +2153,10 @@ mod tests {
         let bundle = run
             .verification_bundle
             .expect("verification bundle must be present");
-        assert!(matches!(bundle.security, SecurityVerification::Passed { .. }));
+        assert!(matches!(
+            bundle.security,
+            SecurityVerification::Passed { .. }
+        ));
         assert!(bundle.approval_eligible(SecurityPolicyMode::Always));
     }
 
@@ -2160,18 +2170,16 @@ mod tests {
         let auth_file_clone = auth_file.clone();
         let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
             let artifact = match spec.expect {
-                ArtifactKind::Classification => Artifact::Classification(
-                    Classification {
-                        task_class: TaskClass::Feature,
-                        complexity: Complexity::Standard,
-                        rationale: "auth change".into(),
-                        research_tasks: vec![ResearchRequest {
-                            kind: ResearchKind::CodeSearch,
-                            focus: "find key".into(),
-                        }],
-                        milestones: None,
-                    },
-                ),
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Feature,
+                    complexity: Complexity::Standard,
+                    rationale: "auth change".into(),
+                    research_tasks: vec![ResearchRequest {
+                        kind: ResearchKind::CodeSearch,
+                        focus: "find key".into(),
+                    }],
+                    milestones: None,
+                }),
                 ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
                     kind: ResearchKind::CodeSearch,
                     findings: vec![EvidenceFinding {
@@ -2322,11 +2330,7 @@ mod tests {
                     out_of_scope: vec![],
                 })),
                 ArtifactKind::PatchReport => {
-                    std::fs::write(
-                        &db_file_clone,
-                        "pub fn connect() -> bool { true }\n",
-                    )
-                    .unwrap();
+                    std::fs::write(&db_file_clone, "pub fn connect() -> bool { true }\n").unwrap();
                     Artifact::PatchReport(Box::new(PatchReport {
                         changed_files: vec!["src/db.rs".into()],
                         summary: "updated connect".into(),
@@ -2446,7 +2450,10 @@ mod tests {
             }],
             tools: vec![],
             run_stats: davinci_agent::RunStats::default(),
-            verification: crate::native_extensions::learning::evidence::verification_evidence_from_bundle(&bundle1),
+            verification:
+                crate::native_extensions::learning::evidence::verification_evidence_from_bundle(
+                    &bundle1,
+                ),
         };
         learning.review_settled_turn(evidence1);
         std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
@@ -2526,5 +2533,3 @@ mod tests {
         assert_eq!(worker_calls.load(Ordering::SeqCst), 10);
     }
 }
-
-

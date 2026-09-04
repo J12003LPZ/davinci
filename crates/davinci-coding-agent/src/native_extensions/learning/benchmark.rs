@@ -14,6 +14,7 @@ pub struct LearningBenchmarkResult {
     pub accepted_high_confidence_artifacts: usize,
 }
 
+#[allow(dead_code)]
 fn estimate_turn_tokens(evidence: &LearningEvidence) -> u64 {
     // Standard heuristic: 4 chars per token + fixed reviewer prompt overhead (~400 tokens)
     let raw_len = evidence.serialized_len() as u64;
@@ -21,6 +22,7 @@ fn estimate_turn_tokens(evidence: &LearningEvidence) -> u64 {
 }
 
 /// Simulated canned reviewer output for high-signal turns without model calls.
+#[allow(dead_code)]
 fn mock_review_turn(evidence: &LearningEvidence) -> Vec<LearningCandidate> {
     if evidence.verification.commands_ran > 0 && evidence.verification.passed {
         vec![LearningCandidate {
@@ -141,6 +143,7 @@ fn mock_review_turn(evidence: &LearningEvidence) -> Vec<LearningCandidate> {
     }
 }
 
+#[allow(dead_code)]
 pub fn run_learning_benchmark(turns: &[LearningEvidence], gated: bool) -> LearningBenchmarkResult {
     let mut token_counts = Vec::with_capacity(turns.len());
     let mut dispatched = 0;
