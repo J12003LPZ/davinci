@@ -391,6 +391,7 @@ mod tests {
                     ended_at: Some(2),
                     last_activity: None,
                     fingerprint: Some(sample_fingerprint()),
+                    mutation: None,
                 },
                 GraphTaskState {
                     id: "plan-1".into(),
@@ -407,6 +408,7 @@ mod tests {
                     ended_at: Some(3),
                     last_activity: None,
                     fingerprint: Some(sample_fingerprint()),
+                    mutation: None,
                 },
                 GraphTaskState {
                     id: "implement-1".into(),
@@ -423,6 +425,7 @@ mod tests {
                     ended_at: Some(4),
                     last_activity: None,
                     fingerprint: Some(sample_fingerprint()),
+                    mutation: None,
                 },
             ],
             verification: None,

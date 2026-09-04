@@ -19,6 +19,7 @@
 pub(crate) mod briefings;
 pub(crate) mod config;
 pub(crate) mod controller;
+pub(crate) mod mutation;
 pub(crate) mod process;
 pub(crate) mod render;
 pub(crate) mod roles;
@@ -31,6 +32,11 @@ pub(crate) mod verify;
 pub(crate) mod worker;
 pub(crate) mod worker_hooks;
 
+#[allow(unused_imports)]
+pub use mutation::{
+    capture_baseline, capture_graph_delta, ChangedFile, FileFingerprint, GraphMutation,
+    MutationBaseline, PatchChunk,
+};
 #[allow(unused_imports)]
 pub use replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
 #[allow(unused_imports)]

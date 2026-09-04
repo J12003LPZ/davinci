@@ -11,11 +11,12 @@ use super::briefings::{
     ReviewInput,
 };
 use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
+use super::mutation::{capture_baseline, capture_graph_delta, GraphMutation};
 use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
 use super::roles::{role_for_research_kind, role_tools};
 use super::store::{
     artifact_path, create_run_dir, new_run_id, now_ms, save_run, transcript_path, write_artifact,
-    write_graph_definition, write_log, write_task_fingerprint,
+    write_graph_definition, write_log, write_task_fingerprint, write_task_mutation,
 };
 use super::topology::{
     build_definition, ready_nodes, validate_definition, GraphMode, GraphRunState,
@@ -904,6 +905,10 @@ fn deliver_goal(
     }
 
     let mut revision_notes: Option<String> = None;
+    let cwd = PathBuf::from(&execution.options.cwd);
+    let milestone_baseline = capture_baseline(&cwd).unwrap_or_default();
+    #[allow(unused_assignments)]
+    let mut cumulative_delta = GraphMutation::default();
     loop {
         if execution.cancelled_if_aborted() {
             return Delivery::Stop;
@@ -911,13 +916,15 @@ fn deliver_goal(
 
         execution.set_phase(Phase::Implement);
         indices.implement += 1;
+        let task_id = format!("implement-{}", indices.implement);
         let task = GraphTaskState::new(
-            format!("implement-{}", indices.implement),
+            task_id.clone(),
             Role::Writer,
             ArtifactKind::PatchReport,
             vec![],
             None,
         );
+        let attempt_baseline = capture_baseline(&cwd).unwrap_or_default();
         let patch = execution
             .execute_node(
                 task,
@@ -936,6 +943,18 @@ fn deliver_goal(
             execution.blocked(execution.task_failure_reason("implementation failed"));
             return Delivery::Stop;
         };
+
+        let attempt_delta = capture_graph_delta(&cwd, &attempt_baseline).unwrap_or_default();
+        cumulative_delta = capture_graph_delta(&cwd, &milestone_baseline).unwrap_or_default();
+        {
+            let mut run = execution.run.lock().unwrap_or_else(|error| error.into_inner());
+            let run_id = run.run_id.clone();
+            if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                task_entry.mutation = Some(attempt_delta.clone());
+            }
+            drop(run);
+            let _ = write_task_mutation(&cwd, &run_id, &task_id, &attempt_delta);
+        }
 
         if patch.plan_invalidated {
             let reason = patch.invalidation_reason.clone().unwrap_or_default();
@@ -1049,7 +1068,17 @@ fn deliver_goal(
 
         execution.set_phase(Phase::Review);
         indices.review += 1;
-        let diff = truncate(&default_get_diff(&cwd), DIFF_MAX_CHARS);
+        let graph_diff = cumulative_delta.diff();
+        let diff = if !graph_diff.is_empty() {
+            truncate(&graph_diff, DIFF_MAX_CHARS)
+        } else {
+            truncate(&default_get_diff(&cwd), DIFF_MAX_CHARS)
+        };
+        let changed_files: Vec<String> = if !cumulative_delta.files.is_empty() {
+            cumulative_delta.files.iter().map(|f| f.path.clone()).collect()
+        } else {
+            patch.changed_files.clone()
+        };
         let task = GraphTaskState::new(
             format!("review-{}", indices.review),
             Role::Reviewer,
@@ -1064,7 +1093,7 @@ fn deliver_goal(
                     goal: goal_text,
                     plan: plan.as_ref(),
                     diff: &diff,
-                    changed_files: &patch.changed_files,
+                    changed_files: &changed_files,
                     verification: &verification,
                 }),
             )

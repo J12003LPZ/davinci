@@ -6,6 +6,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[allow(unused_imports)]
+pub use super::mutation::{
+    capture_baseline, capture_graph_delta, ChangedFile, FileFingerprint, GraphMutation,
+    MutationBaseline, PatchChunk,
+};
+#[allow(unused_imports)]
 pub use super::replay::ReplayFingerprint;
 
 macro_rules! string_enum {
@@ -495,6 +501,9 @@ pub struct GraphTaskState {
     /// Replay compatibility fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<ReplayFingerprint>,
+    /// Graph-owned mutation delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation: Option<GraphMutation>,
 }
 
 impl GraphTaskState {
@@ -520,6 +529,7 @@ impl GraphTaskState {
             ended_at: None,
             last_activity: None,
             fingerprint: None,
+            mutation: None,
         }
     }
 
