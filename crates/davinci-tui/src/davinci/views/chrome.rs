@@ -1141,4 +1141,40 @@ mod tests {
         assert_eq!(thousands(1_200_000), "1.2m");
         assert_eq!(thousands(18_402_000), "18m");
     }
+
+    #[test]
+    fn governor_notice_renders_and_respects_constraints() {
+        let mut m = model(100);
+        assert!(governor_notice(&m).is_empty());
+
+        m.governor_notice = Some((
+            "compressed bash output · saved 14k tokens".into(),
+            std::time::Instant::now(),
+        ));
+        let lines = governor_notice(&m);
+        assert_eq!(lines.len(), 1);
+        let rendered = text(&lines[0]);
+        assert!(rendered.contains("✓ Governor"));
+        assert!(rendered.contains("compressed bash output · saved 14k tokens"));
+        assert!(rendered.contains("/governor-status"));
+
+        // Omitted when window height is below 12 rows
+        m.height = 10;
+        assert!(governor_notice(&m).is_empty());
+        m.height = 44;
+
+        // At narrow width (< 100 cols), the status shortcut is dropped
+        m.width = 80;
+        let narrow = text(&governor_notice(&m)[0]);
+        assert!(narrow.contains("✓ Governor"));
+        assert!(!narrow.contains("/governor-status"));
+
+        // Notice expires after 8 seconds
+        m.width = 100;
+        m.governor_notice = Some((
+            "compressed bash output · saved 14k tokens".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(9),
+        ));
+        assert!(governor_notice(&m).is_empty());
+    }
 }

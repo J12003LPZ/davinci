@@ -1359,4 +1359,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn arrow_keys_and_page_up_down_scroll_feature_sheets() {
+        use crate::davinci::fixtures;
+
+        for screen in [Screen::GraphRun, Screen::Governor, Screen::Vectors] {
+            let mut m = model(100, 30);
+            let screen_code = match screen {
+                Screen::GraphRun => "5a",
+                Screen::Vectors => "5b",
+                Screen::Governor => "5c",
+                _ => unreachable!(),
+            };
+            fixtures::dress_screen(&mut m, screen_code);
+            assert_eq!(m.screen, screen);
+            assert_eq!(m.feature_scroll, 0);
+
+            // Down arrow scrolls by 1
+            handle_key(&mut m, key(KeyCode::Down));
+            assert_eq!(m.feature_scroll, 1);
+
+            handle_key(&mut m, key(KeyCode::Down));
+            assert_eq!(m.feature_scroll, 2);
+
+            // Up arrow scrolls back by 1
+            handle_key(&mut m, key(KeyCode::Up));
+            assert_eq!(m.feature_scroll, 1);
+
+            handle_key(&mut m, key(KeyCode::Up));
+            assert_eq!(m.feature_scroll, 0);
+
+            // Cannot scroll above 0
+            handle_key(&mut m, key(KeyCode::Up));
+            assert_eq!(m.feature_scroll, 0);
+
+            // PageDown scrolls by page (height - 10 = 20)
+            handle_key(&mut m, key(KeyCode::PageDown));
+            assert_eq!(m.feature_scroll, 20);
+
+            // PageUp scrolls back by page
+            handle_key(&mut m, key(KeyCode::PageUp));
+            assert_eq!(m.feature_scroll, 0);
+        }
+    }
 }

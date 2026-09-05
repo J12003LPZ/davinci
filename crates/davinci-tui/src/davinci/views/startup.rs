@@ -341,4 +341,18 @@ mod tests {
             .expect("hair rule");
         assert!(run_width(&rule.spans) <= 62 + (160 - 62) / 2 + 1);
     }
+
+    #[test]
+    fn startup_shows_command_shortcuts_for_graph_governor_and_memory() {
+        let rows: Vec<String> = lines(&model(100), &info()).iter().map(text).collect();
+        assert!(rows.iter().any(|row| {
+            row.contains("/graph <goal>") && row.contains("Plan and follow a worker graph")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.contains("/governor-status") && row.contains("Inspect compression and saved output")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.contains("/memory-status") && row.contains("Explore the vector memory index")
+        }));
+    }
 }
