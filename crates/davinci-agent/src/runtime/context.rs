@@ -114,7 +114,7 @@ impl ContextBroker {
     }
 
     /// Register a context source.
-    pub fn register_context_source(&mut self, source: Arc<dyn ContextSource>) {
+    pub fn register_context_source(&self, source: Arc<dyn ContextSource>) {
         if let Ok(mut sources) = self.sources.write() {
             sources.push(source);
         }
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_priority_ordering() {
-        let mut broker = ContextBroker::new();
+        let broker = ContextBroker::new();
         let source = MockSource {
             items: vec![
                 ContextItem {
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_strict_token_cap() {
-        let mut broker = ContextBroker::new();
+        let broker = ContextBroker::new();
         let source = MockSource {
             items: vec![
                 ContextItem {
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_tie_breaking() {
-        let mut broker = ContextBroker::new();
+        let broker = ContextBroker::new();
         let source = MockSource {
             items: vec![
                 ContextItem {

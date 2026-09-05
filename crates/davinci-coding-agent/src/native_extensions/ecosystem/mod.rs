@@ -1106,4 +1106,168 @@ mod tests {
             "Cache affinity key must stay stable across retries"
         );
     }
+
+    #[test]
+    fn test_graph_worker_suppresses_memory_injection_when_flag_set() {
+        let dir = tempdir().unwrap();
+        let mem_dir = dir.path().join(".pi").join("vector-memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let repo = resolve_repo_id(dir.path());
+        let records = (0..5)
+            .map(|i| {
+                let rec = MemoryRecord {
+                    id: format!("mem-suppress-{i}"),
+                    repo_id: repo.clone(),
+                    kind: MemoryKind::Decision,
+                    text: format!("Memory record {i} for suppression test"),
+                    source: "assistant".into(),
+                    content_hash: format!("hash-suppress-{i}"),
+                    importance: 0.9,
+                    created_at: 1000 + i as u64,
+                    embedding: None,
+                    confidence: None,
+                    source_session_id: None,
+                    source_turn: None,
+                    verification: None,
+                    use_count: 0,
+                    last_used_at: None,
+                };
+                serde_json::to_string(&rec).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(mem_dir.join("records.jsonl"), records).unwrap();
+
+        let memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.1,
+                ..VectorMemoryConfig::default()
+            },
+        );
+
+        let source =
+            crate::native_extensions::vector_memory::MemoryContextSource::from_memory(memory);
+        let broker = davinci_agent::runtime::context::ContextBroker::new();
+        broker.register_context_source(Arc::new(source));
+
+        let request = davinci_agent::runtime::context::ContextRequest {
+            run_id: davinci_agent::RunId::new(),
+            agent_id: davinci_agent::AgentId::new(),
+            goal: "Memory record suppression test".to_string(),
+            provider: "mock".to_string(),
+            model_id: "mock".to_string(),
+            tools: vec!["read".to_string()],
+            max_tokens: 2500,
+            kind: davinci_agent::runtime::events::AgentKind::GraphWorker,
+        };
+
+        // When flag is NOT set, items should be collected (capped at 4 hits, 1200 tokens)
+        std::env::remove_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT");
+        let packet_normal = broker.build_context(&request);
+        assert!(!packet_normal.items.is_empty());
+        assert!(packet_normal.items.len() <= 4);
+        assert!(packet_normal.estimated_tokens <= 1200);
+
+        // When flag IS set to 1, no duplicate memory should appear (returns empty)
+        std::env::set_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1");
+        let packet_suppressed = broker.build_context(&request);
+        std::env::remove_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT");
+
+        assert!(
+            packet_suppressed.items.is_empty(),
+            "Memory injection must be empty when PI_GRAPH_SUPPRESS_MEMORY_INJECT=1"
+        );
+        assert_eq!(packet_suppressed.estimated_tokens, 0);
+    }
+
+    #[test]
+    fn test_broker_feeds_memory_and_skills_within_graph_bounds() {
+        let dir = tempdir().unwrap();
+        let mem_dir = dir.path().join(".pi").join("vector-memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let repo = resolve_repo_id(dir.path());
+        let records = (0..5)
+            .map(|i| {
+                let rec = MemoryRecord {
+                    id: format!("mem-joint-{i}"),
+                    repo_id: repo.clone(),
+                    kind: MemoryKind::Decision,
+                    text: format!("Joint test memory {i} context hit"),
+                    source: "assistant".into(),
+                    content_hash: format!("hash-joint-{i}"),
+                    importance: 0.9,
+                    created_at: 1000 + i as u64,
+                    embedding: None,
+                    confidence: None,
+                    source_session_id: None,
+                    source_turn: None,
+                    verification: None,
+                    use_count: 0,
+                    last_used_at: None,
+                };
+                serde_json::to_string(&rec).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(mem_dir.join("records.jsonl"), records).unwrap();
+
+        let memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.1,
+                ..VectorMemoryConfig::default()
+            },
+        );
+
+        let skills_dir = dir.path().join(".pi").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        for i in 0..3 {
+            let s_dir = skills_dir.join(format!("joint-skill-{i}"));
+            std::fs::create_dir_all(&s_dir).unwrap();
+            let content = format!(
+                "---\nname: joint-skill-{i}\ndescription: Joint skill {i}\nroles: [writer]\n---\n# Joint Skill {i}\nInstructions.\n"
+            );
+            std::fs::write(s_dir.join("SKILL.md"), content).unwrap();
+        }
+        let learning = crate::native_extensions::LearningController::new(dir.path(), None, None);
+
+        let broker = davinci_agent::runtime::context::ContextBroker::new();
+        broker.register_context_source(Arc::new(
+            crate::native_extensions::vector_memory::MemoryContextSource::from_memory(memory),
+        ));
+        broker.register_context_source(Arc::new(
+            crate::native_extensions::learning::SkillContextSource::from_controller(learning),
+        ));
+
+        let request = davinci_agent::runtime::context::ContextRequest {
+            run_id: davinci_agent::RunId::new(),
+            agent_id: davinci_agent::AgentId::new(),
+            goal: "Joint test context hit".to_string(),
+            provider: "mock".to_string(),
+            model_id: "mock".to_string(),
+            tools: vec!["read".to_string()],
+            max_tokens: 2500,
+            kind: davinci_agent::runtime::events::AgentKind::GraphWorker,
+        };
+
+        std::env::remove_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT");
+        let packet = broker.build_context(&request);
+        assert!(!packet.items.is_empty());
+        assert!(packet.estimated_tokens <= 2500);
+
+        let mem_count = packet
+            .items
+            .iter()
+            .filter(|i| i.source == "vector_memory")
+            .count();
+        let skill_count = packet
+            .items
+            .iter()
+            .filter(|i| i.source == "learning_skills")
+            .count();
+
+        assert!(mem_count <= 4, "Memory hits must be <= 4");
+        assert!(skill_count <= 2, "Skill candidates must be <= 2");
+    }
 }

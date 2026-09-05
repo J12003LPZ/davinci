@@ -21,6 +21,8 @@ pub use skill_manager::*;
 pub use store::*;
 pub use types::*;
 
+use davinci_agent::runtime::context::{ContextItem, ContextRequest, ContextSource};
+use davinci_agent::runtime::events::AgentKind;
 use davinci_agent::{ToolError, ToolResult};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -1003,6 +1005,69 @@ pub fn build_learn_prompt(req: &LearnRequest) -> String {
 impl Default for LearningController {
     fn default() -> Self {
         Self::new(Path::new("."), None, None)
+    }
+}
+
+/// ContextSource adapter for LearningController.
+#[derive(Clone)]
+pub struct SkillContextSource {
+    learning: Arc<Mutex<LearningController>>,
+}
+
+impl SkillContextSource {
+    #[allow(dead_code)]
+    pub fn new(learning: Arc<Mutex<LearningController>>) -> Self {
+        Self { learning }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_controller(learning: LearningController) -> Self {
+        Self {
+            learning: Arc::new(Mutex::new(learning)),
+        }
+    }
+}
+
+impl ContextSource for SkillContextSource {
+    fn collect(&self, request: &ContextRequest) -> Vec<ContextItem> {
+        let learning = match self.learning.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        if !learning.config.enabled || request.max_tokens == 0 || request.goal.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let (max_skills, token_cap, role) = match request.kind {
+            AgentKind::GraphWorker => {
+                let tokens = 1000.min(request.max_tokens as usize);
+                (2, tokens, crate::native_extensions::graph::Role::Writer)
+            }
+            _ => {
+                let tokens = 1500.min(request.max_tokens as usize);
+                (3, tokens, crate::native_extensions::graph::Role::Writer)
+            }
+        };
+
+        let candidates =
+            learning.graph_skill_candidates(&request.goal, role, max_skills, token_cap);
+        candidates
+            .into_iter()
+            .map(|candidate| ContextItem {
+                source: "learning_skills".to_string(),
+                content: format!("Skill: {}\n{}", candidate.name, candidate.body),
+                estimated_tokens: candidate.estimated_tokens as u64,
+                priority: (candidate.score * 1000.0) as i32,
+                stable_for_cache: true,
+                provenance: json!({
+                    "name": candidate.name,
+                    "version": candidate.version,
+                    "content_hash": candidate.content_hash,
+                    "score": candidate.score,
+                }),
+            })
+            .collect()
     }
 }
 

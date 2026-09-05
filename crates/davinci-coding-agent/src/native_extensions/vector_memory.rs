@@ -4,6 +4,8 @@
 //! lexical fallback and network failures are deliberately fail-open so memory
 //! cannot make an otherwise healthy agent turn fail.
 
+use davinci_agent::runtime::context::{ContextItem, ContextRequest, ContextSource};
+use davinci_agent::runtime::events::AgentKind;
 use davinci_agent::{ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -577,6 +579,72 @@ pub fn format_memory_context(hits: &[MemoryContextHit]) -> String {
     }
     out.push_str("</memory>");
     out
+}
+
+/// ContextSource adapter for VectorMemory.
+#[derive(Clone)]
+pub struct MemoryContextSource {
+    memory: Arc<Mutex<VectorMemory>>,
+}
+
+impl MemoryContextSource {
+    #[allow(dead_code)]
+    pub fn new(memory: Arc<Mutex<VectorMemory>>) -> Self {
+        Self { memory }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_memory(memory: VectorMemory) -> Self {
+        Self {
+            memory: Arc::new(Mutex::new(memory)),
+        }
+    }
+}
+
+impl ContextSource for MemoryContextSource {
+    fn collect(&self, request: &ContextRequest) -> Vec<ContextItem> {
+        if std::env::var("PI_GRAPH_SUPPRESS_MEMORY_INJECT").as_deref() == Ok("1") {
+            return Vec::new();
+        }
+
+        let memory = match self.memory.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        if !memory.config.enabled || request.max_tokens == 0 || request.goal.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let (max_hits, token_cap) = match request.kind {
+            AgentKind::GraphWorker => {
+                let tokens = 1200.min(request.max_tokens as usize);
+                (4, tokens)
+            }
+            _ => {
+                let tokens = memory
+                    .config
+                    .max_injected_tokens
+                    .min(request.max_tokens as usize);
+                (memory.config.result_limit, tokens)
+            }
+        };
+
+        let hits = memory.context_hits(&request.goal, max_hits, token_cap);
+        hits.into_iter()
+            .map(|hit| ContextItem {
+                source: "vector_memory".to_string(),
+                content: hit.text,
+                estimated_tokens: hit.estimated_tokens as u64,
+                priority: (hit.score * 1000.0) as i32,
+                stable_for_cache: true,
+                provenance: json!({
+                    "id": hit.id,
+                    "score": hit.score,
+                }),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

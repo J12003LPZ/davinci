@@ -86,6 +86,14 @@ impl RuntimeHandle {
         self
     }
 
+    pub fn register_context_source(&self, source: Arc<dyn ContextSource>) {
+        self.context_broker.register_context_source(source);
+    }
+
+    pub fn build_context(&self, request: &ContextRequest) -> ContextPacket {
+        self.context_broker.build_context(request)
+    }
+
     pub fn next_sequence(&self) -> u64 {
         self.sequence.fetch_add(1, Ordering::SeqCst) + 1
     }

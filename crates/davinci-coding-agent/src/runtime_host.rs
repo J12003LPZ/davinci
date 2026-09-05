@@ -1,5 +1,7 @@
 //! Host adapters connecting Davinci extensions, hooks, and persistence into the shared runtime.
 
+use std::sync::{Arc, Mutex};
+
 use davinci_agent::runtime::bus::is_decision_event;
 use davinci_agent::{RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeSubscriber};
 
@@ -99,4 +101,34 @@ impl RuntimeSubscriber for HooksRuntimeSubscriber {
 
         RuntimeDecision::Continue
     }
+}
+
+/// Helper to register native vector memory and skill learning context sources into the runtime.
+#[allow(dead_code)]
+pub fn register_native_context_sources(
+    runtime: &davinci_agent::RuntimeHandle,
+    memory: Arc<Mutex<crate::native_extensions::VectorMemory>>,
+    learning: Arc<Mutex<crate::native_extensions::LearningController>>,
+) {
+    runtime.register_context_source(Arc::new(
+        crate::native_extensions::vector_memory::MemoryContextSource::new(memory),
+    ));
+    runtime.register_context_source(Arc::new(
+        crate::native_extensions::learning::SkillContextSource::new(learning),
+    ));
+}
+
+/// Helper to register native context sources directly from extension instances.
+#[allow(dead_code)]
+pub fn register_native_context_sources_from_instances(
+    runtime: &davinci_agent::RuntimeHandle,
+    memory: &crate::native_extensions::VectorMemory,
+    learning: &crate::native_extensions::LearningController,
+) {
+    runtime.register_context_source(Arc::new(
+        crate::native_extensions::vector_memory::MemoryContextSource::from_memory(memory.clone()),
+    ));
+    runtime.register_context_source(Arc::new(
+        crate::native_extensions::learning::SkillContextSource::from_controller(learning.clone()),
+    ));
 }
