@@ -10,6 +10,7 @@ pub mod context;
 pub mod events;
 pub mod ids;
 pub mod registry;
+pub mod tasks;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
 pub use cache::{hash_system_prompt, hash_tool_names, CacheIdentity, CacheMissReason};
@@ -20,6 +21,7 @@ pub use context::{
 pub use events::{AgentKind, AgentRecord, AgentState, RuntimeEvent, RuntimeEventEnvelope};
 pub use ids::{AgentId, RunId, TaskId, WorkflowId};
 pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
+pub use tasks::{is_valid_task_transition, TaskError, TaskRecord, TaskRegistry, TaskState};
 
 /// Handle held by an executing Agent or worker to participate in the shared runtime.
 #[derive(Clone)]
@@ -33,6 +35,7 @@ pub struct RuntimeHandle {
     pub cancellation_token: CancellationToken,
     pub registry: RuntimeRegistry,
     pub context_broker: ContextBroker,
+    pub task_registry: TaskRegistry,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -50,6 +53,7 @@ impl std::fmt::Debug for RuntimeHandle {
 impl RuntimeHandle {
     pub fn new(run_id: RunId, agent_id: AgentId, bus: RuntimeBus) -> Self {
         let registry = RuntimeRegistry::with_bus(bus.clone());
+        let task_registry = TaskRegistry::with_bus(bus.clone());
         Self {
             run_id,
             agent_id,
@@ -60,7 +64,13 @@ impl RuntimeHandle {
             cancellation_token: CancellationToken::new(),
             registry,
             context_broker: ContextBroker::new(),
+            task_registry,
         }
+    }
+
+    pub fn with_task_registry(mut self, task_registry: TaskRegistry) -> Self {
+        self.task_registry = task_registry;
+        self
     }
 
     pub fn with_context_broker(mut self, broker: ContextBroker) -> Self {
