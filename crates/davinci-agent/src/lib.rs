@@ -87,6 +87,12 @@ pub use tools::{
 };
 pub use turn::retry_delay_ms;
 
+pub mod runtime;
+pub use runtime::{
+    AgentId, AgentKind, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
+    RuntimeEventEnvelope, RuntimeHandle, RuntimeSubscriber, TaskId, WorkflowId,
+};
+
 use davinci_ai::{
     content_text, AssistantMessage, AssistantMessageEvent, ChatMessage, MessageContent,
     ThinkingBudgets,
@@ -245,6 +251,8 @@ pub struct Agent {
     ephemeral_context: Vec<ChatMessage>,
     /// Host-supplied schema/identity estimate, excluding `system_prompt` and messages.
     provider_context_overhead_tokens: Option<u64>,
+    /// Optional shared runtime handle for versioned lifecycle events and coordination.
+    pub runtime: Option<RuntimeHandle>,
 }
 
 impl Agent {
@@ -307,6 +315,7 @@ impl Agent {
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
             provider_context_overhead_tokens: None,
+            runtime: None,
         }
     }
 
