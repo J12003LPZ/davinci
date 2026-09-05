@@ -783,4 +783,321 @@ mod tests {
         assert_eq!(runner_invocations.load(Ordering::SeqCst), 2);
         assert_eq!(run.counters.workers_spawned, 2);
     }
+
+    /// Task 0.1: Architectural regression gate for runtime migration.
+    /// Asserts all 6 core ecosystem invariants:
+    /// 1. zero added coordinator model calls;
+    /// 2. Graph context remains <= 2500 estimated tokens;
+    /// 3. Governor recovery stays byte-for-byte;
+    /// 4. security failure blocks Graph approval;
+    /// 5. learning outcome attribution still uses exact (name, version, content_hash);
+    /// 6. cache-affinity retry key stays stable.
+    #[test]
+    fn runtime_migration_preserves_ecosystem_baseline() {
+        // 1 & 2: Invariant testing: zero added coordinator calls & context <= 2,500
+        let dir = tempdir().unwrap();
+        let mem_dir = dir.path().join(".pi").join("vector-memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let repo = resolve_repo_id(dir.path());
+        let records = (0..5)
+            .map(|i| {
+                let rec = MemoryRecord {
+                    id: format!("mem-baseline-{i}"),
+                    repo_id: repo.clone(),
+                    kind: MemoryKind::Decision,
+                    text: format!("Baseline decision {i} text for context test"),
+                    source: "assistant".into(),
+                    content_hash: format!("hash-baseline-{i}"),
+                    importance: 0.9,
+                    created_at: 1000 + i as u64,
+                    embedding: None,
+                    confidence: None,
+                    source_session_id: None,
+                    source_turn: None,
+                    verification: None,
+                    use_count: 0,
+                    last_used_at: None,
+                };
+                serde_json::to_string(&rec).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(mem_dir.join("records.jsonl"), records).unwrap();
+
+        let memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.1,
+                ..VectorMemoryConfig::default()
+            },
+        );
+
+        let skills_dir = dir.path().join(".pi").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        for i in 0..5 {
+            let s_dir = skills_dir.join(format!("baseline-skill-{i}"));
+            std::fs::create_dir_all(&s_dir).unwrap();
+            let content = format!(
+                "---\nname: baseline-skill-{i}\ndescription: Baseline skill {i}\nroles: [researcher, writer]\n---\n# Baseline Skill {i}\nInstructions.\n"
+            );
+            std::fs::write(s_dir.join("SKILL.md"), content).unwrap();
+        }
+
+        let mut learning =
+            crate::native_extensions::LearningController::new(dir.path(), None, None);
+        let request = ContextPacketRequest::new("Baseline ecosystem test")
+            .with_role(Role::Researcher)
+            .with_token_cap(DEFAULT_GRAPH_CONTEXT_TOKENS);
+        let packet = build_context_packet(&memory, &learning, request);
+        assert!(
+            packet.estimated_tokens <= 2_500,
+            "Graph context packet must remain <= 2,500 estimated tokens, got {}",
+            packet.estimated_tokens
+        );
+
+        // Zero added coordinator calls in Graph run
+        let runner_invocations = Arc::new(AtomicUsize::new(0));
+        let runner_clone = runner_invocations.clone();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
+            runner_clone.fetch_add(1, Ordering::SeqCst);
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Trivial,
+                    complexity: Complexity::Trivial,
+                    rationale: "baseline run".into(),
+                    research_tasks: vec![],
+                    milestones: None,
+                }),
+                _ => Artifact::PatchReport(Box::new(PatchReport {
+                    changed_files: vec![],
+                    summary: "done".into(),
+                    deviations: vec![],
+                    plan_invalidated: false,
+                    invalidation_reason: None,
+                })),
+            };
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
+            config: GraphConfig {
+                verify_commands: vec![VerifyCommandSpec {
+                    command: "echo test".into(),
+                    name: "test".into(),
+                    from_plan: false,
+                }],
+                ..Default::default()
+            },
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: Some(memory),
+            learning: Some(crate::native_extensions::LearningController::new(
+                dir.path(),
+                None,
+                None,
+            )),
+            governor: None,
+        };
+
+        let options = RunOptions {
+            goal: "baseline invariant check".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: Some(Complexity::Trivial),
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+        };
+        let run = run_graph(options, deps);
+        assert_eq!(run.phase, Phase::Done);
+        assert_eq!(
+            runner_invocations.load(Ordering::SeqCst),
+            2,
+            "Zero extra coordinator calls"
+        );
+
+        // 3: Governor recovery stays byte-for-byte
+        let gov_dir = tempdir().unwrap();
+        let gov_config = TokenGovernorConfig {
+            enabled: true,
+            compress_threshold_bytes: 50,
+            store_dir: Some(gov_dir.path().to_path_buf()),
+            ..TokenGovernorConfig::default()
+        };
+        let mut governor = TokenGovernor::new("baseline-session", gov_config);
+        let original_output =
+            "line 1: important output\nline 2: verbose data\nline 3: end of output\n".repeat(10);
+        let initial_result = ToolResult {
+            content: original_output.clone(),
+            is_error: false,
+            details: None,
+        };
+        let compressed =
+            governor.after_tool("bash", &json!({"command": "cat test"}), initial_result);
+        let output_id = compressed
+            .details
+            .as_ref()
+            .and_then(|d| d.get("tokenGovernor"))
+            .and_then(|tg| tg.get("outputId"))
+            .and_then(|id| id.as_str())
+            .expect("outputId present");
+        let retrieved = governor
+            .retrieve(&json!({"id": output_id}))
+            .expect("retrieval succeeds");
+        let reconstructed = retrieved
+            .content
+            .lines()
+            .map(|l| {
+                if let Some(pos) = l.find(": ") {
+                    &l[pos + 2..]
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(
+            reconstructed, original_output,
+            "Governor recovery must be byte-for-byte"
+        );
+
+        // 4: Security failure blocks Graph approval
+        let sec_dir = tempdir().unwrap();
+        let auth_file = sec_dir.path().join("src/auth.rs");
+        std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &auth_file,
+            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+        )
+        .unwrap();
+        let sec_runner: Arc<WorkerRunner> = Arc::new(|spec, _abort, _on_progress| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Trivial,
+                    complexity: Complexity::Trivial,
+                    rationale: "security test".into(),
+                    research_tasks: vec![],
+                    milestones: None,
+                }),
+                ArtifactKind::PatchReport => Artifact::PatchReport(Box::new(PatchReport {
+                    changed_files: vec!["src/auth.rs".into()],
+                    summary: "modified auth".into(),
+                    deviations: vec![],
+                    plan_invalidated: false,
+                    invalidation_reason: None,
+                })),
+                _ => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "ok".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+            };
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+        let sec_deps = ControllerDeps {
+            runner: sec_runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 1)),
+            config: GraphConfig {
+                security_verification: SecurityPolicyMode::Always,
+                verify_commands: vec![VerifyCommandSpec {
+                    command: "echo test".into(),
+                    name: "test".into(),
+                    from_plan: false,
+                }],
+                ..Default::default()
+            },
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+        };
+        let sec_run = run_graph(
+            RunOptions {
+                goal: "sec check".into(),
+                cwd: sec_dir.path().to_path_buf(),
+                forced: Some(Complexity::Trivial),
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+            },
+            sec_deps,
+        );
+        assert_eq!(
+            sec_run.phase,
+            Phase::Blocked,
+            "Security failure must block Graph approval"
+        );
+
+        // 5: Learning outcome attribution uses exact (name, version, content_hash)
+        let sref = SkillVersionRef {
+            name: "test-skill".into(),
+            version: 2,
+            content_hash: "exact-hash-123".into(),
+        };
+        let l_record = SkillLedgerRecord {
+            skill_id: "test-skill-id".into(),
+            name: sref.name.clone(),
+            scope: LearningScope::Project,
+            origin: SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Active,
+            path: dir.path().join("SKILL.md"),
+            content_hash: sref.content_hash.clone(),
+            version: sref.version as u32,
+            success_count: 0,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            pinned: false,
+        };
+        learning.project_store.upsert_skill(l_record).unwrap();
+        learning
+            .record_skill_version_outcome(&sref, SkillOutcome::VerifiedSuccess)
+            .unwrap();
+        let updated_skill = learning.project_store.skill("test-skill").unwrap();
+        assert_eq!(updated_skill.success_count, 1);
+        assert_eq!(updated_skill.version, 2);
+        assert_eq!(updated_skill.content_hash, "exact-hash-123");
+
+        // 6: Cache-affinity retry key stays stable
+        let key_a = derive_worker_cache_key(
+            "/test",
+            1,
+            Role::Researcher,
+            Some("m1"),
+            &["read".into()],
+            "p",
+            ArtifactKind::Evidence,
+        );
+        let key_b = derive_worker_cache_key(
+            "/test",
+            1,
+            Role::Researcher,
+            Some("m1"),
+            &["read".into()],
+            "p",
+            ArtifactKind::Evidence,
+        );
+        assert_eq!(
+            key_a, key_b,
+            "Cache affinity key must stay stable across retries"
+        );
+    }
 }

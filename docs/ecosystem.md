@@ -64,6 +64,9 @@ cargo test -p davinci-coding-agent ecosystem_loop_ -- --nocapture
 # Run invariant enforcement tests (token limits, hit caps, zero model calls):
 cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
 
+# Run runtime migration baseline gate (all 6 core invariants in one gate):
+cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
+
 # Run integration telemetry tests:
 cargo test -p davinci-coding-agent ecosystem_telemetry -- --nocapture
 ```
