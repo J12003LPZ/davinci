@@ -20,6 +20,45 @@ pub struct ContextRequest {
     pub tools: Vec<String>,
     pub max_tokens: u64,
     pub kind: AgentKind,
+    pub agent_profile_name: Option<String>,
+    pub memory_scope: Option<String>,
+}
+
+impl ContextRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        run_id: RunId,
+        agent_id: AgentId,
+        goal: impl Into<String>,
+        provider: impl Into<String>,
+        model_id: impl Into<String>,
+        tools: Vec<String>,
+        max_tokens: u64,
+        kind: AgentKind,
+    ) -> Self {
+        Self {
+            run_id,
+            agent_id,
+            goal: goal.into(),
+            provider: provider.into(),
+            model_id: model_id.into(),
+            tools,
+            max_tokens,
+            kind,
+            agent_profile_name: None,
+            memory_scope: None,
+        }
+    }
+
+    pub fn with_agent_profile(
+        mut self,
+        profile_name: impl Into<String>,
+        scope: impl Into<String>,
+    ) -> Self {
+        self.agent_profile_name = Some(profile_name.into());
+        self.memory_scope = Some(scope.into());
+        self
+    }
 }
 
 /// A discrete item collected by a context source with provenance and metadata.
@@ -197,6 +236,8 @@ mod tests {
             tools: vec![],
             max_tokens,
             kind: AgentKind::Main,
+            agent_profile_name: None,
+            memory_scope: None,
         }
     }
 

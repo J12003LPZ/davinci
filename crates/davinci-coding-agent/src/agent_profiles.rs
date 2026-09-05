@@ -43,14 +43,20 @@ impl std::str::FromStr for MemoryScope {
     }
 }
 
+impl MemoryScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Project => "project",
+            Self::AgentProject => "agent_project",
+            Self::AgentGlobal => "agent_global",
+        }
+    }
+}
+
 impl std::fmt::Display for MemoryScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MemoryScope::None => write!(f, "none"),
-            MemoryScope::Project => write!(f, "project"),
-            MemoryScope::AgentProject => write!(f, "agent_project"),
-            MemoryScope::AgentGlobal => write!(f, "agent_global"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 

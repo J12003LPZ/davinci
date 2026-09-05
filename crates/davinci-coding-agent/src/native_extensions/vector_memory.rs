@@ -269,6 +269,10 @@ pub struct MemoryRecord {
     pub use_count: u64,
     #[serde(default)]
     pub last_used_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_profile_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -630,7 +634,13 @@ impl ContextSource for MemoryContextSource {
             }
         };
 
-        let hits = memory.context_hits(&request.goal, max_hits, token_cap);
+        let hits = memory.context_hits_scoped(
+            &request.goal,
+            max_hits,
+            token_cap,
+            request.agent_profile_name.as_deref(),
+            request.memory_scope.as_deref(),
+        );
         hits.into_iter()
             .map(|hit| ContextItem {
                 source: "vector_memory".to_string(),
@@ -641,6 +651,8 @@ impl ContextSource for MemoryContextSource {
                 provenance: json!({
                     "id": hit.id,
                     "score": hit.score,
+                    "profile": request.agent_profile_name,
+                    "scope": request.memory_scope,
                 }),
             })
             .collect()
@@ -671,8 +683,12 @@ pub struct VectorMemory {
     dense_offline_until: Arc<Mutex<Option<Instant>>>,
 }
 
+fn known_key_scoped(kind: MemoryKind, hash: &str, profile: Option<&str>) -> String {
+    format!("{kind:?}\0{hash}\0{}", profile.unwrap_or(""))
+}
+
 fn known_key(kind: MemoryKind, hash: &str) -> String {
-    format!("{kind:?}\0{hash}")
+    known_key_scoped(kind, hash, None)
 }
 
 impl Default for VectorMemory {
@@ -730,12 +746,18 @@ impl VectorMemory {
         self.records = content
             .lines()
             .filter_map(|line| serde_json::from_str::<MemoryRecord>(line).ok())
-            .filter(|record| record.repo_id == self.repo_id)
+            .filter(|record| record.repo_id == self.repo_id || record.repo_id == "*")
             .collect();
         self.known = self
             .records
             .iter()
-            .map(|record| known_key(record.kind, &record.content_hash))
+            .map(|record| {
+                known_key_scoped(
+                    record.kind,
+                    &record.content_hash,
+                    record.agent_profile_name.as_deref(),
+                )
+            })
             .collect();
     }
 
@@ -761,8 +783,22 @@ impl VectorMemory {
     }
 
     pub fn index_messages(&mut self, messages: &[MemoryMessage]) -> Result<usize, ToolError> {
+        self.index_messages_scoped(messages, None, None)
+    }
+
+    pub fn index_messages_scoped(
+        &mut self,
+        messages: &[MemoryMessage],
+        agent_profile_name: Option<&str>,
+        memory_scope: Option<&str>,
+    ) -> Result<usize, ToolError> {
         if !self.config.enabled {
             return Ok(0);
+        }
+        if let Some(scope) = memory_scope {
+            if scope == "none" {
+                return Ok(0);
+            }
         }
         let mut chunks = extract_chunks(messages, 4_000);
         if self.config.promotion {
@@ -771,14 +807,29 @@ impl VectorMemory {
         }
         let mut inserted = 0;
         let mut inserted_records = Vec::new();
+        let target_repo = if memory_scope == Some("agent_global") {
+            "*".to_string()
+        } else {
+            self.repo_id.clone()
+        };
+        let profile_str = agent_profile_name.map(str::to_string);
+        let scope_str = memory_scope.map(str::to_string);
+
         for chunk in chunks {
             let hash = content_hash(&chunk.text);
-            if !self.known.insert(known_key(chunk.kind, &hash)) {
+            let tag = known_key_scoped(chunk.kind, &hash, agent_profile_name);
+            if !self.known.insert(tag) {
                 continue;
             }
+            let id_seed = format!(
+                "{}\0{}\0{}",
+                target_repo,
+                profile_str.as_deref().unwrap_or(""),
+                hash
+            );
             let record = MemoryRecord {
-                id: hash_to_uuid(&sha256_hex(format!("{}\0{}", self.repo_id, hash))),
-                repo_id: self.repo_id.clone(),
+                id: hash_to_uuid(&sha256_hex(id_seed)),
+                repo_id: target_repo.clone(),
                 kind: chunk.kind,
                 text: chunk.text,
                 source: chunk.source,
@@ -792,6 +843,8 @@ impl VectorMemory {
                 verification: None,
                 use_count: 0,
                 last_used_at: None,
+                agent_profile_name: profile_str.clone(),
+                memory_scope: scope_str.clone(),
             };
             self.records.push(record.clone());
             inserted_records.push(record);
@@ -852,15 +905,59 @@ impl VectorMemory {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<MemoryHit> {
+        self.search_scoped(query, limit, None, None)
+    }
+
+    pub fn search_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        agent_profile_name: Option<&str>,
+        memory_scope: Option<&str>,
+    ) -> Vec<MemoryHit> {
         if !self.config.enabled || query.trim().is_empty() {
             return Vec::new();
         }
-        // Lexical retrieval is the local fail-open path.  Only ask Ollama for
-        // a query vector when this store actually contains indexed vectors;
-        // otherwise every prompt would incur a network timeout for a store
-        // that can only produce lexical scores.
+        if let Some(scope) = memory_scope {
+            if scope == "none" {
+                return Vec::new();
+            }
+        }
+
+        let candidates: Vec<&MemoryRecord> = self
+            .records
+            .iter()
+            .filter(|record| match memory_scope {
+                Some("none") => false,
+                Some("agent_global") => record.agent_profile_name.as_deref() == agent_profile_name,
+                Some("agent_project") => {
+                    (record.repo_id == self.repo_id || record.repo_id == "*")
+                        && record.agent_profile_name.as_deref() == agent_profile_name
+                }
+                Some("project") => {
+                    record.repo_id == self.repo_id
+                        && (record.agent_profile_name.is_none()
+                            || record.agent_profile_name.as_deref() == agent_profile_name)
+                }
+                _ => {
+                    if let Some(profile) = agent_profile_name {
+                        (record.repo_id == self.repo_id || record.repo_id == "*")
+                            && (record.agent_profile_name.is_none()
+                                || record.agent_profile_name.as_deref() == Some(profile))
+                    } else {
+                        // Main agent behavior remains unchanged: only project-wide memory where agent_profile_name is None
+                        record.repo_id == self.repo_id && record.agent_profile_name.is_none()
+                    }
+                }
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
         let query_embedding = (self.dense_available()
-            && self.records.iter().any(|record| record.embedding.is_some()))
+            && candidates.iter().any(|record| record.embedding.is_some()))
         .then(|| match self.embed_query(query) {
             Ok(vector) => Some(vector),
             Err(_) => {
@@ -869,10 +966,10 @@ impl VectorMemory {
             }
         })
         .flatten();
+
         let lexical_query = LexicalQuery::new(query);
-        let mut hits = self
-            .records
-            .iter()
+        let mut hits = candidates
+            .into_iter()
             .filter_map(|record| {
                 let lexical = lexical_query.score(&record.text);
                 let dense = query_embedding
@@ -882,7 +979,7 @@ impl VectorMemory {
                     .unwrap_or(lexical);
                 let score = (dense * 0.6 + lexical * 0.3 + record.importance * 0.1).clamp(0.0, 1.0);
                 (score >= self.config.minimum_score).then(|| MemoryHit {
-                    record: record.clone(),
+                    record: (*record).clone(),
                     score,
                     dense_score: dense,
                     lexical_score: lexical,
@@ -901,7 +998,18 @@ impl VectorMemory {
         max_hits: usize,
         token_cap: usize,
     ) -> Vec<MemoryContextHit> {
-        let hits = self.search(query, max_hits);
+        self.context_hits_scoped(query, max_hits, token_cap, None, None)
+    }
+
+    pub fn context_hits_scoped(
+        &self,
+        query: &str,
+        max_hits: usize,
+        token_cap: usize,
+        agent_profile_name: Option<&str>,
+        memory_scope: Option<&str>,
+    ) -> Vec<MemoryContextHit> {
+        let hits = self.search_scoped(query, max_hits, agent_profile_name, memory_scope);
         let mut results = Vec::new();
         let mut accumulated_tokens = 0;
         for hit in hits {
@@ -1192,6 +1300,8 @@ impl VectorMemory {
             verification: verification.map(str::to_string),
             use_count: 0,
             last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
         };
         self.records.push(record.clone());
         self.last_indexed += 1;
@@ -1771,6 +1881,8 @@ mod tests {
                 verification: None,
                 use_count: 0,
                 last_used_at: None,
+                agent_profile_name: None,
+                memory_scope: None,
             };
             memory.records.push(rec);
         }
@@ -1798,5 +1910,82 @@ mod tests {
         assert!(section.starts_with("<memory>\n"));
         assert!(section.ends_with("</memory>"));
         assert!(section.contains("mem-test-000"));
+    }
+
+    #[test]
+    fn test_agent_scoped_memory_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.2,
+                ..VectorMemoryConfig::default()
+            },
+        );
+
+        // Index Profile A private memory
+        memory
+            .index_messages_scoped(
+                &[MemoryMessage {
+                    role: "assistant".into(),
+                    content: "Profile A confidential database schema details".into(),
+                }],
+                Some("profile-a"),
+                Some("agent_project"),
+            )
+            .unwrap();
+
+        // Index Profile B private memory
+        memory
+            .index_messages_scoped(
+                &[MemoryMessage {
+                    role: "assistant".into(),
+                    content: "Profile B confidential cache protocol details".into(),
+                }],
+                Some("profile-b"),
+                Some("agent_project"),
+            )
+            .unwrap();
+
+        // Index Main-agent / Project memory
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "Global project repository build instructions".into(),
+            }])
+            .unwrap();
+
+        // Profile A searches: should find Profile A memory, but CANNOT find Profile B memory
+        let hits_a =
+            memory.search_scoped("confidential", 10, Some("profile-a"), Some("agent_project"));
+        assert_eq!(hits_a.len(), 1);
+        assert!(hits_a[0].record.text.contains("Profile A"));
+        assert_eq!(
+            hits_a[0].record.agent_profile_name.as_deref(),
+            Some("profile-a")
+        );
+
+        // Profile B searches: should find Profile B memory, but CANNOT find Profile A memory
+        let hits_b =
+            memory.search_scoped("confidential", 10, Some("profile-b"), Some("agent_project"));
+        assert_eq!(hits_b.len(), 1);
+        assert!(hits_b[0].record.text.contains("Profile B"));
+        assert_eq!(
+            hits_b[0].record.agent_profile_name.as_deref(),
+            Some("profile-b")
+        );
+
+        // Main agent searches: main-agent behavior remains unchanged and does not see private profile memory
+        let hits_main_confidential = memory.search("confidential", 10);
+        assert!(hits_main_confidential.is_empty());
+
+        let hits_main_global = memory.search("repository build", 10);
+        assert_eq!(hits_main_global.len(), 1);
+        assert!(hits_main_global[0].record.text.contains("Global project"));
+        assert!(hits_main_global[0].record.agent_profile_name.is_none());
+
+        // Scope 'none' returns empty
+        let hits_none = memory.search_scoped("confidential", 10, Some("profile-a"), Some("none"));
+        assert!(hits_none.is_empty());
     }
 }

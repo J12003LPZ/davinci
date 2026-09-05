@@ -308,6 +308,8 @@ mod tests {
             verification: None,
             use_count: 0,
             last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
         };
         std::fs::write(
             mem_dir.join("records.jsonl"),
@@ -657,6 +659,8 @@ mod tests {
                     verification: None,
                     use_count: 0,
                     last_used_at: None,
+                    agent_profile_name: None,
+                    memory_scope: None,
                 };
                 serde_json::to_string(&rec).unwrap()
             })
@@ -821,6 +825,8 @@ mod tests {
                     verification: None,
                     use_count: 0,
                     last_used_at: None,
+                    agent_profile_name: None,
+                    memory_scope: None,
                 };
                 serde_json::to_string(&rec).unwrap()
             })
@@ -1131,6 +1137,8 @@ mod tests {
                     verification: None,
                     use_count: 0,
                     last_used_at: None,
+                    agent_profile_name: None,
+                    memory_scope: None,
                 };
                 serde_json::to_string(&rec).unwrap()
             })
@@ -1160,6 +1168,8 @@ mod tests {
             tools: vec!["read".to_string()],
             max_tokens: 2500,
             kind: davinci_agent::runtime::events::AgentKind::GraphWorker,
+            agent_profile_name: None,
+            memory_scope: None,
         };
 
         // When flag is NOT set, items should be collected (capped at 4 hits, 1200 tokens)
@@ -1205,6 +1215,8 @@ mod tests {
                     verification: None,
                     use_count: 0,
                     last_used_at: None,
+                    agent_profile_name: None,
+                    memory_scope: None,
                 };
                 serde_json::to_string(&rec).unwrap()
             })
@@ -1249,6 +1261,8 @@ mod tests {
             tools: vec!["read".to_string()],
             max_tokens: 2500,
             kind: davinci_agent::runtime::events::AgentKind::GraphWorker,
+            agent_profile_name: None,
+            memory_scope: None,
         };
 
         std::env::remove_var("PI_GRAPH_SUPPRESS_MEMORY_INJECT");
