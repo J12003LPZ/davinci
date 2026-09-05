@@ -6,10 +6,12 @@ use std::sync::Arc;
 pub mod bus;
 pub mod events;
 pub mod ids;
+pub mod registry;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
 pub use events::{AgentKind, AgentRecord, AgentState, RuntimeEvent, RuntimeEventEnvelope};
 pub use ids::{AgentId, RunId, TaskId, WorkflowId};
+pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
 
 /// Handle held by an executing Agent or worker to participate in the shared runtime.
 #[derive(Clone)]
@@ -21,6 +23,7 @@ pub struct RuntimeHandle {
     sequence: Arc<AtomicU64>,
     pub bus: RuntimeBus,
     pub cancellation_token: Arc<AtomicBool>,
+    pub registry: RuntimeRegistry,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -37,6 +40,7 @@ impl std::fmt::Debug for RuntimeHandle {
 
 impl RuntimeHandle {
     pub fn new(run_id: RunId, agent_id: AgentId, bus: RuntimeBus) -> Self {
+        let registry = RuntimeRegistry::with_bus(bus.clone());
         Self {
             run_id,
             agent_id,
@@ -45,7 +49,13 @@ impl RuntimeHandle {
             sequence: Arc::new(AtomicU64::new(0)),
             bus,
             cancellation_token: Arc::new(AtomicBool::new(false)),
+            registry,
         }
+    }
+
+    pub fn with_registry(mut self, registry: RuntimeRegistry) -> Self {
+        self.registry = registry;
+        self
     }
 
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {

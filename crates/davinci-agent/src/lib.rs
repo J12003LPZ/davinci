@@ -89,8 +89,9 @@ pub use turn::retry_delay_ms;
 
 pub mod runtime;
 pub use runtime::{
-    AgentId, AgentKind, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
-    RuntimeEventEnvelope, RuntimeHandle, RuntimeSubscriber, TaskId, WorkflowId,
+    AgentId, AgentKind, AgentRecord, AgentState, RegistryError, RunId, RuntimeBus, RuntimeDecision,
+    RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, TaskId,
+    WorkflowId,
 };
 
 use davinci_ai::{
