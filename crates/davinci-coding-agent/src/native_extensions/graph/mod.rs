@@ -715,6 +715,7 @@ mod tests {
             worktree: None,
             started_ms: 1000,
             updated_ms: 1000,
+            failure_reason: None,
         };
         runtime.registry.register_agent(root_record).unwrap();
 

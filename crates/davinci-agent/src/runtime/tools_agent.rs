@@ -239,6 +239,7 @@ mod tests {
                 worktree: None,
                 started_ms: 100,
                 updated_ms: 100,
+                failure_reason: None,
             })
             .unwrap();
 
@@ -257,6 +258,7 @@ mod tests {
                 worktree: None,
                 started_ms: 100,
                 updated_ms: 100,
+                failure_reason: None,
             })
             .unwrap();
 

@@ -174,6 +174,7 @@ impl AgentMailbox {
                 RuntimeEvent::AgentMessageQueued {
                     to: message.to,
                     message_id: message.id,
+                    message: Some(message.clone()),
                 },
             );
             bus.emit_observe(envelope);
@@ -246,6 +247,52 @@ impl AgentMailbox {
             .map(|q| q.iter().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Rehydrate mailbox state from historical runtime event envelopes.
+    ///
+    /// Undelivered queued messages remain in the recipient's mailbox.
+    pub fn rehydrate_from_events(&self, events: &[RuntimeEventEnvelope]) {
+        let mut unread_messages: HashMap<Uuid, AgentMessage> = HashMap::new();
+        let mut seen = match self.seen_message_ids.write() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+
+        for envelope in events {
+            match &envelope.payload {
+                RuntimeEvent::AgentMessageQueued {
+                    message_id,
+                    message,
+                    ..
+                } => {
+                    seen.insert(*message_id);
+                    if let Some(msg) = message {
+                        unread_messages.insert(*message_id, msg.clone());
+                    }
+                }
+                RuntimeEvent::AgentMessageDelivered { message_id, .. } => {
+                    unread_messages.remove(message_id);
+                }
+                _ => {}
+            }
+        }
+
+        let mut queues = match self.queues.write() {
+            Ok(q) => q,
+            Err(e) => e.into_inner(),
+        };
+
+        let mut remaining: Vec<AgentMessage> = unread_messages.into_values().collect();
+        remaining.sort_by(|a, b| {
+            a.sent_at_ms
+                .cmp(&b.sent_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        for msg in remaining {
+            queues.entry(msg.to).or_default().push_back(msg);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +320,7 @@ mod tests {
             worktree: None,
             started_ms: now,
             updated_ms: now,
+            failure_reason: None,
         }
     }
 
@@ -332,7 +380,7 @@ mod tests {
         assert_eq!(mailbox.pending_count(&recipient_id), 0);
 
         let captured = events.lock().unwrap();
-        assert!(captured.iter().any(|e| matches!(e, RuntimeEvent::AgentMessageQueued { to, message_id } if *to == recipient_id && *message_id == id1)));
+        assert!(captured.iter().any(|e| matches!(e, RuntimeEvent::AgentMessageQueued { to, message_id, .. } if *to == recipient_id && *message_id == id1)));
         assert!(captured.iter().any(|e| matches!(e, RuntimeEvent::AgentMessageDelivered { to, message_id } if *to == recipient_id && *message_id == id1)));
     }
 
@@ -427,5 +475,69 @@ mod tests {
         let msg = AgentMessage::new(run_id, sender_id, missing_id, "Unknown agent");
         let err = mailbox.send(msg).unwrap_err();
         assert_eq!(err, MailboxError::AgentNotFound(missing_id));
+    }
+
+    #[test]
+    fn test_rehydrate_mailbox_undelivered_remain_queued_and_delivered_removed() {
+        let mailbox = AgentMailbox::new();
+        let run_id = RunId::new();
+        let sender_id = AgentId::new();
+        let recipient_id = AgentId::new();
+
+        let msg1 = AgentMessage::new(run_id, sender_id, recipient_id, "Delivered message");
+        let msg2 = AgentMessage::new(
+            run_id,
+            sender_id,
+            recipient_id,
+            "Pending undelivered message",
+        );
+
+        let events = vec![
+            RuntimeEventEnvelope::new(
+                1,
+                run_id,
+                None,
+                Some(sender_id),
+                None,
+                RuntimeEvent::AgentMessageQueued {
+                    to: recipient_id,
+                    message_id: msg1.id,
+                    message: Some(msg1.clone()),
+                },
+            ),
+            RuntimeEventEnvelope::new(
+                2,
+                run_id,
+                None,
+                Some(recipient_id),
+                None,
+                RuntimeEvent::AgentMessageDelivered {
+                    to: recipient_id,
+                    message_id: msg1.id,
+                },
+            ),
+            RuntimeEventEnvelope::new(
+                3,
+                run_id,
+                None,
+                Some(sender_id),
+                None,
+                RuntimeEvent::AgentMessageQueued {
+                    to: recipient_id,
+                    message_id: msg2.id,
+                    message: Some(msg2.clone()),
+                },
+            ),
+        ];
+
+        mailbox.rehydrate_from_events(&events);
+
+        // msg1 was delivered, so it must not be queued
+        // msg2 was undelivered, so it remains in recipient's queue
+        assert_eq!(mailbox.pending_count(&recipient_id), 1);
+        let drained = mailbox.drain(recipient_id, 10);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].id, msg2.id);
+        assert_eq!(drained[0].content, "Pending undelivered message");
     }
 }

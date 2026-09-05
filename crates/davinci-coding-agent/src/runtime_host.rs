@@ -597,7 +597,10 @@ mod tests {
             Some("session-xyz".into()),
             Some(agent_id),
             None,
-            RuntimeEvent::TaskCreated { task_id },
+            RuntimeEvent::TaskCreated {
+                task_id,
+                record: None,
+            },
         );
 
         bus.emit_observe(env1.clone());
@@ -609,5 +612,210 @@ mod tests {
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[0], env1);
         assert_eq!(replayed[1], env2);
+    }
+
+    #[test]
+    fn test_crash_fixture_running_worker_rehydrates_as_failed_process_terminated() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("crashed_session.runtime.jsonl");
+
+        let run_id = davinci_agent::RunId::new();
+        let worker_id = davinci_agent::AgentId::new();
+        let task1_id = davinci_agent::TaskId::new();
+        let task2_id = davinci_agent::TaskId::new();
+
+        let worker_rec = davinci_agent::AgentRecord {
+            id: worker_id,
+            run_id,
+            parent: None,
+            kind: davinci_agent::AgentKind::WorkflowWorker,
+            name: "worker-1".to_string(),
+            provider: "mock".to_string(),
+            model_id: "mock".to_string(),
+            cwd: dir.path().to_path_buf(),
+            state: davinci_agent::AgentState::Starting,
+            task_id: Some(task1_id),
+            worktree: None,
+            started_ms: 1000,
+            updated_ms: 1000,
+            failure_reason: None,
+        };
+
+        let mut t1 = davinci_agent::TaskRecord::new(run_id, "T1 (Running at crash)");
+        t1.id = task1_id;
+        t1.state = davinci_agent::TaskState::Running;
+        t1.assigned_to = Some(worker_id);
+
+        let mut t2 = davinci_agent::TaskRecord::new(run_id, "T2 (Dependent)");
+        t2.id = task2_id;
+        t2.dependencies = vec![task1_id];
+        t2.state = davinci_agent::TaskState::Pending;
+
+        // 1. Write runtime log ending abruptly while worker and task1 were Running
+        {
+            let mut writer = davinci_session::RuntimeLogWriter::open(&log_path).unwrap();
+            let env1 = davinci_agent::RuntimeEventEnvelope::new(
+                1,
+                run_id,
+                Some("sess-crash".into()),
+                Some(worker_id),
+                None,
+                davinci_agent::RuntimeEvent::AgentStarted { record: worker_rec },
+            );
+            let env2 = davinci_agent::RuntimeEventEnvelope::new(
+                2,
+                run_id,
+                Some("sess-crash".into()),
+                Some(worker_id),
+                None,
+                davinci_agent::RuntimeEvent::AgentStateChanged {
+                    from: davinci_agent::AgentState::Starting,
+                    to: davinci_agent::AgentState::Running,
+                },
+            );
+            let env3 = davinci_agent::RuntimeEventEnvelope::new(
+                3,
+                run_id,
+                Some("sess-crash".into()),
+                Some(worker_id),
+                None,
+                davinci_agent::RuntimeEvent::TaskCreated {
+                    task_id: task1_id,
+                    record: Some(t1),
+                },
+            );
+            let env4 = davinci_agent::RuntimeEventEnvelope::new(
+                4,
+                run_id,
+                Some("sess-crash".into()),
+                None,
+                None,
+                davinci_agent::RuntimeEvent::TaskCreated {
+                    task_id: task2_id,
+                    record: Some(t2),
+                },
+            );
+
+            writer.append(&env1).unwrap();
+            writer.append(&env2).unwrap();
+            writer.append(&env3).unwrap();
+            writer.append(&env4).unwrap();
+        }
+
+        // 2. Simulate process resumption: load events and rehydrate fresh RuntimeHandle
+        let events: Vec<davinci_agent::RuntimeEventEnvelope> =
+            davinci_session::read_runtime_log(&log_path).unwrap();
+        assert_eq!(events.len(), 4);
+
+        let bus = davinci_agent::RuntimeBus::new();
+        let handle = davinci_agent::RuntimeHandle::new(run_id, davinci_agent::AgentId::new(), bus);
+        handle.rehydrate_from_log(&events).unwrap();
+
+        // 3. Worker must be transitioned to Failed with "process_terminated"
+        let rehydrated_agent = handle.registry.get(&worker_id).expect("agent exists");
+        assert_eq!(rehydrated_agent.state, davinci_agent::AgentState::Failed);
+        assert_eq!(
+            rehydrated_agent.failure_reason.as_deref(),
+            Some("process_terminated")
+        );
+
+        // 4. Running task must be Failed with "process_terminated" and dependent cascaded to Blocked
+        let rehydrated_t1 = handle
+            .task_registry
+            .get_task(&task1_id)
+            .expect("task1 exists");
+        assert_eq!(rehydrated_t1.state, davinci_agent::TaskState::Failed);
+        assert_eq!(rehydrated_t1.result.as_deref(), Some("process_terminated"));
+
+        let rehydrated_t2 = handle
+            .task_registry
+            .get_task(&task2_id)
+            .expect("task2 exists");
+        assert_eq!(rehydrated_t2.state, davinci_agent::TaskState::Blocked);
+    }
+
+    #[test]
+    fn test_workflow_resume_fixture_reusing_completed_readonly_phases() {
+        let dir = tempdir().unwrap();
+        let store = davinci_agent::WorkflowStateStore::with_options(
+            32 * 1024,
+            dir.path().join("artifacts"),
+        );
+
+        let bus = davinci_agent::RuntimeBus::new();
+        let run_id = davinci_agent::RunId::new();
+        let lead_id = davinci_agent::AgentId::new();
+        let handle = davinci_agent::RuntimeHandle::new(run_id, lead_id, bus);
+
+        let executor = davinci_agent::WorkflowExecutor::new(handle, store.clone(), None);
+
+        let wf_id = davinci_agent::WorkflowId::new();
+        let spec_json = r#"{
+            "schema_version": 1,
+            "name": "resumable-readonly-workflow",
+            "max_parallel_agents": 2,
+            "max_total_agents": 4,
+            "phases": [
+                {
+                    "id": "discover",
+                    "join": "all",
+                    "workers": [
+                        {
+                            "id": "discoverer-1",
+                            "prompt": "discover files",
+                            "tools": ["read", "find"]
+                        }
+                    ]
+                },
+                {
+                    "id": "analyze",
+                    "depends_on": ["discover"],
+                    "join": "all",
+                    "workers": [
+                        {
+                            "id": "analyzer-1",
+                            "prompt": "analyze findings",
+                            "tools": ["read"]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let spec: davinci_agent::WorkflowSpec = serde_json::from_str(spec_json).unwrap();
+
+        // 1. Simulate persisted artifact from Phase 1 ("discover")
+        let worker_aid = davinci_agent::AgentId::new();
+        store
+            .put_artifact(
+                wf_id,
+                "discover",
+                worker_aid,
+                serde_json::json!({
+                    "worker": "discoverer-1",
+                    "output": "Found 3 files to inspect",
+                }),
+                None,
+            )
+            .unwrap();
+
+        // 2. Resume execution
+        let validated_fps = std::collections::HashSet::new();
+        let state = executor
+            .resume_execution(wf_id, spec, &validated_fps)
+            .expect("resume succeeds");
+
+        assert_eq!(state.status, davinci_agent::WorkflowStatus::Completed);
+        assert_eq!(
+            state.phases["discover"].status,
+            davinci_agent::PhaseStatus::Completed
+        );
+        assert_eq!(
+            state.phases["analyze"].status,
+            davinci_agent::PhaseStatus::Completed
+        );
+
+        // Verify artifacts exist for both phases
+        assert_eq!(store.list_phase_artifacts(wf_id, "discover").len(), 1);
+        assert_eq!(store.list_phase_artifacts(wf_id, "analyze").len(), 1);
     }
 }

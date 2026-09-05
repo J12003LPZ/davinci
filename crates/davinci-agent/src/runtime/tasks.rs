@@ -234,7 +234,7 @@ impl TaskRegistry {
 
             task.state = derived_state;
             task.updated_at_ms = now_ms();
-            tasks.insert(task_id, task);
+            tasks.insert(task_id, task.clone());
         }
 
         // 4. Emit observe events
@@ -246,7 +246,10 @@ impl TaskRegistry {
                 None,
                 assigned_agent,
                 None,
-                RuntimeEvent::TaskCreated { task_id },
+                RuntimeEvent::TaskCreated {
+                    task_id,
+                    record: Some(task.clone()),
+                },
             );
             bus.emit_observe(envelope);
 
@@ -574,6 +577,91 @@ impl TaskRegistry {
             .cloned()
             .collect()
     }
+
+    /// Rehydrate task registry state from historical runtime event envelopes.
+    ///
+    /// Rules:
+    /// - Tasks recorded via `TaskCreated` are inserted.
+    /// - `TaskAssigned` updates assigned agent and transitions Ready tasks to Running.
+    /// - `TaskCompleted` transitions task to Completed (if success=true) or Failed (if success=false).
+    /// - Terminal states (`Completed`, `Failed`, `Cancelled`) stay terminal.
+    /// - Tasks that were `Running` when the process terminated rehydrate as `Failed` with
+    ///   reason `process_terminated`, and cascade `Blocked` to dependent tasks.
+    pub fn rehydrate_from_events(&self, events: &[RuntimeEventEnvelope]) -> Result<(), TaskError> {
+        let mut tasks = self
+            .tasks
+            .write()
+            .map_err(|_| TaskError::InvalidTransition {
+                task_id: TaskId::new(),
+                from: TaskState::Pending,
+                to: TaskState::Failed,
+            })?;
+
+        for envelope in events {
+            match &envelope.payload {
+                RuntimeEvent::TaskCreated { task_id, record } => {
+                    if let Some(rec) = record {
+                        tasks.insert(*task_id, rec.clone());
+                    } else {
+                        let mut rec = TaskRecord::new(envelope.run_id, format!("task-{}", task_id));
+                        rec.id = *task_id;
+                        rec.assigned_to = envelope.agent_id;
+                        rec.created_at_ms = envelope.timestamp_ms;
+                        rec.updated_at_ms = envelope.timestamp_ms;
+                        tasks.insert(*task_id, rec);
+                    }
+                }
+                RuntimeEvent::TaskAssigned { task_id, agent_id } => {
+                    if let Some(task) = tasks.get_mut(task_id) {
+                        task.assigned_to = Some(*agent_id);
+                        if task.state == TaskState::Ready {
+                            task.state = TaskState::Running;
+                        }
+                        task.updated_at_ms = envelope.timestamp_ms;
+                    }
+                }
+                RuntimeEvent::TaskCompleted { task_id, success } => {
+                    if let Some(task) = tasks.get_mut(task_id) {
+                        if *success {
+                            task.state = TaskState::Completed;
+                        } else {
+                            task.state = TaskState::Failed;
+                        }
+                        task.updated_at_ms = envelope.timestamp_ms;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Post-replay: tasks that were Running when the process died transition to Failed with "process_terminated"
+        let now = now_ms();
+        let mut newly_failed = Vec::new();
+        for task in tasks.values_mut() {
+            if task.state == TaskState::Running {
+                task.state = TaskState::Failed;
+                task.result = Some("process_terminated".to_string());
+                task.updated_at_ms = now;
+                newly_failed.push(task.id);
+            }
+        }
+
+        // Cascade Blocked state to dependents of newly failed tasks
+        while let Some(failed_id) = newly_failed.pop() {
+            for other_task in tasks.values_mut() {
+                if other_task.dependencies.contains(&failed_id)
+                    && !other_task.state.is_terminal()
+                    && other_task.state != TaskState::Blocked
+                {
+                    other_task.state = TaskState::Blocked;
+                    other_task.updated_at_ms = now;
+                    newly_failed.push(other_task.id);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -749,7 +837,7 @@ mod tests {
         let captured = events.lock().unwrap();
         assert!(captured
             .iter()
-            .any(|e| matches!(e, RuntimeEvent::TaskCreated { task_id: t } if *t == task_id)));
+            .any(|e| matches!(e, RuntimeEvent::TaskCreated { task_id: t, .. } if *t == task_id)));
         assert!(captured.iter().any(|e| matches!(e, RuntimeEvent::TaskAssigned { task_id: t, agent_id: a } if *t == task_id && *a == agent_id)));
 
         let task = registry.get_task(&task_id).unwrap();
@@ -817,5 +905,92 @@ mod tests {
 
         let err_complete = registry.complete_task(task_id, None).unwrap_err();
         assert!(matches!(err_complete, TaskError::TerminalTask { .. }));
+    }
+
+    #[test]
+    fn test_rehydrate_tasks_running_marked_failed_and_cascades_blocked() {
+        let registry = TaskRegistry::new();
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+
+        let t1_id = TaskId::new();
+        let t2_id = TaskId::new();
+        let t3_id = TaskId::new();
+
+        let mut t1 = TaskRecord::new(run_id, "T1 (Running at crash)");
+        t1.id = t1_id;
+        t1.state = TaskState::Running;
+        t1.assigned_to = Some(agent_id);
+
+        let mut t2 = TaskRecord::new(run_id, "T2 (Depends on T1)");
+        t2.id = t2_id;
+        t2.dependencies = vec![t1_id];
+        t2.state = TaskState::Pending;
+
+        let mut t3 = TaskRecord::new(run_id, "T3 (Completed)");
+        t3.id = t3_id;
+        t3.state = TaskState::Completed;
+
+        let events = vec![
+            RuntimeEventEnvelope::new(
+                1,
+                run_id,
+                None,
+                Some(agent_id),
+                None,
+                RuntimeEvent::TaskCreated {
+                    task_id: t1_id,
+                    record: Some(t1),
+                },
+            ),
+            RuntimeEventEnvelope::new(
+                2,
+                run_id,
+                None,
+                None,
+                None,
+                RuntimeEvent::TaskCreated {
+                    task_id: t2_id,
+                    record: Some(t2),
+                },
+            ),
+            RuntimeEventEnvelope::new(
+                3,
+                run_id,
+                None,
+                None,
+                None,
+                RuntimeEvent::TaskCreated {
+                    task_id: t3_id,
+                    record: Some(t3),
+                },
+            ),
+            RuntimeEventEnvelope::new(
+                4,
+                run_id,
+                None,
+                None,
+                None,
+                RuntimeEvent::TaskCompleted {
+                    task_id: t3_id,
+                    success: true,
+                },
+            ),
+        ];
+
+        registry.rehydrate_from_events(&events).unwrap();
+
+        // T1 was running at process crash: rehydrates as Failed with "process_terminated"
+        let loaded_t1 = registry.get_task(&t1_id).unwrap();
+        assert_eq!(loaded_t1.state, TaskState::Failed);
+        assert_eq!(loaded_t1.result.as_deref(), Some("process_terminated"));
+
+        // T2 depended on T1: cascaded to Blocked
+        let loaded_t2 = registry.get_task(&t2_id).unwrap();
+        assert_eq!(loaded_t2.state, TaskState::Blocked);
+
+        // T3 was Completed: stays Completed
+        let loaded_t3 = registry.get_task(&t3_id).unwrap();
+        assert_eq!(loaded_t3.state, TaskState::Completed);
     }
 }

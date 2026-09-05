@@ -141,6 +141,7 @@ impl TeamManager {
             worktree: None,
             started_ms: now,
             updated_ms: now,
+            failure_reason: None,
         };
 
         self.runtime
@@ -289,6 +290,7 @@ mod tests {
                 worktree: None,
                 started_ms: now,
                 updated_ms: now,
+                failure_reason: None,
             })
             .unwrap();
 

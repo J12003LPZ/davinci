@@ -264,14 +264,134 @@ impl WorkflowExecutor {
         Ok(wf_id)
     }
 
+    /// Resume an existing or partially completed workflow from persisted phase artifacts and tasks.
+    ///
+    /// Rules:
+    /// - Phases already satisfied by persisted artifacts in `WorkflowStateStore` are reused
+    ///   and marked `PhaseStatus::Completed` without executing workers again.
+    /// - For incomplete phases, workers using mutating tools (`is_mutating_tool`) MUST NOT be
+    ///   rerun automatically unless their fingerprint (`format!("{}:{}:{}", wf_id, phase.id, worker.id)`)
+    ///   is in `validated_mutation_fingerprints`.
+    pub fn resume_execution(
+        &self,
+        wf_id: WorkflowId,
+        spec: WorkflowSpec,
+        validated_mutation_fingerprints: &HashSet<String>,
+    ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
+        validate_workflow(&spec)?;
+        let wf_token = self.runtime.cancellation_token.child_token();
+
+        let mut completed_phases = HashSet::new();
+        let mut phase_states = HashMap::new();
+
+        for phase in &spec.phases {
+            let existing_artifacts = self.store.list_phase_artifacts(wf_id, &phase.id);
+            let is_phase_satisfied = match phase.join {
+                WorkflowJoin::All => {
+                    !phase.workers.is_empty()
+                        && phase.workers.iter().all(|w| {
+                            existing_artifacts.iter().any(|a| {
+                                a.value
+                                    .get("worker")
+                                    .and_then(|v| v.as_str())
+                                    .map(|id| id == w.id)
+                                    .unwrap_or(false)
+                            })
+                        })
+                }
+                WorkflowJoin::Any => !existing_artifacts.is_empty(),
+                WorkflowJoin::Quorum { required } => existing_artifacts.len() >= required,
+            };
+
+            if is_phase_satisfied {
+                completed_phases.insert(phase.id.clone());
+                phase_states.insert(
+                    phase.id.clone(),
+                    PhaseExecutionState {
+                        id: phase.id.clone(),
+                        status: PhaseStatus::Completed,
+                        task_ids: Vec::new(),
+                        worker_agent_ids: Vec::new(),
+                        completed_workers: Vec::new(),
+                        failed_workers: Vec::new(),
+                        retry_counts: HashMap::new(),
+                    },
+                );
+            } else {
+                // Incomplete phase: verify mutation workers are validated before attempting rerun
+                for worker in &phase.workers {
+                    let is_mutating = worker
+                        .tools
+                        .iter()
+                        .any(|t| super::validate::is_mutating_tool(t));
+                    if is_mutating {
+                        let fp = format!("{}:{}:{}", wf_id, phase.id, worker.id);
+                        if !validated_mutation_fingerprints.contains(&fp) {
+                            return Err(WorkflowExecutionError::ExecutionError(format!(
+                                "cannot automatically rerun mutation worker '{}' in phase '{}' without fingerprint validation",
+                                worker.id, phase.id
+                            )));
+                        }
+                    }
+                }
+
+                phase_states.insert(
+                    phase.id.clone(),
+                    PhaseExecutionState {
+                        id: phase.id.clone(),
+                        status: PhaseStatus::Pending,
+                        task_ids: Vec::new(),
+                        worker_agent_ids: Vec::new(),
+                        completed_workers: Vec::new(),
+                        failed_workers: Vec::new(),
+                        retry_counts: HashMap::new(),
+                    },
+                );
+            }
+        }
+
+        let now = now_ms();
+        let initial_state = WorkflowExecutionState {
+            id: wf_id,
+            name: spec.name.clone(),
+            status: WorkflowStatus::Running,
+            phases: phase_states,
+            started_ms: now,
+            finished_ms: None,
+            error: None,
+        };
+
+        {
+            let mut execs = self.executions.write().unwrap();
+            execs.insert(wf_id, initial_state);
+            let mut toks = self.tokens.write().unwrap();
+            toks.insert(wf_id, wf_token.clone());
+            let mut sps = self.specs.write().unwrap();
+            sps.insert(wf_id, spec.clone());
+        }
+
+        self.runtime
+            .emit_observe(RuntimeEvent::WorkflowStarted { workflow_id: wf_id });
+
+        self.run_phases_with_completed(spec, wf_id, wf_token, completed_phases)
+    }
+
     fn run_phases(
         &self,
         spec: WorkflowSpec,
         wf_id: WorkflowId,
         wf_token: CancellationToken,
     ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
-        let mut completed_phase_ids: HashSet<String> = HashSet::new();
+        self.run_phases_with_completed(spec, wf_id, wf_token, HashSet::new())
+    }
 
+    fn run_phases_with_completed(
+        &self,
+        spec: WorkflowSpec,
+        wf_id: WorkflowId,
+        wf_token: CancellationToken,
+        mut completed_phase_ids: HashSet<String>,
+    ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
         while completed_phase_ids.len() < spec.phases.len() {
             if wf_token.is_cancelled() {
                 self.cancel(&wf_id)?;
@@ -415,6 +535,7 @@ impl WorkflowExecutor {
                 }),
                 started_ms: now,
                 updated_ms: now,
+                failure_reason: None,
             };
             let _ = self.runtime.registry.register_agent(record);
 
@@ -787,5 +908,130 @@ mod tests {
         // Test pause and resume
         let pause_res = executor.pause(&wf_id);
         assert!(pause_res.is_err(), "cannot pause completed workflow");
+    }
+
+    #[test]
+    fn test_workflow_resume_reusing_completed_readonly_phase() {
+        let (executor, _tmp) = setup_executor(None);
+        let readonly_workflow_json = r#"{
+            "schema_version": 1,
+            "name": "readonly-resume-test",
+            "max_parallel_agents": 2,
+            "max_total_agents": 4,
+            "phases": [
+                {
+                    "id": "research",
+                    "join": "all",
+                    "workers": [
+                        {
+                            "id": "researcher-1",
+                            "prompt": "find occurrences",
+                            "tools": ["read", "grep"]
+                        }
+                    ]
+                },
+                {
+                    "id": "summarize",
+                    "depends_on": ["research"],
+                    "join": "all",
+                    "workers": [
+                        {
+                            "id": "summarizer-1",
+                            "prompt": "summarize findings",
+                            "tools": ["read"]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let spec: WorkflowSpec = serde_json::from_str(readonly_workflow_json).unwrap();
+        let wf_id = WorkflowId::new();
+
+        // 1. Simulate that Phase 1 ("research") already completed and produced an artifact
+        let worker_aid = AgentId::new();
+        let _ = executor.store.put_artifact(
+            wf_id,
+            "research",
+            worker_aid,
+            serde_json::json!({
+                "worker": "researcher-1",
+                "output": "Found relevant files: src/main.rs",
+            }),
+            None,
+        );
+
+        let validated_fps = HashSet::new();
+        let state = executor
+            .resume_execution(wf_id, spec, &validated_fps)
+            .expect("resume succeeds");
+
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert_eq!(state.phases["research"].status, PhaseStatus::Completed);
+        assert_eq!(state.phases["summarize"].status, PhaseStatus::Completed);
+
+        // Verify artifacts exist for both phases
+        assert_eq!(
+            executor.store.list_phase_artifacts(wf_id, "research").len(),
+            1
+        );
+        assert_eq!(
+            executor
+                .store
+                .list_phase_artifacts(wf_id, "summarize")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_workflow_resume_mutation_worker_requires_fingerprint_validation() {
+        let (executor, _tmp) = setup_executor(None);
+        let wf_id = WorkflowId::new();
+
+        let mutating_spec_json = r#"{
+            "schema_version": 1,
+            "name": "mutating-workflow",
+            "max_parallel_agents": 2,
+            "max_total_agents": 4,
+            "phases": [
+                {
+                    "id": "write_code",
+                    "join": "all",
+                    "workers": [
+                        {
+                            "id": "writer-1",
+                            "prompt": "write new feature",
+                            "tools": ["read", "write"]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let spec: WorkflowSpec = serde_json::from_str(mutating_spec_json).unwrap();
+
+        // 1. Without fingerprint validation: resume must be refused
+        let empty_fps = HashSet::new();
+        let err = executor
+            .resume_execution(wf_id, spec.clone(), &empty_fps)
+            .unwrap_err();
+
+        match err {
+            WorkflowExecutionError::ExecutionError(msg) => {
+                assert!(msg.contains("without fingerprint validation"));
+                assert!(msg.contains("writer-1"));
+            }
+            other => panic!("expected ExecutionError, got {other:?}"),
+        }
+
+        // 2. With validated fingerprint: resume is permitted
+        let mut valid_fps = HashSet::new();
+        valid_fps.insert(format!("{}:write_code:writer-1", wf_id));
+
+        let res = executor.resume_execution(wf_id, spec, &valid_fps);
+        assert!(
+            res.is_ok(),
+            "resume should succeed with validated fingerprint"
+        );
+        assert_eq!(res.unwrap().status, WorkflowStatus::Completed);
     }
 }

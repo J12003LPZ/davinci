@@ -556,6 +556,7 @@ impl GraphExecution {
                     worktree: None,
                     started_ms: super::store::now_ms() as i64,
                     updated_ms: super::store::now_ms() as i64,
+                    failure_reason: None,
                 };
                 let _ = runtime.registry.register_agent(record);
                 let _ = runtime

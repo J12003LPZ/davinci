@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use super::ids::{AgentId, RunId, TaskId, WorkflowId};
+use super::mailbox::AgentMessage;
+use super::tasks::TaskRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +48,14 @@ pub struct AgentRecord {
     pub worktree: Option<PathBuf>,
     pub started_ms: i64,
     pub updated_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+impl AgentRecord {
+    pub fn is_reconnectable(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -136,6 +146,8 @@ pub enum RuntimeEvent {
     AgentMessageQueued {
         to: AgentId,
         message_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<AgentMessage>,
     },
     AgentMessageDelivered {
         to: AgentId,
@@ -143,6 +155,8 @@ pub enum RuntimeEvent {
     },
     TaskCreated {
         task_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record: Option<TaskRecord>,
     },
     TaskAssigned {
         task_id: TaskId,

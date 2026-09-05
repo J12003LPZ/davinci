@@ -452,6 +452,7 @@ pub fn run_tool(
                 worktree: wt_path.clone(),
                 started_ms: now,
                 updated_ms: now,
+                failure_reason: None,
             };
             let _ = rt.registry.register_agent(record);
             let _ = rt.registry.transition(child_agent_id, AgentState::Running);

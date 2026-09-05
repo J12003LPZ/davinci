@@ -1788,6 +1788,13 @@ fn complete_prompt_with_host(
     if let Some(session) = &agent.session {
         runtime_handle = runtime_handle.with_session(&session.header.id);
         let log_path = davinci_session::runtime_log_path(&session.path);
+        if log_path.is_file() {
+            if let Ok(events) =
+                davinci_session::read_runtime_log::<davinci_agent::RuntimeEventEnvelope>(&log_path)
+            {
+                let _ = runtime_handle.rehydrate_from_log(&events);
+            }
+        }
         if let Ok(subscriber) = runtime_host::RuntimeLogSubscriber::open(&log_path) {
             runtime_bus.subscribe(Arc::new(subscriber));
         }

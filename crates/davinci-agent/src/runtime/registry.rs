@@ -195,6 +195,61 @@ impl RuntimeRegistry {
         });
         list
     }
+
+    /// Rehydrate the registry from a slice of historical runtime event envelopes.
+    ///
+    /// Rules:
+    /// - Agents recorded via `AgentStarted` are inserted.
+    /// - `AgentStateChanged` updates the state.
+    /// - Terminal states (`Completed`, `Failed`, `Cancelled`) stay terminal.
+    /// - Non-terminal states (`Starting`, `Running`, `Waiting`, `Idle`, `Stopping`)
+    ///   at the end of the log represent agents that were active when the process died;
+    ///   they transition to `Failed` with reason `process_terminated` unless reconnectable.
+    pub fn rehydrate_from_events(
+        &self,
+        events: &[RuntimeEventEnvelope],
+    ) -> Result<(), RegistryError> {
+        let mut map = self
+            .records
+            .write()
+            .map_err(|_| RegistryError::InvalidTransition {
+                agent_id: AgentId::new(),
+                from: AgentState::Starting,
+                to: AgentState::Failed,
+            })?;
+
+        for envelope in events {
+            match &envelope.payload {
+                RuntimeEvent::AgentStarted { record } => {
+                    map.insert(record.id, record.clone());
+                }
+                RuntimeEvent::AgentStateChanged { to, .. } => {
+                    if let Some(agent_id) = envelope.agent_id {
+                        if let Some(rec) = map.get_mut(&agent_id) {
+                            rec.state = *to;
+                            rec.updated_ms = envelope.timestamp_ms;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let now = Self::now_ms();
+        for rec in map.values_mut() {
+            if !matches!(
+                rec.state,
+                AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+            ) && !rec.is_reconnectable()
+            {
+                rec.state = AgentState::Failed;
+                rec.failure_reason = Some("process_terminated".to_string());
+                rec.updated_ms = now;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +275,7 @@ mod tests {
             worktree: None,
             started_ms: 1000,
             updated_ms: 1000,
+            failure_reason: None,
         }
     }
 
@@ -365,6 +421,76 @@ mod tests {
                 from: AgentState::Running,
                 to: AgentState::Completed
             }
+        );
+    }
+
+    #[test]
+    fn test_rehydrate_from_events_terminal_and_crashed() {
+        let registry = RuntimeRegistry::new();
+        let run_id = RunId::new();
+
+        let term_id = AgentId::new();
+        let running_id = AgentId::new();
+
+        let term_rec = sample_record(term_id, AgentState::Starting);
+        let running_rec = sample_record(running_id, AgentState::Starting);
+
+        let events = vec![
+            RuntimeEventEnvelope::new(
+                1,
+                run_id,
+                None,
+                Some(term_id),
+                None,
+                RuntimeEvent::AgentStarted { record: term_rec },
+            ),
+            RuntimeEventEnvelope::new(
+                2,
+                run_id,
+                None,
+                Some(term_id),
+                None,
+                RuntimeEvent::AgentStateChanged {
+                    from: AgentState::Starting,
+                    to: AgentState::Completed,
+                },
+            ),
+            RuntimeEventEnvelope::new(
+                3,
+                run_id,
+                None,
+                Some(running_id),
+                None,
+                RuntimeEvent::AgentStarted {
+                    record: running_rec,
+                },
+            ),
+            RuntimeEventEnvelope::new(
+                4,
+                run_id,
+                None,
+                Some(running_id),
+                None,
+                RuntimeEvent::AgentStateChanged {
+                    from: AgentState::Starting,
+                    to: AgentState::Running,
+                },
+            ),
+        ];
+
+        registry.rehydrate_from_events(&events).unwrap();
+
+        // Terminal agent must remain Completed
+        let term_loaded = registry.get(&term_id).expect("term agent present");
+        assert_eq!(term_loaded.state, AgentState::Completed);
+        assert_eq!(term_loaded.failure_reason, None);
+
+        // Running agent must be safely marked Failed with "process_terminated"
+        let running_loaded = registry.get(&running_id).expect("running agent present");
+        assert_eq!(running_loaded.state, AgentState::Failed);
+        assert_eq!(
+            running_loaded.failure_reason.as_deref(),
+            Some("process_terminated")
         );
     }
 }

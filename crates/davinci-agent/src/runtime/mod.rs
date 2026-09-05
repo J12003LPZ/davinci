@@ -205,4 +205,16 @@ impl RuntimeHandle {
     pub fn drain_messages(&self, limit: usize) -> Vec<AgentMessage> {
         self.mailbox.drain(self.agent_id, limit)
     }
+
+    /// Rehydrate runtime registry, tasks, and mailboxes from historical event log envelopes.
+    pub fn rehydrate_from_log(&self, events: &[RuntimeEventEnvelope]) -> Result<(), String> {
+        self.registry
+            .rehydrate_from_events(events)
+            .map_err(|e| format!("registry rehydration failed: {e}"))?;
+        self.task_registry
+            .rehydrate_from_events(events)
+            .map_err(|e| format!("task registry rehydration failed: {e}"))?;
+        self.mailbox.rehydrate_from_events(events);
+        Ok(())
+    }
 }

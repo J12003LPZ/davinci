@@ -92,10 +92,10 @@ pub use runtime::{
     find_saved_workflow, hash_system_prompt, hash_tool_names, save_workflow_to_project,
     wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState, CacheIdentity,
     CacheMissReason, CancellationToken, ContextBroker, ContextItem, ContextPacket, ContextRequest,
-    ContextSource, RegistryError, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
-    RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, TaskId,
-    WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore, WorktreeError, WorktreeLease,
-    WorktreeManager,
+    ContextSource, PhaseStatus, RegistryError, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
+    RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, TaskError, TaskId,
+    TaskRecord, TaskRegistry, TaskState, WorkflowExecutor, WorkflowId, WorkflowSpec,
+    WorkflowStateStore, WorkflowStatus, WorktreeError, WorktreeLease, WorktreeManager,
 };
 
 use davinci_ai::{
@@ -953,6 +953,17 @@ impl Agent {
     pub fn load_from_session(&mut self, session: JsonlSession) {
         self.messages = messages_from_session(&session);
         self.pending_prompt_messages.clear();
+        if let Some(ref mut rt) = self.runtime {
+            rt.session_id = Some(session.header.id.clone());
+            let log_path = davinci_session::runtime_log_path(&session.path);
+            if log_path.is_file() {
+                if let Ok(events) =
+                    davinci_session::read_runtime_log::<crate::RuntimeEventEnvelope>(&log_path)
+                {
+                    let _ = rt.rehydrate_from_log(&events);
+                }
+            }
+        }
         self.session = Some(session);
     }
 
