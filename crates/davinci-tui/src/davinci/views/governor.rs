@@ -11,9 +11,9 @@
 use ratatui::style::Color;
 use ratatui::text::Line;
 
-use super::sheet::{facts, hint, hint_dim, Composer, SheetChrome};
+use super::sheet::{facts, hint, Composer, SheetChrome};
 use crate::davinci::model::{Model, Tone};
-use crate::davinci::theme::{glyph, State, Theme};
+use crate::davinci::theme::Theme;
 use crate::davinci::ui::{
     blank, clip_ellipsis, column_header, footnote, indent, pad, run_width, span, span_strong,
     spread, truncate_run, wrap, Surface,
@@ -51,41 +51,38 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     // too narrow for four tiles stacks them as two rows each instead.
     let counters = counter_tiles(status, width, th).unwrap_or_else(|| counter_rows(status, th));
 
+    let latest = status.stored.iter().find(|entry| !entry.stale);
+    let sample_rows = if let Some(entry) = latest {
+        vec![
+            vec![
+                span_strong(entry.tool.clone(), th.text, th),
+                span(format!("  {}", entry.call), th.muted),
+            ],
+            vec![
+                span("Original  ", th.muted),
+                span(entry.size.clone(), th.text),
+            ],
+            vec![
+                span("Saved as  ", th.muted),
+                span(entry.id.clone(), th.secondary),
+            ],
+            vec![span(
+                "Ask the agent to retrieve this output by ID, with an optional line range.",
+                th.muted,
+            )],
+        ]
+    } else {
+        vec![
+            vec![span("No outputs compressed in this session yet.", th.muted)],
+            vec![span(
+                "Large results appear here after their originals are saved.",
+                th.muted,
+            )],
+        ]
+    };
     let sample = Surface::new(width, th)
-        .title(vec![span(
-            "WHAT A COMPRESSED RESULT LOOKS LIKE",
-            th.warning,
-        )])
-        .rows(vec![
-            vec![
-                span(format!("{} ", glyph::BRANCH), th.border),
-                span_strong(format!("{} ", State::Done.glyph()), th.success, th),
-                span("cargo test --workspace", th.muted),
-                span(" · 41.2s · manus", th.border),
-            ],
-            vec![span("  running 212 tests", th.border)],
-            vec![
-                span("  test session::store::roundtrip ", th.border),
-                span("... ok", th.success),
-            ],
-            vec![
-                span("  … 1,184 lines held on disk · ", th.border),
-                span("out-9f21c4", th.warning),
-                span(" · 84 KB", th.border),
-            ],
-            vec![
-                span("  test result: ", th.border),
-                span("ok", th.success),
-                span(". 212 passed; 0 failed", th.border),
-            ],
-            Vec::new(),
-            vec![
-                span(format!("{} ", glyph::BRANCH), th.border),
-                span_strong(format!("{} ", State::Attention.glyph()), th.warning, th),
-                span("the model asked for the middle: ", th.muted),
-                span("retrieve_output out-9f21c4 --lines 600-640", th.text),
-            ],
-        ])
+        .title(vec![span_strong("LATEST SAVED OUTPUT", th.primary, th)])
+        .rows(sample_rows)
         .lines();
 
     let held = footnote(
@@ -284,7 +281,19 @@ pub fn chrome(model: &Model) -> SheetChrome {
             th,
             vec![
                 status
-                    .map(|_| vec![span("governor ", th.muted), span("on", th.text)])
+                    .map(|s| {
+                        vec![
+                            span("governor ", th.muted),
+                            span(
+                                match s.enabled {
+                                    Some(true) => "on",
+                                    Some(false) => "off",
+                                    None => "status unknown",
+                                },
+                                th.text,
+                            ),
+                        ]
+                    })
                     .unwrap_or_default(),
                 status
                     .filter(|s| !s.session_id.is_empty())
@@ -299,10 +308,9 @@ pub fn chrome(model: &Model) -> SheetChrome {
         status_third: compressed.map(|n| vec![span(format!("{n} compressed"), th.muted)]),
         status_right: None,
         hints: vec![
-            hint(th, "enter open an output"),
-            hint_dim(th, "d dedupe on/off"),
-            hint_dim(th, "l anti-loop on/off"),
-            hint_dim(th, "r reset counters"),
+            hint(th, "/governor-status refresh"),
+            hint(th, "/governor-reset reset counters"),
+            hint(th, "↑↓ scroll"),
         ],
         escape: Some("esc close"),
         composer: Composer::Prompt("/governor-status"),
@@ -369,12 +377,10 @@ mod tests {
     fn the_sample_and_the_store_are_visible_not_described() {
         let m = model(100);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
+        assert!(rows.iter().any(|row| row.contains("LATEST SAVED OUTPUT")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("WHAT A COMPRESSED RESULT LOOKS LIKE")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("… 1,184 lines held on disk · out-9f21c4")));
+            .any(|row| row.contains("Saved as") && row.contains("out-9f21c4")));
         let held = rows
             .iter()
             .position(|row| row.contains("held on disk, retrievable by id"))
@@ -418,10 +424,7 @@ mod tests {
         assert_eq!(third, "31 compressed");
         assert_eq!(c.composer, Composer::Prompt("/governor-status"));
         let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
-        assert!(
-            hint.starts_with("enter open an output │ d dedupe on/off"),
-            "{hint}"
-        );
+        assert!(hint.starts_with("/governor-status refresh"), "{hint}");
         assert!(hint.trim_end().ends_with("esc close"), "{hint}");
     }
 

@@ -153,40 +153,76 @@ impl TokenGovernorConfig {
 }
 
 fn apply_env(config: &mut TokenGovernorConfig) {
-    if let Some(value) = env_bool_any(&["PI_GOVERNOR_ENABLED", "PI_TOKEN_GOVERNOR_ENABLED"]) {
+    if let Some(value) = env_bool_any(&[
+        "DAVINCI_GOVERNOR_ENABLED",
+        "DAVINCI_TOKEN_GOVERNOR_ENABLED",
+        "PI_GOVERNOR_ENABLED",
+        "PI_TOKEN_GOVERNOR_ENABLED",
+    ]) {
         config.enabled = value;
     }
     if let Some(value) = env_usize_any(&[
+        "DAVINCI_GOVERNOR_COMPRESS_THRESHOLD",
+        "DAVINCI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_BYTES",
         "PI_GOVERNOR_COMPRESS_THRESHOLD",
         "PI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_BYTES",
     ]) {
         config.compress_threshold_bytes = value.max(1);
     }
-    if let Some(value) = env_usize("PI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_LINES") {
+    if let Some(value) = env_usize_any(&[
+        "DAVINCI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_LINES",
+        "PI_TOKEN_GOVERNOR_COMPRESS_THRESHOLD_LINES",
+    ]) {
         config.compress_threshold_lines = value.max(1);
     }
-    if let Some(value) = env_usize("PI_TOKEN_GOVERNOR_KEEP_HEAD_LINES") {
+    if let Some(value) = env_usize_any(&[
+        "DAVINCI_TOKEN_GOVERNOR_KEEP_HEAD_LINES",
+        "PI_TOKEN_GOVERNOR_KEEP_HEAD_LINES",
+    ]) {
         config.keep_head_lines = value;
     }
-    if let Some(value) = env_usize("PI_TOKEN_GOVERNOR_KEEP_TAIL_LINES") {
+    if let Some(value) = env_usize_any(&[
+        "DAVINCI_TOKEN_GOVERNOR_KEEP_TAIL_LINES",
+        "PI_TOKEN_GOVERNOR_KEEP_TAIL_LINES",
+    ]) {
         config.keep_tail_lines = value;
     }
-    if let Some(value) = env_usize("PI_TOKEN_GOVERNOR_MAX_IMPORTANT_LINES") {
+    if let Some(value) = env_usize_any(&[
+        "DAVINCI_TOKEN_GOVERNOR_MAX_IMPORTANT_LINES",
+        "PI_TOKEN_GOVERNOR_MAX_IMPORTANT_LINES",
+    ]) {
         config.max_important_lines = value.max(1);
     }
-    if let Some(value) = env_bool("PI_TOKEN_GOVERNOR_DEDUPE_READS") {
+    if let Some(value) = env_bool_any(&[
+        "DAVINCI_TOKEN_GOVERNOR_DEDUPE_READS",
+        "PI_TOKEN_GOVERNOR_DEDUPE_READS",
+    ]) {
         config.dedupe_reads = value;
     }
-    if let Some(value) = env_usize("PI_TOKEN_GOVERNOR_DEDUPE_WINDOW") {
+    if let Some(value) = env_usize_any(&[
+        "DAVINCI_TOKEN_GOVERNOR_DEDUPE_WINDOW",
+        "PI_TOKEN_GOVERNOR_DEDUPE_WINDOW",
+    ]) {
         config.dedupe_window = value;
     }
-    if let Some(value) = env_bool("PI_TOKEN_GOVERNOR_ANTI_LOOP") {
+    if let Some(value) = env_bool_any(&[
+        "DAVINCI_TOKEN_GOVERNOR_ANTI_LOOP",
+        "PI_TOKEN_GOVERNOR_ANTI_LOOP",
+    ]) {
         config.anti_loop = value;
     }
-    if let Some(value) = env_usize("PI_TOKEN_GOVERNOR_RETRIEVE_MAX_BYTES") {
+    if let Some(value) = env_usize_any(&[
+        "DAVINCI_TOKEN_GOVERNOR_RETRIEVE_MAX_BYTES",
+        "PI_TOKEN_GOVERNOR_RETRIEVE_MAX_BYTES",
+    ]) {
         config.retrieve_max_bytes = value.max(1_024);
     }
-    if let Some(value) = env_string_any(&["PI_GOVERNOR_STORE_DIR", "PI_TOKEN_GOVERNOR_DIR"]) {
+    if let Some(value) = env_string_any(&[
+        "DAVINCI_GOVERNOR_STORE_DIR",
+        "DAVINCI_TOKEN_GOVERNOR_DIR",
+        "PI_GOVERNOR_STORE_DIR",
+        "PI_TOKEN_GOVERNOR_DIR",
+    ]) {
         config.store_dir = Some(PathBuf::from(value));
     }
 }
@@ -408,10 +444,27 @@ impl OutputStore {
     }
 
     pub fn for_session(session_key: &str) -> Self {
-        let base = std::env::var_os("PI_TOKEN_GOVERNOR_DIR")
+        let base = std::env::var_os("DAVINCI_TOKEN_GOVERNOR_DIR")
+            .or_else(|| std::env::var_os("PI_TOKEN_GOVERNOR_DIR"))
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".pi")))
-            .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".pi")))
+            .or_else(|| {
+                let home = std::env::var_os("USERPROFILE")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .map(PathBuf::from);
+                home.map(|h| {
+                    let davinci = h.join(".davinci");
+                    if davinci.exists() {
+                        davinci
+                    } else {
+                        let pi = h.join(".pi");
+                        if pi.exists() {
+                            pi
+                        } else {
+                            davinci
+                        }
+                    }
+                })
+            })
             .unwrap_or_else(std::env::temp_dir)
             .join("agent")
             .join("token-governor")

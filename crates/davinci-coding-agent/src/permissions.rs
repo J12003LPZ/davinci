@@ -12,6 +12,7 @@ use davinci_agent::{PermissionMode, PermissionPolicy, PermissionRule};
 
 use crate::settings::{
     load_settings, load_settings_file, with_settings_lock, PermissionSettings, CONFIG_DIR_NAME,
+    LEGACY_CONFIG_DIR_NAME,
 };
 
 /// The two files a policy is assembled from, kept apart so `/permissions`
@@ -101,7 +102,18 @@ pub fn policy_for(
 }
 
 pub fn project_settings_path(cwd: &Path) -> PathBuf {
-    cwd.join(CONFIG_DIR_NAME).join("settings.json")
+    let davinci = cwd.join(CONFIG_DIR_NAME).join("settings.json");
+    if davinci.exists() {
+        return davinci;
+    }
+    let pi = cwd.join(LEGACY_CONFIG_DIR_NAME).join("settings.json");
+    if pi.exists() {
+        return pi;
+    }
+    if cwd.join(LEGACY_CONFIG_DIR_NAME).is_dir() {
+        return pi;
+    }
+    davinci
 }
 
 /// "Always allow in this project": append the rule to `.pi/settings.json`

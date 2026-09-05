@@ -9,6 +9,26 @@ palette · `1e` Codex workspace (160 cols) · `1f` Memoria + Cogitator · `1g` 8
 cols · `1h` NO_COLOR · `2a` Grafo · `2b` Memoria vector recall · `2c` Mensura
 token governor.
 
+### September 2026 interface revision
+
+The Rust implementation uses the slate palette below with the existing copper
+state accents. The opening screen puts graph, governor, and memory commands
+within reach; the identity illustration requires both 100 columns and 48 rows.
+The status strip has a separate surface, and feature headers use plain names.
+
+- Graph runs show the goal, completed-task progress, topology, and worker ledger.
+- Governor status shows actual stored output metadata, configuration state,
+  and explicitly estimated token savings. Compression and unchanged-read
+  deduplication produce an eight-second notice above the composer without
+  taking focus. The notice is omitted below 12 rows; the status command remains
+  available. Only the latest notice is shown during a burst of tool completions.
+- Vector memory shows the recall flow, record distribution, storage, health,
+  and the actual retrieval mode (automatic, on demand, or off).
+
+Feature footers list working slash commands instead of unimplemented single-key
+actions. Arrow keys and Page Up/Down scroll the three feature sheets, bounded
+to their content. Older mockups retain their original artwork and sample data.
+
 ---
 
 ## 1. Principle
@@ -35,12 +55,12 @@ and drop to `NO_COLOR` (§9) below 16.
 
 | Token       | Hex       | Role |
 |---|---|---|
-| `background` | `#0B1011` | terminal ground |
-| `surface`    | `#101719` | header, status bar, panel fill |
-| `surface_alt`| `#0E1416` | composer well, sidebar |
-| `border`     | `#453A27` | panel rules, separators, inert glyphs, keybind hints |
-| `text`       | `#DDD5C4` | primary copy, active row, code |
-| `muted`      | `#80796D` | secondary copy, tool lines, hair/veil strokes |
+| `background` | `#101419` | terminal ground |
+| `surface`    | `#1B222A` | header, status bar, panel fill |
+| `surface_alt`| `#151B22` | composer well, sidebar |
+| `border`     | `#46515D` | panel rules, separators, inert glyphs, keybind hints |
+| `text`       | `#E3E7EB` | primary copy, active row, code |
+| `muted`      | `#A1ACB8` | secondary copy, tool lines, hair/veil strokes |
 | `primary`    | `#D58A32` | copper: focus, in-progress, selection, Δ, caret, agent mark |
 | `secondary`  | `#52A89C` | verdigris: git branch, paths, identifiers, memoria |
 | `success`    | `#74A879` | ✓, additions, healthy caps |
@@ -48,7 +68,7 @@ and drop to `NO_COLOR` (§9) below 16.
 | `error`      | `#C4593F` | ×, deletions, failing tests |
 
 Dimmed layer (behind a modal, `1d` and `1f`): `text → #3f3a31`,
-`muted → #5d564c`, `primary → #6b512c`, `border → #2b2519`. Never blur, never
+`muted → #5d564c`, `primary → #6b512c`, `border → #303943`. Never blur, never
 tint — just drop the ramp.
 
 Exactly one accent carries state (copper). Verdigris is reserved for *where

@@ -39,7 +39,10 @@ pub enum Hint {
 /// mockups set them (`2b`, `2c`).
 pub fn header(model: &Model) -> Line<'static> {
     let th = &model.theme;
-    let mut left = vec![span_strong("D", th.primary, th), span(" davinci", th.text)];
+    let mut left = vec![
+        span_on(" D ", th.background, Some(th.primary)),
+        span_strong(" davinci", th.text, th),
+    ];
     if !model.minimal() {
         left.push(span(" · ", th.border));
         left.push(span(model.mode(), th.primary));
@@ -98,6 +101,30 @@ pub fn header(model: &Model) -> Line<'static> {
 /// `mode · branch · Δn +a -d` on the left, a context meter on the right.
 pub fn status(model: &Model) -> Line<'static> {
     spread(model.width, status_left(model), status_right(model))
+        .style(Style::default().bg(model.theme.surface))
+}
+
+/// Quiet, focus-preserving feedback above the composer; the ledger stays
+/// available after the notice expires, including with animation disabled.
+pub fn governor_notice(model: &Model) -> Vec<Line<'static>> {
+    let Some((message, when)) = &model.governor_notice else {
+        return Vec::new();
+    };
+    if when.elapsed() >= std::time::Duration::from_secs(8) || model.height < 12 {
+        return Vec::new();
+    }
+    vec![spread(
+        model.width,
+        vec![
+            span_strong("✓ Governor  ", model.theme.success, &model.theme),
+            span(message.clone(), model.theme.text),
+        ],
+        if model.width >= 100 {
+            vec![span(" /governor-status", model.theme.muted)]
+        } else {
+            Vec::new()
+        },
+    )]
 }
 
 fn status_left(model: &Model) -> Vec<Span<'static>> {
@@ -516,7 +543,7 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::Compact => Some("/compact keep the store.rs decisions"),
         Screen::Export => Some("/share"),
         Screen::GraphRun => Some("/graph-view t6"),
-        Screen::Vectors => Some("/memory-search interrupt handling"),
+        Screen::Vectors => Some("/memory-search <query>"),
         Screen::Governor => Some("/governor-status"),
         Screen::Securitas => Some("/sec-report --severity high"),
         Screen::Officina => Some("/reload"),
@@ -841,7 +868,7 @@ mod tests {
     #[test]
     fn the_header_carries_path_branch_and_model_when_there_is_room() {
         let drawn = text(&header(&model(100)));
-        assert!(drawn.starts_with("D davinci · agent"), "{drawn}");
+        assert!(drawn.starts_with(" D  davinci · agent"), "{drawn}");
         assert!(drawn.contains("C:\\dev\\oss\\davinci-rust │ main │ sonnet"));
     }
 

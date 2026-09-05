@@ -50,17 +50,27 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn default_agent_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+    if let Ok(dir) =
+        std::env::var("DAVINCI_CODING_AGENT_DIR").or_else(|_| std::env::var("PI_CODING_AGENT_DIR"))
+    {
         return expand_tilde(&dir);
     }
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pi")
-        .join("agent")
+    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let davinci_dir = home.join(".davinci").join("agent");
+    if davinci_dir.exists() {
+        return davinci_dir;
+    }
+    let pi_dir = home.join(".pi").join("agent");
+    if pi_dir.exists() {
+        return pi_dir;
+    }
+    davinci_dir
 }
 
 pub fn default_session_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR") {
+    if let Ok(dir) = std::env::var("DAVINCI_CODING_AGENT_SESSION_DIR")
+        .or_else(|_| std::env::var("PI_CODING_AGENT_SESSION_DIR"))
+    {
         return expand_tilde(&dir);
     }
     default_agent_dir().join("sessions")
@@ -70,12 +80,14 @@ pub fn resolve_session_dir(explicit: Option<&str>) -> PathBuf {
     resolve_session_dir_from(explicit, None)
 }
 
-/// TS session dir order: `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, `settings.sessionDir`, default.
+/// TS session dir order: `--session-dir`, `DAVINCI/PI_CODING_AGENT_SESSION_DIR`, `settings.sessionDir`, default.
 pub fn resolve_session_dir_from(explicit: Option<&str>, settings_dir: Option<&str>) -> PathBuf {
     if let Some(dir) = explicit.map(str::trim).filter(|dir| !dir.is_empty()) {
         return expand_tilde(dir);
     }
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR") {
+    if let Ok(dir) = std::env::var("DAVINCI_CODING_AGENT_SESSION_DIR")
+        .or_else(|_| std::env::var("PI_CODING_AGENT_SESSION_DIR"))
+    {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {
             return expand_tilde(trimmed);

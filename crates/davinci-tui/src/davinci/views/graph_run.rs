@@ -86,7 +86,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         .rows(
             run.shape
                 .iter()
-                .map(|row| vec![span(row.clone(), th.border)])
+                .map(|row| vec![span(row.clone(), th.muted)])
                 .collect(),
         )
         .lines();
@@ -133,10 +133,6 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             span(" · replans ", th.muted),
             span(run.replans.clone(), th.text),
         ]),
-        Line::from(vec![span(
-            "no run deadline · per-role timeouts unlimited",
-            th.border,
-        )]),
     ];
     budgets.extend(footnote(
         width,
@@ -151,7 +147,29 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         th,
     ));
 
-    let mut out = vec![rail, blank()];
+    let completed = run
+        .tasks
+        .iter()
+        .filter(|task| task.state == State::Done)
+        .count();
+    let mut progress = vec![span_strong("GRAPH RUN  ", th.primary, th)];
+    progress.extend(meter(
+        completed as f64 / run.tasks.len().max(1) as f64,
+        width.saturating_sub(35).min(24),
+        th,
+        Some(th.success),
+    ));
+    progress.push(span(
+        format!("  {completed}/{} complete", run.tasks.len()),
+        th.muted,
+    ));
+    let mut out = vec![rail, blank(), Line::from(progress)];
+    out.extend(
+        crate::davinci::ui::wrap(&run.goal, width)
+            .into_iter()
+            .map(|row| Line::from(vec![span(row, th.text)])),
+    );
+    out.push(blank());
     out.extend(graph);
     out.push(blank());
     out.push(Line::from(vec![
@@ -206,10 +224,10 @@ pub fn chrome(model: &Model) -> SheetChrome {
         status_right: run
             .map(|r| status_meter(th, "run cost", r.cost_fraction, &r.cost, &r.cost_cap)),
         hints: vec![
-            hint(th, "enter open artifact"),
-            hint(th, "v tail a worker"),
-            hint(th, "r resume a stopped run"),
-            hint(th, "a abort"),
+            hint(th, "/graph-view <id>"),
+            hint(th, "/graph-resume"),
+            hint(th, "/graph-abort"),
+            hint(th, "↑↓ scroll"),
         ],
         escape: Some("esc close"),
         // The composer suggests tailing the worker that is running now; with
@@ -378,7 +396,7 @@ mod tests {
         );
         let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
         assert!(
-            hint.starts_with("enter open artifact │ v tail a worker"),
+            hint.starts_with("/graph-view <id> │ /graph-resume"),
             "{hint}"
         );
         assert!(hint.trim_end().ends_with("esc close"), "{hint}");

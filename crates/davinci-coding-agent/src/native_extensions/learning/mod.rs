@@ -48,7 +48,19 @@ impl LearningController {
         let config = config.unwrap_or_default();
         let mut diagnostics = Vec::new();
 
-        let project_root = cwd.join(".pi").join("learning");
+        let project_root = {
+            let davinci = cwd.join(".davinci").join("learning");
+            if davinci.exists() {
+                davinci
+            } else {
+                let pi = cwd.join(".pi").join("learning");
+                if pi.exists() {
+                    pi
+                } else {
+                    davinci
+                }
+            }
+        };
         let project_store = match LearningStore::open(project_root) {
             Ok(store) => store,
             Err(err) => {
@@ -63,12 +75,20 @@ impl LearningController {
             .map(|dir| dir.join("learning"))
             .unwrap_or_else(|| {
                 if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-                    PathBuf::from(home)
-                        .join(".pi")
-                        .join("agent")
-                        .join("learning")
+                    let h = PathBuf::from(home);
+                    let davinci = h.join(".davinci").join("agent").join("learning");
+                    if davinci.exists() {
+                        davinci
+                    } else {
+                        let pi = h.join(".pi").join("agent").join("learning");
+                        if pi.exists() {
+                            pi
+                        } else {
+                            davinci
+                        }
+                    }
                 } else {
-                    PathBuf::from(".pi").join("learning")
+                    PathBuf::from(".davinci").join("learning")
                 }
             });
         let global_store = match LearningStore::open(global_root) {
@@ -81,12 +101,35 @@ impl LearningController {
             }
         };
 
-        let project_skills_dir = cwd.join(".pi").join("skills");
+        let project_skills_dir = {
+            let davinci = cwd.join(".davinci").join("skills");
+            if davinci.exists() {
+                davinci
+            } else {
+                let pi = cwd.join(".pi").join("skills");
+                if pi.exists() {
+                    pi
+                } else {
+                    davinci
+                }
+            }
+        };
         let global_skills_dir = agent_dir.map(|dir| dir.join("skills")).unwrap_or_else(|| {
             if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-                PathBuf::from(home).join(".pi").join("agent").join("skills")
+                let h = PathBuf::from(home);
+                let davinci = h.join(".davinci").join("agent").join("skills");
+                if davinci.exists() {
+                    davinci
+                } else {
+                    let pi = h.join(".pi").join("agent").join("skills");
+                    if pi.exists() {
+                        pi
+                    } else {
+                        davinci
+                    }
+                }
             } else {
-                PathBuf::from(".pi").join("skills")
+                PathBuf::from(".davinci").join("skills")
             }
         });
 

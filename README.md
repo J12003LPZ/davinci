@@ -2,11 +2,11 @@
 
 A terminal coding agent: a product-equivalent Rust rewrite of the TypeScript CLI [`pi`](https://github.com/earendil-works/pi) (vendor pin `853a80d26c90a14c1886f0ebb8ffaae133ca2185`).
 
-Same flags, same `~/.pi` sessions, same provider credentials, same `--print` and `--mode rpc` — one static binary, no Node runtime required (Node is optional, and only for JavaScript extensions).
+Same flags, same `~/.davinci` (and legacy `~/.pi`) sessions, same provider credentials, same `--print` and `--mode rpc` — one static binary, no Node runtime required (Node is optional, and only for JavaScript extensions).
 
 The interactive terminal UI opens the davinci shell described below. `--legacy-tui` keeps the original.
 
-The TypeScript sources under `vendor/pi` are reference-only. Do not delete them.
+The TypeScript sources under `vendor/davinci` are reference-only. Do not delete them.
 
 ---
 
@@ -48,13 +48,13 @@ Eight built-in tools: `read`, `write`, `edit`, `bash`, `powershell`, `grep`, `fi
 
 Tool exposure is controlled per run with `--tools`, `--exclude-tools`, `--no-tools`, and `--no-builtin-tools`.
 
-Project-local configuration is trusted explicitly. If a repository contains `.pi/settings.json`, `.pi/extensions`, `.pi/skills`, `.pi/prompts`, `.pi/themes`, `SYSTEM.md`, or `APPEND_SYSTEM.md`, pi asks before honoring it and remembers the answer in `~/.pi/agent/trust.json`. `--approve` / `--no-approve` override for one run; `/trust` changes the stored decision. Repositories with no such files need no decision at all.
+Project-local configuration is trusted explicitly. If a repository contains `.davinci/settings.json`, `.davinci/extensions`, `.davinci/skills` (or legacy `.pi/` equivalents), `SYSTEM.md`, or `APPEND_SYSTEM.md`, davinci asks before honoring it and remembers the answer in `~/.davinci/agent/trust.json` (or `~/.pi/agent/trust.json`). `--approve` / `--no-approve` override for one run; `/trust` changes the stored decision. Repositories with no such files need no decision at all.
 
 `AGENTS.md` and `CLAUDE.md` are discovered and loaded as context (disable with `--no-context-files`).
 
 ### Sessions
 
-Sessions are JSONL files under `~/.pi/agent/sessions/`, grouped by a cwd-encoded directory (`--C--Users-me-project--/`) byte-compatible with TypeScript pi. Override with `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, or the `sessionDir` setting.
+Sessions are JSONL files under `~/.davinci/agent/sessions/` (or legacy `~/.pi/agent/sessions/`), grouped by a cwd-encoded directory (`--C--Users-me-project--/`) byte-compatible with TypeScript pi. Override with `--session-dir`, `DAVINCI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_SESSION_DIR`, or the `sessionDir` setting.
 
 - `--continue` resumes the latest session for this directory; `--resume` opens a searchable picker.
 - `--session <path|id>` accepts a path or a partial UUID; `--session-id` creates a named id if missing.

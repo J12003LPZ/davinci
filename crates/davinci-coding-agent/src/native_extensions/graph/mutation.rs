@@ -137,7 +137,12 @@ fn walk_dir_files(root: &Path) -> Vec<String> {
             let path = entry.path();
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
-            if name == ".git" || name == ".pi" || name == "target" || name == "node_modules" {
+            if name == ".git"
+                || name == ".pi"
+                || name == ".davinci"
+                || name == "target"
+                || name == "node_modules"
+            {
                 continue;
             }
             if path.is_dir() {

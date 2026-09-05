@@ -136,14 +136,15 @@ const fn rgb(hex: u32) -> Color {
     )
 }
 
-/// design.md §2, verbatim.
+/// Slate surfaces with copper state accents. Muted copy stays readable on
+/// both the canvas and raised surfaces; borders are intentionally quieter.
 const TRUECOLOR: Ramp = Ramp {
-    background: rgb(0x0B1011),
-    surface: rgb(0x101719),
-    surface_alt: rgb(0x0E1416),
-    border: rgb(0x453A27),
-    text: rgb(0xDDD5C4),
-    muted: rgb(0x80796D),
+    background: rgb(0x101419),
+    surface: rgb(0x1B222A),
+    surface_alt: rgb(0x151B22),
+    border: rgb(0x46515D),
+    text: rgb(0xE3E7EB),
+    muted: rgb(0xA1ACB8),
     primary: rgb(0xD58A32),
     secondary: rgb(0x52A89C),
     success: rgb(0x74A879),
@@ -153,10 +154,10 @@ const TRUECOLOR: Ramp = Ramp {
 
 /// "Never blur, never tint — just drop the ramp" (design.md §2).
 const TRUECOLOR_DIM: Ramp = Ramp {
-    background: rgb(0x0B1011),
-    surface: rgb(0x0E1416),
-    surface_alt: rgb(0x0B1011),
-    border: rgb(0x2B2519),
+    background: rgb(0x101419),
+    surface: rgb(0x151B22),
+    surface_alt: rgb(0x101419),
+    border: rgb(0x303943),
     text: rgb(0x3F3A31),
     muted: rgb(0x5D564C),
     primary: rgb(0x6B512C),
@@ -171,9 +172,9 @@ const ANSI256: Ramp = Ramp {
     background: Color::Indexed(233),
     surface: Color::Indexed(235),
     surface_alt: Color::Indexed(234),
-    border: Color::Indexed(58),
-    text: Color::Indexed(187),
-    muted: Color::Indexed(102),
+    border: Color::Indexed(240),
+    text: Color::Indexed(254),
+    muted: Color::Indexed(248),
     primary: Color::Indexed(173),
     secondary: Color::Indexed(73),
     success: Color::Indexed(108),
@@ -404,10 +405,10 @@ mod tests {
     #[test]
     fn truecolor_tokens_match_the_spec_table() {
         let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
-        assert_eq!(theme.background, Color::Rgb(0x0B, 0x10, 0x11));
-        assert_eq!(theme.border, Color::Rgb(0x45, 0x3A, 0x27));
-        assert_eq!(theme.text, Color::Rgb(0xDD, 0xD5, 0xC4));
-        assert_eq!(theme.muted, Color::Rgb(0x80, 0x79, 0x6D));
+        assert_eq!(theme.background, Color::Rgb(0x10, 0x14, 0x19));
+        assert_eq!(theme.border, Color::Rgb(0x46, 0x51, 0x5D));
+        assert_eq!(theme.text, Color::Rgb(0xE3, 0xE7, 0xEB));
+        assert_eq!(theme.muted, Color::Rgb(0xA1, 0xAC, 0xB8));
         assert_eq!(theme.primary, Color::Rgb(0xD5, 0x8A, 0x32));
         assert_eq!(theme.secondary, Color::Rgb(0x52, 0xA8, 0x9C));
         assert_eq!(theme.success, Color::Rgb(0x74, 0xA8, 0x79));
@@ -420,7 +421,7 @@ mod tests {
         let theme = Theme::da_vinci(ColorDepth::Ansi256, false);
         assert_eq!(theme.primary, Color::Indexed(173));
         assert_eq!(theme.secondary, Color::Indexed(73));
-        assert_eq!(theme.border, Color::Indexed(58));
+        assert_eq!(theme.border, Color::Indexed(240));
     }
 
     #[test]
@@ -498,7 +499,7 @@ mod tests {
         assert_eq!(dimmed.text, Color::Rgb(0x3F, 0x3A, 0x31));
         assert_eq!(dimmed.muted, Color::Rgb(0x5D, 0x56, 0x4C));
         assert_eq!(dimmed.primary, Color::Rgb(0x6B, 0x51, 0x2C));
-        assert_eq!(dimmed.border, Color::Rgb(0x2B, 0x25, 0x19));
+        assert_eq!(dimmed.border, Color::Rgb(0x30, 0x39, 0x43));
         assert_eq!(dimmed.dim(), dimmed);
     }
 

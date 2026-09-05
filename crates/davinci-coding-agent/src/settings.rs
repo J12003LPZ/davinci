@@ -619,7 +619,8 @@ pub struct ImageBlockSettings {
     pub block_images: Option<bool>,
 }
 
-pub const CONFIG_DIR_NAME: &str = ".pi";
+pub const CONFIG_DIR_NAME: &str = ".davinci";
+pub const LEGACY_CONFIG_DIR_NAME: &str = ".pi";
 pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 2_000;
 pub const DEFAULT_PROVIDER_MAX_RETRY_DELAY_MS: u64 = 60_000;
 
@@ -676,7 +677,13 @@ pub fn load_merged_settings_with_override(
     ) {
         return global;
     }
-    let project = load_settings_value(&cwd.join(CONFIG_DIR_NAME).join("settings.json"));
+    let project_davinci = cwd.join(CONFIG_DIR_NAME).join("settings.json");
+    let project_path = if project_davinci.exists() {
+        project_davinci
+    } else {
+        cwd.join(LEGACY_CONFIG_DIR_NAME).join("settings.json")
+    };
+    let project = load_settings_value(&project_path);
     let merged = deep_merge_json(global_value, project);
     serde_json::from_value(migrate_settings(merged)).unwrap_or_default()
 }

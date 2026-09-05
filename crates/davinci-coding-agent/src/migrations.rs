@@ -10,7 +10,8 @@ const MIGRATION_GUIDE_URL: &str =
     "https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
 const EXTENSIONS_DOC_URL: &str =
     "https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/extensions.md";
-const CONFIG_DIR_NAME: &str = ".pi";
+const CONFIG_DIR_NAME: &str = ".davinci";
+const LEGACY_CONFIG_DIR_NAME: &str = ".pi";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MigrationResult {
@@ -20,7 +21,17 @@ pub struct MigrationResult {
 }
 
 pub fn project_config_dir(cwd: &Path) -> PathBuf {
-    cwd.join(CONFIG_DIR_NAME)
+    let davinci = cwd.join(CONFIG_DIR_NAME);
+    if davinci.exists() {
+        davinci
+    } else {
+        let legacy = cwd.join(LEGACY_CONFIG_DIR_NAME);
+        if legacy.exists() {
+            legacy
+        } else {
+            davinci
+        }
+    }
 }
 
 pub fn run_migrations(cwd: &Path, agent_dir: &Path) -> MigrationResult {
@@ -274,7 +285,11 @@ pub fn show_deprecation_warnings(warnings: &[String]) {
         return;
     }
     println!("{}", format_deprecation_warnings(warnings));
-    if std::env::var("PI_DEPRECATION_SKIP").is_ok() || !stdin_is_interactive() {
+    if std::env::var("DAVINCI_DEPRECATION_SKIP")
+        .or_else(|_| std::env::var("PI_DEPRECATION_SKIP"))
+        .is_ok()
+        || !stdin_is_interactive()
+    {
         return;
     }
     wait_for_keypress();
@@ -287,7 +302,9 @@ fn stdin_is_interactive() -> bool {
 }
 
 fn wait_for_keypress() {
-    if let Ok(raw) = std::env::var("PI_DEPRECATION_REPLY") {
+    if let Ok(raw) = std::env::var("DAVINCI_DEPRECATION_REPLY")
+        .or_else(|_| std::env::var("PI_DEPRECATION_REPLY"))
+    {
         let _ = raw;
         return;
     }
@@ -296,7 +313,9 @@ fn wait_for_keypress() {
 }
 
 pub fn maybe_run_startup_migrations(cwd: &Path) -> MigrationResult {
-    let agent_dir = if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+    let agent_dir = if let Ok(dir) =
+        std::env::var("DAVINCI_CODING_AGENT_DIR").or_else(|_| std::env::var("PI_CODING_AGENT_DIR"))
+    {
         PathBuf::from(dir)
     } else {
         default_agent_dir()

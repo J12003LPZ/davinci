@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-A Rust reimplementation of the TypeScript agent CLI [`pi`](https://github.com/earendil-works/pi), pinned to vendor commit `853a80d26c90a14c1886f0ebb8ffaae133ca2185`. The goal is *product equivalence*: a user who runs TypeScript `pi` installs this binary and keeps the same flags, `~/.pi` sessions, provider credentials, interactive TUI, `--print`, and `--mode rpc`.
+A Rust reimplementation of the TypeScript agent CLI [`pi`](https://github.com/earendil-works/pi), pinned to vendor commit `853a80d26c90a14c1886f0ebb8ffaae133ca2185`. The goal is *product equivalence*: a user who runs TypeScript `pi` installs this binary and keeps the same flags, `~/.davinci` (and legacy `~/.pi`) sessions, provider credentials, interactive TUI, `--print`, and `--mode rpc`.
 
-`vendor/pi` holds the authoritative TypeScript source (~1,169 `.ts` files). It is reference-only — read it constantly, never delete or edit it. `packages/*` holds a handful of stale TypeScript stubs from the early phases; they are not the reference.
+`vendor/davinci` holds the authoritative TypeScript source (~1,169 `.ts` files). It is reference-only — read it constantly, never delete or edit it. `packages/*` holds a handful of stale TypeScript stubs from the early phases; they are not the reference.
 
 Phase plans describing the rewrite are in `docs/superpowers/plans/`. The ecosystem integration roadmap and its design plus execution plans are in `docs/superpowers/plans/2026-09-04-davinci-ecosystem-integration-roadmap.md`, `docs/superpowers/specs/2026-09-04-davinci-ecosystem-integration-design.md`, and the dated ecosystem A–D plan files. The harness reliability design and implementation plan are in `docs/superpowers/specs/2026-09-04-harness-reliability-design.md` and `docs/superpowers/plans/2026-09-04-harness-reliability.md`. Comprehensive documentation index is in `docs/README.md` and crate architecture is in `crates/README.md`.
 

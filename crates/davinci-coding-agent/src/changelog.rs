@@ -11,8 +11,14 @@ pub struct ChangelogEntry {
 }
 
 pub fn changelog_path() -> PathBuf {
-    if let Ok(path) = std::env::var("PI_CHANGELOG_PATH") {
+    if let Ok(path) =
+        std::env::var("DAVINCI_CHANGELOG_PATH").or_else(|_| std::env::var("PI_CHANGELOG_PATH"))
+    {
         return PathBuf::from(path);
+    }
+    let davinci_vendor = PathBuf::from("vendor/davinci/packages/coding-agent/CHANGELOG.md");
+    if davinci_vendor.exists() {
+        return davinci_vendor;
     }
     PathBuf::from("vendor/pi/packages/coding-agent/CHANGELOG.md")
 }

@@ -1161,6 +1161,7 @@ pub fn graph_run_sheet() -> GraphRunSheet {
 /// `5b` — the vector index.
 pub fn vector_index() -> VectorIndex {
     VectorIndex {
+        retrieval_mode: "automatic".into(),
         repo: "davinci-rust".into(),
         repo_records: "6,914".into(),
         total_records: "18,402".into(),
@@ -1255,6 +1256,7 @@ pub fn governor_sheet() -> GovernorSheet {
         stale,
     };
     GovernorSheet {
+        enabled: Some(true),
         counters: vec![
             counter(
                 "31",

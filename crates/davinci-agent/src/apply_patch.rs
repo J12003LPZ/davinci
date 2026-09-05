@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const JOURNAL_FILE_NAME: &str = ".pi_patch_journal.json";
+const JOURNAL_FILE_NAME: &str = ".davinci_patch_journal.json";
+const LEGACY_JOURNAL_FILE_NAME: &str = ".pi_patch_journal.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileAction {
@@ -86,8 +87,9 @@ pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<P
             _ => None,
         })
         .is_some_and(|name| {
-            name.trim_end_matches(['.', ' '])
-                .eq_ignore_ascii_case(JOURNAL_FILE_NAME)
+            let trimmed = name.trim_end_matches(['.', ' ']);
+            trimmed.eq_ignore_ascii_case(JOURNAL_FILE_NAME)
+                || trimmed.eq_ignore_ascii_case(LEGACY_JOURNAL_FILE_NAME)
         })
     {
         return Err("The patch journal path is reserved".into());
@@ -362,7 +364,15 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
 /// Explicit recovery only: the caller must authorize every journal target.
 /// Repository journals are untrusted and must never be replayed by an ordinary patch.
 pub fn recover_incomplete_journal_if_any(workspace_root: &Path) -> Result<(), String> {
-    let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
+    let davinci_journal = workspace_root.join(JOURNAL_FILE_NAME);
+    let legacy_journal = workspace_root.join(LEGACY_JOURNAL_FILE_NAME);
+    let journal_path = if davinci_journal.exists() {
+        davinci_journal
+    } else if legacy_journal.exists() {
+        legacy_journal
+    } else {
+        return Ok(());
+    };
     match fs::symlink_metadata(&journal_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("Failed inspecting journal: {error}")),
@@ -408,6 +418,13 @@ fn restore_entry(target: &Path, entry: &JournalEntry) -> std::io::Result<()> {
 pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String, String> {
     let parsed = parse_codex_patch(input)?;
     let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
+    let legacy_journal = workspace_root.join(LEGACY_JOURNAL_FILE_NAME);
+    if journal_path.exists() || legacy_journal.exists() {
+        return Err(
+            "An existing patch journal requires explicit, authorized recovery; no files changed"
+                .into(),
+        );
+    }
     match fs::symlink_metadata(&journal_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("Failed inspecting journal: {error}")),

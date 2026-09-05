@@ -948,14 +948,46 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
             result,
             is_error,
             details,
-        } => turn.end_tool(
-            model,
-            tool_call_id,
-            tool_name,
-            result,
-            *is_error,
-            details.as_ref(),
-        ),
+        } => {
+            turn.end_tool(
+                model,
+                tool_call_id,
+                tool_name,
+                result,
+                *is_error,
+                details.as_ref(),
+            );
+            if !is_error {
+                if let Some(governor) = details.as_ref().and_then(|d| d.get("tokenGovernor")) {
+                    let notice = if governor
+                        .get("compressed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        let original = governor
+                            .get("originalBytes")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let withheld = original.saturating_sub(result_text(result).len() as u64);
+                        Some(format!(
+                            "{tool_name} compressed · {} bytes withheld · original saved",
+                            sheet_thousands(withheld)
+                        ))
+                    } else if governor
+                        .get("deduplicated")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        Some("Unchanged read reused · duplicate output avoided".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(notice) = notice {
+                        model.governor_notice = Some((notice, std::time::Instant::now()));
+                    }
+                }
+            }
+        }
 
         AgentEvent::MessageStart { message } if message.role == "assistant" => {
             turn.begin_message(model);
@@ -3973,6 +4005,7 @@ pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<
 // the screen. Nothing here is fixture data.
 
 fn open_sheet(model: &mut Model, screen: Screen) {
+    model.feature_scroll = 0;
     model.running = false;
     model.overlay = None;
     model.screen = screen;
@@ -4947,6 +4980,14 @@ fn vectors_sheet(value: &serde_json::Value) -> VectorIndex {
         )
     };
     VectorIndex {
+        retrieval_mode: if !enabled {
+            "off"
+        } else if automatic {
+            "automatic"
+        } else {
+            "on demand"
+        }
+        .into(),
         repo: json_str(value, "repoId").chars().take(12).collect(),
         repo_records: sheet_thousands(records),
         total_records: sheet_thousands(records),
@@ -5114,6 +5155,8 @@ fn governor_sheet(value: &serde_json::Value) -> GovernorSheet {
         })
         .unwrap_or_default();
     GovernorSheet {
+        enabled: value.get("enabled").and_then(serde_json::Value::as_bool),
+        session_id: json_str(value, "sessionKey"),
         counters: vec![
             GovernorCounter {
                 number: count("compressedOutputs").to_string(),
@@ -5139,8 +5182,8 @@ fn governor_sheet(value: &serde_json::Value) -> GovernorSheet {
             GovernorCounter {
                 number: sheet_compact(tokens_withheld),
                 of: format!("of {} calls", count("toolCalls")),
-                verb: "tokens never sent".into(),
-                note: "digests and markers in place of the bytes".into(),
+                verb: "est. tokens saved".into(),
+                note: "approximation: withheld bytes / 4".into(),
                 tone: Tone::Success,
             },
         ],

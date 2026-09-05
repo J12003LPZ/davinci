@@ -223,7 +223,12 @@ pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
     let user_agents_skills = PathBuf::from(&home).join(".agents").join("skills");
     let user_agents_skills = canonicalize_trust_path(&user_agents_skills);
     let mut current = PathBuf::from(canonicalize_trust_path(cwd));
-    let config_dir = current.join(".pi");
+    let davinci_dir = current.join(".davinci");
+    let config_dir = if davinci_dir.exists() {
+        davinci_dir
+    } else {
+        current.join(".pi")
+    };
     if TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES
         .iter()
         .any(|entry| config_dir.join(entry).exists())

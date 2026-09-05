@@ -1103,6 +1103,7 @@ pub struct GraphRunSheet {
 /// The vector index itself (`5b`).
 #[derive(Debug, Clone, Default)]
 pub struct VectorIndex {
+    pub retrieval_mode: String,
     pub repo: String,
     pub repo_records: String,
     pub total_records: String,
@@ -1150,6 +1151,8 @@ pub struct GovernorStored {
 /// What the governor did to this session's tool output (`5c`).
 #[derive(Debug, Clone, Default)]
 pub struct GovernorSheet {
+    /// None for snapshots from older producers that do not report configuration.
+    pub enabled: Option<bool>,
     pub counters: Vec<GovernorCounter>,
     pub stored: Vec<GovernorStored>,
     pub store_dir: String,
@@ -1353,6 +1356,10 @@ pub struct Model {
     pub height: u16,
     /// One clock, 250ms per step, driving both animations (design.md §8).
     pub tick: u64,
+    /// Latest governor action, shown briefly without stealing keyboard focus.
+    pub governor_notice: Option<(String, std::time::Instant)>,
+    /// Reading position in graph, governor, and vector memory sheets.
+    pub feature_scroll: usize,
     /// The tick the caret last moved on. The blink phase is measured from here
     /// rather than from zero, so a caret being typed at or arrowed across is
     /// solid and only resumes blinking once the composer has been left alone.
@@ -1539,6 +1546,8 @@ impl Model {
             width,
             height,
             tick: 0,
+            governor_notice: None,
+            feature_scroll: 0,
             caret_moved_at: 0,
             animate,
             theme,
@@ -1758,6 +1767,7 @@ impl Model {
     /// The row a sheet's window is kept around: its selection, or the top.
     pub fn sheet_anchor(&self) -> usize {
         match self.screen {
+            Screen::GraphRun | Screen::Governor | Screen::Vectors => self.feature_scroll,
             Screen::Models => self.catalog_index,
             Screen::Settings => self.settings_index,
             Screen::Thinking => self.thinking_index,
@@ -1777,11 +1787,12 @@ impl Model {
             Screen::Agent | Screen::Recovery | Screen::Diff if self.plan_mode => "plan",
             Screen::Agent | Screen::Recovery | Screen::Diff => "agent",
             Screen::Plan => "plan",
-            Screen::Grafo | Screen::GraphRun => "grafo",
-            Screen::Memoria | Screen::Resume | Screen::Tree | Screen::Export | Screen::Vectors => {
-                "memoria"
-            }
-            Screen::Mensura | Screen::Compact | Screen::Governor => "mensura",
+            Screen::GraphRun => "graph",
+            Screen::Vectors => "memory",
+            Screen::Governor => "governor",
+            Screen::Grafo => "grafo",
+            Screen::Memoria | Screen::Resume | Screen::Tree | Screen::Export => "memoria",
+            Screen::Mensura | Screen::Compact => "mensura",
             Screen::Models | Screen::Thinking | Screen::Login => "cogitator",
             Screen::Settings => "settings",
             Screen::Keys => "keys",
@@ -2094,6 +2105,7 @@ impl Model {
     }
 
     pub fn toggle_screen(&mut self, screen: Screen) {
+        self.feature_scroll = 0;
         if self.screen == screen {
             self.screen = Screen::Agent;
         } else {

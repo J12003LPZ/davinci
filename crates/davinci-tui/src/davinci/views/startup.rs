@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 
 use crate::davinci::model::{Model, Startup};
 use crate::davinci::theme::{glyph, Theme};
-use crate::davinci::ui::{blank, center, hair_rule, indent, span, span_strong};
+use crate::davinci::ui::{blank, center, hair_rule, indent, span, span_strong, truncate_run};
 
 /// The mark, as it appears in screen `1a`: the figure with both pairs of
 /// limbs — arms straight to the square, arms raised to the circle, legs
@@ -44,7 +44,7 @@ pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let width = model.width;
     let mut rows = Vec::new();
 
-    if model.decoration() {
+    if model.decoration() && model.height >= 48 {
         rows.extend(emblem(th, width));
         rows.push(blank());
         annotate(th, width, &mut rows);
@@ -54,10 +54,7 @@ pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
         width,
         vec![span_strong("D A V I N C I", th.text, th)],
     ));
-    rows.push(center(
-        width,
-        vec![span("macchina dell'intelletto", th.muted)],
-    ));
+    rows.push(center(width, vec![span("Agent workspace", th.muted)]));
     rows.push(blank());
     rows.push(center(width, vec![span(info.cwd.clone(), th.secondary)]));
     rows.push(center(
@@ -82,10 +79,34 @@ pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     rows.push(blank());
     rows.push(center(
         width,
-        vec![span("A machine for thought, built in Rust.", th.text)],
+        vec![span("Describe a task. Inspect every step.", th.text)],
+    ));
+    rows.push(blank());
+    for (command, description) in [
+        ("/graph <goal>", "Plan and follow a worker graph"),
+        ("/governor-status", "Inspect compression and saved output"),
+        ("/memory-status", "Explore the vector memory index"),
+    ] {
+        rows.push(center(
+            width,
+            vec![
+                span_strong(format!("{command:<19}"), th.primary, th),
+                span(if width >= 64 { description } else { "" }, th.muted),
+            ],
+        ));
+    }
+    rows.push(blank());
+    rows.push(center(
+        width,
+        vec![span(
+            "ctrl+p commands  ·  /help keyboard shortcuts",
+            th.muted,
+        )],
     ));
 
-    rows
+    rows.into_iter()
+        .map(|row| Line::from(truncate_run(row.spans, width)))
+        .collect()
 }
 
 /// The margin note beside the mark — `proportio humana`, in faded copper, at
@@ -152,8 +173,8 @@ fn emblem_row(theme: &Theme, row: &str, index: usize) -> Vec<Span<'static>> {
 pub fn height(model: &Model) -> usize {
     // mark + gap, then the ten rows of copy; the margin note rides on the
     // mark's own rows.
-    let copy = 10;
-    if model.decoration() {
+    let copy = 16;
+    if model.decoration() && model.height >= 48 {
         EMBLEM.len() + 1 + copy
     } else {
         copy
@@ -179,7 +200,7 @@ mod tests {
         Model::new(
             Theme::da_vinci(ColorDepth::TrueColor, false),
             width,
-            44,
+            52,
             true,
         )
     }
@@ -284,9 +305,7 @@ mod tests {
     #[test]
     fn the_empty_state_names_where_it_is_and_what_it_found() {
         let rows: Vec<String> = lines(&model(120), &info()).iter().map(text).collect();
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("macchina dell'intelletto")));
+        assert!(rows.iter().any(|row| row.contains("Agent workspace")));
         assert!(rows
             .iter()
             .any(|row| row.contains("C:\\dev\\oss\\davinci-rust")));
@@ -298,7 +317,7 @@ mod tests {
             .any(|row| row.contains("✓ session restored · memoria intacta")));
         assert!(rows
             .iter()
-            .any(|row| row.contains("A machine for thought, built in Rust.")));
+            .any(|row| row.contains("Describe a task. Inspect every step.")));
         // The margin note rides the mark's shoulder, two words on two rows.
         assert!(rows.iter().any(|row| row.contains("proportio")));
         assert!(rows.iter().any(|row| row.contains("humana")));

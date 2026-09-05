@@ -11,11 +11,19 @@
 use ratatui::text::{Line, Span};
 
 use super::chrome::thousands;
-use super::sheet::{facts, hint, hint_dim, status_meter, Composer, SheetChrome};
+use super::sheet::{facts, hint, status_meter, Composer, SheetChrome};
 use crate::davinci::model::Model;
 use crate::davinci::ui::{blank, footnote, meter, span, span_strong, truncate_run, Surface};
 
 const KIND: usize = 13;
+
+fn retrieval_mode(index: &crate::davinci::model::VectorIndex) -> &str {
+    if index.retrieval_mode.is_empty() {
+        "unknown"
+    } else {
+        &index.retrieval_mode
+    }
+}
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
@@ -28,6 +36,12 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     };
 
     let head = vec![
+        Line::from(vec![span_strong("VECTOR MEMORY", th.secondary, th)]),
+        Line::from(vec![span(
+            "Stored knowledge → relevant recall → turn context",
+            th.muted,
+        )]),
+        blank(),
         Line::from(vec![
             span("this repository ", th.muted),
             span(index.repo.clone(), th.secondary),
@@ -36,7 +50,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
             span(" of them", th.muted),
         ]),
         Line::from(vec![
-            span("retrieval automatic", th.muted),
+            span(format!("retrieval {}", retrieval_mode(index)), th.muted),
             span(" · ", th.border),
             span("at most ", th.muted),
             span(index.injection_cap.clone(), th.text),
@@ -52,14 +66,19 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
                 span(format!("{kind:<KIND$}"), th.muted),
                 span(format!("{count:>6}  "), th.text),
             ];
-            spans.extend(meter(*fraction, 22, th, Some(th.secondary)));
-            spans.push(span(format!("  {note}"), th.border));
+            spans.extend(meter(
+                *fraction,
+                width.saturating_sub(24).min(22),
+                th,
+                Some(th.secondary),
+            ));
+            spans.push(span(format!("  {note}"), th.muted));
             Line::from(spans)
         })
         .collect();
 
     let where_it_lives = Surface::new(width, th)
-        .title(vec![span("WHERE IT LIVES", th.secondary)])
+        .title(vec![span("STORAGE & MODELS", th.secondary)])
         .rows(vec![
             vec![
                 span("embeddings ", th.muted),
@@ -179,7 +198,12 @@ pub fn chrome(model: &Model) -> SheetChrome {
                     .unwrap_or_default(),
             ],
         ),
-        status_third: index.map(|_| vec![span("retrieval on", th.muted)]),
+        status_third: index.map(|index| {
+            vec![span(
+                format!("retrieval {}", retrieval_mode(index)),
+                th.muted,
+            )]
+        }),
         status_right: share.map(|(repo, total)| {
             status_meter(
                 th,
@@ -190,13 +214,12 @@ pub fn chrome(model: &Model) -> SheetChrome {
             )
         }),
         hints: vec![
-            hint(th, "enter search"),
-            hint(th, "i reindex"),
-            hint(th, "t toggle automatic retrieval"),
-            hint_dim(th, "x clear this repo"),
+            hint(th, "/memory-search <query>"),
+            hint(th, "/memory-reindex"),
+            hint(th, "↑↓ scroll"),
         ],
         escape: Some("esc close"),
-        composer: Composer::Prompt("/memory-search interrupt handling"),
+        composer: Composer::Prompt("/memory-search <query>"),
         echo: None,
     }
 }
@@ -241,8 +264,9 @@ mod tests {
     fn the_index_states_its_share_kinds_home_and_health() {
         let m = model(100);
         let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert_eq!(rows[0], "this repository davinci-rust holds 6,914 of them");
-        assert!(rows[1].contains("at most 1.5k tokens injected per turn"));
+        assert_eq!(rows[0], "VECTOR MEMORY");
+        assert_eq!(rows[3], "this repository davinci-rust holds 6,914 of them");
+        assert!(rows[4].contains("at most 1.5k tokens injected per turn"));
         assert!(rows
             .iter()
             .any(|row| row.starts_with("decision") && row.contains("importance 0.9")));
@@ -282,7 +306,7 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(third, "retrieval on");
+        assert_eq!(third, "retrieval automatic");
         let right: String = c
             .status_right
             .as_deref()
@@ -292,12 +316,12 @@ mod tests {
             .collect();
         assert!(right.starts_with("index "), "{right}");
         assert!(right.ends_with(" 6.9k/18.4k"), "{right}");
-        assert_eq!(
-            c.composer,
-            Composer::Prompt("/memory-search interrupt handling")
-        );
+        assert_eq!(c.composer, Composer::Prompt("/memory-search <query>"));
         let hint = text(&super::super::sheet::hint_row(&m, &c).unwrap());
-        assert!(hint.starts_with("enter search │ i reindex"), "{hint}");
+        assert!(
+            hint.starts_with("/memory-search <query> │ /memory-reindex"),
+            "{hint}"
+        );
         assert!(hint.trim_end().ends_with("esc close"), "{hint}");
     }
 

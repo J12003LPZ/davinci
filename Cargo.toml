@@ -24,7 +24,7 @@ members = [
 version = "0.85.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/earendil-works/pi"
+repository = "https://github.com/J12003LPZ/davinci"
 rust-version = "1.83"
 
 [workspace.dependencies]

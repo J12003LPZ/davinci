@@ -101,7 +101,12 @@ pub fn compute_contract_hash(expect: ArtifactKind) -> String {
 }
 
 pub fn compute_config_hash(cwd: &Path) -> String {
-    let config_path = cwd.join(CONFIG_DIR).join("graph.json");
+    let davinci_path = cwd.join(CONFIG_DIR).join("graph.json");
+    let config_path = if davinci_path.exists() {
+        davinci_path
+    } else {
+        cwd.join(super::store::LEGACY_CONFIG_DIR).join("graph.json")
+    };
     if config_path.exists() {
         if let Ok(bytes) = std::fs::read(&config_path) {
             return sha256_hex(&bytes);

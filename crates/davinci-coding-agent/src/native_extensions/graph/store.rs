@@ -15,7 +15,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CONFIG_DIR: &str = ".pi";
+pub const CONFIG_DIR: &str = ".davinci";
+pub const LEGACY_CONFIG_DIR: &str = ".pi";
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -38,18 +39,18 @@ pub fn iso8601_utc(ms: u64) -> String {
     );
 
     let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let shifted_month = mp + 3;
+    let month = if shifted_month <= 12 {
+        shifted_month
     } else {
-        shifted_month - 9
+        shifted_month - 12
     };
     let year = if month <= 2 { year + 1 } else { year };
 
@@ -57,7 +58,17 @@ pub fn iso8601_utc(ms: u64) -> String {
 }
 
 pub fn runs_root_dir(cwd: &Path) -> PathBuf {
-    cwd.join(CONFIG_DIR).join("graph").join("runs")
+    let davinci = cwd.join(CONFIG_DIR).join("graph").join("runs");
+    if davinci.exists() {
+        davinci
+    } else {
+        let pi = cwd.join(LEGACY_CONFIG_DIR).join("graph").join("runs");
+        if pi.exists() {
+            pi
+        } else {
+            davinci
+        }
+    }
 }
 
 pub fn run_dir(cwd: &Path, run_id: &str) -> PathBuf {

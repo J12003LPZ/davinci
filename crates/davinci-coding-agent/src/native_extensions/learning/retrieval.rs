@@ -58,7 +58,7 @@ pub fn rank_skills_with_embeddings(
 
         let scope = record.map(|r| r.scope).unwrap_or_else(|| {
             let path_str = skill.path.to_string_lossy();
-            if path_str.contains(".pi") {
+            if path_str.contains(".davinci") || path_str.contains(".pi") {
                 LearningScope::Project
             } else {
                 LearningScope::Global

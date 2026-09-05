@@ -58,6 +58,7 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     let bottom = extension_rows(model, &model.extensions.footer);
     let above = extension_rows(model, &model.extensions.above());
     let below = extension_rows(model, &model.extensions.below());
+    let notice = chrome::governor_notice(chrome_model);
     // The working line is a block of its own, so it never runs into the last
     // transcript row (design.md §3). It is pinned here rather than pushed into
     // the transcript so what a running turn has cost stays put while the
@@ -71,6 +72,7 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
         + bottom.len()
         + above.len()
         + working.len()
+        + notice.len()
         + offered.len()
         + composer_rows.len()
         + below.len()
@@ -84,6 +86,7 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     rows.extend(bottom);
     rows.extend(above);
     rows.extend(working);
+    rows.extend(notice);
     rows.extend(offered);
     rows.extend(composer_rows);
     rows.extend(below);
@@ -491,6 +494,24 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         return Flow::Continue;
     }
 
+    if matches!(
+        model.screen,
+        Screen::GraphRun | Screen::Governor | Screen::Vectors
+    ) && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+        && key.modifiers.is_empty()
+    {
+        let page = model.height.saturating_sub(10).max(1) as isize;
+        screen_move(
+            model,
+            if key.code == KeyCode::PageUp {
+                -page
+            } else {
+                page
+            },
+        );
+        return Flow::Continue;
+    }
+
     // A sheet with a selection owns the arrows and enter.
     if action_matches(model, data, "tui.select.up") {
         screen_move(model, -1);
@@ -570,6 +591,17 @@ fn screen_move(model: &mut Model, delta: isize) {
         }
         Screen::Keys => {
             model.keys_offset = model.keys_offset.saturating_add_signed(delta);
+        }
+        Screen::GraphRun | Screen::Governor | Screen::Vectors => {
+            let count = match model.screen {
+                Screen::GraphRun => graph_run::lines(model).len(),
+                Screen::Governor => governor::lines(model).len(),
+                _ => vectors::lines(model).len(),
+            };
+            model.feature_scroll = model
+                .feature_scroll
+                .saturating_add_signed(delta)
+                .min(count.saturating_sub(1));
         }
         Screen::Permissions => {
             model.permission_index =

@@ -1122,6 +1122,11 @@ fn load_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
 }
 
 fn coding_agent_docs_dir() -> PathBuf {
+    let davinci_docs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vendor/davinci/packages/coding-agent/docs");
+    if davinci_docs.exists() {
+        return davinci_docs;
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pi/packages/coding-agent/docs")
 }
 

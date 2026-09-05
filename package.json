@@ -1,7 +1,7 @@
 {
-  "name": "pi",
+  "name": "davinci",
   "private": true,
-  "description": "Pi agent harness. TypeScript packages remain authoritative until the Phase 8 Rust gate.",
+  "description": "Davinci agent harness. TypeScript packages remain authoritative until the Phase 8 Rust gate.",
   "workspaces": [
     "packages/*"
   ]

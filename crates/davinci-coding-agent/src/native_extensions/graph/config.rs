@@ -60,7 +60,12 @@ pub fn parse_usize_budget(value: &Value, name: &str) -> Result<usize, String> {
 
 pub fn load_config(cwd: &Path) -> LoadedConfig {
     let mut loaded = LoadedConfig::default();
-    let config_path = cwd.join(CONFIG_DIR).join("graph.json");
+    let davinci_path = cwd.join(CONFIG_DIR).join("graph.json");
+    let config_path = if davinci_path.exists() {
+        davinci_path
+    } else {
+        cwd.join(super::store::LEGACY_CONFIG_DIR).join("graph.json")
+    };
     let Ok(raw) = fs::read_to_string(&config_path) else {
         return loaded;
     };
