@@ -1487,7 +1487,12 @@ fn run_nested_subagent(
         )
     };
     let mut child = Agent::new(system_prompt);
-    child.cwd = cwd.to_path_buf();
+    let effective_cwd = if let Some(wt) = &req.worktree_path {
+        wt.as_path()
+    } else {
+        cwd
+    };
+    child.cwd = effective_cwd.to_path_buf();
 
     let mut tools = if let Some(profile) = &profile {
         if !profile.tools.is_empty() {
@@ -1508,10 +1513,16 @@ fn run_nested_subagent(
     let child_mode = if let Some(profile) = &profile {
         davinci_agent::PermissionMode::parse(&profile.permission_mode)
             .unwrap_or(davinci_agent::PermissionMode::ReadOnly)
+    } else if req.worktree_path.is_some() {
+        davinci_agent::PermissionMode::Edits
     } else {
         davinci_agent::PermissionMode::ReadOnly
     };
-    child.permissions = Arc::new(Mutex::new(davinci_agent::PermissionPolicy::new(child_mode)));
+    let mut policy = davinci_agent::PermissionPolicy::new(child_mode);
+    if req.worktree_path.is_some() {
+        policy.deny_parent_checkout(cwd);
+    }
+    child.permissions = Arc::new(Mutex::new(policy));
     child.approver = None;
     // `mcp_read` and read-only MCP tools need the parent's connections.
     child.tool_context.mcp = mcp.clone();
@@ -1752,8 +1763,12 @@ fn complete_prompt_with_host(
     let mut runtime_handle = davinci_agent::RuntimeHandle::new(
         davinci_agent::RunId::new(),
         davinci_agent::AgentId::new(),
-        runtime_bus,
+        runtime_bus.clone(),
     );
+    let wt_mgr =
+        davinci_agent::WorktreeManager::new(&agent.cwd, default_agent_dir().join("worktrees"))
+            .with_bus(runtime_bus);
+    runtime_handle = runtime_handle.with_worktree_manager(wt_mgr);
     if let Some(session) = &agent.session {
         runtime_handle = runtime_handle.with_session(&session.header.id);
     }

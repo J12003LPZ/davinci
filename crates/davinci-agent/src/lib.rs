@@ -93,7 +93,7 @@ pub use runtime::{
     AgentState, CacheIdentity, CacheMissReason, CancellationToken, ContextBroker, ContextItem,
     ContextPacket, ContextRequest, ContextSource, RegistryError, RunId, RuntimeBus,
     RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry,
-    RuntimeSubscriber, TaskId, WorkflowId,
+    RuntimeSubscriber, TaskId, WorkflowId, WorktreeError, WorktreeLease, WorktreeManager,
 };
 
 use davinci_ai::{

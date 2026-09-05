@@ -309,6 +309,23 @@ impl PermissionPolicy {
         }
     }
 
+    /// Add deny rules preventing any mutation or tool execution targeting the parent checkout.
+    pub fn deny_parent_checkout(&mut self, parent_cwd: &Path) {
+        let parent_str = slashes(&normalize_lexically(parent_cwd));
+        self.deny.push(PermissionRule {
+            tool: "*".to_string(),
+            pattern: Some(format!("{parent_str}/**")),
+        });
+        self.deny.push(PermissionRule {
+            tool: "*".to_string(),
+            pattern: Some(format!("{parent_str}/*")),
+        });
+        self.deny.push(PermissionRule {
+            tool: "*".to_string(),
+            pattern: Some(parent_str),
+        });
+    }
+
     /// Decide one call. Deny rules win; `auto` and allow rules quiet the
     /// rest; `read-only` refuses anything that is not a read; and the mode
     /// table decides what is left.
@@ -476,6 +493,20 @@ pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
                 .to_string(),
             false,
         ),
+        _ if tool == "agent" => {
+            let isolation = args
+                .get("isolation")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    args.get("tasks")
+                        .and_then(Value::as_array)
+                        .and_then(|arr| arr.first())
+                        .and_then(|t| t.get("isolation"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("shared");
+            (format!("isolation:{isolation}"), false)
+        }
         ToolClass::Other => (String::new(), false),
     }
 }
@@ -625,6 +656,12 @@ fn slashes(path: &Path) -> String {
 pub fn session_rule_for(tool: &str, subject: &str) -> PermissionRule {
     // A fetch grant covers the host, not the one page.
     if tool == "web_fetch" && !subject.is_empty() {
+        return PermissionRule {
+            tool: tool.to_string(),
+            pattern: Some(subject.to_string()),
+        };
+    }
+    if tool == "agent" && !subject.is_empty() {
         return PermissionRule {
             tool: tool.to_string(),
             pattern: Some(subject.to_string()),
@@ -1184,5 +1221,47 @@ mod tests {
 *** End Patch"#;
         let (_, is_out_bad) = subject_of("apply_patch", &json!({"input": patch_outside}), &root);
         assert!(is_out_bad);
+    }
+
+    #[test]
+    fn agent_isolation_permission_rules() {
+        let root = cwd();
+        let wt_call = json!({"prompt": "edit", "isolation": "worktree"});
+        let (subject, is_out) = subject_of("agent", &wt_call, &root);
+        assert_eq!(subject, "isolation:worktree");
+        assert!(!is_out);
+        assert_eq!(
+            session_rule_for("agent", &subject).to_string(),
+            "agent(isolation:worktree)"
+        );
+
+        let mut policy = PermissionPolicy::new(PermissionMode::Auto);
+        policy.deny = vec![PermissionRule::parse("agent(isolation:worktree)").unwrap()];
+        assert!(matches!(
+            policy.decide("c1", "agent", &wt_call, &root),
+            PermissionVerdict::Deny { .. }
+        ));
+
+        let shared_call = json!({"prompt": "search", "isolation": "shared"});
+        assert!(matches!(
+            policy.decide("c2", "agent", &shared_call, &root),
+            PermissionVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn deny_parent_checkout_blocks_parent_edits() {
+        let parent_dir = cwd();
+        let mut policy = PermissionPolicy::new(PermissionMode::Edits);
+        policy.deny_parent_checkout(&parent_dir);
+
+        let inside_parent = parent_dir.join("src").join("main.rs");
+        let wt_dir = std::env::temp_dir().join("davinci").join("wt-123");
+        let call =
+            json!({"path": inside_parent.to_string_lossy().to_string(), "content": "mutated"});
+        assert!(matches!(
+            policy.decide("c1", "write", &call, &wt_dir),
+            PermissionVerdict::Deny { .. }
+        ));
     }
 }

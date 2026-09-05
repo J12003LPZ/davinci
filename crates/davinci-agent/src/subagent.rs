@@ -3,6 +3,7 @@
 //! No TypeScript counterpart. Phase 5 spec:
 //! `docs/superpowers/specs/2026-09-01-plan-and-subagents-design.md`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -10,6 +11,7 @@ use serde_json::Value;
 use crate::permission::{tool_class, PermissionMode, ToolClass};
 use crate::runtime::{
     AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RuntimeHandle,
+    WorktreeLease, WorktreeManager,
 };
 use crate::tools::{ToolError, ToolResult};
 
@@ -149,6 +151,8 @@ pub struct SubagentRequest {
     pub runtime_agent_id: Option<AgentId>,
     /// Parent permission mode to enforce permission containment.
     pub parent_permission_mode: Option<PermissionMode>,
+    /// Path to isolated worktree if isolation: worktree was requested.
+    pub worktree_path: Option<PathBuf>,
 }
 
 type SubagentFn = dyn Fn(&SubagentRequest) -> Result<String, String> + Send + Sync;
@@ -218,6 +222,7 @@ pub struct SubagentParent {
     pub runtime: Option<RuntimeHandle>,
     pub permission_mode: Option<PermissionMode>,
     pub agent_id: Option<AgentId>,
+    pub worktree_manager: Option<WorktreeManager>,
 }
 
 /// One worker's request as the model wrote it.
@@ -324,6 +329,11 @@ pub fn run_tool(
     let is_parent_readonly = parent.permission_mode == Some(PermissionMode::ReadOnly);
     for spec in &specs {
         if is_parent_readonly {
+            if spec.isolation.as_deref() == Some("worktree") {
+                return Err(ToolError::Failed(
+                    "Parent permission mode 'read-only' cannot grant worktree isolation".into(),
+                ));
+            }
             if let Some(tools) = &spec.tools {
                 for t in tools {
                     if MUTATION_TOOLS.contains(&t.as_str())
@@ -347,7 +357,35 @@ pub fn run_tool(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
+    let any_worktree = specs
+        .iter()
+        .any(|s| s.isolation.as_deref() == Some("worktree"));
+    let wt_manager = if any_worktree {
+        let mgr = parent
+            .worktree_manager
+            .clone()
+            .or_else(|| {
+                parent
+                    .runtime
+                    .as_ref()
+                    .and_then(|rt| rt.worktree_manager.clone())
+            })
+            .unwrap_or_else(|| {
+                let repo_root = std::env::current_dir().unwrap_or_default();
+                let wt_root = std::env::temp_dir().join("davinci").join("worktrees");
+                let mut m = WorktreeManager::new(repo_root, wt_root);
+                if let Some(rt) = &parent.runtime {
+                    m = m.with_bus(rt.bus.clone());
+                }
+                m
+            });
+        Some(mgr)
+    } else {
+        None
+    };
+
     let mut requests: Vec<SubagentRequest> = Vec::with_capacity(specs.len());
+    let mut leases: Vec<Option<WorktreeLease>> = Vec::with_capacity(specs.len());
     for spec in &specs {
         let child_agent_id = AgentId::new();
         let child_token = parent.cancellation_token.as_ref().map(|p| p.child_token());
@@ -355,7 +393,27 @@ pub fn run_tool(
             .as_ref()
             .map(|t| t.as_atomic_bool())
             .or_else(|| parent.abort.clone());
-        let scoped = scoped_tools_with_policy(spec.tools.as_deref(), parent_tools, allow_mutation);
+        let is_wt = spec.isolation.as_deref() == Some("worktree");
+        let allow_mut = allow_mutation || (is_wt && !is_parent_readonly);
+        let scoped = scoped_tools_with_policy(spec.tools.as_deref(), parent_tools, allow_mut);
+
+        let mut lease_opt: Option<WorktreeLease> = None;
+        if is_wt {
+            let mgr = wt_manager.as_ref().expect("wt_manager initialized");
+            let run_id = parent
+                .runtime
+                .as_ref()
+                .map(|rt| rt.run_id)
+                .unwrap_or_default();
+            let lease = mgr
+                .create_lease(run_id, child_agent_id, None)
+                .map_err(|e| ToolError::Failed(format!("Worktree isolation failed: {e}")))?;
+            lease_opt = Some(lease);
+        }
+        let wt_path = lease_opt.as_ref().map(|l| l.path.clone());
+        let effective_cwd = wt_path
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
         let kind = match spec.mode {
             AgentSpawnMode::Oneshot => AgentKind::Subagent,
@@ -388,16 +446,10 @@ pub fn run_tool(
                     .and_then(|m| m.split('/').nth(1))
                     .map(str::to_string)
                     .unwrap_or_else(|| parent.model_id.clone().unwrap_or_default()),
-                cwd: std::env::current_dir().unwrap_or_default(),
+                cwd: effective_cwd,
                 state: AgentState::Starting,
                 task_id: None,
-                worktree: spec.isolation.as_ref().and_then(|iso| {
-                    if iso == "worktree" {
-                        Some(std::path::PathBuf::from("worktree"))
-                    } else {
-                        None
-                    }
-                }),
+                worktree: wt_path.clone(),
                 started_ms: now,
                 updated_ms: now,
             };
@@ -420,27 +472,35 @@ pub fn run_tool(
             instance_name: spec.name.clone(),
             runtime_agent_id: Some(child_agent_id),
             parent_permission_mode: parent.permission_mode,
+            worktree_path: wt_path,
         });
+        leases.push(lease_opt);
     }
 
     let any_async = requests.iter().any(|r| r.mode != AgentSpawnMode::Oneshot);
     if any_async {
         let mut launched_ids = Vec::new();
-        for req in &requests {
+        for (req, lease_opt) in requests.iter().zip(leases.into_iter()) {
             let req_clone = req.clone();
             let runner_clone = runner.clone();
             let rt_clone = parent.runtime.clone();
             let cid = req.runtime_agent_id.unwrap_or_default();
+            let wt_mgr_clone = wt_manager.clone();
             std::thread::Builder::new()
                 .name(format!("agent-worker-{cid}"))
                 .spawn(move || {
                     let outcome = runner_clone.run(&req_clone);
                     if let Some(rt) = &rt_clone {
-                        let next_state = match outcome {
+                        let next_state = match &outcome {
                             Ok(_) => AgentState::Completed,
                             Err(_) => AgentState::Failed,
                         };
                         let _ = rt.registry.transition(cid, next_state);
+                    }
+                    if let (Some(mgr), Some(lease)) = (wt_mgr_clone, lease_opt) {
+                        if outcome.is_ok() {
+                            let _ = mgr.release_lease(&lease, false);
+                        }
                     }
                 })
                 .map_err(|e| {
@@ -501,6 +561,11 @@ pub fn run_tool(
             };
             let _ = rt.registry.transition(aid, next);
         }
+        if let (Some(mgr), Some(lease)) = (&wt_manager, &leases[0]) {
+            if outcome.is_ok() {
+                let _ = mgr.release_lease(lease, false);
+            }
+        }
         let text = outcome.map_err(ToolError::Failed)?;
         return Ok(ToolResult {
             content: cap_output(text, SUBAGENT_OUTPUT_CAP),
@@ -546,6 +611,15 @@ pub fn run_tool(
                     _ => AgentState::Failed,
                 };
                 let _ = rt.registry.transition(aid, next);
+            }
+        }
+    }
+    if let Some(mgr) = &wt_manager {
+        for (index, lease_opt) in leases.iter().enumerate() {
+            if let Some(lease) = lease_opt {
+                if matches!(outcomes.get(index), Some(Ok(_))) {
+                    let _ = mgr.release_lease(lease, false);
+                }
             }
         }
     }
@@ -906,5 +980,159 @@ mod tests {
         assert!(executed.load(std::sync::atomic::Ordering::SeqCst));
         let record_after = handle.registry.get(&aid).expect("record exists");
         assert_eq!(record_after.state, AgentState::Completed);
+    }
+
+    fn init_subagent_temp_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        std::process::Command::new("git")
+            .current_dir(path)
+            .args(["init"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(path)
+            .args(["config", "user.name", "Davinci Subagent Test"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(path)
+            .args(["config", "user.email", "test@davinci.local"])
+            .output()
+            .unwrap();
+        let readme = path.join("README.md");
+        std::fs::write(&readme, "# Subagent Repo\n").unwrap();
+        std::process::Command::new("git")
+            .current_dir(path)
+            .args(["add", "README.md"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(path)
+            .args(["commit", "-m", "Initial commit"])
+            .output()
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_worktree_isolation_rejected_in_readonly_mode() {
+        let runner = SubagentRunner::new(|_| Ok("done".into()));
+        let parent = SubagentParent {
+            permission_mode: Some(PermissionMode::ReadOnly),
+            ..SubagentParent::default()
+        };
+
+        let err = run_tool(
+            &json!({
+                "prompt": "edit in worktree",
+                "isolation": "worktree",
+                "tools": ["read"]
+            }),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("cannot grant worktree isolation"));
+    }
+
+    #[test]
+    fn test_worktree_isolation_creates_lease_and_updates_record() {
+        let repo_dir = init_subagent_temp_git_repo();
+        let wt_dir = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+
+        let bus = crate::runtime::RuntimeBus::default();
+        let handle = RuntimeHandle::new(crate::runtime::RunId::new(), AgentId::new(), bus)
+            .with_worktree_manager(manager.clone());
+
+        let received_wt = Arc::new(std::sync::Mutex::new(None));
+        let wt_capture = Arc::clone(&received_wt);
+        let runner = SubagentRunner::new(move |req| {
+            *wt_capture.lock().unwrap() = req.worktree_path.clone();
+            Ok("worktree-edit-done".into())
+        });
+
+        let parent = SubagentParent {
+            runtime: Some(handle.clone()),
+            agent_id: Some(handle.agent_id),
+            permission_mode: Some(PermissionMode::Edits),
+            worktree_manager: Some(manager.clone()),
+            ..SubagentParent::default()
+        };
+
+        let res = run_tool(
+            &json!({
+                "prompt": "isolated edit",
+                "isolation": "worktree",
+                "name": "wt-worker",
+                "tools": ["read", "write"]
+            }),
+            &["read".into(), "write".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+
+        assert!(res.content.contains("worktree-edit-done"));
+        let captured = received_wt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("received worktree path");
+        assert!(captured.to_string_lossy().contains("wt-"));
+
+        let details = res.details.unwrap();
+        let aid: AgentId = details["agentId"].as_str().unwrap().parse().unwrap();
+        let record = handle.registry.get(&aid).expect("record in registry");
+        assert_eq!(record.worktree, Some(captured.clone()));
+        assert_eq!(record.cwd, captured);
+        assert_eq!(record.state, AgentState::Completed);
+    }
+
+    #[test]
+    fn test_worktree_isolation_failure_preserves_worktree() {
+        let repo_dir = init_subagent_temp_git_repo();
+        let wt_dir = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+
+        let bus = crate::runtime::RuntimeBus::default();
+        let handle = RuntimeHandle::new(crate::runtime::RunId::new(), AgentId::new(), bus)
+            .with_worktree_manager(manager.clone());
+
+        let created_path = Arc::new(std::sync::Mutex::new(None));
+        let path_capture = Arc::clone(&created_path);
+        let runner = SubagentRunner::new(move |req| {
+            *path_capture.lock().unwrap() = req.worktree_path.clone();
+            Err("failed mutation in worktree".into())
+        });
+
+        let parent = SubagentParent {
+            runtime: Some(handle.clone()),
+            agent_id: Some(handle.agent_id),
+            permission_mode: Some(PermissionMode::Edits),
+            worktree_manager: Some(manager.clone()),
+            ..SubagentParent::default()
+        };
+
+        let err = run_tool(
+            &json!({
+                "prompt": "failed edit",
+                "isolation": "worktree",
+                "name": "wt-fail-worker",
+                "tools": ["read", "write"]
+            }),
+            &["read".into(), "write".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed mutation in worktree"));
+        let wt_path = created_path.lock().unwrap().clone().expect("captured path");
+        // Failed worktree must be preserved for inspection
+        assert!(wt_path.exists());
     }
 }

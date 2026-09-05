@@ -47,6 +47,7 @@ pub struct RuntimeHandle {
     pub context_broker: ContextBroker,
     pub task_registry: TaskRegistry,
     pub mailbox: AgentMailbox,
+    pub worktree_manager: Option<WorktreeManager>,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -78,7 +79,13 @@ impl RuntimeHandle {
             context_broker: ContextBroker::new(),
             task_registry,
             mailbox,
+            worktree_manager: None,
         }
+    }
+
+    pub fn with_worktree_manager(mut self, mgr: WorktreeManager) -> Self {
+        self.worktree_manager = Some(mgr);
+        self
     }
 
     pub fn with_task_registry(mut self, task_registry: TaskRegistry) -> Self {

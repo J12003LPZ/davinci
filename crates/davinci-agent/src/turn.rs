@@ -811,6 +811,10 @@ impl Agent {
                 .or_else(|| self.abort_signal.clone());
             let permission_mode = self.permissions.lock().ok().map(|p| p.mode);
             let parent_agent_id = self.runtime.as_ref().map(|rt| rt.agent_id);
+            let worktree_manager = self
+                .runtime
+                .as_ref()
+                .and_then(|rt| rt.worktree_manager.clone());
             let parent = crate::subagent::SubagentParent {
                 provider: Some(self.provider.clone()),
                 model_id: Some(self.model_id.clone()),
@@ -819,6 +823,7 @@ impl Agent {
                 runtime: self.runtime.clone(),
                 permission_mode,
                 agent_id: parent_agent_id,
+                worktree_manager,
             };
             match crate::subagent::run_tool(
                 args,

@@ -78,6 +78,15 @@ pub struct WorktreeManager {
     seq: Arc<AtomicU64>,
 }
 
+impl std::fmt::Debug for WorktreeManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorktreeManager")
+            .field("repo_root", &self.repo_root)
+            .field("worktree_root", &self.worktree_root)
+            .finish()
+    }
+}
+
 impl WorktreeManager {
     pub fn new(repo_root: impl Into<PathBuf>, worktree_root: impl Into<PathBuf>) -> Self {
         Self {
