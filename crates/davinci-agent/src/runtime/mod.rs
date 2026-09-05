@@ -15,6 +15,7 @@ pub mod tasks;
 pub mod team;
 pub mod tools_agent;
 pub mod tools_task;
+pub mod workflow;
 pub mod worktree;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
@@ -31,6 +32,10 @@ pub use tasks::{is_valid_task_transition, TaskError, TaskRecord, TaskRegistry, T
 pub use team::{TeamConfig, TeamError, TeamManager, TeammateHandle};
 pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
 pub use tools_task::{task_create_tool, task_list_tool, task_tool_specs, task_update_tool};
+pub use workflow::{
+    is_mutating_tool, validate_workflow, validate_workflow_with_permissions, WorkflowJoin,
+    WorkflowPhaseSpec, WorkflowSpec, WorkflowValidationError, WorkflowWorkerSpec,
+};
 pub use worktree::{WorktreeError, WorktreeLease, WorktreeManager};
 
 /// Handle held by an executing Agent or worker to participate in the shared runtime.

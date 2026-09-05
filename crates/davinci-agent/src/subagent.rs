@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use crate::permission::{tool_class, PermissionMode, ToolClass};
 use crate::runtime::{
-    AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RuntimeHandle,
-    WorktreeLease, WorktreeManager,
+    AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RuntimeHandle, WorktreeLease,
+    WorktreeManager,
 };
 use crate::tools::{ToolError, ToolResult};
 
