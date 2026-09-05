@@ -79,6 +79,15 @@ impl Agent {
         let mut new_messages = prompt_messages.clone();
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
+        if let Some(runtime) = &self.runtime {
+            runtime.emit_observe(crate::runtime::RuntimeEvent::TurnStarted);
+        }
+
+        if !prompt_messages.is_empty() {
+            if let Some(runtime) = &self.runtime {
+                let _ = runtime.emit_decision(crate::runtime::RuntimeEvent::UserPromptSubmitted);
+            }
+        }
 
         for prompt in prompt_messages {
             self.push_event(
@@ -293,19 +302,33 @@ impl Agent {
                     tool_results,
                 },
             );
+            if let Some(runtime) = &self.runtime {
+                runtime.emit_observe(crate::runtime::RuntimeEvent::TurnEnded {
+                    success: !self.abort_requested(),
+                });
+            }
 
             if had_tools && !self.abort_requested() {
                 self.push_event(&mut events, AgentEvent::TurnStart);
+                if let Some(runtime) = &self.runtime {
+                    runtime.emit_observe(crate::runtime::RuntimeEvent::TurnStarted);
+                }
                 continue;
             }
 
             if !self.queues.steer.is_empty() {
                 self.push_event(&mut events, AgentEvent::TurnStart);
+                if let Some(runtime) = &self.runtime {
+                    runtime.emit_observe(crate::runtime::RuntimeEvent::TurnStarted);
+                }
                 continue;
             }
 
             if !self.queues.follow_up.is_empty() {
                 self.push_event(&mut events, AgentEvent::TurnStart);
+                if let Some(runtime) = &self.runtime {
+                    runtime.emit_observe(crate::runtime::RuntimeEvent::TurnStarted);
+                }
                 self.inject_queued(&mut events, &mut new_messages, false);
                 continue;
             }
@@ -595,6 +618,16 @@ impl Agent {
             events.extend(local_events);
             messages.push(message);
         }
+        if let Some(runtime) = &self.runtime {
+            let failures = messages
+                .iter()
+                .filter(|m| m.is_error.unwrap_or(false))
+                .count();
+            runtime.emit_observe(crate::runtime::RuntimeEvent::PostToolBatch {
+                calls: width,
+                failures,
+            });
+        }
         messages
     }
 
@@ -671,6 +704,19 @@ impl Agent {
                 Ok(crate::tool_ledger::ReservationOutcome::Reserved) => {
                     // Identity reserved as Pending; proceed to check pre_tool / permissions
                 }
+            }
+        }
+        if let Some(runtime) = &self.runtime {
+            let event = crate::runtime::RuntimeEvent::PreToolUse {
+                call_id: id.to_string(),
+                tool: name.to_string(),
+                args: args.clone(),
+            };
+            if let Err(reason) = runtime.emit_decision(event) {
+                if let Ok(mut ledger) = self.tool_ledger.lock() {
+                    ledger.cancel_reservation(id);
+                }
+                return immediate(reason, false);
             }
         }
         if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
@@ -855,6 +901,13 @@ impl Agent {
         };
         self.emit_live(end.clone());
         events.push(end);
+        if let Some(runtime) = &self.runtime {
+            runtime.emit_observe(crate::runtime::RuntimeEvent::PostToolUse {
+                call_id: id.to_string(),
+                tool: name.to_string(),
+                is_error: result.is_error,
+            });
+        }
         (
             tool_result_message(id, name, result, self.auto_resize_images),
             events,
@@ -874,18 +927,42 @@ impl Agent {
             .decide(id, name, args, cwd);
         let request = match verdict {
             PermissionVerdict::Allow => return None,
-            PermissionVerdict::Deny { reason } => return Some(reason),
-            PermissionVerdict::Ask(request) => request,
+            PermissionVerdict::Deny { reason } => {
+                if let Some(runtime) = &self.runtime {
+                    runtime.emit_observe(crate::runtime::RuntimeEvent::PermissionDenied {
+                        call_id: id.to_string(),
+                        reason: reason.clone(),
+                    });
+                }
+                return Some(reason);
+            }
+            PermissionVerdict::Ask(request) => {
+                if let Some(runtime) = &self.runtime {
+                    let _ =
+                        runtime.emit_decision(crate::runtime::RuntimeEvent::PermissionRequested {
+                            call_id: id.to_string(),
+                            tool: name.to_string(),
+                        });
+                }
+                request
+            }
         };
         let Some(approver) = &self.approver else {
-            return Some(format!(
+            let reason = format!(
                 "Permission denied: `{}` needs approval in permission mode `{}`, and this run cannot ask. \
                  Start pi with --permission-mode auto, or add an allow rule such as `{}` to \
                  ~/.pi/agent/settings.json under permissions.allow.",
                 request.summary,
                 request.mode.as_str(),
                 request.session_rule
-            ));
+            );
+            if let Some(runtime) = &self.runtime {
+                runtime.emit_observe(crate::runtime::RuntimeEvent::PermissionDenied {
+                    call_id: id.to_string(),
+                    reason: reason.clone(),
+                });
+            }
+            return Some(reason);
         };
         match (approver.0)(&request) {
             ToolApprovalDecision::AllowOnce => None,
@@ -896,10 +973,19 @@ impl Agent {
                     .remember(&request.session_rule);
                 None
             }
-            ToolApprovalDecision::Deny => Some(format!(
-                "Permission denied: the user declined `{}`.",
-                request.summary
-            )),
+            ToolApprovalDecision::Deny => {
+                let reason = format!(
+                    "Permission denied: the user declined `{}`.",
+                    request.summary
+                );
+                if let Some(runtime) = &self.runtime {
+                    runtime.emit_observe(crate::runtime::RuntimeEvent::PermissionDenied {
+                        call_id: id.to_string(),
+                        reason: reason.clone(),
+                    });
+                }
+                Some(reason)
+            }
         }
     }
 
@@ -1012,5 +1098,167 @@ fn sleep_retry_delay(delay_ms: u64, cancelled: impl Fn() -> bool) {
             break;
         }
         std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::AgentEvent;
+    use crate::runtime::{
+        AgentId, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope,
+        RuntimeHandle, RuntimeSubscriber,
+    };
+    use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+
+    #[test]
+    fn existing_serialized_agent_event_json_is_unchanged() {
+        let event = AgentEvent::ToolExecutionStart {
+            tool_call_id: "call_1".into(),
+            tool_name: "read".into(),
+            args: json!({"path": "src/main.rs"}),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "tool_execution_start");
+        assert_eq!(value["toolCallId"], "call_1");
+        assert_eq!(value["toolName"], "read");
+        assert_eq!(value["args"]["path"], "src/main.rs");
+    }
+
+    #[derive(Default)]
+    struct SequenceRecorder {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl RuntimeSubscriber for SequenceRecorder {
+        fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+            let desc = match &event.payload {
+                RuntimeEvent::PreToolUse { tool, .. } => format!("runtime:PreToolUse:{tool}"),
+                RuntimeEvent::PostToolUse { tool, .. } => format!("runtime:PostToolUse:{tool}"),
+                RuntimeEvent::TurnStarted => "runtime:TurnStarted".into(),
+                RuntimeEvent::TurnEnded { .. } => "runtime:TurnEnded".into(),
+                _ => "runtime:other".into(),
+            };
+            self.events.lock().unwrap().push(desc);
+            RuntimeDecision::Continue
+        }
+    }
+
+    #[test]
+    fn tool_call_emits_pre_tool_use_then_tool_start_then_post_tool_use() {
+        let dir = tempdir().unwrap();
+        let test_file = dir.path().join("test.txt");
+        std::fs::write(&test_file, "hello runtime").unwrap();
+
+        let mut agent = Agent::new("You are a test agent");
+        agent.cwd = dir.path().to_path_buf();
+        agent.tools = vec!["read".into()];
+
+        let recorder = Arc::new(SequenceRecorder::default());
+        let bus = RuntimeBus::new();
+        bus.subscribe(recorder.clone());
+
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+        let handle = RuntimeHandle::new(run_id, agent_id, bus);
+        agent.runtime = Some(handle);
+
+        let live_events = Arc::new(Mutex::new(Vec::new()));
+        let live_clone = live_events.clone();
+        agent.event_sink = Some(crate::EventSink(Arc::new(move |ev| {
+            if let AgentEvent::ToolExecutionStart { tool_name, .. } = ev {
+                live_clone
+                    .lock()
+                    .unwrap()
+                    .push(format!("agent:ToolExecutionStart:{tool_name}"));
+            }
+        })));
+
+        let called = Arc::new(AtomicUsize::new(0));
+        let called_clone = called.clone();
+
+        let events = agent
+            .run_loop(|_ag| {
+                let count = called_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Ok(AssistantMessage {
+                        id: "msg_tool".into(),
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::ToolCall {
+                            id: "call_read_1".into(),
+                            name: "read".into(),
+                            arguments: json!({"path": "test.txt"}),
+                        }],
+                        model: "test-model".into(),
+                        usage: None,
+                        stop_reason: Some(StopReason::ToolUse),
+                        error_message: None,
+                    })
+                } else {
+                    Ok(AssistantMessage {
+                        id: "msg_end".into(),
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text {
+                            text: "Done reading".into(),
+                        }],
+                        model: "test-model".into(),
+                        usage: None,
+                        stop_reason: Some(StopReason::Stop),
+                        error_message: None,
+                    })
+                }
+            })
+            .unwrap();
+
+        assert!(!events.is_empty());
+
+        let recorded_runtime = recorder.events.lock().unwrap().clone();
+        assert!(recorded_runtime.contains(&"runtime:TurnStarted".to_string()));
+        assert!(recorded_runtime.contains(&"runtime:PreToolUse:read".to_string()));
+        assert!(recorded_runtime.contains(&"runtime:PostToolUse:read".to_string()));
+        assert!(recorded_runtime.contains(&"runtime:TurnEnded".to_string()));
+
+        let pre_idx = recorded_runtime
+            .iter()
+            .position(|e| e == "runtime:PreToolUse:read")
+            .unwrap();
+        let post_idx = recorded_runtime
+            .iter()
+            .position(|e| e == "runtime:PostToolUse:read")
+            .unwrap();
+        assert!(pre_idx < post_idx);
+
+        let live = live_events.lock().unwrap().clone();
+        assert!(live.contains(&"agent:ToolExecutionStart:read".to_string()));
+    }
+
+    #[test]
+    fn agent_run_loop_without_runtime_has_zero_behavioral_difference() {
+        let mut agent = Agent::new("Test prompt");
+        assert!(agent.runtime.is_none());
+
+        let events = agent
+            .run_loop(|_ag| {
+                Ok(AssistantMessage {
+                    id: "msg_plain".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "Direct text response".into(),
+                    }],
+                    model: "test-model".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        assert_eq!(events[0], AgentEvent::AgentStart);
+        assert_eq!(events[1], AgentEvent::TurnStart);
+        assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
     }
 }
