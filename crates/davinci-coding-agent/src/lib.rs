@@ -1,5 +1,6 @@
 //! Embed API matching TypeScript `createAgentSession`.
 
+pub mod agent_profiles;
 pub mod hooks;
 pub mod interactive_tui;
 pub mod native_extensions;

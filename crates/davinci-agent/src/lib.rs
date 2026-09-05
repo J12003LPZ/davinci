@@ -74,8 +74,8 @@ pub use subagent::{
     PLAN_MODE_DENIAL,
 };
 pub use templates::{
-    discover_prompt_templates, expand_prompt_template, parse_command_args, strip_frontmatter,
-    substitute_args, PromptTemplate,
+    discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,
+    strip_frontmatter, substitute_args, PromptTemplate,
 };
 pub use todo::{TodoItem, TodoList, TodoStatus, TODO_ENTRY_TYPE};
 pub use tool_ledger::{

@@ -1,3 +1,4 @@
+mod agent_profiles;
 mod args;
 mod auth_cmd;
 mod cache_stats;
@@ -4828,6 +4829,15 @@ fn handle_user_line(
             println!("{text}");
             Ok(true)
         }
+        SlashAction::Agents => {
+            let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+            let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+            let text = agent_profiles::format_agent_profiles_status(&agent.cwd, None, trusted);
+            session.chrome.transcript.push("agents", &text);
+            session.chrome.status = "agents".into();
+            println!("{text}");
+            Ok(true)
+        }
     }
 }
 
@@ -9213,6 +9223,10 @@ mod tests {
         assert!(matches!(
             slash::parse_line("/status"),
             slash::SlashAction::ShowStatus
+        ));
+        assert!(matches!(
+            slash::parse_line("/agents"),
+            slash::SlashAction::Agents
         ));
         assert!(slash::builtin_slash_commands()
             .iter()

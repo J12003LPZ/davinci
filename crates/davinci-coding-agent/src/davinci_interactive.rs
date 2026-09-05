@@ -1742,6 +1742,11 @@ pub fn corpus(
         "model, permission, jobs, MCP, tokens",
         "command",
     ));
+    items.push(CorpusItem::new(
+        "/agents",
+        "custom agent profiles · list and status",
+        "command",
+    ));
 
     for tool in &agent.tools {
         items.push(CorpusItem::new(tool, &tool_summary(tool), "tool"));
@@ -2886,6 +2891,15 @@ pub fn perform(
         }
         SlashAction::ShowCost => Ok(Done::Said(crate::format_session_cost(parsed, agent))),
         SlashAction::ShowStatus => Ok(Done::Said(crate::format_session_status(parsed, agent))),
+        SlashAction::Agents => {
+            let settings =
+                crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+            let trusted =
+                crate::settings::is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+            Ok(Done::Said(
+                crate::agent_profiles::format_agent_profiles_status(&agent.cwd, None, trusted),
+            ))
+        }
         SlashAction::Llama => Ok(Done::Said(format!(
             "llama.cpp server {}",
             std::env::var("LLAMA_BASE_URL")
@@ -7663,6 +7677,7 @@ mod tests {
             "/act",
             "/cost",
             "/status",
+            "/agents",
             "/thinking",
             "/thinking high",
             "/logout",
@@ -8073,6 +8088,7 @@ mod tests {
         assert!(names.contains(&"/act"), "{names:?}");
         assert!(names.contains(&"/cost"), "{names:?}");
         assert!(names.contains(&"/status"), "{names:?}");
+        assert!(names.contains(&"/agents"), "{names:?}");
     }
 
     #[test]
