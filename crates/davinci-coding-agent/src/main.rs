@@ -1519,8 +1519,8 @@ fn run_nested_subagent(
         davinci_agent::PermissionMode::ReadOnly
     };
     let mut policy = davinci_agent::PermissionPolicy::new(child_mode);
-    if req.worktree_path.is_some() {
-        policy.deny_parent_checkout(cwd);
+    if let Some(wt) = &req.worktree_path {
+        policy.set_worktree_boundary(wt, Some(cwd));
     }
     child.permissions = Arc::new(Mutex::new(policy));
     child.approver = None;

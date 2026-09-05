@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// How much a run may do without asking.
@@ -642,6 +643,35 @@ pub enum PermissionVerdict {
     Ask(ToolApprovalRequest),
 }
 
+/// Policy governing read operations targeting paths outside the project/worktree root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadOutsideRootPolicy {
+    /// Reading outside root is permitted (standard default behavior).
+    #[default]
+    Allow,
+    /// Reading outside root prompts for user approval.
+    Ask,
+    /// Reading outside root is strictly denied.
+    Deny,
+}
+
+/// Filesystem boundary policy enforcing root containment for isolated agents
+/// while optionally allowing git metadata access and configuring read policies.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FilesystemBoundaryPolicy {
+    /// Explicit root directory boundary (e.g. workspace or isolated worktree root).
+    pub root: Option<PathBuf>,
+    /// Git repository root (e.g. main repo when in an isolated worktree).
+    pub repo_root: Option<PathBuf>,
+    /// Policy governing reads targeting paths outside `root`.
+    pub read_outside_root: ReadOutsideRootPolicy,
+    /// If true, any mutation outside `root` is denied immediately without prompting.
+    pub enforce_root_for_mutations: bool,
+    /// If true, git metadata operations (such as under `repo_root/.git`) are permitted.
+    pub allow_git_metadata: bool,
+}
+
 /// The mode plus every rule in force. `allow` and `deny` come from settings;
 /// `session_allow` is what the user granted for this run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -654,6 +684,8 @@ pub struct PermissionPolicy {
     pub mcp_read_only: BTreeSet<String>,
     /// Session-only freeze: mutations refused until `/act`.
     pub plan_mode: bool,
+    /// Filesystem boundary enforcement configuration.
+    pub filesystem_boundary: FilesystemBoundaryPolicy,
 }
 
 impl Default for PermissionPolicy {
@@ -668,6 +700,7 @@ impl Default for PermissionPolicy {
             session_allow: Vec::new(),
             mcp_read_only: BTreeSet::new(),
             plan_mode: false,
+            filesystem_boundary: FilesystemBoundaryPolicy::default(),
         }
     }
 }
@@ -678,6 +711,67 @@ impl PermissionPolicy {
             mode,
             ..Self::default()
         }
+    }
+
+    pub fn with_filesystem_boundary(mut self, boundary: FilesystemBoundaryPolicy) -> Self {
+        self.filesystem_boundary = boundary;
+        self
+    }
+
+    pub fn set_filesystem_boundary(&mut self, boundary: FilesystemBoundaryPolicy) {
+        self.filesystem_boundary = boundary;
+    }
+
+    /// Sets an isolated worktree boundary for this policy.
+    /// Mutations outside `worktree_root` are strictly forbidden,
+    /// and git metadata access to `repo_root` (or parent `.git`) is preserved.
+    pub fn set_worktree_boundary(&mut self, worktree_root: &Path, repo_root: Option<&Path>) {
+        self.filesystem_boundary.root = Some(worktree_root.to_path_buf());
+        self.filesystem_boundary.repo_root = repo_root.map(|p| p.to_path_buf());
+        self.filesystem_boundary.enforce_root_for_mutations = true;
+        self.filesystem_boundary.allow_git_metadata = true;
+        if let Some(parent) = repo_root {
+            self.deny_parent_checkout(parent);
+        }
+    }
+
+    pub fn set_read_outside_root_policy(&mut self, policy: ReadOutsideRootPolicy) {
+        self.filesystem_boundary.read_outside_root = policy;
+    }
+
+    pub fn is_git_metadata_call(&self, tool: &str, args: &Value, cwd: &Path) -> bool {
+        if !self.filesystem_boundary.allow_git_metadata {
+            return false;
+        }
+        let root = self.filesystem_boundary.root.as_deref().unwrap_or(cwd);
+        let repo_root = self.filesystem_boundary.repo_root.as_deref();
+
+        if let Some(raw_path) = args.get("path").and_then(Value::as_str) {
+            let given = Path::new(raw_path);
+            let joined = if given.is_absolute() {
+                given.to_path_buf()
+            } else {
+                cwd.join(given)
+            };
+            return is_git_metadata_path(&joined, repo_root, Some(root));
+        }
+
+        if tool == "apply_patch" {
+            if let Some(input) = args.get("input").and_then(Value::as_str) {
+                if let Ok(parsed) = crate::apply_patch::parse_codex_patch(input) {
+                    return parsed.actions.iter().all(|a| {
+                        let p = match a {
+                            crate::apply_patch::FileAction::Add { path, .. } => path,
+                            crate::apply_patch::FileAction::Update { path, .. } => path,
+                            crate::apply_patch::FileAction::Delete { path } => path,
+                        };
+                        is_git_metadata_path(Path::new(p), repo_root, Some(root))
+                    });
+                }
+            }
+        }
+
+        false
     }
 
     /// Add deny rules preventing any mutation or tool execution targeting the parent checkout.
@@ -700,8 +794,12 @@ impl PermissionPolicy {
         args: &Value,
         cwd: &Path,
     ) -> PermissionVerdict {
-        let (subject, outside_project) = subject_of(tool, args, cwd);
+        let (subject, outside_project) =
+            subject_of_with_boundary(tool, args, cwd, Some(&self.filesystem_boundary));
+        let effective_root = self.filesystem_boundary.root.as_deref().unwrap_or(cwd);
         let class = self.class_of(tool);
+        let is_git_meta = self.is_git_metadata_call(tool, args, cwd);
+
         // A shell command is as many programs as it chains: `git status &&
         // curl x | sh` is judged three times, so a rule for `git *` speaks
         // only for the first and a deny for `curl *` still catches the second.
@@ -715,18 +813,22 @@ impl PermissionPolicy {
         } else {
             vec![subject.clone()]
         };
+
         if let Some(rule) = self.deny.iter().find(|rule| {
             segments
                 .iter()
                 .any(|segment| rule.matches_call(tool, args, segment))
         }) {
-            return PermissionVerdict::Deny {
-                reason: format!(
-                    "Permission denied: `{}` matches the deny rule `{rule}`.",
-                    summary_of(tool, &subject)
-                ),
-            };
+            if !(is_git_meta && self.filesystem_boundary.allow_git_metadata) {
+                return PermissionVerdict::Deny {
+                    reason: format!(
+                        "Permission denied: `{}` matches the deny rule `{rule}`.",
+                        summary_of(tool, &subject)
+                    ),
+                };
+            }
         }
+
         if self.plan_mode && class != ToolClass::Read && class != ToolClass::Network {
             return PermissionVerdict::Deny {
                 reason: format!(
@@ -736,9 +838,44 @@ impl PermissionPolicy {
                 ),
             };
         }
+
+        // Boundary enforcement for mutations (isolated agents or symlink escapes)
+        if class == ToolClass::Edit {
+            if self.filesystem_boundary.enforce_root_for_mutations
+                && outside_project
+                && !is_git_meta
+            {
+                return PermissionVerdict::Deny {
+                    reason: format!(
+                        "Permission denied: `{}` attempts to mutate outside isolated root `{}`.",
+                        summary_of(tool, &subject),
+                        effective_root.display()
+                    ),
+                };
+            }
+
+            let raw_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let given = Path::new(raw_path);
+            let joined = if given.is_absolute() {
+                given.to_path_buf()
+            } else {
+                effective_root.join(given)
+            };
+            if is_symlink_escape(effective_root, &joined) {
+                return PermissionVerdict::Deny {
+                    reason: format!(
+                        "Permission denied: `{}` contains an untrusted symlink escape outside `{}`.",
+                        summary_of(tool, &subject),
+                        effective_root.display()
+                    ),
+                };
+            }
+        }
+
         if self.mode == PermissionMode::Auto {
             return PermissionVerdict::Allow;
         }
+
         // Every segment needs a rule of its own. A pattern rule cannot vouch
         // for a segment that substitutes a command (`$(…)`, backticks,
         // `<(…)`): whatever runs inside is not the program the rule names.
@@ -753,12 +890,41 @@ impl PermissionPolicy {
         }) {
             return PermissionVerdict::Allow;
         }
+
         if class == ToolClass::Read {
+            if outside_project && !is_git_meta {
+                match self.filesystem_boundary.read_outside_root {
+                    ReadOutsideRootPolicy::Allow => return PermissionVerdict::Allow,
+                    ReadOutsideRootPolicy::Ask => {
+                        return PermissionVerdict::Ask(ToolApprovalRequest {
+                            tool_call_id: tool_call_id.to_string(),
+                            tool: tool.to_string(),
+                            args: args.clone(),
+                            summary: summary_of(tool, &subject),
+                            session_rule: session_rule_for(tool, &subject).to_string(),
+                            subject,
+                            outside_project: true,
+                            mode: self.mode,
+                        });
+                    }
+                    ReadOutsideRootPolicy::Deny => {
+                        return PermissionVerdict::Deny {
+                            reason: format!(
+                                "Permission denied: `{}` reads outside root `{}` which is forbidden by read-outside-root policy.",
+                                summary_of(tool, &subject),
+                                effective_root.display()
+                            ),
+                        };
+                    }
+                }
+            }
             return PermissionVerdict::Allow;
         }
+
         if class == ToolClass::Network && self.mode == PermissionMode::ReadOnly {
             return PermissionVerdict::Allow;
         }
+
         if self.mode == PermissionMode::ReadOnly {
             return PermissionVerdict::Deny {
                 reason: format!(
@@ -767,6 +933,7 @@ impl PermissionPolicy {
                 ),
             };
         }
+
         // `.pi/` holds the project's own permission rules and trust state; a
         // write there could grant the next run everything, so it is asked
         // about even in `edits` mode.
@@ -777,6 +944,7 @@ impl PermissionPolicy {
         {
             return PermissionVerdict::Allow;
         }
+
         PermissionVerdict::Ask(ToolApprovalRequest {
             tool_call_id: tool_call_id.to_string(),
             tool: tool.to_string(),
@@ -810,6 +978,15 @@ impl PermissionPolicy {
 /// What a rule is matched against, and whether a file target lies outside
 /// the project.
 pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
+    subject_of_with_boundary(tool, args, cwd, None)
+}
+
+pub fn subject_of_with_boundary(
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    boundary: Option<&FilesystemBoundaryPolicy>,
+) -> (String, bool) {
     match tool_class(tool) {
         ToolClass::Shell => (
             args.get("command")
@@ -831,7 +1008,7 @@ pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
                                 crate::apply_patch::FileAction::Update { path, .. } => path,
                                 crate::apply_patch::FileAction::Delete { path } => path,
                             };
-                            let (rel, is_out) = project_relative(cwd, &p);
+                            let (rel, is_out) = project_relative_with_boundary(cwd, &p, boundary);
                             if is_out {
                                 outside = true;
                             }
@@ -842,7 +1019,7 @@ pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
                 }
             }
             let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            project_relative(cwd, raw)
+            project_relative_with_boundary(cwd, raw, boundary)
         }
         // A fetch is judged by where it goes, a search by what it asks.
         ToolClass::Network if tool == "web_fetch" => (
@@ -920,45 +1097,239 @@ pub fn summary_of(tool: &str, subject: &str) -> String {
     }
 }
 
+/// Check if a path starts with a Windows drive prefix (`C:`, `D:`, etc.).
+pub fn has_windows_drive_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// Strip Windows extended verbatim path prefixes (`\\?\` and `\\?\UNC\`) for uniform path matching.
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Check if a path points to git metadata (e.g. within a `.git` directory or pointer).
+pub fn is_git_metadata_path(path: &Path, repo_root: Option<&Path>, root: Option<&Path>) -> bool {
+    let normalized = strip_verbatim_prefix(&normalize_lexically(path));
+
+    if let Some(repo) = repo_root {
+        let repo_git = strip_verbatim_prefix(&normalize_lexically(&repo.join(".git")));
+        if normalized.starts_with(&repo_git) || normalized == repo_git {
+            return true;
+        }
+    }
+
+    if let Some(r) = root {
+        let root_git = strip_verbatim_prefix(&normalize_lexically(&r.join(".git")));
+        if normalized.starts_with(&root_git) || normalized == root_git {
+            return true;
+        }
+    }
+
+    normalized.components().any(|c| c.as_os_str() == ".git")
+}
+
+/// Check whether `target` escapes `root` either lexically or via symlinks.
+/// Returns `(outside_lexical, symlink_escape)`.
+pub fn check_path_boundary(root: &Path, target: &Path) -> (bool, bool) {
+    let norm_root = strip_verbatim_prefix(&normalize_lexically(root));
+    let norm_target = strip_verbatim_prefix(&normalize_lexically(target));
+
+    // 1. Lexical check
+    let outside_lexical = !norm_target.starts_with(&norm_root);
+
+    if outside_lexical {
+        return (true, false);
+    }
+
+    // 2. Symlink escape check
+    let mut symlink_escape = false;
+
+    if let (Ok(canon_root), Ok(canon_target)) = (root.canonicalize(), target.canonicalize()) {
+        let clean_root = strip_verbatim_prefix(&canon_root);
+        let clean_target = strip_verbatim_prefix(&canon_target);
+        if !clean_target.starts_with(&clean_root) {
+            symlink_escape = true;
+        }
+    } else if let Ok(canon_root) = root.canonicalize() {
+        let clean_root = strip_verbatim_prefix(&canon_root);
+        if let Ok(meta) = target.symlink_metadata() {
+            if meta.file_type().is_symlink() {
+                if let Ok(link) = target.read_link() {
+                    let resolved = if link.is_absolute() {
+                        link
+                    } else if let Some(p) = target.parent() {
+                        p.join(link)
+                    } else {
+                        link
+                    };
+                    let clean_resolved = strip_verbatim_prefix(&normalize_lexically(&resolved));
+                    if !clean_resolved.starts_with(&norm_root) {
+                        symlink_escape = true;
+                    }
+                }
+            }
+        }
+
+        let mut ancestor = target;
+        while let Some(parent) = ancestor.parent() {
+            if parent.exists() {
+                if let Ok(parent_canon) = parent.canonicalize() {
+                    let clean_parent = strip_verbatim_prefix(&parent_canon);
+                    if !clean_parent.starts_with(&clean_root) {
+                        symlink_escape = true;
+                    }
+                }
+                break;
+            }
+            ancestor = parent;
+        }
+    }
+
+    if !symlink_escape {
+        if let Ok(rel) = norm_target.strip_prefix(&norm_root) {
+            let mut current = norm_root.clone();
+            for component in rel.components() {
+                current.push(component);
+                if let Ok(meta) = current.symlink_metadata() {
+                    if meta.file_type().is_symlink() {
+                        if let Ok(link) = current.read_link() {
+                            let resolved = if link.is_absolute() {
+                                link
+                            } else if let Some(p) = current.parent() {
+                                p.join(link)
+                            } else {
+                                link
+                            };
+                            let clean_resolved =
+                                strip_verbatim_prefix(&normalize_lexically(&resolved));
+                            if !clean_resolved.starts_with(&norm_root) {
+                                symlink_escape = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (outside_lexical, symlink_escape)
+}
+
+/// Convenience helper: returns true if `target` is either outside `root` or an untrusted symlink escape.
+pub fn is_outside_or_symlink_escape(root: &Path, target: &Path) -> (bool, bool) {
+    check_path_boundary(root, target)
+}
+
+/// Returns true if target escapes root via symlinks.
+pub fn is_symlink_escape(root: &Path, target: &Path) -> bool {
+    check_path_boundary(root, target).1
+}
+
 /// A path as a rule sees it: forward slashes, relative to the project when
 /// it is inside it. The second value says when it is not.
-fn project_relative(cwd: &Path, raw: &str) -> (String, bool) {
-    let given = Path::new(raw);
+pub fn project_relative(cwd: &Path, raw: &str) -> (String, bool) {
+    project_relative_with_boundary(cwd, raw, None)
+}
+
+pub fn project_relative_with_boundary(
+    cwd: &Path,
+    raw: &str,
+    boundary: Option<&FilesystemBoundaryPolicy>,
+) -> (String, bool) {
+    let effective_root = boundary.and_then(|b| b.root.as_deref()).unwrap_or(cwd);
+    let raw_trimmed = raw.trim();
+
+    let is_diff_drive = if has_windows_drive_prefix(raw_trimmed) {
+        let drive_char = raw_trimmed.chars().next().map(|c| c.to_ascii_uppercase());
+        let root_drive_char = effective_root
+            .to_string_lossy()
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase());
+        drive_char != root_drive_char
+    } else {
+        false
+    };
+
+    let given = Path::new(raw_trimmed);
     let joined = if given.is_absolute() {
         given.to_path_buf()
+    } else if has_windows_drive_prefix(raw_trimmed) {
+        PathBuf::from(raw_trimmed)
     } else {
-        cwd.join(given)
+        effective_root.join(given)
     };
+
+    let (outside_lexical, symlink_escape) = check_path_boundary(effective_root, &joined);
+    let outside = is_diff_drive || outside_lexical || symlink_escape;
+
     let full = normalize_lexically(&joined);
-    let root = normalize_lexically(cwd);
+    let root = normalize_lexically(effective_root);
     match full.strip_prefix(&root) {
-        Ok(rest) => {
+        Ok(rest) if !outside => {
             let text = slashes(rest);
             (if text.is_empty() { ".".into() } else { text }, false)
         }
-        Err(_) => (slashes(&full), true),
+        _ => (slashes(&full), outside),
     }
 }
 
 /// Resolve `.` and `..` without touching the file system: the target may
 /// not exist yet, and a rule is about where it would be.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
+pub fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut prefix = None;
+    let mut has_root = false;
+    let mut normals: Vec<std::ffi::OsString> = Vec::new();
+    let mut leading_parents = 0usize;
+
     for component in path.components() {
         match component {
+            Component::Prefix(p) => {
+                prefix = Some(p.as_os_str().to_os_string());
+            }
+            Component::RootDir => {
+                has_root = true;
+            }
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
+                if !normals.is_empty() {
+                    normals.pop();
+                } else if !has_root {
+                    leading_parents += 1;
                 }
             }
-            other => out.push(other.as_os_str()),
+            Component::Normal(n) => {
+                normals.push(n.to_os_string());
+            }
         }
+    }
+
+    let mut out = PathBuf::new();
+    if let Some(p) = prefix {
+        out.push(p);
+    }
+    if has_root {
+        out.push(std::path::MAIN_SEPARATOR.to_string());
+    }
+    for _ in 0..leading_parents {
+        out.push("..");
+    }
+    for n in normals {
+        out.push(n);
     }
     out
 }
 
-fn slashes(path: &Path) -> String {
+pub fn slashes(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
@@ -1895,5 +2266,216 @@ mod tests {
             ),
             PermissionVerdict::Allow
         );
+    }
+
+    #[test]
+    fn windows_drive_and_unc_path_containment() {
+        let root = PathBuf::from("C:\\work\\proj");
+
+        // Different drive -> outside
+        let (sub, outside) = project_relative(&root, "D:\\other\\file.txt");
+        assert!(outside);
+        assert_eq!(sub, "D:/other/file.txt");
+
+        // Drive prefix without backslash -> outside
+        let (_, outside) = project_relative(&root, "D:other\\file.txt");
+        assert!(outside);
+
+        // Same drive inside root -> inside
+        let (sub, outside) = project_relative(&root, "C:\\work\\proj\\src\\lib.rs");
+        assert!(!outside);
+        assert_eq!(sub, "src/lib.rs");
+
+        // UNC path -> outside
+        let (sub, outside) = project_relative(&root, "\\\\server\\share\\data.txt");
+        assert!(outside);
+        assert!(sub.contains("server/share/data.txt"));
+
+        // Normalization above drive root cannot escape drive root
+        let norm = normalize_lexically(Path::new("C:\\a\\..\\..\\b"));
+        assert_eq!(norm, PathBuf::from("C:\\b"));
+    }
+
+    #[test]
+    fn unix_absolute_and_relative_path_containment() {
+        let root = PathBuf::from("/work/proj");
+
+        // Root file -> outside
+        let (sub, outside) = project_relative(&root, "/etc/passwd");
+        assert!(outside);
+        assert_eq!(sub, "/etc/passwd");
+
+        // Directory traversal escaping root -> outside
+        let (_, outside) = project_relative(&root, "../../secret");
+        assert!(outside);
+
+        // Inside root -> inside
+        let (sub, outside) = project_relative(&root, "/work/proj/src/main.rs");
+        assert!(!outside);
+        assert_eq!(sub, "src/main.rs");
+
+        // Popping root cannot pop below root
+        let norm = normalize_lexically(Path::new("/a/../.."));
+        assert_eq!(norm, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn untrusted_symlink_escape_detection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let secret_file = outside.join("secret.txt");
+        std::fs::write(&secret_file, "classified").unwrap();
+
+        // Create a symlink to outside if the platform/privileges allow
+        let symlink_dir = root.join("link_to_outside");
+        #[cfg(unix)]
+        let symlink_created = std::os::unix::fs::symlink(&outside, &symlink_dir).is_ok();
+        #[cfg(windows)]
+        let symlink_created = std::os::windows::fs::symlink_dir(&outside, &symlink_dir).is_ok();
+
+        if symlink_created {
+            let target = symlink_dir.join("secret.txt");
+            let (outside_lexical, symlink_escape) = check_path_boundary(&root, &target);
+            assert!(
+                symlink_escape || outside_lexical,
+                "Symlink escape must be detected"
+            );
+
+            let (sub, is_out) = project_relative(&root, target.to_str().unwrap());
+            assert!(
+                is_out,
+                "project_relative must mark symlink escape as outside"
+            );
+            let _ = sub;
+        }
+
+        // Internal normal file
+        let internal_file = root.join("normal.txt");
+        std::fs::write(&internal_file, "hello").unwrap();
+        let (outside_lexical, symlink_escape) = check_path_boundary(&root, &internal_file);
+        assert!(!outside_lexical);
+        assert!(!symlink_escape);
+    }
+
+    #[test]
+    fn isolated_agent_worktree_boundary_enforcement() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_dir = temp.path().join("main_repo");
+        let wt_dir = temp.path().join("worktrees").join("wt-1234");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::create_dir_all(wt_dir.join("src")).unwrap();
+
+        let repo_file = repo_dir.join("src").join("lib.rs");
+        let wt_file = wt_dir.join("src").join("lib.rs");
+        std::fs::write(&repo_file, "fn main_repo() {}").unwrap();
+        std::fs::write(&wt_file, "fn worktree() {}").unwrap();
+
+        let mut policy = PermissionPolicy::new(PermissionMode::Auto);
+        policy.set_worktree_boundary(&wt_dir, Some(&repo_dir));
+
+        // 1. Mutation inside worktree -> Allowed even with strict boundaries
+        let wt_write = json!({"path": "src/lib.rs", "content": "updated"});
+        assert_eq!(
+            policy.decide("c1", "write", &wt_write, &wt_dir),
+            PermissionVerdict::Allow
+        );
+
+        // 2. Mutation outside worktree targeting main repo -> Strictly Denied even in Auto mode
+        let parent_write = json!({
+            "path": repo_file.to_string_lossy().to_string(),
+            "content": "illegal modification"
+        });
+        assert!(matches!(
+            policy.decide("c2", "write", &parent_write, &wt_dir),
+            PermissionVerdict::Deny { .. }
+        ));
+
+        // 3. Mutation targeting arbitrary external dir -> Denied
+        let external_file = temp.path().join("external.txt");
+        let ext_write = json!({
+            "path": external_file.to_string_lossy().to_string(),
+            "content": "escaped write"
+        });
+        assert!(matches!(
+            policy.decide("c3", "write", &ext_write, &wt_dir),
+            PermissionVerdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn read_outside_root_policy_enforcement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_file = outside_dir.join("config.sys");
+        std::fs::write(&outside_file, "secret").unwrap();
+
+        let read_outside = json!({"path": outside_file.to_string_lossy().to_string()});
+
+        // 1. Allow policy
+        let mut p_allow = PermissionPolicy::new(PermissionMode::Ask);
+        p_allow.set_read_outside_root_policy(ReadOutsideRootPolicy::Allow);
+        assert_eq!(
+            p_allow.decide("c1", "read", &read_outside, &root),
+            PermissionVerdict::Allow
+        );
+
+        // 2. Ask policy
+        let mut p_ask = PermissionPolicy::new(PermissionMode::Ask);
+        p_ask.set_read_outside_root_policy(ReadOutsideRootPolicy::Ask);
+        assert!(matches!(
+            p_ask.decide("c2", "read", &read_outside, &root),
+            PermissionVerdict::Ask(_)
+        ));
+
+        // 3. Deny policy
+        let mut p_deny = PermissionPolicy::new(PermissionMode::Ask);
+        p_deny.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+        assert!(matches!(
+            p_deny.decide("c3", "read", &read_outside, &root),
+            PermissionVerdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn git_metadata_access_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_dir = temp.path().join("repo");
+        let wt_dir = temp.path().join("worktrees").join("wt-1");
+        std::fs::create_dir_all(repo_dir.join(".git").join("worktrees").join("wt-1")).unwrap();
+        std::fs::create_dir_all(wt_dir.join("src")).unwrap();
+
+        let mut policy = PermissionPolicy::new(PermissionMode::Edits);
+        policy.set_worktree_boundary(&wt_dir, Some(&repo_dir));
+        policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+
+        // Reading git metadata from repo .git -> Allowed despite ReadOutsideRootPolicy::Deny and deny_parent_checkout
+        let git_meta_file = repo_dir
+            .join(".git")
+            .join("worktrees")
+            .join("wt-1")
+            .join("gitdir");
+        std::fs::write(&git_meta_file, "gitdir").unwrap();
+        let read_git_meta = json!({"path": git_meta_file.to_string_lossy().to_string()});
+        assert_eq!(
+            policy.decide("c1", "read", &read_git_meta, &wt_dir),
+            PermissionVerdict::Allow
+        );
+
+        // Non-git-metadata file in repo -> Denied
+        let non_git_file = repo_dir.join("README.md");
+        std::fs::write(&non_git_file, "readme").unwrap();
+        let read_non_git = json!({"path": non_git_file.to_string_lossy().to_string()});
+        assert!(matches!(
+            policy.decide("c2", "read", &read_non_git, &wt_dir),
+            PermissionVerdict::Deny { .. }
+        ));
     }
 }

@@ -58,9 +58,11 @@ pub use images::{
 pub use jobs::{JobBook, JobNotice, JobStatus, JobSummary};
 pub use mcp::{McpRegistry, McpServerRow};
 pub use permission::{
-    glob_matches, session_rule_for, subject_of, summary_of, tool_class, PermissionMode,
-    PermissionPolicy, PermissionRule, PermissionVerdict, RuleParseError, RuleSpecifier,
-    ToolApprovalDecision, ToolApprovalRequest, ToolApprover, ToolClass,
+    check_path_boundary, glob_matches, is_git_metadata_path, is_outside_or_symlink_escape,
+    is_symlink_escape, project_relative, session_rule_for, subject_of, summary_of, tool_class,
+    FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict,
+    ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
+    ToolApprovalRequest, ToolApprover, ToolClass,
 };
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};

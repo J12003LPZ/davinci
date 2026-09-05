@@ -598,7 +598,7 @@ fn detect_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn write_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
-    let path = resolve(cwd, required_str(input, "path")?)?;
+    let path = resolve_for_mutation(cwd, required_str(input, "path")?)?;
     crate::file_mutation_queue::with_file_mutation_queue(&path, || {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| ToolError::Failed(err.to_string()))?;
@@ -629,7 +629,7 @@ fn write_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolE
 fn edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     let (display_path, edits) =
         crate::edit_diff::prepare_edit_arguments(input).map_err(ToolError::Failed)?;
-    let path = resolve(cwd, &display_path)?;
+    let path = resolve_for_mutation(cwd, &display_path)?;
     crate::file_mutation_queue::with_file_mutation_queue(&path, || {
         if crate::notebook::is_notebook_path(&path) {
             if let Some(result) = notebook_edit_locked(&path, &display_path, &edits)? {
@@ -688,7 +688,7 @@ fn notebook_edit_locked(
 fn notebook_edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     use crate::notebook::{self, EditMode};
     let display_path = required_str(input, "path")?.to_string();
-    let path = resolve(cwd, &display_path)?;
+    let path = resolve_for_mutation(cwd, &display_path)?;
     let cell = input
         .get("cell")
         .and_then(Value::as_u64)
@@ -1889,6 +1889,17 @@ fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, ToolError> {
     } else {
         cwd.join(path)
     })
+}
+
+pub fn resolve_for_mutation(cwd: &Path, raw_path: &str) -> Result<PathBuf, ToolError> {
+    let path = resolve(cwd, raw_path)?;
+    let (_, symlink_escape) = crate::permission::check_path_boundary(cwd, &path);
+    if symlink_escape {
+        return Err(ToolError::Failed(format!(
+            "Untrusted symlink escape rejected for mutation: '{raw_path}'"
+        )));
+    }
+    Ok(path)
 }
 
 struct IgnoreRules {

@@ -21,6 +21,8 @@ pub struct WorktreeLease {
     pub branch: String,
     pub base_head: String,
     pub created_at_ms: i64,
+    #[serde(default)]
+    pub repo_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
@@ -185,6 +187,7 @@ impl WorktreeManager {
             branch,
             base_head,
             created_at_ms: now_ms(),
+            repo_root: Some(self.repo_root.clone()),
         };
 
         // 5. Record active lease
@@ -320,6 +323,38 @@ impl WorktreeManager {
             return Vec::new();
         };
         leases.values().cloned().collect()
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    pub fn worktree_root(&self) -> &Path {
+        &self.worktree_root
+    }
+}
+
+impl WorktreeLease {
+    /// Create a filesystem boundary policy enforcing mutations to this worktree
+    /// while preserving git metadata access back to the repository root.
+    pub fn boundary_policy(
+        &self,
+        read_policy: crate::permission::ReadOutsideRootPolicy,
+    ) -> crate::permission::FilesystemBoundaryPolicy {
+        crate::permission::FilesystemBoundaryPolicy {
+            root: Some(self.path.clone()),
+            repo_root: self.repo_root.clone(),
+            read_outside_root: read_policy,
+            enforce_root_for_mutations: true,
+            allow_git_metadata: true,
+        }
+    }
+
+    /// Check if target path is safely within this worktree's filesystem boundary.
+    pub fn is_path_within_boundary(&self, target: &Path) -> bool {
+        let (outside_lexical, symlink_escape) =
+            crate::permission::check_path_boundary(&self.path, target);
+        !outside_lexical && !symlink_escape
     }
 }
 
