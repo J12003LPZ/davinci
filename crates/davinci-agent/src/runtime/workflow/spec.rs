@@ -53,3 +53,63 @@ pub enum WorkflowJoin {
     Any,
     Quorum { required: usize },
 }
+
+pub const VALID_3_PHASE_WORKFLOW_JSON: &str = r#"{
+    "schema_version": 1,
+    "name": "full-feature-pipeline",
+    "max_parallel_agents": 4,
+    "max_total_agents": 8,
+    "phases": [
+        {
+            "id": "investigate",
+            "depends_on": [],
+            "join": "all",
+            "workers": [
+                {
+                    "id": "repo-searcher",
+                    "prompt": "search repo for feature references",
+                    "tools": ["grep", "find", "read"],
+                    "isolation": "shared"
+                },
+                {
+                    "id": "doc-searcher",
+                    "prompt": "fetch documentation",
+                    "tools": ["web_fetch", "web_search"],
+                    "isolation": "shared"
+                }
+            ]
+        },
+        {
+            "id": "plan",
+            "depends_on": ["investigate"],
+            "join": "all",
+            "workers": [
+                {
+                    "id": "architect",
+                    "prompt": "produce architecture plan",
+                    "tools": ["read", "todo"],
+                    "isolation": "shared"
+                }
+            ]
+        },
+        {
+            "id": "implement",
+            "depends_on": ["plan"],
+            "join": "all",
+            "workers": [
+                {
+                    "id": "writer-1",
+                    "prompt": "implement component A",
+                    "tools": ["read", "write", "edit"],
+                    "isolation": "worktree"
+                },
+                {
+                    "id": "writer-2",
+                    "prompt": "implement component B",
+                    "tools": ["read", "write", "edit"],
+                    "isolation": "worktree"
+                }
+            ]
+        }
+    ]
+}"#;

@@ -1,9 +1,14 @@
 //! Deterministic general workflow engine for Davinci.
 
+pub mod executor;
 pub mod spec;
 pub mod state;
 pub mod validate;
 
+pub use executor::{
+    PhaseExecutionState, PhaseStatus, WorkflowExecutionError, WorkflowExecutionState,
+    WorkflowExecutor, WorkflowStatus,
+};
 pub use spec::{WorkflowJoin, WorkflowPhaseSpec, WorkflowSpec, WorkflowWorkerSpec};
 pub use state::{WorkflowArtifact, WorkflowStateError, WorkflowStateStore};
 pub use validate::{
