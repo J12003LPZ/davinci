@@ -34,7 +34,10 @@ pub fn is_valid_transition(from: AgentState, to: AgentState) -> bool {
     use AgentState::*;
     match from {
         Starting => matches!(to, Running | Failed | Cancelled),
-        Running => matches!(to, Waiting | Idle | Stopping | Completed | Failed | Cancelled),
+        Running => matches!(
+            to,
+            Waiting | Idle | Stopping | Completed | Failed | Cancelled
+        ),
         Waiting => matches!(to, Running | Stopping | Failed | Cancelled),
         Idle => matches!(to, Running | Stopping | Completed | Cancelled),
         Stopping => matches!(to, Completed | Failed | Cancelled),
@@ -77,13 +80,14 @@ impl RuntimeRegistry {
     /// Register a new agent. Returns an error if an agent with this ID is already registered.
     pub fn register_agent(&self, record: AgentRecord) -> Result<(), RegistryError> {
         {
-            let mut map = self.records.write().map_err(|_| {
-                RegistryError::InvalidTransition {
+            let mut map = self
+                .records
+                .write()
+                .map_err(|_| RegistryError::InvalidTransition {
                     agent_id: record.id,
                     from: record.state,
                     to: record.state,
-                }
-            })?;
+                })?;
             if map.contains_key(&record.id) {
                 return Err(RegistryError::DuplicateAgent(record.id));
             }
@@ -111,17 +115,21 @@ impl RuntimeRegistry {
     /// Transition an agent's lifecycle state.
     pub fn transition(&self, id: AgentId, to: AgentState) -> Result<(), RegistryError> {
         let (from, run_id, parent) = {
-            let mut map = self.records.write().map_err(|_| {
-                RegistryError::InvalidTransition {
+            let mut map = self
+                .records
+                .write()
+                .map_err(|_| RegistryError::InvalidTransition {
                     agent_id: id,
                     from: to,
                     to,
-                }
-            })?;
+                })?;
             let record = map.get_mut(&id).ok_or(RegistryError::AgentNotFound(id))?;
 
             let from = record.state;
-            if matches!(from, AgentState::Completed | AgentState::Failed | AgentState::Cancelled) {
+            if matches!(
+                from,
+                AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+            ) {
                 return Err(RegistryError::TerminalResurrection {
                     agent_id: id,
                     state: from,
@@ -217,22 +225,49 @@ mod tests {
 
     #[test]
     fn test_valid_transitions_starting() {
-        assert!(is_valid_transition(AgentState::Starting, AgentState::Running));
-        assert!(is_valid_transition(AgentState::Starting, AgentState::Failed));
-        assert!(is_valid_transition(AgentState::Starting, AgentState::Cancelled));
-        assert!(!is_valid_transition(AgentState::Starting, AgentState::Completed));
+        assert!(is_valid_transition(
+            AgentState::Starting,
+            AgentState::Running
+        ));
+        assert!(is_valid_transition(
+            AgentState::Starting,
+            AgentState::Failed
+        ));
+        assert!(is_valid_transition(
+            AgentState::Starting,
+            AgentState::Cancelled
+        ));
+        assert!(!is_valid_transition(
+            AgentState::Starting,
+            AgentState::Completed
+        ));
         assert!(!is_valid_transition(AgentState::Starting, AgentState::Idle));
     }
 
     #[test]
     fn test_valid_transitions_running() {
-        assert!(is_valid_transition(AgentState::Running, AgentState::Waiting));
+        assert!(is_valid_transition(
+            AgentState::Running,
+            AgentState::Waiting
+        ));
         assert!(is_valid_transition(AgentState::Running, AgentState::Idle));
-        assert!(is_valid_transition(AgentState::Running, AgentState::Stopping));
-        assert!(is_valid_transition(AgentState::Running, AgentState::Completed));
+        assert!(is_valid_transition(
+            AgentState::Running,
+            AgentState::Stopping
+        ));
+        assert!(is_valid_transition(
+            AgentState::Running,
+            AgentState::Completed
+        ));
         assert!(is_valid_transition(AgentState::Running, AgentState::Failed));
-        assert!(is_valid_transition(AgentState::Running, AgentState::Cancelled));
-        assert!(!is_valid_transition(AgentState::Running, AgentState::Starting));
+        assert!(is_valid_transition(
+            AgentState::Running,
+            AgentState::Cancelled
+        ));
+        assert!(!is_valid_transition(
+            AgentState::Running,
+            AgentState::Starting
+        ));
     }
 
     #[test]

@@ -79,6 +79,8 @@ pub struct SubagentRequest {
     pub model_id: Option<String>,
     /// The parent's abort flag: an interrupted turn stops the worker too.
     pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Hierarchical runtime cancellation token.
+    pub cancellation_token: Option<crate::runtime::CancellationToken>,
 }
 
 type SubagentFn = dyn Fn(&SubagentRequest) -> Result<String, String> + Send + Sync;
@@ -138,6 +140,7 @@ pub struct SubagentParent {
     pub provider: Option<String>,
     pub model_id: Option<String>,
     pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub cancellation_token: Option<crate::runtime::CancellationToken>,
 }
 
 /// One worker's request as the model wrote it.
@@ -211,13 +214,21 @@ pub fn run_tool(
     };
     let requests: Vec<SubagentRequest> = specs
         .iter()
-        .map(|spec| SubagentRequest {
-            prompt: spec.prompt.clone(),
-            tools: scoped_tools(spec.tools.as_deref(), parent_tools),
-            description: spec.description.clone(),
-            provider: parent.provider.clone(),
-            model_id: parent.model_id.clone(),
-            abort: parent.abort.clone(),
+        .map(|spec| {
+            let child_token = parent.cancellation_token.as_ref().map(|p| p.child_token());
+            let abort = child_token
+                .as_ref()
+                .map(|t| t.as_atomic_bool())
+                .or_else(|| parent.abort.clone());
+            SubagentRequest {
+                prompt: spec.prompt.clone(),
+                tools: scoped_tools(spec.tools.as_deref(), parent_tools),
+                description: spec.description.clone(),
+                provider: parent.provider.clone(),
+                model_id: parent.model_id.clone(),
+                abort,
+                cancellation_token: child_token,
+            }
         })
         .collect();
     if requests.len() == 1 {
@@ -238,11 +249,16 @@ pub fn run_tool(
             run: Box::new(move || runner.run(request)),
         })
         .collect();
+    let parent_abort = parent
+        .cancellation_token
+        .as_ref()
+        .map(|t| t.as_atomic_bool())
+        .or_else(|| parent.abort.clone());
     let (outcomes, _) = crate::scheduler::run_lanes(
         calls,
         false,
         MAX_TASK_CONCURRENCY,
-        parent.abort.as_deref(),
+        parent_abort.as_deref(),
         |_| {},
     );
     let per_task_cap = SUBAGENT_OUTPUT_CAP / requests.len().max(1);
@@ -397,5 +413,79 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not configured"), "{err}");
+    }
+
+    #[test]
+    fn test_parent_cancellation_propagates_to_subagent() {
+        use crate::runtime::CancellationToken;
+
+        let parent_token = CancellationToken::new();
+        let received_token = Arc::new(std::sync::Mutex::new(None));
+        let rec_clone = received_token.clone();
+
+        let runner = SubagentRunner::new(move |req| {
+            *rec_clone.lock().unwrap() = req.cancellation_token.clone();
+            Ok("done".into())
+        });
+
+        let parent = SubagentParent {
+            cancellation_token: Some(parent_token.clone()),
+            ..SubagentParent::default()
+        };
+
+        let result = run_tool(
+            &json!({"prompt": "test cancellation"}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        );
+        assert!(result.is_ok());
+
+        let child_token = received_token.lock().unwrap().take().unwrap();
+        assert!(!child_token.is_cancelled());
+
+        parent_token.cancel();
+        assert!(child_token.is_cancelled());
+    }
+
+    #[test]
+    fn test_fanout_subagents_receive_cancellation() {
+        use crate::runtime::CancellationToken;
+
+        let parent_token = CancellationToken::new();
+        let received_tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec_clone = received_tokens.clone();
+
+        let runner = SubagentRunner::new(move |req| {
+            rec_clone
+                .lock()
+                .unwrap()
+                .push(req.cancellation_token.clone().unwrap());
+            Ok("done".into())
+        });
+
+        let parent = SubagentParent {
+            cancellation_token: Some(parent_token.clone()),
+            ..SubagentParent::default()
+        };
+
+        let result = run_tool(
+            &json!({"tasks": [{"prompt": "task 1"}, {"prompt": "task 2"}]}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        );
+        assert!(result.is_ok());
+
+        let children = received_tokens.lock().unwrap().clone();
+        assert_eq!(children.len(), 2);
+        for child in &children {
+            assert!(!child.is_cancelled());
+        }
+
+        parent_token.cancel();
+        for child in &children {
+            assert!(child.is_cancelled());
+        }
     }
 }

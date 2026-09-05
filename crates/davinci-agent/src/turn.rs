@@ -586,7 +586,11 @@ impl Agent {
                     }),
                 });
             }
-            let abort = agent.abort_signal.clone();
+            let abort = agent
+                .runtime
+                .as_ref()
+                .map(|rt| rt.cancellation_token.as_atomic_bool())
+                .or_else(|| agent.abort_signal.clone());
             let mut starts: Vec<AgentEvent> = Vec::new();
             let (outcomes, report) = crate::scheduler::run_lanes(
                 scheduled,
@@ -797,10 +801,19 @@ impl Agent {
                 .filter(|count| *count > 0)
                 .unwrap_or(1);
             crate::stats::SharedCounters::add(&self.counters.subagents, workers as u64);
+            let token = self
+                .runtime
+                .as_ref()
+                .map(|rt| rt.cancellation_token.clone());
+            let abort = token
+                .as_ref()
+                .map(|t| t.as_atomic_bool())
+                .or_else(|| self.abort_signal.clone());
             let parent = crate::subagent::SubagentParent {
                 provider: Some(self.provider.clone()),
                 model_id: Some(self.model_id.clone()),
-                abort: self.abort_signal.clone(),
+                abort,
+                cancellation_token: token,
             };
             match crate::subagent::run_tool(
                 args,
@@ -821,7 +834,11 @@ impl Agent {
             // The tool sees the turn's abort flag so a long shell command
             // or a `job_output` wait ends when the user interrupts.
             let mut context = self.tool_context.clone();
-            context.abort = self.abort_signal.clone();
+            context.abort = self
+                .runtime
+                .as_ref()
+                .map(|rt| rt.cancellation_token.as_atomic_bool())
+                .or_else(|| self.abort_signal.clone());
             match execute_tool_with(cwd, name, args, &context) {
                 Ok(result) => result,
                 Err(crate::tools::ToolError::Unknown(_)) => {

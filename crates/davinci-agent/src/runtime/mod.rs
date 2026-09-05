@@ -1,14 +1,16 @@
 //! Shared runtime subsystem for Davinci.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub mod bus;
+pub mod cancellation;
 pub mod events;
 pub mod ids;
 pub mod registry;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
+pub use cancellation::CancellationToken;
 pub use events::{AgentKind, AgentRecord, AgentState, RuntimeEvent, RuntimeEventEnvelope};
 pub use ids::{AgentId, RunId, TaskId, WorkflowId};
 pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
@@ -22,7 +24,7 @@ pub struct RuntimeHandle {
     pub session_id: Option<String>,
     sequence: Arc<AtomicU64>,
     pub bus: RuntimeBus,
-    pub cancellation_token: Arc<AtomicBool>,
+    pub cancellation_token: CancellationToken,
     pub registry: RuntimeRegistry,
 }
 
@@ -48,9 +50,14 @@ impl RuntimeHandle {
             session_id: None,
             sequence: Arc::new(AtomicU64::new(0)),
             bus,
-            cancellation_token: Arc::new(AtomicBool::new(false)),
+            cancellation_token: CancellationToken::new(),
             registry,
         }
+    }
+
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = token;
+        self
     }
 
     pub fn with_registry(mut self, registry: RuntimeRegistry) -> Self {
@@ -97,10 +104,10 @@ impl RuntimeHandle {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancellation_token.load(Ordering::SeqCst)
+        self.cancellation_token.is_cancelled()
     }
 
     pub fn cancel(&self) {
-        self.cancellation_token.store(true, Ordering::SeqCst);
+        self.cancellation_token.cancel();
     }
 }

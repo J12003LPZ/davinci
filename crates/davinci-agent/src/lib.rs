@@ -89,9 +89,9 @@ pub use turn::retry_delay_ms;
 
 pub mod runtime;
 pub use runtime::{
-    AgentId, AgentKind, AgentRecord, AgentState, RegistryError, RunId, RuntimeBus, RuntimeDecision,
-    RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, TaskId,
-    WorkflowId,
+    AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RegistryError, RunId,
+    RuntimeBus, RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle,
+    RuntimeRegistry, RuntimeSubscriber, TaskId, WorkflowId,
 };
 
 use davinci_ai::{
@@ -318,6 +318,21 @@ impl Agent {
             provider_context_overhead_tokens: None,
             runtime: None,
         }
+    }
+
+    pub fn set_runtime(&mut self, runtime: RuntimeHandle) {
+        runtime
+            .cancellation_token
+            .attach_job_book(self.tool_context.jobs.clone());
+        if self.abort_signal.is_none() {
+            self.abort_signal = Some(runtime.cancellation_token.as_atomic_bool());
+        }
+        self.runtime = Some(runtime);
+    }
+
+    pub fn with_runtime(mut self, runtime: RuntimeHandle) -> Self {
+        self.set_runtime(runtime);
+        self
     }
 
     /// Restore the base prompt before each extension-aware prompt turn.
