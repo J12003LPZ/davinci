@@ -959,6 +959,15 @@ pub fn normalize_relative_path(path: &Path) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Err("absolute paths are not allowed in security scope".into());
     }
+    let path_str = path.to_string_lossy();
+    if path_str.starts_with('/')
+        || path_str.starts_with('\\')
+        || (path_str.len() >= 2
+            && path_str.as_bytes()[0].is_ascii_alphabetic()
+            && path_str.as_bytes()[1] == b':')
+    {
+        return Err("absolute paths are not allowed in security scope".into());
+    }
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
