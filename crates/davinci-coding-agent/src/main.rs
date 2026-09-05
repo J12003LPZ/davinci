@@ -1772,7 +1772,7 @@ fn complete_prompt_with_host(
     );
     let wt_mgr =
         davinci_agent::WorktreeManager::new(&agent.cwd, default_agent_dir().join("worktrees"))
-            .with_bus(runtime_bus);
+            .with_bus(runtime_bus.clone());
     runtime_handle = runtime_handle.with_worktree_manager(wt_mgr);
     runtime_handle = runtime_handle.with_project_trusted(trusted);
     let wf_store = davinci_agent::WorkflowStateStore::with_options(
@@ -1787,6 +1787,10 @@ fn complete_prompt_with_host(
     runtime_handle = runtime_handle.with_workflow_executor(wf_executor);
     if let Some(session) = &agent.session {
         runtime_handle = runtime_handle.with_session(&session.header.id);
+        let log_path = davinci_session::runtime_log_path(&session.path);
+        if let Ok(subscriber) = runtime_host::RuntimeLogSubscriber::open(&log_path) {
+            runtime_bus.subscribe(Arc::new(subscriber));
+        }
     }
     agent.runtime = Some(runtime_handle);
 

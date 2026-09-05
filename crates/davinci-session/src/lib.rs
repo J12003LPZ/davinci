@@ -5,6 +5,7 @@ mod discovery;
 mod errors;
 mod jsonl_repo;
 mod repo;
+pub mod runtime_log;
 mod tree;
 mod types;
 
@@ -27,6 +28,10 @@ pub use repo::{
     BranchBounds, EntryOrder, EntryQuery, ForkOptions, ForkPosition, ForkScope,
     InMemorySessionRepo, LanePointer, LogItem, LogOptions, RecordQuery, Session,
     SessionCreateOptions, SessionMetadata, SessionState, SessionStats, SessionView,
+};
+pub use runtime_log::{
+    read_runtime_log, runtime_log_path, RuntimeLogError, RuntimeLogWriter,
+    CURRENT_RUNTIME_SCHEMA_VERSION,
 };
 pub use tree::{
     branch_entries, build_context_entries, build_session_path, build_session_tree, entries_since,

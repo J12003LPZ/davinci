@@ -132,6 +132,35 @@ impl RuntimeSubscriber for CompactionRuntimeSubscriber {
     }
 }
 
+/// RuntimeSubscriber that appends runtime lifecycle events into the session's `.runtime.jsonl` sidecar.
+pub struct RuntimeLogSubscriber {
+    writer: Arc<Mutex<davinci_session::RuntimeLogWriter>>,
+}
+
+impl RuntimeLogSubscriber {
+    pub fn new(writer: davinci_session::RuntimeLogWriter) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+        }
+    }
+
+    pub fn open(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, davinci_session::RuntimeLogError> {
+        let writer = davinci_session::RuntimeLogWriter::open(path)?;
+        Ok(Self::new(writer))
+    }
+}
+
+impl RuntimeSubscriber for RuntimeLogSubscriber {
+    fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.append(event);
+        }
+        RuntimeDecision::Continue
+    }
+}
+
 /// Helper to register native vector memory and skill learning context sources into the runtime.
 #[allow(dead_code)]
 pub fn register_native_context_sources(
@@ -536,5 +565,49 @@ mod tests {
             allowed.is_none(),
             "PostCompact must clear governor ledgers via CompactionRuntimeSubscriber"
         );
+    }
+
+    #[test]
+    fn test_runtime_log_subscriber_persists_envelopes() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("test_session.runtime.jsonl");
+
+        let subscriber = RuntimeLogSubscriber::open(&log_path).unwrap();
+        let bus = davinci_agent::RuntimeBus::new();
+        bus.subscribe(Arc::new(subscriber));
+
+        let run_id = davinci_agent::RunId::new();
+        let agent_id = davinci_agent::AgentId::new();
+
+        let task_id = davinci_agent::TaskId::new();
+        let env1 = davinci_agent::RuntimeEventEnvelope::new(
+            1,
+            run_id,
+            Some("session-xyz".into()),
+            Some(agent_id),
+            None,
+            RuntimeEvent::AgentStateChanged {
+                from: davinci_agent::AgentState::Idle,
+                to: davinci_agent::AgentState::Running,
+            },
+        );
+        let env2 = davinci_agent::RuntimeEventEnvelope::new(
+            2,
+            run_id,
+            Some("session-xyz".into()),
+            Some(agent_id),
+            None,
+            RuntimeEvent::TaskCreated { task_id },
+        );
+
+        bus.emit_observe(env1.clone());
+        bus.emit_observe(env2.clone());
+
+        // Replay from log sidecar
+        let replayed: Vec<davinci_agent::RuntimeEventEnvelope> =
+            davinci_session::read_runtime_log(&log_path).unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0], env1);
+        assert_eq!(replayed[1], env2);
     }
 }
