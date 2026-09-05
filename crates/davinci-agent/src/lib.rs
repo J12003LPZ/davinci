@@ -58,8 +58,8 @@ pub use jobs::{JobBook, JobNotice, JobStatus, JobSummary};
 pub use mcp::{McpRegistry, McpServerRow};
 pub use permission::{
     glob_matches, session_rule_for, subject_of, summary_of, tool_class, PermissionMode,
-    PermissionPolicy, PermissionRule, PermissionVerdict, ToolApprovalDecision, ToolApprovalRequest,
-    ToolApprover, ToolClass,
+    PermissionPolicy, PermissionRule, PermissionVerdict, RuleParseError, RuleSpecifier,
+    ToolApprovalDecision, ToolApprovalRequest, ToolApprover, ToolClass,
 };
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};

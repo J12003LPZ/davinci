@@ -99,50 +99,194 @@ pub fn tool_class(tool: &str) -> ToolClass {
     }
 }
 
+/// AST specifier for a permission rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleSpecifier {
+    Wildcard,
+    Subject(String),
+    Parameter { param: String, value: String },
+}
+
+impl std::fmt::Display for RuleSpecifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wildcard => write!(f, "*"),
+            Self::Subject(subject) => write!(f, "{subject}"),
+            Self::Parameter { param, value } => write!(f, "{param}:{value}"),
+        }
+    }
+}
+
+/// Diagnostic errors when parsing a permission rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleParseError {
+    Empty,
+    InvalidToolName(String),
+    MissingClosingParen,
+    TrailingCharacters(String),
+    EmptyParameterName,
+    EmptyParameterValue,
+    InvalidParameterSyntax(String),
+    MalformedSpecifier(String),
+}
+
+impl std::fmt::Display for RuleParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "permission rule is empty"),
+            Self::InvalidToolName(tool) => write!(f, "invalid tool name `{tool}`"),
+            Self::MissingClosingParen => write!(f, "missing closing parenthesis"),
+            Self::TrailingCharacters(s) => write!(f, "unexpected trailing characters `{s}`"),
+            Self::EmptyParameterName => write!(f, "parameter name cannot be empty"),
+            Self::EmptyParameterValue => write!(f, "parameter value cannot be empty"),
+            Self::InvalidParameterSyntax(s) => write!(f, "invalid parameter syntax `{s}`"),
+            Self::MalformedSpecifier(s) => write!(f, "malformed specifier `{s}`"),
+        }
+    }
+}
+
+impl std::error::Error for RuleParseError {}
+
 /// `tool` or `tool(pattern)`. The pattern is a glob over the call's subject:
-/// the command for a shell tool, the path for a file tool.
+/// the command for a shell tool, the path for a file tool, or a parameter rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRule {
     pub tool: String,
     pub pattern: Option<String>,
+    pub specifier: Option<RuleSpecifier>,
 }
 
 impl PermissionRule {
+    pub fn bare(tool: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            pattern: None,
+            specifier: None,
+        }
+    }
+
+    pub fn subject(tool: impl Into<String>, subject: impl Into<String>) -> Self {
+        let s = subject.into();
+        Self {
+            tool: tool.into(),
+            pattern: Some(s.clone()),
+            specifier: Some(RuleSpecifier::Subject(s)),
+        }
+    }
+
+    pub fn wildcard(tool: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            pattern: Some("*".to_string()),
+            specifier: Some(RuleSpecifier::Wildcard),
+        }
+    }
+
+    pub fn parameter(
+        tool: impl Into<String>,
+        param: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let p = param.into();
+        let v = value.into();
+        Self {
+            tool: tool.into(),
+            pattern: Some(format!("{p}:{v}")),
+            specifier: Some(RuleSpecifier::Parameter { param: p, value: v }),
+        }
+    }
+
     pub fn parse(text: &str) -> Option<Self> {
+        Self::parse_with_diagnostic(text).ok()
+    }
+
+    pub fn parse_with_diagnostic(text: &str) -> Result<Self, RuleParseError> {
         let text = text.trim();
         if text.is_empty() {
-            return None;
+            return Err(RuleParseError::Empty);
         }
+
         let Some(open) = text.find('(') else {
             if text.chars().any(char::is_whitespace) || text.contains(')') {
-                return None;
+                return Err(RuleParseError::InvalidToolName(text.to_string()));
             }
-            return Some(Self {
+            return Ok(Self {
                 tool: text.to_string(),
                 pattern: None,
+                specifier: None,
             });
         };
-        if !text.ends_with(')') {
-            return None;
-        }
+
         let tool = text[..open].trim();
-        let pattern = text[open + 1..text.len() - 1].trim();
         if tool.is_empty() || tool.chars().any(char::is_whitespace) {
-            return None;
+            return Err(RuleParseError::InvalidToolName(tool.to_string()));
         }
-        Some(Self {
+
+        let mut depth = 0usize;
+        let mut close_opt = None;
+        for (i, ch) in text[open..].char_indices() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    close_opt = Some(open + i);
+                    break;
+                }
+            }
+        }
+
+        let Some(close) = close_opt else {
+            return Err(RuleParseError::MissingClosingParen);
+        };
+
+        let trailing = text[close + 1..].trim();
+        if !trailing.is_empty() {
+            return Err(RuleParseError::TrailingCharacters(trailing.to_string()));
+        }
+
+        let inner = text[open + 1..close].trim();
+        if inner.is_empty() {
+            return Ok(Self {
+                tool: tool.to_string(),
+                pattern: None,
+                specifier: None,
+            });
+        }
+
+        let specifier = parse_specifier(inner)?;
+        let pattern = specifier.as_ref().map(|s| s.to_string());
+        Ok(Self {
             tool: tool.to_string(),
-            pattern: (!pattern.is_empty()).then(|| pattern.to_string()),
+            pattern,
+            specifier,
         })
     }
 
     pub fn matches(&self, tool: &str, subject: &str) -> bool {
+        self.matches_call(tool, &Value::Null, subject)
+    }
+
+    pub fn matches_call(&self, tool: &str, args: &Value, subject: &str) -> bool {
         if !self.tool_matches(tool) {
             return false;
         }
-        let Some(pattern) = &self.pattern else {
+        let Some(specifier) = &self.specifier else {
+            if let Some(pattern) = &self.pattern {
+                return self.matches_subject(tool, pattern, subject);
+            }
             return true;
         };
+        match specifier {
+            RuleSpecifier::Wildcard => !subject.is_empty() || !args.is_null(),
+            RuleSpecifier::Subject(pattern) => self.matches_subject(tool, pattern, subject),
+            RuleSpecifier::Parameter { param, value } => {
+                self.matches_parameter(tool, args, subject, param, value)
+            }
+        }
+    }
+
+    fn matches_subject(&self, _tool: &str, pattern: &str, subject: &str) -> bool {
         if subject.is_empty() {
             return false;
         }
@@ -156,12 +300,56 @@ impl PermissionRule {
         glob_matches(&fold(pattern), &fold(subject))
     }
 
-    fn tool_matches(&self, tool: &str) -> bool {
-        if self.tool == tool {
+    fn matches_parameter(
+        &self,
+        tool: &str,
+        args: &Value,
+        subject: &str,
+        param: &str,
+        value: &str,
+    ) -> bool {
+        // Safety rule:
+        // Never permit generic parameter matching for primary content fields whose interpretation
+        // is command/path-specific; keep dedicated matchers for shell command, filesystem path,
+        // and URL domain.
+        match param {
+            "command" => self.matches_subject(tool, value, subject),
+            "path" => self.matches_subject(tool, value, subject),
+            "domain" => {
+                let host = if tool_class(tool) == ToolClass::Network && tool == "web_fetch" {
+                    subject.to_string()
+                } else if let Some(url) = args.get("url").and_then(Value::as_str) {
+                    host_of(url)
+                } else {
+                    subject.to_string()
+                };
+                if host.is_empty() {
+                    return false;
+                }
+                glob_matches(&fold(value), &fold(&host))
+            }
+            _ => {
+                if let Some(arg_val) = get_param_value(args, param) {
+                    let actual_str = value_to_string(arg_val);
+                    glob_matches(&fold(value), &fold(&actual_str))
+                } else if let Some(subject_val) = subject.strip_prefix(&format!("{param}:")) {
+                    glob_matches(&fold(value), &fold(subject_val))
+                } else {
+                    // Omitted parameter in a call does NOT match a parameter-specific rule.
+                    false
+                }
+            }
+        }
+    }
+
+    pub fn tool_matches(&self, tool: &str) -> bool {
+        let rule_tool = normalize_tool_name(&self.tool);
+        let target_tool = normalize_tool_name(tool);
+        if rule_tool == target_tool {
             return true;
         }
-        if self.tool.chars().any(|ch| ch == '*' || ch == '?') {
-            glob_matches(&fold(&self.tool), &fold(tool))
+        if rule_tool.chars().any(|ch| ch == '*' || ch == '?') {
+            glob_matches(&rule_tool, &target_tool)
         } else {
             false
         }
@@ -170,10 +358,193 @@ impl PermissionRule {
 
 impl std::fmt::Display for PermissionRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.pattern {
-            Some(pattern) => write!(f, "{}({pattern})", self.tool),
-            None => f.write_str(&self.tool),
+        match &self.specifier {
+            Some(spec) => write!(f, "{}({spec})", self.tool),
+            None => match &self.pattern {
+                Some(pattern) => write!(f, "{}({pattern})", self.tool),
+                None => f.write_str(&self.tool),
+            },
         }
+    }
+}
+
+fn normalize_tool_name(tool: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = tool.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 && chars[i - 1] != '_' && !chars[i - 1].is_ascii_uppercase() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn is_windows_drive_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+fn is_url_with_scheme(s: &str) -> bool {
+    if let Some(pos) = s.find("://") {
+        let scheme = &s[..pos];
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+    } else {
+        false
+    }
+}
+
+fn is_valid_param_name(param: &str) -> bool {
+    if param.is_empty() {
+        return false;
+    }
+    if param
+        .chars()
+        .any(|c| c.is_whitespace() || c == '/' || c == '\\' || c == ':')
+    {
+        return false;
+    }
+    let first = param.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    // A dot is only valid if it's an indexed field access like "tasks[0].model"
+    if param.contains('.') && !param.contains('[') {
+        return false;
+    }
+    if param.contains('[') || param.contains('.') {
+        for part in param.split('.') {
+            if let Some(b_start) = part.find('[') {
+                if !part.ends_with(']') {
+                    return false;
+                }
+                let field = &part[..b_start];
+                if !field.is_empty()
+                    && !field
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return false;
+                }
+                let index_str = &part[b_start + 1..part.len() - 1];
+                if index_str.is_empty() || !index_str.chars().all(|c| c.is_ascii_digit()) {
+                    return false;
+                }
+            } else if !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return false;
+            }
+        }
+        true
+    } else {
+        param
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+}
+
+fn parse_specifier(inner: &str) -> Result<Option<RuleSpecifier>, RuleParseError> {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed == "*" {
+        return Ok(Some(RuleSpecifier::Wildcard));
+    }
+
+    if is_windows_drive_path(trimmed) || is_url_with_scheme(trimmed) {
+        return Ok(Some(RuleSpecifier::Subject(trimmed.to_string())));
+    }
+
+    if let Some(colon_pos) = trimmed.find(':') {
+        let param = trimmed[..colon_pos].trim();
+        let value = trimmed[colon_pos + 1..].trim();
+
+        if colon_pos == 0 || param.is_empty() {
+            return Err(RuleParseError::EmptyParameterName);
+        }
+
+        if is_valid_param_name(param) {
+            if value.is_empty() {
+                return Err(RuleParseError::EmptyParameterValue);
+            }
+            return Ok(Some(RuleSpecifier::Parameter {
+                param: param.to_string(),
+                value: value.to_string(),
+            }));
+        }
+    }
+
+    Ok(Some(RuleSpecifier::Subject(trimmed.to_string())))
+}
+
+fn get_param_value<'a>(args: &'a Value, param: &str) -> Option<&'a Value> {
+    if args.is_null() {
+        return None;
+    }
+    if let Some(val) = args.get(param) {
+        if !val.is_null() {
+            return Some(val);
+        }
+    }
+    if param.contains('[') || param.contains('.') {
+        if let Some(val) = resolve_json_path(args, param) {
+            if !val.is_null() {
+                return Some(val);
+            }
+        }
+    }
+    if let Some(tasks) = args.get("tasks").and_then(Value::as_array) {
+        if let Some(first_task) = tasks.first() {
+            if let Some(val) = first_task.get(param) {
+                if !val.is_null() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_json_path<'a>(mut current: &'a Value, path: &str) -> Option<&'a Value> {
+    for part in path.split('.') {
+        if let Some(bracket_start) = part.find('[') {
+            if !part.ends_with(']') {
+                return None;
+            }
+            let field = &part[..bracket_start];
+            let index_str = &part[bracket_start + 1..part.len() - 1];
+            let index: usize = index_str.parse().ok()?;
+            if !field.is_empty() {
+                current = current.get(field)?;
+            }
+            current = current.as_array()?.get(index)?;
+        } else {
+            current = current.get(part)?;
+        }
+    }
+    Some(current)
+}
+
+fn value_to_string(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -312,18 +683,11 @@ impl PermissionPolicy {
     /// Add deny rules preventing any mutation or tool execution targeting the parent checkout.
     pub fn deny_parent_checkout(&mut self, parent_cwd: &Path) {
         let parent_str = slashes(&normalize_lexically(parent_cwd));
-        self.deny.push(PermissionRule {
-            tool: "*".to_string(),
-            pattern: Some(format!("{parent_str}/**")),
-        });
-        self.deny.push(PermissionRule {
-            tool: "*".to_string(),
-            pattern: Some(format!("{parent_str}/*")),
-        });
-        self.deny.push(PermissionRule {
-            tool: "*".to_string(),
-            pattern: Some(parent_str),
-        });
+        self.deny
+            .push(PermissionRule::subject("*", format!("{parent_str}/**")));
+        self.deny
+            .push(PermissionRule::subject("*", format!("{parent_str}/*")));
+        self.deny.push(PermissionRule::subject("*", parent_str));
     }
 
     /// Decide one call. Deny rules win; `auto` and allow rules quiet the
@@ -351,11 +715,11 @@ impl PermissionPolicy {
         } else {
             vec![subject.clone()]
         };
-        if let Some(rule) = self
-            .deny
-            .iter()
-            .find(|rule| segments.iter().any(|segment| rule.matches(tool, segment)))
-        {
+        if let Some(rule) = self.deny.iter().find(|rule| {
+            segments
+                .iter()
+                .any(|segment| rule.matches_call(tool, args, segment))
+        }) {
             return PermissionVerdict::Deny {
                 reason: format!(
                     "Permission denied: `{}` matches the deny rule `{rule}`.",
@@ -383,8 +747,8 @@ impl PermissionPolicy {
                 .iter()
                 .chain(self.session_allow.iter())
                 .any(|rule| {
-                    rule.matches(tool, segment)
-                        && (rule.pattern.is_none() || !has_command_substitution(segment))
+                    rule.matches_call(tool, args, segment)
+                        && (rule.specifier.is_none() || !has_command_substitution(segment))
                 })
         }) {
             return PermissionVerdict::Allow;
@@ -656,29 +1020,29 @@ fn slashes(path: &Path) -> String {
 pub fn session_rule_for(tool: &str, subject: &str) -> PermissionRule {
     // A fetch grant covers the host, not the one page.
     if tool == "web_fetch" && !subject.is_empty() {
-        return PermissionRule {
-            tool: tool.to_string(),
-            pattern: Some(subject.to_string()),
-        };
+        return PermissionRule::subject(tool, subject);
     }
     if tool == "agent" && !subject.is_empty() {
+        let specifier = if let Some(val) = subject.strip_prefix("isolation:") {
+            Some(RuleSpecifier::Parameter {
+                param: "isolation".to_string(),
+                value: val.to_string(),
+            })
+        } else {
+            Some(RuleSpecifier::Subject(subject.to_string()))
+        };
         return PermissionRule {
             tool: tool.to_string(),
             pattern: Some(subject.to_string()),
+            specifier,
         };
     }
     if tool_class(tool) != ToolClass::Shell || subject.is_empty() {
-        return PermissionRule {
-            tool: tool.to_string(),
-            pattern: None,
-        };
+        return PermissionRule::bare(tool);
     }
     let mut words = subject.split_whitespace();
     let Some(program) = words.next() else {
-        return PermissionRule {
-            tool: tool.to_string(),
-            pattern: None,
-        };
+        return PermissionRule::bare(tool);
     };
     let mut prefix = program.to_string();
     // A script or a path has no subcommands: `./run.sh now` is one program.
@@ -692,10 +1056,7 @@ pub fn session_rule_for(tool: &str, subject: &str) -> PermissionRule {
             prefix.push_str(first);
         }
     }
-    PermissionRule {
-        tool: tool.to_string(),
-        pattern: Some(format!("{prefix} *")),
-    }
+    PermissionRule::subject(tool, format!("{prefix} *"))
 }
 
 #[cfg(test)]
@@ -717,14 +1078,16 @@ mod tests {
             PermissionRule::parse("bash"),
             Some(PermissionRule {
                 tool: "bash".into(),
-                pattern: None
+                pattern: None,
+                specifier: None,
             })
         );
         assert_eq!(
             PermissionRule::parse(" bash(git *) "),
             Some(PermissionRule {
                 tool: "bash".into(),
-                pattern: Some("git *".into())
+                pattern: Some("git *".into()),
+                specifier: Some(RuleSpecifier::Subject("git *".into())),
             })
         );
         assert_eq!(PermissionRule::parse("bash()").unwrap().pattern, None);
@@ -1263,5 +1626,326 @@ mod tests {
             policy.decide("c1", "write", &call, &wt_dir),
             PermissionVerdict::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn rules_parse_parameter_syntax() {
+        let r1 = PermissionRule::parse_with_diagnostic("Agent(model:anthropic/*)").unwrap();
+        assert_eq!(r1.tool, "Agent");
+        assert_eq!(
+            r1.specifier,
+            Some(RuleSpecifier::Parameter {
+                param: "model".into(),
+                value: "anthropic/*".into(),
+            })
+        );
+        assert_eq!(r1.to_string(), "Agent(model:anthropic/*)");
+
+        let r2 = PermissionRule::parse_with_diagnostic("Agent(isolation:worktree)").unwrap();
+        assert_eq!(
+            r2.specifier,
+            Some(RuleSpecifier::Parameter {
+                param: "isolation".into(),
+                value: "worktree".into(),
+            })
+        );
+
+        let r3 = PermissionRule::parse_with_diagnostic("Bash(run_in_background:true)").unwrap();
+        assert_eq!(
+            r3.specifier,
+            Some(RuleSpecifier::Parameter {
+                param: "run_in_background".into(),
+                value: "true".into(),
+            })
+        );
+
+        let r4 = PermissionRule::parse_with_diagnostic("Read(./secrets/**)").unwrap();
+        assert_eq!(
+            r4.specifier,
+            Some(RuleSpecifier::Subject("./secrets/**".into()))
+        );
+
+        let r5 = PermissionRule::parse_with_diagnostic("WebFetch(domain:example.com)").unwrap();
+        assert_eq!(
+            r5.specifier,
+            Some(RuleSpecifier::Parameter {
+                param: "domain".into(),
+                value: "example.com".into(),
+            })
+        );
+
+        // Windows drive letters must not be parsed as parameter rules
+        let r6 = PermissionRule::parse_with_diagnostic("Read(C:/secrets/**)").unwrap();
+        assert_eq!(
+            r6.specifier,
+            Some(RuleSpecifier::Subject("C:/secrets/**".into()))
+        );
+        let r7 = PermissionRule::parse_with_diagnostic("Read(C:\\secrets\\**)").unwrap();
+        assert_eq!(
+            r7.specifier,
+            Some(RuleSpecifier::Subject("C:\\secrets\\**".into()))
+        );
+
+        // URLs with schemes must not be parsed as parameter rules
+        let r8 = PermissionRule::parse_with_diagnostic("WebFetch(https://example.com/*)").unwrap();
+        assert_eq!(
+            r8.specifier,
+            Some(RuleSpecifier::Subject("https://example.com/*".into()))
+        );
+
+        // Host with port must not be parsed as parameter rule
+        let r9 = PermissionRule::parse_with_diagnostic("WebFetch(example.com:8080)").unwrap();
+        assert_eq!(
+            r9.specifier,
+            Some(RuleSpecifier::Subject("example.com:8080".into()))
+        );
+
+        // Wildcard and bare
+        let r10 = PermissionRule::parse_with_diagnostic("Agent(*)").unwrap();
+        assert_eq!(r10.specifier, Some(RuleSpecifier::Wildcard));
+        assert_eq!(r10.to_string(), "Agent(*)");
+
+        let r11 = PermissionRule::parse_with_diagnostic("Agent").unwrap();
+        assert_eq!(r11.specifier, None);
+        assert_eq!(r11.to_string(), "Agent");
+    }
+
+    #[test]
+    fn rules_parse_malformed_diagnostics() {
+        assert_eq!(
+            PermissionRule::parse_with_diagnostic(""),
+            Err(RuleParseError::Empty)
+        );
+        assert_eq!(
+            PermissionRule::parse_with_diagnostic("   "),
+            Err(RuleParseError::Empty)
+        );
+        assert_eq!(
+            PermissionRule::parse_with_diagnostic("Tool("),
+            Err(RuleParseError::MissingClosingParen)
+        );
+        assert_eq!(
+            PermissionRule::parse_with_diagnostic("Tool(param:)"),
+            Err(RuleParseError::EmptyParameterValue)
+        );
+        assert_eq!(
+            PermissionRule::parse_with_diagnostic("Tool(:value)"),
+            Err(RuleParseError::EmptyParameterName)
+        );
+        assert_eq!(
+            PermissionRule::parse_with_diagnostic("Tool(param:value)extra"),
+            Err(RuleParseError::TrailingCharacters("extra".into()))
+        );
+        assert_eq!(
+            PermissionRule::parse_with_diagnostic("two words"),
+            Err(RuleParseError::InvalidToolName("two words".into()))
+        );
+        assert_eq!(
+            PermissionRule::parse_with_diagnostic("Tool(param:value))"),
+            Err(RuleParseError::TrailingCharacters(")".into()))
+        );
+    }
+
+    #[test]
+    fn parameter_aware_wildcard_matching() {
+        let root = cwd();
+        let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+        policy
+            .allow
+            .push(PermissionRule::parse("Agent(model:*)").unwrap());
+
+        // Model present -> matches
+        let call_with_model = json!({"prompt": "hi", "model": "anthropic/claude-3-5-sonnet"});
+        assert_eq!(
+            policy.decide("c1", "agent", &call_with_model, &root),
+            PermissionVerdict::Allow
+        );
+
+        // Model omitted -> does not match
+        let call_without_model = json!({"prompt": "hi"});
+        assert!(matches!(
+            policy.decide("c2", "agent", &call_without_model, &root),
+            PermissionVerdict::Ask(_)
+        ));
+
+        // Agent(*) matches even without model
+        let mut wildcard_policy = PermissionPolicy::new(PermissionMode::Ask);
+        wildcard_policy
+            .allow
+            .push(PermissionRule::parse("Agent(*)").unwrap());
+        assert_eq!(
+            wildcard_policy.decide("c3", "agent", &call_without_model, &root),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn parameter_aware_omitted_parameter() {
+        let root = cwd();
+        let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+        policy
+            .allow
+            .push(PermissionRule::parse("Bash(run_in_background:true)").unwrap());
+
+        // Omitted parameter -> does not match
+        let call_sync = json!({"command": "cargo test"});
+        assert!(matches!(
+            policy.decide("c1", "bash", &call_sync, &root),
+            PermissionVerdict::Ask(_)
+        ));
+
+        // Provided true -> matches
+        let call_bg = json!({"command": "cargo test", "run_in_background": true});
+        assert_eq!(
+            policy.decide("c2", "bash", &call_bg, &root),
+            PermissionVerdict::Allow
+        );
+
+        // Provided false -> does not match
+        let call_not_bg = json!({"command": "cargo test", "run_in_background": false});
+        assert!(matches!(
+            policy.decide("c3", "bash", &call_not_bg, &root),
+            PermissionVerdict::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn parameter_aware_exact_value() {
+        let root = cwd();
+        let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+        policy
+            .allow
+            .push(PermissionRule::parse("Agent(isolation:worktree)").unwrap());
+
+        let call_wt = json!({"prompt": "edit", "isolation": "worktree"});
+        assert_eq!(
+            policy.decide("c1", "agent", &call_wt, &root),
+            PermissionVerdict::Allow
+        );
+
+        let call_shared = json!({"prompt": "edit", "isolation": "shared"});
+        assert!(matches!(
+            policy.decide("c2", "agent", &call_shared, &root),
+            PermissionVerdict::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn deny_precedence_at_every_layer() {
+        let root = cwd();
+
+        // 1. Deny beats allow for matching parameter call
+        let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+        policy
+            .allow
+            .push(PermissionRule::parse("Agent(model:anthropic/*)").unwrap());
+        policy
+            .deny
+            .push(PermissionRule::parse("Agent(model:anthropic/claude-2)").unwrap());
+
+        let call_allowed = json!({"prompt": "hi", "model": "anthropic/claude-3-5-sonnet"});
+        assert_eq!(
+            policy.decide("c1", "agent", &call_allowed, &root),
+            PermissionVerdict::Allow
+        );
+
+        let call_denied = json!({"prompt": "hi", "model": "anthropic/claude-2"});
+        assert!(matches!(
+            policy.decide("c2", "agent", &call_denied, &root),
+            PermissionVerdict::Deny { .. }
+        ));
+
+        // 2. Deny beats Auto mode
+        let mut auto_policy = PermissionPolicy::new(PermissionMode::Auto);
+        auto_policy
+            .deny
+            .push(PermissionRule::parse("Bash(run_in_background:true)").unwrap());
+
+        let call_bg = json!({"command": "cargo build", "run_in_background": true});
+        assert!(matches!(
+            auto_policy.decide("c3", "bash", &call_bg, &root),
+            PermissionVerdict::Deny { .. }
+        ));
+
+        let call_sync = json!({"command": "cargo build"});
+        assert_eq!(
+            auto_policy.decide("c4", "bash", &call_sync, &root),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn parameter_aware_nested_task_matching() {
+        let root = cwd();
+        let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+        policy
+            .allow
+            .push(PermissionRule::parse("Agent(model:anthropic/*)").unwrap());
+        policy
+            .allow
+            .push(PermissionRule::parse("Agent(isolation:worktree)").unwrap());
+
+        // Tasks array element matching
+        let call_with_tasks = json!({
+            "tasks": [
+                {"prompt": "research", "model": "anthropic/claude-3-haiku", "isolation": "worktree"}
+            ]
+        });
+        assert_eq!(
+            policy.decide("c1", "agent", &call_with_tasks, &root),
+            PermissionVerdict::Allow
+        );
+
+        // Direct indexed parameter
+        let mut policy2 = PermissionPolicy::new(PermissionMode::Ask);
+        policy2
+            .allow
+            .push(PermissionRule::parse("Agent(tasks[0].model:anthropic/*)").unwrap());
+        assert_eq!(
+            policy2.decide("c2", "agent", &call_with_tasks, &root),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn dedicated_matchers_for_primary_content_fields() {
+        let root = cwd();
+
+        // command matcher
+        let mut p1 = PermissionPolicy::new(PermissionMode::Ask);
+        p1.allow
+            .push(PermissionRule::parse("Bash(command:git status *)").unwrap());
+        assert_eq!(
+            p1.decide(
+                "c1",
+                "bash",
+                &json!({"command": "git status --short"}),
+                &root
+            ),
+            PermissionVerdict::Allow
+        );
+
+        // path matcher
+        let mut p2 = PermissionPolicy::new(PermissionMode::Ask);
+        p2.allow
+            .push(PermissionRule::parse("Read(path:src/**)").unwrap());
+        assert_eq!(
+            p2.decide("c2", "read", &json!({"path": "src/lib.rs"}), &root),
+            PermissionVerdict::Allow
+        );
+
+        // domain matcher
+        let mut p3 = PermissionPolicy::new(PermissionMode::Ask);
+        p3.allow
+            .push(PermissionRule::parse("WebFetch(domain:*.example.com)").unwrap());
+        assert_eq!(
+            p3.decide(
+                "c3",
+                "web_fetch",
+                &json!({"url": "https://api.example.com/data"}),
+                &root
+            ),
+            PermissionVerdict::Allow
+        );
     }
 }
