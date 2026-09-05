@@ -1453,13 +1453,51 @@ fn run_nested_subagent(
     mcp: &davinci_agent::McpRegistry,
     req: &davinci_agent::SubagentRequest,
 ) -> Result<String, String> {
-    let mut child = Agent::new(format!(
-        "You are a scoped worker. Answer the prompt using only the tools you have. Do not call agent. \
-         Reply with the answer itself — findings, file paths with line numbers, short quotes — not a narrative of what you did.\n{}",
-        davinci_agent::TOOL_USE_STRATEGY
-    ));
+    let settings = load_merged_settings(&default_agent_dir(), cwd);
+    let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
+    let profile = if let Some(agent_name) = &req.agent {
+        let profiles = agent_profiles::discover_agent_profiles(cwd, None, trusted);
+        let found = profiles.into_iter().find(|p| p.name == *agent_name);
+        match found {
+            Some(p) => Some(p),
+            None => return Err(format!("Agent profile '{agent_name}' not found")),
+        }
+    } else {
+        None
+    };
+
+    if let Some(profile) = &profile {
+        let parent_mode = req
+            .parent_permission_mode
+            .unwrap_or(davinci_agent::PermissionMode::ReadOnly);
+        agent_profiles::validate_profile_containment(profile, parent_mode)?;
+    }
+
+    let system_prompt = if let Some(profile) = &profile {
+        format!(
+            "{}\n{}",
+            profile.system_prompt,
+            davinci_agent::TOOL_USE_STRATEGY
+        )
+    } else {
+        format!(
+            "You are a scoped worker. Answer the prompt using only the tools you have. Do not call agent. \
+             Reply with the answer itself — findings, file paths with line numbers, short quotes — not a narrative of what you did.\n{}",
+            davinci_agent::TOOL_USE_STRATEGY
+        )
+    };
+    let mut child = Agent::new(system_prompt);
     child.cwd = cwd.to_path_buf();
-    let mut tools = req.tools.clone();
+
+    let mut tools = if let Some(profile) = &profile {
+        if !profile.tools.is_empty() {
+            profile.tools.clone()
+        } else {
+            req.tools.clone()
+        }
+    } else {
+        req.tools.clone()
+    };
     crate::native_extensions::token_governor::ensure_governor_recovery_tool(&mut tools);
     child.tools = tools.clone();
     child.tool_registry = tools;
@@ -1467,21 +1505,42 @@ fn run_nested_subagent(
     // A worker's output is bounded by the parent; its own overflow has
     // nowhere useful to go.
     child.evidence = None;
-    // The worker's tool list is already read-only; the policy says so too,
-    // so a tool that slipped the list (an extension's, an MCP server's) is
-    // refused rather than run under the library's `auto` default. There is
-    // no approver: the worker cannot ask, and never should.
-    child.permissions = Arc::new(Mutex::new(davinci_agent::PermissionPolicy::new(
-        davinci_agent::PermissionMode::ReadOnly,
-    )));
+    let child_mode = if let Some(profile) = &profile {
+        davinci_agent::PermissionMode::parse(&profile.permission_mode)
+            .unwrap_or(davinci_agent::PermissionMode::ReadOnly)
+    } else {
+        davinci_agent::PermissionMode::ReadOnly
+    };
+    child.permissions = Arc::new(Mutex::new(davinci_agent::PermissionPolicy::new(child_mode)));
     child.approver = None;
     // `mcp_read` and read-only MCP tools need the parent's connections.
     child.tool_context.mcp = mcp.clone();
     child.abort_signal = req.abort.clone();
     apply_resolved_models(parsed, &mut child)?;
-    // Follow the parent's current model, not the launch flags: `/model` and
-    // a restored session both move it.
-    if let (Some(provider), Some(model_id)) = (&req.provider, &req.model_id) {
+
+    let model_req = req.model_override.as_deref().or_else(|| {
+        profile.as_ref().and_then(|p| {
+            if p.model != "inherit" && !p.model.is_empty() {
+                Some(p.model.as_str())
+            } else {
+                None
+            }
+        })
+    });
+    if let Some(target) = model_req {
+        let parts: Vec<&str> = target.splitn(2, '/').collect();
+        let (prov, mid) = if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            ("", parts[0])
+        };
+        let snapshot = load_model_runtime(parsed);
+        if let Some(model) = davinci_ai::find_model(&snapshot.all, prov, mid) {
+            child.provider = model.provider.clone();
+            child.model_id = model.id.clone();
+            child.context_window = model.context_window;
+        }
+    } else if let (Some(provider), Some(model_id)) = (&req.provider, &req.model_id) {
         if !model_id.is_empty() && (provider != &child.provider || model_id != &child.model_id) {
             let snapshot = load_model_runtime(parsed);
             if let Some(model) = davinci_ai::find_model(&snapshot.all, provider, model_id) {
@@ -1489,6 +1548,12 @@ fn run_nested_subagent(
                 child.model_id = model.id.clone();
                 child.context_window = model.context_window;
             }
+        }
+    }
+
+    if let Some(profile) = &profile {
+        if let Some(max_tokens) = profile.max_context_tokens {
+            child.context_window = max_tokens as u64;
         }
     }
     child.prompt(&req.prompt);

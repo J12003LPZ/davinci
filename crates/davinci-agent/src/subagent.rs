@@ -7,6 +7,10 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::permission::{tool_class, PermissionMode, ToolClass};
+use crate::runtime::{
+    AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RuntimeHandle,
+};
 use crate::tools::{ToolError, ToolResult};
 
 pub const PLAN_MODE_APPENDIX: &str =
@@ -43,13 +47,58 @@ pub const SUBAGENT_OUTPUT_CAP: usize = 50 * 1024;
 pub const MAX_PARALLEL_TASKS: usize = 8;
 pub const MAX_TASK_CONCURRENCY: usize = 4;
 
+/// Execution and concurrency lifecycle mode for spawned agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentSpawnMode {
+    #[default]
+    Oneshot,
+    Background,
+    Teammate,
+}
+
+impl std::fmt::Display for AgentSpawnMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oneshot => write!(f, "oneshot"),
+            Self::Background => write!(f, "background"),
+            Self::Teammate => write!(f, "teammate"),
+        }
+    }
+}
+
+impl std::str::FromStr for AgentSpawnMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "oneshot" | "one_shot" | "one-shot" => Ok(Self::Oneshot),
+            "background" | "bg" => Ok(Self::Background),
+            "teammate" | "persistent" => Ok(Self::Teammate),
+            other => Err(format!("unknown agent spawn mode: {other}")),
+        }
+    }
+}
+
 pub fn tool_parameters() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "prompt": {"type": "string", "description": "The question for one worker. Omit when passing tasks."},
-            "tools": {"type": "array", "items": {"type": "string"}, "description": "Allow-list of read-only tools for the worker"},
+            "prompt": {"type": "string", "description": "The question or instruction for one worker. Omit when passing tasks."},
+            "tools": {"type": "array", "items": {"type": "string"}, "description": "Allow-list of tools for the worker"},
             "description": {"type": "string", "description": "A few words naming the task, shown in the UI"},
+            "agent": {"type": "string", "description": "Name of an agent profile from .davinci/agents/*.md or ~/.davinci/agent/agents/*.md"},
+            "mode": {
+                "type": "string",
+                "enum": ["oneshot", "background", "teammate"],
+                "description": "Spawn mode: 'oneshot' (synchronous wait, default), 'background' (async worker), or 'teammate' (persistent collaborator)"
+            },
+            "model": {"type": "string", "description": "Optional model override in provider/model format"},
+            "isolation": {
+                "type": "string",
+                "enum": ["shared", "worktree"],
+                "description": "Workspace isolation: 'shared' (default cwd) or 'worktree' (isolated git worktree)"
+            },
+            "name": {"type": "string", "description": "Custom instance name for the spawned agent"},
             "tasks": {
                 "type": "array",
                 "maxItems": MAX_PARALLEL_TASKS,
@@ -59,7 +108,12 @@ pub fn tool_parameters() -> Value {
                     "properties": {
                         "prompt": {"type": "string"},
                         "description": {"type": "string"},
-                        "tools": {"type": "array", "items": {"type": "string"}}
+                        "tools": {"type": "array", "items": {"type": "string"}},
+                        "agent": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["oneshot", "background", "teammate"]},
+                        "model": {"type": "string"},
+                        "isolation": {"type": "string", "enum": ["shared", "worktree"]},
+                        "name": {"type": "string"}
                     },
                     "required": ["prompt"]
                 }
@@ -80,7 +134,21 @@ pub struct SubagentRequest {
     /// The parent's abort flag: an interrupted turn stops the worker too.
     pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Hierarchical runtime cancellation token.
-    pub cancellation_token: Option<crate::runtime::CancellationToken>,
+    pub cancellation_token: Option<CancellationToken>,
+    /// Profile name to load from agent profiles if specified.
+    pub agent: Option<String>,
+    /// Spawn mode: oneshot, background, teammate.
+    pub mode: AgentSpawnMode,
+    /// Provider/model override.
+    pub model_override: Option<String>,
+    /// Isolation mode: shared or worktree.
+    pub isolation: Option<String>,
+    /// Custom instance name.
+    pub instance_name: Option<String>,
+    /// Registered runtime agent identity.
+    pub runtime_agent_id: Option<AgentId>,
+    /// Parent permission mode to enforce permission containment.
+    pub parent_permission_mode: Option<PermissionMode>,
 }
 
 type SubagentFn = dyn Fn(&SubagentRequest) -> Result<String, String> + Send + Sync;
@@ -109,7 +177,11 @@ impl SubagentRunner {
     }
 }
 
-pub fn scoped_tools(requested: Option<&[String]>, parent: &[String]) -> Vec<String> {
+pub fn scoped_tools_with_policy(
+    requested: Option<&[String]>,
+    parent: &[String],
+    allow_mutation: bool,
+) -> Vec<String> {
     let wanted: Vec<String> = match requested {
         Some(list) if !list.is_empty() => list.to_vec(),
         _ => DEFAULT_SUBAGENT_TOOLS
@@ -117,21 +189,23 @@ pub fn scoped_tools(requested: Option<&[String]>, parent: &[String]) -> Vec<Stri
             .map(|name| (*name).to_string())
             .collect(),
     };
-    // The worker is read-only by class, not by name: an extension or MCP
-    // tool the policy cannot classify (`Other`) could change anything, so
-    // only tools known to read or reach the network go through. The name
-    // list stays as the documented floor.
     wanted
         .into_iter()
         .filter(|name| parent.iter().any(|known| known == name))
-        .filter(|name| !MUTATION_TOOLS.contains(&name.as_str()))
         .filter(|name| {
-            matches!(
-                crate::permission::tool_class(name),
-                crate::permission::ToolClass::Read | crate::permission::ToolClass::Network
-            )
+            if allow_mutation {
+                // Do not allow nested agent to prevent infinite fork recursion
+                name != "agent"
+            } else {
+                !MUTATION_TOOLS.contains(&name.as_str())
+                    && matches!(tool_class(name), ToolClass::Read | ToolClass::Network)
+            }
         })
         .collect()
+}
+
+pub fn scoped_tools(requested: Option<&[String]>, parent: &[String]) -> Vec<String> {
+    scoped_tools_with_policy(requested, parent, false)
 }
 
 /// What the worker inherits from the parent turn.
@@ -140,7 +214,10 @@ pub struct SubagentParent {
     pub provider: Option<String>,
     pub model_id: Option<String>,
     pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
-    pub cancellation_token: Option<crate::runtime::CancellationToken>,
+    pub cancellation_token: Option<CancellationToken>,
+    pub runtime: Option<RuntimeHandle>,
+    pub permission_mode: Option<PermissionMode>,
+    pub agent_id: Option<AgentId>,
 }
 
 /// One worker's request as the model wrote it.
@@ -148,6 +225,11 @@ struct TaskSpec {
     prompt: String,
     tools: Option<Vec<String>>,
     description: Option<String>,
+    agent: Option<String>,
+    mode: AgentSpawnMode,
+    model: Option<String>,
+    isolation: Option<String>,
+    name: Option<String>,
 }
 
 fn task_spec(input: &Value) -> Result<TaskSpec, ToolError> {
@@ -170,10 +252,36 @@ fn task_spec(input: &Value) -> Result<TaskSpec, ToolError> {
         .get("description")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let agent = input
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mode = input
+        .get("mode")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<AgentSpawnMode>().ok())
+        .unwrap_or(AgentSpawnMode::Oneshot);
+    let model = input
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let isolation = input
+        .get("isolation")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok(TaskSpec {
         prompt: prompt.to_string(),
         tools,
         description,
+        agent,
+        mode,
+        model,
+        isolation,
+        name,
     })
 }
 
@@ -212,31 +320,196 @@ pub fn run_tool(
         }
         _ => vec![task_spec(input)?],
     };
-    let requests: Vec<SubagentRequest> = specs
-        .iter()
-        .map(|spec| {
-            let child_token = parent.cancellation_token.as_ref().map(|p| p.child_token());
-            let abort = child_token
-                .as_ref()
-                .map(|t| t.as_atomic_bool())
-                .or_else(|| parent.abort.clone());
-            SubagentRequest {
-                prompt: spec.prompt.clone(),
-                tools: scoped_tools(spec.tools.as_deref(), parent_tools),
-                description: spec.description.clone(),
-                provider: parent.provider.clone(),
-                model_id: parent.model_id.clone(),
-                abort,
-                cancellation_token: child_token,
+
+    let is_parent_readonly = parent.permission_mode == Some(PermissionMode::ReadOnly);
+    for spec in &specs {
+        if is_parent_readonly {
+            if let Some(tools) = &spec.tools {
+                for t in tools {
+                    if MUTATION_TOOLS.contains(&t.as_str())
+                        || !matches!(tool_class(t), ToolClass::Read | ToolClass::Network)
+                    {
+                        return Err(ToolError::Failed(format!(
+                            "Parent permission mode 'read-only' cannot grant mutation tool '{t}'"
+                        )));
+                    }
+                }
             }
-        })
-        .collect();
+        }
+    }
+
+    let allow_mutation = matches!(
+        parent.permission_mode,
+        Some(PermissionMode::Edits | PermissionMode::Auto)
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let mut requests: Vec<SubagentRequest> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let child_agent_id = AgentId::new();
+        let child_token = parent.cancellation_token.as_ref().map(|p| p.child_token());
+        let abort = child_token
+            .as_ref()
+            .map(|t| t.as_atomic_bool())
+            .or_else(|| parent.abort.clone());
+        let scoped = scoped_tools_with_policy(spec.tools.as_deref(), parent_tools, allow_mutation);
+
+        let kind = match spec.mode {
+            AgentSpawnMode::Oneshot => AgentKind::Subagent,
+            AgentSpawnMode::Background => AgentKind::Background,
+            AgentSpawnMode::Teammate => AgentKind::Teammate,
+        };
+
+        if let Some(rt) = &parent.runtime {
+            let agent_name = spec
+                .name
+                .clone()
+                .or_else(|| spec.agent.clone())
+                .unwrap_or_else(|| format!("subagent-{}", &child_agent_id.to_string()[..8]));
+
+            let record = AgentRecord {
+                id: child_agent_id,
+                run_id: rt.run_id,
+                parent: parent.agent_id.or(Some(rt.agent_id)),
+                kind,
+                name: agent_name,
+                provider: spec
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.split('/').next())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| parent.provider.clone().unwrap_or_default()),
+                model_id: spec
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.split('/').nth(1))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| parent.model_id.clone().unwrap_or_default()),
+                cwd: std::env::current_dir().unwrap_or_default(),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: spec.isolation.as_ref().and_then(|iso| {
+                    if iso == "worktree" {
+                        Some(std::path::PathBuf::from("worktree"))
+                    } else {
+                        None
+                    }
+                }),
+                started_ms: now,
+                updated_ms: now,
+            };
+            let _ = rt.registry.register_agent(record);
+            let _ = rt.registry.transition(child_agent_id, AgentState::Running);
+        }
+
+        requests.push(SubagentRequest {
+            prompt: spec.prompt.clone(),
+            tools: scoped,
+            description: spec.description.clone(),
+            provider: parent.provider.clone(),
+            model_id: parent.model_id.clone(),
+            abort,
+            cancellation_token: child_token,
+            agent: spec.agent.clone(),
+            mode: spec.mode,
+            model_override: spec.model.clone(),
+            isolation: spec.isolation.clone(),
+            instance_name: spec.name.clone(),
+            runtime_agent_id: Some(child_agent_id),
+            parent_permission_mode: parent.permission_mode,
+        });
+    }
+
+    let any_async = requests.iter().any(|r| r.mode != AgentSpawnMode::Oneshot);
+    if any_async {
+        let mut launched_ids = Vec::new();
+        for req in &requests {
+            let req_clone = req.clone();
+            let runner_clone = runner.clone();
+            let rt_clone = parent.runtime.clone();
+            let cid = req.runtime_agent_id.unwrap_or_default();
+            std::thread::Builder::new()
+                .name(format!("agent-worker-{cid}"))
+                .spawn(move || {
+                    let outcome = runner_clone.run(&req_clone);
+                    if let Some(rt) = &rt_clone {
+                        let next_state = match outcome {
+                            Ok(_) => AgentState::Completed,
+                            Err(_) => AgentState::Failed,
+                        };
+                        let _ = rt.registry.transition(cid, next_state);
+                    }
+                })
+                .map_err(|e| {
+                    ToolError::Failed(format!("failed to spawn background agent thread: {e}"))
+                })?;
+            launched_ids.push(cid);
+        }
+
+        if requests.len() == 1 {
+            let req = &requests[0];
+            let aid = launched_ids[0];
+            return Ok(ToolResult {
+                content: format!(
+                    "Spawned {} agent '{}' ({aid})",
+                    req.mode,
+                    req.instance_name
+                        .as_deref()
+                        .or(req.agent.as_deref())
+                        .unwrap_or("subagent")
+                ),
+                is_error: false,
+                details: Some(serde_json::json!({
+                    "agentId": aid.to_string(),
+                    "mode": req.mode.to_string(),
+                    "status": "running"
+                })),
+            });
+        } else {
+            let agents_json: Vec<_> = requests
+                .iter()
+                .zip(&launched_ids)
+                .map(|(r, id)| {
+                    serde_json::json!({
+                        "agentId": id.to_string(),
+                        "mode": r.mode.to_string(),
+                        "status": "running"
+                    })
+                })
+                .collect();
+            return Ok(ToolResult {
+                content: format!("Spawned {} background/teammate agents", requests.len()),
+                is_error: false,
+                details: Some(serde_json::json!({
+                    "agents": agents_json,
+                    "status": "running"
+                })),
+            });
+        }
+    }
+
     if requests.len() == 1 {
-        let text = runner.run(&requests[0]).map_err(ToolError::Failed)?;
+        let aid = requests[0].runtime_agent_id.unwrap_or_default();
+        let outcome = runner.run(&requests[0]);
+        if let Some(rt) = &parent.runtime {
+            let next = match &outcome {
+                Ok(_) => AgentState::Completed,
+                Err(_) => AgentState::Failed,
+            };
+            let _ = rt.registry.transition(aid, next);
+        }
+        let text = outcome.map_err(ToolError::Failed)?;
         return Ok(ToolResult {
             content: cap_output(text, SUBAGENT_OUTPUT_CAP),
             is_error: false,
-            details: None,
+            details: Some(serde_json::json!({
+                "agentId": aid.to_string(),
+                "mode": "oneshot",
+                "status": "completed"
+            })),
         });
     }
     // Several workers: fan out over the scheduler's parallel lane, at most
@@ -244,9 +517,13 @@ pub fn run_tool(
     // in task order. One failed worker does not hide the others' answers.
     let calls = requests
         .iter()
-        .map(|request| crate::scheduler::ScheduledCall {
-            lane: crate::scheduler::ToolLane::Parallel,
-            run: Box::new(move || runner.run(request)),
+        .map(|request| {
+            let req = request.clone();
+            let r = runner.clone();
+            crate::scheduler::ScheduledCall {
+                lane: crate::scheduler::ToolLane::Parallel,
+                run: Box::new(move || r.run(&req)),
+            }
         })
         .collect();
     let parent_abort = parent
@@ -261,6 +538,17 @@ pub fn run_tool(
         parent_abort.as_deref(),
         |_| {},
     );
+    if let Some(rt) = &parent.runtime {
+        for (index, req) in requests.iter().enumerate() {
+            if let Some(aid) = req.runtime_agent_id {
+                let next = match outcomes.get(index) {
+                    Some(Ok(_)) => AgentState::Completed,
+                    _ => AgentState::Failed,
+                };
+                let _ = rt.registry.transition(aid, next);
+            }
+        }
+    }
     let per_task_cap = SUBAGENT_OUTPUT_CAP / requests.len().max(1);
     let mut sections = Vec::with_capacity(requests.len());
     let mut failures = 0;
@@ -487,5 +775,136 @@ mod tests {
         for child in &children {
             assert!(child.is_cancelled());
         }
+    }
+
+    #[test]
+    fn test_agent_spawn_mode_parse_and_display() {
+        assert_eq!(
+            "oneshot".parse::<AgentSpawnMode>().unwrap(),
+            AgentSpawnMode::Oneshot
+        );
+        assert_eq!(
+            "background".parse::<AgentSpawnMode>().unwrap(),
+            AgentSpawnMode::Background
+        );
+        assert_eq!(
+            "bg".parse::<AgentSpawnMode>().unwrap(),
+            AgentSpawnMode::Background
+        );
+        assert_eq!(
+            "teammate".parse::<AgentSpawnMode>().unwrap(),
+            AgentSpawnMode::Teammate
+        );
+        assert_eq!(
+            "persistent".parse::<AgentSpawnMode>().unwrap(),
+            AgentSpawnMode::Teammate
+        );
+        assert_eq!(AgentSpawnMode::Oneshot.to_string(), "oneshot");
+        assert_eq!(AgentSpawnMode::Background.to_string(), "background");
+        assert_eq!(AgentSpawnMode::Teammate.to_string(), "teammate");
+    }
+
+    #[test]
+    fn test_mutation_tools_rejected_in_readonly_mode() {
+        let runner = SubagentRunner::new(|_| Ok("done".into()));
+        let parent = SubagentParent {
+            permission_mode: Some(PermissionMode::ReadOnly),
+            ..SubagentParent::default()
+        };
+
+        let err = run_tool(
+            &json!({
+                "prompt": "write a file",
+                "tools": ["read", "write"]
+            }),
+            &["read".into(), "write".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("cannot grant mutation tool 'write'"));
+    }
+
+    #[test]
+    fn test_subagent_registers_in_runtime_registry() {
+        let bus = crate::runtime::RuntimeBus::default();
+        let handle = RuntimeHandle::new(crate::runtime::RunId::new(), AgentId::new(), bus);
+        let runner = SubagentRunner::new(|_| Ok("registered".into()));
+        let parent = SubagentParent {
+            runtime: Some(handle.clone()),
+            agent_id: Some(handle.agent_id),
+            ..SubagentParent::default()
+        };
+
+        let res = run_tool(
+            &json!({
+                "prompt": "inspect",
+                "name": "inspector-1"
+            }),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+
+        let details = res.details.unwrap();
+        let agent_id_str = details["agentId"].as_str().unwrap();
+        let agent_id: AgentId = agent_id_str.parse().unwrap();
+
+        let record = handle
+            .registry
+            .get(&agent_id)
+            .expect("registered in registry");
+        assert_eq!(record.name, "inspector-1");
+        assert_eq!(record.state, AgentState::Completed);
+    }
+
+    #[test]
+    fn test_background_mode_returns_immediately_with_agent_id() {
+        let bus = crate::runtime::RuntimeBus::default();
+        let handle = RuntimeHandle::new(crate::runtime::RunId::new(), AgentId::new(), bus);
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exec_clone = executed.clone();
+
+        let runner = SubagentRunner::new(move |_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            exec_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("async-done".into())
+        });
+
+        let parent = SubagentParent {
+            runtime: Some(handle.clone()),
+            agent_id: Some(handle.agent_id),
+            ..SubagentParent::default()
+        };
+
+        let res = run_tool(
+            &json!({
+                "prompt": "run in bg",
+                "mode": "background",
+                "name": "bg-worker"
+            }),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+
+        // Should return immediately before the thread sleeps 50ms
+        let details = res.details.unwrap();
+        assert_eq!(details["mode"], "background");
+        assert_eq!(details["status"], "running");
+        let aid: AgentId = details["agentId"].as_str().unwrap().parse().unwrap();
+        let record = handle.registry.get(&aid).expect("record exists");
+        assert_eq!(record.name, "bg-worker");
+
+        // Wait for thread to finish
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(executed.load(std::sync::atomic::Ordering::SeqCst));
+        let record_after = handle.registry.get(&aid).expect("record exists");
+        assert_eq!(record_after.state, AgentState::Completed);
     }
 }

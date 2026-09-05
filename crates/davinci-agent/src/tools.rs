@@ -214,7 +214,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "agent".into(),
-            description: "Start nested read-only workers with their own context. Pass a prompt (one worker), or tasks: [{prompt, description?, tools?}] for up to 8 workers that run concurrently. Workers cannot edit, run a shell, or start workers; each returns its last reply. Use it for research that would otherwise fill your context: give each worker a self-contained question and ask for a short answer with file paths.".into(),
+            description: "Start nested workers or persistent teammates with their own context. Pass a prompt (one worker), or tasks: [{prompt, description?, tools?}] for up to 8 workers that run concurrently. Supports custom agent profiles (via `agent`), execution modes (`oneshot`, `background`, `teammate`), model overrides, and isolation.".into(),
             parameters: crate::subagent::tool_parameters(),
         },
         AgentTool {

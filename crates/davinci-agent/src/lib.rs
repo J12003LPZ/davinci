@@ -70,8 +70,8 @@ pub use skills::{
 };
 pub use stats::{RunStats, SharedCounters};
 pub use subagent::{
-    scoped_tools, SubagentRequest, SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX,
-    PLAN_MODE_DENIAL,
+    scoped_tools, scoped_tools_with_policy, AgentSpawnMode, SubagentParent, SubagentRequest,
+    SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX, PLAN_MODE_DENIAL,
 };
 pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,

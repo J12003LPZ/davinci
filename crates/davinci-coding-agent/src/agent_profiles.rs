@@ -338,6 +338,48 @@ pub fn format_agent_profiles_status(
     out
 }
 
+/// Validates that a profile does not exceed the parent's permission mode.
+pub fn validate_profile_containment(
+    profile: &AgentProfile,
+    parent_mode: davinci_agent::PermissionMode,
+) -> Result<(), String> {
+    let profile_mode = davinci_agent::PermissionMode::parse(&profile.permission_mode)
+        .unwrap_or(davinci_agent::PermissionMode::ReadOnly);
+
+    let has_mutation_tools = profile.tools.iter().any(|t| {
+        !matches!(
+            davinci_agent::tool_class(t),
+            davinci_agent::ToolClass::Read | davinci_agent::ToolClass::Network
+        )
+    });
+
+    if parent_mode == davinci_agent::PermissionMode::ReadOnly
+        && (profile_mode != davinci_agent::PermissionMode::ReadOnly || has_mutation_tools)
+    {
+        return Err(format!(
+            "Parent permission mode 'read-only' cannot grant mutation-capable profile '{}'",
+            profile.name
+        ));
+    }
+
+    fn mode_rank(m: davinci_agent::PermissionMode) -> u8 {
+        match m {
+            davinci_agent::PermissionMode::ReadOnly => 0,
+            davinci_agent::PermissionMode::Ask => 1,
+            davinci_agent::PermissionMode::Edits => 2,
+            davinci_agent::PermissionMode::Auto => 3,
+        }
+    }
+    if mode_rank(profile_mode) > mode_rank(parent_mode) {
+        return Err(format!(
+            "Parent permission mode '{:?}' cannot grant profile '{}' with mode '{:?}'",
+            parent_mode, profile.name, profile_mode
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +604,62 @@ Prompt"#,
         let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"legacy-user"));
         assert!(names.contains(&"legacy-proj"));
+    }
+
+    #[test]
+    fn test_profile_containment_validation() {
+        let readonly_profile = AgentProfile {
+            name: "reader".into(),
+            description: "read only".into(),
+            model: "inherit".into(),
+            permission_mode: "read-only".into(),
+            tools: vec!["read".into(), "grep".into()],
+            memory_scope: MemoryScope::Project,
+            max_context_tokens: None,
+            system_prompt: "read".into(),
+            path: PathBuf::new(),
+            is_project: false,
+        };
+        assert!(validate_profile_containment(
+            &readonly_profile,
+            davinci_agent::PermissionMode::ReadOnly
+        )
+        .is_ok());
+
+        let mutation_tools_profile = AgentProfile {
+            name: "writer".into(),
+            description: "mutations".into(),
+            model: "inherit".into(),
+            permission_mode: "read-only".into(),
+            tools: vec!["read".into(), "write".into()],
+            memory_scope: MemoryScope::Project,
+            max_context_tokens: None,
+            system_prompt: "write".into(),
+            path: PathBuf::new(),
+            is_project: false,
+        };
+        let err = validate_profile_containment(
+            &mutation_tools_profile,
+            davinci_agent::PermissionMode::ReadOnly,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot grant mutation-capable profile 'writer'"));
+
+        let auto_profile = AgentProfile {
+            name: "admin".into(),
+            description: "auto".into(),
+            model: "inherit".into(),
+            permission_mode: "auto".into(),
+            tools: vec!["read".into()],
+            memory_scope: MemoryScope::Project,
+            max_context_tokens: None,
+            system_prompt: "admin".into(),
+            path: PathBuf::new(),
+            is_project: false,
+        };
+        let err2 =
+            validate_profile_containment(&auto_profile, davinci_agent::PermissionMode::Edits)
+                .unwrap_err();
+        assert!(err2.contains("cannot grant profile 'admin' with mode 'Auto'"));
     }
 }

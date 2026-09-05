@@ -809,11 +809,16 @@ impl Agent {
                 .as_ref()
                 .map(|t| t.as_atomic_bool())
                 .or_else(|| self.abort_signal.clone());
+            let permission_mode = self.permissions.lock().ok().map(|p| p.mode);
+            let parent_agent_id = self.runtime.as_ref().map(|rt| rt.agent_id);
             let parent = crate::subagent::SubagentParent {
                 provider: Some(self.provider.clone()),
                 model_id: Some(self.model_id.clone()),
                 abort,
                 cancellation_token: token,
+                runtime: self.runtime.clone(),
+                permission_mode,
+                agent_id: parent_agent_id,
             };
             match crate::subagent::run_tool(
                 args,
