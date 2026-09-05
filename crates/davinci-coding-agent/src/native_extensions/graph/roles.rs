@@ -12,8 +12,6 @@
 //! one allowed pattern.
 
 use super::types::{BashPolicy, ResearchKind, Role};
-use regex::RegexSet;
-use std::sync::OnceLock;
 
 const READ_TOOLS: &[&str] = &["read", "grep", "find", "ls"];
 
@@ -64,168 +62,9 @@ pub fn role_for_research_kind(kind: ResearchKind) -> Role {
     }
 }
 
-const DESTRUCTIVE_PATTERNS: &[&str] = &[
-    r"(?i)\brm\b",
-    r"(?i)\brmdir\b",
-    r"(?i)\bmv\b",
-    r"(?i)\bcp\b",
-    r"(?i)\bmkdir\b",
-    r"(?i)\btouch\b",
-    r"(?i)\bchmod\b",
-    r"(?i)\bchown\b",
-    r"(?i)\bln\b",
-    r"(?i)\btee\b",
-    r"(?i)\btruncate\b",
-    r"(?i)\bdd\b",
-    // A single `>` redirect that is not part of `>>`, and `>>` itself.
-    r"(^|[^<>])>[^>]",
-    r"(^|[^<>])>$",
-    r">>",
-    r"(?i)\bnpm\s+(install|uninstall|update|ci|link|publish)\b",
-    r"(?i)\byarn\s+(add|remove|install|publish)\b",
-    r"(?i)\bpnpm\s+(add|remove|install|publish)\b",
-    r"(?i)\bpip\s+(install|uninstall)\b",
-    r"(?i)\bcargo\s+(install|publish|add|remove|clean)\b",
-    r"(?i)\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|restore|switch|stash|cherry-pick|revert|tag|init|clone|clean)\b",
-    r"(?i)\bsudo\b",
-    r"(?i)\bkill\b",
-    r"(?i)\bpkill\b",
-    r"(?i)\bshutdown\b",
-    r"(?i)\bSet-Content\b",
-    r"(?i)\bOut-File\b",
-    r"(?i)\bRemove-Item\b",
-    r"(?i)\bNew-Item\b",
-];
-
-const READ_PATTERNS: &[&str] = &[
-    r"^\s*cat\b",
-    r"^\s*head\b",
-    r"^\s*tail\b",
-    r"^\s*grep\b",
-    r"^\s*rg\b",
-    r"^\s*find\b",
-    r"^\s*fd\b",
-    r"^\s*ls\b",
-    r"(?i)^\s*dir\b",
-    r"^\s*pwd\b",
-    r"^\s*echo\b",
-    r"^\s*wc\b",
-    r"^\s*sort\b",
-    r"^\s*uniq\b",
-    r"^\s*diff\b",
-    r"^\s*stat\b",
-    r"^\s*tree\b",
-    r"^\s*which\b",
-    r"(?i)^\s*where\b",
-    r"^\s*jq\b",
-    r"(?i)^\s*sed\s+-n\b",
-    r"^\s*awk\b",
-    r"(?i)^\s*node\s+--version\b",
-    r"(?i)^\s*rustc\s+--version\b",
-    r"(?i)^\s*cargo\s+(tree|metadata)\b",
-    r"(?i)^\s*git\s+(status|log|diff|show|blame|branch|remote|ls-files|ls-tree|rev-parse|describe|shortlog)\b",
-    r"(?i)^\s*npm\s+(ls|list|view|info|explain)\b",
-    r"(?i)^\s*Get-(Content|ChildItem|Item|Location)\b",
-    r"(?i)^\s*Select-String\b",
-];
-
-const TEST_PATTERNS: &[&str] = &[
-    r"(?i)^\s*(npx\s+)?vitest\b",
-    r"(?i)^\s*(npx\s+)?jest\b",
-    r"(?i)^\s*(npx\s+)?mocha\b",
-    r"(?i)^\s*(npx\s+)?playwright\s+test\b",
-    r"(?i)^\s*(npx\s+)?tsc\b",
-    r"(?i)^\s*(npx\s+)?tsgo\b",
-    r"(?i)^\s*(npx\s+)?eslint\b",
-    r"(?i)^\s*(npx\s+)?biome\s+(check|lint)\b",
-    r"(?i)^\s*npm\s+(test|run\s+(test|tests|check|typecheck|lint|build))\b",
-    r"(?i)^\s*yarn\s+(test|check|typecheck|lint)\b",
-    r"(?i)^\s*pnpm\s+(test|check|typecheck|lint)\b",
-    r"(?i)^\s*node\s+.*vitest[/\\]dist[/\\]cli\.js\b",
-    r"(?i)^\s*node\s+--test\b",
-    r"(?i)^\s*(python|pytest|cargo\s+(test|check|clippy|fmt|build|nextest)|go\s+(test|vet|build)|dotnet\s+(test|build))\b",
-    r"^\s*make\s+(test|check|lint|fmt|clippy|build)\b",
-    r"^\s*\.[/\\]test\.sh\b",
-];
-
-fn destructive_set() -> &'static RegexSet {
-    static SET: OnceLock<RegexSet> = OnceLock::new();
-    SET.get_or_init(|| RegexSet::new(DESTRUCTIVE_PATTERNS).expect("destructive patterns compile"))
-}
-
-fn read_set() -> &'static RegexSet {
-    static SET: OnceLock<RegexSet> = OnceLock::new();
-    SET.get_or_init(|| RegexSet::new(READ_PATTERNS).expect("read patterns compile"))
-}
-
-fn test_set() -> &'static RegexSet {
-    static SET: OnceLock<RegexSet> = OnceLock::new();
-    SET.get_or_init(|| RegexSet::new(TEST_PATTERNS).expect("test patterns compile"))
-}
-
-fn git_mutation_set() -> &'static RegexSet {
-    static SET: OnceLock<RegexSet> = OnceLock::new();
-    SET.get_or_init(|| {
-        // Options between `git` and the verb (`-c user.email=x`, `--git-dir=…`,
-        // `-C path`) and a `.exe` suffix must not hide the verb.
-        RegexSet::new([
-            r"(?i)\bgit(?:\.exe)?(?:\s+-{1,2}\S+(?:\s+[^-\s]\S*)?)*\s+(add|commit|push|pull|merge|rebase|reset|checkout|restore|switch|stash|cherry-pick|revert|tag|clean)\b",
-        ])
-        .expect("git mutation pattern compiles")
-    })
-}
-
-/// The command split at `&&`, `||`, `;`, `|` and newlines outside quotes.
-/// A read-only allowlist anchored at the start of the line is only worth
-/// anything if every segment of the line starts with an allowed command.
+#[allow(dead_code)]
 pub fn shell_segments(command: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match quote {
-            Some(open) => {
-                current.push(ch);
-                if ch == '\\' {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
-                    }
-                } else if ch == open {
-                    quote = None;
-                }
-            }
-            None => match ch {
-                '"' | '\'' => {
-                    quote = Some(ch);
-                    current.push(ch);
-                }
-                '\\' => {
-                    current.push(ch);
-                    if let Some(next) = chars.next() {
-                        current.push(next);
-                    }
-                }
-                '&' | '|' if chars.peek() == Some(&ch) => {
-                    chars.next();
-                    segments.push(std::mem::take(&mut current));
-                }
-                '|' | ';' | '\n' => segments.push(std::mem::take(&mut current)),
-                _ => current.push(ch),
-            },
-        }
-    }
-    segments.push(current);
-    segments
-        .into_iter()
-        .map(|segment| segment.trim().to_string())
-        .filter(|segment| !segment.is_empty())
-        .collect()
-}
-
-/// `$(…)` and backticks run whatever is inside them, allowlist or not.
-fn has_command_substitution(command: &str) -> bool {
-    command.contains("$(") || command.contains('`')
+    davinci_agent::shell_policy::split_shell_segments(command)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,52 +74,22 @@ pub enum BashDecision {
 }
 
 pub fn is_bash_command_allowed(policy: BashPolicy, command: &str) -> BashDecision {
-    match policy {
-        BashPolicy::None => BashDecision::Blocked("this role has no shell access".into()),
+    if command.trim().is_empty() {
+        return BashDecision::Blocked("empty command".into());
+    }
+    let profile = match policy {
+        BashPolicy::None => davinci_agent::shell_policy::ShellPolicyProfile::None,
+        BashPolicy::ReadOnly => davinci_agent::shell_policy::ShellPolicyProfile::ReadOnly,
+        BashPolicy::ReadAndTest => davinci_agent::shell_policy::ShellPolicyProfile::ReadAndTest,
         BashPolicy::WriteNoGitMutation => {
-            if git_mutation_set().is_match(command) {
-                BashDecision::Blocked(
-                    "git state changes are reserved for the human operator; the graph never commits"
-                        .into(),
-                )
-            } else {
-                BashDecision::Allowed
-            }
+            davinci_agent::shell_policy::ShellPolicyProfile::WriteNoGitMutation
         }
-        BashPolicy::ReadOnly | BashPolicy::ReadAndTest => {
-            // `2>&1` joins stderr to stdout; it writes no file and is the
-            // one redirect a test runner routinely needs.
-            let without_stderr_join = command.replace("2>&1", "");
-            if destructive_set().is_match(&without_stderr_join) {
-                return BashDecision::Blocked(
-                    "command matches a destructive pattern; this role is read-only".into(),
-                );
-            }
-            if has_command_substitution(command) {
-                return BashDecision::Blocked(
-                    "command substitution ($(…) or backticks) is not allowed for a read-only role"
-                        .into(),
-                );
-            }
-            let segments = shell_segments(command);
-            if segments.is_empty() {
-                return BashDecision::Blocked("empty command".into());
-            }
-            let offender = segments.iter().find(|segment| {
-                !(read_set().is_match(segment)
-                    || (policy == BashPolicy::ReadAndTest && test_set().is_match(segment)))
-            });
-            match offender {
-                None => BashDecision::Allowed,
-                Some(segment) => BashDecision::Blocked(format!(
-                    "\"{segment}\" is not on the {}",
-                    if policy == BashPolicy::ReadAndTest {
-                        "read-only or test-runner allowlist"
-                    } else {
-                        "read-only allowlist"
-                    }
-                )),
-            }
+    };
+    match davinci_agent::shell_policy::evaluate(profile, command) {
+        davinci_agent::shell_policy::ShellCommandDecision::Allowed => BashDecision::Allowed,
+        davinci_agent::shell_policy::ShellCommandDecision::Denied { reason }
+        | davinci_agent::shell_policy::ShellCommandDecision::NeedsApproval { reason } => {
+            BashDecision::Blocked(reason)
         }
     }
 }

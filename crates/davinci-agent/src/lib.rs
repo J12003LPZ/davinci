@@ -17,6 +17,7 @@ mod permission;
 mod pruning;
 mod queues;
 mod scheduler;
+pub mod shell_policy;
 mod skills;
 mod stats;
 mod subagent;

@@ -880,65 +880,13 @@ pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
 /// not a separator. Empty segments are dropped, so `git status && ` is one
 /// segment.
 pub fn shell_segments(command: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-    let mut previous = '\0';
-    let chars: Vec<char> = command.chars().collect();
-    for (index, &ch) in chars.iter().enumerate() {
-        let mut separator = false;
-        if escaped {
-            escaped = false;
-        } else if single {
-            if ch == '\'' {
-                single = false;
-            }
-        } else if double {
-            if ch == '"' {
-                double = false;
-            } else if ch == '\\' {
-                escaped = true;
-            }
-        } else {
-            match ch {
-                '\\' => escaped = true,
-                '\'' => single = true,
-                '"' => double = true,
-                ';' | '|' | '\n' => separator = true,
-                '&' => {
-                    let next = chars.get(index + 1).copied().unwrap_or('\0');
-                    separator = !matches!(previous, '>' | '<') && !matches!(next, '>' | '<');
-                }
-                _ => {}
-            }
-        }
-        if separator {
-            let segment = current.trim();
-            if !segment.is_empty() {
-                segments.push(segment.to_string());
-            }
-            current.clear();
-        } else {
-            current.push(ch);
-        }
-        previous = ch;
-    }
-    let segment = current.trim();
-    if !segment.is_empty() {
-        segments.push(segment.to_string());
-    }
-    segments
+    crate::shell_policy::split_shell_segments(command)
 }
 
 /// `$(…)`, backticks and process substitution run a program the rule never
 /// named.
 fn has_command_substitution(segment: &str) -> bool {
-    segment.contains("$(")
-        || segment.contains('`')
-        || segment.contains("<(")
-        || segment.contains(">(")
+    crate::shell_policy::has_command_substitution(segment)
 }
 
 /// `.pi/settings.json`, `.pi/mcp.json` and the trust files under `.pi/`.
