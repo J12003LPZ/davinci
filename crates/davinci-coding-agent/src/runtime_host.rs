@@ -103,6 +103,35 @@ impl RuntimeSubscriber for HooksRuntimeSubscriber {
     }
 }
 
+/// RuntimeSubscriber that notifies Token Governor and Vector Memory on compaction lifecycle events.
+pub struct CompactionRuntimeSubscriber {
+    native: Arc<Mutex<crate::native_extensions::NativeExtensionHost>>,
+}
+
+impl CompactionRuntimeSubscriber {
+    pub fn new(native: Arc<Mutex<crate::native_extensions::NativeExtensionHost>>) -> Self {
+        Self { native }
+    }
+}
+
+impl RuntimeSubscriber for CompactionRuntimeSubscriber {
+    fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+        if let RuntimeEvent::PostCompact {
+            before_tokens,
+            after_tokens,
+        } = &event.payload
+        {
+            if before_tokens > after_tokens
+                && std::env::var("DAVINCI_RUNTIME_COMPACTION_SUBSCRIBER").as_deref() != Ok("0")
+            {
+                let mut native = self.native.lock().unwrap_or_else(|e| e.into_inner());
+                native.session_compact();
+            }
+        }
+        RuntimeDecision::Continue
+    }
+}
+
 /// Helper to register native vector memory and skill learning context sources into the runtime.
 #[allow(dead_code)]
 pub fn register_native_context_sources(
@@ -412,5 +441,100 @@ mod tests {
         };
         let processed_ret = adapter.process_tool_output("retrieve_output", &json!({}), ret_res);
         assert_eq!(processed_ret.content, content);
+    }
+
+    #[test]
+    fn test_compaction_runtime_subscriber_lifecycle_and_kill_switch() {
+        let dir = tempdir().unwrap();
+        let native = Arc::new(Mutex::new(
+            crate::native_extensions::NativeExtensionHost::new_with_agent_dir(
+                "test",
+                dir.path(),
+                None,
+            ),
+        ));
+
+        let subscriber = CompactionRuntimeSubscriber::new(native.clone());
+        let bus = davinci_agent::RuntimeBus::new();
+        bus.subscribe(Arc::new(subscriber));
+
+        let run_id = davinci_agent::RunId::new();
+        let agent_id = davinci_agent::AgentId::new();
+
+        // 1. Record a search call in governor
+        let args = json!({"query": "target_fn", "path": "src/lib.rs"});
+        let _ = native
+            .lock()
+            .unwrap()
+            .governor
+            .before_tool("grep", &args, || "head-123".into());
+        let res = ToolResult {
+            content: "match 1".into(),
+            is_error: false,
+            details: None,
+        };
+        let _ = native
+            .lock()
+            .unwrap()
+            .governor
+            .after_tool("grep", &args, res);
+
+        // 2. Immediate duplicate call is blocked
+        let blocked = native
+            .lock()
+            .unwrap()
+            .governor
+            .before_tool("grep", &args, || "head-123".into());
+        assert!(
+            blocked.is_some(),
+            "Duplicate read must be blocked by governor"
+        );
+
+        // 3. Emit PreCompact (does not reset ledger)
+        let pre_env = davinci_agent::RuntimeEventEnvelope::new(
+            1,
+            run_id,
+            Some("test-session".into()),
+            Some(agent_id),
+            None,
+            RuntimeEvent::PreCompact {
+                estimated_tokens: 50_000,
+            },
+        );
+        bus.emit_observe(pre_env);
+        assert!(
+            native
+                .lock()
+                .unwrap()
+                .governor
+                .before_tool("grep", &args, || "head-123".into())
+                .is_some(),
+            "PreCompact must not clear governor ledgers prematurely"
+        );
+
+        // 4. Emit PostCompact event with tokens reduced
+        let post_env = davinci_agent::RuntimeEventEnvelope::new(
+            2,
+            run_id,
+            Some("test-session".into()),
+            Some(agent_id),
+            None,
+            RuntimeEvent::PostCompact {
+                before_tokens: 50_000,
+                after_tokens: 15_000,
+            },
+        );
+        bus.emit_observe(post_env);
+
+        // 5. CompactionRuntimeSubscriber cleared governor ledgers, so duplicate is allowed again
+        let allowed = native
+            .lock()
+            .unwrap()
+            .governor
+            .before_tool("grep", &args, || "head-123".into());
+        assert!(
+            allowed.is_none(),
+            "PostCompact must clear governor ledgers via CompactionRuntimeSubscriber"
+        );
     }
 }

@@ -1758,6 +1758,13 @@ fn complete_prompt_with_host(
     runtime_bus.subscribe(Arc::new(runtime_host::HooksRuntimeSubscriber::new(
         user_hooks.clone(),
     )));
+    runtime_bus.subscribe(Arc::new(runtime_host::CompactionRuntimeSubscriber::new(
+        hook_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .native
+            .clone(),
+    )));
     let mut runtime_handle = davinci_agent::RuntimeHandle::new(
         davinci_agent::RunId::new(),
         davinci_agent::AgentId::new(),

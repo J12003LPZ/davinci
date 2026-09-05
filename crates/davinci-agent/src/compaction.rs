@@ -74,6 +74,8 @@ pub struct CompactionResult {
     pub first_kept_entry_id: String,
     #[serde(rename = "tokensBefore", default)]
     pub tokens_before: u64,
+    #[serde(rename = "tokensAfter", default)]
+    pub tokens_after: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
 }
@@ -340,6 +342,7 @@ pub fn compact_messages_with_options(
                     details,
                     first_kept_entry_id: String::new(),
                     tokens_before,
+                    tokens_after: tokens_before,
                     usage: None,
                 };
             }
@@ -354,6 +357,7 @@ pub fn compact_messages_with_options(
 
     let mut compacted = vec![compaction_context_message(&summary)];
     compacted.extend(messages[cut_index..].iter().cloned());
+    let tokens_after = estimate_context_tokens(&compacted);
     CompactionResult {
         summary,
         messages: compacted,
@@ -361,18 +365,21 @@ pub fn compact_messages_with_options(
         details,
         first_kept_entry_id: String::new(),
         tokens_before,
+        tokens_after,
         usage,
     }
 }
 
 fn empty_result(messages: &[ChatMessage]) -> CompactionResult {
+    let tokens = estimate_context_tokens(messages);
     CompactionResult {
         summary: String::new(),
         messages: messages.to_vec(),
         compacted: false,
         details: CompactionDetails::default(),
         first_kept_entry_id: String::new(),
-        tokens_before: estimate_context_tokens(messages),
+        tokens_before: tokens,
+        tokens_after: tokens,
         usage: None,
     }
 }

@@ -344,7 +344,14 @@ impl ExtensionHost {
             match event {
                 ExtensionEvent::SessionStart => native.session_start(),
                 ExtensionEvent::SessionBeforeCompact | ExtensionEvent::SessionCompact => {
-                    native.session_compact()
+                    // Kill switch: DAVINCI_RUNTIME_COMPACTION_DIRECT=1 retains legacy direct calls during rollout.
+                    // When not forced, CompactionRuntimeSubscriber notifies governor/memory via the runtime bus on PostCompact.
+                    if std::env::var("DAVINCI_RUNTIME_COMPACTION_DIRECT").as_deref() == Ok("1")
+                        || std::env::var("DAVINCI_RUNTIME_COMPACTION_SUBSCRIBER").as_deref()
+                            == Ok("0")
+                    {
+                        native.session_compact()
+                    }
                 }
                 ExtensionEvent::SessionShutdown { .. } => native.session_shutdown(),
                 _ => {}

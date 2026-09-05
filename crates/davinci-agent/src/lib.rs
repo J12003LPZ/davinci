@@ -851,6 +851,12 @@ impl Agent {
 
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
         self.is_compacting = true;
+        let estimated_before = self.estimated_context_tokens();
+        if let Some(runtime) = &self.runtime {
+            runtime.emit_observe(crate::RuntimeEvent::PreCompact {
+                estimated_tokens: estimated_before,
+            });
+        }
         let previous_summary = self.session.as_ref().and_then(|session| {
             session
                 .entries
@@ -919,6 +925,13 @@ impl Agent {
         }
         if result.compacted {
             self.messages = result.messages.clone();
+        }
+        let estimated_after = self.estimated_context_tokens();
+        if let Some(runtime) = &self.runtime {
+            runtime.emit_observe(crate::RuntimeEvent::PostCompact {
+                before_tokens: estimated_before,
+                after_tokens: estimated_after,
+            });
         }
         self.is_compacting = false;
         result
@@ -1254,6 +1267,55 @@ mod tests {
         let compacted = agent.compact(Some("keep decisions"));
         assert!(compacted.summary.contains("keep decisions"));
         assert!(!agent.messages.is_empty());
+    }
+
+    #[test]
+    fn compaction_emits_pre_and_post_compact_on_runtime() {
+        use crate::runtime::{
+            bus::RuntimeSubscriber, AgentId, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
+            RuntimeEventEnvelope, RuntimeHandle,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct EventCollector {
+            events: Mutex<Vec<RuntimeEvent>>,
+        }
+        impl RuntimeSubscriber for EventCollector {
+            fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                self.events.lock().unwrap().push(event.payload.clone());
+                RuntimeDecision::Continue
+            }
+        }
+
+        let bus = RuntimeBus::new();
+        let collector = Arc::new(EventCollector::default());
+        bus.subscribe(collector.clone());
+
+        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), bus);
+        let mut agent = Agent::new("base prompt").with_runtime(runtime);
+
+        agent.prompt("message 1 for conversation history");
+        agent.record_assistant("assistant response 1");
+        agent.prompt("message 2 for conversation history");
+        agent.record_assistant("assistant response 2");
+
+        let result = agent.compact(Some("custom summary"));
+        assert!(result.compacted);
+
+        let events = collector.events.lock().unwrap().clone();
+        let has_pre = events.iter().any(
+            |e| matches!(e, RuntimeEvent::PreCompact { estimated_tokens } if *estimated_tokens > 0),
+        );
+        let has_post = events.iter().any(
+            |e| matches!(e, RuntimeEvent::PostCompact { before_tokens, after_tokens } if *before_tokens > 0 && *after_tokens > 0),
+        );
+
+        assert!(has_pre, "Must emit PreCompact event with estimated tokens");
+        assert!(
+            has_post,
+            "Must emit PostCompact event with before and after tokens"
+        );
     }
 
     #[test]
