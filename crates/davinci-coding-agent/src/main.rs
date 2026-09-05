@@ -90,6 +90,7 @@ mod output;
 mod packages;
 mod permissions;
 mod rpc;
+mod runtime_host;
 mod self_update;
 mod settings;
 mod shutdown;
@@ -1675,10 +1676,27 @@ fn complete_prompt_with_host(
         let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
         hooks::load(&default_agent_dir(), &agent.cwd, trusted)
     };
+
+    let runtime_bus = davinci_agent::RuntimeBus::new();
+    runtime_bus.subscribe(Arc::new(runtime_host::HooksRuntimeSubscriber::new(
+        user_hooks.clone(),
+    )));
+    let mut runtime_handle = davinci_agent::RuntimeHandle::new(
+        davinci_agent::RunId::new(),
+        davinci_agent::AgentId::new(),
+        runtime_bus,
+    );
+    if let Some(session) = &agent.session {
+        runtime_handle = runtime_handle.with_session(&session.header.id);
+    }
+    agent.runtime = Some(runtime_handle);
+
     let pre_hooks = user_hooks.clone();
     agent.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, args| {
-        if let Some(reason) = hooks::run_pre_tool(&pre_hooks, name, args) {
-            return Some(reason);
+        if std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
+            if let Some(reason) = hooks::run_pre_tool(&pre_hooks, name, args) {
+                return Some(reason);
+            }
         }
         // A poisoned lock used to bail out of the closure with `None`, which
         // the agent reads as "not blocked": one panic anywhere holding this
@@ -1721,7 +1739,7 @@ fn complete_prompt_with_host(
                 .and_then(|details| details.get("denied"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            if !denied {
+            if !denied && std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
                 hooks::run_post_tool(&post_hooks, name, args, &result.content);
             }
             hooks::append_event(
