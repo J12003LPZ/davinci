@@ -9,6 +9,7 @@ pub mod cancellation;
 pub mod context;
 pub mod events;
 pub mod ids;
+pub mod mailbox;
 pub mod registry;
 pub mod tasks;
 
@@ -20,6 +21,7 @@ pub use context::{
 };
 pub use events::{AgentKind, AgentRecord, AgentState, RuntimeEvent, RuntimeEventEnvelope};
 pub use ids::{AgentId, RunId, TaskId, WorkflowId};
+pub use mailbox::{AgentMailbox, AgentMessage, MailboxError};
 pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
 pub use tasks::{is_valid_task_transition, TaskError, TaskRecord, TaskRegistry, TaskState};
 
@@ -36,6 +38,7 @@ pub struct RuntimeHandle {
     pub registry: RuntimeRegistry,
     pub context_broker: ContextBroker,
     pub task_registry: TaskRegistry,
+    pub mailbox: AgentMailbox,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -54,6 +57,7 @@ impl RuntimeHandle {
     pub fn new(run_id: RunId, agent_id: AgentId, bus: RuntimeBus) -> Self {
         let registry = RuntimeRegistry::with_bus(bus.clone());
         let task_registry = TaskRegistry::with_bus(bus.clone());
+        let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus.clone());
         Self {
             run_id,
             agent_id,
@@ -65,11 +69,17 @@ impl RuntimeHandle {
             registry,
             context_broker: ContextBroker::new(),
             task_registry,
+            mailbox,
         }
     }
 
     pub fn with_task_registry(mut self, task_registry: TaskRegistry) -> Self {
         self.task_registry = task_registry;
+        self
+    }
+
+    pub fn with_mailbox(mut self, mailbox: AgentMailbox) -> Self {
+        self.mailbox = mailbox;
         self
     }
 
@@ -140,5 +150,20 @@ impl RuntimeHandle {
 
     pub fn cancel(&self) {
         self.cancellation_token.cancel();
+    }
+
+    pub fn send_message(
+        &self,
+        to: AgentId,
+        content: impl Into<String>,
+    ) -> Result<uuid::Uuid, MailboxError> {
+        let msg = AgentMessage::new(self.run_id, self.agent_id, to, content);
+        let id = msg.id;
+        self.mailbox.send(msg)?;
+        Ok(id)
+    }
+
+    pub fn drain_messages(&self, limit: usize) -> Vec<AgentMessage> {
+        self.mailbox.drain(self.agent_id, limit)
     }
 }
