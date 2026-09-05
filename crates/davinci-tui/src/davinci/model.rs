@@ -171,6 +171,8 @@ pub enum Screen {
     Mcp,
     /// `/permissions` — mode and rules.
     Permissions,
+    /// `5e` — deterministic agent workflows (`/workflows`).
+    Workflows,
 }
 
 /// An instrument summoned over the transcript, dismissed with esc.
@@ -1201,6 +1203,25 @@ pub struct PermissionRow {
     pub source: String,
 }
 
+/// One workflow row in `/workflows`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRow {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub phases: Vec<(String, String)>,
+    pub started_ms: i64,
+    pub elapsed: String,
+    pub error: Option<String>,
+}
+
+/// `/workflows` — tracked multi-phase agent workflows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowsSheet {
+    pub workflows: Vec<WorkflowRow>,
+    pub selected_index: usize,
+}
+
 /// Which of the theme's inks a figure is drawn in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
@@ -1541,6 +1562,9 @@ pub struct Model {
     /// `/permissions` — mode and rules.
     pub permission_rows: Vec<PermissionRow>,
     pub permission_index: usize,
+    /// `5e` — deterministic agent workflows (`/workflows`).
+    pub workflows: Option<WorkflowsSheet>,
+    pub workflow_index: usize,
     /// What the command sheets state about the session (design.md §11).
     pub facts: Facts,
 }
@@ -1645,6 +1669,8 @@ impl Model {
             mcp: None,
             permission_rows: Vec::new(),
             permission_index: 0,
+            workflows: None,
+            workflow_index: 0,
             facts: Facts::default(),
         }
     }
@@ -1783,6 +1809,7 @@ impl Model {
             Screen::Securitas => self.security_index,
             Screen::Diff => self.diff_index,
             Screen::Permissions => self.permission_index,
+            Screen::Workflows => self.workflow_index,
             _ => 0,
         }
     }
@@ -1806,6 +1833,7 @@ impl Model {
             Screen::Officina => "officina",
             Screen::Mcp => "instrumenta",
             Screen::Permissions => "fiducia",
+            Screen::Workflows => "opus",
         }
     }
 

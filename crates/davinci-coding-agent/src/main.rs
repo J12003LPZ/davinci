@@ -1750,11 +1750,9 @@ fn complete_prompt_with_host(
         host.js_stream_provider(&agent.provider)
     };
     let hook_host = host.clone();
-    let user_hooks = {
-        let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
-        let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
-        hooks::load(&default_agent_dir(), &agent.cwd, trusted)
-    };
+    let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+    let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    let user_hooks = hooks::load(&default_agent_dir(), &agent.cwd, trusted);
 
     let runtime_bus = davinci_agent::RuntimeBus::new();
     runtime_bus.subscribe(Arc::new(runtime_host::HooksRuntimeSubscriber::new(
@@ -1769,6 +1767,17 @@ fn complete_prompt_with_host(
         davinci_agent::WorktreeManager::new(&agent.cwd, default_agent_dir().join("worktrees"))
             .with_bus(runtime_bus);
     runtime_handle = runtime_handle.with_worktree_manager(wt_mgr);
+    runtime_handle = runtime_handle.with_project_trusted(trusted);
+    let wf_store = davinci_agent::WorkflowStateStore::with_options(
+        davinci_agent::runtime::workflow::state::DEFAULT_MAX_INLINE_ARTIFACT_BYTES,
+        default_agent_dir().join("workflow_artifacts"),
+    );
+    let wf_executor = std::sync::Arc::new(davinci_agent::WorkflowExecutor::new(
+        runtime_handle.clone(),
+        wf_store,
+        agent.subagent_runner.clone(),
+    ));
+    runtime_handle = runtime_handle.with_workflow_executor(wf_executor);
     if let Some(session) = &agent.session {
         runtime_handle = runtime_handle.with_session(&session.header.id);
     }

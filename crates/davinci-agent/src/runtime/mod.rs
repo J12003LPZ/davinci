@@ -33,10 +33,12 @@ pub use team::{TeamConfig, TeamError, TeamManager, TeammateHandle};
 pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
 pub use tools_task::{task_create_tool, task_list_tool, task_tool_specs, task_update_tool};
 pub use workflow::{
-    is_mutating_tool, validate_workflow, validate_workflow_with_permissions, PhaseExecutionState,
-    PhaseStatus, WorkflowArtifact, WorkflowExecutionError, WorkflowExecutionState,
-    WorkflowExecutor, WorkflowJoin, WorkflowPhaseSpec, WorkflowSpec, WorkflowStateError,
-    WorkflowStateStore, WorkflowStatus, WorkflowValidationError, WorkflowWorkerSpec,
+    find_saved_workflow, is_mutating_tool, save_workflow_to_project, validate_workflow,
+    validate_workflow_with_permissions, workflow_run_tool, workflow_status_tool,
+    workflow_tool_specs, PhaseExecutionState, PhaseStatus, WorkflowArtifact,
+    WorkflowExecutionError, WorkflowExecutionState, WorkflowExecutor, WorkflowJoin,
+    WorkflowPhaseSpec, WorkflowSpec, WorkflowStateError, WorkflowStateStore, WorkflowStatus,
+    WorkflowValidationError, WorkflowWorkerSpec,
 };
 pub use worktree::{WorktreeError, WorktreeLease, WorktreeManager};
 
@@ -55,6 +57,8 @@ pub struct RuntimeHandle {
     pub task_registry: TaskRegistry,
     pub mailbox: AgentMailbox,
     pub worktree_manager: Option<WorktreeManager>,
+    pub workflow_executor: Option<Arc<WorkflowExecutor>>,
+    pub project_trusted: bool,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -65,6 +69,7 @@ impl std::fmt::Debug for RuntimeHandle {
             .field("parent_agent_id", &self.parent_agent_id)
             .field("session_id", &self.session_id)
             .field("cancelled", &self.is_cancelled())
+            .field("project_trusted", &self.project_trusted)
             .finish()
     }
 }
@@ -87,7 +92,19 @@ impl RuntimeHandle {
             task_registry,
             mailbox,
             worktree_manager: None,
+            workflow_executor: None,
+            project_trusted: false,
         }
+    }
+
+    pub fn with_workflow_executor(mut self, executor: Arc<WorkflowExecutor>) -> Self {
+        self.workflow_executor = Some(executor);
+        self
+    }
+
+    pub fn with_project_trusted(mut self, trusted: bool) -> Self {
+        self.project_trusted = trusted;
+        self
     }
 
     pub fn with_worktree_manager(mut self, mgr: WorktreeManager) -> Self {

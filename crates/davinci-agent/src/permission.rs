@@ -91,7 +91,7 @@ pub fn tool_class(tool: &str) -> ToolClass {
         "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" | "mcp_read"
         | "batch" | "graph_submit" | "memory_search" | "retrieve_output" | "update_plan"
         | "tool_search" | "agent_status" | "agent_message" | "agent_stop" | "task_create"
-        | "task_update" | "task_list" => ToolClass::Read,
+        | "task_update" | "task_list" | "workflow_status" => ToolClass::Read,
         "write" | "edit" | "notebook_edit" | "apply_patch" => ToolClass::Edit,
         "bash" | "powershell" | "exec_command" | "write_stdin" => ToolClass::Shell,
         "web_fetch" | "web_search" => ToolClass::Network,

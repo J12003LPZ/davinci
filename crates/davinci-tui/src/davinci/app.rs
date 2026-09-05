@@ -19,7 +19,7 @@ use super::views::sheet::{self, Composer};
 use super::views::{
     ask, codex, cogitator, compact, diff, disegno, export, governor, grafo, graph_run, instrumenta,
     keys, login, mcp, memoria, mensura, officina, opera, permissions, recovery, resume, securitas,
-    settings, startup, transcript, tree, trust, vectors,
+    settings, startup, transcript, tree, trust, vectors, workflows,
 };
 
 /// What the runtime should do after a key.
@@ -190,6 +190,7 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
         Screen::Diff => Some(diff::lines(model)),
         Screen::Mcp => Some(mcp::lines(model)),
         Screen::Permissions => Some(permissions::lines(model)),
+        Screen::Workflows => Some(workflows::lines(model)),
         Screen::Keys => Some(keys::lines(model)),
         Screen::Agent => None,
     };
@@ -596,10 +597,11 @@ fn screen_move(model: &mut Model, delta: isize) {
         Screen::Keys => {
             model.keys_offset = model.keys_offset.saturating_add_signed(delta);
         }
-        Screen::GraphRun | Screen::Governor | Screen::Vectors => {
+        Screen::GraphRun | Screen::Governor | Screen::Vectors | Screen::Workflows => {
             let count = match model.screen {
                 Screen::GraphRun => graph_run::lines(model).len(),
                 Screen::Governor => governor::lines(model).len(),
+                Screen::Workflows => workflows::lines(model).len(),
                 _ => vectors::lines(model).len(),
             };
             model.feature_scroll = model

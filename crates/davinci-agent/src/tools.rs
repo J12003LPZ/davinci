@@ -70,6 +70,13 @@ pub fn team_tools_enabled() -> bool {
         .unwrap_or(false)
 }
 
+pub fn workflow_tools_enabled() -> bool {
+    std::env::var("DAVINCI_EXPERIMENTAL_WORKFLOWS")
+        .or_else(|_| std::env::var("DAVINCI_RUNTIME_WORKFLOWS"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 impl ToolContext {
     pub fn is_aborted(&self) -> bool {
         self.abort
@@ -282,6 +289,9 @@ pub fn tool_specs() -> Vec<AgentTool> {
         specs.extend(crate::runtime::agent_tool_specs());
         specs.extend(crate::runtime::task_tool_specs());
     }
+    if workflow_tools_enabled() {
+        specs.extend(crate::runtime::workflow_tool_specs());
+    }
     specs
 }
 
@@ -336,6 +346,15 @@ pub fn execute_tool_with(
         "task_create" => crate::runtime::task_create_tool(input, context),
         "task_update" => crate::runtime::task_update_tool(input, context),
         "task_list" => crate::runtime::task_list_tool(input, context),
+        "workflow_run" | "workflow_status"
+            if !workflow_tools_enabled() =>
+        {
+            Err(ToolError::Failed(
+                "Workflow coordination tools are disabled; set DAVINCI_EXPERIMENTAL_WORKFLOWS=1 to enable".into(),
+            ))
+        }
+        "workflow_run" => crate::runtime::workflow_run_tool(cwd, input, context),
+        "workflow_status" => crate::runtime::workflow_status_tool(input, context),
         other if other.starts_with("mcp__") => mcp_call_tool(other, input, context),
         other => Err(ToolError::Unknown(other.to_string())),
     }
@@ -2582,5 +2601,36 @@ mod tests {
         assert!(specs_enabled.iter().any(|s| s.name == "agent_status"));
         assert!(specs_enabled.iter().any(|s| s.name == "task_create"));
         assert!(specs_enabled.iter().any(|s| s.name == "task_update"));
+    }
+
+    #[test]
+    fn test_workflow_tools_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext::default();
+
+        // When disabled (default)
+        std::env::remove_var("DAVINCI_EXPERIMENTAL_WORKFLOWS");
+        std::env::remove_var("DAVINCI_RUNTIME_WORKFLOWS");
+        let specs = tool_specs();
+        assert!(!specs.iter().any(|s| s.name == "workflow_run"));
+        assert!(!specs.iter().any(|s| s.name == "workflow_status"));
+
+        let err = execute_tool_with(
+            dir.path(),
+            "workflow_status",
+            &serde_json::json!({}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed(ref msg) if msg.contains("Workflow coordination tools are disabled"))
+        );
+
+        // When enabled
+        std::env::set_var("DAVINCI_EXPERIMENTAL_WORKFLOWS", "1");
+        let specs_enabled = tool_specs();
+        std::env::remove_var("DAVINCI_EXPERIMENTAL_WORKFLOWS");
+        assert!(specs_enabled.iter().any(|s| s.name == "workflow_run"));
+        assert!(specs_enabled.iter().any(|s| s.name == "workflow_status"));
     }
 }

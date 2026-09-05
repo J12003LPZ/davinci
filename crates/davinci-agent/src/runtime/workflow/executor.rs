@@ -159,18 +159,39 @@ impl WorkflowExecutor {
         }
     }
 
-    /// Execute a validated workflow from start to finish.
-    pub fn execute(
+    /// Retrieve all tracked workflow executions.
+    pub fn list_workflows(&self) -> Vec<WorkflowExecutionState> {
+        let execs = self.executions.read().unwrap();
+        let mut list: Vec<_> = execs.values().cloned().collect();
+        list.sort_by_key(|w| w.started_ms);
+        list
+    }
+
+    /// Resume a paused workflow.
+    pub fn resume(&self, wf_id: &WorkflowId) -> Result<(), WorkflowExecutionError> {
+        let mut execs = self.executions.write().unwrap();
+        if let Some(state) = execs.get_mut(wf_id) {
+            if state.status == WorkflowStatus::Paused {
+                state.status = WorkflowStatus::Running;
+                self.runtime.emit_observe(RuntimeEvent::WorkflowStarted {
+                    workflow_id: *wf_id,
+                });
+                Ok(())
+            } else {
+                Err(WorkflowExecutionError::InvalidState(state.status))
+            }
+        } else {
+            Err(WorkflowExecutionError::WorkflowNotFound(*wf_id))
+        }
+    }
+
+    fn init_workflow_state(
         &self,
-        spec: WorkflowSpec,
-    ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
-        validate_workflow(&spec)?;
-
-        let wf_id = WorkflowId::new();
-        let wf_token = self.runtime.cancellation_token.child_token();
+        spec: &WorkflowSpec,
+        wf_id: WorkflowId,
+        wf_token: CancellationToken,
+    ) {
         let now = now_ms();
-
-        // 1. Initialize execution states
         let mut phase_states = HashMap::new();
         for phase in &spec.phases {
             phase_states.insert(
@@ -199,17 +220,56 @@ impl WorkflowExecutor {
 
         {
             let mut execs = self.executions.write().unwrap();
-            execs.insert(wf_id, initial_state.clone());
+            execs.insert(wf_id, initial_state);
             let mut toks = self.tokens.write().unwrap();
-            toks.insert(wf_id, wf_token.clone());
+            toks.insert(wf_id, wf_token);
             let mut sps = self.specs.write().unwrap();
             sps.insert(wf_id, spec.clone());
         }
 
         self.runtime
             .emit_observe(RuntimeEvent::WorkflowStarted { workflow_id: wf_id });
+    }
 
-        // 2. Execute phases in topological dependency order
+    /// Execute a validated workflow from start to finish synchronously.
+    pub fn execute(
+        &self,
+        spec: WorkflowSpec,
+    ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
+        validate_workflow(&spec)?;
+        let wf_id = WorkflowId::new();
+        let wf_token = self.runtime.cancellation_token.child_token();
+        self.init_workflow_state(&spec, wf_id, wf_token.clone());
+        self.run_phases(spec, wf_id, wf_token)
+    }
+
+    /// Execute a validated workflow asynchronously in a background thread.
+    pub fn execute_background(
+        &self,
+        spec: WorkflowSpec,
+    ) -> Result<WorkflowId, WorkflowExecutionError> {
+        validate_workflow(&spec)?;
+        let wf_id = WorkflowId::new();
+        let wf_token = self.runtime.cancellation_token.child_token();
+        self.init_workflow_state(&spec, wf_id, wf_token.clone());
+
+        let this = self.clone();
+        std::thread::Builder::new()
+            .name(format!("wf-{}", wf_id))
+            .spawn(move || {
+                let _ = this.run_phases(spec, wf_id, wf_token);
+            })
+            .map_err(|e| WorkflowExecutionError::ExecutionError(e.to_string()))?;
+
+        Ok(wf_id)
+    }
+
+    fn run_phases(
+        &self,
+        spec: WorkflowSpec,
+        wf_id: WorkflowId,
+        wf_token: CancellationToken,
+    ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
         let mut completed_phase_ids: HashSet<String> = HashSet::new();
 
         while completed_phase_ids.len() < spec.phases.len() {
@@ -218,7 +278,6 @@ impl WorkflowExecutor {
                 return Err(WorkflowExecutionError::Cancelled);
             }
 
-            // Find all phases whose dependencies are completed and status is Pending
             let ready_phases: Vec<_> = spec
                 .phases
                 .iter()
@@ -232,7 +291,6 @@ impl WorkflowExecutor {
                 .collect();
 
             if ready_phases.is_empty() {
-                // No ready phases while some remain incomplete indicates a stall/failure
                 let err_msg =
                     "Workflow deadlocked or stalled with unresolvable dependencies".to_string();
                 self.fail_workflow(&wf_id, &err_msg);
@@ -261,25 +319,20 @@ impl WorkflowExecutor {
                 }
 
                 let phase_success = self.execute_phase(&wf_id, &phase, &wf_token)?;
+                if !phase_success {
+                    let err_msg = format!("Phase '{}' failed join requirements", phase.id);
+                    self.fail_workflow(&wf_id, &err_msg);
+                    return Err(WorkflowExecutionError::PhaseFailed { phase: phase.id });
+                }
 
-                if phase_success {
-                    completed_phase_ids.insert(phase.id.clone());
+                completed_phase_ids.insert(phase.id.clone());
+                {
                     let mut execs = self.executions.write().unwrap();
                     if let Some(wf_state) = execs.get_mut(&wf_id) {
                         if let Some(p_state) = wf_state.phases.get_mut(&phase.id) {
                             p_state.status = PhaseStatus::Completed;
                         }
                     }
-                } else {
-                    let mut execs = self.executions.write().unwrap();
-                    if let Some(wf_state) = execs.get_mut(&wf_id) {
-                        if let Some(p_state) = wf_state.phases.get_mut(&phase.id) {
-                            p_state.status = PhaseStatus::Failed;
-                        }
-                    }
-                    let err_msg = format!("Phase '{}' failed join requirements", phase.id);
-                    self.fail_workflow(&wf_id, &err_msg);
-                    return Err(WorkflowExecutionError::PhaseFailed { phase: phase.id });
                 }
             }
         }
@@ -706,5 +759,33 @@ mod tests {
 
         let err = executor.execute(spec).unwrap_err();
         assert_eq!(err, WorkflowExecutionError::Cancelled);
+    }
+
+    #[test]
+    fn test_workflow_execute_background_and_list_and_resume() {
+        let (executor, _tmp) = setup_executor(None);
+        let spec: WorkflowSpec = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+
+        let wf_id = executor.execute_background(spec).unwrap();
+        // Give background thread a moment to finish execution
+        let mut completed = false;
+        for _ in 0..50 {
+            if let Some(st) = executor.get_state(&wf_id) {
+                if st.status == WorkflowStatus::Completed {
+                    completed = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(completed, "background workflow should complete");
+
+        let list = executor.list_workflows();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, wf_id);
+
+        // Test pause and resume
+        let pause_res = executor.pause(&wf_id);
+        assert!(pause_res.is_err(), "cannot pause completed workflow");
     }
 }

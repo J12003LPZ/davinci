@@ -18,7 +18,7 @@ use davinci_tui::davinci::model::{
     HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow,
     PickerItem, PlanStep, ProjectTrustSheet, ProviderRow, ResumeRow, ReviewFile, ReviewSheet,
     Screen, SecurityScan, SettingRow, Severity, Step, ThinkingRow, Tone, TreeNode, TrustFile,
-    VectorIndex, Working, WorkshopSheet,
+    VectorIndex, WorkflowRow, WorkflowsSheet, Working, WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
@@ -32,6 +32,7 @@ pub fn instrument_of(tool_name: &str) -> &'static str {
         name if name.starts_with("memory") => "memoria",
         name if name.starts_with("graph") => "grafo",
         name if name.starts_with("agent_") || name.starts_with("task_") => "societas",
+        name if name.starts_with("workflow_") => "opus",
         _ => "instrumenta",
     }
 }
@@ -42,7 +43,8 @@ pub fn state_of(tool_name: &str, failed: bool) -> State {
         return State::Failed;
     }
     match tool_name {
-        "read" | "ls" | "job_output" | "mcp_read" | "agent_status" | "task_list" => State::Read,
+        "read" | "ls" | "job_output" | "mcp_read" | "agent_status" | "task_list"
+        | "workflow_status" => State::Read,
         "grep" | "find" | "web_fetch" | "web_search" => State::Search,
         name if name.starts_with("memory") => State::Search,
         "edit" | "write" | "notebook_edit" => State::Delta,
@@ -1746,6 +1748,26 @@ pub fn corpus(
     items.push(CorpusItem::new(
         "/agents",
         "custom agent profiles · list and status",
+        "command",
+    ));
+    items.push(CorpusItem::new(
+        "/workflow",
+        "run deterministic workflow · /workflow <goal>",
+        "command",
+    ));
+    items.push(CorpusItem::new(
+        "/workflows",
+        "list active agent workflows",
+        "command",
+    ));
+    items.push(CorpusItem::new(
+        "/workflow-stop",
+        "stop a running workflow · /workflow-stop <id>",
+        "command",
+    ));
+    items.push(CorpusItem::new(
+        "/workflow-resume",
+        "resume a paused workflow · /workflow-resume <id>",
         "command",
     ));
 
@@ -6031,6 +6053,26 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
                 return jobs_command(shell, rest.trim());
             }
         }
+        if let Some(rest) = line.trim().strip_prefix("/workflow-stop") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return workflow_stop_command(shell, rest.trim());
+            }
+        }
+        if let Some(rest) = line.trim().strip_prefix("/workflow-resume") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return workflow_resume_command(shell, rest.trim());
+            }
+        }
+        if let Some(rest) = line.trim().strip_prefix("/workflows") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return workflows_command(shell, rest.trim());
+            }
+        }
+        if let Some(rest) = line.trim().strip_prefix("/workflow") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return workflow_command(shell, rest.trim());
+            }
+        }
     }
     match classify(line) {
         Sent::Quit => {
@@ -6589,6 +6631,195 @@ fn jobs_command(shell: &mut Shell<'_>, arg: &str) -> Next {
             )
             .summarised(&job.status.describe()),
         );
+    }
+    Next::Go
+}
+
+fn open_workflows_sheet(agent: &Agent, model: &mut Model) {
+    let workflows = if let Some(runtime) = &agent.runtime {
+        if let Some(exec) = &runtime.workflow_executor {
+            let list = exec.list_workflows();
+            list.into_iter()
+                .map(|w| {
+                    let mut phases = Vec::new();
+                    for (p_id, p_st) in &w.phases {
+                        phases.push((p_id.clone(), format!("{:?}", p_st.status).to_lowercase()));
+                    }
+                    WorkflowRow {
+                        id: w.id.to_string(),
+                        name: w.name,
+                        status: format!("{:?}", w.status).to_lowercase(),
+                        phases,
+                        started_ms: w.started_ms,
+                        elapsed: if let Some(fin) = w.finished_ms {
+                            format!("{}ms", fin.saturating_sub(w.started_ms))
+                        } else {
+                            "running".into()
+                        },
+                        error: w.error,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    model.workflows = Some(WorkflowsSheet {
+        workflows,
+        selected_index: 0,
+    });
+    open_sheet(model, Screen::Workflows);
+}
+
+fn workflows_command(shell: &mut Shell<'_>, _arg: &str) -> Next {
+    open_workflows_sheet(shell.agent, shell.model);
+    Next::Go
+}
+
+fn workflow_command(shell: &mut Shell<'_>, goal: &str) -> Next {
+    let goal = goal.trim();
+    if goal.is_empty() {
+        open_workflows_sheet(shell.agent, shell.model);
+        return Next::Go;
+    }
+
+    let trusted = shell
+        .agent
+        .runtime
+        .as_ref()
+        .is_some_and(|r| r.project_trusted);
+    match davinci_agent::find_saved_workflow(&shell.agent.cwd, goal, trusted) {
+        Ok(spec) => {
+            if let Some(runtime) = &shell.agent.runtime {
+                if let Some(exec) = &runtime.workflow_executor {
+                    match exec.execute_background(spec) {
+                        Ok(wf_id) => {
+                            shell.model.running = false;
+                            shell.model.transcript.push(Entry::Gap);
+                            shell.model.transcript.push(Entry::tool(
+                                State::Done,
+                                "opus",
+                                &format!("workflow '{}' ({}) started in background", goal, wf_id),
+                                None,
+                            ));
+                            return Next::Go;
+                        }
+                        Err(err) => {
+                            shell.note(&format!("failed to start workflow: {err}"));
+                            return Next::Go;
+                        }
+                    }
+                }
+            }
+            shell.note("runtime workflow executor not available");
+            Next::Go
+        }
+        Err(err) => {
+            if err.contains("requires project trust") {
+                shell.note(&err);
+                return Next::Go;
+            }
+            submit_prompt(
+                shell,
+                &format!(
+                    "Create and execute a deterministic workflow using workflow_run for the following goal:\n{}",
+                    goal
+                ),
+                &[],
+            )
+        }
+    }
+}
+
+fn workflow_stop_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
+    let id_str = id_str.trim();
+    if id_str.is_empty() {
+        shell.note("usage: /workflow-stop <id>");
+        return Next::Go;
+    }
+
+    let Some(runtime) = &shell.agent.runtime else {
+        shell.note("runtime subsystem not available");
+        return Next::Go;
+    };
+    let Some(exec) = &runtime.workflow_executor else {
+        shell.note("workflow executor not initialized");
+        return Next::Go;
+    };
+
+    let list = exec.list_workflows();
+    let target = list
+        .iter()
+        .find(|w| w.id.to_string().starts_with(id_str))
+        .map(|w| w.id);
+
+    match target {
+        Some(wf_id) => match exec.cancel(&wf_id) {
+            Ok(()) => {
+                shell.model.running = false;
+                shell.model.transcript.push(Entry::Gap);
+                shell.model.transcript.push(Entry::tool(
+                    State::Done,
+                    "opus",
+                    &format!("workflow {} stopped", wf_id),
+                    None,
+                ));
+            }
+            Err(err) => {
+                shell.note(&format!("error stopping workflow: {err}"));
+            }
+        },
+        None => {
+            shell.note(&format!("no workflow matching '{}'", id_str));
+        }
+    }
+    Next::Go
+}
+
+fn workflow_resume_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
+    let id_str = id_str.trim();
+    if id_str.is_empty() {
+        shell.note("usage: /workflow-resume <id>");
+        return Next::Go;
+    }
+
+    let Some(runtime) = &shell.agent.runtime else {
+        shell.note("runtime subsystem not available");
+        return Next::Go;
+    };
+    let Some(exec) = &runtime.workflow_executor else {
+        shell.note("workflow executor not initialized");
+        return Next::Go;
+    };
+
+    let list = exec.list_workflows();
+    let target = list
+        .iter()
+        .find(|w| w.id.to_string().starts_with(id_str))
+        .map(|w| w.id);
+
+    match target {
+        Some(wf_id) => match exec.resume(&wf_id) {
+            Ok(()) => {
+                shell.model.running = false;
+                shell.model.transcript.push(Entry::Gap);
+                shell.model.transcript.push(Entry::tool(
+                    State::Done,
+                    "opus",
+                    &format!("workflow {} resumed", wf_id),
+                    None,
+                ));
+            }
+            Err(err) => {
+                shell.note(&format!("error resuming workflow: {err}"));
+            }
+        },
+        None => {
+            shell.note(&format!("no workflow matching '{}'", id_str));
+        }
     }
     Next::Go
 }
@@ -8090,6 +8321,10 @@ mod tests {
         assert!(names.contains(&"/cost"), "{names:?}");
         assert!(names.contains(&"/status"), "{names:?}");
         assert!(names.contains(&"/agents"), "{names:?}");
+        assert!(names.contains(&"/workflow"), "{names:?}");
+        assert!(names.contains(&"/workflows"), "{names:?}");
+        assert!(names.contains(&"/workflow-stop"), "{names:?}");
+        assert!(names.contains(&"/workflow-resume"), "{names:?}");
     }
 
     #[test]
@@ -8608,5 +8843,30 @@ mod tests {
             classify("/session stats"),
             Sent::Command(SlashAction::SessionInfo)
         ));
+    }
+
+    #[test]
+    fn test_workflow_commands_and_sheet() {
+        let mut agent = davinci_agent::Agent::new("test");
+        let bus = davinci_agent::RuntimeBus::new();
+        let runtime = davinci_agent::RuntimeHandle::new(
+            davinci_agent::RunId::new(),
+            davinci_agent::AgentId::new(),
+            bus,
+        );
+        let store = davinci_agent::WorkflowStateStore::new();
+        let executor = std::sync::Arc::new(davinci_agent::WorkflowExecutor::new(
+            runtime.clone(),
+            store,
+            None,
+        ));
+        let runtime = runtime.with_workflow_executor(executor.clone());
+        agent.runtime = Some(runtime);
+
+        let mut m = model();
+        open_workflows_sheet(&agent, &mut m);
+        assert_eq!(m.screen, Screen::Workflows);
+        assert!(m.workflows.is_some());
+        assert_eq!(m.workflows.unwrap().workflows.len(), 0);
     }
 }

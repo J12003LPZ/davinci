@@ -89,11 +89,13 @@ pub use turn::retry_delay_ms;
 
 pub mod runtime;
 pub use runtime::{
-    hash_system_prompt, hash_tool_names, wrap_untrusted_data, AgentId, AgentKind, AgentRecord,
-    AgentState, CacheIdentity, CacheMissReason, CancellationToken, ContextBroker, ContextItem,
-    ContextPacket, ContextRequest, ContextSource, RegistryError, RunId, RuntimeBus,
-    RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry,
-    RuntimeSubscriber, TaskId, WorkflowId, WorktreeError, WorktreeLease, WorktreeManager,
+    find_saved_workflow, hash_system_prompt, hash_tool_names, save_workflow_to_project,
+    wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState, CacheIdentity,
+    CacheMissReason, CancellationToken, ContextBroker, ContextItem, ContextPacket, ContextRequest,
+    ContextSource, RegistryError, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
+    RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, TaskId,
+    WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore, WorktreeError, WorktreeLease,
+    WorktreeManager,
 };
 
 use davinci_ai::{

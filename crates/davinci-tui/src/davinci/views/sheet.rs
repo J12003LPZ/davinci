@@ -16,7 +16,7 @@ use crate::davinci::ui::{self, span};
 
 use super::{
     cogitator, compact, diff, export, governor, graph_run, keys, login, mcp, officina, permissions,
-    recovery, resume, securitas, settings, thinking, tree, trust, vectors,
+    recovery, resume, securitas, settings, thinking, tree, trust, vectors, workflows,
 };
 
 /// What sits under a sheet.
@@ -124,6 +124,7 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         Screen::Diff => diff::chrome(model),
         Screen::Mcp => mcp::chrome(model),
         Screen::Permissions => permissions::chrome(model),
+        Screen::Workflows => workflows::chrome(model),
     })
 }
 
