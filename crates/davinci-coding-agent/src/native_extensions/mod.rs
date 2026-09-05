@@ -4,7 +4,7 @@ pub mod ecosystem;
 pub mod graph;
 pub mod learning;
 mod security_scan;
-mod token_governor;
+pub mod token_governor;
 pub mod vector_memory;
 
 #[allow(unused_imports)]

@@ -1458,8 +1458,10 @@ fn run_nested_subagent(
         davinci_agent::TOOL_USE_STRATEGY
     ));
     child.cwd = cwd.to_path_buf();
-    child.tools = req.tools.clone();
-    child.tool_registry = req.tools.clone();
+    let mut tools = req.tools.clone();
+    crate::native_extensions::token_governor::ensure_governor_recovery_tool(&mut tools);
+    child.tools = tools.clone();
+    child.tool_registry = tools;
     child.session = None;
     // A worker's output is bounded by the parent; its own overflow has
     // nowhere useful to go.

@@ -132,3 +132,285 @@ pub fn register_native_context_sources_from_instances(
         crate::native_extensions::learning::SkillContextSource::from_controller(learning.clone()),
     ));
 }
+
+/// Universal Token Governor host adapter for virtualizing tool outputs across all runtime agents.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct GovernorHostAdapter {
+    pub governor: Arc<Mutex<crate::native_extensions::token_governor::TokenGovernor>>,
+}
+
+#[allow(dead_code)]
+impl GovernorHostAdapter {
+    #[allow(dead_code)]
+    pub fn new(
+        governor: Arc<Mutex<crate::native_extensions::token_governor::TokenGovernor>>,
+    ) -> Self {
+        Self { governor }
+    }
+
+    pub fn from_governor(
+        governor: crate::native_extensions::token_governor::TokenGovernor,
+    ) -> Self {
+        Self {
+            governor: Arc::new(Mutex::new(governor)),
+        }
+    }
+
+    /// Process a tool result after execution, applying compression/virtualization if eligible.
+    /// Exempts `memory_search`, `retrieve_output`, and error outputs.
+    pub fn process_tool_output(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        result: davinci_agent::ToolResult,
+    ) -> davinci_agent::ToolResult {
+        // memory_search, retrieve_output, and error outputs are strictly exempt
+        if result.is_error || name == "memory_search" || name == "retrieve_output" {
+            return result;
+        }
+        let mut gov = match self.governor.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        gov.after_tool(name, args, result)
+    }
+
+    /// Retrieve stored output by id or args.
+    pub fn retrieve(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<davinci_agent::ToolResult, davinci_agent::ToolError> {
+        let gov = match self.governor.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        gov.retrieve(args)
+    }
+
+    /// Ensure that if `tools` contains any tool that can produce compressible output,
+    /// `retrieve_output` is present in `tools`.
+    pub fn ensure_recovery_tool(tools: &mut Vec<String>) {
+        crate::native_extensions::token_governor::ensure_governor_recovery_tool(tools);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_extensions::token_governor::{TokenGovernor, TokenGovernorConfig};
+    use davinci_agent::ToolResult;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn make_adapter() -> (GovernorHostAdapter, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            enabled: true,
+            compress_threshold_bytes: 500,
+            compress_threshold_lines: 10,
+            store_dir: Some(dir.path().to_path_buf()),
+            ..TokenGovernorConfig::default()
+        };
+        let governor = TokenGovernor::new("test-session", config);
+        (GovernorHostAdapter::from_governor(governor), dir)
+    }
+
+    fn large_content() -> String {
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n".repeat(30)
+    }
+
+    #[test]
+    fn test_normal_agent_output_virtualization_and_recovery() {
+        let (adapter, _dir) = make_adapter();
+        let content = large_content();
+        assert!(content.len() > 500);
+
+        let res = ToolResult {
+            content: content.clone(),
+            is_error: false,
+            details: None,
+        };
+
+        // Normal agent executes bash
+        let processed = adapter.process_tool_output("bash", &json!({"command": "test"}), res);
+        assert!(processed.content.contains("Call retrieve_output with id"));
+        assert_eq!(
+            processed.details.as_ref().unwrap()["tokenGovernor"]["compressed"],
+            true
+        );
+
+        let output_id = processed
+            .details
+            .as_ref()
+            .and_then(|d| d.get("tokenGovernor"))
+            .and_then(|tg| tg.get("outputId"))
+            .and_then(|id| id.as_str())
+            .expect("outputId must be present in details");
+
+        let recovered = adapter
+            .retrieve(&json!({"id": output_id}))
+            .expect("recovery must succeed");
+        assert!(!recovered.is_error);
+        assert!(recovered.content.contains("1: Lorem ipsum dolor sit amet"));
+        assert!(recovered.content.contains("30: Lorem ipsum dolor sit amet"));
+    }
+
+    #[test]
+    fn test_subagent_worker_recoverability_and_tool_guarantee() {
+        let (adapter, _dir) = make_adapter();
+        let mut subagent_tools = vec!["read".to_string(), "grep".to_string(), "bash".to_string()];
+        GovernorHostAdapter::ensure_recovery_tool(&mut subagent_tools);
+        assert!(
+            subagent_tools.contains(&"retrieve_output".to_string()),
+            "Subagent with bash must automatically include retrieve_output"
+        );
+
+        let content = large_content();
+        let res = ToolResult {
+            content: content.clone(),
+            is_error: false,
+            details: None,
+        };
+
+        let processed =
+            adapter.process_tool_output("bash", &json!({"command": "subagent_job"}), res);
+        assert!(processed.content.contains("Call retrieve_output with id"));
+        assert_eq!(
+            processed.details.as_ref().unwrap()["tokenGovernor"]["compressed"],
+            true
+        );
+
+        let output_id = processed
+            .details
+            .as_ref()
+            .and_then(|d| d.get("tokenGovernor"))
+            .and_then(|tg| tg.get("outputId"))
+            .and_then(|id| id.as_str())
+            .unwrap();
+
+        let recovered = adapter
+            .retrieve(&json!({"id": output_id}))
+            .expect("recovery must succeed");
+        assert!(!recovered.is_error);
+        assert!(recovered.content.contains("1: Lorem ipsum dolor sit amet"));
+        assert!(recovered.content.contains("30: Lorem ipsum dolor sit amet"));
+    }
+
+    #[test]
+    fn test_graph_worker_recoverability() {
+        let (adapter, _dir) = make_adapter();
+        let graph_tools = crate::native_extensions::graph::roles::role_tools(
+            crate::native_extensions::graph::Role::Writer,
+        );
+        assert!(
+            graph_tools.contains(&"retrieve_output".to_string()),
+            "Graph writer must include retrieve_output"
+        );
+
+        let content = large_content();
+        let res = ToolResult {
+            content: content.clone(),
+            is_error: false,
+            details: None,
+        };
+
+        let processed =
+            adapter.process_tool_output("bash", &json!({"command": "graph_writer_step"}), res);
+        assert!(processed.content.contains("Call retrieve_output with id"));
+        assert_eq!(
+            processed.details.as_ref().unwrap()["tokenGovernor"]["compressed"],
+            true
+        );
+
+        let output_id = processed
+            .details
+            .as_ref()
+            .and_then(|d| d.get("tokenGovernor"))
+            .and_then(|tg| tg.get("outputId"))
+            .and_then(|id| id.as_str())
+            .unwrap();
+
+        let recovered = adapter
+            .retrieve(&json!({"id": output_id}))
+            .expect("recovery must succeed");
+        assert!(!recovered.is_error);
+        assert!(recovered.content.contains("1: Lorem ipsum dolor sit amet"));
+        assert!(recovered.content.contains("30: Lorem ipsum dolor sit amet"));
+    }
+
+    #[test]
+    fn test_workflow_worker_recoverability() {
+        let (adapter, _dir) = make_adapter();
+        let mut workflow_tools = vec!["bash".to_string(), "read".to_string()];
+        GovernorHostAdapter::ensure_recovery_tool(&mut workflow_tools);
+        assert!(
+            workflow_tools.contains(&"retrieve_output".to_string()),
+            "Workflow worker with compressible tools must include retrieve_output"
+        );
+
+        let content = large_content();
+        let res = ToolResult {
+            content: content.clone(),
+            is_error: false,
+            details: None,
+        };
+
+        let processed =
+            adapter.process_tool_output("bash", &json!({"command": "workflow_action"}), res);
+        assert!(processed.content.contains("Call retrieve_output with id"));
+        assert_eq!(
+            processed.details.as_ref().unwrap()["tokenGovernor"]["compressed"],
+            true
+        );
+
+        let output_id = processed
+            .details
+            .as_ref()
+            .and_then(|d| d.get("tokenGovernor"))
+            .and_then(|tg| tg.get("outputId"))
+            .and_then(|id| id.as_str())
+            .unwrap();
+
+        let recovered = adapter
+            .retrieve(&json!({"id": output_id}))
+            .expect("recovery must succeed");
+        assert!(!recovered.is_error);
+        assert!(recovered.content.contains("1: Lorem ipsum dolor sit amet"));
+        assert!(recovered.content.contains("30: Lorem ipsum dolor sit amet"));
+    }
+
+    #[test]
+    fn test_exemptions_memory_search_retrieve_output_and_errors() {
+        let (adapter, _dir) = make_adapter();
+        let content = large_content();
+
+        // 1. Error output is exempt
+        let error_res = ToolResult {
+            content: content.clone(),
+            is_error: true,
+            details: None,
+        };
+        let processed_err = adapter.process_tool_output("bash", &json!({}), error_res);
+        assert_eq!(processed_err.content, content);
+        assert!(processed_err.is_error);
+
+        // 2. memory_search is exempt
+        let mem_res = ToolResult {
+            content: content.clone(),
+            is_error: false,
+            details: None,
+        };
+        let processed_mem = adapter.process_tool_output("memory_search", &json!({}), mem_res);
+        assert_eq!(processed_mem.content, content);
+
+        // 3. retrieve_output is exempt
+        let ret_res = ToolResult {
+            content: content.clone(),
+            is_error: false,
+            details: None,
+        };
+        let processed_ret = adapter.process_tool_output("retrieve_output", &json!({}), ret_res);
+        assert_eq!(processed_ret.content, content);
+    }
+}

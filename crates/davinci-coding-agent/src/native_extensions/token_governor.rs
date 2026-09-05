@@ -61,6 +61,16 @@ pub fn tool_may_be_compressed(name: &str) -> bool {
     !LOSSLESS_TOOLS.contains(&name)
 }
 
+/// Guarantees that if any tool in the list can generate compressible output under
+/// the token governor, `retrieve_output` is automatically included so the worker
+/// never loses access to compressed data.
+pub fn ensure_governor_recovery_tool(tools: &mut Vec<String>) {
+    let has_compressible = tools.iter().any(|t| tool_may_be_compressed(t));
+    if has_compressible && !tools.iter().any(|t| t == "retrieve_output") {
+        tools.push("retrieve_output".into());
+    }
+}
+
 /// Tools the anti-loop ledger watches: pure queries whose answer only changes
 /// when the repository does.
 const SEARCH_TOOLS: &[&str] = &["grep", "find", "ls"];

@@ -19,17 +19,7 @@ const READ_TOOLS: &[&str] = &["read", "grep", "find", "ls"];
 
 pub const GRAPH_SUBMIT_TOOL: &str = "graph_submit";
 
-/// Guarantees that if any tool in the list can generate compressible output under
-/// the token governor, `retrieve_output` is automatically included so the worker
-/// never loses access to compressed data.
-pub fn ensure_governor_recovery_tool(tools: &mut Vec<String>) {
-    let has_compressible = tools
-        .iter()
-        .any(|t| crate::native_extensions::tool_may_be_compressed(t));
-    if has_compressible && !tools.iter().any(|t| t == "retrieve_output") {
-        tools.push("retrieve_output".into());
-    }
-}
+pub use crate::native_extensions::token_governor::ensure_governor_recovery_tool;
 
 pub fn role_tools(role: Role) -> Vec<String> {
     let names: Vec<&str> = match role {
