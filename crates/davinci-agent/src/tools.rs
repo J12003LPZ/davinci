@@ -228,7 +228,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "agent".into(),
-            description: "Start nested workers or persistent teammates with their own context. Pass a prompt (one worker), or tasks: [{prompt, description?, tools?}] for up to 8 workers that run concurrently. Supports custom agent profiles (via `agent`), execution modes (`oneshot`, `background`, `teammate`), model overrides, and isolation.".into(),
+            description: "Start nested workers or persistent teammates with their own context. Pass a prompt (one worker) for bounded independent research, or tasks: [{prompt, description?, tools?}] for up to 8 workers that run concurrently. Supports custom agent profiles (via `agent`), execution modes (`oneshot`, `background`, `teammate`), model overrides, and isolation.".into(),
             parameters: crate::subagent::tool_parameters(),
         },
         AgentTool {

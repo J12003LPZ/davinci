@@ -35,8 +35,11 @@ const KNOWN_TOOLS: &[&str] = &[
     "task_create",
     "task_update",
     "task_list",
-    "graph_submit",
+    "workflow_status",
 ];
+
+/// Graph internal tools that cannot be directly called by general workflows.
+pub const GRAPH_INTERNAL_TOOLS: &[&str] = &["graph_submit"];
 
 const MUTATION_TOOLS: &[&str] = &[
     "write",
@@ -45,6 +48,7 @@ const MUTATION_TOOLS: &[&str] = &[
     "bash",
     "powershell",
     "apply_patch",
+    "graph_run",
 ];
 
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
@@ -85,6 +89,8 @@ pub enum WorkflowValidationError {
     ParallelWriterViolation { phase: String },
     #[error("worker '{worker}' declares unknown or hidden tool: '{tool}'")]
     HiddenTool { worker: String, tool: String },
+    #[error("worker '{worker}' cannot call internal graph tool '{tool}' directly")]
+    GraphInternalToolRejected { worker: String, tool: String },
     #[error("worker '{worker}' requires mutation tool '{tool}' which is denied under permission mode '{mode}'")]
     PermissionViolation {
         worker: String,
@@ -106,6 +112,16 @@ pub fn validate_workflow(spec: &WorkflowSpec) -> Result<(), WorkflowValidationEr
 pub fn validate_workflow_with_permissions(
     spec: &WorkflowSpec,
     parent_permission_mode: Option<PermissionMode>,
+) -> Result<(), WorkflowValidationError> {
+    validate_workflow_with_permissions_and_tools(spec, parent_permission_mode, &[])
+}
+
+/// Validate a workflow specification with optional parent permission mode enforcement
+/// and explicitly exposed extra tools (e.g. `graph_run`).
+pub fn validate_workflow_with_permissions_and_tools(
+    spec: &WorkflowSpec,
+    parent_permission_mode: Option<PermissionMode>,
+    extra_tools: &[&str],
 ) -> Result<(), WorkflowValidationError> {
     if spec.schema_version != 1 {
         return Err(WorkflowValidationError::InvalidSchemaVersion(
@@ -252,7 +268,16 @@ pub fn validate_workflow_with_permissions(
 
             // Check tools
             for tool in &worker.tools {
-                if !KNOWN_TOOLS.contains(&tool.as_str()) && !tool.starts_with("mcp__") {
+                if GRAPH_INTERNAL_TOOLS.contains(&tool.as_str()) {
+                    return Err(WorkflowValidationError::GraphInternalToolRejected {
+                        worker: wid.to_string(),
+                        tool: tool.clone(),
+                    });
+                }
+                if !KNOWN_TOOLS.contains(&tool.as_str())
+                    && !extra_tools.contains(&tool.as_str())
+                    && !tool.starts_with("mcp__")
+                {
                     return Err(WorkflowValidationError::HiddenTool {
                         worker: wid.to_string(),
                         tool: tool.clone(),
@@ -459,6 +484,67 @@ mod tests {
             validate_workflow_with_permissions(&spec, Some(PermissionMode::ReadOnly)).unwrap_err();
         assert!(matches!(
             err,
+            WorkflowValidationError::PermissionViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn test_workflow_cannot_call_graph_internals_directly() {
+        let mut spec: WorkflowSpec = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        spec.phases[0].workers[0].tools.push("graph_submit".into());
+
+        // Default validation rejects graph internals
+        let err = validate_workflow(&spec).unwrap_err();
+        assert_eq!(
+            err,
+            WorkflowValidationError::GraphInternalToolRejected {
+                worker: "repo-searcher".into(),
+                tool: "graph_submit".into(),
+            }
+        );
+
+        // Even when explicitly passed in extra_tools, graph internals are rejected
+        let err_extra =
+            validate_workflow_with_permissions_and_tools(&spec, None, &["graph_submit"])
+                .unwrap_err();
+        assert_eq!(
+            err_extra,
+            WorkflowValidationError::GraphInternalToolRejected {
+                worker: "repo-searcher".into(),
+                tool: "graph_submit".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_workflow_graph_run_rejected_unless_explicitly_exposed() {
+        let mut spec: WorkflowSpec = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        // Add graph_run to an isolated worker in the implement phase
+        spec.phases[2].workers[0].tools.push("graph_run".into());
+
+        // Without explicitly exposing graph_run, it is rejected as HiddenTool
+        let err = validate_workflow(&spec).unwrap_err();
+        assert_eq!(
+            err,
+            WorkflowValidationError::HiddenTool {
+                worker: "writer-1".into(),
+                tool: "graph_run".into(),
+            }
+        );
+
+        // When graph_run is explicitly exposed, validation succeeds
+        let res = validate_workflow_with_permissions_and_tools(&spec, None, &["graph_run"]);
+        assert!(res.is_ok());
+
+        // But in ReadOnly mode, graph_run is rejected as a mutation tool
+        let err_ro = validate_workflow_with_permissions_and_tools(
+            &spec,
+            Some(PermissionMode::ReadOnly),
+            &["graph_run"],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err_ro,
             WorkflowValidationError::PermissionViolation { .. }
         ));
     }

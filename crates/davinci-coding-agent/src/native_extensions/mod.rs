@@ -433,7 +433,7 @@ impl NativeExtensionHost {
                 json!({"type":"object","properties":{"runId":{"type":"string"}}}),
             ),
             "graph_run" => (
-                "Solve a coding task as an execution graph of isolated, least-privileged worker processes (classify, research, plan, implement, verify, review) and return the outcome. Runs to completion, which can take a long time.",
+                "Solve a coding task as an execution graph of isolated, least-privileged worker processes (classify, research, plan, implement, verify, review) with deterministic plan, verification, review coverage, and security audit guarantees. Runs to completion, which can take a long time.",
                 json!({"type":"object","properties":{"goal":{"type":"string","minLength":1},"mode":{"type":"string","enum":["simple","complex"]},"dryRun":{"type":"boolean"}},"required":["goal"]}),
             ),
             "skill_list" => (

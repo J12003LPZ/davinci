@@ -18,7 +18,7 @@ pub fn workflow_tool_specs() -> Vec<AgentTool> {
     vec![
         AgentTool {
             name: "workflow_run".into(),
-            description: "Execute a multi-phase deterministic agent workflow from a validated JSON spec, or run a saved workflow by name.".into(),
+            description: "Execute a multi-phase repeatable agent workflow from a validated JSON spec, or run a saved workflow by name. Best for structured multi-step pipelines with intermediate artifacts (use single-agent for direct turns, subagents for bounded research, teams for collaborative task boards, and /graph for verified code mutation pipelines).".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
