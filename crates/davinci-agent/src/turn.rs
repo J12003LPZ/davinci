@@ -124,16 +124,16 @@ impl Agent {
 
             self.stats.model_turns += 1;
             let model_started = std::time::Instant::now();
-            let (assistant, stream_events, streamed_live) =
-                match self.complete_with_retry(&mut complete, &mut events) {
-                    Ok(output) => output,
-                    Err(err) => {
-                        self.is_streaming = false;
-                        self.flush_pending_bash_messages();
-                        return Err(err);
-                    }
-                };
+            let completion = self.complete_with_retry(&mut complete, &mut events);
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
+            let (assistant, stream_events, streamed_live) = match completion {
+                Ok(output) => output,
+                Err(err) => {
+                    self.is_streaming = false;
+                    self.flush_pending_bash_messages();
+                    return Err(err);
+                }
+            };
             let chat = assistant_to_chat(&assistant);
             self.messages.push(chat.clone());
             self.persist_assistant(&assistant, &chat);
@@ -432,6 +432,9 @@ impl Agent {
                     false,
                 ));
             }
+            if attempt > 0 {
+                self.stats.provider_retries += 1;
+            }
             match complete(self) {
                 Ok(output) => {
                     let output = output.into();
@@ -454,11 +457,14 @@ impl Agent {
                                     .unwrap_or_else(|| "Unknown error".into()),
                             },
                         );
-                        sleep_retry_delay(delay);
+                        sleep_retry_delay(delay, || self.abort_requested() || self.retry_aborted);
                         continue;
                     }
                     if scheduled_attempt > 0 {
-                        let success = message.stop_reason != Some(StopReason::Error);
+                        let success = !matches!(
+                            message.stop_reason,
+                            Some(StopReason::Error | StopReason::Aborted)
+                        );
                         self.push_event(
                             events,
                             AgentEvent::AutoRetryEnd {
@@ -488,7 +494,7 @@ impl Agent {
                                 error_message: err,
                             },
                         );
-                        sleep_retry_delay(delay);
+                        sleep_retry_delay(delay, || self.abort_requested() || self.retry_aborted);
                     } else {
                         // A refused request (a 400, a bad key) comes back the
                         // same every time; TS fails at once and so does this.
@@ -997,9 +1003,14 @@ pub fn retry_delay_ms(base_delay_ms: u64, zero_based_attempt: u32) -> u64 {
     base_delay_ms.saturating_mul(1_u64 << shift)
 }
 
-fn sleep_retry_delay(delay_ms: u64) {
-    if delay_ms == 0 || cfg!(test) {
-        return;
+fn sleep_retry_delay(delay_ms: u64, cancelled: impl Fn() -> bool) {
+    let started = std::time::Instant::now();
+    let delay = std::time::Duration::from_millis(delay_ms);
+    while !cancelled() {
+        let remaining = delay.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
     }
-    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 }

@@ -281,7 +281,10 @@ impl GraphExecution {
         let role = task.role;
         let configured_model = self.deps.config.models.get(&role).cloned();
         let mut tools = role_tools(role);
-        tools.extend(self.deps.config.worker_extra_tools.iter().cloned());
+        // Match the worker-side role guard; do not advertise tools it must refuse.
+        if role == Role::Writer {
+            tools.extend(self.deps.config.worker_extra_tools.iter().cloned());
+        }
         ensure_governor_recovery_tool(&mut tools);
         let has_recovery = tools.iter().any(|t| t == "retrieve_output");
         WorkerSpec {
@@ -1588,6 +1591,59 @@ fn deliver_goal(
 mod tests {
     use super::*;
     use crate::native_extensions::graph::types::*;
+
+    #[test]
+    fn graph_worker_spec_does_not_advertise_privileged_extras_to_classifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _, _| {
+            captured
+                .lock()
+                .unwrap()
+                .push((spec.role, spec.tools.clone()));
+            WorkerResult {
+                ok: false,
+                ..WorkerResult::default()
+            }
+        });
+        let deps = ControllerDeps {
+            runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
+            config: GraphConfig {
+                worker_extra_tools: vec!["write".into(), "custom_mutator".into()],
+                ..Default::default()
+            },
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+        };
+        let run = run_graph(
+            RunOptions {
+                goal: "inspect".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+            },
+            deps,
+        );
+        assert_eq!(run.phase, Phase::Blocked);
+        assert!(!run.tasks.is_empty());
+        let observed = observed.lock().unwrap();
+        assert!(!observed.is_empty());
+        for (role, tools) in observed.iter() {
+            assert_eq!(*role, Role::Classifier);
+            assert!(!tools
+                .iter()
+                .any(|name| name == "write" || name == "custom_mutator"));
+        }
+    }
 
     #[test]
     fn graph_deadline_controller_aborts_run_when_worker_exceeds_deadline() {

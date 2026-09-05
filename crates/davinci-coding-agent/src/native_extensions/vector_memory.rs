@@ -339,24 +339,6 @@ pub fn resolve_repo_id(cwd: &Path) -> String {
     sha256_hex(identity.as_bytes())
 }
 
-pub fn repo_state_key(cwd: &Path) -> String {
-    let head = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_default();
-    let status = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-        .unwrap_or_default();
-    sha256_hex(format!("{head}\0{status}").as_bytes())
-}
-
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
         .trim_end_matches('/')

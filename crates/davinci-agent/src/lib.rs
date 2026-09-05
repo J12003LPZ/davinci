@@ -243,6 +243,8 @@ pub struct Agent {
     /// Context supplied by extensions for the next provider request only.
     /// These messages never enter the persisted session history.
     ephemeral_context: Vec<ChatMessage>,
+    /// Host-supplied schema/identity estimate, excluding `system_prompt` and messages.
+    provider_context_overhead_tokens: Option<u64>,
 }
 
 impl Agent {
@@ -304,6 +306,7 @@ impl Agent {
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
+            provider_context_overhead_tokens: None,
         }
     }
 
@@ -433,10 +436,25 @@ impl Agent {
 
     /// The token estimate for what the provider will actually be sent:
     /// pruned tool results count as their placeholder, and an extension's
-    /// ephemeral context counts although it is not in `messages`.
+    /// ephemeral context counts although it is not in `messages`. System and
+    /// tool schemas count too. This is a byte heuristic, not a tokenizer or upper bound.
     pub fn estimated_context_tokens(&self) -> u64 {
         pruning::estimate_projected_tokens(&self.messages, &self.pruned_tool_results)
             + estimate_context_tokens(&self.ephemeral_context)
+            + (self.system_prompt.len() as u64).div_ceil(4)
+            + self.provider_context_overhead_tokens.unwrap_or_else(|| {
+                let specs = self.builtin_and_mcp_specs();
+                (serde_json::to_vec(&specs)
+                    .expect("tool schemas are JSON")
+                    .len() as u64)
+                    .div_ceil(4)
+            })
+    }
+
+    /// Set once per request configuration using the actual tool catalog and
+    /// any host-added system suffix. `None` restores the builtin/MCP estimate.
+    pub fn set_provider_context_overhead_tokens(&mut self, tokens: Option<u64>) {
+        self.provider_context_overhead_tokens = tokens;
     }
 
     /// Prune old tool output from the provider view when the context has
@@ -1202,6 +1220,117 @@ mod tests {
     }
 
     #[test]
+    fn context_budget_counts_system_and_active_tool_schemas() {
+        let mut agent = Agent::new("");
+        agent.tools.clear();
+        let empty = agent.estimated_context_tokens();
+        agent.system_prompt = "x".repeat(4_000);
+        assert!(agent.estimated_context_tokens() >= empty + 1_000);
+        let without_tools = agent.estimated_context_tokens();
+        agent.tools.push("read".into());
+        assert!(agent.estimated_context_tokens() > without_tools);
+        agent.tools.clear();
+        assert_eq!(agent.estimated_context_tokens(), without_tools);
+        agent.set_provider_context_overhead_tokens(Some(3_000));
+        assert_eq!(agent.estimated_context_tokens(), 4_000);
+        agent.set_provider_context_overhead_tokens(None);
+        assert_eq!(agent.estimated_context_tokens(), without_tools);
+    }
+
+    #[test]
+    fn context_overhead_triggers_pruning_before_the_provider_request() {
+        let mut agent = Agent::new("x".repeat(24_000));
+        agent.tools.clear();
+        agent.context_window = 10_000;
+        agent.prune_settings.keep_recent = 0;
+        let mut result = ChatMessage::text("toolResult", "output".repeat(1_000));
+        result.tool_call_id = Some("old-read".into());
+        agent.messages.push(result);
+        agent.prune_context();
+        assert!(agent.pruned_tool_results().contains("old-read"));
+        assert_eq!(agent.stats.pruned_results, 1);
+    }
+
+    #[test]
+    fn retry_cancellation_during_backoff_prevents_another_request() {
+        use davinci_ai::AssistantMessage;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let signal = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new("");
+        agent.abort_signal = Some(signal.clone());
+        agent.retry_attempts = 2;
+        agent.retry_base_delay_ms = 5_000;
+        agent.prompt("retry cancellation");
+        let mut calls = 0;
+        let mut interrupter = None;
+        let started = std::time::Instant::now();
+        agent
+            .run_loop(|_| -> Result<AssistantMessage, String> {
+                calls += 1;
+                if calls == 1 {
+                    let signal = signal.clone();
+                    interrupter = Some(std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        signal.store(true, Ordering::Relaxed);
+                    }));
+                }
+                Err("overloaded_error".into())
+            })
+            .unwrap();
+        interrupter.unwrap().join().unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(agent.stats.provider_retries, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retry_never_repeats_a_permanent_request_failure() {
+        let mut agent = Agent::new("");
+        agent.retry_base_delay_ms = 0;
+        agent.prompt("bad request");
+        let mut calls = 0;
+        let result = agent.run_loop(|_| -> Result<davinci_ai::AssistantMessage, String> {
+            calls += 1;
+            Err("400 bad request".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert_eq!(agent.stats.provider_retries, 0);
+    }
+
+    #[test]
+    fn retry_aborted_provider_response_is_not_reported_as_success() {
+        let mut agent = Agent::new("");
+        agent.retry_base_delay_ms = 0;
+        agent.prompt("cancel recovery");
+        let mut calls = 0;
+        let events = agent
+            .run_loop(|_| {
+                calls += 1;
+                if calls == 1 {
+                    return Err("overloaded_error".into());
+                }
+                Ok(davinci_ai::AssistantMessage {
+                    id: "abort".into(),
+                    role: "assistant".into(),
+                    content: Vec::new(),
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(davinci_ai::StopReason::Aborted),
+                    error_message: Some("cancelled".into()),
+                })
+            })
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AutoRetryEnd { success: false, .. })));
+        assert_eq!(agent.stats.provider_retries, 1);
+    }
+
+    #[test]
     fn auto_retry_emits_ts_session_events() {
         use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
 
@@ -1237,6 +1366,7 @@ mod tests {
                 })
             })
             .unwrap();
+        assert_eq!(agent.stats.provider_retries, 1);
         let kinds: Vec<_> = events.iter().map(AgentEvent::kind).collect();
         assert!(kinds.contains(&"auto_retry_start"));
         assert!(kinds.contains(&"auto_retry_end"));

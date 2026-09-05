@@ -45,6 +45,9 @@ impl SharedCounters {
 pub struct RunStats {
     /// Provider completions requested (one per model turn, retries excluded).
     pub model_turns: u64,
+    /// Additional provider attempts actually started, excluding cancelled backoffs.
+    #[serde(default)]
+    pub provider_retries: u64,
     /// Assistant messages that carried at least one tool call.
     pub tool_batches: u64,
     /// Tool calls the model issued directly.
@@ -117,5 +120,13 @@ mod tests {
         let json = serde_json::to_value(RunStats::default()).unwrap();
         assert!(json.get("modelTurns").is_some());
         assert!(json.get("peakContextTokens").is_some());
+    }
+
+    #[test]
+    fn older_stats_default_provider_retries_to_zero() {
+        let mut json = serde_json::to_value(RunStats::default()).unwrap();
+        json.as_object_mut().unwrap().remove("providerRetries");
+        let restored: RunStats = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.provider_retries, 0);
     }
 }

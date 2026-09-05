@@ -8,7 +8,7 @@ A Rust reimplementation of the TypeScript agent CLI [`pi`](https://github.com/ea
 
 `vendor/pi` holds the authoritative TypeScript source (~1,169 `.ts` files). It is reference-only — read it constantly, never delete or edit it. `packages/*` holds a handful of stale TypeScript stubs from the early phases; they are not the reference.
 
-Phase plans describing the rewrite are in `docs/superpowers/plans/`. The ecosystem integration roadmap and its design plus execution plans are in `docs/superpowers/plans/2026-09-04-davinci-ecosystem-integration-roadmap.md`, `docs/superpowers/specs/2026-09-04-davinci-ecosystem-integration-design.md`, and the dated ecosystem A–D plan files. Comprehensive documentation index is in `docs/README.md` and crate architecture is in `crates/README.md`.
+Phase plans describing the rewrite are in `docs/superpowers/plans/`. The ecosystem integration roadmap and its design plus execution plans are in `docs/superpowers/plans/2026-09-04-davinci-ecosystem-integration-roadmap.md`, `docs/superpowers/specs/2026-09-04-davinci-ecosystem-integration-design.md`, and the dated ecosystem A–D plan files. The harness reliability design and implementation plan are in `docs/superpowers/specs/2026-09-04-harness-reliability-design.md` and `docs/superpowers/plans/2026-09-04-harness-reliability.md`. Comprehensive documentation index is in `docs/README.md` and crate architecture is in `crates/README.md`.
 
 ## Commands
 
@@ -89,6 +89,14 @@ davinci-coding-agent (bin `davinci`) — CLI, TUI wiring, extensions, slash comm
 - **Append-only ledger & rollback**: `<learning_root>/candidates.jsonl`, `<learning_root>/skills.jsonl`, and `<learning_root>/state.json` track candidates, versions, and verification metrics (`store.rs`), keeping up to 5 versioned backup snapshots under `<learning_root>/history/<skill_name>/<version>.md` for rollbacks (`skill_manager.rs`).
 - **Interactive commands & control**: `/learn [instruction]` synthesizes learning turns; `/learning-status`, `/learning-pending`, `/learning-approve <id>`, `/learning-reject <id>`, `/skill-list`, and `/skill-view <name>` provide review and observability.
 - **Fail-open lifecycle**: Learning operations run asynchronously in the background and will never block or fail foreground turn executions. Can be disabled via `PI_LEARNING_DISABLE_BACKGROUND=1`.
+
+**Harness Reliability and Guard Invariants** (design in `docs/superpowers/specs/2026-09-04-harness-reliability-design.md`, plan in `docs/superpowers/plans/2026-09-04-harness-reliability.md`):
+- **Patch Authority and Recovery** (`apply_patch.rs`): `.pi_patch_journal.json` is reserved and pre-existing journals are refused during standard patch application; explicit recovery (`recover_incomplete_journal_if_any`) validates all targets before restoring and preserves journals on failure; exclusive creation (`create_new`) and flushing guarantee new journal durability.
+- **Graph and Native Guard Boundaries** (`controller.rs`, `worker_hooks.rs`, `extension_host.rs`): Global extra tools are advertised and allowed solely to `Writer` roles; non-writers enforce baseline tools even if configured; shell aliases like `exec_command` enforce command policies; poisoned native locks recover to continue running pre-tool guards.
+- **Context Budget Accounting** (`Agent::estimated_context_tokens`, `main.rs`): Estimates include `system_prompt` length and tool schema overhead; host overhead tokens are cached per prompt configuration, driving earlier pruning/compaction before model loops.
+- **Governor Visibility and Search Freshness** (`token_governor.rs`, `extension_host.rs`, `vector_memory.rs`): Context pruning/compaction notifies the governor (`native_context_pruned`) to clear read/search dedupe ledgers so pruned output is re-fetched; unproven Git HEAD/status hashes were removed so searches run fresh when content state is unknown.
+- **Interruptible Retries and Telemetry** (`turn.rs`, `stats.rs`): Exponential backoff sleeps in 25 ms slices checking abort signals; `RunStats::provider_retries` counts actual additional attempts; model wall time includes failed attempts; backward-compatible with older serialized stats JSON.
+- **Evaluation Release Gate** (`codex_eval.rs`): Release criteria enforces `median_tools <= 10.0` no-worsening to detect tool-call explosions.
 
 **Sessions** are JSONL files under `~/.pi/agent/sessions`, in cwd-encoded directories byte-compatible with TypeScript `pi`. Path resolution lives in `davinci-session/src/discovery.rs` (`default_agent_dir`, `default_session_dir`). Project config and trust decisions live under `.pi/` in the project (`settings.rs`, `trust.rs`).
 

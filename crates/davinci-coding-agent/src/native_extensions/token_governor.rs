@@ -27,11 +27,8 @@ const DEFAULT_KEEP_HEAD_LINES: usize = 15;
 const DEFAULT_KEEP_TAIL_LINES: usize = 30;
 const DEFAULT_MAX_IMPORTANT_LINES: usize = 60;
 const DEFAULT_MAX_LEDGER_ENTRIES: usize = 200;
-/// A repeated read is only replaced by a marker while the earlier output is
-/// still guaranteed to be in the provider's view. `davinci_agent::PruneSettings`
-/// never prunes the newest 8 tool results, so this stays below 8: a read
-/// whose twin may already have been pruned is served again in full instead
-/// of pointing at a placeholder.
+/// A short window limits read suppression. The host also clears visibility
+/// ledgers on actual pruning and compaction, including non-default settings.
 const DEFAULT_DEDUPE_WINDOW: usize = 6;
 /// `retrieve_output` answers at most this many bytes per call and says where
 /// to continue; the whole point of the store is to not flood the context.
@@ -776,9 +773,9 @@ impl TokenGovernor {
         }
     }
 
-    #[allow(dead_code)]
     pub fn record_pruning(&mut self) {
         self.prunings += 1;
+        self.session_start();
     }
 
     #[allow(dead_code)]
@@ -828,8 +825,8 @@ impl TokenGovernor {
         self.retrievals.store(0, Ordering::Relaxed);
     }
 
-    /// `state_hash` is asked for only when a search tool is being fingerprinted:
-    /// computing it means running git, which every other tool call skips.
+    /// `state_hash` must cover the complete search domain's content, not just
+    /// Git status. Empty means freshness is unknown: execute rather than suppress.
     pub fn before_tool(
         &mut self,
         name: &str,
@@ -842,7 +839,11 @@ impl TokenGovernor {
         if !SEARCH_TOOLS.contains(&name) {
             return None;
         }
-        let fingerprint = call_fingerprint(name, args, &state_hash());
+        let state = state_hash();
+        if state.is_empty() {
+            return None;
+        }
+        let fingerprint = call_fingerprint(name, args, &state);
         if self.calls.contains(&fingerprint) {
             self.blocked_calls += 1;
             return Some(format!(
@@ -1230,6 +1231,41 @@ mod tests {
         assert!(governor
             .before_tool("read", &args, || "state".into())
             .is_none());
+    }
+
+    #[test]
+    fn pruning_invalidates_read_and_search_visibility() {
+        let mut governor = TokenGovernor::new("test", TokenGovernorConfig::default());
+        let args = json!({"path": "src"});
+        governor.before_tool("ls", &args, || "state".into());
+        governor.after_tool("ls", &args, ok("src"));
+        governor.after_tool("read", &args, ok("important source"));
+        governor.record_pruning();
+        assert!(governor
+            .before_tool("ls", &args, || "state".into())
+            .is_none());
+        assert_eq!(
+            governor
+                .after_tool("read", &args, ok("important source"))
+                .content,
+            "important source"
+        );
+        assert_eq!(governor.prunings(), 1);
+    }
+
+    #[test]
+    fn unknown_search_state_never_suppresses_a_fresh_search() {
+        let mut governor = TokenGovernor::new("test", TokenGovernorConfig::default());
+        let args = json!({"pattern": "needle"});
+        governor.before_tool("grep", &args, String::new);
+        governor.after_tool("grep", &args, ok("old result"));
+        assert!(governor.before_tool("grep", &args, String::new).is_none());
+        assert_eq!(
+            governor
+                .after_tool("grep", &args, ok("changed result"))
+                .content,
+            "changed result"
+        );
     }
 
     #[test]

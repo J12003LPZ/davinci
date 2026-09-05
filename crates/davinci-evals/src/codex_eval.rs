@@ -212,7 +212,8 @@ pub fn evaluate_release_gate(comparisons: &[PairedTaskComparison]) -> PairedDelt
         improvements += 1;
     }
     // 4. No material worsening (no metric > +10%)
-    let no_material_worsening = median_wall <= 10.0 && median_resp <= 10.0 && median_tokens <= 10.0;
+    let no_material_worsening =
+        median_wall <= 10.0 && median_resp <= 10.0 && median_tokens <= 10.0 && median_tools <= 10.0;
 
     let meets_gate = success_ok && side_effects_ok && (improvements >= 2) && no_material_worsening;
 
@@ -244,9 +245,9 @@ pub fn codex_benchmark_corpus() -> Vec<CodexBenchmarkTask> {
             id: "bugfix_jsonl".into(),
             name: "Fix jsonl truncation boundary".into(),
             prompt: "Fix string truncation bug in session serialization".into(),
-            expected_files_changed: vec!["crates/davinci-session/src/jsonl.rs".into()],
+            expected_files_changed: vec!["crates/davinci-session/src/jsonl_repo.rs".into()],
             forbidden_files_changed: vec!["Cargo.lock".into()],
-            verification_command: Some("cargo test -p pi-session".into()),
+            verification_command: Some("cargo test -p davinci-session".into()),
             verification_substring: None,
         },
         CodexBenchmarkTask {
@@ -357,5 +358,30 @@ mod tests {
 
         let summary = evaluate_release_gate(&comparisons);
         assert!(!summary.meets_release_gate);
+    }
+
+    #[test]
+    fn release_gate_rejects_tool_call_explosion_despite_other_improvements() {
+        let comparisons = vec![PairedTaskComparison {
+            task_id: "tool-regression".into(),
+            generic_metrics: CodexBenchmarkRunMetrics {
+                success: true,
+                wall_time_ms: 100,
+                model_responses: 10,
+                uncached_input_tokens: 100,
+                tool_calls: 10,
+                ..Default::default()
+            },
+            optimized_metrics: CodexBenchmarkRunMetrics {
+                success: true,
+                wall_time_ms: 50,
+                model_responses: 5,
+                uncached_input_tokens: 50,
+                tool_calls: 100,
+                ..Default::default()
+            },
+            external_cli_metrics: None,
+        }];
+        assert!(!evaluate_release_gate(&comparisons).meets_release_gate);
     }
 }

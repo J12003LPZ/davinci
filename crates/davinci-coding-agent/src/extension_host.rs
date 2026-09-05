@@ -380,8 +380,8 @@ impl ExtensionHost {
         }
     }
 
-    /// `state_hash` is computed lazily: only the governor's anti-loop ledger
-    /// needs the repository state, and only for search tools.
+    /// `state_hash` is lazy and must prove search-content freshness; empty
+    /// disables search suppression without disabling worker permission guards.
     pub fn native_before_tool(
         &self,
         name: &str,
@@ -390,8 +390,17 @@ impl ExtensionHost {
     ) -> Option<String> {
         self.native
             .lock()
-            .ok()
-            .and_then(|mut native| native.before_tool(name, args, state_hash))
+            .unwrap_or_else(|error| error.into_inner())
+            .before_tool(name, args, state_hash)
+    }
+
+    /// Agent-level pruning/auto-compaction removed output from the model view.
+    pub fn native_context_pruned(&self) {
+        self.native
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .governor
+            .record_pruning();
     }
 
     pub fn native_after_tool(
@@ -1330,6 +1339,53 @@ fn resolve_extension_shortcuts(
 mod tests {
     use super::*;
     use crate::js_host::JsRegisteredProvider;
+
+    #[test]
+    fn context_pruned_hook_restores_read_visibility() {
+        let host = ExtensionHost::default();
+        let args = serde_json::json!({"path": "source.rs"});
+        let output = davinci_agent::ToolResult {
+            content: "needed source".into(),
+            is_error: false,
+            details: None,
+        };
+        host.native_after_tool("read", &args, output.clone());
+        assert_ne!(
+            host.native_after_tool("read", &args, output.clone())
+                .content,
+            output.content
+        );
+        host.native_context_pruned();
+        assert_eq!(
+            host.native_after_tool("read", &args, output.clone())
+                .content,
+            output.content
+        );
+        assert_eq!(host.native.lock().unwrap().governor.prunings(), 1);
+    }
+
+    #[test]
+    fn poisoned_native_lock_does_not_disable_tool_guards() {
+        let host = ExtensionHost::default();
+        let args = serde_json::json!({"path": "src"});
+        host.native_before_tool("ls", &args, || "verified-state".into());
+        host.native_after_tool(
+            "ls",
+            &args,
+            davinci_agent::ToolResult {
+                content: "src".into(),
+                is_error: false,
+                details: None,
+            },
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = host.native.lock().unwrap();
+            panic!("simulate extension panic");
+        }));
+        assert!(host
+            .native_before_tool("ls", &args, || "verified-state".into())
+            .is_some());
+    }
 
     #[test]
     fn event_names_match_ts() {

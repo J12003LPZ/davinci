@@ -5,6 +5,7 @@
 //! Licensed under the MIT License.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,18 @@ pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<P
         return Err(format!("Absolute path rejected: {raw_path}"));
     }
     let p = Path::new(trimmed);
+    if p.components()
+        .find_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .is_some_and(|name| {
+            name.trim_end_matches(['.', ' '])
+                .eq_ignore_ascii_case(JOURNAL_FILE_NAME)
+        })
+    {
+        return Err("The patch journal path is reserved".into());
+    }
     for comp in p.components() {
         match comp {
             std::path::Component::ParentDir => {
@@ -346,11 +359,17 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
     Ok(result)
 }
 
-/// Recovers any uncommitted changes from an incomplete journal file left by a prior crash.
+/// Explicit recovery only: the caller must authorize every journal target.
+/// Repository journals are untrusted and must never be replayed by an ordinary patch.
 pub fn recover_incomplete_journal_if_any(workspace_root: &Path) -> Result<(), String> {
     let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
-    if !journal_path.exists() {
-        return Ok(());
+    match fs::symlink_metadata(&journal_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Failed inspecting journal: {error}")),
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err("Journal must be a regular file".into())
+        }
+        Ok(_) => {}
     }
 
     let raw =
@@ -358,29 +377,45 @@ pub fn recover_incomplete_journal_if_any(workspace_root: &Path) -> Result<(), St
     let journal: PatchJournal =
         serde_json::from_str(&raw).map_err(|e| format!("Corrupt journal file: {e}"))?;
 
-    for entry in journal.entries {
-        let Ok(file_path) = sanitize_relative_path(workspace_root, &entry.relative_path) else {
-            continue;
-        };
-        match entry.original_content {
-            Some(prev) => {
-                let _ = fs::write(&file_path, prev);
-            }
-            None => {
-                if file_path.exists() {
-                    let _ = fs::remove_file(&file_path);
-                }
-            }
-        }
+    let targets = journal
+        .entries
+        .iter()
+        .map(|entry| sanitize_relative_path(workspace_root, &entry.relative_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (entry, target) in journal.entries.iter().zip(targets) {
+        restore_entry(&target, entry).map_err(|error| {
+            format!(
+                "Recovery failed for {}: {error}; journal retained",
+                entry.relative_path
+            )
+        })?;
     }
-    let _ = fs::remove_file(journal_path);
-    Ok(())
+    fs::remove_file(journal_path)
+        .map_err(|error| format!("Recovery applied but journal cleanup failed: {error}"))
 }
 
-/// Executes an `apply_patch` invocation atomically with journal recovery.
+fn restore_entry(target: &Path, entry: &JournalEntry) -> std::io::Result<()> {
+    match &entry.original_content {
+        Some(original) => fs::write(target, original),
+        None => match fs::remove_file(target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        },
+    }
+}
+
+/// Executes a patch with rollback. Existing journals require explicit recovery.
 pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String, String> {
-    recover_incomplete_journal_if_any(workspace_root)?;
     let parsed = parse_codex_patch(input)?;
+    let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
+    match fs::symlink_metadata(&journal_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Failed inspecting journal: {error}")),
+        Ok(_) => return Err(
+            "An existing patch journal requires explicit, authorized recovery; no files changed"
+                .into(),
+        ),
+    }
 
     // Step 1: Pre-flight validation and prepare journal
     let mut journal_entries = Vec::new();
@@ -437,7 +472,6 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
     }
 
     // Step 2: Write journal
-    let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
     let journal = PatchJournal {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -446,7 +480,18 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
         entries: journal_entries,
     };
     let journal_bytes = serde_json::to_string(&journal).map_err(|e| e.to_string())?;
-    fs::write(&journal_path, journal_bytes).map_err(|e| format!("Failed to write journal: {e}"))?;
+    let mut journal_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&journal_path)
+        .map_err(|e| format!("Failed to create exclusive journal; no files changed: {e}"))?;
+    journal_file
+        .write_all(journal_bytes.as_bytes())
+        .and_then(|_| journal_file.sync_all())
+        .map_err(|e| {
+            format!("Failed to persist journal; no files changed, journal retained: {e}")
+        })?;
+    drop(journal_file);
 
     // Step 3: Apply mutations transactionally
     let mut applied_so_far: Vec<&JournalEntry> = Vec::new();
@@ -473,20 +518,27 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
             if let Some(e) = entry {
                 applied_so_far.push(e);
             }
-            for entry in applied_so_far {
-                if let Ok(file_path) = sanitize_relative_path(workspace_root, &entry.relative_path)
-                {
-                    match &entry.original_content {
-                        Some(orig) => {
-                            let _ = fs::write(&file_path, orig);
-                        }
-                        None => {
-                            let _ = fs::remove_file(&file_path);
-                        }
-                    }
+            let mut rollback_errors = Vec::new();
+            for entry in applied_so_far.into_iter().rev() {
+                let restored = sanitize_relative_path(workspace_root, &entry.relative_path)
+                    .and_then(|path| {
+                        restore_entry(&path, entry).map_err(|error| error.to_string())
+                    });
+                if let Err(error) = restored {
+                    rollback_errors.push(format!("{}: {error}", entry.relative_path));
                 }
             }
-            let _ = fs::remove_file(&journal_path);
+            if !rollback_errors.is_empty() {
+                return Err(format!(
+                    "Mutation failed: {err}; rollback incomplete, journal retained: {}",
+                    rollback_errors.join("; ")
+                ));
+            }
+            fs::remove_file(&journal_path).map_err(|error| {
+                format!(
+                    "Mutation failed: {err}; rollback applied but journal cleanup failed: {error}"
+                )
+            })?;
             return Err(format!("Mutation failed, rolled back changes: {err}"));
         }
 
@@ -496,7 +548,9 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
     }
 
     // Step 4: Commit complete, remove journal
-    let _ = fs::remove_file(journal_path);
+    fs::remove_file(journal_path).map_err(|error| {
+        format!("Patch applied but journal cleanup failed; inspect state before retrying: {error}")
+    })?;
 
     Ok(format!(
         "Applied patch (digest: {}): {} modified, {} added, {} deleted.",
@@ -511,6 +565,128 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn write_journal(root: &Path, entries: Vec<JournalEntry>) -> PathBuf {
+        let path = root.join(JOURNAL_FILE_NAME);
+        fs::write(
+            &path,
+            serde_json::to_vec(&PatchJournal {
+                timestamp: 0,
+                entries,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn patch_never_recovers_unrequested_journal_targets() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("unrelated.txt"), "keep").unwrap();
+        let journal = write_journal(
+            dir.path(),
+            vec![JournalEntry {
+                relative_path: "unrelated.txt".into(),
+                original_content: None,
+            }],
+        );
+        let result = execute_apply_patch(
+            dir.path(),
+            "*** Begin Patch\n*** Add File: requested.txt\n+new\n*** End Patch",
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("unrelated.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!dir.path().join("requested.txt").exists());
+        assert!(journal.exists());
+    }
+
+    #[test]
+    fn patch_cannot_overwrite_reserved_journal() {
+        let dir = tempdir().unwrap();
+        let patch =
+            format!("*** Begin Patch\n*** Add File: ./{JOURNAL_FILE_NAME}\n+forged\n*** End Patch");
+        assert!(execute_apply_patch(dir.path(), &patch).is_err());
+        assert!(!dir.path().join(JOURNAL_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn recovery_validates_all_targets_before_restoring_any() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        let journal = write_journal(
+            dir.path(),
+            vec![
+                JournalEntry {
+                    relative_path: "keep.txt".into(),
+                    original_content: None,
+                },
+                JournalEntry {
+                    relative_path: "../outside.txt".into(),
+                    original_content: None,
+                },
+            ],
+        );
+        assert!(recover_incomplete_journal_if_any(dir.path()).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+            "keep"
+        );
+        assert!(journal.exists());
+    }
+
+    #[test]
+    fn failed_recovery_preserves_journal() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("directory")).unwrap();
+        let journal = write_journal(
+            dir.path(),
+            vec![JournalEntry {
+                relative_path: "directory".into(),
+                original_content: Some("original".into()),
+            }],
+        );
+        assert!(recover_incomplete_journal_if_any(dir.path()).is_err());
+        assert!(journal.exists());
+        assert!(dir.path().join("directory").is_dir());
+    }
+
+    #[test]
+    fn explicit_recovery_restores_and_removes_journal() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("changed.txt"), "changed").unwrap();
+        let journal = write_journal(
+            dir.path(),
+            vec![JournalEntry {
+                relative_path: "changed.txt".into(),
+                original_content: Some("original".into()),
+            }],
+        );
+        recover_incomplete_journal_if_any(dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("changed.txt")).unwrap(),
+            "original"
+        );
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn mutation_failure_restores_already_applied_files() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("blocker"), "not a directory").unwrap();
+        let patch = "*** Begin Patch\n*** Add File: first.txt\n+new\n*** Add File: blocker/child.txt\n+cannot create\n*** End Patch";
+        let error = execute_apply_patch(dir.path(), patch).unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(!dir.path().join("first.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("blocker")).unwrap(),
+            "not a directory"
+        );
+        assert!(!dir.path().join(JOURNAL_FILE_NAME).exists());
+    }
 
     #[test]
     fn parses_valid_multi_file_patch() {

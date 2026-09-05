@@ -215,7 +215,8 @@ fn kill_tree(pid: u32) {
             .status();
     } else {
         let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
+            // A negative PID is a process group, not another signal option.
+            .args(["-TERM", "--", &format!("-{pid}")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -720,6 +721,11 @@ mod tests {
             c.args(["-c", script]);
             c
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -779,6 +785,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(none.contains("no jobs have been started"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn killing_a_job_group_preserves_the_callers_group() {
+        use std::os::unix::process::CommandExt;
+
+        const HELPER: &str = "DAVINCI_TEST_KILL_GROUP_HELPER";
+        if std::env::var_os(HELPER).is_some() {
+            let mut child = Command::new("sleep")
+                .arg("2")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            kill_tree(child.id());
+            assert!(!child.wait().unwrap().success());
+            return;
+        }
+
+        // Isolate the probe so an incorrect group signal fails this assertion
+        // instead of terminating cargo and the CI runner's shell.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "jobs::tests::killing_a_job_group_preserves_the_callers_group",
+                "--nocapture",
+            ])
+            .env(HELPER, "1")
+            .process_group(0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "group cleanup terminated or failed its caller: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

@@ -1651,12 +1651,20 @@ fn complete_prompt_with_host(
             model: agent.model_id.clone(),
         });
     }
+    let schema_bytes = serde_json::to_vec(&tools)
+        .expect("tool specs are JSON")
+        .len();
+    let identity_bytes = system_prompt_with_identity(agent)
+        .len()
+        .saturating_sub(agent.system_prompt.len());
+    agent.set_provider_context_overhead_tokens(Some(
+        ((schema_bytes + identity_bytes) as u64).div_ceil(4),
+    ));
     let js_stream = {
         let host = host.lock().unwrap_or_else(|err| err.into_inner());
         host.js_stream_provider(&agent.provider)
     };
     let hook_host = host.clone();
-    let tool_state_cwd = agent.cwd.clone();
     let user_hooks = {
         let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
         let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
@@ -1677,10 +1685,9 @@ fn complete_prompt_with_host(
             tool_name: name.to_string(),
             args: args.clone(),
         });
-        // The repository state key runs git twice; the host asks for it only
-        // when a search tool is being fingerprinted.
-        let state_hash = || crate::native_extensions::repo_state_key(&tool_state_cwd);
-        if let Some(reason) = host.native_before_tool(name, args, state_hash) {
+        // Git HEAD/status cannot prove content freshness in dirty, ignored or
+        // out-of-repository search targets. Do not suppress on that weak key.
+        if let Some(reason) = host.native_before_tool(name, args, String::new) {
             return Some(reason);
         }
         if host.tool_call_blocked() {
@@ -1734,8 +1741,14 @@ fn complete_prompt_with_host(
             }
         })));
     }
+    let mut context_visibility = (agent.stats.pruned_results, agent.stats.compactions);
     let events = agent
         .run_loop(|current| {
+            let visibility = (current.stats.pruned_results, current.stats.compactions);
+            if visibility != context_visibility {
+                host.lock().unwrap_or_else(|error| error.into_inner()).native_context_pruned();
+                context_visibility = visibility;
+            }
             let last_user = current
                 .messages
                 .iter()

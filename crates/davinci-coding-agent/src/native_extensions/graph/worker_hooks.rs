@@ -79,7 +79,9 @@ impl GraphWorkerContext {
         let mut tools = role_tools(role);
         for tool in extra_tools.unwrap_or_default().split(',') {
             let tool = tool.trim();
-            if !tool.is_empty() {
+            // Global extras are not authority grants to read-only roles.
+            // Unknown extensions have no trustworthy effect classification.
+            if role == Role::Writer && !tool.is_empty() {
                 tools.push(tool.to_string());
             }
         }
@@ -154,16 +156,21 @@ impl GraphWorkerContext {
                 self.role
             ));
         }
-        if !self.allowed_tools.contains(tool_name) {
+        if !self.allowed_tools.contains(tool_name)
+            || (self.role != Role::Writer
+                && !role_tools(self.role).iter().any(|tool| tool == tool_name))
+        {
             return Some(format!(
                 "tool \"{tool_name}\" is not available to the {} role",
                 self.role
             ));
         }
-        if tool_name != "bash" && tool_name != "powershell" {
+        if !matches!(tool_name, "bash" | "powershell" | "exec_command") {
             return None;
         }
-        let command = args.get("command").and_then(Value::as_str)?;
+        let Some(command) = args.get("command").and_then(Value::as_str) else {
+            return Some("Shell command is missing or invalid".into());
+        };
         match is_bash_command_allowed(self.bash_policy, command) {
             super::roles::BashDecision::Allowed => None,
             super::roles::BashDecision::Blocked(reason) => {
@@ -180,6 +187,55 @@ mod tests {
 
     fn submit_guard() -> std::sync::MutexGuard<'static, ()> {
         super::submit_test_guard()
+    }
+
+    #[test]
+    fn extras_cannot_widen_nonwriter_authority() {
+        let _guard = submit_guard();
+        for role in ["researcher", "reviewer", "test-analyzer", "planner"] {
+            let ctx = GraphWorkerContext::from_parts(
+                Some(role),
+                Some("plan"),
+                Some("artifact.json"),
+                Some("write,edit,apply_patch,agent,batch,exec_command,custom_mutator"),
+            )
+            .unwrap();
+            for tool in [
+                "write",
+                "edit",
+                "apply_patch",
+                "agent",
+                "batch",
+                "exec_command",
+                "custom_mutator",
+            ] {
+                assert!(
+                    ctx.block_reason(tool, &json!({"command": "echo ok"}))
+                        .is_some(),
+                    "{role} allowed {tool}"
+                );
+            }
+            assert!(ctx
+                .block_reason("read", &json!({"path": "src/main.rs"}))
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn writer_extra_shell_alias_obeys_command_policy() {
+        let _guard = submit_guard();
+        let ctx = GraphWorkerContext::from_parts(
+            Some("writer"),
+            Some("patch-report"),
+            Some("artifact.json"),
+            Some("exec_command,apply_patch"),
+        )
+        .unwrap();
+        assert!(ctx.block_reason("apply_patch", &json!({})).is_none());
+        assert!(ctx
+            .block_reason("exec_command", &json!({"command": "git push"}))
+            .is_some());
+        assert!(ctx.block_reason("exec_command", &json!({})).is_some());
     }
 
     fn context(role: Role, expect: ArtifactKind, path: &std::path::Path) -> GraphWorkerContext {
