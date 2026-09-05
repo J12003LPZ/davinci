@@ -31,6 +31,7 @@ pub fn instrument_of(tool_name: &str) -> &'static str {
         "bash" | "powershell" | "job_output" | "job_kill" => "manus",
         name if name.starts_with("memory") => "memoria",
         name if name.starts_with("graph") => "grafo",
+        name if name.starts_with("agent_") || name.starts_with("task_") => "societas",
         _ => "instrumenta",
     }
 }
@@ -41,7 +42,7 @@ pub fn state_of(tool_name: &str, failed: bool) -> State {
         return State::Failed;
     }
     match tool_name {
-        "read" | "ls" | "job_output" | "mcp_read" => State::Read,
+        "read" | "ls" | "job_output" | "mcp_read" | "agent_status" | "task_list" => State::Read,
         "grep" | "find" | "web_fetch" | "web_search" => State::Search,
         name if name.starts_with("memory") => State::Search,
         "edit" | "write" | "notebook_edit" => State::Delta,
