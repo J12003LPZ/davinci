@@ -299,7 +299,11 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     let data = key_event_bytes(&key);
 
-    if action_matches(model, data.as_deref(), "davinci.interrupt") {
+    if action_matches(model, data.as_deref(), "davinci.interrupt")
+        || (model.running
+            && model.overlay.is_none()
+            && action_matches(model, data.as_deref(), "app.interrupt"))
+    {
         model.interrupt();
         return Flow::Interrupt;
     }
@@ -966,6 +970,17 @@ mod tests {
         m.submit();
         assert!(m.running);
         assert_eq!(handle_key(&mut m, ctrl('c')), Flow::Interrupt);
+        assert!(!m.running);
+        assert!(!m.transcript.is_empty());
+    }
+
+    #[test]
+    fn esc_interrupts_the_run_when_working() {
+        let mut m = model(100, 24);
+        m.type_char("cargo test");
+        m.submit();
+        assert!(m.running);
+        assert_eq!(handle_key(&mut m, key(KeyCode::Esc)), Flow::Interrupt);
         assert!(!m.running);
         assert!(!m.transcript.is_empty());
     }

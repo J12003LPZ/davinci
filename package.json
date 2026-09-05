@@ -4,5 +4,6 @@
   "description": "Davinci agent harness. TypeScript packages remain authoritative until the Phase 8 Rust gate.",
   "workspaces": [
     "packages/*"
-  ]
+  ],
+  "packageManager": "bun@1.3.14"
 }

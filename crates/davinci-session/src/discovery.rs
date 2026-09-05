@@ -258,13 +258,15 @@ pub fn discover_sessions(
             vec![primary, legacy]
         }
     } else {
-        fs::read_dir(session_dir)
+        let mut roots: Vec<PathBuf> = fs::read_dir(session_dir)
             .map_err(|err| {
                 SessionError::storage(format!("Unable to list session directory: {err}"))
             })?
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .filter(|path| path.is_dir())
-            .collect()
+            .collect();
+        roots.push(session_dir.to_path_buf());
+        roots
     };
     for root in scan_roots {
         if !root.is_dir() {
@@ -283,6 +285,7 @@ pub fn discover_sessions(
         }
     }
     sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    sessions.dedup_by(|a, b| a.path == b.path);
     Ok(sessions)
 }
 
@@ -399,5 +402,34 @@ mod tests {
             Some(value) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", value),
             None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
         }
+    }
+
+    #[test]
+    fn discover_sessions_finds_all_sessions_across_subdirs_and_root() {
+        let dir = tempdir().unwrap();
+        // Create session in a subdirectory
+        let sub = JsonlSession::create(dir.path(), "/tmp/work1", Some("sub-session")).unwrap();
+        // Create session in another subdirectory
+        let sub2 = JsonlSession::create(dir.path(), "/tmp/work2", Some("sub-session-2")).unwrap();
+        // Create session directly in session root
+        let root_file = dir.path().join("root-session.jsonl");
+        let header = crate::JsonlV4Header {
+            kind: "header".into(),
+            version: 4,
+            id: "root-123".into(),
+            created_at: 1234567890u64,
+            cwd: "/tmp/root".into(),
+            parent_session_id: None,
+            legacy_parent_session_path: None,
+            metadata: Some(serde_json::json!({ "name": "root-session" })),
+        };
+        std::fs::write(&root_file, crate::codec::encode_header(&header)).unwrap();
+
+        let all = discover_sessions(dir.path(), None).unwrap();
+        assert_eq!(all.len(), 3);
+        let ids: Vec<String> = all.iter().map(|s| s.id.clone()).collect();
+        assert!(ids.contains(&sub.header.id));
+        assert!(ids.contains(&sub2.header.id));
+        assert!(ids.contains(&"root-123".to_string()));
     }
 }

@@ -335,6 +335,8 @@ pub struct Working {
     pub tokens: u64,
     /// `high`, `medium`, … — `None` when the model is not thinking.
     pub thinking: Option<String>,
+    /// Whether an interrupt was requested and the turn is concluding.
+    pub interrupting: bool,
 }
 
 impl Working {
@@ -345,6 +347,9 @@ impl Working {
     /// The word beside the spinner. It is drawn from the elapsed second, not
     /// from a random seed, so a frame is reproducible in a test.
     pub fn verb(&self) -> &'static str {
+        if self.interrupting {
+            return "Interrupting";
+        }
         // A workshop's vocabulary, one word every three seconds.
         const VERBS: [&str; 20] = [
             "Pondering",
@@ -2072,6 +2077,9 @@ impl Model {
     pub fn interrupt(&mut self) {
         self.running = false;
         self.queued.clear();
+        if let Some(working) = self.working.as_mut() {
+            working.interrupting = true;
+        }
     }
 
     /// Keep the transcript bounded. A multi-hour session grows without limit
@@ -2407,9 +2415,12 @@ mod tests {
         let mut m = model(120);
         m.type_char("run the tests");
         m.submit();
+        m.working = Some(Working::new());
         m.interrupt();
         assert!(!m.running);
         assert!(!m.transcript.is_empty(), "the transcript survives");
+        assert!(m.working.as_ref().unwrap().interrupting);
+        assert_eq!(m.working.as_ref().unwrap().verb(), "Interrupting");
     }
 
     #[test]

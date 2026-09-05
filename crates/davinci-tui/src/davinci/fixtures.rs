@@ -1792,6 +1792,7 @@ fn working() -> crate::davinci::model::Working {
         seconds: 12,
         tokens: 423,
         thinking: Some("high".into()),
+        interrupting: false,
     }
 }
 

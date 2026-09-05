@@ -46,6 +46,8 @@ fn is_manifest_file(file_name: &str) -> bool {
             | "package.json"
             | "package-lock.json"
             | "pnpm-lock.yaml"
+            | "bun.lock"
+            | "bun.lockb"
             | "yarn.lock"
             | "requirements.txt"
             | "pipfile"

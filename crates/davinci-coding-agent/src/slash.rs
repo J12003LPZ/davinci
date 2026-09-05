@@ -37,7 +37,12 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("share", "Share session as a secret GitHub gist", None),
         ("copy", "Copy last agent message to clipboard", None),
         ("name", "Set session display name", None),
-        ("session", "Show session info and stats", None),
+        (
+            "session",
+            "Resume a previous session (or show session stats with /session stats)",
+            None,
+        ),
+        ("sessions", "Resume a previous session", None),
         ("changelog", "Show changelog entries", None),
         ("hotkeys", "Show all keyboard shortcuts", None),
         (
@@ -176,7 +181,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "name" => SlashAction::Name(args.to_string()),
         "fork" => SlashAction::Fork,
         "clone" => SlashAction::Clone,
-        "resume" => SlashAction::Resume,
+        "resume" | "sessions" => SlashAction::Resume,
         "tree" => SlashAction::Tree,
         "copy" => SlashAction::Copy,
         "trust" => SlashAction::Trust,
@@ -187,7 +192,8 @@ pub fn parse_line(line: &str) -> SlashAction {
         "settings" => SlashAction::Settings,
         "scoped-models" => SlashAction::ScopedModels,
         "hotkeys" => SlashAction::Hotkeys,
-        "session" => SlashAction::SessionInfo,
+        "session" if args == "info" || args == "stats" => SlashAction::SessionInfo,
+        "session" => SlashAction::Resume,
         "llama" => SlashAction::Llama,
         "mcp" => SlashAction::Mcp,
         "plan" => SlashAction::Plan,
@@ -243,4 +249,23 @@ pub fn invocable_commands(
         }));
     }
     commands
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_and_sessions_commands_route_to_resume() {
+        assert_eq!(parse_line("/session"), SlashAction::Resume);
+        assert_eq!(parse_line("  /session  "), SlashAction::Resume);
+        assert_eq!(parse_line("/sessions"), SlashAction::Resume);
+        assert_eq!(parse_line("/resume"), SlashAction::Resume);
+    }
+
+    #[test]
+    fn session_stats_and_info_subcommands_route_to_session_info() {
+        assert_eq!(parse_line("/session info"), SlashAction::SessionInfo);
+        assert_eq!(parse_line("/session stats"), SlashAction::SessionInfo);
+    }
 }

@@ -100,6 +100,7 @@ mod tests {
             seconds: 12,
             tokens: 423,
             thinking: Some("high".into()),
+            interrupting: false,
         }
     }
 

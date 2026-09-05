@@ -1,0 +1,65 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "davinci",
+    },
+    "packages/agent": {
+      "name": "@pi/agent",
+      "version": "0.1.0",
+      "dependencies": {
+        "@pi/ai": "workspace:*",
+        "@pi/core": "workspace:*",
+        "@pi/session-sqlite": "workspace:*",
+      },
+    },
+    "packages/ai": {
+      "name": "@pi/ai",
+      "version": "0.1.0",
+      "dependencies": {
+        "@pi/core": "workspace:*",
+      },
+    },
+    "packages/client": {
+      "name": "@pi/client",
+      "version": "0.1.0",
+      "dependencies": {
+        "@pi/core": "workspace:*",
+      },
+    },
+    "packages/core": {
+      "name": "@pi/core",
+      "version": "0.1.0",
+    },
+    "packages/server": {
+      "name": "@pi/server",
+      "version": "0.1.0",
+      "dependencies": {
+        "@pi/agent": "workspace:*",
+        "@pi/core": "workspace:*",
+        "@pi/session-sqlite": "workspace:*",
+      },
+    },
+    "packages/session-sqlite": {
+      "name": "@pi/session-sqlite",
+      "version": "0.1.0",
+      "dependencies": {
+        "@pi/core": "workspace:*",
+      },
+    },
+  },
+  "packages": {
+    "@pi/agent": ["@pi/agent@workspace:packages/agent"],
+
+    "@pi/ai": ["@pi/ai@workspace:packages/ai"],
+
+    "@pi/client": ["@pi/client@workspace:packages/client"],
+
+    "@pi/core": ["@pi/core@workspace:packages/core"],
+
+    "@pi/server": ["@pi/server@workspace:packages/server"],
+
+    "@pi/session-sqlite": ["@pi/session-sqlite@workspace:packages/session-sqlite"],
+  }
+}

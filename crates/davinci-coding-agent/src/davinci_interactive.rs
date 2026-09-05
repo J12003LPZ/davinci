@@ -1198,6 +1198,7 @@ fn run_turn(
         seconds: 0,
         tokens: 0,
         thinking: thinking_effort(agent),
+        interrupting: false,
     });
     if model.terminal_progress {
         let _ = session.set_progress(true);
@@ -4451,7 +4452,6 @@ fn open_resume_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
     let now = davinci_session::now_ms();
     model.resume_sessions = found
         .iter()
-        .take(30)
         .map(|summary| {
             let last = summary
                 .all_messages_text
@@ -8529,5 +8529,67 @@ mod tests {
         assert_eq!(hunks[2].kind, HunkKind::Context);
         assert_eq!(hunks[2].text, "kept");
         assert_eq!(hunks[3].text, "…");
+    }
+
+    #[test]
+    fn open_resume_sheet_shows_all_sessions_without_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        // Create 35 sessions (exceeding the old 30-item limit)
+        for i in 0..35 {
+            davinci_session::JsonlSession::create(
+                &session_dir,
+                &work_dir.to_string_lossy(),
+                Some(&format!("session-{i}")),
+            )
+            .unwrap();
+        }
+
+        let parsed = crate::args::Args {
+            session_dir: Some(session_dir.to_string_lossy().into_owned()),
+            ..crate::args::Args::default()
+        };
+        let mut agent = davinci_agent::Agent::new("test");
+        agent.cwd = work_dir;
+
+        let mut m = model();
+        open_resume_sheet(&parsed, &agent, &mut m);
+
+        assert_eq!(m.screen, Screen::Resume);
+        assert_eq!(m.session_count, 35);
+        assert_eq!(
+            m.resume_sessions.len(),
+            35,
+            "all 35 sessions must be present without a 30-item truncation limit"
+        );
+    }
+
+    #[test]
+    fn session_commands_classify_to_resume_or_stats() {
+        use crate::slash::SlashAction;
+        assert!(matches!(
+            classify("/session"),
+            Sent::Command(SlashAction::Resume)
+        ));
+        assert!(matches!(
+            classify("/sessions"),
+            Sent::Command(SlashAction::Resume)
+        ));
+        assert!(matches!(
+            classify("/resume"),
+            Sent::Command(SlashAction::Resume)
+        ));
+        assert!(matches!(
+            classify("/session info"),
+            Sent::Command(SlashAction::SessionInfo)
+        ));
+        assert!(matches!(
+            classify("/session stats"),
+            Sent::Command(SlashAction::SessionInfo)
+        ));
     }
 }
