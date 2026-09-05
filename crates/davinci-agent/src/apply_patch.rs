@@ -406,9 +406,20 @@ pub fn recover_incomplete_journal_if_any(workspace_root: &Path) -> Result<(), St
 
 fn restore_entry(target: &Path, entry: &JournalEntry) -> std::io::Result<()> {
     match &entry.original_content {
-        Some(original) => fs::write(target, original),
+        Some(original) => {
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(target, original)
+        }
         None => match fs::remove_file(target) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.kind() == std::io::ErrorKind::NotADirectory
+                    || error.raw_os_error() == Some(20) =>
+            {
+                Ok(())
+            }
             result => result,
         },
     }
