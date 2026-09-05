@@ -61,6 +61,13 @@ pub struct ToolContext {
     /// shell command or a `job_output` wait stops at the next poll instead
     /// of holding the tool thread until the process ends on its own.
     pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub runtime: Option<crate::runtime::RuntimeHandle>,
+}
+
+pub fn team_tools_enabled() -> bool {
+    std::env::var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 impl ToolContext {
@@ -116,7 +123,7 @@ pub enum ToolError {
 }
 
 pub fn tool_specs() -> Vec<AgentTool> {
-    vec![
+    let mut specs = vec![
         AgentTool {
             name: "read".into(),
             description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.".into(),
@@ -270,7 +277,12 @@ pub fn tool_specs() -> Vec<AgentTool> {
                 "required": ["query"]
             }),
         },
-    ]
+    ];
+    if team_tools_enabled() {
+        specs.extend(crate::runtime::agent_tool_specs());
+        specs.extend(crate::runtime::task_tool_specs());
+    }
+    specs
 }
 
 pub fn execute_tool(
@@ -310,6 +322,20 @@ pub fn execute_tool_with(
         "job_kill" => crate::jobs::kill_tool(&context.jobs, input).map_err(ToolError::Failed),
         "notebook_edit" => notebook_edit_tool(cwd, input),
         "mcp_read" => mcp_read_tool(input, context),
+        "agent_status" | "agent_message" | "agent_stop" | "task_create" | "task_update"
+        | "task_list"
+            if !team_tools_enabled() =>
+        {
+            Err(ToolError::Failed(
+                "Team coordination tools are disabled; set DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1 to enable".into(),
+            ))
+        }
+        "agent_status" => crate::runtime::agent_status_tool(input, context),
+        "agent_message" => crate::runtime::agent_message_tool(input, context),
+        "agent_stop" => crate::runtime::agent_stop_tool(input, context),
+        "task_create" => crate::runtime::task_create_tool(input, context),
+        "task_update" => crate::runtime::task_update_tool(input, context),
+        "task_list" => crate::runtime::task_list_tool(input, context),
         other if other.starts_with("mcp__") => mcp_call_tool(other, input, context),
         other => Err(ToolError::Unknown(other.to_string())),
     }
@@ -2530,5 +2556,31 @@ mod tests {
         .unwrap();
         assert!(res.is_error);
         assert!(res.content.contains("No background job 42"));
+    }
+
+    #[test]
+    fn test_team_tools_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext::default();
+
+        // When disabled (default)
+        std::env::remove_var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS");
+        let specs = tool_specs();
+        assert!(!specs.iter().any(|s| s.name == "agent_status"));
+        assert!(!specs.iter().any(|s| s.name == "task_create"));
+
+        let err = execute_tool_with(dir.path(), "agent_status", &serde_json::json!({}), &context)
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed(ref msg) if msg.contains("Team coordination tools are disabled"))
+        );
+
+        // When enabled
+        std::env::set_var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS", "1");
+        let specs_enabled = tool_specs();
+        std::env::remove_var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS");
+        assert!(specs_enabled.iter().any(|s| s.name == "agent_status"));
+        assert!(specs_enabled.iter().any(|s| s.name == "task_create"));
+        assert!(specs_enabled.iter().any(|s| s.name == "task_update"));
     }
 }

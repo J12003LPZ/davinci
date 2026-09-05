@@ -90,7 +90,8 @@ pub fn tool_class(tool: &str) -> ToolClass {
         // `retrieve_output` read the memory index and the governor's store.
         "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" | "mcp_read"
         | "batch" | "graph_submit" | "memory_search" | "retrieve_output" | "update_plan"
-        | "tool_search" => ToolClass::Read,
+        | "tool_search" | "agent_status" | "agent_message" | "agent_stop" | "task_create"
+        | "task_update" | "task_list" => ToolClass::Read,
         "write" | "edit" | "notebook_edit" | "apply_patch" => ToolClass::Edit,
         "bash" | "powershell" | "exec_command" | "write_stdin" => ToolClass::Shell,
         "web_fetch" | "web_search" => ToolClass::Network,

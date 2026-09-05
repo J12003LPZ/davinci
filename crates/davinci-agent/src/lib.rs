@@ -329,6 +329,7 @@ impl Agent {
         if self.abort_signal.is_none() {
             self.abort_signal = Some(runtime.cancellation_token.as_atomic_bool());
         }
+        self.tool_context.runtime = Some(runtime.clone());
         self.runtime = Some(runtime);
     }
 

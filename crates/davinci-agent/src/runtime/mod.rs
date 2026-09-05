@@ -12,6 +12,8 @@ pub mod ids;
 pub mod mailbox;
 pub mod registry;
 pub mod tasks;
+pub mod tools_agent;
+pub mod tools_task;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
 pub use cache::{hash_system_prompt, hash_tool_names, CacheIdentity, CacheMissReason};
@@ -24,6 +26,8 @@ pub use ids::{AgentId, RunId, TaskId, WorkflowId};
 pub use mailbox::{AgentMailbox, AgentMessage, MailboxError};
 pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
 pub use tasks::{is_valid_task_transition, TaskError, TaskRecord, TaskRegistry, TaskState};
+pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
+pub use tools_task::{task_create_tool, task_list_tool, task_tool_specs, task_update_tool};
 
 /// Handle held by an executing Agent or worker to participate in the shared runtime.
 #[derive(Clone)]
