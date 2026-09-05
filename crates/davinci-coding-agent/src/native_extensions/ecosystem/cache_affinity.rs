@@ -77,6 +77,57 @@ pub fn derive_worker_cache_key(
     graph_worker_cache_key(&identity)
 }
 
+/// Adapter: convert a graph worker's execution inputs into the universal `CacheIdentity`
+/// from `davinci_agent::runtime::cache`. This preserves the existing `derive_worker_cache_key`
+/// output behavior through an adapter until the full cutover to universal keys.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn graph_worker_to_universal_cache_identity(
+    provider: &str,
+    model: Option<&str>,
+    repo_id: &str,
+    graph_version: u32,
+    role: Role,
+    tools: &[String],
+    system_prompt: &str,
+    expect: crate::native_extensions::graph::ArtifactKind,
+    context_item_hashes: Vec<String>,
+) -> davinci_agent::CacheIdentity {
+    use davinci_agent::runtime::cache::{hash_system_prompt, hash_tool_names};
+    use sha2::{Digest, Sha256};
+
+    let tool_refs: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
+    let tool_schema_hash = hash_tool_names(&tool_refs);
+
+    let mut contract_hasher = Sha256::new();
+    contract_hasher.update(system_prompt.as_bytes());
+    contract_hasher.update(b"\n--contract--\n");
+    let contract_str = format!(
+        "{}",
+        crate::native_extensions::graph::validate::artifact_contract(expect)
+    );
+    contract_hasher.update(contract_str.as_bytes());
+    let contract_hash = format!("{:x}", contract_hasher.finalize());
+
+    let mut repo_hasher = Sha256::new();
+    repo_hasher.update(repo_id.as_bytes());
+    repo_hasher.update(b"\n");
+    repo_hasher.update(graph_version.to_string().as_bytes());
+    let repo_hash = format!("{:x}", repo_hasher.finalize());
+
+    davinci_agent::CacheIdentity {
+        provider: provider.to_string(),
+        model_id: model.unwrap_or("default").to_string(),
+        system_prompt_hash: hash_system_prompt(system_prompt),
+        tool_schema_hash,
+        permission_surface_hash: repo_hash,
+        context_item_hashes,
+        agent_profile_hash: None,
+        contract_hash: Some(contract_hash),
+        role: Some(role.as_str().to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +233,55 @@ mod tests {
             ArtifactKind::Evidence,
         );
         assert_ne!(k1, k_diff_model);
+    }
+
+    #[test]
+    fn universal_cache_identity_adapter_stable_on_retry_and_invalidates_on_change() {
+        use crate::native_extensions::graph::ArtifactKind;
+        let tools = vec!["read".into(), "grep".into()];
+        let id1 = super::graph_worker_to_universal_cache_identity(
+            "openai",
+            Some("gpt-4o"),
+            "my-repo",
+            1,
+            Role::Researcher,
+            &tools,
+            "system prompt",
+            ArtifactKind::Evidence,
+            vec![],
+        );
+        let id2 = super::graph_worker_to_universal_cache_identity(
+            "openai",
+            Some("gpt-4o"),
+            "my-repo",
+            1,
+            Role::Researcher,
+            &tools,
+            "system prompt",
+            ArtifactKind::Evidence,
+            vec![],
+        );
+        // Same inputs → same key (retry stable)
+        assert_eq!(id1.cache_key(), id2.cache_key());
+        assert!(id1.cache_key().starts_with("ci-researcher-"));
+
+        // Changed model → different key (intentional invalidation)
+        let id_diff = super::graph_worker_to_universal_cache_identity(
+            "openai",
+            Some("claude-opus-4-5"),
+            "my-repo",
+            1,
+            Role::Researcher,
+            &tools,
+            "system prompt",
+            ArtifactKind::Evidence,
+            vec![],
+        );
+        assert_ne!(id1.cache_key(), id_diff.cache_key());
+        let diff_reasons = id_diff.diff(&id1);
+        assert!(
+            diff_reasons.contains(&davinci_agent::CacheMissReason::ModelChanged),
+            "Diff must report ModelChanged"
+        );
     }
 }

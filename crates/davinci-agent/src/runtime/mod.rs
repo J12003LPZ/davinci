@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub mod bus;
+pub mod cache;
 pub mod cancellation;
 pub mod context;
 pub mod events;
@@ -11,6 +12,7 @@ pub mod ids;
 pub mod registry;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
+pub use cache::{hash_system_prompt, hash_tool_names, CacheIdentity, CacheMissReason};
 pub use cancellation::CancellationToken;
 pub use context::{
     wrap_untrusted_data, ContextBroker, ContextItem, ContextPacket, ContextRequest, ContextSource,
