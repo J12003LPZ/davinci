@@ -89,7 +89,8 @@ pub use turn::retry_delay_ms;
 
 pub mod runtime;
 pub use runtime::{
-    AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RegistryError, RunId,
+    wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState, CancellationToken,
+    ContextBroker, ContextItem, ContextPacket, ContextRequest, ContextSource, RegistryError, RunId,
     RuntimeBus, RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle,
     RuntimeRegistry, RuntimeSubscriber, TaskId, WorkflowId,
 };
@@ -333,6 +334,23 @@ impl Agent {
     pub fn with_runtime(mut self, runtime: RuntimeHandle) -> Self {
         self.set_runtime(runtime);
         self
+    }
+
+    pub fn register_context_source(&mut self, source: Arc<dyn crate::runtime::ContextSource>) {
+        if let Some(runtime) = &mut self.runtime {
+            runtime.context_broker.register_context_source(source);
+        }
+    }
+
+    pub fn build_context(
+        &self,
+        request: &crate::runtime::ContextRequest,
+    ) -> crate::runtime::ContextPacket {
+        if let Some(runtime) = &self.runtime {
+            runtime.context_broker.build_context(request)
+        } else {
+            crate::runtime::ContextPacket::empty()
+        }
     }
 
     /// Restore the base prompt before each extension-aware prompt turn.

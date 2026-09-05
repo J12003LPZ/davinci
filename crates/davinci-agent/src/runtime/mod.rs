@@ -5,12 +5,16 @@ use std::sync::Arc;
 
 pub mod bus;
 pub mod cancellation;
+pub mod context;
 pub mod events;
 pub mod ids;
 pub mod registry;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
 pub use cancellation::CancellationToken;
+pub use context::{
+    wrap_untrusted_data, ContextBroker, ContextItem, ContextPacket, ContextRequest, ContextSource,
+};
 pub use events::{AgentKind, AgentRecord, AgentState, RuntimeEvent, RuntimeEventEnvelope};
 pub use ids::{AgentId, RunId, TaskId, WorkflowId};
 pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
@@ -26,6 +30,7 @@ pub struct RuntimeHandle {
     pub bus: RuntimeBus,
     pub cancellation_token: CancellationToken,
     pub registry: RuntimeRegistry,
+    pub context_broker: ContextBroker,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -52,7 +57,13 @@ impl RuntimeHandle {
             bus,
             cancellation_token: CancellationToken::new(),
             registry,
+            context_broker: ContextBroker::new(),
         }
+    }
+
+    pub fn with_context_broker(mut self, broker: ContextBroker) -> Self {
+        self.context_broker = broker;
+        self
     }
 
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
