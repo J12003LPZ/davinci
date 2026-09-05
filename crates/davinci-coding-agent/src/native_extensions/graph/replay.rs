@@ -314,6 +314,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         };
 
         // Candidate with incompatible repo_state_hash

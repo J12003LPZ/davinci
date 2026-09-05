@@ -234,6 +234,7 @@ pub struct GraphController {
     pub memory: Option<crate::native_extensions::VectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
     pub governor: Option<crate::native_extensions::TokenGovernor>,
+    pub runtime: Option<davinci_agent::RuntimeHandle>,
 }
 
 impl Default for GraphController {
@@ -252,7 +253,19 @@ impl GraphController {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_runtime(mut self, runtime: davinci_agent::RuntimeHandle) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn set_runtime(&mut self, runtime: Option<davinci_agent::RuntimeHandle>) {
+        self.runtime = runtime;
     }
 
     /// Workers inherit the session's model and thinking level unless the
@@ -298,6 +311,7 @@ impl GraphController {
             memory: self.memory.clone(),
             learning: self.learning.clone(),
             governor: self.governor.clone(),
+            runtime: self.runtime.clone(),
         };
         (deps, loaded.errors)
     }
@@ -674,6 +688,62 @@ mod tests {
             .tasks
             .iter()
             .all(|task| task.status == TaskStatus::Succeeded));
+        drain_active(dir.path());
+    }
+
+    #[test]
+    fn test_graph_dry_run_registers_runtime_workers_with_zero_model_calls() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+
+        let run_id = davinci_agent::RunId::new();
+        let root_agent_id = davinci_agent::AgentId::new();
+        let bus = davinci_agent::RuntimeBus::default();
+        let runtime = davinci_agent::RuntimeHandle::new(run_id, root_agent_id, bus);
+
+        let root_record = davinci_agent::AgentRecord {
+            id: root_agent_id,
+            run_id,
+            parent: None,
+            kind: davinci_agent::AgentKind::Main,
+            name: "root-agent".into(),
+            provider: "mock".into(),
+            model_id: "mock-model".into(),
+            cwd: dir.path().to_path_buf(),
+            state: davinci_agent::AgentState::Running,
+            task_id: None,
+            worktree: None,
+            started_ms: 1000,
+            updated_ms: 1000,
+        };
+        runtime.registry.register_agent(root_record).unwrap();
+
+        let controller = controller(dir.path()).with_runtime(runtime.clone());
+        let run = controller
+            .run_to_completion(parse_graph_args("--dry-run test runtime registration"))
+            .expect("runs");
+
+        assert_eq!(run.phase, Phase::Done);
+        assert_eq!(run.counters.cost_usd, 0.0);
+
+        let workers: Vec<_> = runtime
+            .registry
+            .snapshot()
+            .into_iter()
+            .filter(|r| r.kind == davinci_agent::AgentKind::GraphWorker)
+            .collect();
+
+        assert!(
+            !workers.is_empty(),
+            "expected GraphWorker records in runtime registry"
+        );
+        for worker in &workers {
+            assert_eq!(worker.parent, Some(root_agent_id));
+            assert_eq!(worker.run_id, run_id);
+            assert_eq!(worker.state, davinci_agent::AgentState::Completed);
+            assert!(worker.name.starts_with("graph-worker-"));
+        }
+
         drain_active(dir.path());
     }
 

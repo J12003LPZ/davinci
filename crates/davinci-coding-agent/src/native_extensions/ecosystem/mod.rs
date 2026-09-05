@@ -252,6 +252,7 @@ mod tests {
             run_deadline: None,
             expect: ArtifactKind::Evidence,
             extra_extensions: vec![],
+            runtime_agent_id: None,
         };
         let args = build_worker_args(&spec, Path::new("briefing.md"), Path::new("system.md"));
         assert!(
@@ -481,6 +482,7 @@ mod tests {
             memory: Some(memory),
             learning: Some(learning),
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -596,6 +598,7 @@ mod tests {
             memory: Some(memory),
             learning: Some(learning),
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -765,6 +768,7 @@ mod tests {
             memory: Some(memory),
             learning: Some(learning),
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -905,6 +909,7 @@ mod tests {
                 None,
             )),
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -1026,6 +1031,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         };
         let sec_run = run_graph(
             RunOptions {

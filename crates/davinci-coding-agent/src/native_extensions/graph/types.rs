@@ -906,6 +906,7 @@ pub struct WorkerSpec {
     /// Human-readable live transcript the runner appends to.
     pub transcript_path: Option<std::path::PathBuf>,
     pub project_trusted: bool,
+    pub runtime_agent_id: Option<davinci_agent::AgentId>,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -373,6 +373,10 @@ pub fn run_worker(
         .env("PI_GRAPH_CACHE_KEY", &cache_key)
         .env("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1");
 
+    if let Some(agent_id) = &spec.runtime_agent_id {
+        command.env("DAVINCI_AGENT_ID", agent_id.to_string());
+    }
+
     if let Some(path) = &spec.transcript_path {
         let model = spec
             .model
@@ -724,6 +728,7 @@ mod tests {
             artifact_path: PathBuf::from("artifact.json"),
             transcript_path: None,
             project_trusted: true,
+            runtime_agent_id: None,
         }
     }
 

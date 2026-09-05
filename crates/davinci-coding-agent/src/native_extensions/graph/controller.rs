@@ -58,6 +58,7 @@ pub struct ControllerDeps {
     pub memory: Option<crate::native_extensions::VectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
     pub governor: Option<crate::native_extensions::TokenGovernor>,
+    pub runtime: Option<davinci_agent::RuntimeHandle>,
 }
 
 pub struct RunOptions {
@@ -308,6 +309,7 @@ impl GraphExecution {
             artifact_path: artifact_path(Path::new(&run.cwd), &run.run_id, &task.id),
             transcript_path: Some(transcript_path(Path::new(&run.cwd), &run.run_id, &task.id)),
             project_trusted: self.deps.project_trusted,
+            runtime_agent_id: None,
         }
     }
 
@@ -530,6 +532,37 @@ impl GraphExecution {
                 spec.timeout_ms *= 2;
             }
 
+            let worker_agent_id = davinci_agent::AgentId::new();
+            spec.runtime_agent_id = Some(worker_agent_id);
+            if let Some(runtime) = &self.deps.runtime {
+                let run_snapshot = self.snapshot();
+                let provider = spec
+                    .model
+                    .as_deref()
+                    .and_then(|m| m.split_once('/').map(|(p, _)| p))
+                    .unwrap_or("default")
+                    .to_string();
+                let record = davinci_agent::AgentRecord {
+                    id: worker_agent_id,
+                    run_id: runtime.run_id,
+                    parent: Some(runtime.agent_id),
+                    kind: davinci_agent::AgentKind::GraphWorker,
+                    name: format!("graph-worker-{}-{}", task_id, run_snapshot.run_id),
+                    provider,
+                    model_id: spec.model.clone().unwrap_or_default(),
+                    cwd: spec.cwd.clone(),
+                    state: davinci_agent::AgentState::Starting,
+                    task_id: None,
+                    worktree: None,
+                    started_ms: super::store::now_ms() as i64,
+                    updated_ms: super::store::now_ms() as i64,
+                };
+                let _ = runtime.registry.register_agent(record);
+                let _ = runtime
+                    .registry
+                    .transition(worker_agent_id, davinci_agent::AgentState::Running);
+            }
+
             let reported = Mutex::new(WorkerUsage::default());
             let result = {
                 let mut on_progress = |line: &str, usage: &WorkerUsage| {
@@ -554,6 +587,21 @@ impl GraphExecution {
                 };
                 (self.deps.runner)(&spec, &self.exec_abort, &mut on_progress)
             };
+            let worker_terminal_state = if result.ok {
+                davinci_agent::AgentState::Completed
+            } else if result.timed_out
+                || result.run_deadline_exceeded
+                || self.exec_abort.load(Ordering::Relaxed)
+            {
+                davinci_agent::AgentState::Cancelled
+            } else {
+                davinci_agent::AgentState::Failed
+            };
+            if let Some(runtime) = &self.deps.runtime {
+                let _ = runtime
+                    .registry
+                    .transition(worker_agent_id, worker_terminal_state);
+            }
             let trailing = {
                 let reported = reported.lock().unwrap_or_else(|error| error.into_inner());
                 WorkerUsage::delta(&result.usage, &reported)
@@ -1621,6 +1669,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         };
         let run = run_graph(
             RunOptions {
@@ -1680,6 +1729,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -1800,6 +1850,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -1914,6 +1965,7 @@ mod tests {
             memory: None,
             learning: Some(learning),
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -2110,6 +2162,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -2236,6 +2289,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -2358,6 +2412,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            runtime: None,
         };
 
         let options = RunOptions {
@@ -2489,6 +2544,7 @@ mod tests {
             memory: Some(vector_mem.clone()),
             learning: Some(learning.clone()),
             governor: None,
+            runtime: None,
         };
 
         let options1 = RunOptions {
@@ -2582,6 +2638,7 @@ mod tests {
             memory: Some(vector_mem.clone()),
             learning: Some(learning.clone()),
             governor: None,
+            runtime: None,
         };
 
         let options2 = RunOptions {
