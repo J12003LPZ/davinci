@@ -40,6 +40,20 @@ pub fn collect_startup_notices(
     }
 }
 
+/// Match upstream interactive-mode.ts: optional update checks must not delay
+/// the first prompt. Dropping the receiver never waits for network requests.
+pub fn start_background_checks(
+    current_version: &'static str,
+    settings: Settings,
+) -> std::sync::mpsc::Receiver<StartupNotices> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let notices = collect_startup_notices(current_version, &settings, None, Vec::new());
+        let _ = sender.send(notices);
+    });
+    receiver
+}
+
 pub fn format_notices(notices: &StartupNotices) -> Vec<(String, String)> {
     let mut lines = Vec::new();
     if let Some(release) = &notices.version {

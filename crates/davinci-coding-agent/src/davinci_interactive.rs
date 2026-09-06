@@ -3048,9 +3048,12 @@ pub fn run(
     let cwd = agent.cwd.clone();
     let mut model = davinci_tui::davinci::boot(raw, 100, 44);
     let session_dir = davinci_session::default_session_dir();
-    crate::davinci_sources::dress_from_workspace(&mut model, &cwd, &session_dir);
-    // Every later re-read runs on this worker rather than the drawing thread.
+    model.cwd = cwd.display().to_string();
+    model.startup = crate::davinci_sources::startup(&cwd, "", !agent.messages.is_empty());
+    // The initial scan can be slow in a home directory or a large repository.
+    // Use the same background worker as subsequent refreshes.
     let dresser = crate::davinci_sources::WorkspaceDresser::start(cwd.clone(), session_dir.clone());
+    dresser.request();
     crate::davinci_surfaces::dress_from_extensions(&mut model, &cwd, agent);
     model.model_name = agent.model_id.clone();
     model.config_path = crate::default_agent_dir()
@@ -3156,6 +3159,8 @@ pub fn run(
     // indent, editor padding, hidden thinking blocks — have no davinci
     // surface: the transcript's shape is the design contract's (design.md §3).
     let stored_settings = crate::settings::load_merged_settings(&crate::default_agent_dir(), &cwd);
+    let startup_checks =
+        crate::startup::start_background_checks(crate::VERSION, stored_settings.clone());
     if let Some(rows) = stored_settings.autocomplete_max_visible {
         model.suggestion_rows = rows.clamp(3, 20) as usize;
     }
@@ -3312,7 +3317,13 @@ pub fn run(
         // and trimming under it would repoint its open tool lines.
         model.trim_transcript();
         // A workspace re-read that finished on the dresser's thread.
-        dresser.apply_ready(&mut model);
+        if dresser.apply_ready(&mut model) {
+            model.corpus = corpus(agent, &model.slash_commands, &model.sessions);
+            model.corpus_total = model.corpus.len();
+        }
+        for notices in startup_checks.try_iter() {
+            model.transcript.extend(startup_notice_entries(&notices));
+        }
         if model.screen == Screen::GraphRun
             && last_graph_refresh.elapsed() >= Duration::from_secs(1)
         {
@@ -3687,21 +3698,12 @@ fn opening_block(
     let mut out: Vec<Entry> = Vec::new();
 
     let (_, models_json_error) = crate::load_available_models(parsed);
-    let notices = crate::startup::collect_startup_notices(
-        crate::VERSION,
-        &stored,
+    let notices = crate::startup::StartupNotices {
         models_json_error,
-        migrated_auth_providers.to_vec(),
-    );
-    for (kind, line) in crate::startup::format_notices(&notices) {
-        out.push(Entry::Gap);
-        // A warning wears the attention glyph; anything else is prose.
-        if kind == "warning" || kind == "error" {
-            out.push(Entry::tool(State::Attention, "instrumenta", &line, None));
-        } else {
-            out.push(Entry::prose(&line));
-        }
-    }
+        migrated_auth_providers: migrated_auth_providers.to_vec(),
+        ..crate::startup::StartupNotices::default()
+    };
+    out.extend(startup_notice_entries(&notices));
 
     if !crate::settings::is_trusted(&stored, &agent.cwd, parsed.project_trust_override)
         && crate::trust::has_trust_requiring_project_resources(&agent.cwd)
@@ -3734,6 +3736,19 @@ fn opening_block(
     }
 
     out.extend(custom_messages(agent));
+    out
+}
+
+fn startup_notice_entries(notices: &crate::startup::StartupNotices) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for (kind, line) in crate::startup::format_notices(notices) {
+        out.push(Entry::Gap);
+        if kind == "warning" || kind == "error" {
+            out.push(Entry::tool(State::Attention, "instrumenta", &line, None));
+        } else {
+            out.push(Entry::prose(&line));
+        }
+    }
     out
 }
 
