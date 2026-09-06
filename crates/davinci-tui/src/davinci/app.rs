@@ -1,9 +1,9 @@
 //! The app shell: compose a window's worth of rows, route a key, paint.
 //!
 //! Layout is assembled as a flat list of rows rather than through nested
-//! ratatui `Layout` splits, so the composer can be anchored to the bottom of
-//! the window at any height and an overlay can dim the transcript behind it by
-//! rendering it with the dropped ramp (design.md §1, §2).
+//! ratatui `Layout` splits. The composer follows a short conversation and
+//! reaches the bottom as it fills the window. Overlays dim the transcript
+//! behind them with the dropped ramp (design.md §1, §2).
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/app.ex`.
 
@@ -39,7 +39,8 @@ pub enum Flow {
     Choose(Choice),
 }
 
-/// Compose exactly `height` rows: header, body, composer, status bar.
+/// Compose exactly `height` rows. Conversation chrome follows the content;
+/// command sheets and overlays retain their full-height frame.
 pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     let height = height.max(4) as usize;
     // While an instrument floats over the transcript, the chrome around it
@@ -49,6 +50,8 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
         ..model.clone()
     });
     let chrome_model = dimmed.as_ref().unwrap_or(model);
+    let conversation =
+        model.screen == Screen::Agent && model.overlay.is_none() && !model.codex_open();
 
     let composer_rows = composer_rows(chrome_model);
     // What the composer offers sits directly above it, inside the same stack,
@@ -63,11 +66,15 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     // transcript row (design.md §3). It is pinned here rather than pushed into
     // the transcript so what a running turn has cost stays put while the
     // transcript scrolls under it.
-    let mut working = opera::lines(chrome_model);
+    let mut working = if height >= 8 {
+        opera::lines(chrome_model)
+    } else {
+        Vec::new()
+    };
     if !working.is_empty() {
         working.insert(0, blank());
     }
-    let reserved = 1
+    let reserved = usize::from(!conversation)
         + top.len()
         + bottom.len()
         + above.len()
@@ -80,7 +87,9 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     let body_height = height.saturating_sub(reserved);
 
     let mut rows = Vec::with_capacity(height);
-    rows.push(chrome::header(chrome_model));
+    if !conversation {
+        rows.push(chrome::header(chrome_model));
+    }
     rows.extend(top);
     rows.extend(body(model, body_height));
     rows.extend(bottom);
@@ -92,7 +101,7 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     rows.extend(below);
     rows.push(chrome::status(chrome_model));
     rows.truncate(height);
-    rows
+    pad_to(rows, height)
 }
 
 /// Rows an extension supplied. They are drawn as plain text in the shell's own
@@ -109,13 +118,8 @@ fn extension_rows(model: &Model, lines: &[String]) -> Vec<Line<'static>> {
 }
 
 fn composer_rows(model: &Model) -> Vec<Line<'static>> {
-    // The hint row appears only where the mockups draw it: a plain transcript
-    // or the plan sheet, wide enough for hints, with something under way. An
-    // open instrument, a summoned screen, the Codex split, the narrow window
-    // and the untouched empty state all leave the composer bare (`1a`, `1d`,
-    // `1e`, `1g`, `2a`–`2c`).
-    let untouched =
-        model.transcript.is_empty() && model.composer.is_empty() && model.queued.is_empty();
+    // Conversation hints stay close to the prompt and abbreviate on narrow
+    // windows. Overlays and the Codex split own their keyboard guidance.
     // A command sheet says what sits under it; its hint row is the only hint
     // row (design.md §11).
     if let Some(sheet) = sheet::chrome(model) {
@@ -132,12 +136,11 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
             }
         }
     }
-    let hint = if model.overlay.is_some() || model.minimal() || model.codex_open() {
+    let hint = if model.overlay.is_some() || model.height < 8 || model.codex_open() {
         Hint::None
     } else {
         match model.screen {
             Screen::Memoria | Screen::Trust => Hint::None,
-            Screen::Agent if untouched => Hint::None,
             // Once the composer holds more than one row, the hint that
             // matters is how to end it, not the full list.
             _ if model.composer.contains('\n') || !model.queued.is_empty() => Hint::Multiline,
@@ -157,9 +160,8 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
     chrome::composer(model, Some(&rows), hint)
 }
 
-/// The transcript, bottom-anchored: older rows fall off the top like a
-/// scrollback, and a short transcript is padded so the composer stays put.
-/// An empty transcript is the empty state instead, centred in the body (`1a`).
+/// A short conversation starts under its welcome banner. As it fills the
+/// window, older rows fall off the top and the composer reaches the bottom.
 fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
@@ -205,26 +207,26 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
     }
     let width = model.width;
     let mut rows = transcript::tail_lines(model, &model.transcript, width, height);
-    if rows.len() < height {
-        let lead = height - rows.len();
-        let mut padded = vec![blank(); lead];
-        padded.extend(rows);
-        rows = padded;
+    let banner = startup::banner(model, &model.startup);
+    if rows.len() + banner.len() + 3 <= height {
+        let mut above = vec![blank()];
+        above.extend(banner);
+        above.push(blank());
+        above.extend(rows);
+        rows = above;
     }
-    pad_to(rows, height)
+    if rows.len() < height {
+        rows.push(blank());
+    }
+    rows
 }
 
-/// The identity mark and what the session found, vertically centred. If the
-/// window is too short for the mark, the mark goes rather than the words.
+/// The welcome starts at the top, just as the first conversation will.
 fn empty_state(model: &Model, height: usize) -> Vec<Line<'static>> {
-    let mut rows = startup::lines(model, &model.startup);
-    if rows.len() > height {
-        rows = rows.split_off(rows.len() - height);
-    }
-    let lead = (height - rows.len()) / 2;
-    let mut out = vec![blank(); lead];
-    out.extend(rows);
-    pad_to(out, height)
+    startup::lines(model, &model.startup)
+        .into_iter()
+        .take(height)
+        .collect()
 }
 
 /// A screen that takes over the body. A command sheet (`3a`–`6d`) fills it
@@ -813,22 +815,23 @@ mod tests {
     }
 
     #[test]
-    fn the_composer_is_anchored_to_the_bottom_above_the_status_bar() {
+    fn a_full_conversation_anchors_the_prompt_above_the_status_bar() {
         let mut m = model(100, 24);
-        m.transcript.push(Entry::user("run the tests"));
+        m.transcript = (0..40).map(|i| Entry::user(&format!("turn {i}"))).collect();
         let rows = compose(&m, 24);
-        assert_eq!(text(&rows[19]).chars().next(), Some('╭'));
-        assert!(text(&rows[20]).contains("›"));
+        assert!(text(&rows[19]).chars().all(|ch| ch == '─'));
+        assert!(text(&rows[20]).contains("❯"));
         assert!(!text(&rows[20]).contains("…"), "no placeholder prose");
-        assert_eq!(text(&rows[21]).chars().next(), Some('╰'));
-        assert!(text(&rows[22]).contains("enter send"));
-        assert!(text(&rows[23]).starts_with("agent · main"));
+        assert!(text(&rows[21]).chars().all(|ch| ch == '─'));
+        assert!(text(&rows[22]).contains("/help for shortcuts"));
+        assert!(text(&rows[23]).starts_with("  ask permissions · main"));
     }
 
     #[test]
-    fn the_header_and_status_bar_are_one_row_each_at_every_width() {
+    fn sheet_header_and_status_bar_fill_one_row_each_at_every_width() {
         for width in [72u16, 80, 100, 120, 160] {
-            let m = model(width, 30);
+            let mut m = model(width, 30);
+            m.screen = Screen::Settings;
             let rows = compose(&m, 30);
             assert_eq!(run_width(&rows[0].spans), width);
             assert_eq!(run_width(&rows[29].spans), width);
@@ -846,16 +849,18 @@ mod tests {
     }
 
     #[test]
-    fn a_short_transcript_sits_above_the_composer_not_under_the_header() {
+    fn a_short_conversation_follows_the_banner_and_keeps_spare_space_below() {
         let mut m = model(100, 20);
         m.transcript = vec![Entry::user("run the tests")];
         let rows = compose(&m, 20);
-        assert!(text(&rows[1]).is_empty(), "the gap is above the turn");
-        assert!(
-            text(&rows[14]).contains("> run the tests"),
-            "the turn sits directly above the composer, not under the header"
-        );
-        assert_eq!(text(&rows[15]).chars().next(), Some('╭'));
+        assert!(text(&rows[1]).contains("davinci"));
+        let turn = rows
+            .iter()
+            .position(|row| text(row).contains("> run the tests"))
+            .unwrap();
+        let prompt = rows.iter().position(|row| text(row).contains("❯")).unwrap();
+        assert!(turn < prompt && prompt < 10);
+        assert!(text(rows.last().unwrap()).is_empty());
     }
 
     #[test]
@@ -1064,7 +1069,7 @@ mod tests {
         let mut m = model(120, 30);
         m.composer = "first\nsecond".into();
         let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("› first")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("❯ first")), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("second")));
         // With more than one row in hand, the hint says how to end it.
         assert!(rows.iter().any(|row| row.contains("shift+enter newline")));
@@ -1113,9 +1118,8 @@ mod tests {
                 "{expected} is not on screen"
             );
         }
-        // The header stays the shell's, and the status bar keeps its meter.
-        assert!(rows[0].contains("davinci"));
-        assert!(rows[29].contains("/200k"), "{}", rows[29]);
+        assert!(rows.iter().any(|row| row.contains("davinci")));
+        assert!(rows.iter().any(|row| row.contains("23% context")));
     }
 
     #[test]

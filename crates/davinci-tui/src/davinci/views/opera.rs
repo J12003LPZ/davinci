@@ -1,5 +1,4 @@
-//! The working line: `◜ Pondering… (12s · ↓ 423 tokens · thinking with high
-//! effort)`.
+//! The working line: `◜ Pondering… (esc to interrupt · 12s · ↓ 423 tokens)`.
 //!
 //! One row, pinned directly above the composer, that says a turn is under way
 //! and what it has cost so far. The Studio ledger says *what* the turn is
@@ -45,7 +44,10 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
 
     // Every field the parenthetical can hold, longest last, so the row can be
     // shortened by dropping from the end rather than by re-measuring.
-    let mut facts = vec![format!("{}s", working.seconds)];
+    let mut facts = vec![
+        "esc to interrupt".to_string(),
+        format!("{}s", working.seconds),
+    ];
     if working.tokens > 0 {
         facts.push(format!("↓ {} tokens", thousands(working.tokens)));
     }
@@ -127,7 +129,7 @@ mod tests {
         assert_eq!(height(&m), 1);
         assert_eq!(
             text(&rows[0]),
-            "◜ Measuring… (12s · ↓ 423 tokens · thinking with high effort)"
+            "◜ Measuring… (esc to interrupt · 12s · ↓ 423 tokens · thinking with high effort)"
         );
     }
 
@@ -161,23 +163,23 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_model_states_only_the_elapsed_time() {
+    fn a_silent_model_keeps_the_interrupt_hint_and_elapsed_time() {
         let mut m = model(120);
         m.working = Some(Working::new());
-        assert_eq!(text(&lines(&m)[0]), "◜ Pondering… (0s)");
+        assert_eq!(text(&lines(&m)[0]), "◜ Pondering… (esc to interrupt · 0s)");
     }
 
     #[test]
     fn the_tail_is_dropped_from_the_right_as_the_window_narrows() {
-        let mut m = model(48);
+        let mut m = model(64);
         m.working = Some(working());
         let drawn = text(&lines(&m)[0]);
         assert!(drawn.contains("423 tokens"), "{drawn}");
         assert!(!drawn.contains("effort"), "{drawn}");
 
-        m.width = 26;
+        m.width = 34;
         let drawn = text(&lines(&m)[0]);
-        assert_eq!(drawn, "◜ Measuring… (12s)");
+        assert_eq!(drawn, "◜ Measuring… (esc to interrupt)");
     }
 
     #[test]

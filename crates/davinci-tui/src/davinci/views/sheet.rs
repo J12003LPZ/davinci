@@ -84,9 +84,9 @@ pub fn status_meter(
     run
 }
 
-/// A hint, in border colour.
+/// A hint, in readable secondary ink.
 pub fn hint(theme: &Theme, text: &str) -> Vec<Span<'static>> {
-    vec![span(text, theme.border)]
+    vec![span(text, theme.muted)]
 }
 
 /// A hint whose key does not work yet: drawn in the dim ramp so it reads as

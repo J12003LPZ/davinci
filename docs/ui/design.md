@@ -1,8 +1,9 @@
 # davinci TUI — design specification
 
-Companion to `Pi TUI Mockups.dc.html`. Every rule here is visible in one of the
-eleven mockup screens; the screen id is cited so an implementer can look at the
-thing rather than infer it.
+The current Rust interface follows the compact terminal layout shown in the
+[Claude Code demo](https://github.com/anthropics/claude-code), while keeping
+davinci's identity, commands, providers, and feature screens. The historical
+`Pi TUI Mockups.dc.html` remains a reference for individual feature layouts.
 
 Screens: `1a` startup · `1b` transcript · `1c` Disegno plan · `1d` Instrumenta
 palette · `1e` Codex workspace (160 cols) · `1f` Memoria + Cogitator · `1g` 80
@@ -11,10 +12,19 @@ token governor.
 
 ### September 2026 interface revision
 
-The Rust implementation uses the slate palette below with the existing copper
-state accents. The opening screen puts graph, governor, and memory commands
-within reach; the identity illustration requires both 100 columns and 48 rows.
-The status strip has a separate surface, and feature headers use plain names.
+The Rust interface uses warm charcoal, terracotta accents, and a three-row pixel
+mascot beside the actual version, model, thinking level, and working directory.
+The welcome starts near the top. A short conversation keeps that banner and puts
+the prompt immediately after its content; a full conversation scrolls from the
+top and puts the prompt at the bottom. Command sheets retain their full-height
+layout and compact header.
+
+User messages have a quiet grey background. Assistant replies start with `●`;
+tool calls read `● Read(path)` or `● Shell(command)`, with results on an indented
+`⎿` row. The composer has two neutral rules, no side borders, a `❯` prompt, and
+a white block caret. The footer names the actual permission mode, branch,
+changes, context usage, and thinking level as space allows. Idle hints point to
+`/help` and the command palette; the working line keeps `esc to interrupt`.
 
 - Graph runs show the goal, completed-task progress, topology, and worker ledger.
 - Governor status shows actual stored output metadata, configuration state,
@@ -55,25 +65,24 @@ and drop to `NO_COLOR` (§9) below 16.
 
 | Token       | Hex       | Role |
 |---|---|---|
-| `background` | `#101419` | terminal ground |
-| `surface`    | `#1B222A` | header, status bar, panel fill |
-| `surface_alt`| `#151B22` | composer well, sidebar |
-| `border`     | `#46515D` | panel rules, separators, inert glyphs, keybind hints |
-| `text`       | `#E3E7EB` | primary copy, active row, code |
-| `muted`      | `#A1ACB8` | secondary copy, tool lines, hair/veil strokes |
-| `primary`    | `#D58A32` | copper: focus, in-progress, selection, Δ, caret, agent mark |
-| `secondary`  | `#52A89C` | verdigris: git branch, paths, identifiers, memoria |
-| `success`    | `#74A879` | ✓, additions, healthy caps |
-| `warning`    | `#D5A047` | !, soft-cap breach, governor proposals, `M` in git status |
-| `error`      | `#C4593F` | ×, deletions, failing tests |
+| `background` | `#1B1B1B` | terminal ground |
+| `surface`    | `#303030` | user messages, selection, panel fill |
+| `surface_alt`| `#242424` | secondary panels, sidebar |
+| `border`     | `#555452` | panel rules, separators, inert glyphs |
+| `text`       | `#E8E6E3` | primary copy, code, prompt, caret |
+| `muted`      | `#A3A09B` | secondary copy, tool arguments, keybind hints |
+| `primary`    | `#D97757` | terracotta: mascot, in-progress, selection, Δ |
+| `secondary`  | `#A5AFD6` | identifiers, thinking level, memoria |
+| `success`    | `#8AAF78` | completed tools, additions, healthy caps |
+| `warning`    | `#D5B778` | attention, soft-cap breach, governor proposals |
+| `error`      | `#E08080` | failures, deletions |
 
-Dimmed layer (behind a modal, `1d` and `1f`): `text → #3f3a31`,
-`muted → #5d564c`, `primary → #6b512c`, `border → #303943`. Never blur, never
+Dimmed layer (behind a modal, `1d` and `1f`): `text → #6F6D69`,
+`muted → #595753`, `primary → #77503F`, `border → #383735`. Never blur, never
 tint — just drop the ramp.
 
-Exactly one accent carries state (copper). Verdigris is reserved for *where
-something is* (branch, path, symbol) and never for *what is happening*. That
-split is what keeps the palette from reading as decoration.
+Terracotta carries focus and active work. Muted text carries tool arguments;
+success, warning, and error colors reinforce their status glyphs.
 
 ```rust
 pub struct Theme {
@@ -94,27 +103,27 @@ No color literal outside `Theme`. Widgets take `&Theme`.
 One monospace face, the terminal's own. Mockups render `Cascadia Mono` with
 `JetBrains Mono` as the substitute. Requirements: full box-drawing coverage
 (`─ │ ╭ ╮ ╰ ╯ ┬ ┴ ├ ┤ ╱ ╲ ━ ╸`), geometric shapes (`◉ ○ ◌ ◐ ◑ ◒ ◓ ◜ ◝ ◞ ◟ ◆ ◇`)
-and `Δ · ✓ × ! ↳ ⌕ › ⟐`. If box-drawing is unavailable, fall back to ASCII
+and `Δ · ✓ × ! ↳ ⌕ ❯ ⟐ ● ⎿` plus block elements for the welcome mascot.
+If box-drawing is unavailable, fall back to ASCII
 frames (`+ - |`) rather than mixing widths.
 
 Line rhythm: one blank line between transcript blocks, none inside a block.
-Indent tool lines two columns under the agent mark; indent tool detail (error
-bodies, diff hunks) two further.
+Tool calls align with assistant bullets. Result summaries begin two columns in;
+tool detail (error bodies, diff hunks) begins four columns in.
 
-A tool line hangs from an elbow and states what it did before anything else:
+A tool call names its action, with the result underneath:
 
 ```
-  ⎿ ↳ read crates\pi-agent\src\lib.rs · 412 lines
-  ⎿ ✓ cargo check -p pi-agent · 1.84s · manus
+● Read(crates/davinci-agent/src/lib.rs) · 0.2s
+  ⎿ Read 412 lines
+● Shell(cargo check -p davinci-agent) · 1.84s
 ```
 
-`⎿` then the state glyph, then the target, then what came back — `412 lines`,
-`8 matches`, `+31 -8` — then how long it took. The instrument that ran it comes
-last and is named only when it says something the target does not: `manus`,
-`memoria`, `grafo`. The general-purpose `instrumenta` is the default and is
-never named, and the instrument gives way entirely before the outcome does when
-the row is short of room. This supersedes the `↳ instrumenta · read …` ordering
-the `1b` mockup draws: the outcome earns the row, the instrument does not.
+Action names are bold, arguments muted, and completed calls green. Failures,
+warnings, queued and skipped calls retain distinct glyphs; `NO_COLOR` retains
+all state glyphs. A supplied summary appears on the result row. Without a
+summary, a collapsed successful call shows its first output line. `ctrl+t`
+still expands tool output using the existing line caps.
 
 Panels are drawn with a full rule and a label notched into the top-left corner
 of it, label always uppercase, letter-spaced, and prefixed by nothing:
@@ -141,8 +150,8 @@ Fixed vocabulary. Color reinforces, never replaces.
 | `↳` | file read | secondary |
 | `⌕` | search / recall | secondary |
 | `◆` | agent turn mark | primary |
-| `›` | composer prompt | primary |
-| `>` | user turn, echoed | muted |
+| `❯` | composer prompt | text |
+| `>` | user turn, echoed | text |
 | `·` | measurement tick, compass mark | border |
 
 ---
@@ -172,15 +181,16 @@ constructing, verifying.
 
 ## 6. Components
 
-**AppShell** — header (identity left, `path │ branch │ model` right), transcript,
-composer, status bar. Header and status bar are one line each at every width.
+**AppShell** — welcome banner, transcript, composer, and quiet footer. Short
+conversations leave spare space below the footer. Command sheets and overlays
+keep the compact header and fill the window.
 
-**Transcript** — user turns are `> text` in muted, no bubble, no timestamp.
-Agent turns open with `◆ davinci`. Prose wraps at 74 columns even when the
-terminal is wider; measure never exceeds it.
+**Transcript** — user turns are `> text` on a grey background, preserving typed
+whitespace. Replies open with `●` and have no name label or timestamp. Prose
+wraps at 74 columns plus a two-column bullet gutter.
 
-**ToolCall** — one line: `glyph  instrument · verb   target   duration`. No box.
-Failures expand to at most 4 indented lines and keep the exit code (`1b`).
+**ToolCall** — `● Action(argument)` and an optional `⎿` result row. Failures
+expand to at most 4 indented lines and keep the exit code (`1b`).
 
 **Studio** — the only box allowed mid-turn. Ledger of ✓ / ◉ / ○ steps with the
 active step's target appended in border color. Collapses to one line
@@ -193,14 +203,16 @@ clipped by its own layer so the panel label is never cut.
 **Δ block** — `Δ path  +n -m`, then hunks behind a single left rule. Additions
 success, deletions error, context muted. No line numbers unless asked.
 
-**Composer** — the loudest element on screen: copper 1px rule, `›` prompt,
-blinking block caret. Grows with content; keybind hints below it in border color
-(`enter send · shift+enter newline · tab complete · esc cancel`). `ctrl+c`
-interrupts the run, never the app.
+**Composer** — neutral horizontal rules, `❯` prompt, white block caret. It grows
+to at most eight visible text rows, or one third of a short window. Longer
+drafts scroll around the active editor row and count hidden lines. Long logical
+rows scroll horizontally to keep the caret visible. Hints use muted ink and
+abbreviate with the window. `ctrl+c` interrupts the run.
 
-**StatusBar** — left `mode · branch · Δn +a -d`, right `context ━━━━◸──── 47k/200k`
-or, when narrow, `mensura ◐ 21%`. Both forms are meters, not bare numbers. The
-meter tip is `◸` everywhere; `NO_COLOR` keeps the glyph.
+**StatusBar** — conversation footer: permissions, branch, changes and jobs on
+the left; labeled context percentage and thinking level on the right. Narrow
+windows keep the permission mode first. Feature sheets retain their existing
+meters and facts.
 
 **Instrumenta** — inset overlay (52 cols of margin at 100 cols), query line,
 result rows of `command · description · kind`, selection marked by a 3-cell
@@ -228,7 +240,8 @@ keeps / cost / reversible, then keyed actions. Never acts silently.
 
 | Width | Behaviour |
 |---|---|
-| 80 (`1g`) | no ASCII art, no annotations, Studio collapses to one line, status bar abbreviates (`^p`), paths shorten to crate-relative |
+| <48 | welcome mascot hidden, short hints, permission mode retained |
+| 80 (`1g`) | compact welcome, Studio collapses to one line, footer abbreviates, sheet paths shorten to crate-relative |
 | 100 (`1b`) | full transcript, Studio box, overlays inset by 6 cols |
 | 120 | overlays inset further; panels may open as right sidebars |
 | 160 (`1e`) | Codex sidebar at 250 cells, popovers (git changes) allowed |
@@ -264,13 +277,10 @@ must accept input during it. Everything collapses to static under
 
 ## 10. Signature
 
-The identity mark is a line-drawn Vitruvian Man — the figure in the circle and
-the square — built from the same box-drawing set as the UI, with the navel, the
-compass point of Leonardo's circle, as the only copper stroke
-(`1a`). It appears at startup and in the empty state, nowhere else. Recurring
-motifs across the product: `Δ` for change, `◉` for the thing in hand, Roman
-numerals for plans, proportion meters instead of raw counts, and the Latin
-instrument names.
+The welcome uses a small terracotta pixel mascot beside the davinci name and
+real session facts. It remains above short conversations and gives way as the
+transcript fills the window. Feature screens retain `Δ` for change, `◉` for the
+active item, Roman numerals for plans, and proportion meters for budgets.
 
 ---
 

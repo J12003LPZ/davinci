@@ -1,13 +1,12 @@
 //! AppShell: header, composer, status bar (design.md §6, screen `1b`).
 //!
 //! Header and status bar are one line each at every width; both abbreviate
-//! rather than wrap. The composer is the loudest element on screen: copper
-//! rule, `›` prompt, blinking block caret, keybind hints below it in border
-//! color.
+//! rather than wrap. Neutral rules frame the composer; the prompt and caret
+//! carry focus, and muted keybind hints remain readable below it.
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/views/chrome.ex`.
 
-use ratatui::style::Style;
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
@@ -34,14 +33,14 @@ pub enum Hint {
     None,
 }
 
-/// `D davinci · agent` on the left, `path │ branch │ model` on the right.
+/// `✻ davinci · agent` on the left, `path │ branch │ model` on the right.
 /// Memoria recall and Mensura claim the right run for their own facts, as the
 /// mockups set them (`2b`, `2c`).
 pub fn header(model: &Model) -> Line<'static> {
     let th = &model.theme;
     let mut left = vec![
-        span_on(" D ", th.background, Some(th.primary)),
-        span_strong(" davinci", th.text, th),
+        span("✻ ", th.primary),
+        span("davinci", th.text).add_modifier(ratatui::style::Modifier::BOLD),
     ];
     if !model.minimal() {
         left.push(span(" · ", th.border));
@@ -82,7 +81,7 @@ pub fn header(model: &Model) -> Line<'static> {
         ]
     } else {
         let mut right = vec![
-            span(model.cwd.clone(), th.muted),
+            span(short_cwd(&model.cwd), th.muted),
             span(" │ ", th.border),
             span(model.branch.clone(), th.secondary),
             span(" │ ", th.border),
@@ -100,8 +99,55 @@ pub fn header(model: &Model) -> Line<'static> {
 
 /// `mode · branch · Δn +a -d` on the left, a context meter on the right.
 pub fn status(model: &Model) -> Line<'static> {
+    if model.screen == Screen::Agent && model.overlay.is_none() && !model.codex_open() {
+        return conversation_status(model);
+    }
     spread(model.width, status_left(model), status_right(model))
-        .style(Style::default().bg(model.theme.surface))
+}
+
+/// One quiet footer. Permissions remain explicit even on narrow terminals.
+fn conversation_status(model: &Model) -> Line<'static> {
+    let th = &model.theme;
+    let permission = if model.plan_mode {
+        "plan mode"
+    } else {
+        match model.permission_mode.as_str() {
+            "auto" => "auto permissions",
+            "edits" => "accept edits",
+            "read-only" => "read-only",
+            _ => "ask permissions",
+        }
+    };
+    let mut left = vec![span(format!("  {permission}"), th.primary)];
+    if model.width >= 72 && !model.branch.is_empty() {
+        left.push(span(format!(" · {}", model.branch), th.muted));
+    }
+    let (files, adds, dels) = model.changes;
+    if files > 0 && model.width >= 100 {
+        left.push(span(format!(" · {files} files "), th.muted));
+        left.push(span(format!("+{adds}"), th.success));
+        left.push(span(format!(" -{dels}"), th.error));
+    }
+    if let Some(jobs) = jobs_note(model) {
+        left.push(span(format!(" · {jobs}"), th.muted));
+    }
+    let mut right = Vec::new();
+    if model.context.1 > 0 && model.width >= 48 {
+        right.push(span(
+            format!("{}% context", (model.context_fraction() * 100.0) as u32),
+            th.muted,
+        ));
+    }
+    if model.width >= 72 {
+        if !right.is_empty() {
+            right.push(span(" · ", th.muted));
+        }
+        right.push(span(
+            format!("thinking {} ", model.thinking_level),
+            th.secondary,
+        ));
+    }
+    spread(model.width, left, right)
 }
 
 /// Quiet, focus-preserving feedback above the composer; the ledger stays
@@ -272,7 +318,7 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
         }
         Some(_) => {
             return vec![
-                span("mensura ", th.muted),
+                span("context ", th.muted),
                 span(th.pie(fraction), th.primary),
                 span(format!(" {percent}%"), th.muted),
                 span(" · ", th.border),
@@ -301,7 +347,7 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
 
     if model.narrow() {
         return vec![
-            span("mensura ", th.muted),
+            span("context ", th.muted),
             span(th.pie(fraction), th.primary),
             span(format!(" {percent}%"), th.muted),
             span(" · ", th.border),
@@ -312,18 +358,18 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
     // The empty state points at the palette instead of metering nothing (`1a`).
     if model.screen == Screen::Agent && model.transcript.is_empty() && !model.codex_open() {
         return vec![
-            span("mensura ", th.muted),
+            span("context ", th.muted),
             span(th.pie(fraction), th.primary),
             span(format!(" {percent}%"), th.muted),
             span(" · ", th.border),
-            span("ctrl+p instrumenta", th.border),
+            span("ctrl+p commands", th.muted),
         ];
     }
 
     // The plan sheet reads its budget as a proportion first (`1c`).
     if model.screen == Screen::Plan {
         return vec![
-            span("mensura ", th.muted),
+            span("context ", th.muted),
             span(th.pie(fraction), th.primary),
             span(format!(" {percent}%"), th.muted),
             span(" · ", th.border),
@@ -345,9 +391,8 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
 }
 
 /// Rows for the composer plus its hint row. Grows with content. The box takes
-/// its whole look from the model: copper rule while it is the active input,
-/// border rule at rest — the untouched empty state (`1a`) and under an open
-/// instrument (`1d`) — and the recall screen replaces the line being typed
+/// two neutral rules and no side borders. The prompt and caret carry
+/// focus; under an open instrument the theme dims. Recall replaces the input
 /// with its own keys (`2b`).
 pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line<'static>> {
     let th = &model.theme;
@@ -374,15 +419,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         owned.unwrap_or_else(|| model.composer.split('\n').map(str::to_string).collect());
     let last = entries.len().saturating_sub(1);
     let overlaid = model.overlay.is_some();
-    let untouched = model.screen == Screen::Agent
-        && model.transcript.is_empty()
-        && model.composer.is_empty()
-        && model.queued.is_empty();
-    let border = if overlaid || untouched {
-        th.border
-    } else {
-        th.primary
-    };
+    let border = th.border;
     // An empty composer carries no placeholder prose — the prompt glyph and
     // the caret are the whole invitation, as in every terminal agent. An open
     // sheet is the one exception: its row suggests the command that summoned
@@ -396,7 +433,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         .or_else(|| screen_placeholder(model.screen).map(str::to_string));
     let lit = model.blink();
     let caret_style = if lit {
-        Style::default().bg(th.primary).fg(th.background)
+        Style::default().bg(th.text).fg(th.background)
     } else {
         Style::default().bg(th.background).fg(th.background)
     };
@@ -411,22 +448,27 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
     };
     let caret_row = caret_at.map_or(last, |(row, _)| row.min(last));
 
-    let mut surface = Surface::new(model.width, th).border(border);
-    for (index, entry) in entries.into_iter().enumerate() {
+    let visible = (model.height as usize / 3).clamp(1, 8);
+    let start = caret_row
+        .saturating_sub(visible - 1)
+        .min(entries.len().saturating_sub(visible));
+    let end = (start + visible).min(entries.len());
+    let mut rows = vec![composer_rule(model, border, start, "above")];
+    for (index, entry) in entries.into_iter().enumerate().take(end).skip(start) {
         // An echoed command reads muted, prose bright (`2a`, `2c`).
         let ink = if entry.starts_with('/') {
             th.muted
         } else {
             th.text
         };
-        let shown = clip_ellipsis(&entry, model.width.saturating_sub(10));
+        let column = caret_at
+            .filter(|(row, _)| *row == index)
+            .map(|(_, col)| col);
+        let (shown, column) = composer_view(&entry, column, model.width.saturating_sub(6));
         // The caret sits *on* the character it is in front of, not after the
         // whole row: parking a block at end-of-line made the arrow keys look
         // dead even though the editor had moved.
-        let split = match caret_at {
-            Some((row, col)) if row == index && !overlaid => split_at_caret(&shown, col),
-            _ => None,
-        };
+        let split = column.and_then(|col| split_at_caret(&shown, col));
         let caret_here = split.is_some();
         let body = if entry.is_empty() {
             vec![span(placeholder.clone().unwrap_or_default(), th.muted)]
@@ -446,14 +488,13 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         } else {
             vec![span(shown, ink)]
         };
-        // The prompt is copper on the opening row; continuation rows carry a
-        // quiet one, as the mockup's wrapped composer does (`1c`).
-        let prompt_ink = if index == 0 && !overlaid {
-            th.primary
+        // Only the first visible row has a prompt; continuation text aligns.
+        let prompt = if index == start {
+            format!("{} ", glyph::PROMPT)
         } else {
-            th.border
+            "  ".into()
         };
-        let mut row = vec![span(format!("{} ", glyph::PROMPT), prompt_ink)];
+        let mut row = vec![span(prompt, if overlaid { th.border } else { th.text })];
         row.extend(body);
         // The caret belongs to whatever owns the keyboard; an open instrument
         // owns it, so the composer's goes with it (`1d`, `1f`). At end of line
@@ -461,15 +502,72 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         if index == caret_row && !overlaid && !caret_here {
             row.push(Span::styled(" ", caret_style));
         }
-        surface = surface.row(row);
+        let mut run = vec![pad(2.min(model.width), None)];
+        run.extend(row);
+        rows.push(Line::from(crate::davinci::ui::truncate_run(
+            run,
+            model.width,
+        )));
     }
 
     let rows_typed = last + 1;
-    let mut rows = surface.lines();
+    rows.push(composer_rule(model, border, last + 1 - end, "below"));
     if hint != Hint::None {
         rows.push(hint_line(model, hint, rows_typed));
     }
     rows
+}
+
+fn composer_rule(
+    model: &Model,
+    color: ratatui::style::Color,
+    hidden: usize,
+    direction: &str,
+) -> Line<'static> {
+    let label = if hidden > 0 {
+        format!("─ {hidden} lines {direction} ")
+    } else {
+        String::new()
+    };
+    let used = UnicodeWidthStr::width(label.as_str());
+    Line::from(crate::davinci::ui::truncate_run(
+        vec![span(
+            format!(
+                "{label}{}",
+                "─".repeat((model.width as usize).saturating_sub(used))
+            ),
+            color,
+        )],
+        model.width,
+    ))
+}
+
+/// Scroll a long logical row to keep the editor's byte cursor visible. Display
+/// width and grapheme boundaries keep CJK text and composed characters intact.
+fn composer_view(entry: &str, column: Option<usize>, width: u16) -> (String, Option<usize>) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let Some(column) = column.filter(|&c| c <= entry.len() && entry.is_char_boundary(c)) else {
+        return (clip_ellipsis(entry, width), None);
+    };
+    let mut start = 0;
+    if UnicodeWidthStr::width(&entry[..column]) >= width as usize {
+        let mut used = 0;
+        start = column;
+        for (at, grapheme) in entry[..column].grapheme_indices(true).rev() {
+            let cells = UnicodeWidthStr::width(grapheme);
+            if used + cells > width.saturating_sub(2) as usize {
+                break;
+            }
+            used += cells;
+            start = at;
+        }
+    }
+    let prefix = if start > 0 { "…" } else { "" };
+    let shown = format!(
+        "{prefix}{}",
+        clip_ellipsis(&entry[start..], width.saturating_sub(u16::from(start > 0)))
+    );
+    (shown, Some(column - start + prefix.len()))
 }
 
 /// The model's run in the header and status bar: `sonnet · high`, and
@@ -518,8 +616,9 @@ fn split_at_caret(shown: &str, col: usize) -> Option<(String, String, String)> {
     if col >= shown.len() || !shown.is_char_boundary(col) {
         return None;
     }
-    let under = shown[col..].chars().next()?;
-    let end = col + under.len_utf8();
+    use unicode_segmentation::UnicodeSegmentation;
+    let under = shown[col..].graphemes(true).next()?;
+    let end = col + under.len();
     Some((
         shown[..col].to_string(),
         under.to_string(),
@@ -674,34 +773,54 @@ fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
     if model.exit_armed {
         return Line::from(vec![span("ctrl+c again to exit", th.primary)]);
     }
-    let bar = || span(" │ ", th.border);
+    if model.screen == Screen::Agent && hint == Hint::Default && !model.running {
+        let help = if model.width >= 48 {
+            "  /help for shortcuts · ctrl+p commands"
+        } else {
+            "  /help for shortcuts"
+        };
+        return spread(
+            model.width,
+            vec![span(help, th.muted)],
+            if model.width >= 80 {
+                vec![span("shift+enter for newline ", th.muted)]
+            } else {
+                Vec::new()
+            },
+        );
+    }
+    let bar = || span(" · ", th.border);
     let (left, right) = match hint {
         Hint::None => (Vec::new(), Vec::new()),
         Hint::Closable => (
-            vec![span("enter send", th.border)],
-            vec![span("esc close", th.border)],
+            vec![span("enter send", th.muted)],
+            vec![span("esc close", th.muted)],
+        ),
+        Hint::Multiline if model.width < 64 => (
+            vec![span(format!("{rows_typed} lines"), th.muted)],
+            vec![span("enter send", th.muted)],
         ),
         Hint::Multiline => (
             vec![
-                span("shift+enter newline", th.border),
+                span("shift+enter newline", th.muted),
                 bar(),
-                span(format!("{rows_typed} lines"), th.border),
+                span(format!("{rows_typed} lines"), th.muted),
             ],
-            vec![span("enter send", th.border)],
+            vec![span("enter send", th.muted)],
         ),
         Hint::Default if model.minimal() => (
-            vec![span("enter send", th.border)],
-            vec![span("esc cancel", th.border)],
+            vec![span("enter send", th.muted)],
+            vec![span("esc cancel", th.muted)],
         ),
         Hint::Default => (
             vec![
-                span("enter send", th.border),
+                span("enter send", th.muted),
                 bar(),
-                span("shift+enter newline", th.border),
+                span("shift+enter newline", th.muted),
                 bar(),
-                span("tab complete", th.border),
+                span("tab complete", th.muted),
             ],
-            vec![span("esc cancel", th.border)],
+            vec![span("esc cancel", th.muted)],
         ),
     };
     let mut spans = spread(model.width.saturating_sub(4), left, right).spans;
@@ -869,8 +988,8 @@ mod tests {
     #[test]
     fn the_header_carries_path_branch_and_model_when_there_is_room() {
         let drawn = text(&header(&model(100)));
-        assert!(drawn.starts_with(" D  davinci · agent"), "{drawn}");
-        assert!(drawn.contains("C:\\dev\\oss\\davinci-rust │ main │ sonnet"));
+        assert!(drawn.starts_with("✻ davinci · agent"), "{drawn}");
+        assert!(drawn.contains("davinci-rust │ main │ sonnet"));
     }
 
     #[test]
@@ -890,33 +1009,26 @@ mod tests {
     }
 
     #[test]
-    fn the_status_bar_shows_the_context_as_a_meter_with_its_cap() {
+    fn conversation_status_names_permissions_and_context_usage() {
         let drawn = text(&status(&model(100)));
-        assert!(drawn.contains("context "), "{drawn}");
-        assert!(drawn.contains("47k/200k"), "{drawn}");
-        assert!(drawn.contains('◸'), "the meter has a tip: {drawn}");
+        assert!(drawn.starts_with("  ask permissions"), "{drawn}");
+        assert!(drawn.contains("23% context"), "{drawn}");
+        assert!(drawn.contains("thinking "), "{drawn}");
     }
 
     #[test]
-    fn a_narrow_status_bar_is_still_a_meter_never_a_bare_number() {
+    fn a_narrow_status_bar_keeps_permissions_and_labels_the_percentage() {
         for width in [72u16, 90] {
             let drawn = text(&status(&model(width)));
-            assert!(drawn.contains("23%"), "{drawn}");
-            assert!(
-                drawn.contains('◐')
-                    || drawn.contains('◑')
-                    || drawn.contains('◒')
-                    || drawn.contains('◓'),
-                "no pie glyph at {width}: {drawn}"
-            );
-            assert!(drawn.contains("^p"), "{drawn}");
+            assert!(drawn.contains("23% context"), "{drawn}");
+            assert!(drawn.contains("ask permissions"), "{drawn}");
         }
     }
 
     #[test]
     fn the_status_bar_left_names_the_screen_in_hand() {
         let mut m = model(120);
-        assert!(text(&status(&m)).starts_with("agent · main · Δ3 +42 -11"));
+        assert!(text(&status(&m)).starts_with("  ask permissions · main · 3 files +42 -11"));
         m.toggle_screen(Screen::Grafo);
         let drawn = text(&status(&m));
         assert!(drawn.starts_with("grafo · main · impact view"), "{drawn}");
@@ -924,20 +1036,24 @@ mod tests {
     }
 
     #[test]
-    fn the_composer_is_a_copper_surface_with_a_prompt_and_a_hint_row() {
+    fn the_composer_uses_plain_rules_a_prompt_and_a_hint_row() {
         let m = model(100);
         let rows = composer(&m, None, Hint::Default);
         assert_eq!(rows.len() as u16, composer_height(None, true));
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.primary));
+        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.border));
+        assert_eq!(rows[1].style.bg, None);
+        assert!(text(&rows[0]).chars().all(|ch| ch == '─'));
         let prompt_row = text(&rows[1]);
-        assert!(prompt_row.contains("›"), "{prompt_row}");
+        assert!(prompt_row.contains("❯"), "{prompt_row}");
         assert!(
             !prompt_row.contains("…"),
             "an empty composer carries no placeholder prose: {prompt_row}"
         );
-        assert!(text(&rows[3]).contains("enter send │ shift+enter newline"));
-        assert!(text(&rows[3]).trim_end().ends_with("esc cancel"));
+        assert!(text(&rows[3]).contains("/help for shortcuts · ctrl+p commands"));
+        assert!(text(&rows[3])
+            .trim_end()
+            .ends_with("shift+enter for newline"));
     }
 
     #[test]
@@ -947,7 +1063,7 @@ mod tests {
         let rows = composer(&m, None, Hint::None);
         assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.border));
         let prompt_row = text(&rows[1]);
-        assert!(prompt_row.contains("›"), "{prompt_row}");
+        assert!(prompt_row.contains("❯"), "{prompt_row}");
         assert!(!prompt_row.contains("…"), "{prompt_row}");
     }
 
@@ -988,7 +1104,7 @@ mod tests {
         assert!(text(&rows[1]).contains("keep step IV"));
         assert!(text(&rows[2]).contains("existing TS golden files"));
         let hint = text(&rows[4]);
-        assert!(hint.contains("shift+enter newline │ 2 lines"), "{hint}");
+        assert!(hint.contains("shift+enter newline · 2 lines"), "{hint}");
         assert!(hint.trim_end().ends_with("enter send"), "{hint}");
     }
 
@@ -1000,7 +1116,7 @@ mod tests {
         let caret = |line: &Line<'_>| {
             line.spans
                 .iter()
-                .any(|span| span.style.bg == Some(m.theme.primary))
+                .any(|span| span.style.bg == Some(m.theme.text))
         };
         assert!(!caret(&rows[1]), "no caret on the first row");
         assert!(caret(&rows[2]), "caret on the last row");
@@ -1012,7 +1128,9 @@ mod tests {
 
     #[test]
     fn the_hint_row_abbreviates_below_eighty_columns() {
-        let drawn = text(&composer(&model(72), None, Hint::Default)[3]);
+        let mut m = model(72);
+        m.running = true;
+        let drawn = text(&composer(&m, None, Hint::Default)[3]);
         assert!(drawn.contains("enter send"), "{drawn}");
         assert!(drawn.contains("esc cancel"), "{drawn}");
         assert!(!drawn.contains("tab complete"), "{drawn}");
@@ -1030,7 +1148,7 @@ mod tests {
             !rows
                 .iter()
                 .flat_map(|row| row.spans.iter())
-                .any(|span| span.style.bg == Some(m.theme.primary)),
+                .any(|span| span.style.bg == Some(m.theme.text)),
             "no caret while memoria owns the keys"
         );
     }
@@ -1047,25 +1165,18 @@ mod tests {
         );
     }
 
-    /// The caret cell is the one span drawn on the theme's primary; find where
-    /// it sits within a composer row, in columns after the `› ` prompt.
+    /// Find the caret after the four-cell prompt/continuation gutter.
     fn caret_column(model: &Model, row: usize) -> Option<usize> {
         let line = composer(model, None, Hint::Default).remove(row);
-        // Everything the surface draws before the text: the box rule and the
-        // `› ` prompt.
-        let mut prefix = 0usize;
         let mut column = 0usize;
         let mut caret = None;
         for span in &line.spans {
-            if caret.is_none() && span.style.bg == Some(model.theme.primary) {
+            if caret.is_none() && span.style.bg == Some(model.theme.text) {
                 caret = Some(column);
             }
             column += UnicodeWidthStr::width(span.content.as_ref());
-            if span.content.contains(glyph::PROMPT) {
-                prefix = column;
-            }
         }
-        caret.map(|at| at.saturating_sub(prefix))
+        caret.map(|at| at.saturating_sub(4))
     }
 
     #[test]
@@ -1115,9 +1226,8 @@ mod tests {
 
     #[test]
     fn a_caret_past_the_clip_keeps_its_own_cell() {
-        // No horizontal scrolling: a cursor out beyond the `…` has no
-        // character to sit on, so the row falls back to a trailing caret
-        // rather than indexing into text that was never drawn.
+        // Never index clipped text with the original editor's byte column.
+        // Horizontal scrolling translates the column before splitting it.
         assert_eq!(split_at_caret("abc…", 9), None);
         assert_eq!(
             split_at_caret("abc", 3),

@@ -234,7 +234,7 @@ mod tests {
         let mut m = model(100);
         m.type_char("git");
         let drawn = text(&lines(&m, 44)[1]);
-        assert!(drawn.contains("› git"), "{drawn}");
+        assert!(drawn.contains("❯ git"), "{drawn}");
         assert!(drawn.contains(&format!("of {}", m.corpus_total)), "{drawn}");
     }
 

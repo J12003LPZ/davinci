@@ -1,17 +1,18 @@
 //! The transcript is the interface (design.md §1). No bubbles, no timestamps,
-//! no decoration in the body: user turns are `> text` in muted, agent turns
-//! open with `◆ davinci`, tool calls are one line each, and prose wraps at the
-//! measure even when the terminal is wider.
+//! user turns have a quiet background, replies start with a bullet, and tool
+//! results hang from an indented elbow. Prose keeps a readable measure.
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/views/transcript.ex`.
 
+use ratatui::style::Style;
 use ratatui::text::Line;
 
 use super::{markdown, studio};
 use crate::davinci::model::{Entry, HunkKind, Model};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, detail_line, failure_line, indent, span, tool_line, wrap, MEASURE,
+    blank, clip_ellipsis, detail_line, failure_line, indent, span, tool_line, truncate_run, wrap,
+    MEASURE,
 };
 
 /// How many rows of live reasoning are shown while it streams.
@@ -59,10 +60,20 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
     match entry {
         Entry::Gap => vec![blank()],
 
-        Entry::User(text) => vec![Line::from(vec![
-            span(format!("{} ", glyph::USER), th.primary),
-            span(clip_ellipsis(text, width.saturating_sub(4)), th.muted),
-        ])],
+        Entry::User(text) => {
+            crate::wrap_text_with_ansi(text, width.saturating_sub(4).max(1) as usize)
+                .into_iter()
+                .enumerate()
+                .map(|(row, text)| {
+                    let prompt = if row == 0 { "> " } else { "  " };
+                    Line::from(truncate_run(
+                        vec![span(format!(" {prompt}{text} "), th.text)],
+                        width,
+                    ))
+                    .style(Style::default().bg(th.surface))
+                })
+                .collect()
+        }
 
         // The agent's turn is not announced: the reply follows the prompt
         // after a gap, as in claude code. The entry stays in the transcript
@@ -84,8 +95,15 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                 instrument,
                 target,
                 duration.as_deref(),
-                summary.as_deref(),
+                None,
             )];
+            if let Some(summary) = summary.as_deref().filter(|s| !s.is_empty()) {
+                rows.push(tool_result(th, summary, width));
+            } else if !model.show_tool_output && *state != State::Failed {
+                if let Some(first) = output.first() {
+                    rows.push(tool_result(th, first, width));
+                }
+            }
             rows.extend(output_rows(
                 th,
                 *state,
@@ -100,7 +118,15 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
         Entry::Failure { what, subject } => vec![failure_line(th, what, subject)],
 
-        Entry::Prose(text) => markdown::lines(th, text, MEASURE.min(width.saturating_sub(2))),
+        Entry::Prose(text) => markdown::lines(th, text, MEASURE.min(width.saturating_sub(2)))
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut spans = vec![span(if index == 0 { "● " } else { "  " }, th.text)];
+                spans.extend(row.spans);
+                Line::from(truncate_run(spans, width))
+            })
+            .collect(),
 
         Entry::Thinking {
             text,
@@ -148,6 +174,16 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             rows
         }
     }
+}
+
+fn tool_result(theme: &Theme, text: &str, width: u16) -> Line<'static> {
+    Line::from(truncate_run(
+        vec![
+            span(format!("  {} ", glyph::BRANCH), theme.muted),
+            span(clip_ellipsis(text, width.saturating_sub(4)), theme.muted),
+        ],
+        width,
+    ))
 }
 
 /// Rows of a tool's result shown under its line when expanded (`ctrl+t`).
@@ -457,12 +493,13 @@ mod tests {
     }
 
     #[test]
-    fn a_user_turn_is_an_echo_with_no_bubble_and_no_timestamp() {
+    fn a_user_turn_is_a_shaded_echo_with_no_timestamp() {
         let m = model(100);
         let rows = lines(&m, &[Entry::user("run the tests")], 100);
         assert_eq!(rows.len(), 1);
-        assert_eq!(text(&rows[0]), "> run the tests");
-        assert_eq!(rows[0].spans[1].style.fg, Some(m.theme.muted));
+        assert_eq!(text(&rows[0]), " > run the tests ");
+        assert_eq!(rows[0].style.bg, Some(m.theme.surface));
+        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.text));
     }
 
     #[test]
@@ -483,8 +520,8 @@ mod tests {
             !texts.iter().any(|row| row.contains("davinci")),
             "{texts:?}"
         );
-        assert_eq!(texts[0], "> hello");
-        assert_eq!(texts[2], "Hello! How can I help?");
+        assert_eq!(texts[0], " > hello ");
+        assert_eq!(texts[2], "● Hello! How can I help?");
     }
 
     #[test]
@@ -499,7 +536,7 @@ mod tests {
             for row in lines(&m, std::slice::from_ref(&entry), width) {
                 let drawn = text(&row);
                 assert!(
-                    UnicodeWidthStr::width(drawn.as_str()) <= MEASURE as usize,
+                    UnicodeWidthStr::width(drawn.as_str()) <= MEASURE as usize + 2,
                     "prose exceeded the measure at width {width}: {drawn:?}"
                 );
             }
@@ -521,18 +558,20 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         let drawn = text(&rows[0]);
-        assert!(drawn.starts_with("  ⎿ ✓ cargo fmt"), "{drawn}");
+        assert!(drawn.starts_with("● Shell(cargo fmt)"), "{drawn}");
         assert!(drawn.contains("· 0.31s"), "{drawn}");
-        assert!(drawn.ends_with("· manus"), "{drawn}");
+        assert!(!drawn.contains("manus"), "{drawn}");
         assert!(!drawn.contains('╭'));
     }
 
     #[test]
-    fn collapsed_success_hides_its_output() {
+    fn collapsed_success_shows_only_the_first_output_row() {
         let m = model(100);
         let entry = Entry::tool(State::Done, "manus", "cargo fmt", Some("0.31s"))
             .with_output("ok\nfmt done");
-        assert_eq!(lines(&m, &[entry], 100).len(), 1);
+        let rows = lines(&m, &[entry], 100);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(text(&rows[1]), "  ⎿ ok");
     }
 
     #[test]

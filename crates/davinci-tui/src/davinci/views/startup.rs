@@ -1,131 +1,76 @@
-//! `1a` — startup and the empty state.
+//! Compact welcome screen with workspace facts and useful entry points.
 //!
-//! The identity mark is a line-drawn Vitruvian Man — l'uomo vitruviano, the
-//! figure in the circle and the square — built from the same box-drawing set
-//! as the UI, with the navel, the compass point of Leonardo's circle, as its
-//! only copper stroke. It appears here and nowhere else (design.md §10), and
-//! it is dropped entirely below 100 columns (§7).
-//!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/startup.ex`.
+//! Keeps startup discovery from the native shell; upstream interaction lives in
+//! vendor/davinci/packages/coding-agent/src/modes/interactive/interactive-mode.ts.
 
+use ratatui::style::{Modifier, Stylize};
 use ratatui::text::{Line, Span};
 
 use crate::davinci::model::{Model, Startup};
 use crate::davinci::theme::{glyph, Theme};
-use crate::davinci::ui::{blank, center, hair_rule, indent, span, span_strong, truncate_run};
+use crate::davinci::ui::{blank, indent, span, span_strong, truncate_run};
 
-/// The mark, as it appears in screen `1a`: the figure with both pairs of
-/// limbs — arms straight to the square, arms raised to the circle, legs
-/// together on the square's base, legs spread to the circle's rim.
-const EMBLEM: [&str; 14] = [
-    "         ·───────────·",
-    "      ╱                 ╲",
-    "    ╱    ┌───────────┐    ╲",
-    "   │     │    ╭─╮    │     │",
-    "  │    ╲ │    ╰┬╯    │ ╱    │",
-    "  │     ╲├─────┼─────┤╱     │",
-    "  │      │     │     │      │",
-    "  │      │    ─·─    │      │",
-    "  │      │   ╱│ │╲   │      │",
-    "  │      │  ╱ │ │ ╲  │      │",
-    "   │     │ ╱  │ │  ╲ │     │",
-    "    ╲    │╱   │ │   ╲│    ╱",
-    "      ╲  └────┴─┴────┘  ╱",
-    "         ·───────────·",
-];
-
-/// The one copper stroke: the navel, centre of the circle, as Leonardo
-/// annotated it.
-const NAVEL_ROW: usize = 7;
-const NAVEL: &str = "─·─";
+/// Compact identity block, also kept above a short conversation. The path and
+/// selected model come from the running session, never from sample copy.
+pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let mark = if model.width >= 48 {
+        [" ▐▛███▜▌  ", "▝▜█████▛▘ ", "  ▘▘ ▝▝   "]
+    } else {
+        ["", "", ""]
+    };
+    let facts = [
+        vec![
+            span("davinci", th.text).add_modifier(Modifier::BOLD),
+            span(format!(" v{}", env!("CARGO_PKG_VERSION")), th.muted),
+        ],
+        vec![
+            span(model.model_name.clone(), th.text),
+            span(format!(" · {}", model.thinking_level), th.muted),
+        ],
+        vec![span(info.cwd.clone(), th.muted)],
+    ];
+    mark.into_iter()
+        .zip(facts)
+        .map(|(art, facts)| {
+            let mut run = vec![span(art, th.primary)];
+            run.extend(facts);
+            indent(
+                1.min(model.width),
+                truncate_run(run, model.width.saturating_sub(1)),
+            )
+        })
+        .collect()
+}
 
 pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let th = &model.theme;
     let width = model.width;
-    let mut rows = Vec::new();
-
-    if model.decoration() && model.height >= 48 {
-        rows.extend(emblem(th, width));
-        rows.push(blank());
-        annotate(th, width, &mut rows);
-    }
-
-    rows.push(center(
-        width,
-        vec![span_strong("D A V I N C I", th.text, th)],
-    ));
-    rows.push(center(width, vec![span("Agent workspace", th.muted)]));
-    rows.push(blank());
-    rows.push(center(width, vec![span(info.cwd.clone(), th.secondary)]));
-    rows.push(center(
-        width,
-        vec![
-            span(info.branch.clone(), th.secondary),
-            span(" · ", th.border),
-            span(info.language.clone(), th.muted),
-            span(" · ", th.border),
-            span(info.crates.clone(), th.muted),
-        ],
-    ));
-    rows.push(center(width, restored_row(th, info.restored)));
+    let content_width = width.saturating_sub(2);
+    let mut rows = vec![Line::from(restored_row(th, info.restored))];
     for found in &info.found {
-        rows.push(center(width, vec![span(found.clone(), th.muted)]));
+        rows.push(Line::from(vec![span(found.clone(), th.muted)]));
     }
-    rows.push(blank());
-
-    let rule_width = width.min(62);
-    let rule = hair_rule(rule_width, th, "◦");
-    rows.push(center(width, rule.spans));
-    rows.push(blank());
-    rows.push(center(
-        width,
-        vec![span("Describe a task. Inspect every step.", th.text)],
-    ));
     rows.push(blank());
     for (command, description) in [
-        ("/graph <goal>", "Plan and follow a worker graph"),
-        ("/governor-status", "Inspect compression and saved output"),
-        ("/memory-status", "Explore the vector memory index"),
+        ("/graph <goal>", "Plan a task and follow its progress"),
+        ("/governor-status", "View compression and token savings"),
+        ("/memory-status", "Browse the memory index"),
     ] {
-        rows.push(center(
-            width,
-            vec![
-                span_strong(format!("{command:<19}"), th.primary, th),
-                span(if width >= 64 { description } else { "" }, th.muted),
-            ],
-        ));
+        rows.push(Line::from(vec![
+            span_strong(format!("{command:<19}"), th.primary, th),
+            span(if width >= 64 { description } else { "" }, th.muted),
+        ]));
     }
-    rows.push(blank());
-    rows.push(center(
-        width,
-        vec![span(
-            "ctrl+p commands  ·  /help keyboard shortcuts",
-            th.muted,
-        )],
-    ));
-
-    rows.into_iter()
-        .map(|row| Line::from(truncate_run(row.spans, width)))
-        .collect()
-}
-
-/// The margin note beside the mark — `proportio humana`, in faded copper, at
-/// the mark's shoulder (`1a`). Decoration only; dropped with the mark.
-fn annotate(theme: &Theme, width: u16, rows: &mut [Line<'static>]) {
-    let faded = theme.dim().primary;
-    let margin = width.saturating_sub(emblem_width()) / 2 + emblem_width() + 4;
-    for (row, note) in [(2usize, "proportio"), (3, "humana")] {
-        let Some(line) = rows.get_mut(row) else {
-            continue;
-        };
-        let used = crate::davinci::ui::run_width(&line.spans);
-        if margin + 12 > width || used > margin {
-            continue;
-        }
-        line.spans
-            .push(crate::davinci::ui::pad(margin - used, None));
-        line.spans.push(span(note, faded));
-    }
+    let mut out = vec![blank()];
+    out.extend(banner(model, info));
+    out.push(blank());
+    out.extend(
+        rows.into_iter()
+            .map(|row| indent(1.min(width), truncate_run(row.spans, content_width))),
+    );
+    out.push(blank());
+    out
 }
 
 fn restored_row(theme: &Theme, restored: bool) -> Vec<Span<'static>> {
@@ -133,61 +78,18 @@ fn restored_row(theme: &Theme, restored: bool) -> Vec<Span<'static>> {
         vec![
             span_strong(format!("{} ", glyph::DONE), theme.success, theme),
             span("session restored", theme.muted),
-            span(" · ", theme.border),
-            span("memoria intacta", theme.muted),
         ]
     } else {
         vec![
-            span_strong(format!("{} ", glyph::QUEUED), theme.border, theme),
+            span_strong(format!("{} ", glyph::QUEUED), theme.muted, theme),
             span("new session", theme.muted),
         ]
     }
 }
 
-/// The mark is centred as one block, not row by row: each row keeps its own
-/// leading space, or the drawing skews.
-fn emblem(theme: &Theme, width: u16) -> Vec<Line<'static>> {
-    let lead = width.saturating_sub(emblem_width()) / 2;
-    EMBLEM
-        .iter()
-        .enumerate()
-        .map(|(index, row)| indent(lead, emblem_row(theme, row, index)))
-        .collect()
-}
-
-fn emblem_row(theme: &Theme, row: &str, index: usize) -> Vec<Span<'static>> {
-    if index != NAVEL_ROW {
-        return vec![span(row.to_string(), theme.muted)];
-    }
-    match row.split_once(NAVEL) {
-        Some((head, tail)) => vec![
-            span(head.to_string(), theme.muted),
-            span_strong(NAVEL, theme.primary, theme),
-            span(tail.to_string(), theme.muted),
-        ],
-        None => vec![span(row.to_string(), theme.muted)],
-    }
-}
-
-/// Row count, so the shell can centre the empty state in the body.
+/// Row count includes discovered resources.
 pub fn height(model: &Model) -> usize {
-    // mark + gap, then the ten rows of copy; the margin note rides on the
-    // mark's own rows.
-    let copy = 16;
-    if model.decoration() && model.height >= 48 {
-        EMBLEM.len() + 1 + copy
-    } else {
-        copy
-    }
-}
-
-/// Widest row, so nothing overflows a narrow window.
-pub fn emblem_width() -> u16 {
-    EMBLEM
-        .iter()
-        .map(|row| unicode_width::UnicodeWidthStr::width(*row) as u16)
-        .max()
-        .unwrap_or(0)
+    11 + model.startup.found.len()
 }
 
 #[cfg(test)]
@@ -205,35 +107,6 @@ mod tests {
         )
     }
 
-    fn info() -> Startup {
-        Startup {
-            cwd: "C:\\dev\\oss\\davinci-rust".into(),
-            branch: "main".into(),
-            language: "rust".into(),
-            crates: "11 crates".into(),
-            restored: true,
-            found: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn what_the_session_found_sits_under_the_restored_row() {
-        let m = Model::new(
-            Theme::da_vinci(crate::davinci::theme::ColorDepth::TrueColor, false),
-            110,
-            44,
-            true,
-        );
-        let mut found = info();
-        found.found = vec!["loaded 1 context file · 41 skills".into()];
-        let rows: Vec<String> = lines(&m, &found).iter().map(text).collect();
-        let restored = rows
-            .iter()
-            .position(|row| row.contains("session restored"))
-            .expect("restored row");
-        assert!(rows[restored + 1].contains("loaded 1 context file · 41 skills"));
-    }
-
     fn text(line: &Line<'_>) -> String {
         line.spans
             .iter()
@@ -242,117 +115,33 @@ mod tests {
     }
 
     #[test]
-    fn the_mark_is_drawn_at_a_hundred_columns_and_dropped_below() {
-        let wide = lines(&model(100), &info());
-        assert!(text(&wide[0]).contains('·'));
-        assert_eq!(wide.len(), height(&model(100)));
-
-        let narrow = lines(&model(80), &info());
-        assert!(!text(&narrow[0]).contains('╱'), "no ASCII art at 80");
-        assert!(text(&narrow[0]).contains("D A V I N C I"));
-        assert_eq!(narrow.len(), height(&model(80)));
-    }
-
-    #[test]
-    fn the_navel_is_the_only_copper_stroke_in_the_mark() {
-        let m = model(120);
-        let th = m.theme;
-        let rows = lines(&m, &info());
-        let copper: Vec<String> = rows[..EMBLEM.len()]
-            .iter()
-            .flat_map(|row| row.spans.iter())
-            .filter(|span| span.style.fg == Some(th.primary))
-            .map(|span| span.content.to_string())
-            .collect();
-        assert_eq!(copper, vec![NAVEL.to_string()]);
-    }
-
-    #[test]
-    fn the_mark_is_centred_as_a_block_so_the_drawing_does_not_skew() {
-        let rows = lines(&model(120), &info());
-        let leads: Vec<usize> = rows[..EMBLEM.len()]
-            .iter()
-            .map(|row| text(row).len() - text(row).trim_start().len())
-            .collect();
-        let own: Vec<usize> = EMBLEM
-            .iter()
-            .map(|row| row.len() - row.trim_start().len())
-            .collect();
-        let base = leads[0] - own[0];
-        for (index, lead) in leads.iter().enumerate() {
-            assert_eq!(
-                lead - own[index],
-                base,
-                "row {index} was centred on its own width"
-            );
+    fn welcome_is_bounded_and_reports_its_actual_height() {
+        for width in [1, 40, 64, 80, 100, 160] {
+            let mut m = model(width);
+            m.startup.found = vec!["loaded 1 context file · 41 skills".into()];
+            let rows = lines(&m, &m.startup);
+            assert_eq!(rows.len(), height(&m));
+            assert!(rows.iter().all(|row| run_width(&row.spans) <= width));
         }
     }
 
     #[test]
-    fn the_mark_never_overflows_the_window() {
-        for width in [100u16, 120, 160] {
-            for row in lines(&model(width), &info()) {
-                assert!(
-                    run_width(&row.spans) <= width,
-                    "row overflows {width}: {:?}",
-                    text(&row)
-                );
-            }
+    fn welcome_keeps_session_facts_and_working_commands() {
+        let mut m = model(100);
+        m.startup.restored = true;
+        m.startup.found = vec!["loaded 1 context file · 41 skills".into()];
+        let rows: Vec<String> = lines(&m, &m.startup).iter().map(text).collect();
+        let restored = rows
+            .iter()
+            .position(|row| row.contains("session restored"))
+            .unwrap();
+        assert!(rows[restored + 1].contains("loaded 1 context file · 41 skills"));
+        for command in ["/graph <goal>", "/governor-status", "/memory-status"] {
+            assert!(rows.iter().any(|row| row.contains(command)));
         }
-        assert!(emblem_width() < 100);
-    }
-
-    #[test]
-    fn the_empty_state_names_where_it_is_and_what_it_found() {
-        let rows: Vec<String> = lines(&model(120), &info()).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("Agent workspace")));
-        assert!(rows
+        m.startup.restored = false;
+        assert!(lines(&m, &m.startup)
             .iter()
-            .any(|row| row.contains("C:\\dev\\oss\\davinci-rust")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("main · rust · 11 crates")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("✓ session restored · memoria intacta")));
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("Describe a task. Inspect every step.")));
-        // The margin note rides the mark's shoulder, two words on two rows.
-        assert!(rows.iter().any(|row| row.contains("proportio")));
-        assert!(rows.iter().any(|row| row.contains("humana")));
-    }
-
-    #[test]
-    fn a_fresh_session_says_so_with_its_own_glyph() {
-        let mut fresh = info();
-        fresh.restored = false;
-        let rows: Vec<String> = lines(&model(120), &fresh).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("○ new session")));
-        assert!(!rows.iter().any(|row| row.contains("session restored")));
-    }
-
-    #[test]
-    fn the_hair_rule_is_capped_so_it_does_not_span_a_wide_window() {
-        let rows = lines(&model(160), &info());
-        let rule = rows
-            .iter()
-            .find(|row| text(row).contains('◦'))
-            .expect("hair rule");
-        assert!(run_width(&rule.spans) <= 62 + (160 - 62) / 2 + 1);
-    }
-
-    #[test]
-    fn startup_shows_command_shortcuts_for_graph_governor_and_memory() {
-        let rows: Vec<String> = lines(&model(100), &info()).iter().map(text).collect();
-        assert!(rows.iter().any(|row| {
-            row.contains("/graph <goal>") && row.contains("Plan and follow a worker graph")
-        }));
-        assert!(rows.iter().any(|row| {
-            row.contains("/governor-status") && row.contains("Inspect compression and saved output")
-        }));
-        assert!(rows.iter().any(|row| {
-            row.contains("/memory-status") && row.contains("Explore the vector memory index")
-        }));
+            .any(|row| text(row).contains("new session")));
     }
 }

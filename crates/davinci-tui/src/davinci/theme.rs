@@ -3,7 +3,7 @@
 //! Tokens are resolved once at startup into whatever the terminal understands,
 //! so widgets pass `theme.primary` to a `Style` and never think about it.
 //!
-//! Copper (`primary`) carries state. Verdigris (`secondary`) carries *where
+//! Warm terracotta (`primary`) carries focus. Cool secondary ink carries *where
 //! something is* — branch, path, symbol — and never *what is happening*. That
 //! split is what keeps the palette from reading as decoration.
 //!
@@ -23,7 +23,7 @@ pub mod glyph {
     pub const READ: &str = "↳";
     pub const SEARCH: &str = "⌕";
     pub const AGENT: &str = "◆";
-    pub const PROMPT: &str = "›";
+    pub const PROMPT: &str = "❯";
     pub const USER: &str = ">";
     pub const TICK: &str = "·";
     /// The elbow a tool line hangs from, so a turn's calls read as one branch
@@ -136,64 +136,64 @@ const fn rgb(hex: u32) -> Color {
     )
 }
 
-/// Slate surfaces with copper state accents. Muted copy stays readable on
-/// both the canvas and raised surfaces; borders are intentionally quieter.
+/// Claude Code-inspired warm charcoal and terracotta. Color stays in the
+/// prompt, active work and outcomes; the conversation uses neutral ink.
 const TRUECOLOR: Ramp = Ramp {
-    background: rgb(0x101419),
-    surface: rgb(0x1B222A),
-    surface_alt: rgb(0x151B22),
-    border: rgb(0x46515D),
-    text: rgb(0xE3E7EB),
-    muted: rgb(0xA1ACB8),
-    primary: rgb(0xD58A32),
-    secondary: rgb(0x52A89C),
-    success: rgb(0x74A879),
-    warning: rgb(0xD5A047),
-    error: rgb(0xC4593F),
+    background: rgb(0x1B1B1B),
+    surface: rgb(0x303030),
+    surface_alt: rgb(0x242424),
+    border: rgb(0x555452),
+    text: rgb(0xE8E6E3),
+    muted: rgb(0xA3A09B),
+    primary: rgb(0xD97757),
+    secondary: rgb(0xA5AFD6),
+    success: rgb(0x8AAF78),
+    warning: rgb(0xD5B778),
+    error: rgb(0xE08080),
 };
 
 /// "Never blur, never tint — just drop the ramp" (design.md §2).
 const TRUECOLOR_DIM: Ramp = Ramp {
-    background: rgb(0x101419),
-    surface: rgb(0x151B22),
-    surface_alt: rgb(0x101419),
-    border: rgb(0x303943),
-    text: rgb(0x3F3A31),
-    muted: rgb(0x5D564C),
-    primary: rgb(0x6B512C),
-    secondary: rgb(0x2F5F59),
-    success: rgb(0x435F45),
-    warning: rgb(0x6B512C),
-    error: rgb(0x633127),
+    background: rgb(0x1B1B1B),
+    surface: rgb(0x242424),
+    surface_alt: rgb(0x1B1B1B),
+    border: rgb(0x383735),
+    text: rgb(0x6F6D69),
+    muted: rgb(0x595753),
+    primary: rgb(0x77503F),
+    secondary: rgb(0x595E72),
+    success: rgb(0x4D6045),
+    warning: rgb(0x74623F),
+    error: rgb(0x754848),
 };
 
 /// xterm-256 nearest neighbours of the truecolor table.
 const ANSI256: Ramp = Ramp {
-    background: Color::Indexed(233),
-    surface: Color::Indexed(235),
-    surface_alt: Color::Indexed(234),
+    background: Color::Indexed(234),
+    surface: Color::Indexed(236),
+    surface_alt: Color::Indexed(235),
     border: Color::Indexed(240),
     text: Color::Indexed(254),
-    muted: Color::Indexed(248),
+    muted: Color::Indexed(247),
     primary: Color::Indexed(173),
-    secondary: Color::Indexed(73),
+    secondary: Color::Indexed(146),
     success: Color::Indexed(108),
-    warning: Color::Indexed(179),
-    error: Color::Indexed(167),
+    warning: Color::Indexed(180),
+    error: Color::Indexed(174),
 };
 
 const ANSI256_DIM: Ramp = Ramp {
-    background: Color::Indexed(233),
-    surface: Color::Indexed(234),
-    surface_alt: Color::Indexed(233),
-    border: Color::Indexed(236),
-    text: Color::Indexed(239),
-    muted: Color::Indexed(59),
+    background: Color::Indexed(234),
+    surface: Color::Indexed(235),
+    surface_alt: Color::Indexed(234),
+    border: Color::Indexed(237),
+    text: Color::Indexed(243),
+    muted: Color::Indexed(240),
     primary: Color::Indexed(94),
-    secondary: Color::Indexed(66),
-    success: Color::Indexed(65),
+    secondary: Color::Indexed(241),
+    success: Color::Indexed(240),
     warning: Color::Indexed(94),
-    error: Color::Indexed(95),
+    error: Color::Indexed(240),
 };
 
 /// `NO_COLOR`: greyscale ramp, active glyphs pure white and bold (design.md §9).
@@ -225,7 +225,7 @@ const GREY_DIM: Ramp = Ramp {
     error: rgb(0x9A9A9A),
 };
 
-/// Eight named colors. Kept legible rather than faithful.
+/// Named terminal colors. Kept legible rather than faithful.
 const BASIC: Ramp = Ramp {
     background: Color::Reset,
     surface: Color::Reset,
@@ -233,7 +233,7 @@ const BASIC: Ramp = Ramp {
     border: Color::DarkGray,
     text: Color::White,
     muted: Color::Gray,
-    primary: Color::Yellow,
+    primary: Color::LightRed,
     secondary: Color::Cyan,
     success: Color::Green,
     warning: Color::Yellow,
@@ -316,7 +316,7 @@ impl Theme {
         }
     }
 
-    /// The ink a run of code takes: keywords in verdigris, strings in
+    /// The ink a run of code takes: keywords in blue-grey, strings in
     /// success, comments muted, numbers in warning, and everything else in
     /// the caller's `base` — the line's own colour in a Δ hunk, `text` in a
     /// fenced block. Colour reinforces; under `NO_COLOR` every role is the
@@ -405,22 +405,22 @@ mod tests {
     #[test]
     fn truecolor_tokens_match_the_spec_table() {
         let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
-        assert_eq!(theme.background, Color::Rgb(0x10, 0x14, 0x19));
-        assert_eq!(theme.border, Color::Rgb(0x46, 0x51, 0x5D));
-        assert_eq!(theme.text, Color::Rgb(0xE3, 0xE7, 0xEB));
-        assert_eq!(theme.muted, Color::Rgb(0xA1, 0xAC, 0xB8));
-        assert_eq!(theme.primary, Color::Rgb(0xD5, 0x8A, 0x32));
-        assert_eq!(theme.secondary, Color::Rgb(0x52, 0xA8, 0x9C));
-        assert_eq!(theme.success, Color::Rgb(0x74, 0xA8, 0x79));
-        assert_eq!(theme.warning, Color::Rgb(0xD5, 0xA0, 0x47));
-        assert_eq!(theme.error, Color::Rgb(0xC4, 0x59, 0x3F));
+        assert_eq!(theme.background, Color::Rgb(0x1B, 0x1B, 0x1B));
+        assert_eq!(theme.border, Color::Rgb(0x55, 0x54, 0x52));
+        assert_eq!(theme.text, Color::Rgb(0xE8, 0xE6, 0xE3));
+        assert_eq!(theme.muted, Color::Rgb(0xA3, 0xA0, 0x9B));
+        assert_eq!(theme.primary, Color::Rgb(0xD9, 0x77, 0x57));
+        assert_eq!(theme.secondary, Color::Rgb(0xA5, 0xAF, 0xD6));
+        assert_eq!(theme.success, Color::Rgb(0x8A, 0xAF, 0x78));
+        assert_eq!(theme.warning, Color::Rgb(0xD5, 0xB7, 0x78));
+        assert_eq!(theme.error, Color::Rgb(0xE0, 0x80, 0x80));
     }
 
     #[test]
     fn ansi256_is_the_nearest_neighbour_table() {
         let theme = Theme::da_vinci(ColorDepth::Ansi256, false);
         assert_eq!(theme.primary, Color::Indexed(173));
-        assert_eq!(theme.secondary, Color::Indexed(73));
+        assert_eq!(theme.secondary, Color::Indexed(146));
         assert_eq!(theme.border, Color::Indexed(240));
     }
 
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(State::Read.glyph(), "↳");
         assert_eq!(State::Search.glyph(), "⌕");
         assert_eq!(State::Agent.glyph(), "◆");
-        assert_eq!(State::Prompt.glyph(), "›");
+        assert_eq!(State::Prompt.glyph(), "❯");
         assert_eq!(State::User.glyph(), ">");
         assert_eq!(State::Tick.glyph(), "·");
     }
@@ -496,10 +496,10 @@ mod tests {
         assert_ne!(dimmed.muted, theme.muted);
         assert_ne!(dimmed.primary, theme.primary);
         assert_ne!(dimmed.border, theme.border);
-        assert_eq!(dimmed.text, Color::Rgb(0x3F, 0x3A, 0x31));
-        assert_eq!(dimmed.muted, Color::Rgb(0x5D, 0x56, 0x4C));
-        assert_eq!(dimmed.primary, Color::Rgb(0x6B, 0x51, 0x2C));
-        assert_eq!(dimmed.border, Color::Rgb(0x30, 0x39, 0x43));
+        assert_eq!(dimmed.text, Color::Rgb(0x6F, 0x6D, 0x69));
+        assert_eq!(dimmed.muted, Color::Rgb(0x59, 0x57, 0x53));
+        assert_eq!(dimmed.primary, Color::Rgb(0x77, 0x50, 0x3F));
+        assert_eq!(dimmed.border, Color::Rgb(0x38, 0x37, 0x35));
         assert_eq!(dimmed.dim(), dimmed);
     }
 
