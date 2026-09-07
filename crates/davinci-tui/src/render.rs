@@ -262,3 +262,211 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     }
     lines
 }
+
+/// Shared terminal-native section formatting for the reusable ANSI components.
+/// Uses their existing theme (or inherits the caller's ink), and the same focus
+/// gutter as the native renderer. Input/state remain owned by each component.
+pub(crate) struct CommandSection<'a> {
+    width: usize,
+    theme: Option<&'a crate::themes::Theme>,
+    rows: Vec<String>,
+}
+
+pub(crate) fn selection_window(
+    selected: usize,
+    count: usize,
+    limit: usize,
+) -> std::ops::Range<usize> {
+    let limit = limit.max(1);
+    let selected = selected.min(count.saturating_sub(1));
+    let start = selected
+        .saturating_sub(limit / 2)
+        .min(count.saturating_sub(limit));
+    start..start.saturating_add(limit).min(count)
+}
+
+impl<'a> CommandSection<'a> {
+    pub(crate) fn new(width: usize, title: &str, theme: Option<&'a crate::themes::Theme>) -> Self {
+        let mut section = Self {
+            width,
+            theme,
+            rows: Vec::new(),
+        };
+        section.heading(title);
+        section
+    }
+    fn paint(&self, role: &str, text: &str) -> String {
+        self.theme
+            .map(|theme| theme.fg(role, text))
+            .unwrap_or_else(|| text.to_string())
+    }
+    pub(crate) fn heading(&mut self, text: &str) {
+        let text = self
+            .theme
+            .map(|theme| theme.bold(text))
+            .unwrap_or_else(|| text.to_string());
+        self.wrapped(&self.paint("text", &text), 2);
+    }
+    pub(crate) fn detail(&mut self, text: &str) {
+        self.message("muted", text);
+    }
+    pub(crate) fn message(&mut self, role: &str, text: &str) {
+        if !text.is_empty() {
+            self.wrapped(&self.paint(role, text), 3);
+        }
+    }
+    fn wrapped(&mut self, text: &str, indent: usize) {
+        if self.width == 0 {
+            return;
+        }
+        let indent = indent.min(self.width.saturating_sub(1));
+        let room = self.width - indent;
+        for line in crate::ansi::wrap_text_with_ansi(text, room) {
+            self.rows.push(crate::ansi::truncate_to_width(
+                &format!("{}{line}", " ".repeat(indent)),
+                self.width,
+                "",
+                false,
+            ));
+        }
+    }
+    /// Read-only query preview; the component still handles query editing.
+    pub(crate) fn search(&mut self, query: &str) {
+        let room = self.width.saturating_sub(11);
+        let cells = crate::ansi::visible_width(query);
+        let query = if cells > room {
+            format!(
+                "…{}",
+                crate::ansi::slice_by_column(
+                    query,
+                    cells.saturating_sub(room.saturating_sub(1)),
+                    room.saturating_sub(1),
+                    true
+                )
+            )
+        } else {
+            query.to_string()
+        };
+        self.detail(&format!("Search: {query}"));
+    }
+    pub(crate) fn input(&mut self, rows: Vec<String>) {
+        self.rows.extend(
+            rows.into_iter()
+                .map(|row| crate::ansi::truncate_to_width(&row, self.width, "", false)),
+        );
+    }
+    pub(crate) fn item(&mut self, selected: bool, label: &str, value: &str) {
+        use crate::ansi::{strip_terminal_sequences, truncate_to_width, visible_width};
+        let prefix = if selected {
+            crate::davinci::ui::SELECTION_BAR
+        } else {
+            "   "
+        };
+        let prefix_width = visible_width(prefix);
+        let available = self.width.saturating_sub(prefix_width);
+        let value_width = if self.width < 32 {
+            0
+        } else {
+            visible_width(value).min(available / 3).min(28)
+        };
+        let gap = usize::from(value_width > 0) * 2;
+        let name_width = available.saturating_sub(value_width + gap);
+        let name = truncate_to_width(label, name_width, "…", false);
+        let mut row = format!(
+            "{}{}",
+            self.paint(if selected { "accent" } else { "muted" }, prefix),
+            self.paint(if selected { "accent" } else { "text" }, &name)
+        );
+        if value_width > 0 {
+            row.push_str(&" ".repeat(available.saturating_sub(visible_width(&name) + value_width)));
+            row.push_str(&self.paint("muted", &truncate_to_width(value, value_width, "…", false)));
+        }
+        self.rows
+            .push(truncate_to_width(&row, self.width, "", false));
+        if selected {
+            if strip_terminal_sequences(&name) != strip_terminal_sequences(label) {
+                self.detail(label);
+            }
+            if !value.is_empty() && (value_width == 0 || visible_width(value) > value_width) {
+                self.detail(value);
+            }
+        }
+    }
+    pub(crate) fn position(&mut self, selected: usize, count: usize, limit: usize) {
+        if count > limit.max(1) {
+            self.detail(&format!(
+                "{} of {count}",
+                selected.saturating_add(1).min(count)
+            ));
+        }
+    }
+    pub(crate) fn hint(&mut self, text: &str) {
+        self.message("dim", text);
+    }
+    pub(crate) fn finish(self) -> Vec<String> {
+        self.rows
+    }
+}
+
+#[cfg(test)]
+mod command_component_regressions {
+    use super::*;
+    use crate::{
+        ansi::{strip_terminal_sequences, visible_width},
+        config_selector::{ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector},
+        oauth_selector::{AuthSelectorMode, OAuthSelector},
+        settings::{SettingItem, SettingsList},
+        thinking_selector::ThinkingSelector,
+    };
+    #[test]
+    fn unicode_resource_names_cannot_panic_or_overflow_a_narrow_view() {
+        let selector = ConfigSelector::new(vec![ConfigResource {
+            kind: ConfigResourceKind::Skills,
+            name: "你好吗 café 🦀".into(),
+            source: "项目/source".into(),
+            enabled: true,
+            scope: ConfigScope::User,
+        }]);
+        for width in [0, 1, 7, 20, 32, 40] {
+            for row in selector.render(width) {
+                assert!(visible_width(&row) <= width, "{width}: {row}");
+            }
+        }
+    }
+    #[test]
+    fn settings_window_follows_focus_beyond_the_first_page() {
+        let mut list = SettingsList::new(
+            (0..40)
+                .map(|i| SettingItem {
+                    id: i.to_string(),
+                    label: format!("setting-{i}"),
+                    current_value: "on".into(),
+                    values: vec!["on".into(), "off".into()],
+                    description: Some("Help for this setting".into()),
+                })
+                .collect(),
+            8,
+        );
+        list.selected = 30;
+        let drawn = strip_terminal_sequences(&list.render(40).join("\n"));
+        assert!(drawn.contains("setting-30"), "{drawn}");
+        assert!(drawn.contains("Help for this setting"));
+    }
+    #[test]
+    fn empty_auth_lists_keep_a_visible_cancel_hint() {
+        let selector = OAuthSelector::new(AuthSelectorMode::Logout, Vec::new(), None);
+        let drawn = strip_terminal_sequences(&selector.render(40).join("\n"));
+        assert!(drawn.to_lowercase().contains("esc"), "{drawn}");
+    }
+    #[test]
+    fn thinking_names_survive_ansi_styling_and_narrow_widths() {
+        let selector = ThinkingSelector::new("low", vec!["low".into(), "high".into()], "high");
+        let drawn = strip_terminal_sequences(&selector.render(20).join("\n"));
+        assert!(drawn.contains("low"), "{drawn}");
+        for width in [0, 1, 20, 32, 40] {
+            for row in selector.render(width) {
+                assert!(visible_width(&row) <= width, "{width}: {row}");
+            }
+        }
+    }
+}

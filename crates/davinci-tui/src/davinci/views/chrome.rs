@@ -6,14 +6,15 @@
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/views/chrome.ex`.
 
-use ratatui::style::{Style, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::davinci::model::{Model, Overlay, Screen};
 use crate::davinci::theme::glyph;
 use crate::davinci::ui::{
-    clip_ellipsis, meter, pad, run_width, span, span_on, span_strong, spread, Surface,
+    clip_ellipsis, meter, pad, paper_label, print_rule, run_width, span, span_on, span_strong,
+    spread, Surface,
 };
 
 use super::instrumenta::SELECTION_BAR;
@@ -38,13 +39,17 @@ pub enum Hint {
 /// mockups set them (`2b`, `2c`).
 pub fn header(model: &Model) -> Line<'static> {
     let th = &model.theme;
-    let mut left = vec![
-        span("✻ ", th.primary),
-        span("davinci", th.text).add_modifier(ratatui::style::Modifier::BOLD),
-    ];
+    if let Some(section) = sheet::chrome(model) {
+        return spread(
+            model.width,
+            vec![paper_label(sheet::title(model.screen), th, false)],
+            section.header_right,
+        );
+    }
+    let mut left = vec![paper_label("davinci", th, true)];
     if !model.minimal() {
         left.push(span(" · ", th.border));
-        left.push(span(model.mode(), th.primary));
+        left.push(span(model.mode().to_uppercase(), th.text));
     }
 
     // A command sheet claims the right run for its own facts (design.md §11).
@@ -189,17 +194,14 @@ fn status_left(model: &Model) -> Vec<Span<'static>> {
         ];
     }
 
-    // A command sheet: `mode · branch · third`, the third its own (§11).
+    // A section reports its own state, not the underlying conversation mode.
     if let Some(chrome) = sheet::chrome(model) {
-        let mut run = vec![
-            span(model.mode(), th.primary),
-            span(" · ", th.border),
-            span(model.branch.clone(), th.secondary),
-        ];
-        if let Some(third) = chrome.status_third {
-            run.push(span(" · ", th.border));
-            run.extend(third);
-        }
+        let mut run = vec![span("  ", th.muted)];
+        run.extend(
+            chrome
+                .status_third
+                .unwrap_or_else(|| vec![span(sheet::title(model.screen), th.muted)]),
+        );
         return run;
     }
 
@@ -297,14 +299,12 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
     let percent = (fraction * 100.0) as u32;
     let (used, cap) = model.context;
 
-    if model.screen == Screen::Grafo {
-        return vec![
-            span("enter open node", th.border),
-            span(" · ", th.border),
-            span("x expand", th.border),
-            span(" · ", th.border),
-            span("esc close", th.border),
-        ];
+    // Section keyboard guidance belongs to its actual input owner, not the
+    // conversation footer or historical instrument mockups.
+    if model.overlay.is_none() {
+        if let Some(section) = sheet::chrome(model) {
+            return section.status_right.unwrap_or_default();
+        }
     }
 
     // Behind an overlay the meter abbreviates; the pickers also state the
@@ -494,7 +494,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         } else {
             "  ".into()
         };
-        let mut row = vec![span(prompt, if overlaid { th.border } else { th.text })];
+        let mut row = vec![span(prompt, if overlaid { th.border } else { th.primary })];
         row.extend(body);
         // The caret belongs to whatever owns the keyboard; an open instrument
         // owns it, so the composer's goes with it (`1d`, `1f`). At end of line
@@ -524,6 +524,27 @@ fn composer_rule(
     hidden: usize,
     direction: &str,
 ) -> Line<'static> {
+    if direction == "above" {
+        if let Some((x, _)) = mic_geometry(model) {
+            let left = if hidden > 0 {
+                format!("─ {hidden} lines above ")
+            } else {
+                String::new()
+            };
+            let left = clip_ellipsis(&left, x);
+            let used = UnicodeWidthStr::width(left.as_str());
+            return Line::from(vec![
+                span(
+                    format!("{left}{}", "─".repeat((x as usize).saturating_sub(used))),
+                    color,
+                ),
+                span(mic_label(model), model.theme.primary),
+            ]);
+        }
+    }
+    if hidden == 0 {
+        return print_rule(model.width, &model.theme);
+    }
     let label = if hidden > 0 {
         format!("─ {hidden} lines {direction} ")
     } else {
@@ -540,6 +561,26 @@ fn composer_rule(
         )],
         model.width,
     ))
+}
+
+fn mic_label(model: &Model) -> String {
+    if model.width >= 52 {
+        format!("[{}]", model.voice.label)
+    } else if model.voice.label.starts_with("REC ") {
+        "[REC / Esc cancel]".into()
+    } else if model.voice.active {
+        "[voice / Esc]".into()
+    } else {
+        "[mic]".into()
+    }
+}
+
+pub fn mic_geometry(model: &Model) -> Option<(u16, u16)> {
+    if !model.voice.enabled || !model.voice_eligible() || model.height < 4 {
+        return None;
+    }
+    let width = UnicodeWidthStr::width(mic_label(model).as_str()) as u16;
+    (width <= model.width).then_some((model.width.saturating_sub(width), width))
 }
 
 /// Scroll a long logical row to keep the editor's byte cursor visible. Display
@@ -659,6 +700,9 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
 /// selection reads without color (design.md §6). Nothing is drawn when there is
 /// nothing on offer.
 pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
+    if let Some(rows) = super::cogitator::suggestions(model) {
+        return rows;
+    }
     let th = &model.theme;
     let Some(found) = &model.suggestions else {
         return Vec::new();
@@ -743,6 +787,9 @@ pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
 
 /// How many rows [`suggestions`] will occupy, known before it is built.
 pub fn suggestions_height(model: &Model) -> u16 {
+    if let Some(rows) = super::cogitator::suggestions(model) {
+        return rows.len() as u16;
+    }
     match &model.suggestions {
         Some(found) if !found.items.is_empty() => {
             let (start, end) = model.suggestion_window();
@@ -770,6 +817,12 @@ pub fn composer_height(lines: Option<&[String]>, hinted: bool) -> u16 {
 /// split by hairline bars (`1b`, `1c`).
 fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
     let th = &model.theme;
+    if model.voice.enabled && model.voice_eligible() && !model.voice.notice.is_empty() {
+        return Line::from(span(
+            clip_ellipsis(&model.voice.notice, model.width),
+            th.muted,
+        ));
+    }
     if model.exit_armed {
         return Line::from(vec![span("ctrl+c again to exit", th.primary)]);
     }
@@ -896,11 +949,12 @@ mod tests {
         crate::davinci::fixtures::dress_screen(&mut m, "6d");
         let h = text(&header(&m));
         assert!(
-            h.ends_with("7 files │ +145 -127 │ main · 3 commits behind"),
+            h.contains("REVIEW CHANGES") && h.contains("7 files · +145 -127"),
             "{h}"
         );
         let s = text(&status(&m));
-        assert!(s.starts_with("agent · main · Δ7 +145 -127"), "{s}");
+        assert!(s.starts_with("  review only"), "{s}");
+        assert!(!s.contains("agent · main"));
     }
 
     #[test]
@@ -949,6 +1003,30 @@ mod tests {
     }
 
     #[test]
+    fn model_arguments_use_the_model_picker_design() {
+        let mut m = model(140);
+        m.model_names = vec![
+            "openai-codex / gpt-6-astra".into(),
+            "openai-codex / gpt-5.6-luna".into(),
+        ];
+        m.composer.set_text("/model ");
+        m.refresh_suggestions();
+        let rows = suggestions(&m);
+        let drawn = rows.iter().map(text).collect::<Vec<_>>().join("\n");
+        for label in [
+            "SELECT A MODEL",
+            "OpenAI Codex",
+            "gpt-6-astra",
+            "LATEST",
+            "Balanced performance for most tasks",
+        ] {
+            assert!(drawn.contains(label), "{label}: {drawn}");
+        }
+        assert!(!drawn.contains("COMPLETIONS"));
+        assert_eq!(suggestions_height(&m) as usize, rows.len());
+    }
+
+    #[test]
     fn the_header_is_one_line_at_every_width() {
         for width in [72u16, 80, 100, 120, 160] {
             let line = header(&model(width));
@@ -988,7 +1066,7 @@ mod tests {
     #[test]
     fn the_header_carries_path_branch_and_model_when_there_is_room() {
         let drawn = text(&header(&model(100)));
-        assert!(drawn.starts_with("✻ davinci · agent"), "{drawn}");
+        assert!(drawn.starts_with(" DAVINCI  · AGENT"), "{drawn}");
         assert!(drawn.contains("davinci-rust │ main │ sonnet"));
     }
 
@@ -1031,8 +1109,9 @@ mod tests {
         assert!(text(&status(&m)).starts_with("  ask permissions · main · 3 files +42 -11"));
         m.toggle_screen(Screen::Grafo);
         let drawn = text(&status(&m));
-        assert!(drawn.starts_with("grafo · main · impact view"), "{drawn}");
-        assert!(drawn.contains("esc close"), "grafo states its exits");
+        assert!(drawn.contains("Code graph"), "{drawn}");
+        assert!(!drawn.contains("enter open node") && !drawn.contains("x expand"));
+        assert_eq!(sheet::chrome(&m).unwrap().escape, Some("esc close"));
     }
 
     #[test]
@@ -1043,7 +1122,7 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.border));
         assert_eq!(rows[1].style.bg, None);
-        assert!(text(&rows[0]).chars().all(|ch| ch == '─'));
+        assert!(text(&rows[0]).chars().all(|ch| "━╸┄╺".contains(ch)));
         let prompt_row = text(&rows[1]);
         assert!(prompt_row.contains("❯"), "{prompt_row}");
         assert!(

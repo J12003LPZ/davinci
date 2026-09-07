@@ -1,9 +1,25 @@
 # davinci TUI — design specification
 
-The current Rust interface follows the compact terminal layout shown in the
-[Claude Code demo](https://github.com/anthropics/claude-code), while keeping
-davinci's identity, commands, providers, and feature screens. The historical
-`Pi TUI Mockups.dc.html` remains a reference for individual feature layouts.
+### Experimental local voice
+
+The composer upper rule carries a right-aligned mic control. Its mouse target
+comes from the same composed frame, follows short transcripts, and disappears
+on modal or clipped surfaces. It does not consume editable width. Ctrl+T and
+mic click share one action; default tool expansion moves to Alt+T while explicit
+bindings and legacy/tree contexts retain their meaning. Labels and hotkeys use
+the effective map.
+
+Preparing, REC elapsed time, stopping, transcribing and cancelling are visible.
+Only a capture acknowledgement enables REC. Final text is one undoable insertion
+at the live caret; Enter cannot send while voice is active or before the inserted
+draft is drawn and its guard expires. Setup requires explicit download/import
+consent and never starts capture. See [local voice](../voice-input.md) for settings,
+privacy and the unverified platform/release acceptance gates.
+
+The current Rust interface uses an editorial print system inspired by the supplied
+newspaper collage references: warm ink, aged paper, crimson and navy layers,
+and yellow callouts. The historical `Pi TUI Mockups.dc.html` remains a reference
+for feature layout and behavior, not the current color or typography treatment.
 
 Screens: `1a` startup · `1b` transcript · `1c` Disegno plan · `1d` Instrumenta
 palette · `1e` Codex workspace (160 cols) · `1f` Memoria + Cogitator · `1g` 80
@@ -12,19 +28,33 @@ token governor.
 
 ### September 2026 interface revision
 
-The Rust interface uses warm charcoal, terracotta accents, and a three-row pixel
-mascot beside the actual version, model, thinking level, and working directory.
-The welcome starts near the top. A short conversation keeps that banner and puts
-the prompt immediately after its content; a full conversation scrolls from the
-top and puts the prompt at the bottom. Command sheets retain their full-height
-layout and compact header.
+The optional `vox` theme is selectable beside `dark` and `light` in `/settings`
+and first-time setup. It adds distressed clipping ends, coarse print rules, and
+brighter crimson selection bands while retaining ink, cream, navy, and yellow.
+The existing light and dark palettes are preserved. Color-depth fallbacks and
+`NO_COLOR` remain supported. Preview it with
+`cargo run -p davinci-tui --example editorial_preview --offline -- vox`.
 
-User messages have a quiet grey background. Assistant replies start with `●`;
-tool calls read `● Read(path)` or `● Shell(command)`, with results on an indented
-`⎿` row. The composer has two neutral rules, no side borders, a `❯` prompt, and
-a white block caret. The footer names the actual permission mode, branch,
-changes, context usage, and thinking level as space allows. Idle hints point to
-`/help` and the command palette; the working line keeps `esc to interrupt`.
+The masthead combines a four-row screen-print D with a yellow DAVINCI clipping,
+actual version, model, thinking level, and working directory. Cream paper strips
+carry uppercase screen titles; section summaries keep their original case because
+they can contain IDs and paths. The terminal keeps its own monospace font.
+
+A short conversation keeps the masthead and places the composer after its content;
+a full conversation anchors the composer at the bottom. Crimson bands separate
+user messages and focused selections. Navy supports secondary panels. Static,
+irregular print rules frame the composer; texture stays out of code and prose.
+The caret is cream, and state glyphs retain meaning without color.
+
+This is a character-grid adaptation: no photographs, rotated scraps, custom fonts,
+image protocols, random grain or animation behind readable content. Geometry,
+keyboard ownership, commands, wrapping and scrolling remain unchanged. The default
+legacy palette follows the same ink and sepia colors; custom themes retain their
+existing configuration.
+
+Render a reproducible, offline contact sheet of actual Ratatui buffers:
+`cargo run -p davinci-tui --example editorial_preview --offline > preview.html`.
+It includes wide and narrow screens plus monochrome; fixture data is illustrative.
 
 - Graph runs show the goal, completed-task progress, topology, and worker ledger.
 - Governor status shows actual stored output metadata, configuration state,
@@ -65,24 +95,26 @@ and drop to `NO_COLOR` (§9) below 16.
 
 | Token       | Hex       | Role |
 |---|---|---|
-| `background` | `#1B1B1B` | terminal ground |
-| `surface`    | `#303030` | user messages, selection, panel fill |
-| `surface_alt`| `#242424` | secondary panels, sidebar |
-| `border`     | `#555452` | panel rules, separators, inert glyphs |
-| `text`       | `#E8E6E3` | primary copy, code, prompt, caret |
-| `muted`      | `#A3A09B` | secondary copy, tool arguments, keybind hints |
-| `primary`    | `#D97757` | terracotta: mascot, in-progress, selection, Δ |
-| `secondary`  | `#A5AFD6` | identifiers, thinking level, memoria |
-| `success`    | `#8AAF78` | completed tools, additions, healthy caps |
-| `warning`    | `#D5B778` | attention, soft-cap breach, governor proposals |
-| `error`      | `#E08080` | failures, deletions |
+| `background` | `#1D1516` | terminal ground |
+| `surface`    | `#5E1C16` | user messages, selection, panel fill |
+| `surface_alt`| `#182033` | secondary panels, sidebar |
+| `border`     | `#9C6C4F` | panel rules, separators, inert glyphs |
+| `text`       | `#D8A687` | primary copy, code, prompt, caret |
+| `muted`      | `#C59574` | secondary copy, tool arguments, keybind hints |
+| `primary`    | `#F3D90D` | editorial yellow: identity, in-progress, selection, Δ |
+| `secondary`  | `#D8A687` | identifiers, thinking level, memoria |
+| `success`    | `#D8A687` | completed tools, additions, healthy caps |
+| `warning`    | `#F3D90D` | attention, soft-cap breach, governor proposals |
+| `error`      | `#E6A080` | failures, deletions |
 
-Dimmed layer (behind a modal, `1d` and `1f`): `text → #6F6D69`,
-`muted → #595753`, `primary → #77503F`, `border → #383735`. Never blur, never
+Dimmed layer (behind a modal, `1d` and `1f`): `text → #80604D`,
+`muted → #70503E`, `primary → #827522`, `border → #4A3028`. Never blur, never
 tint — just drop the ramp.
 
-Terracotta carries focus and active work. Muted text carries tool arguments;
-success, warning, and error colors reinforce their status glyphs.
+Yellow carries focus and active work. Muted text carries tool arguments;
+success, warning, and error colors reinforce their status glyphs. Muted sepia
+(`#C59574`) and error ink (`#E6A080`) are lifted print tints for readable contrast
+on crimson; the darker reference reds are surface colors rather than small text.
 
 ```rust
 pub struct Theme {
@@ -343,3 +375,13 @@ wears the same frame, described in one place (`views/sheet.rs`,
     run with one missing fact drops that segment; a status third that cannot
     be computed drops to two segments. Paths are shown as `.pi\…` with
     `%USERPROFILE%` (or `~`) for the home directory.
+
+### Live theme selection
+
+Open `/settings`, select **Theme**, and press Enter to switch between `dark` and `light`. The interface redraws immediately and the choice is saved for future sessions. Trusted project settings retain their existing precedence over user settings. Light uses aged cream paper, dark printed ink, crimson focus, and yellow headline scraps; terminal color-depth and monochrome fallbacks are preserved.
+
+`/model` lists only models from providers with usable credentials. Log in with `/login` to add a provider. The internal security scan control commands are omitted from slash-command discovery.
+
+Thinking levels are selected in `/model`: use Up/Down to highlight a model and Left/Right to adjust its supported reasoning level. Enter saves both; Escape cancels the pending selection. The choice is remembered per model. `/thinking` is removed from slash-command discovery; Tab reasoning-cycle shortcuts are disabled in the native UI.
+
+`/init [focus]` starts a normal agent turn to inspect the repository and create or carefully update `AGENTS.md`, preserving existing instructions. It uses the active model and normal tool permissions. It does not target `CLAUDE.md`.

@@ -1,24 +1,13 @@
-//! Startup version / package / tmux warnings matching TS `interactive-mode.ts`.
+//! Package and tmux startup warnings matching TS `interactive-mode.ts`.
+//! Davinci releases independently, so upstream Pi release checks are omitted.
 
 use std::process::Command;
-use std::time::Duration;
 
 use crate::args::APP_NAME;
 use crate::settings::Settings;
 
-const LATEST_VERSION_URL: &str = "https://pi.dev/api/latest-version";
-const CHANGELOG_URL: &str = "https://pi.dev/changelog";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LatestPiRelease {
-    pub version: String,
-    pub package_name: Option<String>,
-    pub note: Option<String>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupNotices {
-    pub version: Option<LatestPiRelease>,
     pub package_updates: Vec<String>,
     pub tmux_warning: Option<String>,
     pub models_json_error: Option<String>,
@@ -26,13 +15,12 @@ pub struct StartupNotices {
 }
 
 pub fn collect_startup_notices(
-    current_version: &str,
+    _current_version: &str,
     settings: &Settings,
     models_json_error: Option<String>,
     migrated_auth_providers: Vec<String>,
 ) -> StartupNotices {
     StartupNotices {
-        version: check_for_new_pi_version(current_version),
         package_updates: check_for_package_updates(settings),
         tmux_warning: check_tmux_keyboard_setup(),
         models_json_error,
@@ -56,22 +44,6 @@ pub fn start_background_checks(
 
 pub fn format_notices(notices: &StartupNotices) -> Vec<(String, String)> {
     let mut lines = Vec::new();
-    if let Some(release) = &notices.version {
-        lines.push(("status".into(), "Update Available".into()));
-        lines.push((
-            "muted".into(),
-            format!(
-                "New version {} is available. Run {} update",
-                release.version, APP_NAME
-            ),
-        ));
-        if let Some(note) = &release.note {
-            if !note.trim().is_empty() {
-                lines.push(("muted".into(), note.trim().to_string()));
-            }
-        }
-        lines.push(("muted".into(), format!("Changelog: {CHANGELOG_URL}")));
-    }
     if !notices.package_updates.is_empty() {
         lines.push(("status".into(), "Package Updates Available".into()));
         lines.push((
@@ -99,72 +71,6 @@ pub fn format_notices(notices: &StartupNotices) -> Vec<(String, String)> {
         lines.push(("error".into(), format!("models.json error: {error}")));
     }
     lines
-}
-
-pub fn compare_package_versions(left: &str, right: &str) -> Option<i32> {
-    let left = parse_semver(left.trim())?;
-    let right = parse_semver(right.trim())?;
-    Some(left.cmp(&right) as i32)
-}
-
-pub fn is_newer_package_version(candidate: &str, current: &str) -> bool {
-    match compare_package_versions(candidate, current) {
-        Some(cmp) => cmp > 0,
-        None => candidate.trim() != current.trim(),
-    }
-}
-
-pub fn check_for_new_pi_version(current_version: &str) -> Option<LatestPiRelease> {
-    if std::env::var("PI_SKIP_VERSION_CHECK").is_ok() || std::env::var("PI_OFFLINE").is_ok() {
-        return None;
-    }
-    let latest = get_latest_pi_release(current_version)?;
-    if is_newer_package_version(&latest.version, current_version) {
-        Some(latest)
-    } else {
-        None
-    }
-}
-
-pub fn get_latest_pi_release(current_version: &str) -> Option<LatestPiRelease> {
-    if std::env::var("PI_OFFLINE").is_ok() {
-        return None;
-    }
-    let body = if let Ok(path) = std::env::var("PI_LATEST_VERSION_REPLY") {
-        std::fs::read_to_string(path).ok()?
-    } else if cfg!(test) {
-        return None;
-    } else {
-        let agent = format!("{APP_NAME}/{current_version}");
-        ureq::get(LATEST_VERSION_URL)
-            .set("User-Agent", &agent)
-            .set("accept", "application/json")
-            .timeout(Duration::from_millis(10_000))
-            .call()
-            .ok()?
-            .into_string()
-            .ok()?
-    };
-    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let version = value.get("version")?.as_str()?.trim();
-    if version.is_empty() {
-        return None;
-    }
-    Some(LatestPiRelease {
-        version: version.to_string(),
-        package_name: value
-            .get("packageName")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        note: value
-            .get("note")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-    })
 }
 
 pub fn check_for_package_updates(settings: &Settings) -> Vec<String> {
@@ -237,46 +143,9 @@ fn tmux_show(option: &str) -> Option<String> {
     }
 }
 
-fn parse_semver(value: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = value.trim().trim_start_matches('v').split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts
-        .next()?
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok()?;
-    Some((major, minor, patch))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compares_semver_and_falls_back_to_string() {
-        assert_eq!(compare_package_versions("0.84.5", "0.84.4"), Some(1));
-        assert!(is_newer_package_version("0.85.0", "0.84.4"));
-        assert!(is_newer_package_version("not-semver", "0.84.4"));
-        assert!(!is_newer_package_version("0.84.4", "0.84.4"));
-    }
-
-    #[test]
-    fn version_check_uses_fixture_and_skip_flags() {
-        std::env::set_var("PI_SKIP_VERSION_CHECK", "1");
-        assert!(check_for_new_pi_version("0.84.4").is_none());
-        std::env::remove_var("PI_SKIP_VERSION_CHECK");
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("latest.json");
-        std::fs::write(&path, r#"{"version":"0.99.0","note":"ship it"}"#).unwrap();
-        std::env::set_var("PI_LATEST_VERSION_REPLY", path.to_string_lossy().as_ref());
-        let release = check_for_new_pi_version("0.84.4").unwrap();
-        assert_eq!(release.version, "0.99.0");
-        assert_eq!(release.note.as_deref(), Some("ship it"));
-        std::env::remove_var("PI_LATEST_VERSION_REPLY");
-    }
 
     #[test]
     fn package_and_tmux_fixtures() {
@@ -298,15 +167,10 @@ mod tests {
         std::env::remove_var("PI_TMUX_EXTENDED_KEYS");
         std::env::remove_var("PI_TMUX_EXTENDED_KEYS_FORMAT");
         let formatted = format_notices(&StartupNotices {
-            version: Some(LatestPiRelease {
-                version: "1.0.0".into(),
-                package_name: None,
-                note: None,
-            }),
             package_updates: vec!["todo".into()],
             ..StartupNotices::default()
         });
-        assert!(formatted.iter().any(|(_, line)| line == "Update Available"));
+        assert!(!formatted.iter().any(|(_, line)| line == "Update Available"));
         assert!(formatted
             .iter()
             .any(|(_, line)| line.contains("Package Updates Available")));

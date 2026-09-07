@@ -430,7 +430,11 @@ impl Agent {
         let mut last_error = None;
         let mut scheduled_attempt = 0_u32;
         for attempt in 0..attempts {
-            if self.abort_requested() || self.retry_aborted {
+            let permit = crate::runtime::capacity::REQUEST_CAPACITY
+                .acquire(crate::runtime::capacity::RequestClass::Foreground, || {
+                    self.abort_requested() || self.retry_aborted
+                });
+            if permit.is_none() {
                 if scheduled_attempt > 0 {
                     self.push_event(
                         events,
@@ -458,7 +462,9 @@ impl Agent {
             if attempt > 0 {
                 self.stats.provider_retries += 1;
             }
-            match complete(self) {
+            let result = complete(self);
+            drop(permit);
+            match result {
                 Ok(output) => {
                     let output = output.into();
                     let message = output.message;

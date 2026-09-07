@@ -139,70 +139,31 @@ fn description_for(level: &str) -> &'static str {
 
 impl Component for ThinkingSelector {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = vec![
-            String::new(),
-            "Thinking Level".into(),
-            String::new(),
-            self.theme
-                .fg("muted", "Ctrl+T cycles thinking levels in-session"),
-            String::new(),
-            format!("> {}", self.search),
-            String::new(),
-        ];
-        let filtered = self.filtered();
-        if filtered.is_empty() {
-            lines.push(self.theme.fg("muted", "  No matching levels"));
+        let mut section =
+            crate::render::CommandSection::new(width, "Thinking level", Some(&self.theme));
+        section.search(&self.search);
+        let levels = self.filtered();
+        if levels.is_empty() {
+            section.detail("No matching levels.");
         }
-        for (index, level) in filtered.iter().enumerate() {
-            let selected = index == self.selected;
-            let prefix = if selected {
-                self.theme.fg("accent", "→ ")
-            } else {
-                "  ".into()
-            };
-            let name = if selected {
-                self.theme.fg("accent", level)
-            } else {
-                level.clone()
-            };
-            let mut desc = description_for(level).to_string();
-            if level == &self.default_level {
-                desc.push_str(" · default");
+        for (index, level) in levels.iter().enumerate() {
+            let mut labels = Vec::new();
+            if level == &self.current {
+                labels.push("current");
             }
-            let check = if level == &self.current {
-                self.theme.fg("success", " ✓")
-            } else {
-                String::new()
-            };
-            let line = format!("{prefix}{name}  {}{check}", self.theme.fg("muted", &desc));
-            lines.push(truncate(&line, width));
+            if level == &self.default_level {
+                labels.push("default");
+            }
+            section.item(index == self.selected, level, &labels.join(" · "));
+            if index == self.selected {
+                section.detail(description_for(level));
+            }
         }
-        lines.push(String::new());
-        lines.push(self.theme.fg(
-            "dim",
-            "  Enter to select · Ctrl+S to set as default · Esc to cancel",
-        ));
-        lines
+        section.hint("↑↓ move · enter select · ctrl+s default · esc cancel");
+        section.finish()
     }
 
     fn invalidate(&mut self) {}
-}
-
-fn truncate(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let w = if ch.is_ascii() { 1 } else { 2 };
-        if used + w > width {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -237,7 +198,7 @@ mod tests {
         assert_eq!(selector.selected_level().as_deref(), Some("xhigh"));
         assert_eq!(selector.handle_key("\x1b"), ThinkingSelectorAction::Cancel);
         let rendered = selector.render(80).join("\n");
-        assert!(rendered.contains("Thinking Level"));
-        assert!(rendered.contains("Enter to select · Ctrl+S to set as default · Esc to cancel"));
+        assert!(rendered.contains("Thinking level"));
+        assert!(rendered.contains("↑↓ move · enter select · ctrl+s default · esc cancel"));
     }
 }

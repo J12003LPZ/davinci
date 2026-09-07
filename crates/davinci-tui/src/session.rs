@@ -1981,10 +1981,10 @@ mod tests {
             .render(80);
         assert!(thinking_frame
             .iter()
-            .any(|line| line.contains("Thinking Level")));
+            .any(|line| line.contains("Thinking level")));
         assert!(thinking_frame
             .iter()
-            .any(|line| line.contains("Enter to select · Ctrl+S to set as default")));
+            .any(|line| line.contains("↑↓ move · enter select · ctrl+s default")));
         assert_eq!(
             session.handle_bytes("\r"),
             SessionAction::SelectThinking("minimal".into())
@@ -2180,7 +2180,7 @@ mod tests {
             id: "one".into(),
             name: "One".into(),
         }]);
-        assert!(session.render_frame().contains("Model Configuration"));
+        assert!(session.render_frame().contains("Model configuration"));
         assert_eq!(session.handle_bytes("\x1b"), SessionAction::CloseOverlay);
     }
 
@@ -2206,7 +2206,7 @@ mod tests {
         );
         assert!(session.render_frame().contains("Automatic"));
         assert_eq!(session.handle_bytes("\r"), SessionAction::None);
-        assert!(session.render_frame().contains("Automatic Theme"));
+        assert!(session.render_frame().contains("Automatic theme"));
         session.chrome.settings_submenu = None;
         session.open_settings_list(crate::interactive_settings_list(
             &crate::InteractiveSettingsConfig::default(),

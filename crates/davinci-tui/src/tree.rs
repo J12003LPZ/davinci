@@ -1052,7 +1052,8 @@ impl Component for TreeSelector {
     fn render(&self, width: usize) -> Vec<String> {
         let mut lines = vec![
             "  Session Tree".into(),
-            "  ↑↓ move · ←→ page · branch · L label · ctrl+x copy · filters · cycle".into(),
+            "  ↑↓ move · esc close · ←→ page · branch · L label · ctrl+x copy · filters · cycle"
+                .into(),
         ];
         if self.search_query.is_empty() {
             lines.push("  Type to search:".into());
@@ -1071,7 +1072,11 @@ impl Component for TreeSelector {
         let end = (start + self.max_visible).min(self.filtered.len());
         for (offset, flat) in self.filtered[start..end].iter().enumerate() {
             let index = start + offset;
-            let cursor = if index == self.selected { "› " } else { "  " };
+            let cursor = if index == self.selected {
+                crate::davinci::ui::SELECTION_BAR
+            } else {
+                "   "
+            };
             let display_indent = if self.multiple_roots {
                 flat.indent.saturating_sub(1)
             } else {
@@ -1289,5 +1294,39 @@ mod tests {
             .all(|line| crate::render::visible_width(line) <= 12
                 || line.contains("Session Tree")
                 || line.contains("move")));
+    }
+}
+
+#[cfg(test)]
+mod section_style_regressions {
+    use super::*;
+
+    #[test]
+    fn legacy_tree_uses_shared_focus_gutter_without_losing_connectors() {
+        let roots = build_session_tree(vec![
+            SessionTreeEntry::message("u1", None, "user", "你好 tree root"),
+            SessionTreeEntry::message("a1", Some("u1"), "assistant", "child branch"),
+            SessionTreeEntry::message("u2", Some("u1"), "user", "sibling branch"),
+        ]);
+        let mut tree = TreeSelector::new(roots, Some("u2".into()), 6, FilterMode::Default);
+        tree.selected = 1;
+        let rendered = crate::render::strip_terminal_sequences(&tree.render(28).join("\n"));
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("├") || rendered.contains("└"),
+            "{rendered}"
+        );
+        assert!(rendered.to_lowercase().contains("esc"), "{rendered}");
+        for width in [0, 1, 12, 28, 40] {
+            for row in tree.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
     }
 }

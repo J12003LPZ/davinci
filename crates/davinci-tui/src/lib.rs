@@ -76,7 +76,7 @@ pub use ansi::{
     SlicedText,
 };
 pub use autocomplete::{
-    apply_completion, autocomplete_debounce_ms, suggestions, AutocompleteItem,
+    apply_completion, autocomplete_debounce_ms, model_picker_rank, suggestions, AutocompleteItem,
     AutocompleteSuggestions, ExtraAutocompleteProvider, LiveAutocompleteQuery, SlashCommandSpec,
     SuggestionQuery, ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS, DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS,
 };

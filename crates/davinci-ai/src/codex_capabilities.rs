@@ -114,12 +114,36 @@ impl CodexCapabilities {
 
     /// Resolve capabilities from model, backend URL, and authentication type.
     pub fn resolve(model: &Model, base_url: Option<&str>, is_oauth: bool) -> Self {
-        let url = base_url
-            .or(model.base_url.as_deref())
-            .unwrap_or(crate::codex::DEFAULT_CODEX_BASE_URL);
-        if is_oauth || url.contains("chatgpt.com") || model.api == "openai-codex-responses" {
+        let default_url = match model.api.as_str() {
+            "openai-codex-responses" => crate::codex::DEFAULT_CODEX_BASE_URL,
+            "openai-responses" => "https://api.openai.com/v1",
+            _ => return Self::default(),
+        };
+        let Ok(url) = url::Url::parse(
+            base_url
+                .or(model.base_url.as_deref())
+                .unwrap_or(default_url),
+        ) else {
+            return Self::default();
+        };
+        if url.scheme() != "https"
+            || url.port_or_known_default() != Some(443)
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Self::default();
+        }
+        let openai_provider = matches!(model.provider.as_str(), "openai" | "openai-codex");
+        if openai_provider
+            && is_oauth
+            && model.api == "openai-codex-responses"
+            && url.host_str() == Some("chatgpt.com")
+        {
             Self::for_chatgpt_codex(model)
-        } else if model.api == "openai-responses" || model.api == "azure-openai-responses" {
+        } else if model.provider == "openai"
+            && model.api == "openai-responses"
+            && url.host_str() == Some("api.openai.com")
+        {
             Self::for_public_responses(model)
         } else {
             Self::default()
@@ -189,5 +213,39 @@ mod tests {
         let caps = CodexCapabilities::resolve(&model, Some("https://api.anthropic.com"), false);
         assert!(!caps.responses_items);
         assert!(!caps.websocket_transport);
+    }
+
+    #[test]
+    fn generic_oauth_does_not_imply_codex() {
+        let mut model = test_model("anthropic-messages");
+        model.provider = "anthropic".into();
+        assert_eq!(
+            CodexCapabilities::resolve(&model, Some("https://api.anthropic.com"), true),
+            CodexCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn unknown_and_deceptive_origins_are_conservative() {
+        let model = test_model("openai-codex-responses");
+        for url in [
+            "https://chatgpt.com.evil.test/backend-api",
+            "https://proxy.test/chatgpt.com",
+            "https://chatgpt.com@evil.test",
+            "http://chatgpt.com/backend-api",
+            "https://chatgpt.com:8443/backend-api",
+            "not a url",
+        ] {
+            assert_eq!(
+                CodexCapabilities::resolve(&model, Some(url), true),
+                CodexCapabilities::default(),
+                "{url}"
+            );
+        }
+        let azure = test_model("azure-openai-responses");
+        assert_eq!(
+            CodexCapabilities::resolve(&azure, Some("https://api.openai.com/v1"), false),
+            CodexCapabilities::default()
+        );
     }
 }

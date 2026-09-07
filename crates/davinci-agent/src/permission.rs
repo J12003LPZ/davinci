@@ -68,7 +68,7 @@ impl PermissionMode {
 }
 
 /// What kind of thing a tool does, for the mode table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolClass {
     Read,
     Edit,

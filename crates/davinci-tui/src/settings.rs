@@ -73,28 +73,48 @@ impl SettingsList {
 
 impl Component for SettingsList {
     fn render(&self, width: usize) -> Vec<String> {
+        let mut section = crate::render::CommandSection::new(width, "Settings", None);
+        if !self.query.is_empty() {
+            section.search(&self.query);
+        }
         let filtered = self.filtered();
-        filtered
-            .iter()
-            .take(self.max_visible)
-            .enumerate()
-            .map(|(index, item)| {
-                let prefix = if index == self.selected { "> " } else { "  " };
-                let line = format!("{prefix}{}  {}", item.label, item.current_value);
-                if line.len() > width {
-                    line.chars().take(width).collect()
-                } else {
-                    line
+        if filtered.is_empty() {
+            section.detail("No matching settings.");
+        }
+        for index in
+            crate::render::selection_window(self.selected, filtered.len(), self.max_visible)
+        {
+            let item = &filtered[index];
+            let focused = index == self.selected;
+            section.item(focused, &item.label, &item.current_value);
+            if focused {
+                if let Some(description) = &item.description {
+                    section.detail(description);
                 }
-            })
-            .collect()
+                if !item.values.is_empty() {
+                    section.detail(&format!("Choices: {}", item.values.join(" · ")));
+                }
+            }
+        }
+        section.position(self.selected, filtered.len(), self.max_visible);
+        section.hint("↑↓ move · enter/space change · type to filter · esc close");
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
-        if data == " " || data == "\n" {
+        let bindings = crate::keybindings::Keybindings::defaults();
+        if bindings.matches(data, "tui.select.up") {
+            self.move_by(-1);
+        } else if bindings.matches(data, "tui.select.down") {
+            self.move_by(1);
+        } else if data == " " || data == "\n" || data == "\r" {
             self.cycle();
-        } else {
+        } else if data == "\x7f" || data == "\x08" {
+            self.query.pop();
+            self.selected = 0;
+        } else if data.chars().all(|ch| !ch.is_control()) {
             self.query.push_str(data);
+            self.selected = 0;
         }
     }
 
@@ -479,7 +499,7 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 label: "Theme".into(),
                 description: Some("Color theme for the interface".into()),
                 current_value: config.theme.clone(),
-                values: vec!["dark".into(), "light".into(), "pi".into()],
+                values: vec!["dark".into(), "light".into(), "vox".into(), "pi".into()],
             },
             SettingItem {
                 id: "warnings".into(),

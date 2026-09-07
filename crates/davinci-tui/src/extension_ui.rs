@@ -103,17 +103,17 @@ impl ExtensionSelector {
 
 impl Component for ExtensionSelector {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = vec![truncate(&self.title, width)];
+        let mut section = crate::render::CommandSection::new(width, &self.title, None);
         if self.options.is_empty() {
-            lines.push("  No options".into());
-            return lines;
+            section.detail("No options available.");
+        } else {
+            for index in crate::render::selection_window(self.selected, self.options.len(), 8) {
+                section.item(index == self.selected, &self.options[index], "");
+            }
+            section.position(self.selected, self.options.len(), 8);
         }
-        for (index, option) in self.options.iter().enumerate() {
-            let prefix = if index == self.selected { "> " } else { "  " };
-            lines.push(truncate(&format!("{prefix}{option}"), width));
-        }
-        lines.push("  enter select  escape cancel".into());
-        lines
+        section.hint("↑↓ move · enter select · esc cancel");
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -156,14 +156,14 @@ impl ExtensionInput {
 
 impl Component for ExtensionInput {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = vec![truncate(&self.title, width)];
+        let mut section = crate::render::CommandSection::new(width, &self.title, None);
         if self.input.get_value().is_empty() && !self.placeholder.is_empty() {
-            lines.push(truncate(&format!("  {}", self.placeholder), width));
+            section.detail(&self.placeholder);
         } else {
-            lines.extend(self.input.render(width));
+            section.input(self.input.render(width.saturating_sub(3)));
         }
-        lines.push("  enter submit  escape cancel".into());
-        lines
+        section.hint("enter submit · esc cancel");
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -206,10 +206,10 @@ impl ExtensionEditor {
 
 impl Component for ExtensionEditor {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = vec![truncate(&self.title, width)];
-        lines.extend(self.editor.render(width));
-        lines.push("  ctrl+s save  escape cancel".into());
-        lines
+        let mut section = crate::render::CommandSection::new(width, &self.title, None);
+        section.input(self.editor.render(width.saturating_sub(3)));
+        section.hint("ctrl+s save · esc cancel");
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -265,19 +265,21 @@ impl ExtensionProgress {
 
 impl Component for ExtensionProgress {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = vec![
-            truncate(&self.title, width),
-            truncate(&self.model, width),
-            truncate(&self.message, width),
-        ];
+        let mut section = crate::render::CommandSection::new(width, &self.title, None);
+        if !self.model.is_empty() {
+            section.detail(&format!("Model: {}", self.model));
+        }
+        if !self.message.is_empty() {
+            section.detail(&self.message);
+        }
         if let Some(ratio) = self.ratio {
-            lines.push(truncate(&Self::progress_bar(ratio), width));
+            section.detail(&Self::progress_bar(ratio));
         }
         if let Some(detail) = &self.detail {
-            lines.push(truncate(detail, width));
+            section.detail(detail);
         }
-        lines.push("  escape stop".into());
-        lines
+        section.hint("esc/ctrl+c stop");
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -312,11 +314,10 @@ impl ExtensionConfirm {
 
 impl Component for ExtensionConfirm {
     fn render(&self, width: usize) -> Vec<String> {
-        vec![
-            truncate(&self.title, width),
-            truncate(&format!("  {}", self.message), width),
-            "  enter/y confirm  escape/n cancel".into(),
-        ]
+        let mut section = crate::render::CommandSection::new(width, &self.title, None);
+        section.detail(&self.message);
+        section.hint("enter/y confirm · esc/n cancel");
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -324,14 +325,6 @@ impl Component for ExtensionConfirm {
     }
 
     fn invalidate(&mut self) {}
-}
-
-fn truncate(text: &str, width: usize) -> String {
-    if crate::render::visible_width(text) <= width {
-        text.to_string()
-    } else {
-        text.chars().take(width).collect()
-    }
 }
 
 #[cfg(test)]
@@ -397,8 +390,53 @@ mod tests {
         assert!(rendered.contains("Starting…"));
         assert!(rendered.contains("50%"));
         assert!(rendered.contains("512 B / 1.00 KiB"));
-        assert!(rendered.contains("escape stop"));
+        assert!(rendered.contains("esc/ctrl+c stop"));
         assert_eq!(progress.handle_key("\x1b"), ExtensionDialogAction::Cancel);
         assert_eq!(progress.handle_key("\x03"), ExtensionDialogAction::Cancel);
+    }
+}
+
+#[cfg(test)]
+mod section_style_regressions {
+    use super::*;
+
+    #[test]
+    fn extension_dialogs_use_shared_sections_and_keep_empty_cancel_hints() {
+        let selector = ExtensionSelector::new("Choose 模型 🦀", Vec::new());
+        let empty = crate::render::strip_terminal_sequences(&selector.render(24).join("\n"));
+        assert!(empty.contains("No options"), "{empty}");
+        assert!(empty.to_lowercase().contains("esc"), "{empty}");
+
+        let selector = ExtensionSelector::new(
+            "Choose option",
+            vec!["one".into(), "模型 café 🦀 with a very long option".into()],
+        );
+        let rendered = crate::render::strip_terminal_sequences(&selector.render(28).join("\n"));
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        for width in [0, 1, 12, 24, 28, 40] {
+            for component in [
+                selector.render(width),
+                ExtensionInput::new("Input title", "placeholder text").render(width),
+                ExtensionEditor::new("Editor title", "hello").render(width),
+                ExtensionConfirm::new("Confirm title", "very long confirmation message 模型 🦀")
+                    .render(width),
+                ExtensionProgress::new(
+                    "Loading 模型 🦀",
+                    "provider/model",
+                    "long progress message",
+                )
+                .render(width),
+            ] {
+                for row in component {
+                    assert!(
+                        crate::render::visible_width_stripped(&row) <= width,
+                        "{width}: {row:?}"
+                    );
+                }
+            }
+        }
     }
 }

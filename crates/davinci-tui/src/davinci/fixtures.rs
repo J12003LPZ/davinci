@@ -484,6 +484,7 @@ pub fn catalog() -> Vec<CatalogRow> {
         ring,
         provider: name.split(" / ").next().unwrap_or("").into(),
         id: name.split(" / ").nth(1).unwrap_or("").into(),
+        ..Default::default()
     };
     vec![
         row(
@@ -1590,24 +1591,10 @@ pub fn failed_run() -> FailedRun {
         files_written: "0".into(),
         billed: "$0.04".into(),
         retry: "retrying in 9s".into(),
-        aftermath: vec![
-            (
-                State::Done,
-                "transcript written to the session file · nothing to recover on restart".into(),
-            ),
-            (
-                State::Done,
-                "the running cargo check was killed with its process group".into(),
-            ),
-            (
-                State::Attention,
-                "edit to openai.rs had not started — the file on disk is untouched".into(),
-            ),
-            (
-                State::Skipped,
-                "a second ctrl+c within a second clears the composer; ctrl+d quits".into(),
-            ),
-        ],
+        aftermath: vec![(
+            State::Attention,
+            "the active turn was interrupted; review partial results before retrying".into(),
+        )],
     }
 }
 

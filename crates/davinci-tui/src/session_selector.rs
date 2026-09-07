@@ -372,52 +372,63 @@ impl SessionSelector {
 
 impl Component for SessionSelector {
     fn render(&self, width: usize) -> Vec<String> {
-        let path_state = if self.show_path { "(on)" } else { "(off)" };
-        let mut lines = vec![
-            format!("  Resume Session ({})", self.scope.label()),
-            format!(
-                "  {} · path {path_state} · {} · named {} · ctrl+p path · ctrl+s sort · ctrl+r rename · ctrl+n named · ctrl+d delete · tab scope",
-                self.sort_mode.label(),
-                self.scope.label(),
-                self.name_filter.label()
-            ),
-        ];
-        if self.query.is_empty() {
-            lines.push("  Type to search:".into());
+        let mut section = crate::render::CommandSection::new(width, "Resume session", None);
+        section.detail(&format!(
+            "Scope: {} · sort: {} · names: {} · path: {}",
+            self.scope.label(),
+            self.sort_mode.label(),
+            self.name_filter.label(),
+            if self.show_path { "on" } else { "off" },
+        ));
+        if !self.query.is_empty() {
+            section.search(&self.query);
         } else {
-            lines.push(format!("  Type to search: {}", self.query));
+            section.detail("Type to search sessions.");
         }
+
         if self.filtered.is_empty() {
-            lines.push("  No sessions found".into());
-            return lines;
-        }
-        for (index, item) in self.filtered.iter().enumerate() {
-            let prefix = if index == self.selected { "> " } else { "  " };
-            let name = item
-                .name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&item.id);
-            let mut line = format!("{prefix}{name}");
-            if self.show_path {
-                line.push_str("  ");
-                line.push_str(&item.path);
+            section.detail("No sessions found.");
+        } else {
+            let limit = 10usize;
+            for index in crate::render::selection_window(self.selected, self.filtered.len(), limit)
+            {
+                let item = &self.filtered[index];
+                let name = item
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&item.id);
+                section.item(
+                    index == self.selected,
+                    name,
+                    if self.show_path { &item.path } else { "" },
+                );
+                if index == self.selected {
+                    section.detail(&format!("ID: {}", item.id));
+                    if !item.cwd.is_empty() {
+                        section.detail(&format!("Folder: {}", item.cwd));
+                    }
+                }
             }
-            if crate::render::visible_width(&line) > width {
-                line = line.chars().take(width).collect();
-            }
-            lines.push(line);
+            section.position(self.selected, self.filtered.len(), limit);
         }
+
         if let Some((_, buffer)) = &self.rename {
-            lines.push("  Rename (empty to clear):".into());
-            lines.push(format!("  {buffer}"));
-            lines.push("  enter save  escape cancel".into());
+            section.heading("Rename");
+            section.detail("Empty name clears the saved name.");
+            section.detail(buffer);
+            section.hint("enter save · esc cancel");
+        } else if self.confirming_delete {
+            section.heading("Delete session?");
+            if let Some(item) = self.filtered.get(self.selected) {
+                section.detail(item.name.as_deref().unwrap_or(&item.id));
+                section.detail(&item.path);
+            }
+            section.hint("enter confirm · esc cancel");
+        } else {
+            section.hint("↑↓ move · enter resume · type search · ctrl+p path · ctrl+s sort · ctrl+r rename · ctrl+n named · ctrl+d delete · tab scope · esc close");
         }
-        if self.confirming_delete {
-            lines.push("  Delete selected session?".into());
-            lines.push("  enter confirm  escape cancel".into());
-        }
-        lines
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -732,19 +743,21 @@ mod tests {
     fn path_sort_and_rename_match_ts() {
         let mut selector = SessionSelector::new(sample());
         let rendered = selector.render(80).join("\n");
-        assert!(rendered.contains("Resume Session (Current Folder)"));
+        assert!(rendered.contains("Resume session"));
+        assert!(rendered.contains("Scope: Current Folder"));
         assert!(rendered.contains("Threaded"));
-        assert!(rendered.contains("path (off)"));
+        assert!(rendered.contains("path: off"));
         assert!(rendered.contains("ctrl+p path"));
         assert!(rendered.contains("ctrl+s sort"));
-        assert!(rendered.contains("ctrl+r rename"));
+        assert!(rendered.contains("ctrl+r"));
+        assert!(rendered.contains("rename"));
         assert!(rendered.contains("ctrl+n named"));
         assert!(rendered.contains("ctrl+d delete"));
         assert!(rendered.contains("tab scope"));
         assert!(!rendered.contains("/tmp/aaa.jsonl"));
         selector.handle_key("\x10");
         assert!(selector.show_path);
-        assert!(selector.render(80).join("\n").contains("path (on)"));
+        assert!(selector.render(80).join("\n").contains("path: on"));
         assert!(selector.render(80).join("\n").contains("/tmp/aaa.jsonl"));
         selector.handle_key("\x13");
         assert_eq!(selector.sort_mode, SortMode::Recent);
@@ -754,10 +767,7 @@ mod tests {
         assert!(selector.render(80).join("\n").contains("Fuzzy"));
         selector.selected = 0;
         selector.handle_key("\x12");
-        assert!(selector
-            .render(80)
-            .join("\n")
-            .contains("Rename (empty to clear):"));
+        assert!(selector.render(80).join("\n").contains("Rename"));
         for _ in 0..5 {
             selector.handle_key("\x7f");
         }
@@ -788,10 +798,7 @@ mod tests {
         assert_eq!(selector.filtered.len(), 2);
         selector.handle_key("\t");
         assert_eq!(selector.scope, SessionScope::All);
-        assert!(selector
-            .render(80)
-            .join("\n")
-            .contains("Resume Session (All)"));
+        assert!(selector.render(80).join("\n").contains("Scope: All"));
         assert_eq!(selector.filtered.len(), 3);
         selector.handle_key("\x0e");
         assert_eq!(selector.name_filter, NameFilter::Named);
@@ -830,10 +837,7 @@ mod tests {
         selector.apply_filter();
         selector.selected = 0;
         selector.handle_key("\x04");
-        assert!(selector
-            .render(80)
-            .join("\n")
-            .contains("Delete selected session?"));
+        assert!(selector.render(80).join("\n").contains("Delete session?"));
         assert_eq!(
             selector.handle_key("\r"),
             SessionSelectorAction::Delete {
@@ -997,5 +1001,53 @@ mod tests {
         selector.handle_key("\x0e");
         assert_eq!(selector.filtered.len(), 1);
         assert_eq!(selector.filtered[0].id, "named");
+    }
+}
+
+#[cfg(test)]
+mod section_regressions {
+    use super::*;
+
+    fn item(i: usize) -> SessionItem {
+        SessionItem {
+            id: format!("session-{i}"),
+            name: Some(format!("Session {i} — 模型 🦀")),
+            path: format!("C:/very/long/项目/session/{i}/transcript.jsonl"),
+            cwd: "C:/work".into(),
+            modified_at: i as u64,
+            parent_id: None,
+            all_messages_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn selected_session_stays_visible_and_empty_states_keep_controls() {
+        let mut selector = SessionSelector::new((0..30).map(item).collect());
+        selector.set_cwd("C:/work");
+        selector.selected = selector
+            .filtered
+            .iter()
+            .position(|item| item.id == "session-24")
+            .expect("session-24 should remain visible");
+        let rendered = crate::render::strip_terminal_sequences(&selector.render(36).join("\n"));
+        assert!(rendered.contains("Session 24"), "{rendered}");
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        assert!(rendered.to_lowercase().contains("esc"), "{rendered}");
+        for width in [0, 1, 20, 36, 48] {
+            for row in selector.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
+        selector.query = "no-such-session".into();
+        selector.apply_filter();
+        let empty = crate::render::strip_terminal_sequences(&selector.render(36).join("\n"));
+        assert!(empty.contains("No sessions"), "{empty}");
+        assert!(empty.to_lowercase().contains("esc"), "{empty}");
     }
 }

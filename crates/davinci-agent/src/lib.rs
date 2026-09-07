@@ -73,8 +73,9 @@ pub use skills::{
 };
 pub use stats::{RunStats, SharedCounters};
 pub use subagent::{
-    scoped_tools, scoped_tools_with_policy, AgentSpawnMode, SubagentParent, SubagentRequest,
-    SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX, PLAN_MODE_DENIAL,
+    scoped_tools, scoped_tools_with_policy, scoped_tools_with_registry, AgentSpawnMode,
+    SubagentParent, SubagentRequest, SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX,
+    PLAN_MODE_DENIAL,
 };
 pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,
@@ -94,8 +95,9 @@ pub mod runtime;
 pub use runtime::{
     find_saved_workflow, hash_system_prompt, hash_tool_names, save_workflow_to_project,
     wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState, CacheIdentity,
-    CacheMissReason, CancellationToken, ContextBroker, ContextItem, ContextPacket, ContextRequest,
-    ContextSource, PhaseStatus, RegistryError, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent,
+    CacheMissReason, CancellationToken, CapabilitySource, ContextBroker, ContextItem,
+    ContextPacket, ContextRequest, ContextSource, PhaseStatus, RegistryError, RunId, RuntimeBus,
+    RuntimeCapability, RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent,
     RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, TaskError, TaskId,
     TaskRecord, TaskRegistry, TaskState, WorkflowExecutor, WorkflowId, WorkflowSpec,
     WorkflowStateStore, WorkflowStatus, WorktreeError, WorktreeLease, WorktreeManager,
@@ -251,6 +253,7 @@ pub struct Agent {
     /// Tool-call ids whose results are pruned from the provider view. Only
     /// grows; the session file keeps every body.
     pruned_tool_results: std::collections::HashSet<String>,
+    pruned_evidence: std::collections::HashMap<String, (PathBuf, String)>,
     base_system_prompt: String,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -318,6 +321,7 @@ impl Agent {
             evidence: None,
             tool_ledger: Arc::new(std::sync::Mutex::new(ToolCallLedger::default())),
             pruned_tool_results: std::collections::HashSet::new(),
+            pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -328,6 +332,9 @@ impl Agent {
     }
 
     pub fn set_runtime(&mut self, runtime: RuntimeHandle) {
+        self.tool_context
+            .mcp
+            .register_with(&runtime.capability_registry);
         runtime
             .cancellation_token
             .attach_job_book(self.tool_context.jobs.clone());
@@ -465,7 +472,7 @@ impl Agent {
         if self.ephemeral_context.is_empty() && self.pruned_tool_results.is_empty() {
             return convert_to_llm_for_provider(&self.messages, self.block_images);
         }
-        let mut messages = pruning::project(&self.messages, &self.pruned_tool_results);
+        let mut messages = self.project_with_evidence();
         if self.ephemeral_context.is_empty() {
             return convert_to_llm_for_provider(&messages, self.block_images);
         }
@@ -489,7 +496,14 @@ impl Agent {
     /// ephemeral context counts although it is not in `messages`. System and
     /// tool schemas count too. This is a byte heuristic, not a tokenizer or upper bound.
     pub fn estimated_context_tokens(&self) -> u64 {
-        pruning::estimate_projected_tokens(&self.messages, &self.pruned_tool_results)
+        self.messages
+            .iter()
+            .map(|message| {
+                self.pruned_text(message)
+                    .map(|text| (text.len() as u64).div_ceil(4))
+                    .unwrap_or_else(|| compaction::estimate_tokens(message))
+            })
+            .sum::<u64>()
             + estimate_context_tokens(&self.ephemeral_context)
             + (self.system_prompt.len() as u64).div_ceil(4)
             + self.provider_context_overhead_tokens.unwrap_or_else(|| {
@@ -511,6 +525,9 @@ impl Agent {
     /// grown past the start line. Idempotent between prune passes, so the
     /// provider's prompt cache keeps its prefix until the next pass.
     pub fn prune_context(&mut self) {
+        if self.evidence.is_none() || !self.tools.iter().any(|tool| tool == "read") {
+            return;
+        }
         let tokens = self.estimated_context_tokens();
         let plan = pruning::plan_prune(
             &self.messages,
@@ -522,6 +539,30 @@ impl Agent {
         if plan.is_empty() {
             return;
         }
+        let plan: Vec<String> = plan.into_iter().filter(|id| {
+            let Some(message) = self.messages.iter().find(|message| {
+                message.role == "toolResult" && message.tool_call_id.as_ref() == Some(id)
+            }) else { return false; };
+            // Images and other structured blocks must remain lossless in context.
+            if !message.content.iter().all(|block| matches!(block, davinci_ai::MessageContent::Text { .. })) {
+                return false;
+            }
+            if !self.pruned_evidence.contains_key(id) {
+                let text = davinci_ai::content_text(&message.content);
+                let Ok(path) = self.evidence.as_ref().unwrap().store("pruned", &text) else {
+                    return false;
+                };
+                let tool = message.tool_name.as_deref().unwrap_or("tool");
+                let hint = format!(
+                    "{} Read retained output at {} with offset/limit. Call {}; outcome {}; {} bytes, {} lines.",
+                    pruning::placeholder(tool, text.len()), path.display(), id,
+                    match message.is_error { Some(true) => "error", Some(false) => "completed", None => "unknown" },
+                    text.len(), text.lines().count());
+                self.pruned_evidence.insert(id.clone(), (path, hint));
+                SharedCounters::add(&self.counters.evidence_files, 1);
+            }
+            self.evidence_readable(&self.pruned_evidence[id].0)
+        }).collect();
         let ids: std::collections::HashSet<&String> = plan.iter().collect();
         let chars: usize = self
             .messages
@@ -538,6 +579,49 @@ impl Agent {
         self.stats.pruned_results += plan.len() as u64;
         self.stats.pruned_chars += chars as u64;
         self.pruned_tool_results.extend(plan);
+    }
+
+    fn evidence_readable(&self, path: &std::path::Path) -> bool {
+        self.tools.iter().any(|tool| tool == "read")
+            && path.is_file()
+            && matches!(
+                self.permissions
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .decide(
+                        "pruned-evidence",
+                        "read",
+                        &serde_json::json!({"path": path}),
+                        &self.cwd
+                    ),
+                PermissionVerdict::Allow
+            )
+    }
+
+    fn pruned_text(&self, message: &ChatMessage) -> Option<&str> {
+        let id = message.tool_call_id.as_ref()?;
+        let (path, hint) = self.pruned_evidence.get(id)?;
+        (message.role == "toolResult"
+            && self.pruned_tool_results.contains(id)
+            && self.evidence_readable(path))
+        .then_some(hint.as_str())
+    }
+
+    fn project_with_evidence(&self) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .map(|message| {
+                let Some(text) = self.pruned_text(message) else {
+                    return message.clone();
+                };
+                ChatMessage {
+                    content: vec![davinci_ai::MessageContent::Text {
+                        text: text.to_string(),
+                    }],
+                    ..message.clone()
+                }
+            })
+            .collect()
     }
 
     /// Ids of the tool results currently pruned from the provider view.
@@ -805,6 +889,9 @@ impl Agent {
     pub fn attach_mcp(&mut self, registry: crate::mcp::McpRegistry) {
         let names = registry.tool_names();
         let read_only = registry.read_only_names();
+        if let Some(runtime) = &self.runtime {
+            registry.register_with(&runtime.capability_registry);
+        }
         self.tool_context.mcp = registry;
         self.apply_extension_tools(&names);
         self.permissions
@@ -1362,8 +1449,11 @@ mod tests {
 
     #[test]
     fn context_overhead_triggers_pruning_before_the_provider_request() {
+        let dir = tempfile::tempdir().unwrap();
         let mut agent = Agent::new("x".repeat(24_000));
         agent.tools.clear();
+        agent.tools.push("read".into());
+        agent.evidence = Some(EvidenceStore::new(dir.path()));
         agent.context_window = 10_000;
         agent.prune_settings.keep_recent = 0;
         let mut result = ChatMessage::text("toolResult", "output".repeat(1_000));
@@ -1372,6 +1462,82 @@ mod tests {
         agent.prune_context();
         assert!(agent.pruned_tool_results().contains("old-read"));
         assert_eq!(agent.stats.pruned_results, 1);
+    }
+
+    #[test]
+    fn pruning_requires_readable_evidence_and_recovers_after_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("");
+        agent.context_window = 100;
+        agent.prune_settings.keep_recent = 0;
+        let original = ChatMessage::tool_result("effect", "bash", "done".repeat(2000), false);
+        agent.messages.push(original.clone());
+        agent.prune_context();
+        assert!(agent.pruned_tool_results().is_empty());
+        agent.evidence = Some(EvidenceStore::new(dir.path()));
+        agent.tools.retain(|tool| tool != "read");
+        agent.prune_context();
+        assert!(agent.pruned_tool_results().is_empty());
+        agent.tools.push("read".into());
+        agent.prune_context();
+        assert!(agent.pruned_tool_results().contains("effect"));
+        let path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content_text(&original.content)
+        );
+        assert!(content_text(&agent.messages_for_provider()[0].content)
+            .contains(&path.display().to_string()));
+        let reduced = agent.estimated_context_tokens();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(agent.messages_for_provider()[0].content, original.content);
+        assert!(agent.estimated_context_tokens() > reduced);
+    }
+
+    #[test]
+    fn evidence_write_failure_keeps_recoverable_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "occupied").unwrap();
+        let mut agent = Agent::new("");
+        agent.evidence = Some(EvidenceStore::new(file));
+        agent.context_window = 100;
+        agent.prune_settings.keep_recent = 0;
+        let original = ChatMessage::tool_result("effect", "bash", "done".repeat(2000), false);
+        agent.messages.push(original.clone());
+        agent.prune_context();
+        assert!(agent.pruned_tool_results().is_empty());
+        assert_eq!(agent.messages_for_provider()[0].content, original.content);
+        assert_eq!(agent.run_stats().evidence_files, 0);
+    }
+
+    #[test]
+    fn revoked_evidence_permission_restores_original_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("");
+        agent.evidence = Some(EvidenceStore::new(dir.path()));
+        agent.context_window = 100;
+        agent.prune_settings.keep_recent = 0;
+        let original = ChatMessage::tool_result("effect", "bash", "done".repeat(2000), true);
+        agent.messages.push(original.clone());
+        agent.prune_context();
+        assert!(agent.pruned_tool_results().contains("effect"));
+        agent.prune_context();
+        assert_eq!(agent.run_stats().evidence_files, 1);
+        let projected = agent.messages_for_provider();
+        assert!(content_text(&projected[0].content).contains("outcome error"));
+        agent
+            .permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(PermissionRule::bare("read"));
+        assert_eq!(agent.messages_for_provider()[0].content, original.content);
     }
 
     #[test]
@@ -1979,6 +2145,7 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), &body).unwrap();
         let mut agent = Agent::new(default_system_prompt());
         agent.cwd = dir.path().to_path_buf();
+        agent.evidence = Some(EvidenceStore::new(dir.path().join("evidence")));
         agent.auto_compaction = false;
         // ~1000 tokens per read; a 6k window starts pruning past 3k.
         agent.context_window = 6_000;

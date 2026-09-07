@@ -17,6 +17,7 @@ pub use tools::{
     workflow_tool_specs,
 };
 pub use validate::{
-    is_mutating_tool, validate_workflow, validate_workflow_with_permissions,
+    is_mutating_tool, is_mutating_tool_with_registry, validate_workflow,
+    validate_workflow_with_capabilities, validate_workflow_with_permissions,
     WorkflowValidationError,
 };

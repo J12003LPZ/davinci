@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::fuzzy::fuzzy_filter;
+use crate::fuzzy::{fuzzy_filter, fuzzy_match};
 
 type LiveAutocompleteFn = dyn Fn(&str) -> Vec<AutocompleteItem> + Send + Sync;
 
@@ -160,21 +160,15 @@ pub fn suggestions(query: SuggestionQuery<'_>) -> Option<AutocompleteSuggestions
                 return Some(found);
             }
         } else {
-            // TS Editor Tab uses force:false for slash names (`handleSlashCommandCompletion`).
-            let filtered = fuzzy_filter(
-                rest,
-                &query
-                    .commands
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect::<Vec<_>>(),
-            );
+            // Command names use a stricter relevance pipeline than generic fuzzy lists.
+            // Short slash queries intentionally reject weak interior/subsequence hits so
+            // `/me` stays about memory commands instead of filling with model/name/resume.
+            let filtered = rank_slash_commands(rest, query.commands);
             if filtered.is_empty() {
                 return None;
             }
             let items = filtered
                 .into_iter()
-                .filter_map(|name| query.commands.iter().find(|c| c.name == name))
                 .map(|command| {
                     let description = match &command.argument_hint {
                         Some(hint) if !command.description.is_empty() => {
@@ -217,6 +211,218 @@ pub fn suggestions(query: SuggestionQuery<'_>) -> Option<AutocompleteSuggestions
     None
 }
 
+const MAX_SLASH_SUGGESTIONS: usize = 20;
+
+#[derive(Debug, Clone, Copy)]
+struct SlashMatch {
+    class: u8,
+    distance: usize,
+    position: usize,
+    fuzzy_score: f64,
+}
+
+fn rank_slash_commands<'a>(
+    query: &str,
+    commands: &'a [SlashCommandSpec],
+) -> Vec<&'a SlashCommandSpec> {
+    if query.is_empty() {
+        return commands.iter().collect();
+    }
+
+    let query_lower = query.to_lowercase();
+    let mut ranked = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            let name = command.name.to_lowercase();
+            slash_name_match(&query_lower, &name).map(|matched| {
+                let description_hit = command.description.to_lowercase().contains(&query_lower);
+                (
+                    matched,
+                    description_hit,
+                    name.chars().count(),
+                    index,
+                    command,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|a, b| {
+        a.0.class
+            .cmp(&b.0.class)
+            .then_with(|| a.0.distance.cmp(&b.0.distance))
+            .then_with(|| a.0.position.cmp(&b.0.position))
+            .then_with(|| {
+                a.0.fuzzy_score
+                    .partial_cmp(&b.0.fuzzy_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+
+    ranked
+        .into_iter()
+        .take(MAX_SLASH_SUGGESTIONS)
+        .map(|(_, _, _, _, command)| command)
+        .collect()
+}
+
+fn slash_name_match(query: &str, name: &str) -> Option<SlashMatch> {
+    if name == query {
+        return Some(SlashMatch {
+            class: 0,
+            distance: 0,
+            position: 0,
+            fuzzy_score: 0.0,
+        });
+    }
+    if name.starts_with(query) {
+        return Some(SlashMatch {
+            class: 1,
+            distance: 0,
+            position: 0,
+            fuzzy_score: 0.0,
+        });
+    }
+
+    if let Some(position) = segment_prefix_position(name, query) {
+        return Some(SlashMatch {
+            class: 2,
+            distance: 0,
+            position,
+            fuzzy_score: 0.0,
+        });
+    }
+
+    let query_len = query.chars().count();
+    if query_len >= 3 {
+        if let Some(position) = name.find(query) {
+            return Some(SlashMatch {
+                class: 3,
+                distance: 0,
+                position,
+                fuzzy_score: 0.0,
+            });
+        }
+    }
+
+    if query_len >= 4 {
+        let typo_limit = if query_len >= 7 { 2 } else { 1 };
+        if let Some(distance) = best_typo_distance(query, name, typo_limit) {
+            return Some(SlashMatch {
+                class: 4,
+                distance,
+                position: 0,
+                fuzzy_score: 0.0,
+            });
+        }
+    }
+
+    if query_len >= 3 {
+        let fuzzy = fuzzy_match(query, name);
+        if fuzzy.matches {
+            if let Some(span) = subsequence_span(query, name) {
+                if span <= query_len + 1 {
+                    return Some(SlashMatch {
+                        class: 5,
+                        distance: 0,
+                        position: span.saturating_sub(query_len),
+                        fuzzy_score: fuzzy.score,
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn segment_prefix_position(name: &str, query: &str) -> Option<usize> {
+    let mut segment_start = 0;
+    for (index, ch) in name.char_indices() {
+        if matches!(ch, '-' | '_' | '.' | ':' | '/' | ' ') {
+            segment_start = index + ch.len_utf8();
+            continue;
+        }
+        if index == segment_start && name[index..].starts_with(query) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn best_typo_distance(query: &str, name: &str, limit: usize) -> Option<usize> {
+    let mut best = damerau_levenshtein(query, name);
+    for segment in name.split(['-', '_', '.', ':', '/', ' ']) {
+        if !segment.is_empty() {
+            best = best.min(damerau_levenshtein(query, segment));
+        }
+    }
+    (best <= limit).then_some(best)
+}
+
+fn damerau_levenshtein(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let mut matrix = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=right.len() {
+        matrix[0][j] = j;
+    }
+    for i in 1..=left.len() {
+        for j in 1..=right.len() {
+            let cost = usize::from(left[i - 1] != right[j - 1]);
+            let mut value = (matrix[i - 1][j] + 1)
+                .min(matrix[i][j - 1] + 1)
+                .min(matrix[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && left[i - 1] == right[j - 2] && left[i - 2] == right[j - 1] {
+                value = value.min(matrix[i - 2][j - 2] + 1);
+            }
+            matrix[i][j] = value;
+        }
+    }
+    matrix[left.len()][right.len()]
+}
+
+fn subsequence_span(query: &str, text: &str) -> Option<usize> {
+    let query = query.chars().collect::<Vec<_>>();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let mut query_index = 0usize;
+    let mut first = None;
+    for (index, ch) in text.chars().enumerate() {
+        if ch == query[query_index] {
+            first.get_or_insert(index);
+            query_index += 1;
+            if query_index == query.len() {
+                return first.map(|start| index - start + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Display order from the model picker reference. Unknown models retain their
+/// source order after these featured generations; no release dates are inferred.
+pub fn model_picker_rank(model: &str) -> usize {
+    let id = model.split_once('/').map_or(model, |(_, id)| id).trim();
+    match id {
+        "gpt-6-astra" => 0,
+        "gpt-5.6-luna" => 1,
+        "gpt-5.6-sol" => 2,
+        "gpt-5.6-terra" => 3,
+        "gpt-5.5" => 4,
+        "gpt-5.4-mini" => 5,
+        _ => 6,
+    }
+}
+
 fn argument_suggestions(
     command: &str,
     args: &str,
@@ -257,7 +463,21 @@ fn argument_suggestions(
         "login" => login_providers,
         _ => return None,
     };
-    let filtered = fuzzy_filter(args, pool);
+    let mut filtered = fuzzy_filter(args, pool);
+    if command == "model" {
+        filtered.sort_by(|left, right| {
+            let provider = |value: &str| {
+                value
+                    .split_once('/')
+                    .map_or("", |(provider, _)| provider)
+                    .trim()
+                    .to_string()
+            };
+            provider(left)
+                .cmp(&provider(right))
+                .then_with(|| model_picker_rank(left).cmp(&model_picker_rank(right)))
+        });
+    }
     if filtered.is_empty() {
         return None;
     }
@@ -266,7 +486,14 @@ fn argument_suggestions(
             .into_iter()
             .map(|value| AutocompleteItem {
                 label: value.clone(),
-                value,
+                value: if command == "model" {
+                    value
+                        .split_once('/')
+                        .map(|(provider, id)| format!("{}/{}", provider.trim(), id.trim()))
+                        .unwrap_or(value)
+                } else {
+                    value
+                },
                 description: None,
             })
             .collect(),
@@ -1128,5 +1355,299 @@ mod tests {
                     .any(|item| item.value == "@src/utils/helpers.ts"));
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod slash_relevance_tests {
+    use super::*;
+
+    fn query<'a>(text: &'a str, commands: &'a [SlashCommandSpec]) -> SuggestionQuery<'a> {
+        SuggestionQuery {
+            text,
+            commands,
+            models: &[],
+            thinking_levels: &[],
+            login_providers: &[],
+            extra_providers: &[],
+            cwd: Path::new("."),
+            force_path: false,
+        }
+    }
+
+    #[test]
+    fn model_argument_values_keep_display_spaces_out_of_provider_ids() {
+        let models = vec!["openai-codex / gpt-6-astra".into()];
+        let found = suggestions(SuggestionQuery {
+            models: &models,
+            ..query("/model ", &[])
+        })
+        .unwrap();
+        assert_eq!(found.items[0].label, "openai-codex / gpt-6-astra");
+        assert_eq!(found.items[0].value, "openai-codex/gpt-6-astra");
+    }
+
+    #[test]
+    fn model_arguments_put_reference_models_before_older_models() {
+        let models = [
+            "gpt-5.3-codex",
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+            "gpt-5.4-mini",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+        ]
+        .map(|id| format!("openai-codex / {id}"));
+        let found = suggestions(SuggestionQuery {
+            models: &models,
+            ..query("/model ", &[])
+        })
+        .unwrap();
+        assert_eq!(
+            found
+                .items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "openai-codex/gpt-6-astra",
+                "openai-codex/gpt-5.6-luna",
+                "openai-codex/gpt-5.6-sol",
+                "openai-codex/gpt-5.6-terra",
+                "openai-codex/gpt-5.5",
+                "openai-codex/gpt-5.4-mini",
+                "openai-codex/gpt-5.3-codex"
+            ]
+        );
+    }
+
+    fn slash_spec(name: &str, description: &str) -> SlashCommandSpec {
+        SlashCommandSpec {
+            name: name.into(),
+            description: description.into(),
+            argument_hint: None,
+            argument_items: Vec::new(),
+        }
+    }
+
+    fn values(found: &AutocompleteSuggestions) -> Vec<&str> {
+        found.items.iter().map(|item| item.value.as_str()).collect()
+    }
+
+    #[test]
+    fn slash_me_keeps_memory_commands_and_drops_weak_subsequence_noise() {
+        let commands = vec![
+            slash_spec("memory-status", "Show vector-memory health"),
+            slash_spec("memory-clear", "Clear local vector-memory records"),
+            slash_spec("model", "Select model"),
+            slash_spec("name", "Set session display name"),
+            slash_spec("scoped-models", "Enable models for cycling"),
+            slash_spec("resume", "Resume a different session"),
+            slash_spec("graph-resume", "Resume an unfinished graph run"),
+        ];
+        let found = suggestions(query("/me", &commands)).unwrap();
+        let values = values(&found);
+        assert_eq!(values.len(), 2);
+        assert!(values.contains(&"memory-status"));
+        assert!(values.contains(&"memory-clear"));
+    }
+
+    #[test]
+    fn slash_prefix_and_segment_prefix_rank_by_name_strength() {
+        let commands = vec![
+            slash_spec("scoped-models", "Enable models"),
+            slash_spec("model", "Select model"),
+            slash_spec("graph-resume", "Resume graph"),
+            slash_spec("resume", "Resume session"),
+        ];
+        let mo = suggestions(query("/mo", &commands)).unwrap();
+        assert_eq!(mo.items[0].value, "model");
+
+        let res = suggestions(query("/res", &commands)).unwrap();
+        let values = values(&res);
+        let resume = values.iter().position(|value| *value == "resume").unwrap();
+        let graph_resume = values
+            .iter()
+            .position(|value| *value == "graph-resume")
+            .unwrap();
+        assert!(resume < graph_resume);
+    }
+
+    #[test]
+    fn slash_typo_tolerance_recovers_model() {
+        let commands = vec![
+            slash_spec("memory-status", "Memory status"),
+            slash_spec("model", "Select model"),
+            slash_spec("reload", "Reload configuration"),
+        ];
+        let found = suggestions(query("/mdoel", &commands)).unwrap();
+        assert_eq!(found.items[0].value, "model");
+    }
+
+    #[test]
+    fn slash_name_relevance_beats_description_only_hits() {
+        let commands = vec![
+            slash_spec("memory-status", "Show records"),
+            slash_spec("unrelated", "Memory status dashboard and record counts"),
+        ];
+        let found = suggestions(query("/memory", &commands)).unwrap();
+        assert_eq!(values(&found), vec!["memory-status"]);
+    }
+
+    #[test]
+    fn slash_weak_fuzzy_matches_below_threshold_are_excluded() {
+        let commands = vec![
+            slash_spec("memory-clear", "Clear memory"),
+            slash_spec("model", "Select model"),
+            slash_spec("resume", "Resume session"),
+            slash_spec("graph-resume", "Resume graph"),
+        ];
+        let found = suggestions(query("/me", &commands)).unwrap();
+        assert_eq!(values(&found), vec!["memory-clear"]);
+    }
+
+    #[test]
+    fn slash_argument_completion_keeps_existing_fuzzy_behavior() {
+        let commands = vec![SlashCommandSpec {
+            name: "commands".into(),
+            description: "List commands".into(),
+            argument_hint: None,
+            argument_items: vec![
+                AutocompleteItem {
+                    value: "extension".into(),
+                    label: "extension".into(),
+                    description: None,
+                },
+                AutocompleteItem {
+                    value: "prompt".into(),
+                    label: "prompt".into(),
+                    description: None,
+                },
+                AutocompleteItem {
+                    value: "skill".into(),
+                    label: "skill".into(),
+                    description: None,
+                },
+            ],
+        }];
+        let found = suggestions(query("/commands etn", &commands)).unwrap();
+        assert_eq!(found.items[0].value, "extension");
+    }
+
+    #[test]
+    fn slash_external_templates_skills_and_extensions_still_participate() {
+        let commands = vec![
+            slash_spec("deploy-extension", "Extension command"),
+            slash_spec("review-template", "Prompt template"),
+            slash_spec("skill:rust", "Skill command"),
+        ];
+        for (typed, expected) in [
+            ("/dep", "deploy-extension"),
+            ("/rev", "review-template"),
+            ("/skill:r", "skill:rust"),
+        ] {
+            let found = suggestions(query(typed, &commands)).unwrap();
+            assert_eq!(found.items[0].value, expected);
+        }
+    }
+
+    #[test]
+    fn slash_results_are_bounded_even_when_many_names_are_relevant() {
+        let commands = (0..64)
+            .map(|index| slash_spec(&format!("memory-{index:02}"), "Memory command"))
+            .collect::<Vec<_>>();
+        let found = suggestions(query("/mem", &commands)).unwrap();
+        assert!(found.items.len() <= 20, "{} results", found.items.len());
+    }
+}
+
+#[cfg(test)]
+mod slash_source_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn empty_slash_query_keeps_late_extension_template_and_skill_sources_reachable() {
+        let mut commands = (0..24)
+            .map(|index| SlashCommandSpec {
+                name: format!("builtin-{index:02}"),
+                description: "Builtin command".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        commands.extend([
+            SlashCommandSpec {
+                name: "extension:deploy".into(),
+                description: "Extension command".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            },
+            SlashCommandSpec {
+                name: "prompt:review".into(),
+                description: "Prompt template".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            },
+            SlashCommandSpec {
+                name: "skill:rust".into(),
+                description: "Skill command".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            },
+        ]);
+        let found = suggestions(SuggestionQuery {
+            text: "/",
+            commands: &commands,
+            models: &[],
+            thinking_levels: &[],
+            login_providers: &[],
+            extra_providers: &[],
+            cwd: Path::new("."),
+            force_path: false,
+        })
+        .unwrap();
+        let values = found
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(values.contains(&"extension:deploy"));
+        assert!(values.contains(&"prompt:review"));
+        assert!(values.contains(&"skill:rust"));
+    }
+}
+
+#[cfg(test)]
+mod slash_narrow_render_tests {
+    use super::*;
+    use crate::davinci::model::Model;
+    use crate::davinci::theme::{ColorDepth, Theme};
+    use crate::davinci::views::chrome;
+
+    #[test]
+    fn relevant_slash_list_stays_bounded_and_renders_at_narrow_widths() {
+        let commands = (0..64)
+            .map(|index| SlashCommandSpec {
+                name: format!("memory-{index:02}"),
+                description: "A deliberately long memory command description".into(),
+                argument_hint: None,
+                argument_items: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        for width in [0u16, 1, 8, 20, 32] {
+            let mut model = Model::new(
+                Theme::da_vinci(ColorDepth::TrueColor, false),
+                width,
+                24,
+                false,
+            );
+            model.slash_commands = commands.clone();
+            model.type_char("/mem");
+            assert!(model.suggestions.as_ref().unwrap().items.len() <= MAX_SLASH_SUGGESTIONS);
+            let rows = chrome::suggestions(&model);
+            assert!(rows.len() <= MAX_SLASH_SUGGESTIONS + 4);
+        }
     }
 }

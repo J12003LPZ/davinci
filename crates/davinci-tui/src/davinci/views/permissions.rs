@@ -1,117 +1,114 @@
-//! `/permissions`. The mode in force and every rule, by source.
-//!
-//! Enter on a mode switches it for the session. Enter on a rule removes it.
-//! No TypeScript counterpart.
+//! `/permissions`: the active mode and rules grouped by kind.
+//! Enter still applies a mode or removes a rule through the existing policy code.
 
 use ratatui::text::Line;
 
 use super::sheet::{facts, hint, Composer, SheetChrome};
 use crate::davinci::model::Model;
-use crate::davinci::theme::{glyph, State, Theme};
-use crate::davinci::ui::{span, span_strong};
+use crate::davinci::ui::{section_detail, section_row, span};
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let mut out: Vec<Line<'static>> = Vec::new();
+    let width = model.width;
     if model.permission_rows.is_empty() {
-        out.push(Line::from(vec![span(
-            "no permission policy loaded",
-            th.muted,
-        )]));
-        return out;
+        return section_detail(width, th, "No permission policy loaded.");
     }
     let selected = model.permission_index % model.permission_rows.len();
+    let mut rows = Vec::new();
+    let mut previous_kind = "";
     for (index, row) in model.permission_rows.iter().enumerate() {
-        out.push(permission_row(row, index == selected, th));
+        if row.kind != previous_kind {
+            rows.extend(section_detail(
+                width,
+                th,
+                if row.kind == "mode" { "Modes" } else { "Rules" },
+            ));
+            previous_kind = &row.kind;
+        }
+        let value = if row.current {
+            "current"
+        } else if row.kind == "rule" {
+            &row.detail
+        } else {
+            ""
+        };
+        rows.push(section_row(width, th, index == selected, &row.label, value));
+        if index == selected {
+            if row.current {
+                rows.extend(section_detail(width, th, "Current mode for this session"));
+            }
+            rows.extend(section_detail(width, th, &row.detail));
+            if row.kind == "rule" {
+                rows.extend(section_detail(width, th, &format!("Rule: {}", row.key)));
+                rows.extend(section_detail(
+                    width,
+                    th,
+                    &format!("Enter removes this rule from {} permissions.", row.source),
+                ));
+            }
+        }
     }
-    out
+    rows.extend(section_detail(
+        width,
+        th,
+        "Deny rules take precedence over allow rules.",
+    ));
+    rows
 }
 
-fn permission_row(
-    row: &crate::davinci::model::PermissionRow,
-    selected: bool,
-    th: &Theme,
-) -> Line<'static> {
-    let mark = if row.current {
-        State::Done.glyph()
-    } else if selected {
-        State::Active.glyph()
-    } else {
-        State::Queued.glyph()
-    };
-    let color = if row.current {
-        th.success
-    } else if selected {
-        th.primary
-    } else {
-        th.text
-    };
-    Line::from(vec![
-        span(format!("{} ", glyph::BRANCH), th.border),
-        span_strong(format!("{mark} "), color, th),
-        span(format!("{:<22}", row.label), color),
-        span(row.detail.clone(), th.muted),
-    ])
-}
-
-/// The sheet's frame (design.md §11): the mode in force and the rule count
-/// in the header, the mode in the status bar, the one key on the hint row.
 pub fn chrome(model: &Model) -> SheetChrome {
     let th = &model.theme;
     let mode = model
         .permission_rows
         .iter()
-        .find(|row| row.kind == "mode" && row.current)
-        .map(|row| row.label.clone());
+        .find(|r| r.kind == "mode" && r.current)
+        .map(|r| r.label.clone());
     let rules = model
         .permission_rows
         .iter()
-        .filter(|row| row.kind == "rule")
+        .filter(|r| r.kind == "rule")
         .count();
     SheetChrome {
         header_right: facts(
             th,
             vec![
-                mode.clone()
-                    .map(|mode| vec![span("mode ", th.muted), span(mode, th.text)])
+                mode.as_ref()
+                    .map(|mode| vec![span(format!("mode {mode}"), th.muted)])
                     .unwrap_or_default(),
-                if model.permission_rows.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![span(
-                        format!("{rules} rule{}", if rules == 1 { "" } else { "s" }),
-                        th.muted,
-                    )]
-                },
+                vec![span(
+                    format!("{rules} rule{}", if rules == 1 { "" } else { "s" }),
+                    th.muted,
+                )],
             ],
         ),
         status_third: mode.map(|mode| vec![span(mode, th.muted)]),
-        status_right: None,
-        hints: vec![hint(th, "enter sets a mode or drops a rule")],
+        hints: vec![hint(th, "↑↓ move"), hint(th, "enter apply")],
         escape: Some("esc close"),
-        composer: Composer::Prompt("/permissions"),
-        echo: Some("/permissions".into()),
+        composer: Composer::Hidden,
+        ..SheetChrome::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::model::{Model, PermissionRow};
-    use crate::davinci::theme::{ColorDepth, Theme};
+    use crate::davinci::{
+        model::PermissionRow,
+        theme::{ColorDepth, Theme},
+        ui,
+    };
 
-    #[test]
-    fn the_sheet_marks_the_mode_in_force() {
-        let mut model = Model::new(
+    fn model(width: u16) -> Model {
+        let mut m = Model::new(
             Theme::da_vinci(ColorDepth::TrueColor, false),
-            100,
+            width,
             24,
             false,
         );
-        model.permission_rows = vec![
+        m.permission_rows = vec![
             PermissionRow {
                 label: "ask".into(),
-                detail: "read tools run; edits ask".into(),
+                detail: "Read tools run; edits ask".into(),
                 current: true,
                 kind: "mode".into(),
                 key: "ask".into(),
@@ -119,40 +116,57 @@ mod tests {
             },
             PermissionRow {
                 label: "bash(git *)".into(),
-                detail: "session".into(),
+                detail: "allow · user".into(),
                 current: false,
                 kind: "rule".into(),
                 key: "bash(git *)".into(),
-                source: "session".into(),
+                source: "user".into(),
             },
         ];
-        let blob: String = lines(&model)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!blob.contains("/permissions"), "{blob}");
-        assert!(!blob.contains("esc closes"), "{blob}");
-        assert!(blob.contains("ask"), "{blob}");
-        assert!(blob.contains("bash(git *)"), "{blob}");
-        let c = chrome(&model);
-        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(header, "mode ask │ 1 rule");
-        let third: String = c
-            .status_third
-            .as_deref()
-            .unwrap()
+        m
+    }
+    fn text(m: &Model) -> String {
+        lines(m)
             .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(third, "ask");
-        assert_eq!(c.escape, Some("esc close"));
-        assert_eq!(c.composer, Composer::Prompt("/permissions"));
-        assert_eq!(c.echo.as_deref(), Some("/permissions"));
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn mode_and_focus_are_distinct_and_rule_removal_names_its_source() {
+        let mut m = model(80);
+        m.permission_index = 1;
+        let rows = lines(&m);
+        assert!(rows[ui::focused_row(&rows).unwrap()]
+            .to_string()
+            .contains("bash(git *)"));
+        assert!(rows
+            .iter()
+            .any(|r| r.to_string().contains("ask") && r.to_string().contains("current")));
+        for expected in [
+            "Modes",
+            "Rules",
+            "allow · user",
+            "Enter removes this rule from user permissions",
+            "Deny rules take precedence",
+        ] {
+            assert!(text(&m).contains(expected), "{expected}");
+        }
+        assert_eq!(chrome(&m).composer, Composer::Hidden);
+    }
+
+    #[test]
+    fn empty_and_narrow_policies_do_not_overflow() {
+        let mut m = model(80);
+        m.permission_rows.clear();
+        assert!(text(&m).contains("No permission policy"));
+        for width in [0, 1, 20, 32, 40, 80, 120] {
+            let mut m = model(width);
+            m.permission_rows[1].label = "bash(检查 café 🦀 *)".into();
+            for row in lines(&m) {
+                assert!(ui::run_width(&row.spans) <= width);
+            }
+        }
     }
 }

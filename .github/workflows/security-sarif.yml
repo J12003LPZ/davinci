@@ -1,0 +1,22 @@
+name: Security SARIF interoperability
+on:
+  push:
+  pull_request:
+jobs:
+  schema:
+    runs-on: ubuntu-latest
+    env:
+      PI_OFFLINE: "1"
+      DAVINCI_OFFLINE: "1"
+      DAVINCI_SARIF_PYTHON: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Provision test validator
+        run: python -m pip install -r scripts/security-sarif-requirements.txt
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Validate native exports against official schema offline
+        run: cargo test -p davinci-coding-agent --lib security_sarif_official_schema --locked -- --ignored

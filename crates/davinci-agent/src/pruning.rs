@@ -7,9 +7,8 @@
 //! whole conversation with another model call; pruning is cheaper and
 //! lossless for the session: the JSONL keeps every byte, and only the
 //! messages handed to the provider carry a placeholder in place of the
-//! body. Once a result is pruned it stays pruned, so the prompt prefix is
-//! rewritten once per prune pass rather than on every turn, and the
-//! provider's prompt cache survives the turns in between.
+//! body. The agent retains readable evidence before replacing text and
+//! restores the original body if that evidence becomes unavailable.
 //!
 //! The rule: when the estimated context passes `start_fraction` of the
 //! window, prune the oldest large tool results, never the most recent
@@ -18,7 +17,7 @@
 
 use std::collections::HashSet;
 
-use davinci_ai::{ChatMessage, MessageContent};
+use davinci_ai::ChatMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PruneSettings {
@@ -48,7 +47,7 @@ impl Default for PruneSettings {
 /// The text the provider sees in place of a pruned body.
 pub fn placeholder(tool_name: &str, chars: usize) -> String {
     format!(
-        "[output of {tool_name} pruned to save context ({chars} chars). Re-run the tool if you need it again.]"
+        "[output of {tool_name} pruned to save context ({chars} chars). Do not repeat the operation to recover output; consult retained evidence or session history.]"
     )
 }
 
@@ -99,59 +98,16 @@ pub fn plan_prune(
     plan
 }
 
-/// The messages as the provider should see them: pruned tool results carry
-/// a placeholder instead of their body (and no images).
-pub fn project(messages: &[ChatMessage], pruned: &HashSet<String>) -> Vec<ChatMessage> {
-    if pruned.is_empty() {
-        return messages.to_vec();
-    }
-    messages
-        .iter()
-        .map(|message| {
-            if message.role != "toolResult" {
-                return message.clone();
-            }
-            let Some(id) = &message.tool_call_id else {
-                return message.clone();
-            };
-            if !pruned.contains(id) {
-                return message.clone();
-            }
-            let chars = result_chars(message);
-            let tool = message.tool_name.as_deref().unwrap_or("tool");
-            ChatMessage {
-                content: vec![MessageContent::Text {
-                    text: placeholder(tool, chars),
-                }],
-                ..message.clone()
-            }
-        })
-        .collect()
-}
-
-/// Token estimate for the projected view without building it.
-pub fn estimate_projected_tokens(messages: &[ChatMessage], pruned: &HashSet<String>) -> u64 {
-    messages
-        .iter()
-        .map(|message| {
-            let is_pruned = message.role == "toolResult"
-                && message
-                    .tool_call_id
-                    .as_ref()
-                    .is_some_and(|id| pruned.contains(id));
-            if is_pruned {
-                let tool = message.tool_name.as_deref().unwrap_or("tool");
-                (placeholder(tool, result_chars(message)).len() as u64).div_ceil(4)
-            } else {
-                crate::compaction::estimate_tokens(message)
-            }
-        })
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruned_mutation_does_not_request_reexecution() {
+        let body = placeholder("bash", 7_000);
+        assert!(!body.contains("Re-run"));
+        assert!(body.contains("Do not repeat"));
+    }
 
     fn tool_result(id: &str, chars: usize) -> ChatMessage {
         ChatMessage::tool_result(id, "grep", "x".repeat(chars), false)
@@ -162,7 +118,10 @@ mod tests {
         let messages: Vec<_> = (0..12)
             .map(|i| tool_result(&format!("c{i}"), 4_000))
             .collect();
-        let tokens = estimate_projected_tokens(&messages, &HashSet::new());
+        let tokens = messages
+            .iter()
+            .map(crate::compaction::estimate_tokens)
+            .sum();
         // 12 * 1000 = 12k tokens; window 100k; start at 50k.
         let plan = plan_prune(
             &messages,
@@ -188,14 +147,6 @@ mod tests {
         // Only the first four are prunable; pruning all four brings 12k
         // down to 8k, above the 7k target, so all four are taken.
         assert_eq!(plan, vec!["c0", "c1", "c2", "c3"]);
-        let pruned: HashSet<String> = plan.into_iter().collect();
-        let projected = project(&messages, &pruned);
-        assert!(projected[0].content.iter().any(|block| matches!(
-            block,
-            MessageContent::Text { text } if text.contains("pruned to save context")
-        )));
-        assert_eq!(projected[11], messages[11]);
-        assert!(estimate_projected_tokens(&messages, &pruned) < 9_000);
     }
 
     #[test]

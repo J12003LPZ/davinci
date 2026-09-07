@@ -179,12 +179,30 @@ impl ItemSelectList {
         description: Option<&str>,
         primary_column_width: usize,
     ) -> String {
-        let prefix = if is_selected { "→ " } else { "  " };
-        let prefix_width = visible_width(prefix);
+        if width == 0 {
+            return String::new();
+        }
+        let full_gutter = visible_width(crate::davinci::ui::SELECTION_BAR);
+        let prefix = if width < full_gutter {
+            if is_selected {
+                truncate_to_width(crate::davinci::ui::SELECTION_BAR, width, "", false)
+            } else {
+                " ".repeat(width)
+            }
+        } else if is_selected {
+            crate::davinci::ui::SELECTION_BAR.to_string()
+        } else {
+            " ".repeat(full_gutter)
+        };
+        let prefix_width = visible_width(&prefix);
         if let Some(description) = description {
             if width > 40 {
-                let effective =
-                    1.max(primary_column_width.min(width.saturating_sub(prefix_width + 4)));
+                // SelectList's public layout options were defined around the original
+                // two-cell cursor gutter. Keep those description columns stable while
+                // rendering the shared, wider Davinci focus marker.
+                let gutter_extra = prefix_width.saturating_sub(2);
+                let requested = primary_column_width.saturating_sub(gutter_extra).max(1);
+                let effective = 1.max(requested.min(width.saturating_sub(prefix_width + 4)));
                 let max_primary = 1.max(effective.saturating_sub(PRIMARY_COLUMN_GAP));
                 let truncated_value =
                     self.truncate_primary(item, is_selected, max_primary, effective);
@@ -379,5 +397,46 @@ mod tests {
         let rendered = list.render(80);
         assert_eq!(visible_index_of(&rendered[0], "first"), 22);
         assert_eq!(visible_index_of(&rendered[1], "second"), 22);
+    }
+}
+
+#[cfg(test)]
+mod section_style_regressions {
+    use super::*;
+
+    #[test]
+    fn generic_select_list_uses_shared_focus_marker_and_unicode_widths() {
+        let items = vec![
+            SelectItem {
+                value: "alpha".into(),
+                label: "Alpha".into(),
+                description: Some("first".into()),
+            },
+            SelectItem {
+                value: "unicode".into(),
+                label: "模型 café 🦀 with a very long label".into(),
+                description: Some("long description that must remain readable".into()),
+            },
+        ];
+        let mut list = ItemSelectList::new(
+            items,
+            5,
+            SelectListTheme::identity(),
+            SelectListLayoutOptions::default(),
+        );
+        list.set_selected_index(1);
+        let rendered = crate::render::strip_terminal_sequences(&list.render(28).join("\n"));
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        for width in [0, 1, 12, 28, 40] {
+            for row in list.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
     }
 }

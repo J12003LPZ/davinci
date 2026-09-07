@@ -632,6 +632,46 @@ pub fn load_settings(agent_dir: &Path) -> Settings {
     load_settings_file(&settings_path(agent_dir))
 }
 
+/// Security admission must preserve parse failures rather than use the general
+/// settings loader's forgiving fallback. Project data can only narrow limits.
+pub fn load_security_scan_config(
+    agent_dir: &Path,
+    cwd: &Path,
+    trusted: bool,
+) -> Result<crate::native_extensions::ScanConfig, String> {
+    fn read(path: &Path) -> Result<crate::native_extensions::ScanConfig, String> {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Default::default())
+            }
+            Err(_) => return Err("cannot read security scan settings".into()),
+        };
+        let value = parse_settings_value(&raw)
+            .ok_or("invalid settings JSON blocks security scan admission")?;
+        if !value.is_object() {
+            return Err("settings must be an object".into());
+        }
+        match value.get("securityScan") {
+            None => Ok(Default::default()),
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|_| "invalid securityScan settings".into()),
+        }
+    }
+    let global = read(&settings_path(agent_dir))?;
+    global.validate()?;
+    if !trusted {
+        return Ok(global);
+    }
+    let current = cwd.join(CONFIG_DIR_NAME).join("settings.json");
+    let project = if current.exists() {
+        current
+    } else {
+        cwd.join(LEGACY_CONFIG_DIR_NAME).join("settings.json")
+    };
+    global.narrow_with(&read(&project)?)
+}
+
 pub fn load_settings_file(path: &Path) -> Settings {
     let Ok(raw) = fs::read_to_string(path) else {
         return Settings::default();

@@ -1,6 +1,6 @@
 //! Terminal themes. The default dark theme is the da Vinci palette described
-//! in the davinci TUI design spec: copper carries state, verdigris carries
-//! location (git, paths), and every state also has a glyph so `NO_COLOR`
+//! in the davinci TUI design spec: yellow carries focus, sepia carries
+//! supporting information, and every state also has a glyph so `NO_COLOR`
 //! still reads. Custom theme JSON files without a `palette` keep the legacy
 //! 16-color rendering.
 
@@ -46,16 +46,16 @@ impl Palette {
     /// Design spec §2 truecolor values.
     pub fn da_vinci() -> Self {
         Self {
-            surface: "#101719".into(),
-            border: "#453A27".into(),
-            text: "#DDD5C4".into(),
-            muted: "#80796D".into(),
-            primary: "#D58A32".into(),
-            secondary: "#52A89C".into(),
-            success: "#74A879".into(),
-            warning: "#D5A047".into(),
-            error: "#C4593F".into(),
-            dim: "#5d564c".into(),
+            surface: "#5E1C16".into(),
+            border: "#9C6C4F".into(),
+            text: "#D8A687".into(),
+            muted: "#C59574".into(),
+            primary: "#F3D90D".into(),
+            secondary: "#D8A687".into(),
+            success: "#D8A687".into(),
+            warning: "#F3D90D".into(),
+            error: "#E6A080".into(),
+            dim: "#9C6C4F".into(),
         }
     }
 }
@@ -134,7 +134,7 @@ impl Theme {
                 // which is where the NO_COLOR check lives — the one role that
                 // could still emit colour with colour turned off.
                 "searchMatchText" if no_color() => return text.to_string(),
-                "searchMatchText" => return format!("\x1b[30m{text}\x1b[39m"),
+                "searchMatchText" => return self.paint(&self.background, text, false),
                 _ => return text.to_string(),
             };
             return self.paint(hex, text, false);
@@ -177,6 +177,16 @@ impl Theme {
                 "selectedBg" => format!("\x1b[7m{text}\x1b[27m"),
                 _ => text.to_string(),
             };
+        }
+        if let Some(palette) = &self.palette {
+            let hex = match role {
+                "customMessageBg" => Some(&palette.surface),
+                "searchMatchBg" => Some(&palette.primary),
+                _ => None,
+            };
+            if let Some((r, g, b)) = hex.and_then(|hex| truecolor(hex)) {
+                return format!("\x1b[48;2;{r};{g};{b}m{text}\x1b[49m");
+            }
         }
         match role {
             "customMessageBg" => format!("\x1b[45m{text}\x1b[49m"),
@@ -268,17 +278,43 @@ pub fn builtin_themes() -> Vec<Theme> {
     vec![
         Theme {
             name: "dark".into(),
-            background: "#0B1011".into(),
-            foreground: "#DDD5C4".into(),
-            accent: "#D58A32".into(),
+            background: "#1D1516".into(),
+            foreground: "#D8A687".into(),
+            accent: "#F3D90D".into(),
             palette: Some(Palette::da_vinci()),
         },
         Theme {
             name: "light".into(),
-            background: "#f8f8f8".into(),
-            foreground: "#1e1e1e".into(),
-            accent: "#2e6da4".into(),
-            palette: None,
+            background: "#EAD5B9".into(),
+            foreground: "#1D1516".into(),
+            accent: "#8D150F".into(),
+            palette: Some(Palette {
+                surface: "#E2BE9E".into(),
+                border: "#9C6C4F".into(),
+                text: "#1D1516".into(),
+                muted: "#543829".into(),
+                primary: "#8D150F".into(),
+                secondary: "#182033".into(),
+                success: "#182033".into(),
+                warning: "#5E1C16".into(),
+                error: "#8D150F".into(),
+                dim: "#543829".into(),
+            }),
+        },
+        Theme {
+            name: "vox".into(),
+            background: "#1D1516".into(),
+            foreground: "#E2BE9E".into(),
+            accent: "#F3D90D".into(),
+            palette: Some(Palette {
+                surface: "#8D150F".into(),
+                text: "#E2BE9E".into(),
+                muted: "#E2BE9E".into(),
+                secondary: "#E2BE9E".into(),
+                success: "#E2BE9E".into(),
+                error: "#E2BE9E".into(),
+                ..Palette::da_vinci()
+            }),
         },
         Theme {
             name: "pi".into(),
@@ -319,6 +355,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vox_is_a_separate_builtin_with_matching_native_palette() {
+        let themes = builtin_themes();
+        assert_eq!(themes[0].name, "dark");
+        let vox = themes.iter().find(|theme| theme.name == "vox").unwrap();
+        assert_eq!(vox.background, "#1D1516");
+        assert_eq!(vox.palette.as_ref().unwrap().surface, "#8D150F");
+        assert!(crate::first_time::THEME_OPTIONS
+            .iter()
+            .any(|(name, _)| *name == "vox"));
+        let mut setup = crate::first_time::FirstTimeSetup::new("light", "Davinci");
+        assert_eq!(
+            setup.handle_key("j"),
+            crate::first_time::FirstTimeAction::PreviewTheme("vox".into())
+        );
+        setup.handle_key("\r");
+        match setup.handle_key("\r") {
+            crate::first_time::FirstTimeAction::Submit(result) => assert_eq!(result.theme, "vox"),
+            other => panic!("expected saved Vox selection, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn load_themes_from_dir_overlays_json() {
         let dir = tempfile::tempdir().expect("temp");
         std::fs::write(
@@ -349,12 +407,14 @@ mod tests {
         let theme = builtin_themes().into_iter().next().unwrap();
         assert!(theme.palette.is_some());
         let copper = theme.fg("primary", "x");
-        assert!(copper.contains("38;2;213;138;50"), "{copper:?}");
+        assert!(copper.contains("38;2;243;217;13"), "{copper:?}");
         let verdigris = theme.fg("secondary", "x");
-        assert!(verdigris.contains("38;2;82;168;156"), "{verdigris:?}");
+        assert!(verdigris.contains("38;2;216;166;135"), "{verdigris:?}");
         // Legacy role names stay mapped.
-        assert!(theme.fg("accent", "x").contains("38;2;213;138;50"));
-        assert!(theme.fg("muted", "x").contains("38;2;128;121;109"));
+        assert!(theme.fg("accent", "x").contains("38;2;243;217;13"));
+        assert!(theme.fg("muted", "x").contains("38;2;197;149;116"));
+        assert!(theme.bg("customMessageBg", "x").contains("48;2;94;28;22"));
+        assert!(theme.bg("searchMatchBg", "x").contains("48;2;243;217;13"));
     }
 
     #[test]

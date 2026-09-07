@@ -358,58 +358,50 @@ impl ScopedModelsSelector {
 }
 
 impl Component for ScopedModelsSelector {
-    fn render(&self, _width: usize) -> Vec<String> {
-        let mut lines = vec![
-            "Model Configuration".into(),
-            "Session-only. ctrl+s to save to settings.".into(),
-        ];
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut section = crate::render::CommandSection::new(width, "Model configuration", None);
+        section.detail("Session-only. ctrl+s saves the enabled set to settings.");
         if !self.query.is_empty() {
-            lines.push(format!("/{query}", query = self.query));
+            section.search(&self.query);
         }
+
         let filtered = self.filtered_ids();
         if filtered.is_empty() {
-            lines.push("  No matching models".into());
+            section.detail("No matching models.");
         } else {
-            let start = self
-                .selected
-                .saturating_sub(self.max_visible / 2)
-                .min(filtered.len().saturating_sub(self.max_visible));
-            let end = (start + self.max_visible).min(filtered.len());
             let all_enabled = self.enabled_ids.is_none();
-            for (offset, id) in filtered[start..end].iter().enumerate() {
-                let index = start + offset;
+            for index in
+                crate::render::selection_window(self.selected, filtered.len(), self.max_visible)
+            {
+                let id = &filtered[index];
                 let model = self.models.iter().find(|model| model.full_id() == *id);
-                let prefix = if index == self.selected { "→ " } else { "  " };
-                let name = model.map(|m| m.id.as_str()).unwrap_or(id.as_str());
-                let badge = match model {
-                    Some(model) => format!(" [{}]", model.provider),
-                    None => " [unavailable]".into(),
+                let name = model.map(|model| model.id.as_str()).unwrap_or(id.as_str());
+                let provider = model
+                    .map(|model| model.provider.as_str())
+                    .unwrap_or("unavailable");
+                let state = match model {
+                    Some(_) if all_enabled => format!("{provider} · enabled"),
+                    Some(_) if is_enabled(&self.enabled_ids, id) => format!("{provider} · enabled"),
+                    Some(_) => format!("{provider} · disabled"),
+                    None => "unavailable · enabled in settings".to_string(),
                 };
-                let status = match model {
-                    Some(_) if all_enabled => String::new(),
-                    Some(_) if is_enabled(&self.enabled_ids, id) => " ✓".into(),
-                    _ => " ✗".into(),
-                };
-                lines.push(format!("{prefix}{name}{badge}{status}"));
+                let focused = index == self.selected;
+                section.item(focused, name, &state);
+                if focused {
+                    match model {
+                        Some(model) => section.detail(&format!("Model name: {}", model.name)),
+                        None => section
+                            .detail("This saved model is not available in the current catalog."),
+                    }
+                }
             }
-            if start > 0 || end < filtered.len() {
-                lines.push(format!("  ({}/{})", self.selected + 1, filtered.len()));
-            }
-            if let Some(id) = filtered.get(self.selected) {
-                let detail = self
-                    .models
-                    .iter()
-                    .find(|model| model.full_id() == *id)
-                    .map(|model| format!("  Model Name: {}", model.name))
-                    .unwrap_or_else(|| "  Model unavailable".into());
-                lines.push(detail);
-            }
+            section.position(self.selected, filtered.len(), self.max_visible);
         }
         if let Some(status) = &self.refresh_status {
-            lines.push(format!("  {status}"));
+            section.detail(status);
         }
-        lines.push(self.footer());
-        lines
+        section.hint(self.footer().trim());
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -466,11 +458,42 @@ mod tests {
     }
 
     #[test]
+    fn selector_uses_shared_sections_and_unicode_widths() {
+        let mut list = models();
+        list.push(ScopedModel {
+            provider: "提供者".into(),
+            id: "very-long-model-🦀".into(),
+            name: "模型 café 🦀".into(),
+        });
+        let mut selector = ScopedModelsSelector::new(
+            list,
+            Some(vec!["faux/one".into(), "missing/provider-model".into()]),
+        );
+        selector.selected = selector.filtered_ids().len().saturating_sub(1);
+        let rendered = crate::render::strip_terminal_sequences(&selector.render(32).join("\n"));
+        assert!(rendered.contains("Model configuration"), "{rendered}");
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("unavailable"), "{rendered}");
+        assert!(rendered.contains("ctrl+s save"), "{rendered}");
+        for width in [0, 1, 20, 32, 40] {
+            for row in selector.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn selector_reorders_and_renders_ts_copy() {
         let ids: Vec<String> = models().iter().map(ScopedModel::full_id).collect();
         let mut selector = ScopedModelsSelector::new(models(), Some(ids.clone()));
         let rendered = selector.render(80).join("\n");
-        assert!(rendered.contains("Model Configuration"));
+        assert!(rendered.contains("Model configuration"));
         assert!(rendered.contains("Session-only."));
         assert!(rendered.contains("all enabled") || rendered.contains("3/3 enabled"));
         assert_eq!(

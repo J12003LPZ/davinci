@@ -348,6 +348,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts,
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);

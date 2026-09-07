@@ -328,25 +328,25 @@ pub fn parse_auto_theme(setting: &str) -> Option<(String, String)> {
 }
 
 impl Component for SettingsSubmenu {
-    fn render(&self, _width: usize) -> Vec<String> {
+    fn render(&self, width: usize) -> Vec<String> {
         match self.kind {
-            SettingsSubmenuKind::Theme => self.render_theme(),
-            SettingsSubmenuKind::Warnings => vec![
-                "Warnings".into(),
-                String::new(),
-                format!(
-                    "{} Anthropic extra usage  {}",
-                    if self.selected == 0 { ">" } else { " " },
+            SettingsSubmenuKind::Theme => self.render_theme(width),
+            SettingsSubmenuKind::Warnings => {
+                let mut section = crate::render::CommandSection::new(width, "Warnings", None);
+                section.item(
+                    true,
+                    "Anthropic extra usage",
                     if self.anthropic_extra_usage {
-                        "true"
+                        "on"
                     } else {
-                        "false"
-                    }
-                ),
-                String::new(),
-                "  Enter to toggle · Esc to go back".into(),
-            ],
-            SettingsSubmenuKind::ModelThinking => self.render_thinking(),
+                        "off"
+                    },
+                );
+                section.detail("Controls the extra-usage warning shown for Anthropic accounts.");
+                section.hint("enter toggle · esc back");
+                section.finish()
+            }
+            SettingsSubmenuKind::ModelThinking => self.render_thinking(width),
         }
     }
 
@@ -358,27 +358,24 @@ impl Component for SettingsSubmenu {
 }
 
 impl SettingsSubmenu {
-    fn render_theme(&self) -> Vec<String> {
+    fn render_theme(&self, width: usize) -> Vec<String> {
         match self.theme_mode {
             ThemeMode::Single => {
-                let mut lines = vec![
-                    "Theme".into(),
-                    String::new(),
-                    "Select a theme, or choose Automatic to follow terminal appearance.".into(),
-                    String::new(),
-                ];
-                for (index, value) in self.single_items().into_iter().enumerate() {
+                let items = self.single_items();
+                let mut section = crate::render::CommandSection::new(width, "Theme", None);
+                section.detail("Select one theme, or Automatic to follow terminal appearance.");
+                for index in crate::render::selection_window(self.selected, items.len(), 8) {
+                    let value = &items[index];
                     let label = if value == AUTOMATIC_THEME_VALUE {
-                        "Automatic".to_string()
+                        "Automatic"
                     } else {
                         value
                     };
-                    let prefix = if index == self.selected { "> " } else { "  " };
-                    lines.push(format!("{prefix}{label}"));
+                    section.item(index == self.selected, label, "");
                 }
-                lines.push(String::new());
-                lines.push("  Enter to select · Esc to go back".into());
-                lines
+                section.position(self.selected, items.len(), 8);
+                section.hint("↑↓ move · enter select · esc back");
+                section.finish()
             }
             ThemeMode::Automatic => {
                 let rows = [
@@ -387,71 +384,65 @@ impl SettingsSubmenu {
                     ("Apply", "save and go back"),
                     ("Change mode", "switch to single theme"),
                 ];
-                let mut lines = vec![
-                    "Automatic Theme".into(),
-                    String::new(),
-                    "Choose themes for terminal light and dark appearance.".into(),
-                    "Light/dark detection requires terminal support.".into(),
-                    String::new(),
-                ];
+                let mut section =
+                    crate::render::CommandSection::new(width, "Automatic theme", None);
+                section.detail("Choose themes for terminal light and dark appearance.");
+                section.detail("Light/dark detection requires terminal support.");
                 for (index, (label, value)) in rows.iter().enumerate() {
-                    let prefix = if index == self.selected { "> " } else { "  " };
-                    lines.push(format!("{prefix}{label}  {value}"));
+                    section.item(index == self.selected, label, value);
                 }
-                lines.push(String::new());
-                lines.push("  Enter to select · Esc to go back".into());
-                lines
+                section.hint("↑↓ move · enter select · esc back");
+                section.finish()
             }
         }
     }
 
-    fn render_thinking(&self) -> Vec<String> {
+    fn render_thinking(&self, width: usize) -> Vec<String> {
         match self.thinking_step {
             ThinkingStep::Model => {
-                let mut lines = vec![
-                    "Per-Model Thinking Level".into(),
-                    String::new(),
-                    "Select a model to configure".into(),
-                    String::new(),
-                ];
+                let mut section =
+                    crate::render::CommandSection::new(width, "Per-model thinking level", None);
+                section.detail("Select a model to configure.");
                 if self.models.is_empty() {
-                    lines.push("  No models available".into());
+                    section.detail("No models available.");
                 } else {
-                    for (index, model) in self.models.iter().enumerate() {
-                        let prefix = if index == self.selected { "> " } else { "  " };
-                        let level = model.level.as_deref().unwrap_or("");
-                        lines.push(format!("{prefix}{}  {level}", model.label));
+                    for index in
+                        crate::render::selection_window(self.selected, self.models.len(), 8)
+                    {
+                        let model = &self.models[index];
+                        section.item(
+                            index == self.selected,
+                            &model.label,
+                            model.level.as_deref().unwrap_or("default"),
+                        );
                     }
+                    section.position(self.selected, self.models.len(), 8);
                 }
-                lines.push(String::new());
-                lines.push("  Enter to select · Esc to go back".into());
-                lines
+                section.hint("↑↓ move · enter select · esc back");
+                section.finish()
             }
             ThinkingStep::Level => {
                 let title = self
                     .thinking_model
                     .as_deref()
                     .and_then(|key| self.models.iter().find(|item| item.key == key))
-                    .map(|item| format!("Thinking Level for {}", item.label))
-                    .unwrap_or_else(|| "Thinking Level".into());
-                let mut lines = vec![
-                    title,
-                    String::new(),
-                    "Select default thinking level for this model".into(),
-                    String::new(),
-                ];
-                for (index, level) in self.level_values().into_iter().enumerate() {
-                    let prefix = if index == self.selected { "> " } else { "  " };
+                    .map(|item| format!("Thinking level for {}", item.label))
+                    .unwrap_or_else(|| "Thinking level".into());
+                let levels = self.level_values();
+                let mut section = crate::render::CommandSection::new(width, &title, None);
+                section.detail("Select the default thinking level for this model.");
+                for index in crate::render::selection_window(self.selected, levels.len(), 8) {
+                    let level = &levels[index];
                     let label = if level == "__clear__" {
-                        "(clear override)"
+                        "Clear override"
                     } else {
-                        &level
+                        level
                     };
-                    lines.push(format!("{prefix}{label}"));
+                    section.item(index == self.selected, label, "");
                 }
-                lines.push(String::new());
-                lines.push("  Enter to select · Esc to go back".into());
-                lines
+                section.position(self.selected, levels.len(), 8);
+                section.hint("↑↓ move · enter select · esc back");
+                section.finish()
             }
         }
     }
@@ -466,14 +457,14 @@ mod tests {
         let mut menu =
             SettingsSubmenu::theme("dark", vec!["dark".into(), "light".into(), "pi".into()]);
         let rendered = menu.render(80).join("\n");
-        assert!(rendered.contains("Select a theme, or choose Automatic"));
+        assert!(rendered.contains("Select one theme, or Automatic"));
         assert!(rendered.contains("Automatic"));
         assert_eq!(
             menu.handle_key("\r"),
             SettingsSubmenuAction::Preview("dark/dark".into())
         );
         let automatic = menu.render(80).join("\n");
-        assert!(automatic.contains("Automatic Theme"));
+        assert!(automatic.contains("Automatic theme"));
         assert!(automatic.contains("Light theme"));
         assert!(automatic.contains("Dark theme"));
         assert!(automatic.contains("save and go back"));
@@ -515,12 +506,12 @@ mod tests {
         assert!(thinking
             .render(80)
             .join("\n")
-            .contains("Per-Model Thinking Level"));
+            .contains("Per-model thinking level"));
         assert_eq!(thinking.handle_key("\r"), SettingsSubmenuAction::None);
         assert!(thinking
             .render(80)
             .join("\n")
-            .contains("Thinking Level for gpt [openai]"));
+            .contains("Thinking level for gpt [openai]"));
         thinking.selected = thinking
             .level_values()
             .iter()
@@ -533,5 +524,44 @@ mod tests {
                 value: "openai/gpt=high".into(),
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod section_regressions {
+    use super::*;
+
+    #[test]
+    fn submenus_use_shared_sections_and_keep_nested_back_behavior() {
+        let mut menu = SettingsSubmenu::theme(
+            "dark",
+            vec![
+                "dark".into(),
+                "light".into(),
+                "模型-🦀-very-long-theme".into(),
+            ],
+        );
+        menu.selected = 2;
+        let rendered = crate::render::strip_terminal_sequences(&menu.render(28).join("\n"));
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        assert!(rendered.to_lowercase().contains("esc"), "{rendered}");
+        for width in [0, 1, 20, 28, 40] {
+            for row in menu.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
+        menu.selected = 0;
+        assert!(matches!(
+            menu.handle_key("\r"),
+            SettingsSubmenuAction::Preview(_)
+        ));
+        assert_eq!(menu.handle_key("\x1b"), SettingsSubmenuAction::None);
+        assert_eq!(menu.handle_key("\x1b"), SettingsSubmenuAction::Cancel);
     }
 }

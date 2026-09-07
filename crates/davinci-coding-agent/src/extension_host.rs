@@ -11,6 +11,9 @@ use crate::js_host::{
     JsRegisteredProvider, JsRegisteredTool,
 };
 use crate::native_extensions::{NativeExtensionHost, NATIVE_COMMANDS, NATIVE_TOOLS};
+use davinci_agent::{
+    tool_class, CapabilitySource, RuntimeCapability, RuntimeCapabilityRegistry, ToolClass,
+};
 use davinci_tui::Keybindings;
 
 /// Extension event bus matching `vendor/pi/packages/coding-agent/src/core/extensions`.
@@ -371,6 +374,71 @@ impl ExtensionHost {
         NativeExtensionHost::tool_specs()
     }
 
+    /// Describe extension tools using the runtime-wide capability contract.
+    /// Extension-defined tools are mutation-capable unless the host recognizes
+    /// their name as a built-in read class.
+    pub fn capabilities(&self) -> Vec<RuntimeCapability> {
+        let mut capabilities = std::collections::BTreeMap::new();
+
+        for spec in self.native_tool_specs() {
+            let class = tool_class(&spec.name);
+            let read_only = matches!(class, ToolClass::Read | ToolClass::Network);
+            capabilities.insert(
+                spec.name.clone(),
+                RuntimeCapability::new(
+                    spec.name,
+                    CapabilitySource::NativeExtension,
+                    class,
+                    read_only,
+                    &spec.parameters,
+                    Some(env!("CARGO_PKG_VERSION").to_string()),
+                ),
+            );
+        }
+
+        for manifest in &self.manifests {
+            for tool in &manifest.tools {
+                capabilities.insert(
+                    tool.name.clone(),
+                    RuntimeCapability::new(
+                        tool.name.clone(),
+                        CapabilitySource::JsExtension,
+                        ToolClass::Other,
+                        false,
+                        &serde_json::json!({"type": "object"}),
+                        None,
+                    ),
+                );
+            }
+        }
+
+        for extension in &self.js {
+            for tool in &extension.tool_defs {
+                let schema = tool
+                    .parameters
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                capabilities.insert(
+                    tool.name.clone(),
+                    RuntimeCapability::new(
+                        tool.name.clone(),
+                        CapabilitySource::JsExtension,
+                        ToolClass::Other,
+                        false,
+                        &schema,
+                        None,
+                    ),
+                );
+            }
+        }
+
+        capabilities.into_values().collect()
+    }
+
+    pub fn register_with(&self, registry: &RuntimeCapabilityRegistry) {
+        registry.register_all(self.capabilities());
+    }
+
     /// Graph workers inherit the session's model, thinking level, and trust
     /// decision unless the project pins a per-role model in `.pi/graph.json`.
     pub fn set_graph_session_context(
@@ -521,6 +589,21 @@ impl ExtensionHost {
     pub fn execute_native_command(&self, name: &str, args: &str) -> Result<Option<Value>, String> {
         if !NATIVE_COMMANDS.iter().any(|command| *command == name) {
             return Ok(None);
+        }
+        if matches!(
+            name,
+            "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
+        ) {
+            let security = {
+                let native = self.native.lock().map_err(|err| err.to_string())?;
+                (native.security.has_review()
+                    || matches!(name, "security-scan" | "sec-resume")
+                    || name == "sec-report" && !args.trim().is_empty())
+                .then(|| native.security.clone())
+            };
+            if let Some(mut security) = security {
+                return security.command(name, args);
+            }
         }
         self.native
             .lock()
@@ -1346,6 +1429,17 @@ fn resolve_extension_shortcuts(
 mod tests {
     use super::*;
     use crate::js_host::JsRegisteredProvider;
+
+    #[test]
+    fn native_tools_register_runtime_capabilities() {
+        let host = ExtensionHost::default();
+        let registry = RuntimeCapabilityRegistry::new();
+        host.register_with(&registry);
+        let memory = registry.get("memory_search").expect("native capability");
+        assert_eq!(memory.source, CapabilitySource::NativeExtension);
+        assert!(memory.read_only);
+        assert!(registry.is_mutating("graph_run"));
+    }
 
     #[test]
     fn context_pruned_hook_restores_read_visibility() {

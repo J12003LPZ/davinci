@@ -5,7 +5,11 @@ use crate::themes::Theme;
 
 pub const SETUP_LOGO_LINES: &[&str] = &["██████", "██  ██", "████  ██", "██    ██"];
 
-pub const THEME_OPTIONS: &[(&str, &str)] = &[("dark", "Dark"), ("light", "Light")];
+pub const THEME_OPTIONS: &[(&str, &str)] = &[
+    ("dark", "Dark"),
+    ("light", "Light"),
+    ("vox", "Vox — Editorial collage"),
+];
 pub const ANALYTICS_OPTIONS: &[(bool, &str)] =
     &[(true, "Share anonymous usage data"), (false, "Don't share")];
 
@@ -111,80 +115,52 @@ impl FirstTimeSetup {
             self.analytics_index = next;
         }
     }
-
-    fn option_lines(&self) -> Vec<String> {
-        let (labels, selected) = match self.step {
-            FirstTimeStep::Theme => (
-                THEME_OPTIONS
-                    .iter()
-                    .map(|(_, label)| (*label).to_string())
-                    .collect::<Vec<_>>(),
-                self.theme_index,
-            ),
-            FirstTimeStep::Analytics => (
-                ANALYTICS_OPTIONS
-                    .iter()
-                    .map(|(_, label)| (*label).to_string())
-                    .collect::<Vec<_>>(),
-                self.analytics_index,
-            ),
-        };
-        labels
-            .into_iter()
-            .enumerate()
-            .map(|(index, label)| {
-                if index == selected {
-                    format!("→ {label}")
-                } else {
-                    format!("  {label}")
-                }
-            })
-            .collect()
-    }
 }
 
 impl Component for FirstTimeSetup {
-    fn render(&self, _width: usize) -> Vec<String> {
-        let mut lines = Vec::new();
-        lines.extend(SETUP_LOGO_LINES.iter().map(|line| (*line).to_string()));
-        lines.push(String::new());
-        lines.push(self.welcome_line());
-        lines.push(String::new());
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut section = crate::render::CommandSection::new(
+            width,
+            &format!("Welcome to {}", self.app_name),
+            None,
+        );
+        section.detail(&self.welcome_line());
         match self.step {
             FirstTimeStep::Theme => {
-                lines.push("Pick a theme.".into());
-                lines.push(format!(
-                    "Detected system appearance: {}",
+                section.detail(&format!(
+                    "Choose a theme · detected: {}",
                     self.detected_theme
                 ));
+                for (index, (_, label)) in THEME_OPTIONS.iter().enumerate() {
+                    section.item(
+                        index == self.theme_index,
+                        label,
+                        if index == self.theme_index {
+                            "selected"
+                        } else {
+                            ""
+                        },
+                    );
+                }
+                section.hint("↑↓ move · enter continue · esc skip setup");
             }
             FirstTimeStep::Analytics => {
-                lines.push("Opt-in to anonymous usage data sharing?".into());
-                lines.push(
-                    "Opting in stores a tracking identifier in settings.json and enables anonymous"
-                        .into(),
-                );
-                lines.push(
-                    "usage analytics. This helps us to better debug, reproduce, and resolve issues"
-                        .into(),
-                );
-                lines.push(
-                    "and bugs within Pi. You can observe what is shared using /privacy and make"
-                        .into(),
-                );
-                lines.push("changes anytime in settings.json.".into());
+                section.detail("Anonymous usage data helps diagnose and reproduce product issues. You can change this later in settings.");
+                for (index, (_, label)) in ANALYTICS_OPTIONS.iter().enumerate() {
+                    section.item(
+                        index == self.analytics_index,
+                        label,
+                        if index == self.analytics_index {
+                            "selected"
+                        } else {
+                            ""
+                        },
+                    );
+                }
+                section.hint("↑↓ move · enter finish · esc skip setup");
             }
         }
-        lines.push(String::new());
-        lines.extend(self.option_lines());
-        lines.push(String::new());
-        let confirm = if self.step == FirstTimeStep::Theme {
-            "continue"
-        } else {
-            "finish"
-        };
-        lines.push(format!("↑↓ navigate  enter {confirm}  escape skip setup"));
-        lines
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -221,15 +197,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn setup_uses_terminal_native_sections_without_the_block_logo() {
+        let setup = FirstTimeSetup::new("dark", "pi");
+        let rendered = setup.render(32).join("\n");
+        assert!(!rendered.contains("██████"), "{rendered}");
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        for width in [0, 1, 20, 32, 40] {
+            for row in setup.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wizard_matches_ts_copy_and_steps() {
         let mut setup = FirstTimeSetup::new("dark", "pi");
         let rendered = setup.render(80).join("\n");
-        assert!(rendered.contains("██████"));
         assert!(rendered.contains("Welcome to pi, the minimal coding agent."));
-        assert!(rendered.contains("Pick a theme."));
-        assert!(rendered.contains("Detected system appearance: dark"));
-        assert!(rendered.contains("→ Dark"));
-        assert!(rendered.contains("  Light"));
+        assert!(rendered.contains("Choose a theme"));
+        assert!(rendered.contains("detected: dark"));
+        assert!(rendered.contains("Dark"));
+        assert!(rendered.contains("Light"));
         assert!(rendered.contains("continue"));
         assert!(rendered.contains("skip setup"));
         assert_eq!(
@@ -239,7 +233,7 @@ mod tests {
         assert_eq!(setup.handle_key("\r"), FirstTimeAction::None);
         assert_eq!(setup.step, FirstTimeStep::Analytics);
         let analytics = setup.render(80).join("\n");
-        assert!(analytics.contains("Opt-in to anonymous usage data sharing?"));
+        assert!(analytics.contains("Anonymous usage data"));
         assert!(analytics.contains("Share anonymous usage data"));
         assert!(analytics.contains("Don't share"));
         assert!(analytics.contains("finish"));

@@ -31,8 +31,6 @@ pub enum Flow {
     Quit,
     /// The user asked to interrupt the run in progress.
     Interrupt,
-    /// Cycle the active model's thinking/reasoning level.
-    CycleThinking,
     /// The composer was sent; the caller owns what happens next.
     Submit(String),
     /// A row of the open instrument was chosen; the caller owns the action.
@@ -42,7 +40,57 @@ pub enum Flow {
 /// Compose exactly `height` rows. Conversation chrome follows the content;
 /// command sheets and overlays retain their full-height frame.
 pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
-    let height = height.max(4) as usize;
+    compose_frame(model, height).lines
+}
+
+pub struct ComposedFrame {
+    pub lines: Vec<Line<'static>>,
+    pub mic_rect: Option<ratatui::layout::Rect>,
+}
+
+pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
+    let height = height as usize;
+    if model.voice.setup {
+        let rows = model
+            .voice
+            .setup_rows
+            .iter()
+            .map(|text| {
+                Line::from(ui::span(
+                    ui::clip_ellipsis(text, model.width),
+                    model.theme.text,
+                ))
+            })
+            .collect();
+        return ComposedFrame {
+            lines: pad_to(rows, height),
+            mic_rect: None,
+        };
+    }
+    if height == 0 {
+        return ComposedFrame {
+            lines: Vec::new(),
+            mic_rect: None,
+        };
+    }
+    if model.screen == Screen::Models && model.overlay.is_none() {
+        let picker = cogitator::screen(model, cogitator::screen_height(model).min(height));
+        let picker_height = picker.len();
+        let mut lines = transcript::tail_lines(
+            model,
+            &model.transcript,
+            model.width,
+            height.saturating_sub(picker_height),
+        );
+        while lines.len() < height.saturating_sub(picker_height) {
+            lines.insert(0, blank());
+        }
+        lines.extend(picker);
+        return ComposedFrame {
+            lines: pad_to(lines, height),
+            mic_rect: None,
+        };
+    }
     // While an instrument floats over the transcript, the chrome around it
     // drops its ramp too — only the panel keeps full ink (`1d`, `1f`).
     let dimmed = model.overlay.map(|_| Model {
@@ -97,11 +145,27 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     rows.extend(working);
     rows.extend(notice);
     rows.extend(offered);
+    let mic_rect = chrome::mic_geometry(model).and_then(|(x, width)| {
+        if height >= 4 && !composer_rows.is_empty() && rows.len() + 1 < height {
+            Some(ratatui::layout::Rect::new(x, rows.len() as u16, width, 1))
+        } else {
+            None
+        }
+    });
     rows.extend(composer_rows);
     rows.extend(below);
     rows.push(chrome::status(chrome_model));
     rows.truncate(height);
-    pad_to(rows, height)
+    if !conversation {
+        rows = rows
+            .into_iter()
+            .map(|row| Line::from(ui::truncate_run(row.spans, model.width)))
+            .collect();
+    }
+    ComposedFrame {
+        lines: pad_to(rows, height),
+        mic_rect,
+    }
 }
 
 /// Rows an extension supplied. They are drawn as plain text in the shell's own
@@ -118,6 +182,9 @@ fn extension_rows(model: &Model, lines: &[String]) -> Vec<Line<'static>> {
 }
 
 fn composer_rows(model: &Model) -> Vec<Line<'static>> {
+    if model.overlay.is_some() {
+        return Vec::new();
+    }
     // Conversation hints stay close to the prompt and abbreviate on narrow
     // windows. Overlays and the Codex split own their keyboard guidance.
     // A command sheet says what sits under it; its hint row is the only hint
@@ -162,14 +229,8 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
 
 /// A short conversation starts under its welcome banner. As it fills the
 /// window, older rows fall off the top and the composer reaches the bottom.
-fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
-    if height == 0 {
-        return Vec::new();
-    }
-    if let Some(overlay) = model.overlay {
-        return overlay_body(model, overlay, height);
-    }
-    let screen_rows = match model.screen {
+fn section_rows(model: &Model) -> Option<Vec<Line<'static>>> {
+    match model.screen {
         Screen::Plan => Some(disegno::lines(model)),
         Screen::Grafo => Some(grafo::lines(model)),
         Screen::Memoria => Some(memoria::recall(model)),
@@ -195,8 +256,17 @@ fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
         Screen::Workflows => Some(workflows::lines(model)),
         Screen::Keys => Some(keys::lines(model)),
         Screen::Agent => None,
-    };
-    if let Some(rows) = screen_rows {
+    }
+}
+
+fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    if let Some(overlay) = model.overlay {
+        return overlay_body(model, overlay, height);
+    }
+    if let Some(rows) = section_rows(model) {
         return panel(model, rows, height);
     }
     if model.codex_open() {
@@ -259,9 +329,57 @@ fn panel(model: &Model, rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'st
         out.push(blank());
     }
     let hint_rows = usize::from(hint.is_some());
-    let room = height.saturating_sub(out.len()).saturating_sub(hint_rows);
-    out.extend(ui::window(rows, room, model.sheet_anchor(), th));
-    let mut out = pad_to(out, height.saturating_sub(hint_rows));
+    let mut notice = model
+        .section_notice
+        .as_ref()
+        .map(|text| ui::section_detail(model.width, th, &format!("! {text}")))
+        .unwrap_or_default();
+    notice.truncate(3.min(height.saturating_sub(hint_rows + 1)));
+    for row in &mut notice {
+        for span in &mut row.spans {
+            span.style.fg = Some(th.warning);
+        }
+    }
+    let room = height
+        .saturating_sub(out.len())
+        .saturating_sub(hint_rows + notice.len());
+    let picking = matches!(
+        model.screen,
+        Screen::Models
+            | Screen::Settings
+            | Screen::Thinking
+            | Screen::Login
+            | Screen::Resume
+            | Screen::Tree
+            | Screen::Permissions
+            | Screen::Diff
+            | Screen::Securitas
+    );
+    let anchor = model.section_offset.unwrap_or_else(|| {
+        if picking {
+            ui::focused_row(&rows).unwrap_or(model.sheet_anchor())
+        } else {
+            model.sheet_anchor()
+        }
+    });
+    let pinned = match model.screen {
+        Screen::Settings => settings::PINNED_DETAIL_ROWS,
+        _ => 0,
+    };
+    if pinned > 0 && room > pinned && rows.len() > pinned {
+        let pinned = pinned.min(rows.len());
+        out.extend(rows[..pinned].iter().cloned());
+        out.extend(ui::window(
+            rows[pinned..].to_vec(),
+            room - pinned,
+            anchor.saturating_sub(pinned),
+            th,
+        ));
+    } else {
+        out.extend(ui::window(rows, room, anchor, th));
+    }
+    let mut out = pad_to(out, height.saturating_sub(hint_rows + notice.len()));
+    out.extend(notice);
     if let Some(hint) = hint {
         out.push(hint);
     }
@@ -272,27 +390,35 @@ fn panel(model: &Model, rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'st
 /// An instrument in hand: the transcript stays visible behind it with the ramp
 /// dropped, and the panel is drawn over it, anchored above the composer
 /// (design.md §2, screens `1d` and `1f`).
+fn overlay_rows(model: &Model, overlay: Overlay) -> Vec<Line<'static>> {
+    match overlay {
+        Overlay::Instrumenta => instrumenta::all_lines(model),
+        Overlay::Sessions => memoria::session_lines(model),
+        Overlay::Cogitator => cogitator::lines(model, &model.config_path),
+        Overlay::Ask => ask::lines(model),
+    }
+}
+
 fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'static>> {
     let dimmed = Model {
         theme: model.theme.dim(),
         overlay: None,
+        screen: Screen::Agent,
         ..model.clone()
     };
-    let mut behind = body(&dimmed, height);
-
-    let panel = match overlay {
-        Overlay::Instrumenta => instrumenta::lines(model, height),
-        Overlay::Sessions => memoria::sessions(model, height),
-        Overlay::Cogitator => cogitator::lines(model, &model.config_path),
-        Overlay::Ask => ask::lines(model),
-    };
-
-    let panel = if panel.len() > height {
-        tail(panel, height)
-    } else {
-        panel
-    };
-    behind.truncate(height - panel.len());
+    let panel = ui::window_section(
+        overlay_rows(model, overlay),
+        height,
+        if overlay == Overlay::Instrumenta {
+            2
+        } else {
+            1
+        },
+        model.overlay_offset,
+        &model.theme,
+    );
+    let mut behind = body(&dimmed, height.saturating_sub(panel.len()));
+    behind = pad_to(behind, height.saturating_sub(panel.len()));
     behind.extend(panel);
     behind
 }
@@ -300,6 +426,10 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the
 /// run and never the app (design.md §6).
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
+    if model.voice.blocks_send && voice_send_key(model, &key) {
+        model.voice.notice = "Finish or cancel voice before sending".into();
+        return Flow::Continue;
+    }
     let data = key_event_bytes(&key);
 
     if action_matches(model, data.as_deref(), "davinci.interrupt")
@@ -385,6 +515,17 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     Flow::Continue
 }
 
+/// Shared preflight runs before extensions and autocomplete in the live loops.
+pub fn voice_send_key(model: &Model, key: &KeyEvent) -> bool {
+    let Some(data) = key_event_bytes(key) else {
+        return false;
+    };
+    !model.keybindings.matches(&data, "davinci.composer.newLine")
+        && (model.keybindings.matches(&data, "tui.input.submit")
+            || model.keybindings.matches(&data, "app.message.followUp")
+            || key.code == KeyCode::Enter)
+}
+
 /// Steer the open completion list. `None` hands the key back to the composer,
 /// so ordinary typing keeps narrowing the list rather than being swallowed by
 /// it (design.md §6).
@@ -403,6 +544,22 @@ fn handle_suggestion_key(model: &mut Model, data: Option<&str>) -> Option<Flow> 
     // hint row promises, enter because a list in hand means the user is
     // choosing a command, not sending one.
     let tab = bindings.matches(data, "tui.input.tab");
+    let model_command = model.suggestions.as_ref().is_some_and(|found| {
+        found.prefix.starts_with('/')
+            && found
+                .items
+                .get(model.suggestion_index)
+                .is_some_and(|item| item.value == "model")
+    });
+    // Choosing the `/model` command itself opens the full picker for both
+    // advertised acceptance keys. Letting Tab merely expand to `/model `
+    // dropped into argument autocomplete, whose compact list cannot own the
+    // selected model's reasoning level.
+    if (tab || bindings.matches(data, "tui.input.submit")) && model_command {
+        model.composer.set_text("/model");
+        model.submit();
+        return Some(Flow::Submit("/model".into()));
+    }
     if tab || bindings.matches(data, "tui.input.submit") {
         if model.accept_suggestion() || tab {
             return Some(Flow::Continue);
@@ -422,9 +579,6 @@ fn action_matches(model: &Model, data: Option<&str>, action: &str) -> bool {
 }
 
 fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
-    if model.keybindings.matches(data, "app.thinking.cycle") {
-        return Some(Flow::CycleThinking);
-    }
     if model.keybindings.matches(data, "davinci.quit") {
         return Some(Flow::Quit);
     }
@@ -501,21 +655,44 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         return Flow::Continue;
     }
 
-    if matches!(
-        model.screen,
-        Screen::GraphRun | Screen::Governor | Screen::Vectors
-    ) && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) && key.modifiers.is_empty() {
+        let page = model.height.saturating_sub(6).max(1) as isize;
+        let delta = if key.code == KeyCode::PageUp {
+            -page
+        } else {
+            page
+        };
+        if is_picker(model.screen) {
+            let rows = section_rows(model).unwrap_or_default();
+            let anchor = model
+                .section_offset
+                .or_else(|| ui::focused_row(&rows))
+                .unwrap_or(0);
+            model.section_offset = Some(
+                anchor
+                    .saturating_add_signed(delta)
+                    .min(rows.len().saturating_sub(1)),
+            );
+        } else {
+            screen_move(model, delta);
+        }
+        return Flow::Continue;
+    }
+
+    if model.screen == Screen::Models
         && key.modifiers.is_empty()
+        && matches!(key.code, KeyCode::Left | KeyCode::Right)
     {
-        let page = model.height.saturating_sub(10).max(1) as isize;
-        screen_move(
-            model,
-            if key.code == KeyCode::PageUp {
-                -page
+        let len = model.catalog.len();
+        if let Some(row) = model.catalog.get_mut(model.catalog_index % len.max(1)) {
+            row.reasoning_index = if key.code == KeyCode::Left {
+                row.reasoning_index.saturating_sub(1)
             } else {
-                page
-            },
-        );
+                row.reasoning_index.saturating_add(1)
+            }
+            .min(row.reasoning_levels.len().saturating_sub(1));
+        }
+        model.section_offset = None;
         return Flow::Continue;
     }
 
@@ -529,6 +706,9 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         return Flow::Continue;
     }
     if action_matches(model, data, "tui.select.confirm") {
+        if model.section_offset.take().is_some() {
+            return Flow::Continue;
+        }
         if let Some(choice) = screen_accept(model) {
             return Flow::Choose(choice);
         }
@@ -543,7 +723,23 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
 
 /// Move the selection of whichever sheet is open. The session tree steps over
 /// its spacer rows, which carry only the trunk.
+fn is_picker(screen: Screen) -> bool {
+    matches!(
+        screen,
+        Screen::Models
+            | Screen::Settings
+            | Screen::Thinking
+            | Screen::Login
+            | Screen::Resume
+            | Screen::Tree
+            | Screen::Permissions
+            | Screen::Diff
+            | Screen::Securitas
+    )
+}
+
 fn screen_move(model: &mut Model, delta: isize) {
+    model.section_offset = None;
     use super::model::wrap_index;
     match model.screen {
         Screen::Models => {
@@ -597,7 +793,10 @@ fn screen_move(model: &mut Model, delta: isize) {
             model.diff_index = wrap_index(model.diff_index, delta, len);
         }
         Screen::Keys => {
-            model.keys_offset = model.keys_offset.saturating_add_signed(delta);
+            model.keys_offset = model
+                .keys_offset
+                .saturating_add_signed(delta)
+                .min(keys::lines(model).len().saturating_sub(1));
         }
         Screen::GraphRun | Screen::Governor | Screen::Vectors | Screen::Workflows => {
             let count = match model.screen {
@@ -615,13 +814,18 @@ fn screen_move(model: &mut Model, delta: isize) {
             model.permission_index =
                 wrap_index(model.permission_index, delta, model.permission_rows.len());
         }
-        _ => {}
+        _ => {
+            let last = section_rows(model)
+                .map(|rows| rows.len().saturating_sub(1))
+                .unwrap_or(0);
+            model.feature_scroll = model.feature_scroll.saturating_add_signed(delta).min(last);
+        }
     }
 }
 
 /// What enter means on the open sheet, if it means anything.
 fn screen_accept(model: &Model) -> Option<Choice> {
-    let pick = |index: usize, len: usize| (len > 0).then_some(index % len);
+    let pick = |index: usize, len: usize| (len > 0).then(|| index % len);
     match model.screen {
         Screen::Models => pick(model.catalog_index, model.catalog.len()).map(Choice::Catalog),
         Screen::Settings => {
@@ -640,7 +844,7 @@ fn screen_accept(model: &Model) -> Option<Choice> {
             .filter(|row| row.id.is_some())
             .map(|_| Choice::TreeEntry(model.tree_index)),
         // The sheet is for reading; enter moves on to the decision.
-        Screen::Trust => Some(Choice::TrustDecide),
+        Screen::Trust => model.project_trust.as_ref().map(|_| Choice::TrustDecide),
         Screen::Permissions => {
             pick(model.permission_index, model.permission_rows.len()).map(Choice::Permission)
         }
@@ -664,7 +868,27 @@ fn handle_overlay_key(
         || action_matches(model, data, "tui.select.cancel")
     {
         model.overlay = None;
+        model.overlay_offset = None;
         model.query.clear();
+        return Flow::Continue;
+    }
+    if key.modifiers.is_empty() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        let rows = overlay_rows(model, overlay);
+        let anchor = model
+            .overlay_offset
+            .or_else(|| ui::focused_row(&rows))
+            .unwrap_or(0);
+        let page = model.height.saturating_sub(6).max(1) as isize;
+        let delta = if key.code == KeyCode::PageUp {
+            -page
+        } else {
+            page
+        };
+        model.overlay_offset = Some(
+            anchor
+                .saturating_add_signed(delta)
+                .min(rows.len().saturating_sub(3)),
+        );
         return Flow::Continue;
     }
     if action_matches(model, data, "tui.select.up") {
@@ -676,12 +900,18 @@ fn handle_overlay_key(
         return Flow::Continue;
     }
     if action_matches(model, data, "tui.select.confirm") {
+        if model.overlay_offset.take().is_some() {
+            return Flow::Continue;
+        }
         let chosen = model.accept();
-        model.overlay = None;
-        model.query.clear();
+        if chosen.is_some() {
+            model.overlay = None;
+            model.query.clear();
+        }
         return chosen.map(Flow::Choose).unwrap_or(Flow::Continue);
     }
     if overlay == Overlay::Instrumenta {
+        model.overlay_offset = None;
         if action_matches(model, data, "tui.editor.deleteCharBackward") {
             model.backspace();
             return Flow::Continue;
@@ -704,6 +934,25 @@ mod tests {
     use crate::davinci::model::Entry;
     use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
+
+    #[test]
+    fn voice_hit_rectangle_tracks_the_rendered_composer_rule() {
+        for width in [20, 40, 100] {
+            let mut m = model(width, 30);
+            m.screen = Screen::Agent;
+            m.overlay = None;
+            m.voice.enabled = true;
+            m.voice.label = "mic ctrl+t".into();
+            let frame = compose_frame(&m, 30);
+            let rect = frame.mic_rect.expect("visible mic");
+            assert!(frame.lines[rect.y as usize].to_string().contains("[mic"));
+            assert_eq!(rect.right(), width);
+            assert!(rect.y < 28, "short transcript follows its content");
+            assert!(compose_frame(&m, 1).mic_rect.is_none());
+            m.voice.setup = true;
+            assert!(compose_frame(&m, 30).mic_rect.is_none());
+        }
+    }
 
     fn model(width: u16, height: u16) -> Model {
         let mut model = Model::new(
@@ -741,6 +990,30 @@ mod tests {
         // status bar.
         let hint = rows.iter().rev().nth(1).map(row_text).unwrap();
         assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+    }
+
+    #[test]
+    fn model_picker_is_content_sized_and_keeps_the_conversation_visible_above_it() {
+        let mut m = model(108, 30);
+        crate::davinci::fixtures::dress_screen(&mut m, "3a");
+        m.transcript = vec![Entry::user("keep this conversation visible")];
+
+        let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
+        let conversation = rows
+            .iter()
+            .position(|row| row.contains("keep this conversation visible"))
+            .expect("the conversation remains visible");
+        let command = rows
+            .iter()
+            .position(|row| row.contains("> /model"))
+            .expect("the picker command is visible");
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.contains('╰'))
+            .expect("the picker has a bottom border");
+
+        assert!(conversation < command, "{rows:?}");
+        assert_eq!(bottom, rows.len() - 1, "the picker is bottom anchored");
     }
 
     fn ctrl(ch: char) -> KeyEvent {
@@ -819,10 +1092,10 @@ mod tests {
         let mut m = model(100, 24);
         m.transcript = (0..40).map(|i| Entry::user(&format!("turn {i}"))).collect();
         let rows = compose(&m, 24);
-        assert!(text(&rows[19]).chars().all(|ch| ch == '─'));
+        assert!(text(&rows[19]).chars().all(|ch| "━╸┄╺".contains(ch)));
         assert!(text(&rows[20]).contains("❯"));
         assert!(!text(&rows[20]).contains("…"), "no placeholder prose");
-        assert!(text(&rows[21]).chars().all(|ch| ch == '─'));
+        assert!(text(&rows[21]).chars().all(|ch| "━╸┄╺".contains(ch)));
         assert!(text(&rows[22]).contains("/help for shortcuts"));
         assert!(text(&rows[23]).starts_with("  ask permissions · main"));
     }
@@ -853,7 +1126,7 @@ mod tests {
         let mut m = model(100, 20);
         m.transcript = vec![Entry::user("run the tests")];
         let rows = compose(&m, 20);
-        assert!(text(&rows[1]).contains("davinci"));
+        assert!(text(&rows[1]).contains("DAVINCI"));
         let turn = rows
             .iter()
             .position(|row| text(row).contains("> run the tests"))
@@ -923,12 +1196,16 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_requests_thinking_cycle_when_composer_owns_input() {
+    fn tab_chords_do_not_change_reasoning_when_composer_owns_input() {
         let mut m = model(120, 30);
 
         assert_eq!(
             handle_key(&mut m, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),),
-            Flow::CycleThinking,
+            Flow::Continue,
+        );
+        assert_eq!(
+            handle_key(&mut m, KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            Flow::Continue
         );
     }
 
@@ -1118,7 +1395,7 @@ mod tests {
                 "{expected} is not on screen"
             );
         }
-        assert!(rows.iter().any(|row| row.contains("davinci")));
+        assert!(rows.iter().any(|row| row.contains("DAVINCI")));
         assert!(rows.iter().any(|row| row.contains("23% context")));
     }
 
@@ -1415,13 +1692,588 @@ mod tests {
             handle_key(&mut m, key(KeyCode::Up));
             assert_eq!(m.feature_scroll, 0);
 
-            // PageDown scrolls by page (height - 10 = 20)
+            // PageDown uses the visible section reading budget.
             handle_key(&mut m, key(KeyCode::PageDown));
-            assert_eq!(m.feature_scroll, 20);
+            assert_eq!(m.feature_scroll, m.height.saturating_sub(6) as usize);
 
             // PageUp scrolls back by page
             handle_key(&mut m, key(KeyCode::PageUp));
             assert_eq!(m.feature_scroll, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod section_regressions {
+    use super::*;
+    use crate::davinci::{
+        fixtures,
+        theme::{ColorDepth, Theme},
+    };
+
+    #[test]
+    fn accepting_model_command_opens_the_picker_instead_of_argument_completion() {
+        for (input, key) in [
+            ("/model", KeyCode::Enter),
+            ("/mo", KeyCode::Enter),
+            ("/model", KeyCode::Tab),
+            ("/mo", KeyCode::Tab),
+        ] {
+            let mut model = Model::new(
+                Theme::da_vinci(ColorDepth::TrueColor, false),
+                100,
+                32,
+                false,
+            );
+            model.slash_commands = vec![crate::autocomplete::SlashCommandSpec {
+                name: "model".into(),
+                ..Default::default()
+            }];
+            model.model_names = vec!["openai-codex / gpt-6-astra".into()];
+            model.composer.set_text(input);
+            model.refresh_suggestions();
+            assert_eq!(
+                handle_key(&mut model, KeyEvent::new(key, KeyModifiers::NONE)),
+                Flow::Submit("/model".into())
+            );
+            assert_eq!(model.composer.to_string(), "");
+        }
+    }
+
+    #[test]
+    fn primary_command_screens_use_open_terminal_sections() {
+        for id in ["3b", "3c", "3d", "4a"] {
+            let mut model =
+                Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 32, false);
+            fixtures::dress_screen(&mut model, id);
+            let text = compose(&model, 32)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !text.contains('╭'),
+                "{id} still renders a framed command screen: {text}"
+            );
+            assert!(text.contains("esc"), "{id} has no visible exit");
+        }
+    }
+
+    #[test]
+    fn model_names_remain_readable_on_narrow_terminals() {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 40, 24, false);
+        fixtures::dress_screen(&mut model, "3a");
+        model.catalog[0].id = "recognizable-model".into();
+        model.catalog_index = 0;
+        let text = compose(&model, 24)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("recognizable-model"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod section_behavior_regressions {
+    use super::*;
+    use crate::davinci::views::thinking;
+    use crate::davinci::{
+        fixtures,
+        theme::{ColorDepth, Theme},
+    };
+
+    fn fixture(id: &str, width: u16, height: u16) -> Model {
+        let mut model = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            width,
+            height,
+            false,
+        );
+        fixtures::dress_screen(&mut model, id);
+        model
+    }
+
+    #[test]
+    fn model_arrows_preview_supported_reasoning_until_confirmation() {
+        let mut model = fixture("3a", 80, 32);
+        model.catalog_index = 0;
+        model.catalog[0].reasoning_levels = vec!["low".into(), "high".into()];
+        model.catalog[0].reasoning_index = 0;
+        let current = model.thinking_level.clone();
+        for (key, expected) in [
+            (KeyCode::Left, 0),
+            (KeyCode::Right, 1),
+            (KeyCode::Right, 1),
+            (KeyCode::Left, 0),
+        ] {
+            assert!(matches!(
+                handle_key(&mut model, KeyEvent::new(key, KeyModifiers::NONE)),
+                Flow::Continue
+            ));
+            assert_eq!(model.catalog[0].reasoning_index, expected);
+            assert_eq!(model.thinking_level, current);
+            let rendered = cogitator::screen(&model, 30)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains(&format!(
+                "Reasoning: ◀ {} ▶",
+                model.catalog[0].reasoning_levels[expected]
+            )));
+        }
+        assert!(matches!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Flow::Choose(Choice::Catalog(0))
+        ));
+        model.catalog[0].reasoning_levels.clear();
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(model.catalog[0].reasoning_index, 0);
+        model.catalog.clear();
+        handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn enter_on_an_empty_picker_is_a_no_op() {
+        for screen in [
+            Screen::Models,
+            Screen::Settings,
+            Screen::Thinking,
+            Screen::Login,
+            Screen::Resume,
+            Screen::Permissions,
+        ] {
+            let mut model =
+                Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 40, 12, false);
+            model.screen = screen;
+            assert!(screen_accept(&model).is_none(), "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn moving_thinking_focus_does_not_change_the_current_level() {
+        let mut model = fixture("3c", 80, 32);
+        model.thinking_level = "low".into();
+        model.thinking_index = model
+            .thinking_rows
+            .iter()
+            .position(|r| r.level == "high")
+            .unwrap();
+        let status = thinking::chrome(&model)
+            .status_third
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(status.contains("low"), "{status}");
+        let rows = thinking::lines(&model);
+        assert!(rows
+            .iter()
+            .any(|r| r.to_string().contains("low") && r.to_string().contains("current")));
+        assert!(rows[ui::focused_row(&rows).expect("focus marker")]
+            .to_string()
+            .contains("high"));
+    }
+
+    #[test]
+    fn primary_lists_do_not_advertise_inert_filters() {
+        for id in ["3a", "4a"] {
+            let model = fixture(id, 80, 32);
+            let text = compose(&model, 32)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !text.contains("filter models") && !text.contains("filter sessions"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_and_settings_keep_their_detail_summary_visible_when_selection_is_deep() {
+        let mut models = fixture("3a", 80, 16);
+        models.catalog_index = models.catalog.len().saturating_sub(1);
+        let selected_model = models.catalog[models.catalog_index].id.clone();
+        let model_text = compose(&models, 16)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(model_text.contains("SELECT A MODEL"), "{model_text}");
+        assert!(model_text.contains(&selected_model), "{model_text}");
+
+        let mut settings = fixture("3b", 80, 16);
+        settings.settings_index = settings.settings_rows.len().saturating_sub(1);
+        let selected_setting = settings.settings_rows[settings.settings_index]
+            .label
+            .clone();
+        let settings_text = compose(&settings, 16)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(settings_text.contains("SETTING DETAILS"), "{settings_text}");
+        assert!(settings_text.contains(&selected_setting), "{settings_text}");
+    }
+
+    #[test]
+    fn expanded_settings_remain_readable_at_narrow_widths() {
+        let mut model = fixture("3b", 32, 24);
+        model.settings_rows[0].value = "a-long-current-value".into();
+        model.settings_rows[0].description = "Focused setting details".into();
+        model.settings_index = 0;
+        let text = settings::lines(&model)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("a-long-current-value"), "{text}");
+        assert!(text.contains("Focused setting details"), "{text}");
+        assert!(
+            !text.contains("%USERPROFILE%"),
+            "the renderer must not invent a settings path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod section_truth_regressions {
+    use super::*;
+    use crate::davinci::{
+        model::{Compaction, ExportLedger, FailedRun, ProjectTrustSheet},
+        theme::{ColorDepth, Theme},
+    };
+    fn model() -> Model {
+        Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 24, false)
+    }
+    fn text(rows: Vec<Line<'static>>) -> String {
+        rows.iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_local_export_is_not_presented_as_an_upload_or_clipboard_action() {
+        let mut m = model();
+        m.export_ledger = Some(ExportLedger {
+            gist: "session.html".into(),
+            size: "4 KB".into(),
+            ..Default::default()
+        });
+        let drawn = text(export::lines(&m));
+        assert!(drawn.contains("session.html"));
+        for unsupported in ["uploaded", "clipboard", "[o]", "[c]", "[d]", "exporting"] {
+            assert!(!drawn.contains(unsupported), "{drawn}");
+        }
+    }
+    #[test]
+    fn completed_compaction_does_not_offer_a_second_unwired_confirmation() {
+        let mut m = model();
+        m.compaction = Some(Compaction {
+            before_tokens: "40k".into(),
+            after_tokens: "8k".into(),
+            ..Default::default()
+        });
+        let drawn = text(compact::lines(&m));
+        assert!(drawn.contains("40k") && drawn.contains("8k"));
+        for unsupported in ["compact now", "[e]", "[t]", "pays a full", "reversible"] {
+            assert!(!drawn.contains(unsupported), "{drawn}");
+        }
+    }
+    #[test]
+    fn trust_review_does_not_claim_unread_files_or_unwired_decision_letters() {
+        let mut m = model();
+        m.project_trust = Some(ProjectTrustSheet {
+            path: "example-project".into(),
+            ..Default::default()
+        });
+        let drawn = text(trust::lines(&m));
+        assert!(drawn.contains("example-project"));
+        for unsupported in [
+            "Nothing here has been read",
+            "[t]",
+            "[o]",
+            "[p]",
+            "[n]",
+            "no tools loaded",
+        ] {
+            assert!(!drawn.contains(unsupported), "{drawn}");
+        }
+    }
+    #[test]
+    fn a_failure_does_not_invent_interrupt_persistence_or_retry_actions() {
+        let mut m = model();
+        m.failed_run = Some(FailedRun {
+            error: "provider rejected the request".into(),
+            ..Default::default()
+        });
+        let drawn = text(recovery::lines(&m));
+        assert!(drawn.contains("provider rejected the request"));
+        for unsupported in [
+            "session written",
+            "You stopped",
+            "ctrl+c",
+            "finish on opus",
+            "retry now",
+        ] {
+            assert!(!drawn.contains(unsupported), "{drawn}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod section_layout_regressions {
+    use super::*;
+    use crate::davinci::{
+        fixtures,
+        theme::{ColorDepth, Theme},
+    };
+    const IDS: &[&str] = &[
+        "1c",
+        "1d",
+        "1f",
+        "1f-cogitator",
+        "2a",
+        "2b",
+        "2c",
+        "3a",
+        "3b",
+        "3c",
+        "3d",
+        "3e",
+        "4a",
+        "4b",
+        "4c",
+        "4d",
+        "5a",
+        "5b",
+        "5c",
+        "5d",
+        "6a",
+        "6b",
+        "6c",
+        "6d",
+    ];
+    fn fixture(id: &str, width: u16, height: u16) -> Model {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            width,
+            height,
+            false,
+        );
+        fixtures::dress_screen(&mut m, id);
+        m.width = width;
+        m.height = height;
+        m
+    }
+    #[test]
+    fn every_fixture_fits_the_terminal_cells_and_requested_height() {
+        for id in IDS {
+            for width in [20, 32, 40, 80, 120] {
+                for height in [0, 1, 2, 4, 8, 16, 32] {
+                    let m = fixture(id, width, height);
+                    let rows = compose(&m, height);
+                    assert_eq!(rows.len(), height as usize, "{id} {width}x{height}");
+                    for row in rows {
+                        assert!(
+                            ui::run_width(&row.spans) <= width,
+                            "{id} {width}x{height}: {row:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn section_titles_take_priority_over_metadata_on_narrow_terminals() {
+        let mut m = fixture("3a", 32, 16);
+        m.catalog.resize(12000, m.catalog[0].clone());
+        assert!(chrome::header(&m).to_string().contains("SELECT MODEL"));
+    }
+    #[test]
+    fn scrolling_a_status_view_is_not_pinned_to_its_running_worker_marker() {
+        let mut m = fixture("5a", 80, 12);
+        let before = compose(&m, 12);
+        screen_move(&mut m, 200);
+        assert_ne!(compose(&m, 12), before);
+    }
+    #[test]
+    fn read_only_sections_do_not_advertise_unimplemented_actions_in_the_status_bar() {
+        let m = fixture("2a", 80, 24);
+        let status = chrome::status(&m).to_string();
+        assert!(
+            !status.contains("enter open node") && !status.contains("x expand"),
+            "{status}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod section_content_regressions {
+    use super::*;
+    use crate::davinci::{
+        fixtures,
+        model::{Ask, PickerItem, SecurityScan},
+        theme::{ColorDepth, Theme},
+    };
+    fn model(id: &str) -> Model {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 32, false);
+        fixtures::dress_screen(&mut m, id);
+        m
+    }
+    fn text(rows: Vec<Line<'static>>) -> String {
+        rows.iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn confirmation_context_precedes_the_choices() {
+        let mut m = model("1a");
+        m.ask = Ask {
+            title: "Permission".into(),
+            note: "Read a file outside this project".into(),
+            items: vec![PickerItem::new("Allow once", "This call only")],
+            ..Default::default()
+        };
+        m.overlay = Some(Overlay::Ask);
+        let drawn = text(ask::lines(&m));
+        assert!(drawn.find("outside this project").unwrap() < drawn.find("Allow once").unwrap());
+    }
+    #[test]
+    fn overlays_only_advertise_implemented_actions() {
+        let mut m = model("1d");
+        m.width = 120;
+        let palette = text(instrumenta::lines(&m, 40));
+        assert!(!palette.contains("tab complete"), "{palette}");
+        m.overlay = Some(Overlay::Sessions);
+        let sessions = text(memoria::sessions(&m, 40));
+        assert!(
+            !sessions.contains("d delete") && !sessions.contains("f fork"),
+            "{sessions}"
+        );
+        assert!(sessions.contains("esc close"));
+    }
+    #[test]
+    fn read_only_recall_and_worker_status_are_not_fake_pickers() {
+        for (id, render) in [
+            ("2b", memoria::recall as fn(&Model) -> Vec<Line<'static>>),
+            ("5a", graph_run::lines),
+        ] {
+            let m = model(id);
+            let drawn = render(&m);
+            assert!(ui::focused_row(&drawn).is_none(), "{id}");
+            assert!(!text(drawn).contains('▌'), "{id}");
+        }
+    }
+    #[test]
+    fn security_status_does_not_invent_validation_network_or_seal_guarantees() {
+        let mut m = model("5d");
+        m.security = Some(SecurityScan {
+            id: "test-scan".into(),
+            state: "running".into(),
+            ..Default::default()
+        });
+        let drawn = text(securitas::lines(&m));
+        for claim in [
+            "report sealed",
+            "never left this machine",
+            "allow_network false",
+            "not guessed",
+        ] {
+            assert!(!drawn.contains(claim), "{drawn}");
+        }
+    }
+    #[test]
+    fn plans_and_budget_advice_do_not_offer_unhandled_letter_keys() {
+        let plan = text(disegno::lines(&model("1c")));
+        assert!(!plan.contains("a accept") && !plan.contains("e edit step"));
+        let budget = text(mensura::lines(&model("2c")));
+        assert!(
+            !budget.contains("[a]") && !budget.contains("[d]"),
+            "{budget}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod section_input_regressions {
+    use super::*;
+    use crate::davinci::{
+        fixtures,
+        model::{Ask, PickerItem},
+        theme::{ColorDepth, Theme},
+    };
+    fn model(id: &str) -> Model {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 40, 16, false);
+        fixtures::dress_screen(&mut m, id);
+        m.width = 40;
+        m.height = 16;
+        m
+    }
+    fn press(m: &mut Model, key: KeyCode) -> Flow {
+        handle_key(m, KeyEvent::new(key, KeyModifiers::NONE))
+    }
+    #[test]
+    fn paging_reads_expanded_details_without_changing_the_pending_selection() {
+        let mut m = model("3b");
+        m.settings_index = 0;
+        m.settings_rows[0].description =
+            "A long setting description with important detail. ".repeat(40);
+        press(&mut m, KeyCode::PageDown);
+        assert_eq!(m.settings_index, 0);
+        assert!(m.section_offset.is_some());
+        press(&mut m, KeyCode::Down);
+        assert_eq!(m.settings_index, 1);
+        assert!(m.section_offset.is_none());
+    }
+    #[test]
+    fn paging_a_question_does_not_choose_or_move_its_answer() {
+        let mut m = model("1a");
+        m.ask = Ask {
+            title: "Permission".into(),
+            note: "Important context. ".repeat(60),
+            items: vec![
+                PickerItem::new("Allow", "One call"),
+                PickerItem::new("Deny", "Do not run"),
+            ],
+            ..Default::default()
+        };
+        m.toggle_overlay(Overlay::Ask);
+        press(&mut m, KeyCode::PageUp);
+        assert!(m.overlay_offset.is_some());
+        assert_eq!(m.ask_index, 0);
+        assert_eq!(m.overlay, Some(Overlay::Ask));
+        press(&mut m, KeyCode::Down);
+        assert_eq!(m.ask_index, 1);
+        assert!(m.overlay_offset.is_none());
+        press(&mut m, KeyCode::Esc);
+        assert!(m.overlay.is_none());
+    }
+    #[test]
+    fn a_sheet_error_is_visible_without_discarding_the_picker_or_composer_draft() {
+        let mut m = model("3a");
+        m.section_notice = Some("Provider unavailable".into());
+        m.composer.push_str("saved draft");
+        let drawn = compose(&m, 16)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drawn.contains("Provider unavailable"));
+        assert!(drawn.contains("esc close"));
+        assert!(!drawn.contains("saved draft"));
+        press(&mut m, KeyCode::Esc);
+        assert_eq!(&*m.composer, "saved draft");
     }
 }

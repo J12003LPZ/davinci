@@ -301,135 +301,78 @@ impl ModelSelector {
 
 impl Component for ModelSelector {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = vec![String::new()];
-        lines.push(format!(
-            "{} {} {}",
-            self.theme.fg("secondary", "COGITATOR"),
-            self.theme.fg("border", "·"),
-            self.theme.fg("muted", "MODEL")
-        ));
-        if !self.locked_models.is_empty() {
-            lines.push(self.theme.fg(
-                "muted",
-                &format!(
-                    "{} more models need credentials; they are listed dimmed. Enter on one shows its /login.",
-                    self.locked_models.len()
-                ),
-            ));
-        } else if self.scoped_models.is_empty() {
-            lines.push(self.theme.fg(
+        let mut section =
+            crate::render::CommandSection::new(width, "Choose model", Some(&self.theme));
+        if self.scoped_models.is_empty() {
+            section.message(
                 "warning",
-                "Only showing models from configured providers. Use /login to add providers.",
-            ));
+                "Configured providers only. Use /login to add a provider.",
+            );
         } else {
-            let all = if self.scope == ModelScope::All {
-                self.theme.fg("accent", "all")
-            } else {
-                self.theme.fg("muted", "all")
+            let scope = match self.scope {
+                ModelScope::All => "all",
+                ModelScope::Scoped => "scoped",
             };
-            let scoped = if self.scope == ModelScope::Scoped {
-                self.theme.fg("accent", "scoped")
-            } else {
-                self.theme.fg("muted", "scoped")
-            };
-            lines.push(format!(
-                "{}{}{}{}",
-                self.theme.fg("muted", "Scope: "),
-                all,
-                self.theme.fg("muted", " | "),
-                scoped
-            ));
-            lines.push(format!(
-                "tab scope{}",
-                self.theme.fg("muted", " (all/scoped)")
+            section.detail(&format!("Scope: {scope} · tab changes scope"));
+        }
+        if !self.locked_models.is_empty() {
+            section.detail(&format!(
+                "{} models need provider credentials.",
+                self.locked_models.len()
             ));
         }
-        lines.push(String::new());
-        lines.push(format!("> {}", self.search));
-        lines.push(String::new());
+        section.search(&self.search);
 
         let filtered = self.filtered();
-        let max_visible = 10;
-        let start = if filtered.is_empty() {
-            0
-        } else {
-            self.selected
-                .saturating_sub(max_visible / 2)
-                .min(filtered.len().saturating_sub(max_visible))
-        };
-        let end = (start + max_visible).min(filtered.len());
-        for (offset, item) in filtered[start..end].iter().enumerate() {
-            let index = start + offset;
+        if filtered.is_empty() {
+            section.detail("No matching models.");
+        }
+        for index in crate::render::selection_window(self.selected, filtered.len(), 10) {
+            let item = &filtered[index];
             let selected = index == self.selected;
-            let prefix = if selected {
-                self.theme.fg("accent", "→ ")
-            } else {
-                "  ".into()
-            };
-            let id = if selected {
-                self.theme.fg("accent", &item.id)
-            } else {
-                item.id.clone()
-            };
-            let provider_badge = self.theme.fg("muted", &format!("[{}]", item.provider));
-            let default_badge = if self.is_default(item) {
-                self.theme.fg("muted", " · default")
-            } else {
-                String::new()
-            };
-            let check = if self.is_current(item) {
-                self.theme.fg("success", " ✓")
-            } else {
-                String::new()
-            };
             let locked = self.is_locked(&item.key());
-            let line = if locked {
-                format!(
-                    "{prefix}{} {}{}",
-                    self.theme.fg("dim", &item.id),
-                    self.theme.fg("dim", &format!("[{}]", item.provider)),
-                    self.theme
-                        .fg("border", &format!(" · /login {}", item.provider)),
-                )
-            } else {
-                format!("{prefix}{id} {provider_badge}{default_badge}{check}")
-            };
-            lines.push(truncate(&line, width));
-        }
-        if start > 0 || end < filtered.len() {
-            lines.push(self.theme.fg(
-                "muted",
-                &format!("  ({}/{})", self.selected + 1, filtered.len()),
-            ));
-        }
-        if let Some(error) = &self.error_message {
-            for line in error.split('\n') {
-                lines.push(self.theme.fg("error", line));
+            let mut state = item.provider.clone();
+            if locked {
+                state.push_str(" · unavailable");
             }
-        } else if filtered.is_empty() {
-            lines.push(self.theme.fg("muted", "  No matching models"));
-        } else if let Some(selected) = filtered.get(self.selected) {
-            lines.push(String::new());
-            lines.push(
-                self.theme
-                    .fg("muted", &format!("  Model Name: {}", selected.name)),
-            );
+            if self.is_current(item) {
+                state.push_str(" · current");
+            }
+            if self.is_default(item) {
+                state.push_str(" · default");
+            }
+            let label = if item.name.is_empty() || item.name == item.id {
+                item.id.clone()
+            } else {
+                format!("{} · {}", item.name, item.id)
+            };
+            section.item(selected, &label, &state);
+            if selected {
+                section.detail(&format!("ID: {}", item.key()));
+                if locked {
+                    section.message(
+                        "warning",
+                        &format!("Unavailable until /login {} succeeds.", item.provider),
+                    );
+                }
+            }
+        }
+        section.position(self.selected, filtered.len(), 10);
+        if let Some(error) = &self.error_message {
+            section.message("error", error);
         }
         if let Some(status) = &self.refresh_status {
-            lines.push(String::new());
-            let role = if self.refresh_status_success {
-                "success"
-            } else {
-                "muted"
-            };
-            lines.push(self.theme.fg(role, &format!("  {status}")));
+            section.message(
+                if self.refresh_status_success {
+                    "success"
+                } else {
+                    "muted"
+                },
+                status,
+            );
         }
-        lines.push(String::new());
-        lines.push(self.theme.fg(
-            "dim",
-            "  Enter to select · Ctrl+S to set as default · Esc to cancel",
-        ));
-        lines
+        section.hint("↑↓ move · type search · enter select · ctrl+s default · esc cancel");
+        section.finish()
     }
 
     fn invalidate(&mut self) {}
@@ -465,14 +408,6 @@ fn cmp_models(
 fn is_default_search(query: &str) -> bool {
     let normalized = query.trim().to_ascii_lowercase();
     !normalized.is_empty() && "default".starts_with(&normalized)
-}
-
-fn truncate(line: &str, width: usize) -> String {
-    if crate::render::visible_width_stripped(line) <= width {
-        line.to_string()
-    } else {
-        crate::ansi::truncate_to_width(line, width, "…", false)
-    }
 }
 
 #[cfg(test)]
@@ -531,16 +466,13 @@ mod tests {
         assert_eq!(filtered[0].key(), "google/gemini");
         assert_eq!(filtered[1].key(), "anthropic/sonnet");
         let lines = selector.render(80);
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("Only showing models from configured providers")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("Enter to select · Ctrl+S to set as default")));
-        assert!(lines.iter().any(|line| line.contains("Model Name:")));
-        // Role colors present: warning, accent (copper), success, muted.
+        let rendered = crate::render::strip_terminal_sequences(&lines.join("\n"));
+        assert!(rendered.contains("Configured providers only."));
+        assert!(rendered.contains("enter select"));
+        assert!(rendered.contains("ID: google/gemini"));
+        // Role colors present: warning, accent (copper), and muted.
         let joined = lines.join("\n");
-        for role in ["warning", "accent", "success", "muted"] {
+        for role in ["warning", "accent", "muted"] {
             let colored = selector.theme.fg(role, "probe");
             let code = colored
                 .strip_suffix("probe\x1b[39m")
@@ -554,6 +486,36 @@ mod tests {
 
         if let Some(value) = previous {
             std::env::set_var("NO_COLOR", value);
+        }
+    }
+
+    #[test]
+    fn command_section_render_uses_shared_focus_and_keeps_locked_guidance() {
+        let locked = ModelSelectorItem {
+            provider: "provider-长".into(),
+            id: "locked-model-with-a-long-name".into(),
+            name: "Locked Model 🦀".into(),
+        };
+        let mut selector =
+            ModelSelector::new(items(), Some("google/gemini".into()), None, Vec::new())
+                .with_locked_models(vec![locked]);
+        selector.selected = selector.filtered().len().saturating_sub(1);
+        let rendered = crate::render::strip_terminal_sequences(&selector.render(32).join("\n"));
+        assert!(rendered.contains("Choose model"), "{rendered}");
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/login"), "{rendered}");
+        assert!(rendered.contains("provider-长 succeeds."), "{rendered}");
+        assert!(!rendered.contains("COGITATOR"), "{rendered}");
+        for width in [0, 1, 20, 32, 40] {
+            for row in selector.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
         }
     }
 

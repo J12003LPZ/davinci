@@ -6,6 +6,8 @@ use std::sync::Arc;
 pub mod bus;
 pub mod cache;
 pub mod cancellation;
+pub mod capabilities;
+pub mod capacity;
 pub mod context;
 pub mod events;
 pub mod ids;
@@ -21,6 +23,10 @@ pub mod worktree;
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
 pub use cache::{hash_system_prompt, hash_tool_names, CacheIdentity, CacheMissReason};
 pub use cancellation::CancellationToken;
+pub use capabilities::{
+    builtin_capabilities, compute_schema_hash, CapabilitySource, RuntimeCapability,
+    RuntimeCapabilityRegistry,
+};
 pub use context::{
     wrap_untrusted_data, ContextBroker, ContextItem, ContextPacket, ContextRequest, ContextSource,
 };
@@ -33,7 +39,8 @@ pub use team::{TeamConfig, TeamError, TeamManager, TeammateHandle};
 pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
 pub use tools_task::{task_create_tool, task_list_tool, task_tool_specs, task_update_tool};
 pub use workflow::{
-    find_saved_workflow, is_mutating_tool, save_workflow_to_project, validate_workflow,
+    find_saved_workflow, is_mutating_tool, is_mutating_tool_with_registry,
+    save_workflow_to_project, validate_workflow, validate_workflow_with_capabilities,
     validate_workflow_with_permissions, workflow_run_tool, workflow_status_tool,
     workflow_tool_specs, PhaseExecutionState, PhaseStatus, WorkflowArtifact,
     WorkflowExecutionError, WorkflowExecutionState, WorkflowExecutor, WorkflowJoin,
@@ -58,6 +65,7 @@ pub struct RuntimeHandle {
     pub mailbox: AgentMailbox,
     pub worktree_manager: Option<WorktreeManager>,
     pub workflow_executor: Option<Arc<WorkflowExecutor>>,
+    pub capability_registry: RuntimeCapabilityRegistry,
     pub project_trusted: bool,
 }
 
@@ -93,8 +101,14 @@ impl RuntimeHandle {
             mailbox,
             worktree_manager: None,
             workflow_executor: None,
+            capability_registry: RuntimeCapabilityRegistry::with_builtins(),
             project_trusted: false,
         }
+    }
+
+    pub fn with_capability_registry(mut self, registry: RuntimeCapabilityRegistry) -> Self {
+        self.capability_registry = registry;
+        self
     }
 
     pub fn with_workflow_executor(mut self, executor: Arc<WorkflowExecutor>) -> Self {

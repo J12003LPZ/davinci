@@ -16,6 +16,44 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+mod analyzers;
+mod artifact_index;
+mod budget;
+mod checkpoint_encoding;
+pub mod command;
+pub mod config;
+mod conflict_capture;
+pub mod controller;
+mod deadline;
+mod feedback;
+mod git;
+mod grouping;
+mod identity;
+pub mod interrupt;
+mod partial;
+mod policy;
+pub mod recon;
+mod reconciliation;
+mod redaction;
+pub mod report;
+mod report_contract;
+mod report_envelope;
+pub mod review;
+mod root_cause;
+pub mod skills;
+pub mod snapshot;
+mod store;
+mod supporting;
+pub mod tools;
+pub mod types;
+pub mod usage;
+pub mod validation;
+mod validation_budget;
+pub mod worker;
+mod worker_cache;
+
+pub use config::ScanConfig;
+
 #[derive(Debug, Clone)]
 pub struct SecurityVerifyRequest<'a> {
     pub cwd: &'a Path,
@@ -351,6 +389,11 @@ pub struct SecurityScanController {
     pub config: SecurityScanConfig,
     current: Option<SecurityScan>,
     artifact: Option<SecurityArtifactStore>,
+    review: controller::ScanCoordinator,
+    runner: Option<worker::SecurityWorkerRunner>,
+    review_config: ScanConfig,
+    report: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
+    review_agent_dir: Option<PathBuf>,
 }
 
 impl Default for SecurityScanController {
@@ -366,6 +409,11 @@ impl SecurityScanController {
             config: SecurityScanConfig::default(),
             current: None,
             artifact: None,
+            review: controller::ScanCoordinator::default(),
+            runner: None,
+            review_config: ScanConfig::default(),
+            report: Default::default(),
+            review_agent_dir: None,
         }
     }
 
@@ -638,11 +686,223 @@ impl SecurityScanController {
         })
     }
 
-    pub fn command(&mut self, name: &str, _args: &str) -> Result<Option<Value>, String> {
+    pub fn configure_review(&mut self, runner: worker::SecurityWorkerRunner, config: ScanConfig) {
+        self.runner = Some(runner);
+        self.review_config = config;
+    }
+
+    pub fn set_review_storage(&mut self, agent_dir: PathBuf) {
+        self.review_agent_dir = Some(agent_dir);
+    }
+
+    pub fn has_review(&self) -> bool {
+        self.review.status().is_some()
+    }
+
+    pub fn wait_for_review(&self) {
+        self.review.wait();
+    }
+
+    pub fn wait_for_review_interruptible(&self, interrupt: &interrupt::Interrupt) {
+        while self
+            .review
+            .status()
+            .is_some_and(|state| !state.status.terminal())
+        {
+            if interrupt.requested() {
+                let _ = self.review.abort(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        self.wait_for_review();
+    }
+
+    pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
         match name {
+            "security-scan" => {
+                let request = command::ScanCommand::parse_with_default(
+                    args,
+                    self.review_config.default_mode,
+                )?;
+                self.review_config.admit(self.runner.is_some())?;
+                let runner = self.runner.clone().ok_or("security provider unavailable")?;
+                let root = self.cwd.clone();
+                let config = self.review_config.clone();
+                let report = self.report.clone();
+                let agent_dir = self.review_agent_dir.clone();
+                let run = self.review.start(move |run| {
+                    let result = (|| {
+                        let store = agent_dir
+                            .as_ref()
+                            .map(|dir| {
+                                store::Store::open(
+                                    dir,
+                                    &git::root(&root),
+                                    &run.status().scan_id,
+                                    true,
+                                )
+                            })
+                            .transpose()?;
+                        if let Some(store) = &store {
+                            run.set_generation(store.next_generation()?)?;
+                        }
+                        let mut value = review::execute(
+                            &root,
+                            &request,
+                            &config,
+                            &runner,
+                            &run,
+                            store.as_ref(),
+                            None,
+                        )?;
+                        report::sanitize(&mut value);
+                        run.begin_publication()?;
+                        if let Some(store) = &store {
+                            store.complete(&value, run.status().generation)?;
+                        }
+                        Ok::<_, String>(value)
+                    })();
+                    match result {
+                        Ok(mut value) => {
+                            report::sanitize(&mut value);
+                            let complete = value["coverageComplete"].as_bool().unwrap_or(false);
+                            *report.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+                            run.finish(Ok(complete));
+                        }
+                        Err(error) => run.finish(Err(error)),
+                    }
+                })?;
+                Ok(Some(
+                    serde_json::to_value(run.status()).map_err(|e| e.to_string())?,
+                ))
+            }
+            "sec-resume" => {
+                let id = if args.trim().is_empty() {
+                    self.review
+                        .status()
+                        .map(|s| s.scan_id)
+                        .ok_or("provide a scan ID to resume")?
+                } else {
+                    args.trim().to_string()
+                };
+                if uuid::Uuid::parse_str(&id)
+                    .map_err(|_| "invalid scan identity")?
+                    .to_string()
+                    != id
+                {
+                    return Err("invalid scan identity".into());
+                }
+                self.review_config.admit(self.runner.is_some())?;
+                let runner = self.runner.clone().ok_or("security provider unavailable")?;
+                let config = self.review_config.clone();
+                let agent_dir = self
+                    .review_agent_dir
+                    .clone()
+                    .ok_or("security checkpoint storage unavailable")?;
+                let root = self.cwd.clone();
+                let report = self.report.clone();
+                let run = self.review.start_generation(id, 0, move |run| {
+                    let result = (|| {
+                        let store = store::Store::open(
+                            &agent_dir,
+                            &git::root(&root),
+                            &run.status().scan_id,
+                            false,
+                        )?;
+                        if store.has_sealed_report() {
+                            store.latest_report()?;
+                            return Err(
+                                "sealed security reviews are immutable; start a new scan".into()
+                            );
+                        }
+                        let checkpoint = store.load(config.checkpoint_byte_limit())?;
+                        checkpoint.validate_resume(&config)?;
+                        run.set_generation(store.next_generation()?)?;
+                        let mut value = review::execute(
+                            &root,
+                            &checkpoint.request,
+                            &config,
+                            &runner,
+                            &run,
+                            Some(&store),
+                            Some(checkpoint.snapshot),
+                        )?;
+                        report::sanitize(&mut value);
+                        run.begin_publication()?;
+                        store.complete(&value, run.status().generation)?;
+                        Ok::<_, String>(value)
+                    })();
+                    match result {
+                        Ok(value) => {
+                            let complete = value["coverageComplete"].as_bool().unwrap_or(false);
+                            *report.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+                            run.finish(Ok(complete));
+                        }
+                        Err(error) => run.finish(Err(error)),
+                    }
+                })?;
+                Ok(Some(
+                    serde_json::to_value(run.status()).map_err(|e| e.to_string())?,
+                ))
+            }
+            "sec-status" if self.review.status().is_some() => {
+                let progress = self.review.status().unwrap();
+                if !args.trim().is_empty() && args.trim() != progress.scan_id {
+                    return Err("scan identity does not match this session".into());
+                }
+                Ok(Some(
+                    serde_json::to_value(progress).map_err(|err| err.to_string())?,
+                ))
+            }
+            "sec-abort" if self.review.status().is_some() => {
+                let id = (!args.trim().is_empty()).then_some(args.trim());
+                Ok(Some(
+                    serde_json::to_value(self.review.abort(id)?).map_err(|err| err.to_string())?,
+                ))
+            }
             "sec-status" => Ok(Some(
                 serde_json::to_value(self.current()).map_err(|err| err.to_string())?,
             )),
+            "sec-report" if self.review.status().is_some() => {
+                let request = command::ReportCommand::parse(args)?;
+                let progress = self.review.status().unwrap();
+                if request
+                    .scan_id
+                    .as_ref()
+                    .is_some_and(|id| id != &progress.scan_id)
+                {
+                    return Err("scan identity does not match this session".into());
+                }
+                let report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(Some(report::select_finding(
+                    report
+                        .as_ref()
+                        .filter(|value| {
+                            value["scanId"] == progress.scan_id
+                                && value["generation"] == progress.generation
+                        })
+                        .cloned()
+                        .or_else(|| self.review.partial_report())
+                        .unwrap_or(serde_json::to_value(progress).map_err(|e| e.to_string())?),
+                    request.finding_id.as_deref(),
+                )?))
+            }
+            "sec-report" if !args.trim().is_empty() => {
+                let request = command::ReportCommand::parse(args)?;
+                let id = request
+                    .scan_id
+                    .as_deref()
+                    .ok_or("scan identity required without an active review")?;
+                let agent_dir = self
+                    .review_agent_dir
+                    .as_ref()
+                    .ok_or("security report storage unavailable")?;
+                let store = store::Store::open(agent_dir, &git::root(&self.cwd), id, false)?;
+                Ok(Some(report::select_finding(
+                    store.available_report()?,
+                    request.finding_id.as_deref(),
+                )?))
+            }
             "sec-report" => {
                 let report = self
                     .artifact
@@ -1439,5 +1699,53 @@ mod tests {
             }
             other => panic!("expected Passed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn security_graph_deterministic_gate_preserves_blockers() {
+        use crate::native_extensions::ecosystem::verification::{
+            SecurityPolicyMode, VerificationBundle,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_file = tmp.path().join("src/auth.rs");
+        fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        fs::write(
+            &auth_file,
+            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+        )
+        .unwrap();
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let result = controller
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: tmp.path(),
+                changed_files: &["src/auth.rs".to_string()],
+                graph_run_id: "run-gate",
+            })
+            .unwrap();
+        match &result {
+            SecurityVerification::Failed { blockers, .. } => assert!(*blockers > 0),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let bundle = VerificationBundle {
+            commands_ran: 1,
+            commands_failed: 0,
+            deterministic_passed: true,
+            security: result.clone(),
+            changed_files: vec!["src/auth.rs".into()],
+            graph_run_id: Some("run-gate".into()),
+        };
+        assert!(!bundle.approval_eligible(SecurityPolicyMode::Risk));
+        assert!(!bundle.approval_eligible(SecurityPolicyMode::Always));
+        let unavailable = VerificationBundle {
+            security: SecurityVerification::Unavailable {
+                reason: "ai scan incomplete".into(),
+            },
+            ..bundle.clone()
+        };
+        assert!(
+            !unavailable.approval_eligible(SecurityPolicyMode::Always),
+            "incomplete AI scan must not clear a mandatory security gate"
+        );
+        assert!(!bundle.approval_eligible(SecurityPolicyMode::Risk));
     }
 }

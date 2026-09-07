@@ -140,36 +140,31 @@ impl ConfigSelector {
 
 impl Component for ConfigSelector {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = vec![
-            "Package resources".into(),
-            format!(
-                "Scope: {}  (Tab switches User / Project)",
-                self.scope.label()
-            ),
-            String::new(),
-        ];
+        let mut section = crate::render::CommandSection::new(width, "Package resources", None);
+        section.detail(&format!("Scope: {}", self.scope.label()));
         let visible = self.visible();
         if visible.is_empty() {
-            lines.push("  No resources in this scope.".into());
-        } else {
-            let mut last_kind = None;
-            for (index, item) in visible.iter().enumerate() {
-                if last_kind != Some(item.kind) {
-                    lines.push(item.kind.label().to_string());
-                    last_kind = Some(item.kind);
-                }
-                let mark = if item.enabled { "[x]" } else { "[ ]" };
-                let prefix = if index == self.selected { "> " } else { "  " };
-                let mut line = format!("{prefix}{mark} {}  ({})", item.name, item.source);
-                if crate::render::visible_width(&line) > width {
-                    line.truncate(width.max(1));
-                }
-                lines.push(line);
+            section.detail("No resources in this scope.");
+        }
+        let mut last_kind = None;
+        for index in crate::render::selection_window(self.selected, visible.len(), 8) {
+            let item = visible[index];
+            if last_kind != Some(item.kind) {
+                section.heading(item.kind.label());
+                last_kind = Some(item.kind);
+            }
+            section.item(
+                index == self.selected,
+                &item.name,
+                if item.enabled { "enabled" } else { "disabled" },
+            );
+            if index == self.selected {
+                section.detail(&format!("Source: {}", item.source));
             }
         }
-        lines.push(String::new());
-        lines.push("Space/Enter toggle   Esc close".into());
-        lines
+        section.position(self.selected, visible.len(), 8);
+        section.hint("↑↓ move · enter/space toggle · tab scope · esc close");
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -203,13 +198,14 @@ mod tests {
         ]);
         let lines = selector.render(80);
         assert!(lines.iter().any(|line| line.contains("Scope: User")));
-        assert!(lines.iter().any(|line| line.contains("[x] demo")));
+        let rendered = crate::render::strip_terminal_sequences(&lines.join("\n"));
+        assert!(rendered.contains("demo"));
+        assert!(rendered.contains("enabled"), "{rendered:?}");
         assert_eq!(selector.handle_key("\t"), ConfigSelectorAction::Changed);
         assert_eq!(selector.scope, ConfigScope::Project);
-        assert!(selector
-            .render(80)
-            .iter()
-            .any(|line| line.contains("[ ] review")));
+        let project = crate::render::strip_terminal_sequences(&selector.render(80).join("\n"));
+        assert!(project.contains("review"));
+        assert!(project.contains("disabled"));
         assert_eq!(selector.handle_key(" "), ConfigSelectorAction::Toggle);
         assert!(selector.items[1].enabled);
     }

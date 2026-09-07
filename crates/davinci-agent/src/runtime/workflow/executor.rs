@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use super::spec::{WorkflowJoin, WorkflowSpec};
 use super::state::WorkflowStateStore;
-use super::validate::{validate_workflow, WorkflowValidationError};
+use super::validate::{validate_workflow_with_capabilities, WorkflowValidationError};
 use crate::runtime::cancellation::CancellationToken;
 use crate::runtime::events::{AgentKind, AgentRecord, AgentState, RuntimeEvent};
 use crate::runtime::ids::{AgentId, TaskId, WorkflowId};
@@ -236,7 +236,7 @@ impl WorkflowExecutor {
         &self,
         spec: WorkflowSpec,
     ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
-        validate_workflow(&spec)?;
+        validate_workflow_with_capabilities(&spec, None, &[], &self.runtime.capability_registry)?;
         let wf_id = WorkflowId::new();
         let wf_token = self.runtime.cancellation_token.child_token();
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
@@ -248,7 +248,7 @@ impl WorkflowExecutor {
         &self,
         spec: WorkflowSpec,
     ) -> Result<WorkflowId, WorkflowExecutionError> {
-        validate_workflow(&spec)?;
+        validate_workflow_with_capabilities(&spec, None, &[], &self.runtime.capability_registry)?;
         let wf_id = WorkflowId::new();
         let wf_token = self.runtime.cancellation_token.child_token();
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
@@ -278,7 +278,7 @@ impl WorkflowExecutor {
         spec: WorkflowSpec,
         validated_mutation_fingerprints: &HashSet<String>,
     ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
-        validate_workflow(&spec)?;
+        validate_workflow_with_capabilities(&spec, None, &[], &self.runtime.capability_registry)?;
         let wf_token = self.runtime.cancellation_token.child_token();
 
         let mut completed_phases = HashSet::new();

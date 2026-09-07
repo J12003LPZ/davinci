@@ -22,15 +22,28 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
+use unicode_width::UnicodeWidthChar;
 
 use super::app::{self, Flow};
 use super::model::Model;
 
 /// One frame of the clock. Both animations are derived from it.
 pub const TICK: Duration = Duration::from_millis(250);
+
+fn display_column_slice(text: &str, from: usize, to: usize) -> String {
+    let mut column = 0;
+    text.chars()
+        .filter(|ch| {
+            let width = UnicodeWidthChar::width(*ch).unwrap_or(0);
+            let keep = column >= from && column < to;
+            column = column.saturating_add(width);
+            keep
+        })
+        .collect()
+}
 
 /// Whether the terminal can tell `ctrl+m` from `enter`.
 ///
@@ -72,6 +85,7 @@ fn supports_keyboard_enhancement() -> bool {
 static DISAMBIGUATED: AtomicBool = AtomicBool::new(false);
 /// Whether the alternate screen is currently ours.
 static HELD: AtomicBool = AtomicBool::new(false);
+static MOUSE: AtomicBool = AtomicBool::new(false);
 
 /// Undo everything [`Session::open`] did, from anywhere, at most once.
 ///
@@ -82,6 +96,9 @@ pub fn restore() -> io::Result<()> {
     }
     if DISAMBIGUATED.swap(false, Ordering::SeqCst) {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    if MOUSE.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), event::DisableMouseCapture);
     }
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
@@ -278,6 +295,10 @@ pub struct Session {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     keyboard: Keyboard,
     paste: PasteFilter,
+    mic_rect: Option<Rect>,
+    rendered_lines: Vec<String>,
+    selection_anchor: Option<(u16, u16)>,
+    selection_focus: Option<(u16, u16)>,
 }
 
 impl Session {
@@ -311,6 +332,10 @@ impl Session {
             terminal,
             keyboard: Keyboard { disambiguated },
             paste: PasteFilter::default(),
+            mic_rect: None,
+            rendered_lines: Vec::new(),
+            selection_anchor: None,
+            selection_focus: None,
         })
     }
 
@@ -346,6 +371,9 @@ impl Session {
     pub fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
         loop {
             if let Some(ready) = self.paste.next_ready() {
+                if matches!(ready, Event::Resize(..)) {
+                    self.mic_rect = None;
+                }
                 return Ok(Some(ready));
             }
             // While a partial marker is held, wait only briefly: the rest of
@@ -367,6 +395,9 @@ impl Session {
                 self.paste.feed(event::read()?);
             }
             if let Some(ready) = self.paste.next_ready() {
+                if matches!(ready, Event::Resize(..)) {
+                    self.mic_rect = None;
+                }
                 return Ok(Some(ready));
             }
             // Everything read so far is inside a marker or a paste; poll
@@ -395,13 +426,134 @@ impl Session {
 
     /// Paint one frame.
     pub fn draw(&mut self, model: &Model) -> io::Result<()> {
+        self.mic_rect = None;
+        let mouse = true;
+        if mouse != MOUSE.load(Ordering::SeqCst) {
+            if mouse {
+                execute!(io::stdout(), event::EnableMouseCapture)?;
+            } else {
+                execute!(io::stdout(), event::DisableMouseCapture)?;
+            }
+            MOUSE.store(mouse, Ordering::SeqCst);
+        }
         let background = Style::default().bg(model.theme.background);
+        let mut mic_rect = None;
+        let mut rendered_lines = Vec::new();
+        let selection = self.selection_range();
         self.terminal.draw(|frame| {
             let area: Rect = frame.area();
-            let rows = app::compose(model, area.height);
-            frame.render_widget(Paragraph::new(rows).style(background), area);
+            let composed = app::compose_frame(model, area.height);
+            mic_rect = composed
+                .mic_rect
+                .filter(|r| r.right() <= area.width && r.bottom() <= area.height);
+            rendered_lines = composed.lines.iter().map(ToString::to_string).collect();
+            frame.render_widget(Paragraph::new(composed.lines).style(background), area);
+            if let Some((start, end)) = selection {
+                for row in start.1..=end.1.min(area.height.saturating_sub(1)) {
+                    let left = if row == start.1 { start.0 } else { 0 };
+                    let right = if row == end.1 {
+                        end.0.saturating_add(1).min(area.width)
+                    } else {
+                        area.width
+                    };
+                    if right > left {
+                        frame.buffer_mut().set_style(
+                            Rect::new(left, row, right.saturating_sub(left), 1),
+                            Style::default().add_modifier(Modifier::REVERSED),
+                        );
+                    }
+                }
+            }
         })?;
+        self.mic_rect = mic_rect;
+        self.rendered_lines = rendered_lines;
         Ok(())
+    }
+
+    fn selection_range(&self) -> Option<((u16, u16), (u16, u16))> {
+        let anchor = self.selection_anchor?;
+        let focus = self.selection_focus?;
+        Some(if (anchor.1, anchor.0) <= (focus.1, focus.0) {
+            (anchor, focus)
+        } else {
+            (focus, anchor)
+        })
+    }
+
+    /// Own left-drag selection while mouse reporting is enabled. Releasing the
+    /// button copies immediately, matching the upstream fullscreen terminal.
+    /// Returns true only when the microphone button was activated.
+    pub fn handle_mouse(&mut self, mouse: event::MouseEvent) -> bool {
+        use event::{MouseButton::Left, MouseEventKind};
+        let point = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(Left)
+                if self.mic_rect.is_some_and(|r| r.contains(point.into())) =>
+            {
+                self.selection_anchor = None;
+                self.selection_focus = None;
+                true
+            }
+            MouseEventKind::Down(Left) => {
+                self.selection_anchor = Some(point);
+                self.selection_focus = Some(point);
+                false
+            }
+            MouseEventKind::Drag(Left) if self.selection_anchor.is_some() => {
+                self.selection_focus = Some(point);
+                false
+            }
+            MouseEventKind::Up(Left) if self.selection_anchor.is_some() => {
+                self.selection_focus = Some(point);
+                if let Some(text) = self.selected_text() {
+                    crate::open_browser::copy_text(&text);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        if start == end {
+            return None;
+        }
+        let mut rows = Vec::new();
+        for row in start.1..=end.1 {
+            let line = self
+                .rendered_lines
+                .get(row as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            let from = if row == start.1 { start.0 as usize } else { 0 };
+            let to = if row == end.1 {
+                end.0.saturating_add(1) as usize
+            } else {
+                usize::MAX
+            };
+            rows.push(display_column_slice(line, from, to).trim_end().to_string());
+        }
+        let text = rows.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub fn mic_clicked(&self, mouse: event::MouseEvent) -> bool {
+        mouse.kind == event::MouseEventKind::Down(event::MouseButton::Left)
+            && self
+                .mic_rect
+                .is_some_and(|r| r.contains((mouse.column, mouse.row).into()))
+    }
+
+    pub fn mic_visible(&self) -> bool {
+        self.mic_rect.is_some()
+    }
+
+    pub fn input_pending(&self) -> bool {
+        !self.paste.ready.is_empty()
+            || self.paste.holding()
+            || self.paste.pasting.is_some()
+            || event::poll(Duration::ZERO).unwrap_or(true)
     }
 
     /// OSC 9;4 terminal progress, for tab strips that draw it (Windows
@@ -449,10 +601,7 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
                         Flow::Submit(text) => on_submit(model, text),
                         // The fixture runner has no agent to act on a
                         // choice; the live shell in `davinci_session` does.
-                        Flow::Choose(_)
-                        | Flow::Continue
-                        | Flow::Interrupt
-                        | Flow::CycleThinking => {}
+                        Flow::Choose(_) | Flow::Continue | Flow::Interrupt => {}
                     }
                 }
                 Event::Resize(width, height) => {
@@ -460,6 +609,9 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
                     model.height = height.max(4);
                 }
                 Event::Paste(text) => model.paste(&text),
+                Event::Mouse(mouse) => {
+                    session.handle_mouse(mouse);
+                }
                 _ => {}
             }
         }
@@ -480,6 +632,12 @@ mod tests {
     #[test]
     fn the_clock_is_two_hundred_and_fifty_milliseconds() {
         assert_eq!(TICK, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn display_column_slice_respects_wide_characters() {
+        assert_eq!(display_column_slice("ab界cd", 2, 4), "界");
+        assert_eq!(display_column_slice("ab界cd", 4, usize::MAX), "cd");
     }
 
     fn key(code: KeyCode) -> Event {

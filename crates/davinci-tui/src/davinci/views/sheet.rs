@@ -89,8 +89,7 @@ pub fn hint(theme: &Theme, text: &str) -> Vec<Span<'static>> {
     vec![span(text, theme.muted)]
 }
 
-/// A hint whose key does not work yet: drawn in the dim ramp so it reads as
-/// a promise, not an affordance (spec, *Out of scope*).
+/// A secondary explanatory hint. Only describe actions the input owner supports.
 pub fn hint_dim(theme: &Theme, text: &str) -> Vec<Span<'static>> {
     vec![span(text, theme.dim().border)]
 }
@@ -101,10 +100,9 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
     if model.overlay.is_some() {
         return None;
     }
-    Some(match model.screen {
-        Screen::Agent | Screen::Plan | Screen::Grafo | Screen::Memoria | Screen::Mensura => {
-            return None;
-        }
+    let mut chrome = match model.screen {
+        Screen::Agent => return None,
+        Screen::Plan | Screen::Grafo | Screen::Memoria | Screen::Mensura => SheetChrome::default(),
         Screen::Models => cogitator::chrome(model),
         Screen::Settings => settings::chrome(model),
         Screen::Thinking => thinking::chrome(model),
@@ -125,7 +123,63 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         Screen::Mcp => mcp::chrome(model),
         Screen::Permissions => permissions::chrome(model),
         Screen::Workflows => workflows::chrome(model),
-    })
+    };
+    // These surfaces own the keyboard. A drawn-but-inert composer is misleading.
+    chrome.composer = Composer::Hidden;
+    chrome.echo = None;
+    chrome.escape = Some("esc close");
+    let action = match model.screen {
+        Screen::Models | Screen::Thinking => Some("enter select"),
+        Screen::Settings => Some("enter change"),
+        Screen::Login => Some("enter configure"),
+        Screen::Resume => Some("enter resume"),
+        Screen::Tree => Some("enter switch"),
+        Screen::Trust => Some("enter decide"),
+        Screen::Permissions => Some(
+            if model
+                .permission_rows
+                .get(model.permission_index)
+                .is_some_and(|row| row.kind == "rule")
+            {
+                "enter remove rule"
+            } else {
+                "enter set mode"
+            },
+        ),
+        _ => None,
+    };
+    let picking = matches!(
+        model.screen,
+        Screen::Models
+            | Screen::Settings
+            | Screen::Thinking
+            | Screen::Login
+            | Screen::Resume
+            | Screen::Tree
+            | Screen::Permissions
+            | Screen::Diff
+            | Screen::Securitas
+    );
+    chrome.hints = vec![hint(
+        &model.theme,
+        if picking {
+            "↑↓ move"
+        } else {
+            "↑↓ scroll"
+        },
+    )];
+    if let Some(action) = action {
+        chrome.hints.push(hint(
+            &model.theme,
+            if model.section_offset.is_some() {
+                "enter back"
+            } else {
+                action
+            },
+        ));
+    }
+    chrome.hints.push(hint(&model.theme, "pgup/pgdn page"));
+    Some(chrome)
 }
 
 /// The hint row for this sheet, if it has one.
@@ -133,6 +187,37 @@ pub fn hint_row(model: &Model, chrome: &SheetChrome) -> Option<Line<'static>> {
     chrome
         .escape
         .map(|esc| ui::hint_row(model.width, &chrome.hints, Some(esc), &model.theme))
+}
+
+/// Human-readable section names; domain-specific content keeps its own structure.
+pub fn title(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Agent => "Conversation",
+        Screen::Plan => "Plan",
+        Screen::Grafo => "Code graph",
+        Screen::Memoria => "Memory recall",
+        Screen::Mensura => "Context budget",
+        Screen::Models => "Select model",
+        Screen::Settings => "Settings",
+        Screen::Thinking => "Model thinking level",
+        Screen::Login => "Providers",
+        Screen::Keys => "Keyboard shortcuts",
+        Screen::Resume => "Resume session",
+        Screen::Tree => "Session tree",
+        Screen::Compact => "Compaction",
+        Screen::Export => "Export session",
+        Screen::GraphRun => "Graph run",
+        Screen::Vectors => "Vector memory",
+        Screen::Governor => "Output governor",
+        Screen::Securitas => "Security report",
+        Screen::Trust => "Project trust",
+        Screen::Officina => "Reload",
+        Screen::Recovery => "Recovery",
+        Screen::Diff => "Review changes",
+        Screen::Mcp => "MCP servers",
+        Screen::Permissions => "Permissions",
+        Screen::Workflows => "Workflows",
+    }
 }
 
 #[cfg(test)]

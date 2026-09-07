@@ -9,6 +9,8 @@ mod davinci_sources;
 mod davinci_surfaces;
 #[cfg(unix)]
 mod experimental;
+mod voice_input;
+mod voice_models;
 #[cfg(not(unix))]
 #[allow(dead_code)]
 mod experimental {
@@ -297,6 +299,10 @@ fn main() {
 
 fn run(raw: Vec<String>) -> Result<i32, String> {
     apply_offline_mode(&raw);
+    let command_start = raw.iter().position(|arg| arg != "--offline").unwrap_or(0);
+    if raw.get(command_start).map(String::as_str) == Some("voice") {
+        return voice_models::cli(&raw[command_start + 1..]);
+    }
     // `--davinci --screen <id>` renders a mockup screen against fixtures for
     // comparison with docs/ui. The davinci shell is what interactive pi opens;
     // `--legacy-tui` (or `PI_DAVINCI=0`) asks for the previous chrome, which
@@ -1799,7 +1805,10 @@ fn complete_prompt_with_host(
             runtime_bus.subscribe(Arc::new(subscriber));
         }
     }
-    agent.runtime = Some(runtime_handle);
+    host.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .register_with(&runtime_handle.capability_registry);
+    agent.set_runtime(runtime_handle);
 
     let pre_hooks = user_hooks.clone();
     agent.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, args| {
@@ -2264,6 +2273,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     if let Some(prompt) = &prepared.text {
         if !prompt.trim().is_empty() || !prepared.images.is_empty() {
             match prepare_user_input(parsed, agent, prompt, &prepared.images, "print", None)? {
+                PreparedInput::Completed(code) => return Ok(code),
                 PreparedInput::Handled => {}
                 PreparedInput::Ready { text, images } => {
                     agent.prompt_with(&text, &images);
@@ -2279,6 +2289,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             continue;
         }
         match prepare_user_input(parsed, agent, extra, &[], "print", None)? {
+            PreparedInput::Completed(code) => return Ok(code),
             PreparedInput::Handled => {}
             PreparedInput::Ready { text, images } => {
                 agent.prompt_with(&text, &images);
@@ -2599,6 +2610,39 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         let mut command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
         let is_prompt = command.kind == "prompt";
         if is_prompt {
+            let message = command.message.as_deref().unwrap_or("");
+            if message.trim_start().starts_with('/') {
+                let (name, args) = parse_extension_command(message);
+                if matches!(
+                    name.as_str(),
+                    "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
+                ) {
+                    let locked = host.lock().unwrap_or_else(|e| e.into_inner());
+                    locked
+                        .native
+                        .lock()
+                        .map_err(|_| "native host lock poisoned")?
+                        .security
+                        .set_review_storage(default_agent_dir());
+                    let result = (|| {
+                        if matches!(name.as_str(), "security-scan" | "sec-resume") {
+                            configure_security_review(parsed, &runtime.agent, &locked)?;
+                        }
+                        locked.execute_native_command(&name, &args)
+                    })();
+                    let response = match result {
+                        Ok(value) => rpc::ok_response(command.id.clone(), "prompt", value),
+                        Err(error) => rpc::fail_response(command.id.clone(), "prompt", error),
+                    };
+                    output::write_raw_stdout_line(
+                        &serde_json::to_string(&response).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    continue;
+                }
+            }
+        }
+        if is_prompt {
             if let Some(err) = rpc_prompt_auth_error(&runtime) {
                 let response = rpc::fail_response(command.id.clone(), "prompt", err);
                 output::write_raw_stdout_line(
@@ -2621,7 +2665,7 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 None,
             )?;
             match prepared {
-                PreparedInput::Handled => {
+                PreparedInput::Handled | PreparedInput::Completed(_) => {
                     let response = rpc::ok_response(command.id.clone(), "prompt", None);
                     output::write_raw_stdout_line(
                         &serde_json::to_string(&response).map_err(|err| err.to_string())?,
@@ -2734,6 +2778,10 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         .map_err(|err| err.to_string())?;
     }
     crate::js_host::clear_ui_waiter();
+    {
+        let locked = host.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = locked.execute_native_command("sec-abort", "");
+    }
     emit_session_shutdown(parsed);
     *agent = runtime.agent;
     Ok(0)
@@ -4445,6 +4493,7 @@ fn apply_thinking_level(
 
 enum PreparedInput {
     Handled,
+    Completed(i32),
     Ready {
         text: String,
         images: Vec<davinci_ai::MessageContent>,
@@ -4474,6 +4523,79 @@ fn prepare_user_input(
         } else {
             let mut host = loaded_extension_host(parsed);
             apply_graph_session_context(parsed, agent, &host);
+            if matches!(name.as_str(), "security-scan" | "sec-resume") {
+                let request = if name == "security-scan" {
+                    native_extensions::security_scan::command::ScanCommand::parse(&args)
+                } else {
+                    native_extensions::security_scan::command::ScanCommand::parse("")
+                };
+                let format = request
+                    .as_ref()
+                    .map(|request| request.format)
+                    .unwrap_or(native_extensions::security_scan::command::ReportFormat::Terminal);
+                let outcome = (|| {
+                    request?;
+                    configure_security_review(parsed, agent, &host)?;
+                    let interrupt =
+                        native_extensions::security_scan::interrupt::Interrupt::install()?;
+                    let result = host
+                        .execute_native_command(&name, &args)?
+                        .ok_or("security command unavailable")?;
+                    let security = host
+                        .native
+                        .lock()
+                        .map_err(|_| "native host lock poisoned")?
+                        .security
+                        .clone();
+                    security.wait_for_review_interruptible(&interrupt);
+                    Ok::<_, String>(
+                        host.execute_native_command("sec-report", "")?
+                            .unwrap_or(result),
+                    )
+                })();
+                let report = outcome.unwrap_or_else(|error| serde_json::json!({"schemaVersion":2,"status":"failed","coverageComplete":false,"limitations":[error]}));
+                if parsed.mode == Some(Mode::Json) {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"security_scan_report","report":report})
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        native_extensions::security_scan::report::render(&report, format)?
+                    );
+                }
+                return Ok(PreparedInput::Completed(
+                    native_extensions::security_scan::report::exit_code(&report),
+                ));
+            }
+            if name == "sec-report" {
+                let report = host.execute_native_command(&name, &args)
+                    .and_then(|value| value.ok_or_else(|| "security report unavailable".to_string()))
+                    .unwrap_or_else(|error| serde_json::json!({"schemaVersion":2,"status":"failed","coverageComplete":false,"limitations":[error]}));
+                if parsed.mode == Some(Mode::Json) {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"security_scan_report","report":report})
+                    );
+                } else if report["schemaVersion"] == 2 {
+                    println!(
+                        "{}",
+                        native_extensions::security_scan::report::render(
+                            &report,
+                            native_extensions::security_scan::command::ReportFormat::Terminal
+                        )?
+                    );
+                } else {
+                    println!(
+                        "/{name}: {}",
+                        format_extension_command_result(report.clone())
+                    );
+                }
+                return Ok(PreparedInput::Completed(
+                    native_extensions::security_scan::report::exit_code(&report),
+                ));
+            }
             if let Some(result) = host.execute_native_command(&name, &args)? {
                 println!("/{name}: {}", format_extension_command_result(result));
                 return Ok(PreparedInput::Handled);
@@ -4590,17 +4712,6 @@ fn handle_user_line(
         }
         SlashAction::Prompt(prompt) => {
             submit_user_message(parsed, agent, session, &prompt, &[], tui)
-        }
-        SlashAction::OpenThinking => {
-            sync_session_thinking(session, agent);
-            session.open_thinking_selector(
-                load_settings(&default_agent_dir())
-                    .default_thinking_level
-                    .as_deref(),
-            );
-            session.chrome.status = "Select thinking level".into();
-            println!("{}", session.chrome.status);
-            Ok(true)
         }
         SlashAction::Status(message) => {
             if let Some(name) = message.strip_prefix("Unknown command /") {
@@ -6049,6 +6160,12 @@ fn host_invoke_shortcut(
     Ok(result)
 }
 
+thread_local! {
+    // The legacy chrome creates an extension host per command. Retain only its
+    // scanner controller, keyed by the actual session, between those calls.
+    static LEGACY_SECURITY: std::cell::RefCell<Option<(String, native_extensions::SecurityScanController)>> = const { std::cell::RefCell::new(None) };
+}
+
 fn try_extension_slash(
     parsed: &Args,
     agent: &mut Agent,
@@ -6057,8 +6174,45 @@ fn try_extension_slash(
     args: &str,
 ) -> Result<bool, String> {
     let mut host = loaded_extension_host(parsed);
+    let security_command = matches!(
+        name,
+        "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
+    );
+    let session_key = agent
+        .session
+        .as_ref()
+        .map(|session| session.header.id.clone())
+        .unwrap_or_else(|| agent.cwd.to_string_lossy().into_owned());
+    if security_command {
+        LEGACY_SECURITY.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some((key, controller)) = slot.as_mut() {
+                if key == &session_key {
+                    host.native
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .security = controller.clone();
+                } else {
+                    let _ = controller.command("sec-abort", "");
+                }
+            }
+        });
+    }
     apply_graph_session_context(parsed, agent, &host);
-    if let Some(result) = host.execute_native_command(name, args)? {
+    if matches!(name, "security-scan" | "sec-resume") {
+        configure_security_review(parsed, agent, &host)?;
+    }
+    let result = host.execute_native_command(name, args);
+    if security_command {
+        let controller = host
+            .native
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .security
+            .clone();
+        LEGACY_SECURITY.with(|slot| *slot.borrow_mut() = Some((session_key, controller)));
+    }
+    if let Some(result) = result? {
         push_native_panel(session, name, &result);
         session.chrome.status = format!("/{name}");
         return Ok(true);
@@ -6567,7 +6721,105 @@ fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>
 
 /// Hand the graph controller the session's model, thinking level, and trust
 /// decision so the workers it spawns inherit them.
+fn configure_security_review(
+    parsed: &Args,
+    agent: &Agent,
+    host: &ExtensionHost,
+) -> Result<(), String> {
+    use native_extensions::security_scan::worker::SecurityWorkerRunner;
+    if parsed.offline
+        || ["DAVINCI_OFFLINE", "PI_OFFLINE", "PI_DISABLE_NETWORK"]
+            .iter()
+            .any(|name| matches!(std::env::var(name).as_deref(), Ok("1" | "true" | "yes")))
+    {
+        if let Ok(path) = std::env::var("PI_SECURITY_SCAN_FIXTURE") {
+            let runner = SecurityWorkerRunner::from_offline_fixture(Path::new(&path))?;
+            let config = crate::settings::load_security_scan_config(
+                &default_agent_dir(),
+                &agent.cwd,
+                false,
+            )?;
+            let mut native = host
+                .native
+                .lock()
+                .map_err(|_| "native host lock poisoned")?;
+            native.security.configure_review(runner, config);
+            native.security.set_review_storage(default_agent_dir());
+            davinci_agent::runtime::capacity::bind_shared_directory(
+                default_agent_dir().join("capacity"),
+            );
+            return Ok(());
+        }
+        return Err(
+            "offline mode forbids security provider requests; no model review was started".into(),
+        );
+    }
+    if davinci_ai::trace::enabled() {
+        return Err("disable AI wire tracing before reviewing private source".into());
+    }
+    let settings = load_merged_settings_with_override(
+        &default_agent_dir(),
+        &agent.cwd,
+        parsed.project_trust_override,
+    );
+    let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    let config =
+        crate::settings::load_security_scan_config(&default_agent_dir(), &agent.cwd, trusted)?;
+    let models = available_models(parsed);
+    let model = find_model(&models, &agent.provider, &agent.model_id)
+        .cloned()
+        .ok_or("selected security review model is unavailable")?;
+    let mut storage = AuthStorage::create().map_err(|_| "cannot load provider authorization")?;
+    if let Some(key) = parsed.api_key.as_deref() {
+        storage.set_runtime_override(&agent.provider, key);
+    }
+    let env = std::env::vars().collect();
+    let auth = resolve_provider_auth(&agent.provider, &storage, &env, true)
+        .ok_or("selected security review provider has no existing authorization")?;
+    let supported = davinci_ai::get_supported_thinking_levels(&model);
+    let thinking = native_extensions::security_scan::worker::effective_thinking_level(
+        agent.thinking_level,
+        &supported,
+    )?;
+    let provenance = serde_json::json!({"provider":model.provider,"modelId":model.id,"requestedThinkingLevel":agent.thinking_level.as_str(),"effectiveThinkingLevel":thinking.as_str(),"qualityEvaluation":"unmeasured"});
+    let runner = SecurityWorkerRunner::new(move |request| {
+        let options = davinci_ai::StreamOptions {
+            thinking_level: Some(thinking),
+            timeout_ms: Some(120_000),
+            max_retries: Some(0),
+            max_tokens: Some(request.max_output_tokens),
+            install_telemetry: Some(false),
+            abort_signal: Some(request.run.abort_signal()),
+            session_id: Some(request.run.status().scan_id),
+            ..Default::default()
+        };
+        davinci_ai::live_complete_streaming_with_sink(
+            &model,
+            request.messages,
+            &auth,
+            Some(request.system),
+            request.tools,
+            &options,
+            &mut |_| {},
+        )
+        .map(|(response, _)| response)
+        .map_err(|_| "security provider request failed".into())
+    })
+    .with_provenance(provenance);
+    let mut native = host
+        .native
+        .lock()
+        .map_err(|_| "native host lock poisoned")?;
+    native.security.configure_review(runner, config);
+    native.security.set_review_storage(default_agent_dir());
+    davinci_agent::runtime::capacity::bind_shared_directory(default_agent_dir().join("capacity"));
+    Ok(())
+}
+
 fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHost) {
+    if let Ok(mut native) = host.native.lock() {
+        native.security.set_review_storage(default_agent_dir());
+    }
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),
         &agent.cwd,
@@ -9283,11 +9535,11 @@ mod tests {
         ));
         assert!(matches!(
             slash::parse_line("/thinking"),
-            slash::SlashAction::OpenThinking
+            slash::SlashAction::Status(_)
         ));
         assert!(matches!(
             slash::parse_line("/thinking high"),
-            slash::SlashAction::SetThinking(_)
+            slash::SlashAction::Status(_)
         ));
         assert_eq!(
             unknown_thinking_error("nope"),

@@ -494,6 +494,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);
@@ -610,6 +611,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);
@@ -782,6 +784,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);
@@ -925,6 +928,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
         let run = run_graph(options, deps);
         assert_eq!(run.phase, Phase::Done);
@@ -1047,6 +1051,7 @@ mod tests {
                 dry_run: false,
                 abort: Arc::new(AtomicBool::new(false)),
                 resume_artifacts: HashMap::new(),
+                resume_run: None,
             },
             sec_deps,
         );

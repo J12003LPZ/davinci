@@ -11,6 +11,11 @@ pub struct SlashCommand {
 
 pub fn builtin_slash_commands() -> Vec<SlashCommand> {
     [
+        (
+            "init",
+            "Analyze this project and create or update AGENTS.md",
+            Some("[focus]"),
+        ),
         ("settings", "Open settings menu", None),
         (
             "model",
@@ -18,7 +23,6 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             Some("<provider/model>"),
         ),
         ("tree", "Navigate session tree (switch branches)", None),
-        ("thinking", "Set thinking level", Some("<level>")),
         (
             "scoped-models",
             "Enable/disable models for Ctrl+P cycling",
@@ -37,12 +41,6 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("share", "Share session as a secret GitHub gist", None),
         ("copy", "Copy last agent message to clipboard", None),
         ("name", "Set session display name", None),
-        (
-            "session",
-            "Resume a previous session (or show session stats with /session stats)",
-            None,
-        ),
-        ("sessions", "Resume a previous session", None),
         ("changelog", "Show changelog entries", None),
         ("hotkeys", "Show all keyboard shortcuts", None),
         (
@@ -85,6 +83,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("cost", "Tokens and USD spent this session", None),
         ("status", "Model, permission, jobs, MCP, tokens", None),
         ("agents", "List custom agent profiles and status", None),
+        ("help", "Show all commands and shortcuts", None),
         ("quit", "Quit pi", None),
     ]
     .into_iter()
@@ -105,7 +104,6 @@ pub enum SlashAction {
     NewSession,
     Compact(Option<String>),
     OpenModel,
-    OpenThinking,
     SetModel(String),
     SetThinking(String),
     Export(Option<String>),
@@ -140,6 +138,27 @@ pub enum SlashAction {
     Agents,
 }
 
+/// Repository initialization uses the normal agent turn and its permission gates.
+fn init_prompt(focus: &str) -> String {
+    let mut prompt = String::from(
+        "Inspect this project's repository and create a concise AGENTS.md guide for future coding agents. \
+         Use the repository root when it is identifiable, otherwise the current working directory. \
+         Read existing instructions, README files, build manifests, scripts, CI configuration, and representative source files first. \
+         Include verified build, test, lint, and formatting commands; the main architecture and important paths; \
+         and repository-specific conventions and pitfalls. Distinguish documented commands from commands you actually ran. \
+         Do not invent commands, architecture, or test results. Avoid generic advice and exhaustive file listings. \
+         If AGENTS.md already exists, preserve its existing instructions and user edits, adding or correcting only evidence-backed project guidance. \
+         The output filename must be AGENTS.md. Do not create or modify CLAUDE.md or other files. \
+         Do not include secrets. Respect the current permission mode; if writing is unavailable, provide a draft and explain that it was not saved. \
+         Finish by reporting the file path and a brief summary of what changed."
+    );
+    if !focus.is_empty() {
+        prompt.push_str("\n\nAdditional user focus:\n");
+        prompt.push_str(focus);
+    }
+    prompt
+}
+
 pub fn parse_line(line: &str) -> SlashAction {
     let trimmed = line.trim();
     if !trimmed.starts_with('/') {
@@ -153,6 +172,7 @@ pub fn parse_line(line: &str) -> SlashAction {
     match name {
         "quit" | "exit" | "q" => SlashAction::Quit,
         "new" => SlashAction::NewSession,
+        "init" => SlashAction::Prompt(init_prompt(args)),
         "compact" => SlashAction::Compact(if args.is_empty() {
             None
         } else {
@@ -160,8 +180,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         }),
         "model" if args.is_empty() => SlashAction::OpenModel,
         "model" => SlashAction::SetModel(args.to_string()),
-        "thinking" if args.is_empty() => SlashAction::OpenThinking,
-        "thinking" => SlashAction::SetThinking(args.to_string()),
+        "thinking" => SlashAction::Status("Select a thinking level in /model.".into()),
         "export" => SlashAction::Export(if args.is_empty() {
             None
         } else {
@@ -259,11 +278,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_and_sessions_commands_route_to_resume() {
+    fn init_is_discoverable_and_expands_into_an_agents_file_task() {
+        assert!(builtin_slash_commands()
+            .iter()
+            .any(|command| command.name == "init"));
+        for command in ["/init", "  /init  ", "/init focus on Rust testing"] {
+            let SlashAction::Prompt(prompt) = parse_line(command) else {
+                panic!("init must run an agent turn")
+            };
+            assert!(prompt.contains("AGENTS.md"));
+            assert!(prompt.contains("existing instructions"));
+            assert!(!prompt.starts_with('/'));
+            if command.contains("focus on") {
+                assert!(prompt.contains("focus on Rust testing"));
+            }
+        }
+        assert_eq!(
+            parse_line("/initial"),
+            SlashAction::Prompt("/initial".into())
+        );
+    }
+
+    #[test]
+    fn session_aliases_stay_compatible_but_are_hidden_from_the_public_registry() {
         assert_eq!(parse_line("/session"), SlashAction::Resume);
         assert_eq!(parse_line("  /session  "), SlashAction::Resume);
         assert_eq!(parse_line("/sessions"), SlashAction::Resume);
         assert_eq!(parse_line("/resume"), SlashAction::Resume);
+
+        let names = builtin_slash_commands()
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "resume"));
+        assert!(names.iter().any(|name| name == "help"));
+        assert!(!names.iter().any(|name| name == "session"));
+        assert!(!names.iter().any(|name| name == "sessions"));
     }
 
     #[test]

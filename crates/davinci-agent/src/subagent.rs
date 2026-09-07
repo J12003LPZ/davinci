@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use crate::permission::{tool_class, PermissionMode, ToolClass};
 use crate::runtime::{
-    AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RuntimeHandle, WorktreeLease,
-    WorktreeManager,
+    AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RuntimeCapabilityRegistry,
+    RuntimeHandle, WorktreeLease, WorktreeManager,
 };
 use crate::tools::{ToolError, ToolResult};
 
@@ -186,6 +186,21 @@ pub fn scoped_tools_with_policy(
     parent: &[String],
     allow_mutation: bool,
 ) -> Vec<String> {
+    scoped_tools_with_registry(
+        requested,
+        parent,
+        allow_mutation,
+        &RuntimeCapabilityRegistry::with_builtins(),
+    )
+}
+
+/// Scope child tools using host-verified capability metadata.
+pub fn scoped_tools_with_registry(
+    requested: Option<&[String]>,
+    parent: &[String],
+    allow_mutation: bool,
+    registry: &RuntimeCapabilityRegistry,
+) -> Vec<String> {
     let wanted: Vec<String> = match requested {
         Some(list) if !list.is_empty() => list.to_vec(),
         _ => DEFAULT_SUBAGENT_TOOLS
@@ -201,8 +216,7 @@ pub fn scoped_tools_with_policy(
                 // Do not allow nested agent to prevent infinite fork recursion
                 name != "agent"
             } else {
-                !MUTATION_TOOLS.contains(&name.as_str())
-                    && matches!(tool_class(name), ToolClass::Read | ToolClass::Network)
+                !MUTATION_TOOLS.contains(&name.as_str()) && registry.is_read_only(name)
             }
         })
         .collect()
@@ -395,7 +409,19 @@ pub fn run_tool(
             .or_else(|| parent.abort.clone());
         let is_wt = spec.isolation.as_deref() == Some("worktree");
         let allow_mut = allow_mutation || (is_wt && !is_parent_readonly);
-        let scoped = scoped_tools_with_policy(spec.tools.as_deref(), parent_tools, allow_mut);
+        let fallback_registry;
+        let capability_registry = if let Some(runtime) = &parent.runtime {
+            &runtime.capability_registry
+        } else {
+            fallback_registry = RuntimeCapabilityRegistry::with_builtins();
+            &fallback_registry
+        };
+        let scoped = scoped_tools_with_registry(
+            spec.tools.as_deref(),
+            parent_tools,
+            allow_mut,
+            capability_registry,
+        );
 
         let mut lease_opt: Option<WorktreeLease> = None;
         if is_wt {
@@ -666,6 +692,26 @@ pub fn run_tool(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn verified_read_only_extension_tool_can_be_scoped_to_a_child() {
+        let registry = RuntimeCapabilityRegistry::new();
+        registry.register(crate::RuntimeCapability::new(
+            "extension_search",
+            crate::CapabilitySource::NativeExtension,
+            crate::ToolClass::Read,
+            true,
+            &json!({"type": "object"}),
+            Some("1".into()),
+        ));
+        let tools = scoped_tools_with_registry(
+            Some(&["extension_search".into()]),
+            &["extension_search".into()],
+            false,
+            &registry,
+        );
+        assert_eq!(tools, vec!["extension_search"]);
+    }
 
     #[test]
     fn mutation_tools_and_agent_are_stripped() {

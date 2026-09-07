@@ -8,20 +8,25 @@ use ratatui::text::{Line, Span};
 
 use crate::davinci::model::{Model, Startup};
 use crate::davinci::theme::{glyph, Theme};
-use crate::davinci::ui::{blank, indent, span, span_strong, truncate_run};
+use crate::davinci::ui::{blank, indent, paper_label, span, span_strong, truncate_run};
 
 /// Compact identity block, also kept above a short conversation. The path and
 /// selected model come from the running session, never from sample copy.
 pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let th = &model.theme;
     let mark = if model.width >= 48 {
-        [" ▐▛███▜▌  ", "▝▜█████▛▘ ", "  ▘▘ ▝▝   "]
+        [
+            " ▓▓▓▓▓╸      ",
+            " ▓▓  ▓▓      ",
+            " ▓▓  ▓▓      ",
+            " ▓▓▓▓▓╸      ",
+        ]
     } else {
-        ["", "", ""]
+        ["", "", "", ""]
     };
     let facts = [
         vec![
-            span("davinci", th.text).add_modifier(Modifier::BOLD),
+            paper_label("davinci", th, true),
             span(format!(" v{}", env!("CARGO_PKG_VERSION")), th.muted),
         ],
         vec![
@@ -29,11 +34,12 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
             span(format!(" · {}", model.thinking_level), th.muted),
         ],
         vec![span(info.cwd.clone(), th.muted)],
+        vec![span("CODE / TOOLS / CONTEXT", th.muted).add_modifier(Modifier::BOLD)],
     ];
     mark.into_iter()
         .zip(facts)
         .map(|(art, facts)| {
-            let mut run = vec![span(art, th.primary)];
+            let mut run = vec![span(art, th.text)];
             run.extend(facts);
             indent(
                 1.min(model.width),
@@ -53,9 +59,12 @@ pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     }
     rows.push(blank());
     for (command, description) in [
-        ("/graph <goal>", "Plan a task and follow its progress"),
+        ("/graph", "Plan a task and follow its progress"),
         ("/governor-status", "View compression and token savings"),
         ("/memory-status", "Browse the memory index"),
+        ("/model", "Choose and manage the active model"),
+        ("/resume", "Resume a previous session"),
+        ("/help", "Show all commands and shortcuts"),
     ] {
         rows.push(Line::from(vec![
             span_strong(format!("{command:<19}"), th.primary, th),
@@ -89,7 +98,7 @@ fn restored_row(theme: &Theme, restored: bool) -> Vec<Span<'static>> {
 
 /// Row count includes discovered resources.
 pub fn height(model: &Model) -> usize {
-    11 + model.startup.found.len()
+    15 + model.startup.found.len()
 }
 
 #[cfg(test)]
@@ -136,12 +145,39 @@ mod tests {
             .position(|row| row.contains("session restored"))
             .unwrap();
         assert!(rows[restored + 1].contains("loaded 1 context file · 41 skills"));
-        for command in ["/graph <goal>", "/governor-status", "/memory-status"] {
-            assert!(rows.iter().any(|row| row.contains(command)));
+        for command in [
+            "/graph",
+            "/governor-status",
+            "/memory-status",
+            "/model",
+            "/resume",
+            "/help",
+        ] {
+            assert!(
+                rows.iter().any(|row| row.contains(command)),
+                "missing {command}"
+            );
         }
+        assert!(!rows.iter().any(|row| row.contains("/session")));
+        assert!(!rows.iter().any(|row| row.contains("/sessions")));
         m.startup.restored = false;
         assert!(lines(&m, &m.startup)
             .iter()
             .any(|row| text(row).contains("new session")));
+    }
+
+    #[test]
+    fn banner_uses_editorial_masthead() {
+        let m = model(100);
+        let art = banner(&m, &m.startup)
+            .iter()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(art.contains("▓▓▓▓▓╸"));
+        assert!(art.contains("DAVINCI"));
+        assert!(art.contains("CODE / TOOLS / CONTEXT"));
+        assert!(!art.contains("▐▛███▜▌"));
+        assert!(!art.contains("▝▜█████▛▘"));
     }
 }

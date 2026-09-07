@@ -410,9 +410,11 @@ mod tests {
         let m = model(100);
         let rows = lines(&m, &[Entry::prose("# Title\n\n- one\n- two")], 100);
         let texts: Vec<String> = rows.iter().map(text).collect();
-        assert_eq!(texts[0], "Title");
+        assert_eq!(texts[0], "● Title");
         assert!(
-            texts.iter().any(|row| row.starts_with("· one")),
+            texts
+                .iter()
+                .any(|row| row.trim_start().starts_with("· one")),
             "{texts:?}"
         );
     }

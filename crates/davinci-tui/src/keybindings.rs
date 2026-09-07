@@ -1,11 +1,12 @@
 //! App keybindings matching TS `keybindings.ts` + `keybindings.json`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keybindings {
     bindings: HashMap<String, Vec<String>>,
+    explicit: HashSet<String>,
 }
 
 impl Default for Keybindings {
@@ -23,7 +24,10 @@ impl Keybindings {
                 keys.iter().map(|key| (*key).to_string()).collect(),
             );
         }
-        Self { bindings }
+        Self {
+            bindings,
+            explicit: HashSet::new(),
+        }
     }
 
     pub fn load(agent_dir: &Path) -> Self {
@@ -53,6 +57,7 @@ impl Keybindings {
                 serde_json::Value::Null => Vec::new(),
                 _ => continue,
             };
+            bindings.explicit.insert(action.clone());
             bindings.bindings.insert(action, parsed);
         }
         bindings
@@ -60,6 +65,70 @@ impl Keybindings {
 
     pub fn keys_for(&self, action: &str) -> &[String] {
         self.bindings.get(action).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Derive composer-only defaults without changing legacy/tree mappings or disk.
+    pub fn with_voice(&self, enabled: bool) -> (Self, Option<String>) {
+        let mut effective = self.clone();
+        let voice = "davinci.voice.toggle";
+        let tools = "davinci.tools.expand";
+        if !enabled {
+            if !self.explicit.contains(voice) {
+                effective.bindings.remove(voice);
+            }
+            if !self.explicit.contains(tools) {
+                effective
+                    .bindings
+                    .insert(tools.into(), vec!["ctrl+t".into()]);
+            }
+            return (effective, None);
+        }
+        if !self.explicit.contains(voice) {
+            effective
+                .bindings
+                .insert(voice.into(), vec!["ctrl+t".into()]);
+        }
+        if !self.explicit.contains(tools) {
+            effective
+                .bindings
+                .insert(tools.into(), vec!["alt+t".into()]);
+        }
+        let tools_conflict = !self.explicit.contains(tools)
+            && self.bindings.iter().any(|(action, keys)| {
+                action != tools
+                    && self.explicit.contains(action)
+                    && !action.starts_with("app.tree.")
+                    && !action.starts_with("app.models.")
+                    && !action.starts_with("app.session.")
+                    && keys.iter().any(|key| key_to_bytes(key) == "\x1bt")
+            });
+        if tools_conflict {
+            effective.bindings.insert(tools.into(), Vec::new());
+        }
+        let collision = effective.keys_for(voice).iter().any(|key| {
+            effective.bindings.iter().any(|(action, keys)| {
+                action != voice
+                    && !action.starts_with("app.tree.")
+                    && !action.starts_with("app.session.")
+                    && !action.starts_with("app.models.")
+                    && !action.starts_with("tui.select.")
+                    && action != "app.thinking.toggle"
+                    && keys
+                        .iter()
+                        .any(|other| key_to_bytes(other) == key_to_bytes(key))
+            })
+        });
+        if collision {
+            effective.bindings.insert(voice.into(), Vec::new());
+            return (effective,Some("Voice shortcut conflicts with an existing binding; use the mic or choose a unique voice binding".into()));
+        }
+        (
+            effective,
+            tools_conflict.then(|| {
+                "Alt+T is explicitly assigned; choose a tool-expansion shortcut in keybindings"
+                    .into()
+            }),
+        )
     }
 
     pub fn matches(&self, data: &str, action: &str) -> bool {
@@ -256,6 +325,7 @@ pub fn key_to_bytes(key: &str) -> String {
         "alt+q" => "\x1bq".into(),
         "alt+v" => "\x1bv".into(),
         "alt+b" => "\x1bb".into(),
+        "alt+t" => "\x1bt".into(),
         "alt+f" => "\x1bf".into(),
         "alt+d" => "\x1bd".into(),
         "alt+y" => "\x1by".into(),
@@ -354,6 +424,32 @@ fn kitty_code_matches(data: &str, code: u32, bits: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_defaults_preserve_legacy_and_explicit_shortcuts() {
+        let original = Keybindings::defaults();
+        let (keys, notice) = original.with_voice(true);
+        assert!(notice.is_none());
+        assert!(keys.matches("\x14", "davinci.voice.toggle"));
+        assert!(keys.matches("\x1b[116;5u", "davinci.voice.toggle"));
+        assert!(keys.matches("\x1bt", "davinci.tools.expand"));
+        assert!(keys.matches("\x14", "app.tree.filter.noTools"));
+        assert!(keys.matches("\x14", "app.thinking.toggle"));
+        assert_eq!(keys.with_voice(false).0, original);
+        let (keys, notice) =
+            Keybindings::from_json(r#"{"tui.editor.yank":"alt+t"}"#).with_voice(true);
+        assert!(notice.is_some());
+        assert!(keys.keys_for("davinci.tools.expand").is_empty());
+        assert!(keys.matches("\x1bt", "tui.editor.yank"));
+        for raw in [
+            r#"{"davinci.tools.expand":"ctrl+t"}"#,
+            r#"{"davinci.voice.toggle":"ctrl+p"}"#,
+        ] {
+            let (keys, notice) = Keybindings::from_json(raw).with_voice(true);
+            assert!(notice.is_some());
+            assert!(keys.keys_for("davinci.voice.toggle").is_empty());
+        }
+    }
 
     #[test]
     fn loads_user_overrides_from_json() {

@@ -182,18 +182,35 @@ fn sleep_retry(ms: u64) {
 
 /// TS `retryProviderRequest`.
 pub fn retry_provider_request<T, F>(
-    mut request: F,
+    request: F,
     options: ProviderRetryOptions,
 ) -> Result<T, ProviderError>
 where
     F: FnMut() -> Result<T, ProviderError>,
 {
+    retry_provider_request_controlled(request, options, None, sleep_retry)
+}
+
+/// Retry with interruptible, bounded wait slices. The injected wait exercises
+/// the same cancellation decisions in offline fixtures as in production.
+pub fn retry_provider_request_controlled<T, F, W>(
+    mut request: F,
+    options: ProviderRetryOptions,
+    abort: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    mut wait: W,
+) -> Result<T, ProviderError>
+where
+    F: FnMut() -> Result<T, ProviderError>,
+    W: FnMut(u64),
+{
     let max_retries = options.max_retries;
     let mut retries_remaining = max_retries;
     loop {
+        check_retry_abort(abort)?;
         match request() {
             Ok(value) => return Ok(value),
             Err(error) => {
+                check_retry_abort(abort)?;
                 if retries_remaining == 0 || !is_retryable_provider_error(&error) {
                     return Err(error);
                 }
@@ -209,9 +226,25 @@ where
                     options.max_retry_delay_ms,
                     now_ms,
                 )?;
-                sleep_retry(delay);
+                let mut remaining = delay;
+                while remaining > 0 {
+                    check_retry_abort(abort)?;
+                    let slice = remaining.min(25);
+                    wait(slice);
+                    remaining -= slice;
+                }
             }
         }
+    }
+}
+
+fn check_retry_abort(
+    abort: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), ProviderError> {
+    if abort.is_some_and(|signal| signal.load(std::sync::atomic::Ordering::SeqCst)) {
+        Err(ProviderError::new(None, "Request aborted"))
+    } else {
+        Ok(())
     }
 }
 
@@ -246,6 +279,37 @@ pub fn provider_error_from_ureq(err: ureq::Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_during_provider_backoff_sends_no_request() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut calls = 0;
+        let mut waited = 0;
+        let result = retry_provider_request_controlled(
+            || {
+                calls += 1;
+                Err::<(), _>(
+                    ProviderError::new(Some(429), "wait").with_header("retry-after-ms", "1000"),
+                )
+            },
+            ProviderRetryOptions {
+                max_retries: 3,
+                max_retry_delay_ms: None,
+            },
+            Some(&abort),
+            |ms| {
+                waited += ms;
+                abort.store(true, Ordering::SeqCst);
+            },
+        );
+        assert!(result.unwrap_err().message.contains("aborted"));
+        assert_eq!(calls, 1);
+        assert_eq!(waited, 25);
+    }
 
     #[test]
     fn retries_retryable_provider_errors() {

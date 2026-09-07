@@ -23,6 +23,18 @@ use super::theme::{State, Theme};
 /// belongs to visible (design.md §2).
 pub const SUGGESTION_ROWS: usize = 6;
 
+#[derive(Debug, Default, Clone)]
+pub struct VoiceView {
+    pub enabled: bool,
+    pub mouse: bool,
+    pub active: bool,
+    pub blocks_send: bool,
+    pub label: String,
+    pub notice: String,
+    pub setup: bool,
+    pub setup_rows: Vec<String>,
+}
+
 /// Da Vinci's composer text backed by the mature shared [`Editor`].
 ///
 /// `Deref<str>` and the string conversions keep the renderer/fixture surface
@@ -931,6 +943,8 @@ pub struct Facts {
 /// listed, dimmed, so the catalog reads the same every time.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogRow {
+    pub reasoning_levels: Vec<String>,
+    pub reasoning_index: usize,
     pub name: String,
     /// What follows the name in border ink: `router :8080` for a local model.
     pub detail: String,
@@ -1386,6 +1400,11 @@ pub struct Model {
     pub governor_notice: Option<(String, std::time::Instant)>,
     /// Reading position in graph, governor, and vector memory sheets.
     pub feature_scroll: usize,
+    /// Manual reading position; arrows return to selection-following mode.
+    pub section_offset: Option<usize>,
+    pub overlay_offset: Option<usize>,
+    /// Feedback for an operation that failed while its section stays open.
+    pub section_notice: Option<String>,
     /// The tick the caret last moved on. The blink phase is measured from here
     /// rather than from zero, so a caret being typed at or arrowed across is
     /// solid and only resumes blinking once the composer has been left alone.
@@ -1398,6 +1417,9 @@ pub struct Model {
     pub codex: bool,
 
     pub composer: Composer,
+    /// Lightweight host projection; never owns native/audio resources.
+    pub voice: VoiceView,
+    pub composer_epoch: u64,
     /// Configurable bindings shared with the regular TUI editor.
     pub keybindings: Keybindings,
     /// `(key, extension path)` for every `pi.registerShortcut` an extension
@@ -1577,6 +1599,9 @@ impl Model {
             tick: 0,
             governor_notice: None,
             feature_scroll: 0,
+            section_offset: None,
+            overlay_offset: None,
+            section_notice: None,
             caret_moved_at: 0,
             animate,
             theme,
@@ -1584,6 +1609,8 @@ impl Model {
             overlay: None,
             codex: false,
             composer: Composer::default(),
+            voice: VoiceView::default(),
+            composer_epoch: 0,
             keybindings: Keybindings::defaults(),
             extension_shortcuts: Vec::new(),
             terminal_input_registered: false,
@@ -1727,6 +1754,7 @@ impl Model {
 
     /// Move the selection in whichever list is open.
     pub fn move_selection(&mut self, delta: isize) {
+        self.overlay_offset = None;
         match self.overlay {
             Some(Overlay::Instrumenta) => {
                 let len = self.filtered_corpus().len();
@@ -1809,8 +1837,8 @@ impl Model {
             Screen::Securitas => self.security_index,
             Screen::Diff => self.diff_index,
             Screen::Permissions => self.permission_index,
-            Screen::Workflows => self.workflow_index,
-            _ => 0,
+            Screen::Workflows => self.feature_scroll,
+            _ => self.feature_scroll,
         }
     }
 
@@ -1870,6 +1898,11 @@ impl Model {
     /// composer — the block was pasted, not typed, so none of them is a
     /// submit — and are flattened in a query, which is one line by definition.
     pub fn paste(&mut self, text: &str) {
+        if (self.screen != Screen::Agent || self.overlay.is_some() || self.codex_open())
+            && self.overlay != Some(Overlay::Instrumenta)
+        {
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.overlay == Some(Overlay::Instrumenta) {
             self.type_char(&text.replace('\n', " "));
@@ -2064,13 +2097,64 @@ impl Model {
         }
     }
 
+    pub fn voice_eligible(&self) -> bool {
+        self.screen == Screen::Agent
+            && self.overlay.is_none()
+            && !self.codex_open()
+            && !self.voice.setup
+    }
+
+    pub fn replace_composer(&mut self, text: impl Into<String>) {
+        self.composer_epoch = self.composer_epoch.saturating_add(1);
+        self.composer.set_text(text);
+        self.mark_caret_moved();
+        self.refresh_suggestions();
+    }
+
+    /// Keep the same cursor/edit operations available during agent generation.
+    pub fn edit_composer_key(&mut self, data: &str) -> bool {
+        if !crate::interaction::apply_editor_key(
+            self.composer.editor_mut(),
+            &self.keybindings,
+            data,
+        ) {
+            return false;
+        }
+        self.refresh_suggestions();
+        self.mark_caret_moved();
+        true
+    }
+
+    /// One editor transaction at the current caret, never a submission.
+    pub fn insert_dictation(
+        &mut self,
+        text: &str,
+        epoch: u64,
+    ) -> Result<bool, davinci_voice::normalize::TextError> {
+        if epoch != self.composer_epoch || !self.voice_eligible() {
+            return Ok(false);
+        }
+        let text = davinci_voice::normalize::insertion(
+            text,
+            &self.composer,
+            self.composer.editor().cursor,
+        )?;
+        if text.is_empty() {
+            return Ok(false);
+        }
+        self.composer.push_str(&text);
+        self.mark_caret_moved();
+        self.refresh_suggestions();
+        Ok(true)
+    }
+
     /// Enter sends. An empty composer sends nothing.
     ///
     /// The line goes through [`Editor::submit`], which is what records it in
     /// the composer history and expands any paste markers — taking the buffer
     /// directly shipped markers literally and remembered nothing.
     pub fn submit(&mut self) {
-        if self.composer.trim().is_empty() {
+        if self.voice.blocks_send || self.composer.trim().is_empty() {
             return;
         }
         self.mark_caret_moved();
@@ -2089,7 +2173,7 @@ impl Model {
     /// Returns whether anything was queued. Queued lines join the history
     /// too: they were typed and sent, only later.
     pub fn queue(&mut self) -> bool {
-        if self.composer.trim().is_empty() {
+        if self.voice.blocks_send || self.composer.trim().is_empty() {
             return false;
         }
         self.mark_caret_moved();
@@ -2127,11 +2211,15 @@ impl Model {
 
     /// esc closes the instrument in hand and returns to the transcript.
     pub fn close(&mut self) {
+        self.section_offset = None;
+        self.overlay_offset = None;
+        self.section_notice = None;
         self.screen = Screen::Agent;
         self.overlay = None;
     }
 
     pub fn toggle_overlay(&mut self, overlay: Overlay) {
+        self.overlay_offset = None;
         if self.overlay == Some(overlay) {
             self.overlay = None;
         } else {
@@ -2142,6 +2230,8 @@ impl Model {
 
     pub fn toggle_screen(&mut self, screen: Screen) {
         self.feature_scroll = 0;
+        self.section_offset = None;
+        self.section_notice = None;
         if self.screen == screen {
             self.screen = Screen::Agent;
         } else {
@@ -2197,6 +2287,24 @@ pub fn wrap_index(index: usize, delta: isize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictation_inserts_at_live_cursor_once_without_sending() {
+        let mut m = model(100);
+        m.composer.push_str("abXY");
+        m.composer.editor_mut().cursor = 2;
+        let entries = m.transcript.len();
+        assert!(m.insert_dictation("hello\n世界", m.composer_epoch).unwrap());
+        assert_eq!(m.composer.to_string(), "ab hello\n世界XY");
+        assert_eq!(m.transcript.len(), entries);
+        assert!(m.queued.is_empty());
+        m.composer.editor_mut().undo();
+        assert_eq!(m.composer.to_string(), "abXY");
+        m.replace_composer("new draft");
+        assert!(!m.insert_dictation("stale", 0).unwrap());
+        m.overlay = Some(Overlay::Instrumenta);
+        assert!(!m.insert_dictation("modal", m.composer_epoch).unwrap());
+    }
     use crate::davinci::theme::ColorDepth;
 
     fn model(width: u16) -> Model {
@@ -2401,7 +2509,7 @@ mod tests {
     #[test]
     fn backspacing_narrows_what_is_offered() {
         let mut m = with_commands();
-        m.type_char("/settingsx");
+        m.type_char("/settingszzz");
         assert!(m.suggestions.is_none(), "nothing matches that");
         m.backspace();
         assert!(m.suggestions.is_some(), "removing the typo offers again");

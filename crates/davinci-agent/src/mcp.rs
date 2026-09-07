@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use crate::permission::ToolClass;
+use crate::runtime::{CapabilitySource, RuntimeCapability, RuntimeCapabilityRegistry};
 use crate::tools::{AgentTool, ToolError, ToolResult};
 
 /// One connected (or failed) MCP server, as `/mcp` lists it.
@@ -120,6 +122,34 @@ impl McpRegistry {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Describe every connected MCP tool using the shared runtime capability contract.
+    pub fn capabilities(&self) -> Vec<RuntimeCapability> {
+        let read_only = self.read_only_names();
+        self.specs()
+            .into_iter()
+            .map(|tool| {
+                let is_read_only = read_only.contains(&tool.name);
+                RuntimeCapability::new(
+                    tool.name,
+                    CapabilitySource::Mcp,
+                    if is_read_only {
+                        ToolClass::Read
+                    } else {
+                        ToolClass::Other
+                    },
+                    is_read_only,
+                    &tool.parameters,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// Register the current MCP tool set with the shared runtime registry.
+    pub fn register_with(&self, registry: &RuntimeCapabilityRegistry) {
+        registry.register_all(self.capabilities());
     }
 
     /// Resources currently listed, for `mcp_read`'s description.
@@ -327,6 +357,15 @@ mod tests {
         assert_eq!(specs[0].name, "mcp__memory__echo");
         assert!(specs[0].description.starts_with("mcp:memory."));
         assert!(registry.read_only_names().contains("mcp__memory__echo"));
+        let capabilities = registry.capabilities();
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].name, "mcp__memory__echo");
+        assert_eq!(capabilities[0].source, crate::CapabilitySource::Mcp);
+        assert!(capabilities[0].read_only);
+        assert_eq!(capabilities[0].tool_class, crate::ToolClass::Read);
+        let runtime_registry = crate::RuntimeCapabilityRegistry::new();
+        registry.register_with(&runtime_registry);
+        assert!(runtime_registry.is_read_only("mcp__memory__echo"));
         let result = registry
             .call("memory", "echo", &json!({"text": "hi"}))
             .unwrap();

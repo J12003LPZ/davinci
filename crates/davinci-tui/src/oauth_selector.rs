@@ -153,102 +153,63 @@ impl OAuthSelector {
     }
 
     fn format_status(provider: &AuthSelectorProvider, theme: &Theme) -> String {
-        let Some(status_type) = provider.status_type.as_deref() else {
-            return theme.fg("muted", " • unconfigured");
+        let status = match provider.status_type.as_deref() {
+            None => "not configured".to_string(),
+            Some(kind) if kind != provider.auth_type => {
+                format!("{} configured", format_auth_selector_provider_type(kind))
+            }
+            Some(_) => "configured".to_string(),
         };
-        if status_type != provider.auth_type {
-            let label = if status_type == "oauth" {
-                "subscription configured"
-            } else {
-                "API key configured"
-            };
-            return format!("{}{}", theme.fg("muted", " • "), theme.fg("warning", label));
-        }
-        let source = provider.status_source.as_deref().unwrap_or("");
-        if source.is_empty() || source == "OAuth" || source == "stored credential" {
-            return theme.fg("success", " ✓ configured");
-        }
-        let env_like = source.chars().all(|ch| {
-            ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == ',' || ch == ' '
-        }) && source
-            .split(", ")
-            .all(|part| part.starts_with(|ch: char| ch.is_ascii_uppercase()));
-        let shown = if env_like {
-            format!("env: {source}")
-        } else {
-            source.to_string()
-        };
-        theme.fg("success", &format!(" ✓ {shown}"))
+        theme.fg("muted", &status)
     }
 }
 
 impl Component for OAuthSelector {
     fn render(&self, width: usize) -> Vec<String> {
         let title = if self.mode == AuthSelectorMode::Login {
-            "Select provider to configure:"
+            "Configure provider"
         } else {
-            "Select provider to logout:"
+            "Log out provider"
         };
-        let mut lines = vec![
-            self.theme.fg("accent", &self.theme.bold(title)),
-            String::new(),
-        ];
-        lines.extend(self.search.render(width.saturating_sub(2).max(1)));
-        lines.push(String::new());
+        let mut section = crate::render::CommandSection::new(width, title, Some(&self.theme));
+        section.input(self.search.render(width));
         if self.filtered.is_empty() {
-            let message = if self.all.is_empty() {
+            section.detail(if self.all.is_empty() {
                 if self.mode == AuthSelectorMode::Login {
-                    "No providers available"
+                    "No providers available."
                 } else {
                     "No providers logged in. Use /login first."
                 }
             } else {
-                "No matching providers"
-            };
-            lines.push(self.theme.fg("muted", &format!("  {message}")));
-            return lines;
+                "No matching providers."
+            });
         }
-        let max_visible = 8usize;
-        let start = self
-            .selected
-            .saturating_sub(max_visible / 2)
-            .min(self.filtered.len().saturating_sub(max_visible));
-        let end = (start + max_visible).min(self.filtered.len());
-        for (offset, provider) in self.filtered[start..end].iter().enumerate() {
-            let index = start + offset;
-            let auth_type_label = if self.show_auth_type_labels {
-                self.theme.fg(
-                    "muted",
-                    &format!(
-                        " [{}]",
-                        format_auth_selector_provider_type(&provider.auth_type)
-                    ),
-                )
-            } else {
-                String::new()
-            };
-            let status = Self::format_status(provider, &self.theme);
-            let line = if index == self.selected {
-                format!(
-                    "{}{}{auth_type_label}{status}",
-                    self.theme.fg("accent", "→ "),
-                    self.theme.fg("accent", &provider.name)
-                )
-            } else {
-                format!(
-                    "  {}{auth_type_label}{status}",
-                    self.theme.fg("text", &provider.name)
-                )
-            };
-            lines.push(line);
+        for index in crate::render::selection_window(self.selected, self.filtered.len(), 8) {
+            let provider = &self.filtered[index];
+            section.item(
+                index == self.selected,
+                &provider.name,
+                &Self::format_status(provider, &self.theme),
+            );
+            if index == self.selected {
+                section.detail(&format!("Provider: {}", provider.id));
+                if self.show_auth_type_labels || provider.method_name.is_some() {
+                    section.detail(&format!(
+                        "Method: {}",
+                        provider
+                            .method_name
+                            .as_deref()
+                            .unwrap_or(&provider.auth_type)
+                    ));
+                }
+                if let Some(source) = &provider.status_source {
+                    section.detail(&format!("Source: {source}"));
+                }
+            }
         }
-        if start > 0 || end < self.filtered.len() {
-            lines.push(self.theme.fg(
-                "muted",
-                &format!("  ({}/{})", self.selected + 1, self.filtered.len()),
-            ));
-        }
-        lines
+        section.position(self.selected, self.filtered.len(), 8);
+        section.hint("↑↓ move · enter select · esc cancel");
+        section.finish()
     }
 
     fn invalidate(&mut self) {}
@@ -283,10 +244,11 @@ mod tests {
             None,
         );
         let rendered = selector.render(40).join("\n");
-        assert!(rendered.contains("Select provider to configure:"));
-        assert!(rendered.contains("unconfigured"));
-        assert!(rendered.contains("env: OPENAI_API_KEY"));
+        assert!(rendered.contains("Configure provider"));
+        assert!(rendered.contains("not configured"));
         selector.handle_key("open");
+        let filtered = selector.render(40).join("\n");
+        assert!(filtered.contains("Source: OPENAI_API_KEY"), "{filtered:?}");
         assert_eq!(
             selector.handle_key("\r"),
             OAuthSelectorAction::Select {
@@ -300,6 +262,8 @@ mod tests {
     fn logout_empty_copy_matches_ts() {
         let selector = OAuthSelector::new(AuthSelectorMode::Logout, Vec::new(), None);
         let rendered = selector.render(40).join("\n");
-        assert!(rendered.contains("No providers logged in. Use /login first."));
+        assert!(rendered.contains("No providers logged in."));
+        assert!(rendered.contains("Use /login"), "{rendered:?}");
+        assert!(rendered.contains("first."), "{rendered:?}");
     }
 }

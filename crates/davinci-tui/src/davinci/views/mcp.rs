@@ -1,189 +1,160 @@
-//! `/mcp`. Connected MCP servers, their transport, and whether they answered.
-//!
-//! No TypeScript counterpart. Phase 4 spec:
-//! `docs/superpowers/specs/2026-09-01-native-mcp-design.md`.
+//! MCP server status, using actual transports, tool counts and errors.
 
+use super::sheet::{hint, Composer, SheetChrome};
+use crate::davinci::ui::{section_detail, section_state, span};
+use crate::davinci::{model::Model, theme::State};
 use ratatui::text::Line;
-
-use super::sheet::{facts, Composer, SheetChrome};
-use crate::davinci::model::Model;
-use crate::davinci::theme::{glyph, State, Theme};
-use crate::davinci::ui::{blank, span, span_strong, wrap, MEASURE};
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let Some(sheet) = model.mcp.as_ref() else {
-        return vec![Line::from(vec![span(
-            "no MCP servers configured — edit ~/.pi/agent/mcp.json",
-            th.muted,
-        )])];
+    let width = model.width;
+    let Some(sheet) = &model.mcp else {
+        return section_detail(
+            width,
+            th,
+            "MCP server status is unavailable. Check your MCP configuration.",
+        );
     };
-
-    let mut out: Vec<Line<'static>> = Vec::new();
-
+    let mut rows = Vec::new();
     if sheet.servers.is_empty() {
-        out.push(Line::from(vec![span("no servers in mcp.json", th.muted)]));
-    } else {
-        for server in &sheet.servers {
-            out.push(row(server, th));
-            if let Some(error) = &server.error {
-                for line in wrap(error, MEASURE.saturating_sub(6)) {
-                    out.push(Line::from(vec![
-                        span("      ", th.muted),
-                        span(line, th.error),
-                    ]));
+        rows.extend(section_detail(width, th, "No MCP servers configured."));
+    }
+    for server in &sheet.servers {
+        let state = match server.status.as_str() {
+            "connected" => State::Done,
+            "disabled" => State::Skipped,
+            "connecting" | "pending" => State::Active,
+            _ => State::Failed,
+        };
+        rows.extend(section_state(width, th, state, &server.name));
+        rows.extend(section_detail(
+            width,
+            th,
+            &format!(
+                "{} · {} · {} tools",
+                server.status, server.transport, server.tools
+            ),
+        ));
+        if let Some(error) = &server.error {
+            let mut error = section_detail(width, th, error);
+            for row in &mut error {
+                for span in &mut row.spans {
+                    span.style.fg = Some(th.error);
                 }
             }
+            rows.extend(error);
         }
     }
-
-    out.push(blank());
-    let connected = sheet
-        .servers
-        .iter()
-        .filter(|server| server.status == "connected")
-        .count();
-    let tools: usize = sheet.servers.iter().map(|server| server.tools).sum();
-    out.push(Line::from(vec![span(
-        format!(
-            "{connected} of {} connected · {tools} tools",
-            sheet.servers.len()
-        ),
-        th.muted,
-    )]));
     if !sheet.config_path.is_empty() {
-        out.push(Line::from(vec![
-            span("edit ", th.muted),
-            span(sheet.config_path.clone(), th.text),
-        ]));
+        rows.extend(section_detail(
+            width,
+            th,
+            &format!("Config: {}", sheet.config_path),
+        ));
     }
-    out
+    rows
 }
 
-fn row(server: &crate::davinci::model::McpServerRow, th: &Theme) -> Line<'static> {
-    let (state, color) = match server.status.as_str() {
-        "connected" => (State::Done, th.success),
-        "disabled" => (State::Skipped, th.border),
-        _ => (State::Failed, th.error),
-    };
-    Line::from(vec![
-        span(format!("{} ", glyph::BRANCH), th.border),
-        span_strong(format!("{} ", state.glyph()), color, th),
-        span(format!("{:<16}", server.name), th.text),
-        span(format!("{:<8}", server.transport), th.muted),
-        span(
-            if server.status == "connected" {
-                if server.tools == 1 {
-                    "1 tool".into()
-                } else {
-                    format!("{} tools", server.tools)
-                }
-            } else {
-                server.status.clone()
-            },
-            color,
-        ),
-    ])
-}
-
-/// The sheet's frame (design.md §11): servers and tools in the header, how
-/// many answered in the status bar, the command echoed and offered again.
 pub fn chrome(model: &Model) -> SheetChrome {
     let th = &model.theme;
-    let sheet = model.mcp.as_ref();
-    let connected = sheet.map(|s| {
-        s.servers
-            .iter()
-            .filter(|server| server.status == "connected")
-            .count()
-    });
-    let tools: usize = sheet
-        .map(|s| s.servers.iter().map(|server| server.tools).sum())
-        .unwrap_or(0);
     SheetChrome {
-        header_right: facts(
-            th,
-            vec![
-                sheet
-                    .map(|s| vec![span(format!("{} servers", s.servers.len()), th.muted)])
-                    .unwrap_or_default(),
-                sheet
-                    .map(|_| vec![span(format!("{tools} tools"), th.muted)])
-                    .unwrap_or_default(),
-            ],
-        ),
-        status_third: connected.map(|n| vec![span(format!("{n} connected"), th.muted)]),
-        status_right: None,
-        hints: Vec::new(),
+        header_right: model
+            .mcp
+            .as_ref()
+            .map(|sheet| {
+                vec![span(
+                    format!(
+                        "{} servers · {} tools",
+                        sheet.servers.len(),
+                        sheet
+                            .servers
+                            .iter()
+                            .map(|server| server.tools)
+                            .sum::<usize>()
+                    ),
+                    th.muted,
+                )]
+            })
+            .unwrap_or_default(),
+        status_third: model.mcp.as_ref().map(|sheet| {
+            vec![span(
+                format!(
+                    "{} connected",
+                    sheet
+                        .servers
+                        .iter()
+                        .filter(|server| server.status == "connected")
+                        .count()
+                ),
+                th.muted,
+            )]
+        }),
+        hints: vec![hint(th, "↑↓ scroll")],
         escape: Some("esc close"),
-        composer: Composer::Prompt("/mcp"),
-        echo: Some("/mcp".into()),
+        composer: Composer::Hidden,
+        ..SheetChrome::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::model::{McpServerRow, McpSheet, Model};
-    use crate::davinci::theme::{ColorDepth, Theme};
-
-    #[test]
-    fn a_connected_and_an_error_row_draw() {
-        let mut model = Model::new(
+    use crate::davinci::{
+        model::{McpServerRow, McpSheet},
+        theme::{ColorDepth, Theme},
+        ui,
+    };
+    fn model(width: u16) -> Model {
+        let mut m = Model::new(
             Theme::da_vinci(ColorDepth::TrueColor, false),
-            100,
+            width,
             24,
             false,
         );
-        model.mcp = Some(McpSheet {
-            servers: vec![
-                McpServerRow {
-                    name: "memory".into(),
-                    transport: "stdio".into(),
-                    status: "connected".into(),
-                    tools: 3,
-                    error: None,
-                },
-                McpServerRow {
-                    name: "docs".into(),
-                    transport: "http".into(),
-                    status: "error".into(),
-                    tools: 0,
-                    error: Some("connection refused".into()),
-                },
-            ],
-            config_path: "~/.pi/agent/mcp.json".into(),
+        m.mcp = Some(McpSheet {
+            config_path: "project/mcp.json".into(),
+            servers: vec![McpServerRow {
+                name: "long-server-name".into(),
+                transport: "stdio".into(),
+                status: "failed".into(),
+                tools: 0,
+                error: Some("Cannot start server: executable not found".into()),
+            }],
         });
-        let drawn: Vec<String> = lines(&model)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect();
-        let blob = drawn.join("\n");
-        assert!(!blob.contains("> /mcp"), "{blob}");
-        assert!(blob.contains("memory"), "{blob}");
-        assert!(blob.contains("3 tools"), "{blob}");
-        assert!(blob.contains("docs"), "{blob}");
-        assert!(blob.contains("error"), "{blob}");
-        assert!(blob.contains("connection refused"), "{blob}");
-        assert!(blob.contains("1 of 2 connected"), "{blob}");
-        let c = chrome(&model);
-        let header: String = c.header_right.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(header, "2 servers │ 3 tools");
-        let third: String = c
-            .status_third
-            .as_deref()
-            .unwrap()
+        m
+    }
+    #[test]
+    fn statuses_and_errors_keep_actual_names_counts_and_config_paths() {
+        let m = model(80);
+        let drawn = lines(&m)
             .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(third, "1 connected");
-        assert_eq!(c.escape, Some("esc close"));
-        assert_eq!(c.composer, Composer::Prompt("/mcp"));
-        assert_eq!(c.echo.as_deref(), Some("/mcp"));
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for value in [
+            "long-server-name",
+            "stdio",
+            "failed",
+            "0 tools",
+            "executable not found",
+            "project/mcp.json",
+        ] {
+            assert!(drawn.contains(value));
+        }
+        assert!(!drawn.contains("~/.pi"));
+        assert!(ui::focused_row(&lines(&m)).is_none());
+    }
+    #[test]
+    fn unavailable_empty_and_narrow_servers_are_bounded() {
+        let mut m = model(80);
+        m.mcp = None;
+        assert!(lines(&m)[0].to_string().contains("unavailable"));
+        m.mcp = Some(McpSheet::default());
+        assert!(lines(&m)[0].to_string().contains("No MCP servers"));
+        for width in [0, 1, 20, 32, 40, 80, 120] {
+            for row in lines(&model(width)) {
+                assert!(ui::run_width(&row.spans) <= width);
+            }
+        }
     }
 }

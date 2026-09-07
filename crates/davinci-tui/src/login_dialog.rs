@@ -164,16 +164,34 @@ impl LoginDialog {
 }
 
 impl Component for LoginDialog {
-    fn render(&self, _width: usize) -> Vec<String> {
-        let mut lines = vec![self.title.clone()];
-        lines.extend(self.lines.iter().cloned());
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut section = crate::render::CommandSection::new(width, &self.title, None);
+        let close_hint = self.lines.iter().any(|line| line == "(escape to close)");
+        for line in &self.lines {
+            if line.starts_with("(escape ") {
+                continue;
+            }
+            section.detail(line);
+        }
         if self.input_enabled {
-            lines.push(format!("> {}", self.input));
+            section.input(vec![crate::ansi::truncate_to_width(
+                &format!("> {}", self.input),
+                width,
+                "",
+                false,
+            )]);
+            section.hint("enter submit · esc cancel");
+        } else if let Some(message) = &self.complete_message {
+            section.message(if self.cancelled { "warning" } else { "success" }, message);
+            section.hint("esc close");
+        } else {
+            section.hint(if close_hint {
+                "esc close"
+            } else {
+                "esc cancel"
+            });
         }
-        if let Some(message) = &self.complete_message {
-            lines.push(message.clone());
-        }
-        lines
+        section.finish()
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -186,6 +204,22 @@ impl Component for LoginDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_dialog_wraps_long_unicode_content_to_the_requested_width() {
+        let mut dialog = LoginDialog::new("provider", Some("Provider 🦀"), None);
+        dialog.show_details(&["Long authorization detail 你好 café with more words".into()]);
+        dialog.show_manual_input("Paste the redirect URL from the browser");
+        dialog.input = "https://example.test/callback?code=长长长".into();
+        for width in [0, 1, 20, 32, 40] {
+            for row in dialog.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn login_dialog_matches_ts_chrome() {
@@ -228,7 +262,7 @@ mod tests {
         );
         let info = dialog.render(80).join("\n");
         assert!(info.contains("Visit the docs"));
-        assert!(info.contains("escape to close"));
+        assert!(info.contains("esc close"));
         dialog.show_manual_input("Paste the redirect URL");
         assert_eq!(
             dialog.handle_key("pi-fixture-code"),

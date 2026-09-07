@@ -66,7 +66,7 @@ pub struct RunOptions {
     pub cwd: PathBuf,
     pub forced: Option<Complexity>,
     pub dry_run: bool,
-    /// Set by the operator (`/graph-abort`) or by session shutdown.
+    /// Set by the graph UI's stop action or by session shutdown.
     pub abort: Arc<AtomicBool>,
     /// Artifacts from a previous run of the same goal, keyed by task id. A task
     /// whose id has a cached artifact is reused without spawning a worker (its
@@ -74,6 +74,10 @@ pub struct RunOptions {
     /// replays deterministically until the first uncached task, then continues
     /// live. Verification always re-runs.
     pub resume_artifacts: HashMap<String, (Artifact, WorkerUsage, Option<ReplayFingerprint>)>,
+    /// Persisted lifecycle state when a stopped graph continues. The new
+    /// execution reuses the run identity and cumulative counters while safely
+    /// replaying only the artifacts admitted above.
+    pub resume_run: Option<Box<GraphRun>>,
 }
 
 pub fn default_is_git_repo(cwd: &Path) -> bool {
@@ -818,7 +822,17 @@ fn spawn_abort_watcher(
 }
 
 pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
-    let run_id = new_run_id();
+    let continuation = options.resume_run.as_deref().map(|run| {
+        (
+            run.run_id.clone(),
+            run.counters,
+            run.ecosystem_stats.clone(),
+        )
+    });
+    let run_id = continuation
+        .as_ref()
+        .map(|(run_id, _, _)| run_id.clone())
+        .unwrap_or_else(new_run_id);
     let _ = create_run_dir(&options.cwd, &run_id);
     let budgets: GraphBudgets = deps.config.budgets.clone();
     let run_deadline = (budgets.run_deadline_ms > 0)
@@ -840,16 +854,22 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         verification_bundle: None,
         review_coverage: None,
         budgets,
-        counters: GraphCounters {
-            workers_spawned: 0,
-            revision_cycles: 0,
-            replans: 0,
-            cost_usd: 0.0,
-            started_at: now_ms(),
-        },
+        counters: continuation
+            .as_ref()
+            .map(|(_, counters, _)| *counters)
+            .unwrap_or(GraphCounters {
+                workers_spawned: 0,
+                revision_cycles: 0,
+                replans: 0,
+                cost_usd: 0.0,
+                started_at: now_ms(),
+            }),
         blocked_reason: None,
         resource_snapshot: None,
-        ecosystem_stats: Default::default(),
+        ecosystem_stats: continuation
+            .as_ref()
+            .map(|(_, _, stats)| stats.clone())
+            .unwrap_or_default(),
         updated_at: 0,
     };
 
@@ -871,7 +891,11 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         budget_abort_reason: Mutex::new(None),
         run_deadline,
     };
-    execution.checkpoint(Some("run created"));
+    execution.checkpoint(Some(if continuation.is_some() {
+        "run continued"
+    } else {
+        "run created"
+    }));
     let result = drive(&execution);
     finished.store(true, Ordering::Relaxed);
     let _ = watcher.join();
@@ -1680,6 +1704,7 @@ mod tests {
                 dry_run: false,
                 abort: Arc::new(AtomicBool::new(false)),
                 resume_artifacts: HashMap::new(),
+                resume_run: None,
             },
             deps,
         );
@@ -1740,6 +1765,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);
@@ -1861,6 +1887,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);
@@ -1976,6 +2003,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let execution = GraphExecution {
@@ -2173,6 +2201,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);
@@ -2300,6 +2329,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);
@@ -2423,6 +2453,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run = run_graph(options, deps);
@@ -2555,6 +2586,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run1 = run_graph(options1, deps1);
@@ -2649,6 +2681,7 @@ mod tests {
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
+            resume_run: None,
         };
 
         let run2 = run_graph(options2, deps2);

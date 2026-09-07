@@ -496,12 +496,14 @@ pub fn live_complete_with(
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
-    let text = crate::provider_retry::retry_provider_request(
+    let text = crate::provider_retry::retry_provider_request_controlled(
         || send_provider_body(&url, &headers, &body, timeout_ms, compress_zstd),
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
         },
+        options.abort_signal.as_ref(),
+        |ms| std::thread::sleep(Duration::from_millis(ms)),
     )
     .map_err(|err| err.message)?;
     Ok(parse_provider_response(model, &text))
@@ -619,12 +621,14 @@ pub fn live_complete_streaming_with_sink(
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
     crate::trace::log(&format!("sse post {url}"));
-    let response = crate::provider_retry::retry_provider_request(
+    let response = crate::provider_retry::retry_provider_request_controlled(
         || send_provider_request(&url, &headers, &body, timeout_ms, compress_zstd),
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
         },
+        options.abort_signal.as_ref(),
+        |ms| std::thread::sleep(Duration::from_millis(ms)),
     )
     .map_err(|err| {
         crate::trace::log(&format!("sse request failed: {}", err.message));

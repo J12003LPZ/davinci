@@ -9,6 +9,24 @@ env:
   PI_OFFLINE: "1"
 
 jobs:
+  voice-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux capture headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Native deterministic tests (no microphone or model)
+        run: cargo test -p davinci-voice --features native --locked
+      - name: Build matching helper
+        run: cargo build -p davinci-voice --features native --bin davinci-voice-worker --locked
+
   quality:
     runs-on: ubuntu-latest
     steps:

@@ -123,57 +123,46 @@ fn format_decision(trust_path: Option<&str>, decision: Option<&TrustSavedDecisio
 impl Component for TrustSelector {
     fn invalidate(&mut self) {}
 
-    fn render(&self, _width: usize) -> Vec<String> {
+    fn render(&self, width: usize) -> Vec<String> {
         let saved_path = self
             .options
             .first()
             .and_then(|option| option.saved_path.as_deref());
-        let mut lines = vec![
-            self.theme.fg("accent", &self.theme.bold("Project trust")),
-            self.theme.fg("muted", &self.cwd),
-            String::new(),
-            self.theme.fg(
-                "muted",
-                &format!(
-                    "Saved decision: {}",
-                    format_decision(saved_path, self.saved.as_ref())
-                ),
-            ),
-            self.theme.fg(
-                "muted",
-                &format!(
-                    "Current session: {}",
-                    if self.project_trusted {
-                        "trusted"
-                    } else {
-                        "untrusted"
-                    }
-                ),
-            ),
-            String::new(),
-        ];
-        for (index, option) in self.options.iter().enumerate() {
-            let selected = index == self.selected;
-            let prefix = if selected {
-                self.theme.fg("accent", "→ ")
+        let mut section =
+            crate::render::CommandSection::new(width, "Project trust", Some(&self.theme));
+        section.detail(&self.cwd);
+        section.detail(&format!(
+            "Saved: {}",
+            format_decision(saved_path, self.saved.as_ref())
+        ));
+        section.detail(&format!(
+            "Current session: {}",
+            if self.project_trusted {
+                "trusted"
             } else {
-                "  ".into()
-            };
-            let label = if selected {
-                self.theme.fg("accent", &option.label)
-            } else {
-                self.theme.fg("text", &option.label)
-            };
-            let check = if is_saved_option(option, self.saved.as_ref()) {
-                self.theme.fg("success", " ✓")
-            } else {
-                String::new()
-            };
-            lines.push(format!("{prefix}{label}{check}"));
+                "untrusted"
+            }
+        ));
+        if self.options.is_empty() {
+            section.detail("No trust choices are available.");
         }
-        lines.push(String::new());
-        lines.push("↑↓ navigate  Enter save  Esc cancel".into());
-        lines
+        for index in crate::render::selection_window(self.selected, self.options.len(), 8) {
+            let option = &self.options[index];
+            let saved = is_saved_option(option, self.saved.as_ref());
+            section.item(
+                index == self.selected,
+                &option.label,
+                if saved { "saved" } else { "" },
+            );
+            if index == self.selected {
+                if let Some(path) = option.saved_path.as_deref() {
+                    section.detail(&format!("Applies to: {path}"));
+                }
+            }
+        }
+        section.position(self.selected, self.options.len(), 8);
+        section.hint("↑↓ move · enter save · esc cancel");
+        section.finish()
     }
 }
 
@@ -231,6 +220,29 @@ mod tests {
     }
 
     #[test]
+    fn trust_selector_uses_shared_focus_and_wraps_paths() {
+        let selector = TrustSelector::new(
+            "/very/long/项目/path/that/needs/wrapping",
+            options_for("/very/long/项目/path/that/needs/wrapping"),
+            None,
+            false,
+        );
+        let rendered = strip_terminal_sequences(&selector.render(32).join("\n"));
+        assert!(
+            rendered.contains(crate::davinci::ui::SELECTION_BAR.trim()),
+            "{rendered}"
+        );
+        for width in [0, 1, 20, 32, 40] {
+            for row in selector.render(width) {
+                assert!(
+                    crate::render::visible_width_stripped(&row) <= width,
+                    "{width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn marks_the_saved_trusted_decision() {
         let selector = TrustSelector::new(
             "/project",
@@ -242,10 +254,10 @@ mod tests {
             true,
         );
         let output = rendered(&selector);
-        assert!(output.contains("Saved decision: trusted (/project)"));
+        assert!(output.contains("Saved: trusted (/project)"));
         assert!(output.contains("Current session: trusted"));
-        assert!(output.contains("Trust ✓"));
-        assert!(!output.contains("Do not trust ✓"));
+        assert!(output.contains("Trust") && output.contains("saved"));
+        assert!(!output.contains("Do not trust     saved"));
     }
 
     #[test]
@@ -275,7 +287,7 @@ mod tests {
             }),
             true,
         );
-        assert!(rendered(&selector).contains("Saved decision: trusted (inherited from /parent)"));
+        assert!(rendered(&selector).contains("Saved: trusted (inherited from /parent)"));
     }
 
     #[test]
@@ -290,8 +302,8 @@ mod tests {
             true,
         );
         let output = rendered(&selector);
-        assert!(output.contains("Saved decision: trusted (inherited from /parent)"));
-        assert!(output.contains("Trust parent folder (/parent) ✓"));
+        assert!(output.contains("Saved: trusted (inherited from /parent)"));
+        assert!(output.contains("Trust parent folder (/parent)") && output.contains("saved"));
         assert_eq!(
             selector.handle_key("\n"),
             TrustSelectorAction::Select {

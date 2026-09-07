@@ -4,6 +4,9 @@ Usage:
   pi [options] [--] [@files...] [messages...]
 
 Commands:
+  davinci voice status|devices|model list   Experimental local CPU dictation setup
+  davinci voice model install <id>         Download an approved tiny/base/small model
+  davinci voice model import <id> <path>   Verify and import a local model (offline)
   pi install <source> [-l]     Install extension source and add to settings
   pi remove <source> [-l]      Remove extension source from settings
   pi uninstall <source> [-l]   Alias for remove

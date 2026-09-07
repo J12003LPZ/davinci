@@ -4,6 +4,7 @@ pub mod artifacts;
 pub mod codex_eval;
 pub mod harness_table;
 pub mod reporter;
+pub mod security_eval;
 pub mod summary;
 
 pub use artifacts::{

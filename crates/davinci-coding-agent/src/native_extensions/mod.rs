@@ -3,7 +3,7 @@
 pub mod ecosystem;
 pub mod graph;
 pub mod learning;
-mod security_scan;
+pub mod security_scan;
 pub mod token_governor;
 pub mod vector_memory;
 
@@ -11,7 +11,13 @@ pub mod vector_memory;
 pub use ecosystem::*;
 pub use graph::*;
 pub use learning::*;
-pub use security_scan::*;
+#[allow(unused_imports)]
+pub use security_scan::{
+    enumerate_scope, normalize_relative_path, render_report, render_sarif, tool_spec,
+    FindingSeverity, ScanConfig, ScanStatus, SecurityArtifactSeal, SecurityArtifactStore,
+    SecurityCandidate, SecurityCoverage, SecurityFinding, SecurityScan, SecurityScanConfig,
+    SecurityScanController, SecurityScanManifest, SecurityVerifyRequest,
+};
 pub use token_governor::*;
 pub use vector_memory::*;
 
@@ -51,10 +57,14 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "governor-status",
     "governor-reset",
     "graph",
+    // Internal graph lifecycle operations. Deliberately omitted from
+    // `command_specs`: the terminal exposes one context-sensitive `/graph`.
     "graph-resume",
     "graph-status",
     "graph-view",
     "graph-abort",
+    "security-scan",
+    "sec-resume",
     "sec-status",
     "sec-report",
     "sec-abort",
@@ -71,6 +81,31 @@ pub const NATIVE_COMMANDS: &[&str] = &[
 /// other invocable pi command to clients and autocomplete.
 pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
     vec![
+        (
+            "security-scan",
+            "Start an experimental source-grounded security review.",
+            Some("[path] [--mode quick|standard|deep] [--format terminal|json|sarif]"),
+        ),
+        (
+            "sec-status",
+            "Show security review status and coverage.",
+            Some("[scan-id]"),
+        ),
+        (
+            "sec-report",
+            "Show a security review report.",
+            Some("[scan-id] [--finding finding-id]"),
+        ),
+        (
+            "sec-abort",
+            "Cancel the active security review.",
+            Some("[scan-id]"),
+        ),
+        (
+            "sec-resume",
+            "Resume an interrupted security review.",
+            Some("<scan-id>"),
+        ),
         (
             "memory-status",
             "Show vector-memory health and record counts.",
@@ -99,24 +134,9 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         ),
         (
             "graph",
-            "Run a coding task as an execution graph of isolated workers.",
-            Some("<goal> [--simple|--complex] [--dry-run]"),
+            "Start, watch, or continue a coding task as an execution graph.",
+            Some("[goal] [--simple|--complex] [--dry-run]"),
         ),
-        (
-            "graph-resume",
-            "Resume an unfinished graph run, reusing its completed workers.",
-            Some("[runId]"),
-        ),
-        ("graph-status", "Show active and recent graph runs.", None),
-        (
-            "graph-view",
-            "Tail a graph worker's live transcript.",
-            Some("[taskId]"),
-        ),
-        ("graph-abort", "Abort the active graph-engineer run.", None),
-        ("sec-status", "Show the active security scan status.", None),
-        ("sec-report", "Show the active security scan report.", None),
-        ("sec-abort", "Cancel the active security scan.", None),
         (
             "learning-status",
             "Show learning subsystem status and statistics.",
@@ -413,7 +433,9 @@ impl NativeExtensionHost {
             "skill-list" => self.learning.skill_list_command(args).map(Some),
             "skill-view" => self.learning.skill_view_command(args).map(Some),
             name if name.starts_with("graph") => self.graph.command(name, args),
-            name if name.starts_with("sec-") => self.security.command(name, args),
+            name if name == "security-scan" || name.starts_with("sec-") => {
+                self.security.command(name, args)
+            }
             _ => Ok(None),
         }
     }
@@ -615,9 +637,17 @@ mod tests {
     }
 
     #[test]
-    fn every_native_command_has_discoverable_metadata() {
+    fn public_native_commands_have_discoverable_metadata() {
         let specs = command_specs();
-        assert_eq!(specs.len(), NATIVE_COMMANDS.len());
+        for command in [
+            "security-scan",
+            "sec-status",
+            "sec-report",
+            "sec-abort",
+            "sec-resume",
+        ] {
+            assert!(specs.iter().any(|(name, _, _)| *name == command));
+        }
         for (name, description, _) in specs {
             assert!(NATIVE_COMMANDS.contains(&name));
             assert!(!description.is_empty());
@@ -625,9 +655,19 @@ mod tests {
     }
 
     #[test]
+    fn graph_has_one_user_facing_slash_command() {
+        let names: Vec<_> = command_specs().into_iter().map(|spec| spec.0).collect();
+        assert!(names.contains(&"graph"));
+        for legacy in ["graph-resume", "graph-status", "graph-view", "graph-abort"] {
+            assert!(!names.contains(&legacy), "{legacy} must remain internal");
+            assert!(NATIVE_COMMANDS.contains(&legacy));
+        }
+    }
+
+    #[test]
     fn native_invocable_commands_identify_rust_runtime() {
         let commands = native_invocable_commands();
-        assert_eq!(commands.len(), NATIVE_COMMANDS.len());
+        assert_eq!(commands.len(), command_specs().len());
         assert!(commands.iter().any(|command| {
             command["name"] == "memory-search"
                 && command["source"] == "native"

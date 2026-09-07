@@ -1,156 +1,136 @@
-//! The one-question instrument: a titled list, one row chosen, esc to leave.
-//!
-//! Trust (`/trust`), thinking level (`/thinking`) and stored credentials
-//! (`/logout`) all wear this panel rather than each growing one of their own —
-//! design.md §1 asks for one panel at a time, not one panel per question. Its
-//! shape is Cogitator's (`1f`); only the name and the rows differ.
+//! Shared confirmation and question view. Context precedes the answers;
+//! focus does not imply approval, and the runtime still owns every decision.
 
-use ratatui::text::{Line, Span};
-
-use super::memoria::picker_row;
+use super::sheet::hint;
 use crate::davinci::model::Model;
-use crate::davinci::ui::{span, Surface};
+use crate::davinci::ui::{self, section_detail, section_row, span, Surface};
+use ratatui::text::Line;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
     let ask = &model.ask;
     let inset = model.overlay_inset();
-    let width = model.width;
-    let inner = width.saturating_sub(inset * 2).saturating_sub(4);
+    let inner = model.width.saturating_sub(inset * 2).saturating_sub(4);
     let selected = model.selection(ask.items.len());
-
-    let mut body: Vec<Vec<Span<'static>>> = ask
-        .items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            picker_row(
+    let mut body = section_detail(inner, th, &ask.note);
+    if ask.items.is_empty() {
+        body.extend(section_detail(inner, th, "nothing to choose"));
+    }
+    for (index, item) in ask.items.iter().enumerate() {
+        let focused = Some(index) == selected;
+        body.push(section_row(inner, th, focused, &item.label, ""));
+        if focused {
+            if ui::run_width(&[span(item.label.clone(), th.text)]) > inner.saturating_sub(3) {
+                body.extend(section_detail(inner, th, &item.label));
+            }
+            body.extend(section_detail(inner, th, &item.detail));
+        }
+    }
+    let exit = if ask.key == "/permissions" {
+        "esc deny"
+    } else {
+        "esc close"
+    };
+    body.push(ui::hint_row(
+        inner,
+        &[
+            hint(th, "↑↓ move"),
+            hint(
                 th,
-                inner,
-                &item.label,
-                &item.detail,
-                Some(index) == selected,
-            )
-        })
-        .collect();
-
-    if body.is_empty() {
-        body.push(vec![span("nothing to choose", th.muted)]);
-    }
-
-    if !ask.note.is_empty() {
-        body.push(Vec::new());
-        body.push(vec![span(ask.note.clone(), th.secondary)]);
-    }
-    body.push(vec![
-        span("↑↓ move", th.border),
-        span(" · ", th.border),
-        span("enter select", th.border),
-        span(" · ", th.border),
-        span("esc close", th.border),
-    ]);
-
+                if model.overlay_offset.is_some() {
+                    "enter back"
+                } else {
+                    "enter select"
+                },
+            ),
+            hint(th, "pgup/pgdn read"),
+        ],
+        Some(exit),
+        th,
+    ));
     let mut title = vec![span(ask.title.clone(), th.primary)];
-    if !ask.name.is_empty() {
-        title.push(span(" · ", th.border));
-        title.push(span(ask.name.clone(), th.muted));
+    if !ask.name.is_empty() && ask.name != ask.title {
+        title.push(span(format!(" · {}", ask.name), th.muted));
     }
-
-    Surface::new(width, th)
+    Surface::section(model.width, th)
         .inset(inset)
         .title(title)
-        .right(vec![span(ask.key.clone(), th.border)])
-        .rows(body)
+        .rows(body.into_iter().map(|r| r.spans).collect())
         .lines()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::model::{Ask, Overlay, PickerItem};
-    use crate::davinci::theme::{ColorDepth, Theme};
-    use crate::davinci::ui::run_width;
-
+    use crate::davinci::{
+        model::{Ask, Overlay, PickerItem},
+        theme::{ColorDepth, Theme},
+    };
     fn model(width: u16) -> Model {
-        let mut model = Model::new(
+        let mut m = Model::new(
             Theme::da_vinci(ColorDepth::TrueColor, false),
             width,
-            44,
-            true,
+            24,
+            false,
         );
-        model.ask = Ask {
-            title: "FIDES".into(),
-            name: "TRUST".into(),
+        m.ask = Ask {
+            title: "Project trust".into(),
             key: "/trust".into(),
-            note: "C:\\work\\pi-rust".into(),
+            note: "Review this project's resources".into(),
             items: vec![
-                PickerItem::new("trust this folder", "tools run without asking"),
-                PickerItem::new("ask every time", "the safe default"),
+                PickerItem::new("Trust this folder", "Load project resources"),
+                PickerItem::new("Do not trust", "Ignore project resources"),
             ],
+            ..Default::default()
         };
-        model.toggle_overlay(Overlay::Ask);
-        model
+        m.toggle_overlay(Overlay::Ask);
+        m
     }
-
-    fn text(line: &Line<'_>) -> String {
-        line.spans
+    fn text(m: &Model) -> String {
+        lines(m)
             .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
-
     #[test]
-    fn the_question_names_itself_and_states_its_exits() {
-        let m = model(100);
+    fn context_precedes_answers_and_only_focus_expands() {
+        let m = model(80);
+        let text = text(&m);
+        assert!(text.contains("PROJECT TRUST") && !text.contains('╭'));
+        assert!(
+            text.find("Review this project").unwrap() < text.find("Trust this folder").unwrap()
+        );
+        assert!(
+            text.contains("Load project resources") && !text.contains("Ignore project resources")
+        );
         let rows = lines(&m);
-        let top = text(&rows[0]);
-        assert!(top.contains("╭─ FIDES · TRUST ─"), "{top}");
-        assert!(top.trim_end().ends_with("─ /trust ─╮"), "{top}");
-        let drawn: Vec<String> = rows.iter().map(text).collect();
-        assert!(drawn.iter().any(|row| row.contains("esc close")));
-        assert!(drawn.iter().any(|row| row.contains("C:\\work\\pi-rust")));
+        assert!(rows[ui::focused_row(&rows).unwrap()]
+            .spans
+            .iter()
+            .any(|s| s.style.bg == Some(m.theme.surface)));
+        assert!(text.contains("enter select") && text.contains("esc close"));
     }
-
     #[test]
-    fn the_highlighted_row_is_marked_by_glyph_not_only_by_colour() {
-        let m = model(100);
-        let rows = lines(&m);
-        assert!(text(&rows[1]).contains("◉ "), "{}", text(&rows[1]));
-        assert!(text(&rows[2]).contains("○ "), "{}", text(&rows[2]));
+    fn permissions_name_the_real_cancel_semantics() {
+        let mut m = model(80);
+        m.ask.key = "/permissions".into();
+        assert!(text(&m).contains("esc deny"));
     }
-
     #[test]
-    fn a_question_with_no_answers_still_draws_and_still_says_how_to_leave() {
-        let mut m = model(100);
+    fn empty_choices_still_offer_an_exit() {
+        let mut m = model(80);
         m.ask.items.clear();
-        let rows: Vec<String> = lines(&m).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("nothing to choose")));
-        assert!(rows.iter().any(|row| row.contains("esc close")));
+        assert!(text(&m).contains("nothing to choose") && text(&m).contains("esc close"));
     }
-
     #[test]
-    fn the_panel_is_row_exact_at_every_width() {
-        for width in [72u16, 80, 100, 120, 160] {
-            let m = model(width);
-            for row in lines(&m) {
-                assert_eq!(run_width(&row.spans), width, "at {width}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_label_longer_than_the_panel_is_clipped_rather_than_bursting_it() {
-        // Trust offers a row naming a parent folder, and a deep path is
-        // longer than any window. The row gives way; the frame does not.
-        for width in [72u16, 80, 100, 120, 160] {
+    fn long_unicode_questions_and_options_wrap_within_the_terminal() {
+        for width in [0, 1, 20, 32, 40, 80, 120] {
             let mut m = model(width);
-            m.ask.items = vec![PickerItem::new(
-                &format!("Trust parent folder ({})", "C:\\deep\\path".repeat(20)),
-                "project .pi resources are used",
-            )];
-            m.ask.note = "x".repeat(400);
+            m.ask.note = "项目/café/🦀/long-path ".repeat(8);
+            m.ask.items[0].label = "Trust parent folder 项目/café/🦀 ".repeat(6);
             for row in lines(&m) {
-                assert_eq!(run_width(&row.spans), width, "at {width}");
+                assert!(ui::run_width(&row.spans) <= width, "{width}: {row:?}");
             }
         }
     }

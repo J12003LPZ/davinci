@@ -47,14 +47,8 @@ pub fn derive_worker_cache_key(
     system_prompt: &str,
     expect: crate::native_extensions::graph::ArtifactKind,
 ) -> String {
-    let mut sorted_tools = tools.to_vec();
-    sorted_tools.sort();
-    let mut tool_hasher = Sha256::new();
-    for tool in &sorted_tools {
-        tool_hasher.update(tool.as_bytes());
-        tool_hasher.update(b"\n");
-    }
-    let toolset_hash = format!("{:x}", tool_hasher.finalize());
+    let registry = davinci_agent::RuntimeCapabilityRegistry::with_builtins();
+    let toolset_hash = registry.hash_tool_capabilities(tools);
 
     let mut contract_hasher = Sha256::new();
     contract_hasher.update(system_prompt.as_bytes());
@@ -93,11 +87,11 @@ pub fn graph_worker_to_universal_cache_identity(
     expect: crate::native_extensions::graph::ArtifactKind,
     context_item_hashes: Vec<String>,
 ) -> davinci_agent::CacheIdentity {
-    use davinci_agent::runtime::cache::{hash_system_prompt, hash_tool_names};
+    use davinci_agent::runtime::cache::hash_system_prompt;
     use sha2::{Digest, Sha256};
 
-    let tool_refs: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
-    let tool_schema_hash = hash_tool_names(&tool_refs);
+    let registry = davinci_agent::RuntimeCapabilityRegistry::with_builtins();
+    let tool_schema_hash = registry.hash_tool_capabilities(tools);
 
     let mut contract_hasher = Sha256::new();
     contract_hasher.update(system_prompt.as_bytes());

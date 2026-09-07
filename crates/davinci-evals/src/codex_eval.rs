@@ -46,11 +46,11 @@ pub struct CodexBenchmarkRunMetrics {
 
 impl CodexBenchmarkRunMetrics {
     pub fn cached_ratio(&self) -> f64 {
-        let total = self.uncached_input_tokens + self.cached_input_tokens;
-        if total == 0 {
+        let total = self.uncached_input_tokens as f64 + self.cached_input_tokens as f64;
+        if total == 0.0 {
             0.0
         } else {
-            self.cached_input_tokens as f64 / total as f64
+            self.cached_input_tokens as f64 / total
         }
     }
 }
@@ -61,6 +61,138 @@ pub struct PairedTaskComparison {
     pub generic_metrics: CodexBenchmarkRunMetrics,
     pub optimized_metrics: CodexBenchmarkRunMetrics,
     pub external_cli_metrics: Option<CodexBenchmarkRunMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    VerifiedSuccess,
+    VerifiedFailure,
+    Blocked,
+    Aborted,
+    BudgetExhausted,
+    InfrastructureFailure,
+    UnverifiedCompletion,
+}
+
+/// Observations collected by the runner, independently of assistant output.
+/// This is intentionally not deserializable as a model-produced artifact.
+#[derive(Debug, Clone, Default)]
+pub struct OracleObservation {
+    pub command: Option<String>,
+    pub exit_code: Option<i32>,
+    pub output: String,
+    pub changed_files: Vec<String>,
+    pub file_inventory_complete: bool,
+}
+
+impl OracleObservation {
+    pub fn outcome(&self, task: &CodexBenchmarkTask) -> RunOutcome {
+        if !self.file_inventory_complete {
+            return RunOutcome::UnverifiedCompletion;
+        }
+        if self.changed_files.iter().any(|file| {
+            task.forbidden_files_changed.contains(file)
+                || !task.expected_files_changed.contains(file)
+        }) {
+            return RunOutcome::VerifiedFailure;
+        }
+        // Substrings in assistant text are never an independent oracle.
+        if task
+            .verification_command
+            .as_deref()
+            .is_none_or(str::is_empty)
+            || self.command != task.verification_command
+            || self.exit_code.is_none()
+        {
+            return RunOutcome::UnverifiedCompletion;
+        }
+        if self.exit_code != Some(0)
+            || task
+                .expected_files_changed
+                .iter()
+                .any(|file| !self.changed_files.contains(file))
+            || task
+                .verification_substring
+                .as_ref()
+                .is_some_and(|expected| !self.output.contains(expected))
+        {
+            RunOutcome::VerifiedFailure
+        } else {
+            RunOutcome::VerifiedSuccess
+        }
+    }
+}
+
+/// Only runner observations can construct a verified comparison. Serializing
+/// the legacy boolean remains supported; it is always derived from the oracle.
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifiedTaskComparison {
+    manifest_fingerprint: String,
+    generic_outcome: RunOutcome,
+    optimized_outcome: RunOutcome,
+    comparison: PairedTaskComparison,
+}
+
+impl VerifiedTaskComparison {
+    pub fn from_observations(
+        task: &CodexBenchmarkTask,
+        mut generic_metrics: CodexBenchmarkRunMetrics,
+        generic: &OracleObservation,
+        mut optimized_metrics: CodexBenchmarkRunMetrics,
+        optimized: &OracleObservation,
+    ) -> Self {
+        let generic_outcome = generic.outcome(task);
+        let optimized_outcome = optimized.outcome(task);
+        generic_metrics.success = generic_outcome == RunOutcome::VerifiedSuccess;
+        optimized_metrics.success = optimized_outcome == RunOutcome::VerifiedSuccess;
+        Self {
+            manifest_fingerprint: task_fingerprint(task),
+            generic_outcome,
+            optimized_outcome,
+            comparison: PairedTaskComparison {
+                task_id: task.id.clone(),
+                generic_metrics,
+                optimized_metrics,
+                external_cli_metrics: None,
+            },
+        }
+    }
+}
+
+fn task_fingerprint(task: &CodexBenchmarkTask) -> String {
+    use sha2::{Digest, Sha256};
+    // All fields are strings/arrays/options, so serialization is infallible.
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(task).expect("task serialization"))
+    )
+}
+
+/// Require the complete caller-owned manifest and matching oracle definitions.
+/// Imported legacy reports remain readable but cannot authorize a release.
+pub fn evaluate_verified_report(
+    schema_version: u32,
+    expected: &[CodexBenchmarkTask],
+    comparisons: &[VerifiedTaskComparison],
+) -> PairedDeltaSummary {
+    let raw: Vec<_> = comparisons
+        .iter()
+        .map(|pair| pair.comparison.clone())
+        .collect();
+    let mut summary = evaluate_efficiency(&raw);
+    let ids: std::collections::HashSet<_> = expected.iter().map(|task| &task.id).collect();
+    let coverage = !expected.is_empty()
+        && ids.len() == expected.len()
+        && expected.len() == comparisons.len()
+        && comparisons.iter().all(|pair| {
+            expected.iter().any(|task| {
+                task.id == pair.comparison.task_id
+                    && task_fingerprint(task) == pair.manifest_fingerprint
+            })
+        });
+    summary.meets_release_gate &= schema_version == 1 && coverage;
+    summary
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,12 +251,17 @@ pub fn paired_bootstrap_median_ci(deltas: &[f64], iterations: usize) -> (f64, f6
     (point_median, resamples[p025_idx], resamples[p975_idx])
 }
 
-/// Evaluates whether the paired run results meet §16.5 release gate criteria:
-/// - Verified success rate of optimized >= generic.
-/// - Duplicate side-effect execution is zero.
-/// - At least two major efficiency dimensions improve (wall time, turns, tokens)
-///   without another materially worsening (>10% increase in median).
+/// Summarize legacy metrics without authorizing promotion. Use
+/// `evaluate_verified_report` for oracle-checked reports with exact coverage.
 pub fn evaluate_release_gate(comparisons: &[PairedTaskComparison]) -> PairedDeltaSummary {
+    let mut summary = evaluate_efficiency(comparisons);
+    // Legacy input has neither independent oracle evidence nor a manifest.
+    // Preserve its measurements, but never use a boolean claim for promotion.
+    summary.meets_release_gate = false;
+    summary
+}
+
+fn evaluate_efficiency(comparisons: &[PairedTaskComparison]) -> PairedDeltaSummary {
     if comparisons.is_empty() {
         return PairedDeltaSummary {
             median_wall_time_delta_pct: 0.0,
@@ -144,18 +281,34 @@ pub fn evaluate_release_gate(comparisons: &[PairedTaskComparison]) -> PairedDelt
     let mut tool_deltas = Vec::new();
     let mut generic_successes = 0;
     let mut optimized_successes = 0;
-    let mut total_duplicates = 0;
+    let mut total_duplicates = 0_u32;
+    let mut case_ids = std::collections::HashSet::new();
+    let mut complete_pairs = true;
 
     for c in comparisons {
+        complete_pairs &= !c.task_id.trim().is_empty() && case_ids.insert(&c.task_id);
         if c.generic_metrics.success {
             generic_successes += 1;
         }
         if c.optimized_metrics.success {
             optimized_successes += 1;
         }
-        total_duplicates += c.optimized_metrics.duplicate_side_effects;
+        total_duplicates =
+            total_duplicates.saturating_add(c.optimized_metrics.duplicate_side_effects);
 
-        // Calculate deltas only among tasks where generic succeeded (or both)
+        // Failed runs remain in the outcome denominator, never in efficiency pairs.
+        if !c.generic_metrics.success || !c.optimized_metrics.success {
+            continue;
+        }
+        // Legacy counters cannot distinguish missing usage from zero. Such
+        // records may be reported, but cannot justify an efficiency promotion.
+        complete_pairs &= c.generic_metrics.wall_time_ms > 0
+            && c.optimized_metrics.wall_time_ms > 0
+            && c.generic_metrics.model_responses > 0
+            && c.optimized_metrics.model_responses > 0
+            && c.generic_metrics.uncached_input_tokens > 0
+            && c.optimized_metrics.uncached_input_tokens > 0
+            && (c.generic_metrics.tool_calls > 0 || c.optimized_metrics.tool_calls == 0);
         if c.generic_metrics.wall_time_ms > 0 {
             let delta = ((c.optimized_metrics.wall_time_ms as f64
                 - c.generic_metrics.wall_time_ms as f64)
@@ -215,7 +368,14 @@ pub fn evaluate_release_gate(comparisons: &[PairedTaskComparison]) -> PairedDelt
     let no_material_worsening =
         median_wall <= 10.0 && median_resp <= 10.0 && median_tokens <= 10.0 && median_tools <= 10.0;
 
-    let meets_gate = success_ok && side_effects_ok && (improvements >= 2) && no_material_worsening;
+    let meets_gate = complete_pairs
+        && !wall_time_deltas.is_empty()
+        && !response_deltas.is_empty()
+        && !token_deltas.is_empty()
+        && success_ok
+        && side_effects_ok
+        && (improvements >= 2)
+        && no_material_worsening;
 
     PairedDeltaSummary {
         median_wall_time_delta_pct: median_wall,
@@ -266,6 +426,178 @@ pub fn codex_benchmark_corpus() -> Vec<CodexBenchmarkTask> {
 mod tests {
     use super::*;
 
+    fn oracle_task() -> CodexBenchmarkTask {
+        CodexBenchmarkTask {
+            id: "oracle".into(),
+            name: "oracle".into(),
+            prompt: "fix".into(),
+            expected_files_changed: vec!["src/lib.rs".into()],
+            forbidden_files_changed: vec!["Cargo.lock".into()],
+            verification_command: Some("fixture-test".into()),
+            verification_substring: Some("passed".into()),
+        }
+    }
+
+    #[test]
+    fn independent_oracle_rejects_claims_and_forbidden_changes() {
+        let task = oracle_task();
+        let evidence = OracleObservation {
+            command: Some("fixture-test".into()),
+            exit_code: Some(0),
+            output: "passed".into(),
+            changed_files: vec!["src/lib.rs".into()],
+            file_inventory_complete: true,
+        };
+        assert_eq!(evidence.outcome(&task), RunOutcome::VerifiedSuccess);
+        let mut failed = evidence.clone();
+        failed.exit_code = Some(1);
+        assert_eq!(failed.outcome(&task), RunOutcome::VerifiedFailure);
+        failed.exit_code = None;
+        assert_eq!(failed.outcome(&task), RunOutcome::UnverifiedCompletion);
+        let mut forbidden = evidence.clone();
+        forbidden.changed_files.push("Cargo.lock".into());
+        assert_eq!(forbidden.outcome(&task), RunOutcome::VerifiedFailure);
+        let mut absent = evidence;
+        absent.file_inventory_complete = false;
+        assert_eq!(absent.outcome(&task), RunOutcome::UnverifiedCompletion);
+    }
+
+    #[test]
+    fn report_requires_exact_manifest_and_schema() {
+        let task = oracle_task();
+        let evidence = OracleObservation {
+            command: Some("fixture-test".into()),
+            exit_code: Some(0),
+            output: "passed".into(),
+            changed_files: vec!["src/lib.rs".into()],
+            file_inventory_complete: true,
+        };
+        let run = |wall_time_ms, model_responses, uncached_input_tokens| CodexBenchmarkRunMetrics {
+            wall_time_ms,
+            model_responses,
+            uncached_input_tokens,
+            ..Default::default()
+        };
+        let pair = VerifiedTaskComparison::from_observations(
+            &task,
+            run(100, 10, 100),
+            &evidence,
+            run(50, 5, 50),
+            &evidence,
+        );
+        let tasks = vec![task.clone()];
+        assert!(evaluate_verified_report(1, &tasks, &[pair.clone()]).meets_release_gate);
+        assert!(!evaluate_verified_report(0, &tasks, &[pair.clone()]).meets_release_gate);
+        assert!(!evaluate_verified_report(1, &tasks, &[]).meets_release_gate);
+        assert!(
+            !evaluate_verified_report(1, &tasks, &[pair.clone(), pair.clone()]).meets_release_gate
+        );
+        let mut changed_manifest = tasks.clone();
+        changed_manifest[0].verification_command = Some("different-oracle".into());
+        assert!(
+            !evaluate_verified_report(1, &changed_manifest, &[pair.clone()]).meets_release_gate
+        );
+        let mut failed_oracle = evidence.clone();
+        failed_oracle.exit_code = Some(1);
+        let claimed_success = CodexBenchmarkRunMetrics {
+            success: true,
+            ..run(50, 5, 50)
+        };
+        let failed_pair = VerifiedTaskComparison::from_observations(
+            &task,
+            run(100, 10, 100),
+            &evidence,
+            claimed_success,
+            &failed_oracle,
+        );
+        assert!(!evaluate_verified_report(1, &tasks, &[failed_pair]).meets_release_gate);
+        let mut extra = task;
+        extra.id = "missing".into();
+        assert!(
+            !evaluate_verified_report(1, &[tasks[0].clone(), extra], &[pair]).meets_release_gate
+        );
+    }
+
+    #[test]
+    fn legacy_boolean_cannot_authorize_release() {
+        let pair = PairedTaskComparison {
+            task_id: "legacy".into(),
+            generic_metrics: CodexBenchmarkRunMetrics {
+                success: true,
+                wall_time_ms: 100,
+                model_responses: 10,
+                uncached_input_tokens: 100,
+                ..Default::default()
+            },
+            optimized_metrics: CodexBenchmarkRunMetrics {
+                success: true,
+                wall_time_ms: 50,
+                model_responses: 5,
+                uncached_input_tokens: 50,
+                ..Default::default()
+            },
+            external_cli_metrics: None,
+        };
+        assert!(!evaluate_release_gate(&[pair]).meets_release_gate);
+    }
+
+    #[test]
+    fn failed_fast_runs_cannot_pass_efficiency_gate() {
+        for (generic_success, optimized_success) in [(false, false), (false, true), (true, false)] {
+            let run = |success, wall_time_ms, model_responses, uncached_input_tokens| {
+                CodexBenchmarkRunMetrics {
+                    success,
+                    wall_time_ms,
+                    model_responses,
+                    tool_calls: model_responses,
+                    uncached_input_tokens,
+                    ..Default::default()
+                }
+            };
+            let pairs = vec![PairedTaskComparison {
+                task_id: "failed-fast".into(),
+                generic_metrics: run(generic_success, 1_000, 10, 1_000),
+                optimized_metrics: run(optimized_success, 100, 1, 100),
+                external_cli_metrics: None,
+            }];
+            assert!(!evaluate_efficiency(&pairs).meets_release_gate);
+        }
+    }
+
+    #[test]
+    fn incomplete_and_duplicate_pairs_cannot_pass() {
+        let baseline = CodexBenchmarkRunMetrics {
+            success: true,
+            wall_time_ms: 100,
+            model_responses: 10,
+            tool_calls: 10,
+            uncached_input_tokens: 100,
+            ..Default::default()
+        };
+        let candidate = CodexBenchmarkRunMetrics {
+            success: true,
+            wall_time_ms: 50,
+            model_responses: 5,
+            tool_calls: 5,
+            uncached_input_tokens: 50,
+            ..Default::default()
+        };
+        let pair = PairedTaskComparison {
+            task_id: "case".into(),
+            generic_metrics: baseline,
+            optimized_metrics: candidate,
+            external_cli_metrics: None,
+        };
+        assert!(!evaluate_efficiency(&[pair.clone(), pair.clone()]).meets_release_gate);
+        let mut missing = pair.clone();
+        missing.optimized_metrics.uncached_input_tokens = 0;
+        assert!(!evaluate_efficiency(&[missing]).meets_release_gate);
+        let mut zero = pair;
+        zero.generic_metrics.tool_calls = 0;
+        assert!(!evaluate_efficiency(&[zero]).meets_release_gate);
+        assert!(!evaluate_efficiency(&[]).meets_release_gate);
+    }
+
     #[test]
     fn median_odd_and_even() {
         let mut odd = vec![5.0, 1.0, 3.0];
@@ -273,6 +605,16 @@ mod tests {
 
         let mut even = vec![1.0, 2.0, 5.0, 10.0];
         assert_eq!(median(&mut even), 3.5);
+    }
+
+    #[test]
+    fn cache_ratio_remains_finite_at_counter_limits() {
+        let run = CodexBenchmarkRunMetrics {
+            uncached_input_tokens: u64::MAX,
+            cached_input_tokens: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(run.cached_ratio(), 0.5);
     }
 
     #[test]
@@ -327,7 +669,7 @@ mod tests {
             },
         ];
 
-        let summary = evaluate_release_gate(&comparisons);
+        let summary = evaluate_efficiency(&comparisons);
         assert!(summary.meets_release_gate);
         assert!(summary.median_wall_time_delta_pct <= -20.0);
         assert!(summary.median_responses_delta_pct <= -25.0);
@@ -356,7 +698,7 @@ mod tests {
             external_cli_metrics: None,
         }];
 
-        let summary = evaluate_release_gate(&comparisons);
+        let summary = evaluate_efficiency(&comparisons);
         assert!(!summary.meets_release_gate);
     }
 
@@ -382,6 +724,6 @@ mod tests {
             },
             external_cli_metrics: None,
         }];
-        assert!(!evaluate_release_gate(&comparisons).meets_release_gate);
+        assert!(!evaluate_efficiency(&comparisons).meets_release_gate);
     }
 }

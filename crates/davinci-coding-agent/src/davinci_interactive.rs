@@ -1090,6 +1090,21 @@ fn mid_turn_key(
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if model.voice.blocks_send && davinci_tui::davinci::app::voice_send_key(model, &key) {
+        return false;
+    }
+    if let Some(data) = davinci_tui::key_event_bytes(&key) {
+        if model.keybindings.matches(&data, "davinci.tools.expand") {
+            model.show_tool_output = !model.show_tool_output;
+            return false;
+        }
+        if key.code != KeyCode::Esc
+            && !(ctrl && key.code == KeyCode::Char('c'))
+            && model.edit_composer_key(&data)
+        {
+            return false;
+        }
+    }
     match key.code {
         KeyCode::Esc => {
             let again = abort.swap(true, Ordering::Relaxed);
@@ -1104,7 +1119,6 @@ fn mid_turn_key(
         KeyCode::Char('j') if ctrl => model.newline(),
         // Tool output can be opened while the turn still runs: that is when
         // a long read is most worth seeing.
-        KeyCode::Char('t') if ctrl => model.show_tool_output = !model.show_tool_output,
         KeyCode::Char(_) if ctrl => {}
         KeyCode::Enter
             if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -1133,7 +1147,14 @@ fn mid_turn_key(
 /// bypassed every check: a queued `/command` went to the provider verbatim.
 fn run_turns(shell: &mut Shell<'_>) -> Next {
     let host = shell.host.clone();
-    if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host) {
+    if let Err(err) = run_turn(
+        shell.parsed,
+        shell.agent,
+        shell.model,
+        shell.terminal,
+        host,
+        shell.voice,
+    ) {
         return Next::Fail(err.to_string());
     }
     while !shell.model.queued.is_empty() {
@@ -1152,12 +1173,20 @@ fn run_turns(shell: &mut Shell<'_>) -> Next {
     Next::Go
 }
 
+fn interrupted_recovery_aftermath() -> Vec<(State, String)> {
+    vec![(
+        State::Attention,
+        "the active turn was interrupted; review partial results before retrying".into(),
+    )]
+}
+
 fn run_turn(
     parsed: &crate::args::Args,
     agent: &mut Agent,
     model: &mut Model,
     session: &mut davinci_tui::davinci::runtime::Session,
     host: Arc<Mutex<ExtensionHost>>,
+    voice: &mut crate::voice_input::VoiceInput,
 ) -> std::io::Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
     let abort = Arc::new(AtomicBool::new(false));
@@ -1228,20 +1257,30 @@ fn run_turn(
                 if let Ok((request, reply)) = approval_rx.try_recv() {
                     turn.await_approval(model, &request);
                     model.ask = permission_ask(&request, trusted);
-                    model.ask_index = 0;
-                    model.overlay = Some(Overlay::Ask);
+                    open_ask_overlay(model);
+                    voice.cancel(model);
                     approval = Some((request, reply));
                 }
             }
             if let Some(working) = model.working.as_mut() {
                 working.seconds = started.elapsed().as_secs();
             }
+            voice.tick(model, session.input_pending());
             session.draw(model)?;
+            voice.drawn();
+            if model.voice.active && !session.mic_visible() {
+                voice.cancel(model);
+            }
 
             if worker.is_finished() {
                 break;
             }
             if let Some(event) = session.poll_event(Duration::from_millis(40))? {
+                if let crossterm::event::Event::Key(key) = event {
+                    if voice.key(model, key) {
+                        continue;
+                    }
+                }
                 match event {
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release
@@ -1316,7 +1355,16 @@ fn run_turn(
                         model.width = width.max(20);
                         model.height = height.max(4);
                     }
-                    crossterm::event::Event::Paste(text) => model.paste(&text),
+                    crossterm::event::Event::Paste(text) => {
+                        if !voice.paste(model, &text) {
+                            model.paste(&text);
+                        }
+                    }
+                    crossterm::event::Event::Mouse(mouse) => {
+                        if session.handle_mouse(mouse) {
+                            voice.toggle(model);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1402,24 +1450,7 @@ fn run_turn(
                 davinci_tui::davinci::views::chrome::thousands(kept)
             ),
             billed: "in the next /session stats".into(),
-            aftermath: vec![
-                (
-                    State::Done,
-                    "transcript written to the session file · nothing to recover on restart".into(),
-                ),
-                (
-                    State::Done,
-                    "the abort was delivered; a running tool stops at its next check".into(),
-                ),
-                (
-                    State::Attention,
-                    "queued follow-ups were dropped with the interrupt".into(),
-                ),
-                (
-                    State::Skipped,
-                    "esc esc opens the session tree · ctrl+d quits".into(),
-                ),
-            ],
+            aftermath: interrupted_recovery_aftermath(),
         });
         open_sheet(model, Screen::Recovery);
     }
@@ -1705,6 +1736,11 @@ pub fn corpus(
 
     // Davinci's own commands, which no shared command list carries.
     items.push(CorpusItem::new(
+        "Local voice setup",
+        "download or import an approved local speech model",
+        "voice",
+    ));
+    items.push(CorpusItem::new(
         "/diff",
         "review every change in the working tree",
         "command",
@@ -1873,10 +1909,35 @@ fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
         return None;
     }
 
-    let outcome = {
+    let outcome = if matches!(
+        name.as_str(),
+        "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
+    ) {
+        let host = shell
+            .host
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        crate::apply_graph_session_context(shell.parsed, shell.agent, &host);
+        let admission = if matches!(name.as_str(), "security-scan" | "sec-resume") {
+            crate::configure_security_review(shell.parsed, shell.agent, &host)
+        } else {
+            Ok(())
+        };
+        Some(
+            admission
+                .and_then(|()| host.execute_native_command(&name, &args))
+                .and_then(|value| value.ok_or_else(|| "security command unavailable".into())),
+        )
+    } else {
         let mut host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
         crate::apply_graph_session_context(shell.parsed, shell.agent, &host);
-        match host.execute_native_command(&name, &args) {
+        let admission = if matches!(name.as_str(), "security-scan" | "sec-resume") {
+            crate::configure_security_review(shell.parsed, shell.agent, &host)
+        } else {
+            Ok(())
+        };
+        match admission.and_then(|()| host.execute_native_command(&name, &args)) {
             Ok(Some(value)) => Some(Ok(value)),
             Err(err) => Some(Err(err)),
             Ok(None) => {
@@ -1913,12 +1974,27 @@ fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
                 shell.model.governor = Some(governor_sheet(&value));
                 open_sheet(shell.model, Screen::Governor);
             }
-            "sec-status" => {
+            "security-scan" | "sec-resume" | "sec-status" => {
                 shell.model.security = Some(security_sheet(&value));
                 shell.model.security_index = 0;
                 open_sheet(shell.model, Screen::Securitas);
             }
             "sec-report" => {
+                if value["schemaVersion"] == 2 {
+                    shell.model.security = Some(security_sheet(&value));
+                    shell.model.security_index = value["selectedFindingId"]
+                        .as_str()
+                        .and_then(|id| {
+                            value["findings"].as_array().and_then(|findings| {
+                                findings
+                                    .iter()
+                                    .position(|finding| finding["findingId"].as_str() == Some(id))
+                            })
+                        })
+                        .unwrap_or(0);
+                    open_sheet(shell.model, Screen::Securitas);
+                    return Some(Next::Go);
+                }
                 // The report command answers with markdown; the sheet wants
                 // the structured scan, which `sec-status` carries.
                 let structured = {
@@ -1934,7 +2010,7 @@ fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
                     _ => push_command_result(shell.model, &name, &value),
                 }
             }
-            "graph-status" | "graph-view" => match graph_sheet(&value) {
+            "graph" | "graph-status" | "graph-view" => match graph_sheet(&value) {
                 Some(sheet) => {
                     shell.model.graph_run = Some(sheet);
                     open_sheet(shell.model, Screen::GraphRun);
@@ -1949,7 +2025,7 @@ fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
             // A run just started (or resumed): watch it on the sheet rather
             // than reading its first checkpoint as rows. The sheet refreshes
             // itself every second while it is open.
-            "graph" | "graph-resume"
+            "graph-resume"
                 if value.get("started").and_then(serde_json::Value::as_bool) == Some(true) =>
             {
                 if refresh_graph_sheet(shell.model, shell.host) {
@@ -2215,7 +2291,7 @@ impl Question {
     pub fn ask(&self, _agent: &Agent) -> Ask {
         match self {
             Question::Trust { path, options } => Ask {
-                title: "FIDES".into(),
+                title: "Trust".into(),
                 name: "TRUST".into(),
                 key: "/trust".into(),
                 note: format!("{path} · takes effect on the next start"),
@@ -2234,7 +2310,7 @@ impl Question {
                     .collect(),
             },
             Question::FirstRun => Ask {
-                title: "SALVE".into(),
+                title: "Welcome".into(),
                 name: "WELCOME".into(),
                 key: "first run".into(),
                 note: "anonymous usage data helps pi improve; it is never required".into(),
@@ -2244,7 +2320,7 @@ impl Question {
                 ],
             },
             Question::Logout { providers } => Ask {
-                title: "CLAVES".into(),
+                title: "Credentials".into(),
                 name: "CREDENTIALS".into(),
                 key: "/logout".into(),
                 note: "chosen credentials are removed from this machine".into(),
@@ -2257,7 +2333,7 @@ impl Question {
     }
 }
 
-/// The `LICENTIA · PERMISSION` panel for one tool call the policy could not
+/// The permission panel for one tool call the policy could not
 /// decide on its own (spec: trust-and-control, *davinci*). Four rows; three
 /// when the project is not trusted, because a rule written to
 /// `.pi/settings.json` would never be read back from an untrusted checkout.
@@ -2279,7 +2355,7 @@ pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
         note.push_str(" · outside the project");
     }
     Ask {
-        title: "LICENTIA".into(),
+        title: "Permission".into(),
         name: "PERMISSION".into(),
         key: "/permissions".into(),
         note,
@@ -2322,7 +2398,7 @@ fn approval_key(
             Some(ToolApprovalDecision::Deny)
         }
         Flow::Continue if model.overlay.is_none() => Some(ToolApprovalDecision::Deny),
-        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) | Flow::CycleThinking => None,
+        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) => None,
     }
 }
 
@@ -2377,6 +2453,7 @@ pub fn perform(
             let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
             agent.messages.clear();
+            model.composer_epoch = model.composer_epoch.saturating_add(1);
             agent.session = Some(store);
             model.transcript.clear();
             Ok(Done::Said("started a new session".into()))
@@ -2533,6 +2610,7 @@ pub fn perform(
                     &session_dir,
                 )
                 .map_err(|err| err.to_string())?;
+            model.composer_epoch = model.composer_epoch.saturating_add(1);
             agent.load_from_session(next);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("forked to {}", session_id(agent))))
@@ -2545,6 +2623,7 @@ pub fn perform(
             let next = store
                 .clone_session(&session_dir)
                 .map_err(|err| err.to_string())?;
+            model.composer_epoch = model.composer_epoch.saturating_add(1);
             agent.load_from_session(next);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("cloned to {}", session_id(agent))))
@@ -2555,6 +2634,7 @@ pub fn perform(
             }
             let expanded = davinci_session::expand_tilde(&path);
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
+            model.composer_epoch = model.composer_epoch.saturating_add(1);
             agent.load_from_session(next);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("imported {}", session_id(agent))))
@@ -2609,7 +2689,7 @@ pub fn perform(
                 model: agent.model_id.clone(),
             });
             adopt_model(parsed, agent, model);
-            let remembered = persist_model_choice(&agent.provider, &agent.model_id);
+            let remembered = persist_model_choice(agent);
             Ok(Done::Said(match remembered {
                 Ok(()) => format!("model {} / {}", agent.provider, agent.model_id),
                 Err(err) => format!(
@@ -2641,10 +2721,6 @@ pub fn perform(
                 ),
             }))
         }
-        SlashAction::OpenThinking => {
-            open_thinking_sheet(agent, model);
-            Ok(Done::Opened)
-        }
         SlashAction::Tree => {
             let mut host = crate::loaded_extension_host(parsed);
             host.runtime_flag_values = crate::flag_values_json(parsed);
@@ -2669,7 +2745,9 @@ pub fn perform(
         }
         SlashAction::Reload => {
             let keybindings_started = Instant::now();
-            model.keybindings = davinci_tui::Keybindings::load(&agent_dir);
+            model.keybindings = davinci_tui::Keybindings::load(&agent_dir)
+                .with_voice(model.voice.enabled)
+                .0;
             let keybindings_ms = keybindings_started.elapsed().as_millis();
             let resources_started = Instant::now();
             crate::apply_discovered_resources(parsed, agent);
@@ -2728,9 +2806,9 @@ pub fn perform(
                 ),
             ];
             let native_commands = |prefix: &str| {
-                crate::native_extensions::NATIVE_COMMANDS
+                crate::native_extensions::command_specs()
                     .iter()
-                    .filter(|name| name.starts_with(prefix))
+                    .filter(|(name, _, _)| name.starts_with(prefix))
                     .count()
             };
             let native_tools = |prefix: &str| {
@@ -2944,11 +3022,20 @@ fn session_id(agent: &Agent) -> String {
 /// chrome's `SessionAction::SelectModelAsDefault` both do. A switch that only
 /// lived in memory came back as the previous provider on the next start, which
 /// read from the outside as a login that had been lost.
-fn persist_model_choice(provider: &str, model_id: &str) -> Result<(), String> {
+fn persist_model_choice(agent: &Agent) -> Result<(), String> {
     let dir = crate::default_agent_dir();
     let mut stored = crate::settings::load_settings(&dir);
-    stored.default_provider = Some(provider.to_string());
-    stored.default_model = Some(model_id.to_string());
+    stored.default_provider = Some(agent.provider.clone());
+    stored.default_model = Some(agent.model_id.clone());
+    let level = agent.thinking_level.as_str().to_string();
+    stored
+        .model_thinking_levels
+        .get_or_insert_with(Default::default)
+        .insert(
+            format!("{}/{}", agent.provider, agent.model_id),
+            level.clone(),
+        );
+    stored.default_thinking_level = Some(level);
     crate::settings::save_settings(&dir, &stored)
 }
 
@@ -2990,19 +3077,24 @@ fn sync_thinking_state(agent: &Agent, model: &mut Model) {
         .unwrap_or_default();
 }
 
-fn cycle_thinking(agent: &mut Agent, model: &mut Model) -> Option<String> {
-    let current = agent.thinking_level.as_str();
-    let next_index = model
-        .thinking_levels
+/// Keep a previous or remembered level within the destination model's support.
+fn supported_thinking_choice(
+    preferred: davinci_protocol::ThinkingLevel,
+    supported: &[davinci_protocol::ThinkingLevel],
+) -> davinci_protocol::ThinkingLevel {
+    let all = davinci_protocol::ThinkingLevel::all();
+    let rank = |level| {
+        all.iter()
+            .position(|candidate| *candidate == level)
+            .unwrap_or(0)
+    };
+    supported
         .iter()
-        .position(|level| level == current)
-        .map(|index| (index + 1) % model.thinking_levels.len())
-        .unwrap_or(0);
-    let next = model.thinking_levels.get(next_index)?.clone();
-    let parsed = davinci_protocol::ThinkingLevel::parse(&next)?;
-    agent.thinking_level = parsed;
-    model.thinking_level = next.clone();
-    Some(next)
+        .copied()
+        .rev()
+        .find(|level| rank(*level) <= rank(preferred))
+        .or_else(|| supported.first().copied())
+        .unwrap_or(davinci_protocol::ThinkingLevel::Off)
 }
 
 fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model) {
@@ -3011,6 +3103,15 @@ fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model)
         .find(|item| item.provider == agent.provider && item.id == agent.model_id)
     {
         agent.context_window = found.context_window;
+        let stored = crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+        let remembered = stored
+            .model_thinking_levels
+            .as_ref()
+            .and_then(|levels| levels.get(&format!("{}/{}", agent.provider, agent.model_id)))
+            .and_then(|level| davinci_protocol::ThinkingLevel::parse(level))
+            .unwrap_or(agent.thinking_level);
+        agent.thinking_level =
+            supported_thinking_choice(remembered, &crate::get_supported_thinking_levels(&found));
     }
     model.model_index = model
         .models
@@ -3136,6 +3237,7 @@ pub fn run(
     // The user's own bindings, which davinci was rendering the defaults of
     // however `~/.pi/agent/keybindings.json` read.
     model.keybindings = davinci_tui::Keybindings::load(&crate::default_agent_dir());
+    let mut voice = crate::voice_input::VoiceInput::new(&mut model);
     // Every `pi.registerShortcut` an extension made, resolved against those
     // bindings so a shortcut never shadows a reserved chord. Without this,
     // every registered shortcut was dead under davinci.
@@ -3159,6 +3261,7 @@ pub fn run(
     // indent, editor padding, hidden thinking blocks — have no davinci
     // surface: the transcript's shape is the design contract's (design.md §3).
     let stored_settings = crate::settings::load_merged_settings(&crate::default_agent_dir(), &cwd);
+    apply_theme_setting(&mut model, &stored_settings);
     let startup_checks =
         crate::startup::start_background_checks(crate::VERSION, stored_settings.clone());
     if let Some(rows) = stored_settings.autocomplete_max_visible {
@@ -3230,7 +3333,7 @@ pub fn run(
     )) {
         pending = Some(Question::FirstRun);
         model.ask = Question::FirstRun.ask(agent);
-        model.overlay = Some(Overlay::Ask);
+        open_ask_overlay(&mut model);
     }
 
     // `pi "do the thing"` and `--file` open straight into a turn rather than
@@ -3255,6 +3358,7 @@ pub fn run(
     );
     for (text, images) in openers {
         let mut shell = Shell {
+            voice: &mut voice,
             parsed,
             agent,
             model: &mut model,
@@ -3324,23 +3428,44 @@ pub fn run(
         for notices in startup_checks.try_iter() {
             model.transcript.extend(startup_notice_entries(&notices));
         }
-        if model.screen == Screen::GraphRun
+        if matches!(model.screen, Screen::GraphRun | Screen::Securitas)
             && last_graph_refresh.elapsed() >= Duration::from_secs(1)
         {
             last_graph_refresh = Instant::now();
-            refresh_graph_sheet(&mut model, &host);
+            if model.screen == Screen::GraphRun {
+                refresh_graph_sheet(&mut model, &host);
+            } else {
+                let locked = host.lock().unwrap_or_else(|e| e.into_inner());
+                if let Ok(Some(value)) = locked.execute_native_command("sec-report", "") {
+                    model.security = Some(security_sheet(&value));
+                }
+            }
         }
+        voice.tick(&mut model, terminal.input_pending());
         if let Err(err) = terminal.draw(&model) {
             break Err(err.to_string());
         }
+        voice.drawn();
+        if model.voice.active && !terminal.mic_visible() {
+            voice.cancel(&mut model);
+        }
 
         let timeout = davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed());
+        let timeout = if voice.polling() {
+            timeout.min(Duration::from_millis(40))
+        } else {
+            timeout
+        };
         match terminal.poll_event(timeout) {
             Ok(Some(event)) => match event {
                 crossterm::event::Event::Key(key)
                     if key.kind != crossterm::event::KeyEventKind::Release =>
                 {
                     // An extension's registered shortcut gets the chord before
+                    if voice.key(&mut model, key) {
+                        last_escape = None;
+                        continue;
+                    }
                     // the shell's own keys, exactly as the legacy loop gives
                     // it. Resolution already refused the reserved chords.
                     let claimed = davinci_tui::key_event_bytes(&key).and_then(|data| {
@@ -3352,6 +3477,7 @@ pub fn run(
                     });
                     if let Some((chord, path)) = claimed {
                         let mut shell = Shell {
+                            voice: &mut voice,
                             parsed,
                             agent,
                             model: &mut model,
@@ -3379,6 +3505,7 @@ pub fn run(
                         });
                         if taken {
                             let mut shell = Shell {
+                                voice: &mut voice,
                                 parsed,
                                 agent,
                                 model: &mut model,
@@ -3473,6 +3600,7 @@ pub fn run(
                             ) {
                                 davinci_tui::DoubleEscapeAction::Fork => {
                                     let mut shell = Shell {
+                                        voice: &mut voice,
                                         parsed,
                                         agent,
                                         model: &mut model,
@@ -3514,6 +3642,7 @@ pub fn run(
                             });
                             if doubled {
                                 run_stop_hooks(&mut Shell {
+                                    voice: &mut voice,
                                     parsed,
                                     agent,
                                     model: &mut model,
@@ -3536,6 +3665,7 @@ pub fn run(
                         }
                         Flow::Quit => {
                             run_stop_hooks(&mut Shell {
+                                voice: &mut voice,
                                 parsed,
                                 agent,
                                 model: &mut model,
@@ -3550,6 +3680,7 @@ pub fn run(
                         }
                         Flow::Submit(line) => on_line(
                             &mut Shell {
+                                voice: &mut voice,
                                 parsed,
                                 agent,
                                 model: &mut model,
@@ -3564,6 +3695,7 @@ pub fn run(
                         ),
                         Flow::Choose(choice) => on_choice(
                             &mut Shell {
+                                voice: &mut voice,
                                 parsed,
                                 agent,
                                 model: &mut model,
@@ -3576,56 +3708,6 @@ pub fn run(
                             },
                             choice,
                         ),
-                        Flow::CycleThinking => {
-                            let cycled = cycle_thinking(agent, &mut model);
-                            if let Some(level) = cycled.clone() {
-                                let mut extension_host =
-                                    host.lock().unwrap_or_else(|err| err.into_inner());
-                                extension_host.runtime_thinking_level = level.clone();
-                                extension_host.emit(
-                                    crate::extension_host::ExtensionEvent::ThinkingLevelSelect {
-                                        level,
-                                    },
-                                );
-                            }
-                            let mut shell = Shell {
-                                parsed,
-                                agent,
-                                model: &mut model,
-                                terminal: &mut terminal,
-                                host: &host,
-                                pending: &mut pending,
-                                cwd: &cwd,
-                                dresser: &dresser,
-                                images: &mut attached_images,
-                            };
-                            match cycled {
-                                // The header carries the new level, but a chord
-                                // that only moves a token in the top-right row
-                                // reads as a key that did nothing.
-                                Some(level) => {
-                                    let provider = shell.agent.provider.clone();
-                                    let model_id = shell.agent.model_id.clone();
-                                    match persist_thinking_choice(&provider, &model_id, &level) {
-                                        Ok(()) => shell.say(&format!("thinking level {level}")),
-                                        Err(err) => shell.say(&format!(
-                                            "thinking level {level} · this run only ({err})"
-                                        )),
-                                    }
-                                }
-                                // Refusing in silence is what made shift+tab
-                                // look broken rather than inapplicable.
-                                None => {
-                                    let why = if shell.model.thinking_levels.is_empty() {
-                                        "no model in hand — /model picks one before thinking has levels"
-                                    } else {
-                                        "this model has one thinking level"
-                                    };
-                                    shell.note(why);
-                                }
-                            }
-                            Next::Go
-                        }
                         Flow::Continue => Next::Go,
                     };
                     // Recall is a search, so it runs when the instrument is
@@ -3655,7 +3737,16 @@ pub fn run(
                 // in the pasted block submit a turn of its own. On Windows the
                 // burst of keys the console delivers is reassembled into this
                 // event by the paste filter behind `poll_event`.
-                crossterm::event::Event::Paste(text) => model.paste(&text),
+                crossterm::event::Event::Paste(text) => {
+                    if !voice.paste(&mut model, &text) {
+                        model.paste(&text);
+                    }
+                }
+                crossterm::event::Event::Mouse(mouse) => {
+                    if terminal.handle_mouse(mouse) {
+                        voice.toggle(&mut model);
+                    }
+                }
                 _ => {}
             },
             Ok(None) => {}
@@ -3672,6 +3763,10 @@ pub fn run(
     };
 
     crate::set_hosted_tui_active(false);
+    {
+        let locked = host.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = locked.execute_native_command("sec-abort", "");
+    }
     terminal.close().map_err(|err| err.to_string())?;
     // Anything shared code printed while the screen was ours, said now that
     // stdout is the user's again rather than dropped.
@@ -4015,7 +4110,7 @@ pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<
                     ));
                 }
             }
-            Some("setEditorText") => model.composer = field(call, "text").into(),
+            Some("setEditorText") => model.replace_composer(field(call, "text")),
             Some("pasteToEditor") => {
                 model.composer.push_str(&field(call, "text"));
                 model.mark_caret_moved();
@@ -4059,9 +4154,27 @@ pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<
 
 fn open_sheet(model: &mut Model, screen: Screen) {
     model.feature_scroll = 0;
+    model.section_offset = None;
+    model.overlay_offset = None;
+    model.section_notice = None;
     model.running = false;
     model.overlay = None;
     model.screen = screen;
+}
+
+fn open_ask_overlay(model: &mut Model) {
+    model.overlay_offset = None;
+    model.ask_index = 0;
+    model.overlay = Some(Overlay::Ask);
+}
+
+fn attach_section_notice(model: &mut Model, text: &str) {
+    if model.screen != Screen::Agent {
+        let text = text.trim();
+        if !text.is_empty() {
+            model.section_notice = Some(text.to_string());
+        }
+    }
 }
 
 /// A path under the home directory, said the way the artboards say it:
@@ -4185,11 +4298,10 @@ fn open_mcp_sheet(agent: &Agent, model: &mut Model) {
     open_sheet(model, Screen::Mcp);
 }
 
-/// `3a` — the full model catalog, from the live runtime snapshot. Every
-/// catalog model stays listed; a row without a credential draws dimmed with
-/// its note saying so, exactly as the legacy `/model` lists them locked.
+/// `3a` — models from authenticated providers in the live runtime snapshot.
 fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Model) {
     let snapshot = crate::load_model_runtime(parsed);
+    let stored = crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
     let available: std::collections::BTreeSet<String> = snapshot
         .available
         .iter()
@@ -4212,7 +4324,27 @@ fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
             } else {
                 format!("{:.2} · {:.2}", entry.cost.input, entry.cost.output)
             };
+            let supported = crate::get_supported_thinking_levels(entry);
+            let preferred = if entry.provider == agent.provider && entry.id == agent.model_id {
+                agent.thinking_level
+            } else {
+                stored
+                    .model_thinking_levels
+                    .as_ref()
+                    .and_then(|levels| levels.get(&key))
+                    .and_then(|level| davinci_protocol::ThinkingLevel::parse(level))
+                    .unwrap_or(agent.thinking_level)
+            };
+            let resolved = supported_thinking_choice(preferred, &supported);
             CatalogRow {
+                reasoning_index: supported
+                    .iter()
+                    .position(|level| *level == resolved)
+                    .unwrap_or(0),
+                reasoning_levels: supported
+                    .iter()
+                    .map(|level| level.as_str().to_string())
+                    .collect(),
                 name: key.clone(),
                 detail: String::new(),
                 window: davinci_tui::davinci::views::chrome::thousands(entry.context_window),
@@ -4261,20 +4393,26 @@ fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
     open_sheet(model, Screen::Models);
 }
 
-/// The model in hand first, then everything a credential unlocks (the
-/// current provider's models ahead of the others), then the rest of the
-/// catalogue — the row the user can act on is never buried under a thousand
-/// providers they have not signed in to. Returns the current model's row.
-fn order_catalog(catalog: &mut [CatalogRow], provider: &str, model_id: &str) -> usize {
-    let current = |row: &CatalogRow| row.provider == provider && row.id == model_id;
+/// Keep only usable providers, with the active provider leading, and show
+/// newer featured models first within each provider. Focus the top row; the
+/// active model is marked independently by the view.
+fn order_catalog(catalog: &mut Vec<CatalogRow>, provider: &str, _model_id: &str) -> usize {
+    catalog.retain(|row| row.credential == Credential::Ready);
     catalog.sort_by_key(|row| {
         (
-            !current(row),
             row.credential != Credential::Ready,
             row.provider != provider,
+            row.provider.clone(),
+            davinci_tui::model_picker_rank(&row.id),
         )
     });
-    catalog.iter().position(current).unwrap_or(0)
+    0
+}
+
+fn apply_theme_setting(model: &mut Model, settings: &crate::settings::Settings) {
+    model.theme = model
+        .theme
+        .with_name(settings.theme.as_deref().unwrap_or("dark"));
 }
 
 /// `3b` — the settings sheet, from the same list the legacy overlay builds,
@@ -4285,11 +4423,12 @@ fn open_settings_sheet(agent: &Agent, model: &mut Model) {
     let user = crate::settings::load_settings(&dir);
     let merged = crate::settings::load_merged_settings(&dir, &agent.cwd);
     let user_list = davinci_tui::interactive_settings_list(
-        &crate::settings::to_interactive_config(&user, "davinci"),
+        &crate::settings::to_interactive_config(&user, "dark"),
     );
     let merged_list = davinci_tui::interactive_settings_list(
-        &crate::settings::to_interactive_config(&merged, "davinci"),
+        &crate::settings::to_interactive_config(&merged, "dark"),
     );
+    apply_theme_setting(model, &merged);
     model.settings_rows = merged_list
         .items
         .into_iter()
@@ -4304,13 +4443,20 @@ fn open_settings_sheet(agent: &Agent, model: &mut Model) {
                 label: item.label,
                 value: item.current_value,
                 project,
-                values: item.values,
+                values: if item.id == "theme" {
+                    vec!["dark".into(), "light".into(), "vox".into()]
+                } else {
+                    item.values
+                },
                 description: item.description.unwrap_or_default(),
                 key: item.id,
                 note: String::new(),
             }
         })
         .collect();
+    model
+        .settings_rows
+        .sort_by_key(|row| davinci_tui::davinci::views::settings::group_rank(&row.key));
     model.settings_index = 0;
     model.facts.settings_keys = model.settings_rows.len();
     open_sheet(model, Screen::Settings);
@@ -4319,7 +4465,7 @@ fn open_settings_sheet(agent: &Agent, model: &mut Model) {
 /// `3c` — the thinking sheet: every level this model supports, as the budget
 /// it actually sends, with its share of the 64k ceiling and a warning when a
 /// level would take a third of the window before the turn starts.
-fn open_thinking_sheet(agent: &Agent, model: &mut Model) {
+fn refresh_thinking_sheet(agent: &Agent, model: &mut Model) {
     let stored = crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
     let budgets = stored.thinking_budgets.clone();
     let levels = crate::current_runtime_model(agent)
@@ -4373,7 +4519,6 @@ fn open_thinking_sheet(agent: &Agent, model: &mut Model) {
     model.facts.thinking_reserve = String::new();
     model.facts.thinking_last_turn = last_turn;
     model.facts.thinking_output_share = share;
-    open_sheet(model, Screen::Thinking);
 }
 
 /// `3d` — provider credentials: every provider `/login` offers, with where
@@ -4427,20 +4572,23 @@ fn humanize_action(action: &str) -> String {
 /// `3e` — the keymap, grouped by the surface a key belongs to, from the real
 /// binding table plus every extension shortcut.
 fn open_keys_sheet(model: &mut Model) {
-    let bindings = davinci_tui::get_keybindings();
+    let mut bindings: Vec<_> = model
+        .keybindings
+        .bindings()
+        .filter(|(action, _)| *action != "app.thinking.cycle")
+        .collect();
+    bindings.sort_by_key(|(action, _)| *action);
     let mut instruments: Vec<(String, String)> = Vec::new();
     let mut composer: Vec<(String, String)> = Vec::new();
     let mut lists: Vec<(String, String)> = Vec::new();
     let mut other: Vec<(String, String)> = Vec::new();
-    for binding in &bindings {
-        let row = (binding.keys.join(", "), humanize_action(&binding.action));
-        if binding.action.starts_with("davinci.") {
+    for (action, keys) in &bindings {
+        let row = (keys.join(", "), humanize_action(action));
+        if action.starts_with("davinci.") {
             instruments.push(row);
-        } else if binding.action.starts_with("tui.editor.")
-            || binding.action.starts_with("tui.input.")
-        {
+        } else if action.starts_with("tui.editor.") || action.starts_with("tui.input.") {
             composer.push(row);
-        } else if binding.action.starts_with("tui.select.") {
+        } else if action.starts_with("tui.select.") {
             lists.push(row);
         } else {
             other.push(row);
@@ -5249,6 +5397,93 @@ fn governor_sheet(value: &serde_json::Value) -> GovernorSheet {
 
 /// `5d` — the security scan sheet, from the structured `sec-status` payload.
 fn security_sheet(value: &serde_json::Value) -> SecurityScan {
+    if value["schemaVersion"] == 2 {
+        let empty = Vec::new();
+        let raw = value["findings"].as_array().unwrap_or(&empty);
+        let findings = raw
+            .iter()
+            .map(|finding| {
+                let assessment = &finding["assessment"];
+                let location = &finding["claim"]["locations"][0];
+                let count = finding["occurrences"].as_array().map_or(1, Vec::len);
+                Finding {
+                    message: format!(
+                        "{}{}: {}{}",
+                        if finding["scope"] == "supporting" {
+                            "Outside target · "
+                        } else {
+                            ""
+                        },
+                        assessment["classification"]
+                            .as_str()
+                            .unwrap_or_else(|| assessment["disposition"]
+                                .as_str()
+                                .unwrap_or("deferred")),
+                        json_str(&finding["claim"], "title"),
+                        if count > 1 {
+                            format!(" ({count} occurrences)")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    location: format!("{}:{}", json_str(location, "path"), location["startLine"]),
+                    severity: match assessment["severity"].as_str() {
+                        Some("critical") => Severity::Critical,
+                        Some("high") => Severity::High,
+                        Some("medium") => Severity::Medium,
+                        Some("low") => Severity::Low,
+                        _ => Severity::Dismissed,
+                    },
+                    rule: "native-security-review".into(),
+                    evidence:
+                        crate::native_extensions::security_scan::report::render_finding_details(
+                            finding,
+                        ),
+                    path: String::new(),
+                }
+            })
+            .collect();
+        let reviewed = value["coverage"]["reviewedPaths"]
+            .as_array()
+            .map_or(0, Vec::len);
+        let eligible = value["coverage"]["eligibleFiles"].as_u64().unwrap_or(0);
+        let status = value["status"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        return SecurityScan {
+            validated: raw
+                .iter()
+                .filter(|finding| finding["assessment"]["classification"] == "confirmed")
+                .count() as u32,
+            candidates: raw.len() as u32,
+            fraction: if eligible == 0 {
+                0.0
+            } else {
+                reviewed as f64 / eligible as f64
+            },
+            files: format!("{reviewed}/{eligible}"),
+            skipped: value["coverage"]["skipped"]
+                .as_array()
+                .map_or(0, Vec::len)
+                .to_string(),
+            findings,
+            seal: String::new(),
+            id: json_str(value, "scanId"),
+            state: status.to_string(),
+            report: format!(
+                "Experimental · {} · coverage {} · scan {} · /sec-status /sec-report /sec-abort",
+                status,
+                if value["coverageComplete"] == true {
+                    "complete"
+                } else {
+                    "incomplete"
+                },
+                json_str(value, "scanId")
+            ),
+            ..Default::default()
+        };
+    }
     let severity_of = |name: &str| match name {
         "critical" => Severity::Critical,
         "high" => Severity::High,
@@ -5325,13 +5560,18 @@ fn security_sheet(value: &serde_json::Value) -> SecurityScan {
         }
     }
     let coverage = value.get("coverage").cloned().unwrap_or_default();
+    let read_only = value["readOnly"] == true || value["status"] == "legacy-readonly";
     SecurityScan {
         validated,
         candidates: candidates.max(findings.len() as u32),
-        fraction: if candidates == 0 {
-            1.0
+        fraction: if value["coverageComplete"] == true {
+            if candidates == 0 {
+                1.0
+            } else {
+                validated as f64 / candidates as f64
+            }
         } else {
-            validated as f64 / candidates as f64
+            0.0
         },
         files: coverage
             .get("filesScanned")
@@ -5351,7 +5591,17 @@ fn security_sheet(value: &serde_json::Value) -> SecurityScan {
             value.get("manifest").unwrap_or(&serde_json::Value::Null),
             "scanId",
         ),
-        report: "report.md in the scan artifact · /sec-report".into(),
+        id: json_str(value, "scanId"),
+        state: if read_only {
+            "legacy-readonly".into()
+        } else {
+            json_str(value, "status")
+        },
+        report: if read_only {
+            "Legacy v1 · read-only · not v2 confirmation · coverage incomplete".into()
+        } else {
+            "report.md in the scan artifact · /sec-report".into()
+        },
         ..Default::default()
     }
 }
@@ -5753,6 +6003,7 @@ fn refresh_graph_sheet(model: &mut Model, host: &Arc<Mutex<ExtensionHost>>) -> b
 /// Everything a composer line or a chosen row may need. Bundled because the
 /// borrow checker will not let the loop hand out eight `&mut` pieces at once.
 struct Shell<'a> {
+    voice: &'a mut crate::voice_input::VoiceInput,
     parsed: &'a crate::args::Args,
     agent: &'a mut Agent,
     model: &'a mut Model,
@@ -5791,6 +6042,7 @@ impl Shell<'_> {
     /// (design.md §4), so this reads as a warning under `NO_COLOR` too.
     fn note(&mut self, text: &str) {
         self.model.running = false;
+        attach_section_notice(self.model, text);
         self.model.transcript.push(Entry::Gap);
         self.model
             .transcript
@@ -5843,8 +6095,7 @@ impl Shell<'_> {
             Done::Ask(question) => {
                 self.model.running = false;
                 self.model.ask = question.ask(self.agent);
-                self.model.ask_index = 0;
-                self.model.overlay = Some(Overlay::Ask);
+                open_ask_overlay(self.model);
                 *self.pending = Some(question);
             }
             Done::Detach(detached) => return self.detach(detached),
@@ -5856,6 +6107,8 @@ impl Shell<'_> {
     /// then take it again. A browser handshake prints and prompts; it cannot
     /// do either underneath an alternate screen.
     fn detach(&mut self, detached: Detached) -> Next {
+        self.voice.terminal_handoff(self.model);
+        self.model.composer_epoch = self.model.composer_epoch.saturating_add(1);
         if let Err(err) = self.terminal.close() {
             return Next::Fail(err.to_string());
         }
@@ -5899,6 +6152,8 @@ impl Shell<'_> {
         }
         match davinci_session::JsonlSession::open(std::path::Path::new(path)) {
             Ok(store) => {
+                self.voice.cancel(self.model);
+                self.model.composer_epoch = self.model.composer_epoch.saturating_add(1);
                 self.agent.load_from_session(store);
                 self.model.transcript = transcript_from(&self.agent.messages);
                 self.model.running = false;
@@ -6169,6 +6424,11 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
 fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
     match choice {
         Choice::Command { name, kind } => match kind.as_str() {
+            "voice" => {
+                shell.model.close();
+                shell.voice.open_setup(shell.model);
+                Next::Go
+            }
             "command" => on_line(shell, &name),
             "session" => {
                 let label = name.trim_start_matches("memoria: ").to_string();
@@ -6216,7 +6476,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 },
             );
             adopt_model(shell.parsed, shell.agent, shell.model);
-            match persist_model_choice(&item.provider, &item.id) {
+            match persist_model_choice(shell.agent) {
                 Ok(()) => shell.say(&format!("model {} / {}", item.provider, item.id)),
                 Err(err) => shell.say(&format!(
                     "model {} / {} · this run only ({err})",
@@ -6257,13 +6517,28 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 },
             );
             adopt_model(shell.parsed, shell.agent, shell.model);
-            match persist_model_choice(&row.provider, &row.id) {
+            if let Some(level) = row
+                .reasoning_levels
+                .get(row.reasoning_index)
+                .filter(|level| shell.model.thinking_levels.contains(level))
+                .and_then(|level| davinci_protocol::ThinkingLevel::parse(level))
+            {
+                shell.agent.thinking_level = level;
+                crate::loaded_extension_host(shell.parsed).emit(
+                    crate::extension_host::ExtensionEvent::ThinkingLevelSelect {
+                        level: level.as_str().to_string(),
+                    },
+                );
+                sync_thinking_state(shell.agent, shell.model);
+            }
+            match persist_model_choice(shell.agent) {
                 Ok(()) => shell.say(&format!("model {} / {}", row.provider, row.id)),
                 Err(err) => shell.say(&format!(
                     "model {} / {} · this run only ({err})",
                     row.provider, row.id
                 )),
             }
+            refresh_thinking_sheet(shell.agent, shell.model);
             Next::Go
         }
         // `3b` — advance the setting to its next value and persist it.
@@ -6281,7 +6556,10 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             shell.model.thinking_index = index;
             let action = crate::slash::SlashAction::SetThinking(level);
             match perform(shell.parsed, shell.agent, shell.model, action) {
-                Ok(Done::Said(text)) => shell.say(&text),
+                Ok(Done::Said(text)) => {
+                    shell.model.close();
+                    shell.say(&text);
+                }
                 Ok(Done::Note(text)) | Err(text) => shell.note(&text),
                 Ok(_) => {}
             }
@@ -6337,6 +6615,8 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 .navigate_tree_entry(&target, false, None, false, 16_384)
             {
                 Ok(_) => {
+                    shell.voice.cancel(shell.model);
+                    shell.model.composer_epoch = shell.model.composer_epoch.saturating_add(1);
                     shell.model.close();
                     shell.model.transcript = transcript_from(&shell.agent.messages);
                     shell.say(&format!(
@@ -6432,6 +6712,25 @@ fn reload_file_rules(shell: &mut Shell<'_>) {
     policy.deny = fresh.deny;
 }
 
+fn persist_setting_row<F>(row: &mut SettingRow, persist: F) -> Result<String, String>
+where
+    F: FnOnce(&str) -> Result<(), String>,
+{
+    if row.values.is_empty() {
+        return Ok(row.value.clone());
+    }
+    let at = row
+        .values
+        .iter()
+        .position(|value| value == &row.value)
+        .unwrap_or(0);
+    let next = row.values[(at + 1) % row.values.len()].clone();
+    persist(&format!("{}={next}", row.key))?;
+    row.value = next.clone();
+    row.project = false;
+    Ok(next)
+}
+
 /// `3b` — advance a setting to the next value on its ramp, write it through
 /// the same store the legacy overlay writes, and re-honour it at once where
 /// davinci reads it live.
@@ -6442,29 +6741,31 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
     if row.values.is_empty() {
         return Next::Go;
     }
-    let at = row
-        .values
-        .iter()
-        .position(|value| value == &row.value)
-        .unwrap_or(0);
-    let next = row.values[(at + 1) % row.values.len()].clone();
     let key = row.key.clone();
-    row.value = next.clone();
-    row.project = false;
-    if let Err(err) = crate::persist_interactive_setting(&format!("{key}={next}")) {
+    if let Err(err) = persist_setting_row(row, crate::persist_interactive_setting) {
         shell.note(&err);
         return Next::Go;
     }
+
     crate::sync_agent_from_settings(shell.agent);
+    open_settings_sheet(shell.agent, shell.model);
+    shell.model.settings_index = index.min(shell.model.settings_rows.len().saturating_sub(1));
+    let effective = shell
+        .model
+        .settings_rows
+        .iter()
+        .find(|row| row.key == key)
+        .map(|row| row.value.clone())
+        .unwrap_or_default();
     match key.as_str() {
         "autocomplete-max-visible" => {
-            if let Ok(rows) = next.parse::<usize>() {
+            if let Ok(rows) = effective.parse::<usize>() {
                 shell.model.suggestion_rows = rows.clamp(3, 20);
             }
         }
-        "terminal-progress" => shell.model.terminal_progress = next == "true",
-        "double-escape-action" => shell.model.double_escape_action = next.clone(),
-        "show-tool-output" => shell.model.show_tool_output = next == "true",
+        "terminal-progress" => shell.model.terminal_progress = effective == "true",
+        "double-escape-action" => shell.model.double_escape_action = effective,
+        "show-tool-output" => shell.model.show_tool_output = effective == "true",
         _ => {}
     }
     Next::Go
@@ -6960,6 +7261,92 @@ fn refresh_context(model: &mut Model, agent: &Agent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn security_tui_maps_cancelled_failed_and_admission_without_success() {
+        use davinci_tui::davinci::{
+            model::Model,
+            theme::{ColorDepth, Theme},
+            views::securitas,
+        };
+        fn drawn(sheet: davinci_tui::davinci::model::SecurityScan) -> String {
+            let mut model =
+                Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 24, false);
+            model.security = Some(sheet);
+            securitas::lines(&model)
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        for status in ["cancelled", "failed", "interrupted"] {
+            let sheet = super::security_sheet(&serde_json::json!({
+                "schemaVersion": 2,
+                "scanId": "11111111-1111-1111-1111-111111111111",
+                "status": status,
+                "coverageComplete": false,
+                "findings": [],
+                "coverage": {"eligibleFiles": 1, "reviewedPaths": [], "skipped": []}
+            }));
+            assert_eq!(sheet.state, status);
+            assert_eq!(sheet.id, "11111111-1111-1111-1111-111111111111");
+            let text = drawn(sheet);
+            assert!(text.contains(&format!("Status: {status}")), "{text}");
+            assert!(text.contains("coverage incomplete"), "{text}");
+            for claim in [
+                "complete for captured scope",
+                "report sealed",
+                "never left",
+                "coverage complete",
+            ] {
+                assert!(!text.contains(claim), "{status}: {text}");
+            }
+        }
+        let missing = super::security_sheet(&serde_json::json!({"schemaVersion": 2}));
+        assert_eq!(missing.state, "unknown");
+        assert!(!drawn(missing).contains("Status: completed"));
+        let mut empty = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 24, false);
+        empty.security = None;
+        let text = securitas::lines(&empty)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("No security scan available"));
+        assert!(!text.contains("Status: completed"));
+        let view = crate::native_extensions::security_scan::report::project_legacy_v1(
+            br#"{"schemaVersion":1,"validated":true,"findings":[{"severity":"critical","title":"old"}]}"#,
+        )
+        .unwrap();
+        let sheet = super::security_sheet(&view);
+        assert_eq!(sheet.state, "legacy-readonly");
+        assert_eq!(sheet.fraction, 0.0);
+        let text = drawn(sheet);
+        assert!(text.contains("Status: legacy-readonly"), "{text}");
+        assert!(text.contains("not v2 confirmation"), "{text}");
+        assert!(!text.contains("Status: completed"), "{text}");
+        assert!(!text.contains("report sealed"), "{text}");
+    }
+
+    #[test]
+    fn security_sheet_preserves_grouped_occurrence_assessments() {
+        let report = serde_json::json!({"schemaVersion":2,"findings":[{
+            "claim":{"title":"Shared control","locations":[{"path":"control.rs","startLine":1}]},
+            "assessment":{"classification":"confirmed","severity":"high","reason":"First reason"},
+            "occurrences":[
+                {"claim":{"entrypoint":"First caller"},"assessment":{"classification":"confirmed","severity":"high","reason":"First reason"}},
+                {"claim":{"entrypoint":"Second caller","prerequisites":["Second prerequisite"],"locations":[{"path":"second.rs","startLine":2,"endLine":3}]},"assessment":{"classification":"likely","severity":"critical","reason":"Second reason","proofGaps":["Second unknown condition"]}}]}]});
+        let sheet = super::security_sheet(&report);
+        assert_eq!(sheet.findings.len(), 1);
+        assert!(sheet.findings[0].message.contains("2 occurrences"));
+        assert!(sheet.findings[0].evidence.contains("First caller"));
+        assert!(sheet.findings[0].evidence.contains("likely / critical"));
+        assert!(sheet.findings[0].evidence.contains("Second caller"));
+        assert!(sheet.findings[0]
+            .evidence
+            .contains("Second unknown condition"));
+        assert!(sheet.findings[0].evidence.contains("Second prerequisite"));
+        assert!(sheet.findings[0].evidence.contains("second.rs:2-3"));
+    }
     use super::*;
     use serde_json::json;
 
@@ -7023,7 +7410,17 @@ mod tests {
         let mut m = model();
         open_keys_sheet(&mut m);
         assert_eq!(m.screen, Screen::Keys);
-        assert_eq!(m.facts.keys_count, davinci_tui::get_keybindings().len());
+        assert_eq!(
+            m.facts.keys_count,
+            m.keymap.iter().map(|group| group.rows.len()).sum::<usize>()
+        );
+        assert!(
+            !m.keymap
+                .iter()
+                .flat_map(|group| &group.rows)
+                .any(|(_, label)| label.contains("thinking cycle")
+                    || label.contains("cycle thinking"))
+        );
         assert_eq!(m.facts.keys_surfaces, m.keymap.len());
         assert!(m.facts.keys_surfaces >= 3);
     }
@@ -7130,19 +7527,103 @@ mod tests {
     }
 
     #[test]
-    fn cycling_thinking_advances_supported_levels_and_syncs_chrome() {
-        let mut agent = davinci_agent::Agent::new("test");
-        agent.thinking_level = davinci_protocol::ThinkingLevel::Low;
-        let mut m = model();
-        m.thinking_levels = vec!["off".into(), "low".into(), "medium".into(), "high".into()];
-        m.thinking_level = "low".into();
-
+    fn switching_models_resolves_unsupported_thinking_before_optional_confirmation() {
+        use davinci_protocol::ThinkingLevel::*;
         assert_eq!(
-            cycle_thinking(&mut agent, &mut m).as_deref(),
-            Some("medium")
+            supported_thinking_choice(Max, &[Off, Low, Medium, High]),
+            High
         );
-        assert_eq!(agent.thinking_level.as_str(), "medium");
-        assert_eq!(m.thinking_level, "medium");
+        assert_eq!(
+            supported_thinking_choice(Low, &[Off, Low, Medium, High]),
+            Low
+        );
+        assert_eq!(supported_thinking_choice(High, &[Off]), Off);
+        assert_eq!(supported_thinking_choice(Off, &[Low, Medium, High]), Low);
+    }
+
+    #[test]
+    fn theme_setting_persists_and_recolors_the_current_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = model();
+        m.composer = "keep this draft".into();
+        let dark = m.theme;
+        let mut row = SettingRow {
+            key: "theme".into(),
+            value: "dark".into(),
+            values: vec!["dark".into(), "light".into()],
+            ..SettingRow::default()
+        };
+        persist_setting_row(&mut row, |assignment| {
+            assert_eq!(assignment, "theme=light");
+            let stored = crate::settings::Settings {
+                theme: Some("light".into()),
+                ..Default::default()
+            };
+            crate::settings::save_settings(dir.path(), &stored)
+        })
+        .unwrap();
+        let stored = crate::settings::load_settings(dir.path());
+        apply_theme_setting(&mut m, &stored);
+        assert_ne!(m.theme.background, dark.background);
+        assert_eq!(m.composer, "keep this draft");
+        let mut restarted = model();
+        apply_theme_setting(&mut restarted, &stored);
+        assert_eq!(restarted.theme, m.theme);
+        assert_eq!(row.value, "light");
+    }
+
+    #[test]
+    fn failed_setting_persistence_does_not_change_the_displayed_row() {
+        let mut row = SettingRow {
+            label: "Auto compact".into(),
+            value: "on".into(),
+            values: vec!["on".into(), "off".into()],
+            project: true,
+            key: "auto-compact".into(),
+            ..SettingRow::default()
+        };
+        let result = persist_setting_row(&mut row, |_| Err("disk full".into()));
+        assert_eq!(result.unwrap_err(), "disk full");
+        assert_eq!(row.value, "on");
+        assert!(row.project);
+    }
+
+    #[test]
+    fn section_notices_are_only_attached_to_open_sheets() {
+        let mut sheet = model();
+        sheet.screen = Screen::Settings;
+        attach_section_notice(&mut sheet, "could not save");
+        assert_eq!(sheet.section_notice.as_deref(), Some("could not save"));
+
+        let mut agent = model();
+        agent.screen = Screen::Agent;
+        attach_section_notice(&mut agent, "conversation warning");
+        assert!(agent.section_notice.is_none());
+    }
+
+    #[test]
+    fn opening_an_ask_overlay_resets_only_overlay_reading_state() {
+        let mut m = model();
+        m.section_offset = Some(5);
+        m.overlay_offset = Some(8);
+        m.ask_index = 3;
+        open_ask_overlay(&mut m);
+        assert_eq!(m.section_offset, Some(5));
+        assert!(m.overlay_offset.is_none());
+        assert_eq!(m.ask_index, 0);
+        assert_eq!(m.overlay, Some(Overlay::Ask));
+    }
+
+    #[test]
+    fn opening_a_sheet_clears_section_reading_state() {
+        let mut m = model();
+        m.section_offset = Some(9);
+        m.overlay_offset = Some(7);
+        m.section_notice = Some("stale notice".into());
+        open_sheet(&mut m, Screen::Settings);
+        assert!(m.section_offset.is_none());
+        assert!(m.overlay_offset.is_none());
+        assert!(m.section_notice.is_none());
     }
 
     fn model() -> Model {
@@ -7319,7 +7800,7 @@ mod tests {
     }
 
     #[test]
-    fn the_catalogue_opens_on_the_model_in_hand_with_usable_rows_first() {
+    fn the_catalogue_opens_with_newer_models_before_the_current_older_model() {
         let row = |provider: &str, id: &str, ready: bool| CatalogRow {
             name: format!("{provider}/{id}"),
             detail: String::new(),
@@ -7335,12 +7816,15 @@ mod tests {
             ring: false,
             provider: provider.into(),
             id: id.into(),
+            ..Default::default()
         };
         let mut catalog = vec![
             row("amazon-bedrock", "nova", false),
             row("anthropic", "claude", true),
             row("openai-codex", "gpt-5", true),
             row("openai-codex", "gpt-5-mini", true),
+            row("openai-codex", "gpt-5.6-luna", true),
+            row("openai-codex", "gpt-6-astra", true),
             row("xai", "grok", false),
         ];
         let index = order_catalog(&mut catalog, "openai-codex", "gpt-5-mini");
@@ -7349,11 +7833,11 @@ mod tests {
         assert_eq!(
             names,
             [
-                "openai-codex/gpt-5-mini",
+                "openai-codex/gpt-6-astra",
+                "openai-codex/gpt-5.6-luna",
                 "openai-codex/gpt-5",
+                "openai-codex/gpt-5-mini",
                 "anthropic/claude",
-                "amazon-bedrock/nova",
-                "xai/grok",
             ]
         );
     }
@@ -7398,7 +7882,7 @@ mod tests {
     #[test]
     fn the_permission_panel_offers_always_only_in_a_trusted_project() {
         let ask = permission_ask(&approval("bash", "git status --short", false), true);
-        assert_eq!(ask.title, "LICENTIA");
+        assert_eq!(ask.title, "Permission");
         assert_eq!(ask.name, "PERMISSION");
         assert_eq!(ask.key, "/permissions");
         assert_eq!(ask.note, "bash · git status --short");
@@ -7422,6 +7906,21 @@ mod tests {
         let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, ["allow once", "allow for this session", "deny"]);
         assert_eq!(ask.note, "write · ../out.txt · outside the project");
+    }
+
+    #[test]
+    fn interrupted_recovery_copy_avoids_unverified_guarantees() {
+        let rows = interrupted_recovery_aftermath();
+        let copy = rows
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(copy.contains("interrupted"));
+        assert!(!copy.contains("nothing to recover"));
+        assert!(!copy.contains("transcript written"));
+        assert!(!copy.contains("abort was delivered"));
+        assert!(!copy.contains("esc esc"));
     }
 
     #[test]
@@ -7899,6 +8398,23 @@ mod tests {
     }
 
     #[test]
+    fn init_starts_a_repository_analysis_prompt() {
+        assert!(
+            matches!(classify("/init"), Sent::Prompt(text) if text.contains("AGENTS.md") && !text.starts_with('/'))
+        );
+    }
+
+    #[test]
+    fn removed_thinking_command_redirects_to_model_without_sending_a_prompt() {
+        for command in ["/thinking", "/thinking high"] {
+            assert!(matches!(classify(command), Sent::Say(text) if text.contains("/model")));
+        }
+        assert!(!crate::slash::builtin_slash_commands()
+            .iter()
+            .any(|command| command.name == "thinking"));
+    }
+
+    #[test]
     fn every_builtin_command_reaches_the_agent_rather_than_the_model() {
         use crate::slash::SlashAction;
         // Nothing a `/` line can parse to may fall through to the model as
@@ -7925,8 +8441,6 @@ mod tests {
             "/cost",
             "/status",
             "/agents",
-            "/thinking",
-            "/thinking high",
             "/logout",
             "/login openai",
             "/tree",
@@ -8026,7 +8540,7 @@ mod tests {
             options: crate::trust::get_project_trust_options(std::path::Path::new("."), false),
         };
         let panel = trust.ask(&agent);
-        assert_eq!(panel.title, "FIDES");
+        assert_eq!(panel.title, "Trust");
         assert!(panel.note.contains("C:\\work\\pi-rust"), "{}", panel.note);
         assert!(!panel.items.is_empty());
 
@@ -8034,7 +8548,7 @@ mod tests {
             providers: vec!["anthropic".into(), "openai".into()],
         }
         .ask(&agent);
-        assert_eq!(credentials.title, "CLAVES");
+        assert_eq!(credentials.title, "Credentials");
         assert_eq!(credentials.items.len(), 2);
         assert_eq!(credentials.items[0].label, "anthropic");
     }
@@ -8045,6 +8559,7 @@ mod tests {
         let panel = Question::FirstRun.ask(&agent);
         // The old setup asked for a theme too; there is one palette here, so
         // the only question left is the one about the user, not the terminal.
+        assert_eq!(panel.title, "Welcome");
         assert_eq!(panel.items.len(), 2);
         assert!(panel.items[0].label.contains("share"));
         assert!(panel.note.contains("never required"), "{}", panel.note);

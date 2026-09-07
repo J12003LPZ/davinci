@@ -1,308 +1,178 @@
-//! `2c` — the token governor.
-//!
-//! Budget by role, one row each: `role tokens meter cap`. Rows within cap use
-//! verdigris, the breaching row copper with a warning cap note. The proposal
-//! always states recovers / keeps / cost / reversible, then keyed actions. It
-//! never acts silently (design.md §6).
-//!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/mensura.ex`.
+//! Context budget and policy advice. The view reports measurements and
+//! recommendations; it does not expose actions the input owner cannot apply.
 
-use ratatui::text::{Line, Span};
-
-use crate::davinci::model::{Model, Proposal};
-use crate::davinci::theme::glyph;
-use crate::davinci::ui::{
-    blank, meter, pad, run_width, span, span_strong, spread, surface_rule, wrap, Surface, MEASURE,
-};
-
-/// How many cells the per-role meters take.
-const METER_CELLS: u16 = 24;
+use crate::davinci::ui::{section_detail, section_heading, section_state};
+use crate::davinci::{model::Model, theme::State};
+use ratatui::text::Line;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 14);
+    let width = model.width;
     let meta = &model.budget_meta;
-
-    // One row: what is in use on the left, the headroom on the right (`2c`).
-    let mut rows = vec![
-        spread(
+    let mut rows = Vec::new();
+    if !meta.in_use.is_empty() && !meta.window.is_empty() {
+        rows.extend(section_heading(
             width,
-            vec![
-                span("in use ", th.muted),
-                span(meta.in_use.clone(), th.primary),
-                span(" of ", th.muted),
-                span(meta.window.clone(), th.muted),
-            ],
-            vec![
-                span(format!("headroom {}", meta.headroom), th.muted),
-                span(" · ", th.border),
-                span(meta.rate.clone(), th.muted),
-                span(" · ", th.border),
-                span(th.pie(meta.in_use_fraction), th.warning),
-                span(
-                    format!(" {}%", (meta.in_use_fraction * 100.0) as u32),
-                    th.muted,
-                ),
-            ],
-        ),
-        blank(),
-    ];
-
+            th,
+            &format!("Context: {} of {}", meta.in_use, meta.window),
+        ));
+    }
+    for (label, value) in [
+        ("Headroom", &meta.headroom),
+        ("Growth", &meta.rate),
+        ("Policy", &meta.policy),
+    ] {
+        if !value.is_empty() {
+            rows.extend(section_detail(width, th, &format!("{label}: {value}")));
+        }
+    }
+    if model.budget.is_empty() {
+        rows.extend(section_detail(
+            width,
+            th,
+            "No per-role context budget data available.",
+        ));
+    }
     for item in &model.budget {
-        let color = if item.breach {
-            th.primary
+        let share = if item.fraction.is_finite() {
+            format!(" · {:.0}%", item.fraction * 100.0)
         } else {
-            th.secondary
+            String::new()
         };
-        let role_color = if item.breach { th.primary } else { th.muted };
-        let note_color = if item.breach { th.warning } else { th.border };
-
-        let mut row = vec![
-            span(format!("{:<13}", item.role), role_color),
-            span(format!("{:>6}  ", item.tokens), th.text),
-        ];
-        row.extend(meter(item.fraction, METER_CELLS, th, Some(color)));
-        let note = vec![span(item.note.clone(), note_color)];
-        let gap = width
-            .saturating_sub(run_width(&row))
-            .saturating_sub(run_width(&note))
-            .max(1);
-        row.push(pad(gap, None));
-        row.extend(note);
-        rows.push(Line::from(row));
+        rows.extend(section_heading(
+            width,
+            th,
+            &format!("{} · {} tokens{share}", item.role, item.tokens),
+        ));
+        if item.breach {
+            rows.extend(section_state(width, th, State::Attention, &item.note));
+        } else {
+            rows.extend(section_detail(width, th, &item.note));
+        }
     }
-
     if let Some(proposal) = &model.proposal {
-        rows.push(blank());
-        rows.extend(governor(model, proposal, width));
+        rows.extend(section_heading(width, th, "Policy recommendation"));
+        rows.extend(section_detail(width, th, &proposal.summary));
+        for (label, value) in [
+            ("Recovers", &proposal.recovers),
+            ("Keeps", &proposal.keeps),
+            ("Cost", &proposal.cost),
+        ] {
+            if !value.is_empty() {
+                rows.extend(section_detail(width, th, &format!("{label}: {value}")));
+            }
+        }
+        rows.extend(section_detail(
+            width,
+            th,
+            &format!(
+                "Reversible: {}",
+                if proposal.reversible { "yes" } else { "no" }
+            ),
+        ));
+        if !proposal.actions.is_empty() {
+            rows.extend(section_detail(
+                width,
+                th,
+                "Alternatives listed by the policy:",
+            ));
+            for (_, description) in &proposal.actions {
+                rows.extend(section_detail(width, th, description));
+            }
+        }
+        rows.extend(section_detail(
+            width,
+            th,
+            "This review does not apply changes.",
+        ));
     }
-
-    rows.push(blank());
-    // A hairline, then the spend against its cap left and the governor's
-    // history right (`2c`) — on one row when both fit, or the history moves
-    // right-aligned beneath so neither fact is ever clipped.
-    rows.push(Line::from(surface_rule(width + 4, th)));
-    let spend = vec![
-        span("session spend ", th.muted),
-        span(meta.session_spend.clone(), th.text),
-        span(" · ", th.border),
-        span(format!("daily cap {}", meta.daily_cap), th.muted),
-        span(" · ", th.border),
-        span(th.pie(meta.daily_fraction), th.primary),
-        span(
-            format!(" {}%", (meta.daily_fraction * 100.0) as u32),
-            th.muted,
-        ),
-    ];
-    let history = vec![span(meta.history.clone(), th.muted)];
-    if run_width(&spend) + run_width(&history) < width {
-        rows.push(spread(width, spend, history));
-    } else {
-        rows.push(Line::from(spend));
-        rows.push(spread(width, Vec::new(), history));
+    for (label, value) in [
+        ("Session spend", &meta.session_spend),
+        ("Daily cap", &meta.daily_cap),
+        ("History", &meta.history),
+    ] {
+        if !value.is_empty() {
+            rows.extend(section_detail(width, th, &format!("{label}: {value}")));
+        }
     }
     rows
-}
-
-/// The proposal block. Bordered in warning, and it always says what it
-/// recovers, what it keeps, what it costs and whether it can be undone.
-fn governor(model: &Model, proposal: &Proposal, width: u16) -> Vec<Line<'static>> {
-    let th = &model.theme;
-    let mut body: Vec<Vec<Span<'static>>> = wrap(
-        &format!("{} {}", glyph::ATTENTION, proposal.summary),
-        width.saturating_sub(6),
-    )
-    .into_iter()
-    .map(|row| vec![span(row, th.text)])
-    .collect();
-
-    body.push(Vec::new());
-    body.push(vec![
-        span("recovers ", th.muted),
-        span(proposal.recovers.clone(), th.success),
-        span("   keeps ", th.muted),
-        span(proposal.keeps.clone(), th.text),
-        span("   cost ", th.muted),
-        span(proposal.cost.clone(), th.text),
-        span("   reversible ", th.muted),
-        if proposal.reversible {
-            span_strong(glyph::DONE, th.success, th)
-        } else {
-            span_strong(glyph::FAILED, th.error, th)
-        },
-    ]);
-    body.push(surface_rule(width, th));
-
-    let mut actions: Vec<Span<'static>> = Vec::new();
-    for (index, (key, what)) in proposal.actions.iter().enumerate() {
-        if index > 0 {
-            actions.push(span("   ", th.border));
-        }
-        actions.push(span(format!("[{key}]"), th.primary));
-        actions.push(span(format!(" {what}"), th.muted));
-    }
-    body.push(actions);
-
-    Surface::new(width, th)
-        .border(th.warning)
-        .title(vec![span("GOVERNOR", th.warning)])
-        .rows(body)
-        .lines()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::fixtures;
-    use crate::davinci::model::Screen;
-    use crate::davinci::theme::{ColorDepth, Theme};
-    use unicode_width::UnicodeWidthStr;
-
+    use crate::davinci::{
+        fixtures,
+        theme::{ColorDepth, Theme},
+        ui,
+    };
     fn model(width: u16) -> Model {
-        let mut model = Model::new(
+        let mut m = Model::new(
             Theme::da_vinci(ColorDepth::TrueColor, false),
             width,
-            44,
-            true,
+            24,
+            false,
         );
-        fixtures::dress(&mut model);
-        model.toggle_screen(Screen::Mensura);
-        model
+        fixtures::dress(&mut m);
+        m
     }
-
-    fn text(line: &Line<'_>) -> String {
-        line.spans
+    fn text(m: &Model) -> String {
+        lines(m)
             .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
-
     #[test]
-    fn every_role_is_a_row_of_tokens_meter_and_cap() {
+    fn budgets_retain_role_counts_caps_and_textual_warnings() {
         let m = model(120);
-        let drawn: Vec<String> = lines(&m).iter().map(text).collect();
-        for item in &m.budget {
-            let row = drawn
-                .iter()
-                .find(|row| row.starts_with(&item.role))
-                .unwrap_or_else(|| panic!("{} has no row", item.role));
-            assert!(row.contains(&item.tokens), "{row}");
-            assert!(row.contains('━') || row.contains('─'), "{row}");
-            assert!(row.contains(&item.note), "{row}");
-        }
-    }
-
-    #[test]
-    fn the_breaching_row_is_copper_with_a_warning_note() {
-        let m = model(120);
-        let rows = lines(&m);
-        let breach = rows
-            .iter()
-            .find(|row| text(row).starts_with("transcript"))
-            .expect("the breaching row");
-        assert!(text(breach).contains("soft cap"), "{:?}", text(breach));
-        assert!(breach
-            .spans
-            .iter()
-            .any(|span| span.style.fg == Some(m.theme.primary)));
-        assert!(breach
-            .spans
-            .iter()
-            .any(|span| span.style.fg == Some(m.theme.warning)));
-
-        let within = rows
-            .iter()
-            .find(|row| text(row).starts_with("memoria"))
-            .expect("a row within cap");
-        assert!(within
-            .spans
-            .iter()
-            .any(|span| span.style.fg == Some(m.theme.secondary)));
-    }
-
-    #[test]
-    fn the_proposal_always_states_recovers_keeps_cost_and_reversible() {
-        let m = model(120);
-        let drawn: Vec<String> = lines(&m).iter().map(text).collect();
-        let row = drawn
-            .iter()
-            .find(|row| row.contains("recovers"))
-            .expect("the proposal facts");
-        for word in ["recovers", "keeps", "cost", "reversible"] {
-            assert!(row.contains(word), "{word} missing from {row}");
+        let drawn = text(&m);
+        for row in &m.budget {
+            assert!(
+                drawn.contains(&row.role)
+                    && drawn.contains(&row.tokens)
+                    && drawn.contains(&row.note)
+            );
         }
         assert!(
-            row.contains('✓'),
-            "reversibility reads without color: {row}"
+            drawn.contains(&m.budget_meta.session_spend)
+                && drawn.contains(&m.budget_meta.daily_cap)
         );
+        assert!(lines(&m).iter().any(|r| r.to_string().contains('!')
+            && r.spans.iter().any(|s| s.style.fg == Some(m.theme.warning))));
     }
-
     #[test]
-    fn the_proposal_is_bordered_in_warning_and_offers_keyed_actions() {
+    fn advice_explains_its_effect_without_claiming_keyboard_actions() {
         let m = model(120);
-        let rows = lines(&m);
-        let top = rows
-            .iter()
-            .find(|row| text(row).contains("GOVERNOR"))
-            .expect("the governor block");
-        assert_eq!(top.spans[0].style.fg, Some(m.theme.warning));
-
-        let actions = rows
-            .iter()
-            .find(|row| text(row).contains("[a] apply"))
-            .expect("keyed actions");
-        for key in ["[a]", "[e]", "[p]", "[h]", "[d]"] {
-            assert!(text(actions).contains(key), "{key} missing");
+        let proposal = m.proposal.as_ref().unwrap();
+        let drawn = text(&m);
+        for value in [
+            &proposal.summary,
+            &proposal.recovers,
+            &proposal.keeps,
+            &proposal.cost,
+        ] {
+            assert!(drawn.contains(value));
         }
+        for (key, description) in &proposal.actions {
+            assert!(!drawn.contains(&format!("[{key}]")));
+            assert!(drawn.contains(description));
+        }
+        assert!(drawn.contains("This review does not apply changes"));
     }
-
     #[test]
-    fn the_governor_never_acts_silently() {
-        let mut m = model(120);
-        let with = lines(&m).len();
+    fn missing_invalid_and_narrow_budget_data_do_not_overflow() {
+        let mut m = model(80);
+        m.budget.clear();
         m.proposal = None;
-        let without = lines(&m).len();
-        assert!(
-            with > without,
-            "a proposal must occupy rows of its own, not act in the background"
-        );
-    }
-
-    #[test]
-    fn the_summary_carries_the_attention_glyph() {
-        let m = model(120);
-        let drawn: Vec<String> = lines(&m).iter().map(text).collect();
-        assert!(
-            drawn.iter().any(|row| row.contains("! transcript is 19%")),
-            "{drawn:?}"
-        );
-    }
-
-    #[test]
-    fn spend_is_reported_against_its_cap_never_as_a_bare_number() {
-        let drawn: Vec<String> = lines(&model(120)).iter().map(text).collect();
-        let row = drawn
-            .iter()
-            .find(|row| row.contains("session spend"))
-            .expect("the spend row");
-        assert!(row.contains("daily cap"), "{row}");
-        assert!(
-            row.contains('◐') || row.contains('◑') || row.contains('◒') || row.contains('◓'),
-            "{row}"
-        );
-    }
-
-    #[test]
-    fn nothing_overflows_at_any_width() {
-        for width in [80u16, 100, 120, 160] {
-            let cap = width.min(MEASURE + 14);
-            for row in lines(&model(width)) {
-                assert!(
-                    UnicodeWidthStr::width(text(&row).as_str()) <= cap as usize,
-                    "row wider than {cap} at {width}: {:?}",
-                    text(&row)
-                );
+        assert!(text(&m).contains("No per-role"));
+        for width in [0, 1, 20, 32, 40, 80, 120] {
+            let mut m = model(width);
+            m.budget[0].fraction = f64::NAN;
+            for row in lines(&m) {
+                assert!(ui::run_width(&row.spans) <= width);
             }
+            assert!(!text(&m).contains("NaN"));
         }
     }
 }

@@ -1,0 +1,29 @@
+[package]
+name = "davinci-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local dictation contracts and isolated CPU speech worker"
+
+[features]
+default = []
+native = ["dep:cpal", "dep:rubato", "dep:ringbuf", "dep:cmake"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+cpal = { version = "=0.16.0", optional = true }
+rubato = { version = "=0.16.2", optional = true }
+ringbuf = { version = "=0.4.8", optional = true }
+
+[build-dependencies]
+cmake = { version = "=0.1.58", optional = true }
+
+[[bin]]
+name = "davinci-voice-worker"
+path = "src/bin/davinci-voice-worker.rs"
+required-features = ["native"]

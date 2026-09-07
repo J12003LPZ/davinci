@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use super::spec::{WorkflowJoin, WorkflowSpec};
 use crate::permission::{tool_class, PermissionMode, ToolClass};
+use crate::runtime::RuntimeCapabilityRegistry;
 
 const KNOWN_TOOLS: &[&str] = &[
     "read",
@@ -103,6 +104,10 @@ pub fn is_mutating_tool(tool: &str) -> bool {
     MUTATION_TOOLS.contains(&tool) || matches!(tool_class(tool), ToolClass::Edit | ToolClass::Shell)
 }
 
+pub fn is_mutating_tool_with_registry(tool: &str, registry: &RuntimeCapabilityRegistry) -> bool {
+    registry.is_mutating(tool)
+}
+
 /// Validate a workflow specification against static structure and invariants.
 pub fn validate_workflow(spec: &WorkflowSpec) -> Result<(), WorkflowValidationError> {
     validate_workflow_with_permissions(spec, None)
@@ -122,6 +127,17 @@ pub fn validate_workflow_with_permissions_and_tools(
     spec: &WorkflowSpec,
     parent_permission_mode: Option<PermissionMode>,
     extra_tools: &[&str],
+) -> Result<(), WorkflowValidationError> {
+    let registry = RuntimeCapabilityRegistry::with_builtins();
+    validate_workflow_with_capabilities(spec, parent_permission_mode, extra_tools, &registry)
+}
+
+/// Validate a workflow against the host's exact visible capability metadata.
+pub fn validate_workflow_with_capabilities(
+    spec: &WorkflowSpec,
+    parent_permission_mode: Option<PermissionMode>,
+    extra_tools: &[&str],
+    registry: &RuntimeCapabilityRegistry,
 ) -> Result<(), WorkflowValidationError> {
     if spec.schema_version != 1 {
         return Err(WorkflowValidationError::InvalidSchemaVersion(
@@ -274,7 +290,8 @@ pub fn validate_workflow_with_permissions_and_tools(
                         tool: tool.clone(),
                     });
                 }
-                if !KNOWN_TOOLS.contains(&tool.as_str())
+                if registry.get(tool).is_none()
+                    && !KNOWN_TOOLS.contains(&tool.as_str())
                     && !extra_tools.contains(&tool.as_str())
                     && !tool.starts_with("mcp__")
                 {
@@ -283,7 +300,7 @@ pub fn validate_workflow_with_permissions_and_tools(
                         tool: tool.clone(),
                     });
                 }
-                if is_mutating_tool(tool) {
+                if is_mutating_tool_with_registry(tool, registry) {
                     worker_mutates = true;
                     if parent_permission_mode == Some(PermissionMode::ReadOnly) {
                         return Err(WorkflowValidationError::PermissionViolation {
@@ -321,6 +338,24 @@ pub fn validate_workflow_with_permissions_and_tools(
 mod tests {
     use super::*;
     use crate::runtime::workflow::spec::*;
+
+    #[test]
+    fn registry_metadata_controls_custom_tool_mutation_classification() {
+        let mut spec: WorkflowSpec = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        spec.phases[0].workers[0].tools.push("custom_search".into());
+        let registry = RuntimeCapabilityRegistry::with_builtins();
+        registry.register(crate::RuntimeCapability::new(
+            "custom_search",
+            crate::CapabilitySource::Mcp,
+            ToolClass::Read,
+            true,
+            &serde_json::json!({"type": "object"}),
+            None,
+        ));
+        validate_workflow_with_capabilities(&spec, None, &[], &registry).unwrap();
+        assert!(!is_mutating_tool_with_registry("custom_search", &registry));
+        assert!(is_mutating_tool_with_registry("unknown_tool", &registry));
+    }
 
     pub const VALID_3_PHASE_WORKFLOW_JSON: &str = r#"{
         "schema_version": 1,

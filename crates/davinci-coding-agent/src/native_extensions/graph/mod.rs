@@ -3,10 +3,7 @@
 //!
 //! ```text
 //! /graph <goal> [--simple|--complex] [--dry-run]   start a run in the background
-//! /graph-status                                    active + recent runs
-//! /graph-view [taskId]                             tail a worker's live transcript
-//! /graph-resume [runId]                            re-run, reusing finished workers
-//! /graph-abort                                     stop the active run
+//! /graph                                            watch, or continue if stopped
 //! ```
 //!
 //! The controller is deterministic code: model calls happen only inside worker
@@ -109,8 +106,8 @@ impl Drop for FinishedOnDrop {
 }
 
 /// Active runs are process-wide, not per-controller: the CLI builds a fresh
-/// extension host for every slash command, so `/graph-status` and
-/// `/graph-abort` must find the run that `/graph` started.
+/// extension host for every slash command, so opening `/graph` again must find
+/// the run that `/graph <goal>` started.
 fn active_runs() -> &'static Mutex<HashMap<PathBuf, Arc<ActiveRun>>> {
     static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, Arc<ActiveRun>>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -146,7 +143,7 @@ fn is_running(cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// `/graph`, `/graph-resume` and `graph_run` refuse while a run is live. One
+/// `/graph <goal>` and `graph_run` refuse while a run is live. One
 /// that is stopping is still live: starting another would put two runs on
 /// the same working tree.
 fn refuse_if_active(cwd: &Path) -> Result<(), String> {
@@ -161,7 +158,7 @@ fn refuse_if_active(cwd: &Path) -> Result<(), String> {
     Err(if stopping {
         "The previous graph run is still stopping; wait a moment and retry.".into()
     } else {
-        "A graph run is already active. Use /graph-abort or /graph-status first.".into()
+        "A graph run is already active. Open /graph to watch it first.".into()
     })
 }
 
@@ -321,6 +318,7 @@ impl GraphController {
         parsed: &ParsedGraphArgs,
         abort: Arc<AtomicBool>,
         resume_artifacts: HashMap<String, (Artifact, WorkerUsage, Option<ReplayFingerprint>)>,
+        resume_run: Option<Box<types::GraphRun>>,
     ) -> RunOptions {
         RunOptions {
             goal: parsed.goal.clone(),
@@ -329,6 +327,7 @@ impl GraphController {
             dry_run: parsed.dry_run,
             abort,
             resume_artifacts,
+            resume_run,
         }
     }
 
@@ -337,6 +336,7 @@ impl GraphController {
         &self,
         parsed: ParsedGraphArgs,
         resume_artifacts: HashMap<String, (Artifact, WorkerUsage, Option<ReplayFingerprint>)>,
+        resume_run: Option<Box<types::GraphRun>>,
     ) -> Result<Value, String> {
         if parsed.goal.trim().is_empty() {
             return Err("Usage: /graph <goal> [--simple|--complex] [--dry-run]".into());
@@ -344,7 +344,12 @@ impl GraphController {
         refuse_if_active(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
         let (deps, config_errors) = self.deps(parsed.dry_run, &active);
-        let options = self.options(&parsed, Arc::clone(&active.abort), resume_artifacts);
+        let options = self.options(
+            &parsed,
+            Arc::clone(&active.abort),
+            resume_artifacts,
+            resume_run,
+        );
         let resumed = options.resume_artifacts.len();
         register_run(&self.cwd, Arc::clone(&active));
 
@@ -391,7 +396,7 @@ impl GraphController {
         refuse_if_active(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
         let (deps, _config_errors) = self.deps(parsed.dry_run, &active);
-        let options = self.options(&parsed, Arc::clone(&active.abort), HashMap::new());
+        let options = self.options(&parsed, Arc::clone(&active.abort), HashMap::new(), None);
         register_run(&self.cwd, Arc::clone(&active));
         let _guard = FinishedOnDrop(Arc::clone(&active));
         Ok(run_graph(options, deps))
@@ -456,6 +461,7 @@ impl GraphController {
                 dry_run: old_run.dry_run,
             },
             resume_artifacts,
+            Some(Box::new(old_run)),
         )
     }
 
@@ -614,7 +620,23 @@ impl GraphController {
 
     pub fn command(&self, name: &str, args: &str) -> Result<Option<Value>, String> {
         let value = match name {
-            "graph" => self.start_background(parse_graph_args(args), HashMap::new())?,
+            "graph" if !args.trim().is_empty() => {
+                self.start_background(parse_graph_args(args), HashMap::new(), None)?
+            }
+            "graph" if is_running(&self.cwd) => self.status(None),
+            "graph" => {
+                let Some(latest) = list_runs(&self.cwd).first().cloned() else {
+                    return Err("Usage: /graph <goal> [--simple|--complex] [--dry-run]".into());
+                };
+                let Some(run) = load_run(&self.cwd, &latest.run_id) else {
+                    return Err(format!("Could not load state for run {}.", latest.run_id));
+                };
+                if run.phase == types::Phase::Done {
+                    self.status(Some(&run.run_id))
+                } else {
+                    self.resume(&run.run_id)?
+                }
+            }
             "graph-resume" => self.resume(args.trim())?,
             "graph-status" => self.status(Some(args.trim())),
             "graph-view" => self.view(args.trim()),
@@ -798,6 +820,30 @@ mod tests {
         let error = controller.command("graph", "  --dry-run  ").unwrap_err();
         assert!(error.contains("Usage: /graph"));
         drain_active(dir.path());
+    }
+
+    #[test]
+    fn bare_graph_continues_a_stopped_run_with_the_same_identity_and_counters() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+        let mut stopped = controller
+            .run_to_completion(parse_graph_args("--dry-run continue me"))
+            .expect("initial run completes");
+        drain_active(dir.path());
+        stopped.phase = Phase::Cancelled;
+        stopped.counters.workers_spawned = 41;
+        store::save_run(&mut stopped).expect("stopped state persists");
+
+        let started = controller.command("graph", "").unwrap().unwrap();
+        assert_eq!(started["started"], true);
+        assert_eq!(started["runId"], stopped.run_id);
+        drain_active(dir.path());
+
+        let continued = load_run(dir.path(), &stopped.run_id).expect("continued state persists");
+        assert_eq!(continued.run_id, stopped.run_id);
+        assert!(continued.counters.workers_spawned >= 41);
+        assert_eq!(list_runs(dir.path()).len(), 1, "continuation is one run");
     }
 
     #[test]
