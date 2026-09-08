@@ -307,7 +307,11 @@ impl GraphExecution {
                 .then(|| self.deps.session_thinking.clone())
                 .flatten(),
             tools,
-            extra_extensions: self.deps.config.worker_extensions.clone(),
+            extra_extensions: if self.deps.project_trusted {
+                self.deps.config.worker_extensions.clone()
+            } else {
+                Vec::new()
+            },
             timeout_ms: run.budgets.worker_timeout_ms.get(role),
             run_deadline: self.run_deadline,
             artifact_path: artifact_path(Path::new(&run.cwd), &run.run_id, &task.id),
@@ -1671,10 +1675,11 @@ mod tests {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let captured = observed.clone();
         let runner: Arc<WorkerRunner> = Arc::new(move |spec, _, _| {
-            captured
-                .lock()
-                .unwrap()
-                .push((spec.role, spec.tools.clone()));
+            captured.lock().unwrap().push((
+                spec.role,
+                spec.tools.clone(),
+                spec.extra_extensions.clone(),
+            ));
             WorkerResult {
                 ok: false,
                 ..WorkerResult::default()
@@ -1685,6 +1690,7 @@ mod tests {
             verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
             config: GraphConfig {
                 worker_extra_tools: vec!["write".into(), "custom_mutator".into()],
+                worker_extensions: vec!["./fixture.mjs".into()],
                 ..Default::default()
             },
             session_model: None,
@@ -1712,8 +1718,12 @@ mod tests {
         assert!(!run.tasks.is_empty());
         let observed = observed.lock().unwrap();
         assert!(!observed.is_empty());
-        for (role, tools) in observed.iter() {
+        for (role, tools, extensions) in observed.iter() {
             assert_eq!(*role, Role::Classifier);
+            assert!(
+                extensions.is_empty(),
+                "untrusted project authorized executable extensions"
+            );
             assert!(!tools
                 .iter()
                 .any(|name| name == "write" || name == "custom_mutator"));

@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod mcp;
 pub mod notebook;
 mod permission;
+pub mod planning;
 mod pruning;
 mod queues;
 mod scheduler;
@@ -81,6 +82,8 @@ pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,
     strip_frontmatter, substitute_args, PromptTemplate,
 };
+pub mod living_plan;
+pub use living_plan::{LivingPlan, PLAN_ENTRY_TYPE};
 pub use todo::{TodoItem, TodoList, TodoStatus, TODO_ENTRY_TYPE};
 pub use tool_ledger::{
     classify_side_effect, ToolCallLedger, ToolCallRecord, ToolExecutionStatus, ToolSideEffect,
@@ -227,8 +230,6 @@ pub struct Agent {
     pub tool_context: ToolContext,
     pub summarizer: Option<Summarizer>,
     pub subagent_runner: Option<crate::subagent::SubagentRunner>,
-    /// When true, mutations are refused until `/act`.
-    pub plan_mode: bool,
     pub block_images: bool,
     pub auto_resize_images: bool,
     pub retry_aborted: bool,
@@ -255,6 +256,11 @@ pub struct Agent {
     pruned_tool_results: std::collections::HashSet<String>,
     pruned_evidence: std::collections::HashMap<String, (PathBuf, String)>,
     base_system_prompt: String,
+    /// Return target for /act, not another active mode.
+    previous_execution_mode: Option<PermissionMode>,
+    /// Historical snapshot for a bounded revision diff, never an active plan.
+    previous_plan_revision: Option<LivingPlan>,
+    plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
     /// Context supplied by extensions for the next provider request only.
@@ -306,7 +312,6 @@ impl Agent {
             tool_context: ToolContext::default(),
             summarizer: None,
             subagent_runner: None,
-            plan_mode: false,
             block_images: false,
             auto_resize_images: true,
             retry_aborted: false,
@@ -323,6 +328,9 @@ impl Agent {
             pruned_tool_results: std::collections::HashSet::new(),
             pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,
+            previous_execution_mode: None,
+            previous_plan_revision: None,
+            plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
@@ -370,19 +378,74 @@ impl Agent {
     /// Restore the base prompt before each extension-aware prompt turn.
     pub fn reset_system_prompt_to_base(&mut self) {
         self.system_prompt = self.base_system_prompt.clone();
-        if self.plan_mode {
+        if self.plan_mode() {
             self.system_prompt.push_str("\n\n");
             self.system_prompt.push_str(crate::PLAN_MODE_APPENDIX);
         }
     }
 
-    pub fn set_plan_mode(&mut self, on: bool) {
-        self.plan_mode = on;
+    pub fn permission_mode(&self) -> PermissionMode {
         self.permissions
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .plan_mode = on;
+            .mode
+    }
+
+    pub fn is_plan_mode(&self) -> bool {
+        self.permission_mode() == PermissionMode::ReadOnly
+    }
+
+    /// Compatibility accessor; both getters read the policy, never a flag.
+    pub fn plan_mode(&self) -> bool {
+        self.is_plan_mode()
+    }
+
+    /// Hosts call this while idle, before another tool can be approved.
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        let previous = self.permission_mode();
+        if previous != mode {
+            if mode == PermissionMode::ReadOnly {
+                self.previous_execution_mode = Some(previous);
+                self.tool_context
+                    .living_plan
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .approved_revision = None;
+            } else {
+                self.previous_execution_mode = Some(mode);
+            }
+            let mut policy = self
+                .permissions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            policy.session_allow.clear();
+            policy.mode = mode;
+        }
         self.reset_system_prompt_to_base();
+    }
+
+    pub fn cycle_permission_mode(&mut self) -> PermissionMode {
+        let mode = self.permission_mode().next();
+        self.set_permission_mode(mode);
+        mode
+    }
+
+    fn plan_execution_target(&self) -> PermissionMode {
+        match self.previous_execution_mode {
+            Some(mode @ (PermissionMode::Ask | PermissionMode::Edits | PermissionMode::Auto)) => {
+                mode
+            }
+            _ => PermissionMode::Ask,
+        }
+    }
+
+    pub fn set_plan_mode(&mut self, on: bool) {
+        if on {
+            self.set_permission_mode(PermissionMode::ReadOnly);
+        } else if self.is_plan_mode() {
+            // Never silently restore Always Approve.
+            self.set_permission_mode(self.plan_execution_target());
+        }
     }
 
     /// Replace the ephemeral context used for the next provider request.
@@ -469,18 +532,29 @@ impl Agent {
     }
 
     pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
-        if self.ephemeral_context.is_empty() && self.pruned_tool_results.is_empty() {
+        let plan_context = self
+            .plan_provider_context()
+            .map(|text| ChatMessage::text("custom", text));
+        if self.ephemeral_context.is_empty()
+            && self.pruned_tool_results.is_empty()
+            && plan_context.is_none()
+        {
             return convert_to_llm_for_provider(&self.messages, self.block_images);
         }
         let mut messages = self.project_with_evidence();
-        if self.ephemeral_context.is_empty() {
+        if self.ephemeral_context.is_empty() && plan_context.is_none() {
             return convert_to_llm_for_provider(&messages, self.block_images);
         }
         let insertion = messages
             .iter()
             .rposition(|message| message.role == "user")
             .unwrap_or(messages.len());
-        messages.splice(insertion..insertion, self.ephemeral_context.iter().cloned());
+        messages.splice(
+            insertion..insertion,
+            plan_context
+                .into_iter()
+                .chain(self.ephemeral_context.iter().cloned()),
+        );
         convert_to_llm_for_provider(&messages, self.block_images)
     }
 
@@ -505,6 +579,10 @@ impl Agent {
             })
             .sum::<u64>()
             + estimate_context_tokens(&self.ephemeral_context)
+            + self
+                .plan_provider_context()
+                .map(|text| (text.len() as u64).div_ceil(4))
+                .unwrap_or(0)
             + (self.system_prompt.len() as u64).div_ceil(4)
             + self.provider_context_overhead_tokens.unwrap_or_else(|| {
                 let specs = self.builtin_and_mcp_specs();
@@ -775,8 +853,22 @@ impl Agent {
         }
     }
 
+    /// Compatibility spelling for the checked session persistence path.
+    pub fn persist_living_plan(&mut self) -> Result<(), String> {
+        self.persist_plan()
+    }
+
+    /// Restore from the active branch; a different session cannot inherit a plan.
+    /// Human execution approval is renewed after resume, while decisions survive.
+    pub fn restore_living_plan(&mut self) -> bool {
+        // The compatibility bool reports failure, while restore_plan also
+        // exposes the error in /plan show and provider context and fails closed.
+        self.restore_plan().unwrap_or(false)
+    }
+
     /// The ledger the session last saved, if any.
     pub fn restore_todos(&mut self) -> bool {
+        self.restore_living_plan();
         let Some(session) = &self.session else {
             return false;
         };
@@ -1055,6 +1147,7 @@ impl Agent {
             }
         }
         self.session = Some(session);
+        self.restore_living_plan();
     }
 
     /// Navigate the session tree. When `summarize` is true, generates a branch
@@ -1134,6 +1227,7 @@ impl Agent {
         if let Some(session) = &self.session {
             self.messages = messages_from_session(session);
         }
+        self.restore_plan()?;
         Ok(TreeNavigateResult {
             cancelled: false,
             editor_text,
@@ -1417,6 +1511,42 @@ mod tests {
             has_post,
             "Must emit PostCompact event with before and after tokens"
         );
+    }
+
+    #[test]
+    fn plan_mode_has_one_authoritative_permission_state() {
+        let mut agent = Agent::new("base prompt");
+        agent.permissions.lock().unwrap().mode = PermissionMode::Edits;
+        agent.set_plan_mode(true);
+        assert_eq!(
+            agent.permissions.lock().unwrap().mode,
+            PermissionMode::ReadOnly
+        );
+        assert!(agent.system_prompt.contains(crate::PLAN_MODE_APPENDIX));
+        agent.set_plan_mode(true);
+        agent.set_plan_mode(false);
+        assert_eq!(
+            agent.permissions.lock().unwrap().mode,
+            PermissionMode::Edits
+        );
+        assert_eq!(agent.system_prompt, "base prompt");
+    }
+
+    #[test]
+    fn update_plan_accepts_legacy_steps_without_approving_structured_plan() {
+        let context = ToolContext::default();
+        let result = execute_tool_with(
+            Path::new("."), "update_plan",
+            &serde_json::json!({"plan": [{"step": "Inspect parser", "status": "in_progress"}], "explanation": "Start from source"}),
+            &context,
+        ).unwrap();
+        assert!(
+            result.content.contains("Inspect parser"),
+            "{}",
+            result.content
+        );
+        assert_eq!(context.todos.lock().unwrap().items.len(), 1);
+        assert_eq!(context.living_plan.lock().unwrap().approved_revision, None);
     }
 
     #[test]
@@ -2099,7 +2229,7 @@ mod tests {
             text.contains("[1] write path=\"x.txt\" content=\"no\" → error"),
             "{text}"
         );
-        assert!(text.contains("read-only"), "{text}");
+        assert!(text.contains(crate::PLAN_MODE_DENIAL), "{text}");
         assert!(!dir.path().join("x.txt").exists());
         assert!(text.contains("[2] ls → ok"), "{text}");
     }
@@ -2183,7 +2313,17 @@ mod tests {
             .find(|message| message.role == "toolResult")
             .unwrap();
         assert!(content_text(&last.content).contains(&body));
-        assert!(agent.estimated_context_tokens() < crate::estimate_context_tokens(&agent.messages));
+        // Compare like-for-like estimates: both include system prompt and tool
+        // schema overhead, which can exceed the saved history tokens by itself.
+        assert!(
+            crate::estimate_context_tokens(&projected)
+                < crate::estimate_context_tokens(&agent.messages)
+        );
+        let pruned_estimate = agent.estimated_context_tokens();
+        let saved = std::mem::take(&mut agent.pruned_tool_results);
+        let unpruned_estimate = agent.estimated_context_tokens();
+        agent.pruned_tool_results = saved;
+        assert!(pruned_estimate < unpruned_estimate);
     }
 
     #[test]
@@ -2270,9 +2410,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].1, "{outcomes:?}");
         assert!(
-            outcomes[0]
-                .2
-                .contains("not allowed in permission mode `read-only`"),
+            outcomes[0].2.contains(crate::PLAN_MODE_DENIAL),
             "{}",
             outcomes[0].2
         );
@@ -3028,6 +3166,121 @@ mod tests {
             vec![("user".to_string(), true), ("user".to_string(), false)]
         );
         assert_eq!(agent.pending_prompt_messages.len(), 2);
+    }
+
+    #[test]
+    fn permission_mode_cycle_keeps_policy_and_native_prompt_in_sync() {
+        let mut agent = Agent::new("unchanged base");
+        agent.set_permission_mode(PermissionMode::Ask);
+        for expected in [
+            PermissionMode::Edits,
+            PermissionMode::ReadOnly,
+            PermissionMode::Auto,
+            PermissionMode::AlwaysApprove,
+            PermissionMode::Ask,
+        ] {
+            assert_eq!(agent.cycle_permission_mode(), expected);
+            assert_eq!(agent.permission_mode(), expected);
+            assert_eq!(
+                agent.system_prompt.contains(PLAN_MODE_APPENDIX),
+                expected == PermissionMode::ReadOnly
+            );
+        }
+        assert_eq!(agent.system_prompt, "unchanged base");
+    }
+
+    #[test]
+    fn structured_plan_storage_failure_emits_only_failure_and_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.rs"), "fn existing() {}\n").unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        let mut session =
+            JsonlSession::create(dir.path(), &dir.path().display().to_string(), None).unwrap();
+        session.path = dir.path().join("missing-parent/session.jsonl");
+        agent.session = Some(session);
+        agent.set_permission_mode(PermissionMode::ReadOnly);
+        agent.prompt("Propose a change");
+        let events = agent.run_loop(scripted_tool_calls(vec![("propose_plan", serde_json::json!({
+            "expected_revision":0, "goal":"Add behavior", "evidence":[{"path":"src.rs","finding":"Existing function"}],
+            "steps":[{"id":"implement","change":"Extend existing function","files":["src.rs"],"why":"Requested behavior","verify":["cargo test --offline"]}]
+        }))])).unwrap();
+        let ends: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolExecutionEnd {
+                    tool_name,
+                    is_error,
+                    ..
+                } if tool_name == "propose_plan" => Some(*is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec![true]);
+        assert_eq!(agent.tool_context.living_plan.lock().unwrap().revision, 0);
+        assert!(agent.is_plan_mode());
+        assert!(agent.render_plan().contains("storage error"));
+    }
+
+    #[test]
+    fn structured_plan_post_hook_failure_does_not_commit_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.rs"), "fn existing() {}\n").unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.session = Some(
+            JsonlSession::create(dir.path(), &dir.path().display().to_string(), None).unwrap(),
+        );
+        agent.set_permission_mode(PermissionMode::ReadOnly);
+        let hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_count = hooks.clone();
+        agent.post_tool = Some(PostToolHook(Arc::new(move |_, _, name, _, mut result| {
+            if name == "propose_plan" {
+                hook_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                result.is_error = true;
+                result.content = "Plan rejected by validation hook".into();
+            }
+            result
+        })));
+        agent.prompt("Propose a change");
+        let events = agent.run_loop(scripted_tool_calls(vec![("propose_plan", serde_json::json!({
+            "expected_revision":0, "goal":"Add behavior", "evidence":[{"path":"src.rs","finding":"Existing function"}],
+            "steps":[{"id":"implement","change":"Extend function","files":["src.rs"],"why":"Requested behavior","verify":["cargo test --offline"]}]
+        }))])).unwrap();
+        assert_eq!(hooks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolExecutionEnd {tool_name, is_error:true, ..} if tool_name == "propose_plan")));
+        assert_eq!(agent.tool_context.living_plan.lock().unwrap().revision, 0);
+        let raw = std::fs::read_to_string(&agent.session.as_ref().unwrap().path).unwrap();
+        assert!(!raw.contains("\"customType\":\"living_plan\""));
+    }
+
+    #[test]
+    fn structured_plan_tool_is_read_only_and_persists_in_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.rs"), "fn existing() {}\n").unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.cwd = dir.path().to_path_buf();
+        agent.session = Some(
+            JsonlSession::create(dir.path(), &dir.path().display().to_string(), Some("plan"))
+                .unwrap(),
+        );
+        agent.set_permission_mode(PermissionMode::ReadOnly);
+        agent.prompt("Investigate and propose a change without implementing it");
+        let events = agent.run_loop(scripted_tool_calls(vec![("propose_plan", serde_json::json!({
+            "expected_revision":0, "goal":"Add behavior", "evidence":[{"path":"src.rs","finding":"Existing function"}],
+            "steps":[{"id":"implement","change":"Extend the existing function","files":["src.rs"],"why":"Requested behavior","verify":["cargo test --offline"]}]
+        }))])).unwrap();
+        assert!(
+            tool_outcomes(&events)[0].2.contains("Revision 1"),
+            "{:?}",
+            tool_outcomes(&events)
+        );
+        let raw = std::fs::read_to_string(&agent.session.as_ref().unwrap().path).unwrap();
+        assert!(raw.contains("\"customType\":\"living_plan\""), "{raw}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+            "fn existing() {}\n"
+        );
     }
 
     #[test]

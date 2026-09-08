@@ -47,9 +47,8 @@ pub fn lane_for(tool: &str, class: ToolClass) -> ToolLane {
         // The ledger and the job book are shared state behind a mutex, but
         // two `todo` writes in one message would race for last-wins; keep
         // them ordered.
-        "todo" | "job_kill" | "agent_message" | "agent_stop" | "task_create" | "task_update" => {
-            ToolLane::Serial
-        }
+        "todo" | "update_plan" | "propose_plan" | "job_kill" | "agent_message" | "agent_stop"
+        | "task_create" | "task_update" => ToolLane::Serial,
         _ => match class {
             ToolClass::Read | ToolClass::Network => ToolLane::Parallel,
             ToolClass::Edit | ToolClass::Shell | ToolClass::Other => ToolLane::Serial,

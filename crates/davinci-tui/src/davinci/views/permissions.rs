@@ -32,7 +32,22 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         } else {
             ""
         };
-        rows.push(section_row(width, th, index == selected, &row.label, value));
+        let always_approve = row.kind == "mode" && row.key == "always-approve";
+        let mut mode_row = section_row(width, th, index == selected, &row.label, value);
+        if always_approve {
+            for span in &mut mode_row.spans {
+                span.style.fg = Some(th.warning);
+                span.style = span.style.add_modifier(ratatui::style::Modifier::BOLD);
+            }
+        }
+        rows.push(mode_row);
+        if always_approve {
+            let mut warning = section_detail(width, th, "! no prompts; deny rules still apply.");
+            for span in warning.iter_mut().flat_map(|line| &mut line.spans) {
+                span.style.fg = Some(th.warning);
+            }
+            rows.extend(warning);
+        }
         if index == selected {
             if row.current {
                 rows.extend(section_detail(width, th, "Current mode for this session"));
@@ -105,24 +120,47 @@ mod tests {
             24,
             false,
         );
-        m.permission_rows = vec![
-            PermissionRow {
-                label: "ask".into(),
-                detail: "Read tools run; edits ask".into(),
-                current: true,
-                kind: "mode".into(),
-                key: "ask".into(),
-                source: String::new(),
-            },
-            PermissionRow {
-                label: "bash(git *)".into(),
-                detail: "allow · user".into(),
-                current: false,
-                kind: "rule".into(),
-                key: "bash(git *)".into(),
-                source: "user".into(),
-            },
-        ];
+        m.permission_rows = [
+            ("ask", "Manual", "Read tools run; edits ask"),
+            (
+                "edits",
+                "Accept Edits",
+                "Workspace edits run; commands may ask",
+            ),
+            (
+                "read-only",
+                "Plan Mode",
+                "Explore without mutating the workspace",
+            ),
+            (
+                "auto",
+                "Auto Mode",
+                "Routine safe actions run; risky actions ask",
+            ),
+            (
+                "always-approve",
+                "Always Approve",
+                "Permitted actions run without approval prompts",
+            ),
+        ]
+        .into_iter()
+        .map(|(key, label, detail)| PermissionRow {
+            label: label.into(),
+            detail: detail.into(),
+            current: key == "ask",
+            kind: "mode".into(),
+            key: key.into(),
+            source: String::new(),
+        })
+        .collect();
+        m.permission_rows.push(PermissionRow {
+            label: "bash(git *)".into(),
+            detail: "allow · user".into(),
+            current: false,
+            kind: "rule".into(),
+            key: "bash(git *)".into(),
+            source: "user".into(),
+        });
         m
     }
     fn text(m: &Model) -> String {
@@ -136,14 +174,14 @@ mod tests {
     #[test]
     fn mode_and_focus_are_distinct_and_rule_removal_names_its_source() {
         let mut m = model(80);
-        m.permission_index = 1;
+        m.permission_index = 5;
         let rows = lines(&m);
         assert!(rows[ui::focused_row(&rows).unwrap()]
             .to_string()
             .contains("bash(git *)"));
         assert!(rows
             .iter()
-            .any(|r| r.to_string().contains("ask") && r.to_string().contains("current")));
+            .any(|r| r.to_string().contains("Manual") && r.to_string().contains("current")));
         for expected in [
             "Modes",
             "Rules",
@@ -157,13 +195,31 @@ mod tests {
     }
 
     #[test]
+    fn always_approve_row_warns_about_no_prompts_even_when_not_selected() {
+        for width in [20, 32, 40, 80] {
+            let mut m = model(width);
+            m.permission_index = 0; // Always Approve remains unselected.
+            let rows = lines(&m);
+            let warning = rows
+                .iter()
+                .find(|row| row.to_string().contains("no prompts"))
+                .expect("unselected Always Approve must disclose no prompts");
+            assert!(warning
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(m.theme.warning)));
+            assert!(rows.iter().all(|row| ui::run_width(&row.spans) <= width));
+        }
+    }
+
+    #[test]
     fn empty_and_narrow_policies_do_not_overflow() {
         let mut m = model(80);
         m.permission_rows.clear();
         assert!(text(&m).contains("No permission policy"));
         for width in [0, 1, 20, 32, 40, 80, 120] {
             let mut m = model(width);
-            m.permission_rows[1].label = "bash(检查 café 🦀 *)".into();
+            m.permission_rows[5].label = "bash(检查 café 🦀 *)".into();
             for row in lines(&m) {
                 assert!(ui::run_width(&row.spans) <= width);
             }

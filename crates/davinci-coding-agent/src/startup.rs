@@ -73,6 +73,14 @@ pub fn format_notices(notices: &StartupNotices) -> Vec<(String, String)> {
     lines
 }
 
+fn parse_package_updates_reply(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn check_for_package_updates(settings: &Settings) -> Vec<String> {
     if matches!(
         std::env::var("PI_OFFLINE").as_deref(),
@@ -81,12 +89,7 @@ pub fn check_for_package_updates(settings: &Settings) -> Vec<String> {
         return Vec::new();
     }
     if let Ok(raw) = std::env::var("PI_PACKAGE_UPDATES_REPLY") {
-        return raw
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect();
+        return parse_package_updates_reply(&raw);
     }
     let agent_dir = davinci_session::default_agent_dir();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -149,10 +152,11 @@ mod tests {
 
     #[test]
     fn package_and_tmux_fixtures() {
-        std::env::set_var("PI_PACKAGE_UPDATES_REPLY", "todo, snake");
-        let updates = check_for_package_updates(&Settings::default());
+        // Parsing a fixture must not depend on (or disable) the offline guard.
+        let updates = parse_package_updates_reply("todo, snake");
+        assert!(parse_package_updates_reply(" , ").is_empty());
         assert_eq!(updates, vec!["todo".to_string(), "snake".to_string()]);
-        std::env::remove_var("PI_PACKAGE_UPDATES_REPLY");
+
         std::env::set_var("TMUX", "1");
         std::env::set_var("PI_TMUX_EXTENDED_KEYS", "off");
         assert!(check_tmux_keyboard_setup()
@@ -194,10 +198,10 @@ mod tests {
             r#"{"name":"todo","version":"1.0.0"}"#,
         )
         .unwrap();
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let old_npm_reply = std::env::var_os("PI_NPM_VIEW_REPLY");
         std::env::set_var("PI_NPM_VIEW_REPLY", "\"2.0.0\"");
-        std::env::remove_var("PI_PACKAGE_UPDATES_REPLY");
-        std::env::remove_var("PI_OFFLINE");
+
+        // All roots and replies are fixture inputs; retain the caller's offline mode.
         let settings = Settings {
             packages: vec!["npm:todo".into()],
             ..Settings::default()
@@ -215,7 +219,9 @@ mod tests {
             dir.path(),
         );
         assert!(none.is_empty());
-        std::env::remove_var("PI_NPM_VIEW_REPLY");
-        std::env::remove_var("PI_CODING_AGENT_DIR");
+        match old_npm_reply {
+            Some(value) => std::env::set_var("PI_NPM_VIEW_REPLY", value),
+            None => std::env::remove_var("PI_NPM_VIEW_REPLY"),
+        }
     }
 }

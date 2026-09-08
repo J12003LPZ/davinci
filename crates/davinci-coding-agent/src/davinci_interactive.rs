@@ -1747,7 +1747,7 @@ pub fn corpus(
     ));
     items.push(CorpusItem::new(
         "/permissions",
-        "what runs without asking · read-only, ask, edits, auto",
+        "Manual · Accept Edits · Plan Mode · Auto Mode · Always Approve",
         "command",
     ));
     items.push(CorpusItem::new(
@@ -2398,7 +2398,7 @@ fn approval_key(
             Some(ToolApprovalDecision::Deny)
         }
         Flow::Continue if model.overlay.is_none() => Some(ToolApprovalDecision::Deny),
-        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) => None,
+        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) | Flow::CyclePermissionMode => None,
     }
 }
 
@@ -3126,14 +3126,7 @@ pub fn run(
     model.login_providers = crate::interactive_login_providers(parsed);
     model.model_names = model.models.iter().map(|item| item.name.clone()).collect();
     sync_thinking_state(agent, &mut model);
-    model.permission_mode = agent
-        .permissions
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .mode
-        .as_str()
-        .to_string();
-    model.plan_mode = agent.plan_mode;
+    sync_permission_state(agent, &mut model);
     model.show_tool_output =
         crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd)
             .show_tool_output
@@ -3651,6 +3644,10 @@ pub fn run(
                             },
                             choice,
                         ),
+                        Flow::CyclePermissionMode => {
+                            cycle_permission_mode(agent, &mut model);
+                            Next::Go
+                        }
                         Flow::Continue => Next::Go,
                     };
                     // Recall is a search, so it runs when the instrument is
@@ -6125,6 +6122,20 @@ fn run_user_bash(shell: &mut Shell<'_>, line: &str) -> Next {
 
 /// One composer line, carried out.
 fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
+    // Mode changes are host-owned; an extension cannot shadow their safety state.
+    if let Some(rest) = line.trim().strip_prefix("/permissions") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return permissions_command(shell, rest.trim());
+        }
+    }
+    if let Some(result) = crate::permissions::handle_mode_command(shell.agent, line) {
+        sync_permission_state(shell.agent, shell.model);
+        match result {
+            Ok(message) => shell.say(&message),
+            Err(error) => shell.note(&error),
+        }
+        return Next::Go;
+    }
     // `!command` runs in the shell, never in the model (the legacy chrome's
     // `SessionAction::RunBash`); without this it was sent as prose.
     if line.trim_start().starts_with('!') {
@@ -6157,13 +6168,6 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
         // working tree. Checked after extensions so one may still claim it.
         if line.trim() == "/diff" {
             return open_diff_sheet(shell);
-        }
-        // `/permissions` likewise: the mode and rules in force, or a new
-        // mode for the rest of the session.
-        if let Some(rest) = line.trim().strip_prefix("/permissions") {
-            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                return permissions_command(shell, rest.trim());
-            }
         }
         // `/todo` — the model's ledger; `/jobs` — the background jobs.
         if let Some(rest) = line.trim().strip_prefix("/todo") {
@@ -6501,13 +6505,7 @@ fn apply_permission_row(shell: &mut Shell<'_>, index: usize) -> Next {
     };
     if row.kind == "mode" {
         if let Some(mode) = PermissionMode::parse(&row.key) {
-            shell
-                .agent
-                .permissions
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .mode = mode;
-            shell.model.permission_mode = mode.as_str().to_string();
+            change_permission_mode(shell.agent, shell.model, mode);
             open_permissions_sheet(shell);
         }
         return Next::Go;
@@ -7007,25 +7005,33 @@ fn run_stop_hooks(shell: &mut Shell<'_>) {
 /// `/permissions` — the mode and every rule in force, by source; or, with a
 /// mode named, that mode for the rest of the session. Rules are drawn as
 /// tool rows rather than prose: `bash(git *)` is not markdown emphasis.
+fn sync_permission_state(agent: &Agent, model: &mut Model) {
+    model.permission_mode = agent.permission_mode().as_str().to_string();
+}
+
+fn change_permission_mode(agent: &mut Agent, model: &mut Model, mode: PermissionMode) {
+    agent.set_permission_mode(mode);
+    sync_permission_state(agent, model);
+}
+
+fn cycle_permission_mode(agent: &mut Agent, model: &mut Model) {
+    let next = agent.permission_mode().next();
+    change_permission_mode(agent, model, next);
+}
+
 fn permissions_command(shell: &mut Shell<'_>, arg: &str) -> Next {
     if !arg.is_empty() {
         match PermissionMode::parse(arg) {
             Some(mode) => {
-                shell
-                    .agent
-                    .permissions
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .mode = mode;
-                shell.model.permission_mode = mode.as_str().to_string();
+                change_permission_mode(shell.agent, shell.model, mode);
                 shell.say(&format!(
-                    "permission mode {} · {} · this session",
-                    mode.as_str(),
+                    "{} · {} · this session",
+                    mode.label(),
                     mode.describe()
                 ));
             }
             None => shell.note(&format!(
-                "no permission mode {arg} — read-only, ask, edits or auto"
+                "no permission mode {arg} — Manual, Accept Edits, Plan Mode, Auto Mode or Always Approve"
             )),
         }
         return Next::Go;
@@ -7049,7 +7055,7 @@ fn open_permissions_sheet(shell: &mut Shell<'_>) {
     let mut rows = Vec::new();
     for mode in PermissionMode::ALL {
         rows.push(PermissionRow {
-            label: mode.as_str().into(),
+            label: mode.label().into(),
             detail: mode.describe().into(),
             current: policy.mode == mode,
             kind: "mode".into(),
@@ -7105,6 +7111,9 @@ fn detached_login_message(provider: &str, oauth_pending: bool) -> Result<String,
 }
 
 fn refresh_context(model: &mut Model, agent: &Agent) {
+    // Session restoration and fail-closed tool failures can change the mode
+    // without a composer event; always redraw from the authoritative policy.
+    sync_permission_state(agent, model);
     model.context = (
         davinci_agent::estimate_context_tokens(&agent.messages),
         agent.context_window,
@@ -7489,6 +7498,73 @@ mod tests {
             40,
             true,
         )
+    }
+
+    #[test]
+    fn shift_tab_cycle_commits_policy_prompt_and_status_without_submitting_the_draft() {
+        let mut agent = Agent::new("base prompt");
+        let mut m = model();
+        change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+        m.composer.set_text("unfinished request");
+        for expected in [
+            PermissionMode::Edits,
+            PermissionMode::ReadOnly,
+            PermissionMode::Auto,
+            PermissionMode::AlwaysApprove,
+            PermissionMode::Ask,
+        ] {
+            let flow = davinci_tui::davinci::app::handle_key(
+                &mut m,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::BackTab,
+                    crossterm::event::KeyModifiers::SHIFT,
+                ),
+            );
+            assert_eq!(flow, davinci_tui::davinci::app::Flow::CyclePermissionMode);
+            cycle_permission_mode(&mut agent, &mut m);
+            assert_eq!(agent.permission_mode(), expected);
+            assert_eq!(m.permission_mode, expected.as_str());
+            assert_eq!(agent.is_plan_mode(), expected == PermissionMode::ReadOnly);
+            assert_eq!(
+                agent
+                    .system_prompt
+                    .contains(davinci_agent::PLAN_MODE_APPENDIX),
+                agent.is_plan_mode()
+            );
+            assert_eq!(m.composer.to_string(), "unfinished request");
+        }
+    }
+
+    #[test]
+    fn context_refresh_resynchronizes_mode_after_session_restore() {
+        let mut agent = Agent::new("base prompt");
+        let mut m = model();
+        change_permission_mode(&mut agent, &mut m, PermissionMode::AlwaysApprove);
+        // Session loading can choose Plan Mode without a keyboard event.
+        agent.set_permission_mode(PermissionMode::ReadOnly);
+        refresh_context(&mut m, &agent);
+        assert_eq!(m.permission_label(), "Plan Mode");
+        assert!(m.is_plan_mode());
+    }
+
+    #[test]
+    fn switching_to_plan_from_always_approve_blocks_real_tool_permissions() {
+        let mut agent = Agent::new("base prompt");
+        let mut m = model();
+        change_permission_mode(&mut agent, &mut m, PermissionMode::AlwaysApprove);
+        change_permission_mode(&mut agent, &mut m, PermissionMode::ReadOnly);
+        let policy = agent.permissions.lock().unwrap();
+        let verdict = policy.decide(
+            "plan-transition",
+            "write",
+            &serde_json::json!({"path":"src/new.rs", "content":"mutation"}),
+            &agent.cwd,
+        );
+        assert!(matches!(
+            verdict,
+            davinci_agent::PermissionVerdict::Deny { .. }
+        ));
+        assert_eq!(m.permission_label(), "Plan Mode");
     }
 
     fn partial(text: &str) -> davinci_ai::AssistantMessage {

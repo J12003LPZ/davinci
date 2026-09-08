@@ -1705,7 +1705,7 @@ fn complete_prompt_with_host(
             agent.system_prompt = prompt.clone();
             // An extension's prompt replaces the base, not the mode: plan
             // mode keeps its appendix.
-            if agent.plan_mode
+            if agent.is_plan_mode()
                 && !agent
                     .system_prompt
                     .contains(davinci_agent::PLAN_MODE_APPENDIX)
@@ -3327,6 +3327,7 @@ fn run_streaming_turn(
             .unwrap_or(davinci_agent::ToolApprovalDecision::Deny)
     })));
     let mut approval: Option<std::sync::mpsc::Sender<davinci_agent::ToolApprovalDecision>> = None;
+    session.running = true;
     let outcome = std::thread::scope(|scope| {
         let worker = scope.spawn(|| complete_prompt_with_host(parsed, agent, Some(host), false));
         let frames = davinci_tui::glyphs::SPINNER_FRAMES;
@@ -3451,6 +3452,7 @@ fn run_streaming_turn(
     if approval.take().is_some() {
         session.close_overlays();
     }
+    session.running = false;
     session.chrome.working_message = None;
     session.chrome.status.clear();
     let worker_panicked = outcome.is_err();
@@ -4305,6 +4307,11 @@ fn apply_session_action(
             }
             Ok(true)
         }
+        SessionAction::CyclePermissionMode => {
+            let mode = agent.cycle_permission_mode();
+            session.chrome.status = format!("{} · {}", mode.label(), mode.describe());
+            Ok(true)
+        }
         SessionAction::CycleThinking => {
             sync_session_thinking(session, agent);
             if session.supports_thinking {
@@ -4500,6 +4507,18 @@ fn prepare_user_input(
 ) -> Result<PreparedInput, String> {
     let mut text = prompt.to_string();
     let mut images = images.to_vec();
+    if let Some(result) = permissions::handle_mode_command(agent, &text) {
+        let message = result?;
+        if parsed.mode == Some(Mode::Json) {
+            println!(
+                "{}",
+                serde_json::json!({"type":"mode_change", "mode":agent.permission_mode().as_str(), "message":message})
+            );
+        } else {
+            println!("{message}");
+        }
+        return Ok(PreparedInput::Handled);
+    }
     if text.starts_with('/') {
         let (name, args) = parse_extension_command(&text);
         if name == "learn" {
@@ -5860,7 +5879,7 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         .unwrap_or_else(|err| err.into_inner())
         .mode
         .as_str();
-    let plan = if agent.plan_mode { "plan" } else { "act" };
+    let plan = if agent.is_plan_mode() { "plan" } else { "act" };
     let jobs = agent
         .tool_context
         .jobs

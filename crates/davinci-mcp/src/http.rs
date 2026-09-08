@@ -118,11 +118,7 @@ impl HttpTransport {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let mut text = String::new();
-        response
-            .into_reader()
-            .read_to_string(&mut text)
-            .map_err(|err| Error::Transport(format!("mcp http body: {err}")))?;
+        let text = read_response_body(response.into_reader(), MAX_BODY_BYTES)?;
         Ok(Reply {
             content_type,
             session_id,
@@ -216,6 +212,36 @@ impl Drop for HttpTransport {
     }
 }
 
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn read_response_body(reader: impl Read, limit: usize) -> Result<String> {
+    let mut text = String::new();
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_string(&mut text)
+        .map_err(|err| Error::Transport(format!("mcp http body: {err}")))?;
+    if text.len() > limit {
+        return Err(Error::Transport(format!(
+            "mcp http body exceeds {limit} bytes"
+        )));
+    }
+    Ok(text)
+}
+
+fn validate_response(value: &Value, wanted: &Value) -> Result<()> {
+    let valid = !wanted.is_null()
+        && value.get("id") == Some(wanted)
+        && value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && value.get("method").is_none()
+        && (value.get("result").is_some() != value.get("error").is_some());
+    if !valid {
+        return Err(Error::Protocol(
+            "invalid or uncorrelated MCP response envelope".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_agent(timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(timeout).build()
 }
@@ -240,11 +266,21 @@ fn load_fixture(url: &str) -> Option<Value> {
 /// notifications and requests interleaved in the stream are skipped. With
 /// no `want`, the last event wins.
 pub fn parse_http_body(content_type: &str, text: &str, want: Option<&Value>) -> Result<Value> {
+    if text.len() > MAX_BODY_BYTES {
+        return Err(Error::Transport(
+            "mcp http body exceeds the input limit".into(),
+        ));
+    }
     if text.trim().is_empty() {
         return Ok(Value::Null);
     }
     if !content_type.contains("text/event-stream") {
-        return serde_json::from_str(text).map_err(|err| Error::Transport(format!("json: {err}")));
+        let value =
+            serde_json::from_str(text).map_err(|err| Error::Transport(format!("json: {err}")))?;
+        if let Some(id) = want {
+            validate_response(&value, id)?;
+        }
+        return Ok(value);
     }
     let mut last = None;
     for data in sse_events(text) {
@@ -254,6 +290,7 @@ pub fn parse_http_body(content_type: &str, text: &str, want: Option<&Value>) -> 
         match want {
             Some(id) => {
                 if value.get("method").is_none() && value.get("id") == Some(id) {
+                    validate_response(&value, id)?;
                     return Ok(value);
                 }
             }
@@ -270,32 +307,81 @@ pub fn parse_http_body(content_type: &str, text: &str, want: Option<&Value>) -> 
 
 /// The `data` payload of every event in an SSE body, multi-line `data:`
 /// fields joined with `\n` as the spec says.
-fn sse_events(text: &str) -> Vec<String> {
-    let mut events = Vec::new();
-    let mut data: Vec<&str> = Vec::new();
-    let mut flush = |data: &mut Vec<&str>| {
-        if !data.is_empty() {
-            events.push(data.join("\n"));
-            data.clear();
+fn sse_events(text: &str) -> impl Iterator<Item = String> + '_ {
+    // Materialize only one event at a time, and stop when the caller finds its
+    // reply. The aggregate input was already bounded before reaching this point.
+    let mut lines = text.lines().chain(std::iter::once(""));
+    std::iter::from_fn(move || {
+        let mut data = String::new();
+        let mut seen = false;
+        for line in lines.by_ref() {
+            if line.is_empty() {
+                if seen {
+                    return Some(data);
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("data:") {
+                if seen {
+                    data.push('\n');
+                }
+                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                seen = true;
+            }
         }
-    };
-    for line in text.lines() {
-        if line.is_empty() {
-            flush(&mut data);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("data:") {
-            data.push(rest.strip_prefix(' ').unwrap_or(rest));
-        }
-    }
-    flush(&mut data);
-    events
+        None
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn security_http_body_is_bounded_before_buffering() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; 1024]);
+        assert!(read_response_body(&mut reader, 64).is_err());
+        assert!(reader.position() <= 65, "read beyond the configured bound");
+        assert_eq!(
+            read_response_body(std::io::Cursor::new("éé"), 4).unwrap(),
+            "éé"
+        );
+        assert!(read_response_body(std::io::Cursor::new("ééé"), 4).is_err());
+        assert_eq!(read_response_body(std::io::Cursor::new(""), 0).unwrap(), "");
+    }
+
+    #[test]
+    fn security_replies_require_correlated_valid_envelopes() {
+        let wanted = json!(7);
+        for invalid in [
+            json!({"jsonrpc":"2.0","id":8,"result":{}}),
+            json!({"jsonrpc":"2.0","result":{}}),
+            json!({"jsonrpc":"2.0","id":null,"result":{}}),
+            json!({"jsonrpc":"2.0","id":"7","result":{}}),
+            json!({"jsonrpc":"1.0","id":7,"result":{}}),
+            json!({"id":7,"result":{}}),
+            json!({"jsonrpc":"2.0","id":7,"method":"tools/call","result":{}}),
+            json!({"jsonrpc":"2.0","id":7,"result":{},"error":{}}),
+            json!({"jsonrpc":"2.0","id":7}),
+        ] {
+            let text = invalid.to_string();
+            assert!(
+                parse_http_body("application/json", &text, Some(&wanted)).is_err(),
+                "accepted invalid JSON reply: {text}"
+            );
+            let sse = format!("data: {text}\n\n");
+            assert!(
+                parse_http_body("text/event-stream", &sse, Some(&wanted)).is_err(),
+                "accepted invalid SSE reply: {text}"
+            );
+        }
+        let valid = json!({"jsonrpc":"2.0","id":7,"result":null});
+        assert_eq!(
+            parse_http_body("application/json", &valid.to_string(), Some(&wanted)).unwrap(),
+            valid
+        );
+    }
 
     #[test]
     fn an_empty_body_is_null_and_json_parses() {

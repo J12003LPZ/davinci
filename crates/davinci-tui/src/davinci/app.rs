@@ -7,7 +7,7 @@
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/app.ex`.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 
 use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOwner};
@@ -35,6 +35,9 @@ pub enum Flow {
     Submit(String),
     /// A row of the open instrument was chosen; the caller owns the action.
     Choose(Choice),
+    /// Request the next permission mode. Only the runtime may apply it and
+    /// synchronize `Model::permission_mode`; the draft and UI state stay put.
+    CyclePermissionMode,
 }
 
 /// Compose exactly `height` rows. Conversation chrome follows the content;
@@ -466,6 +469,24 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     }
 
     if let Some(data) = data.as_deref() {
+        // Active surfaces get first refusal above. Autocomplete may decline
+        // this chord without losing its suggestions or changing the draft.
+        if model.keybindings.matches(data, "app.permissions.cycle") {
+            let plain_tab_modifiers = !matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+                || (key.modifiers - KeyModifiers::SHIFT).is_empty()
+                || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::CONTROL);
+            return if key.kind == KeyEventKind::Press
+                && !model.running
+                && !model.voice.setup
+                && model.screen == Screen::Agent
+                && !model.codex_open()
+                && plain_tab_modifiers
+            {
+                Flow::CyclePermissionMode
+            } else {
+                Flow::Continue
+            };
+        }
         // The shell's own shortcuts are checked before the editor's, because
         // several of them (`ctrl+u` mensura, `ctrl+b` codex, `ctrl+d` quit)
         // spell the same bytes as a readline binding. design.md §5 gives those
@@ -1097,7 +1118,7 @@ mod tests {
         assert!(!text(&rows[20]).contains("…"), "no placeholder prose");
         assert!(text(&rows[21]).chars().all(|ch| "━╸┄╺".contains(ch)));
         assert!(text(&rows[22]).contains("/help for shortcuts"));
-        assert!(text(&rows[23]).starts_with("  ask permissions · main"));
+        assert!(text(&rows[23]).starts_with("  Manual · main"));
     }
 
     #[test]
@@ -1196,17 +1217,123 @@ mod tests {
     }
 
     #[test]
-    fn tab_chords_do_not_change_reasoning_when_composer_owns_input() {
+    fn ctrl_tab_cycles_modes_without_editing_or_submitting_the_draft() {
         let mut m = model(120, 30);
+        m.running = false;
+        m.composer.set_text("keep this café 🦀 draft");
+        let current = m.permission_mode.clone();
+        let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL);
+        assert_eq!(handle_key(&mut m, key), Flow::CyclePermissionMode);
+        assert_eq!(
+            m.permission_mode, current,
+            "runtime must commit the transition first"
+        );
+        assert_eq!(m.composer, "keep this café 🦀 draft");
+        m.running = true;
+        assert_eq!(handle_key(&mut m, key), Flow::Continue);
+        m.running = false;
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let mut repeated = key;
+            repeated.kind = kind;
+            assert_eq!(handle_key(&mut m, repeated), Flow::Continue);
+        }
+        m.overlay = Some(Overlay::Ask);
+        assert_eq!(handle_key(&mut m, key), Flow::Continue);
+    }
 
-        assert_eq!(
-            handle_key(&mut m, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),),
-            Flow::Continue,
-        );
-        assert_eq!(
-            handle_key(&mut m, KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
-            Flow::Continue
-        );
+    #[test]
+    fn shift_tab_requests_mode_cycle_without_submitting_or_erasing_draft() {
+        for key in [
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        ] {
+            let mut m = model(120, 30);
+            m.running = false;
+            m.composer.set_text("keep this café 🦀\ndraft");
+            m.composer.editor_mut().move_left();
+            let cursor = m.composer.editor().get_cursor();
+            let thinking = m.thinking_level.clone();
+            let permission = m.permission_mode.clone();
+            let transcript = format!("{:?}", m.transcript);
+            assert_eq!(handle_key(&mut m, key), Flow::CyclePermissionMode);
+            assert_eq!(m.composer, "keep this café 🦀\ndraft");
+            assert_eq!(m.composer.editor().get_cursor(), cursor);
+            assert_eq!(m.thinking_level, thinking);
+            assert_eq!(
+                m.permission_mode, permission,
+                "wait for runtime confirmation"
+            );
+            assert_eq!(format!("{:?}", m.transcript), transcript);
+        }
+    }
+
+    #[test]
+    fn shift_tab_does_not_escalate_running_modal_or_repeated_input() {
+        use crossterm::event::KeyEventKind;
+        let mut m = model(120, 30);
+        let mut key = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+        m.running = true;
+        assert_eq!(handle_key(&mut m, key), Flow::Continue);
+        m.running = false;
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            key.kind = kind;
+            assert_eq!(handle_key(&mut m, key), Flow::Continue);
+        }
+        key.kind = KeyEventKind::Press;
+        for overlay in [
+            Overlay::Instrumenta,
+            Overlay::Sessions,
+            Overlay::Cogitator,
+            Overlay::Ask,
+        ] {
+            m.overlay = Some(overlay);
+            assert_eq!(handle_key(&mut m, key), Flow::Continue, "{overlay:?}");
+            assert_eq!(m.overlay, Some(overlay));
+        }
+        m.overlay = None;
+        for screen in [
+            Screen::Plan,
+            Screen::Models,
+            Screen::Settings,
+            Screen::Permissions,
+            Screen::Login,
+        ] {
+            m.screen = screen;
+            assert_eq!(handle_key(&mut m, key), Flow::Continue, "{screen:?}");
+            assert_eq!(m.screen, screen);
+        }
+        m.screen = Screen::Agent;
+        m.toggle_codex();
+        assert_eq!(handle_key(&mut m, key), Flow::Continue);
+        m.toggle_codex();
+        m.voice.setup = true;
+        assert_eq!(handle_key(&mut m, key), Flow::Continue);
+    }
+
+    #[test]
+    fn unbound_modified_tab_chords_do_not_cycle_permissions() {
+        for code in [KeyCode::Tab, KeyCode::BackTab] {
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+                KeyModifiers::SHIFT | KeyModifiers::ALT,
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ] {
+                let mut m = model(120, 30);
+                m.running = false;
+                m.composer.set_text("keep this draft");
+                let expected = if code == KeyCode::Tab && modifiers == KeyModifiers::CONTROL {
+                    Flow::CyclePermissionMode
+                } else {
+                    Flow::Continue
+                };
+                assert_eq!(handle_key(&mut m, KeyEvent::new(code, modifiers)), expected);
+                assert_eq!(m.composer, "keep this draft");
+                assert_eq!(m.permission_mode, "ask");
+            }
+        }
     }
 
     #[test]
@@ -1454,8 +1581,36 @@ mod tests {
             .expect("the composer is drawn");
         assert!(offered < composer, "the list sits above the composer");
 
-        // Down then tab takes the second row; esc would have closed it.
+        // Mode cycling leaves the completion owner and Unicode caret alone;
+        // ordinary Tab must still accept exactly the previously selected row.
         handle_key(&mut m, key(KeyCode::Down));
+        m.running = false;
+        let found = format!("{:?}", m.suggestions);
+        let selected = m.suggestion_index;
+        let cursor = m.composer.editor().get_cursor();
+        assert_eq!(
+            handle_key(&mut m, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Flow::CyclePermissionMode
+        );
+        assert_eq!(m.composer, "/se");
+        assert_eq!(m.composer.editor().get_cursor(), cursor);
+        assert_eq!(m.suggestion_index, selected);
+        assert_eq!(format!("{:?}", m.suggestions), found);
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ] {
+            let expected = if modifiers == KeyModifiers::CONTROL {
+                Flow::CyclePermissionMode
+            } else {
+                Flow::Continue
+            };
+            assert_eq!(
+                handle_key(&mut m, KeyEvent::new(KeyCode::Tab, modifiers)),
+                expected
+            );
+            assert_eq!(m.composer, "/se");
+        }
         handle_key(&mut m, key(KeyCode::Tab));
         assert_eq!(m.composer, "/sessions ");
     }

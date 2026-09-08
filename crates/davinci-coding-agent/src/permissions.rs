@@ -87,9 +87,40 @@ impl PermissionSources {
             deny: rules(|settings| &settings.deny),
             session_allow: Vec::new(),
             mcp_read_only: Default::default(),
-            plan_mode: false,
             filesystem_boundary: Default::default(),
         }
+    }
+}
+
+/// User-input entry point shared by native, legacy, and headless hosts.
+/// These control commands are never exposed as model-callable tools.
+pub fn handle_mode_command(
+    agent: &mut davinci_agent::Agent,
+    line: &str,
+) -> Option<Result<String, String>> {
+    let mut words = line.trim().splitn(2, char::is_whitespace);
+    let name = words.next()?;
+    let args = words.next().unwrap_or_default().trim();
+    match name {
+        "/plan" => Some(agent.handle_plan_command(args)),
+        "/act" if args.is_empty() => {
+            agent.set_plan_mode(false);
+            Some(Ok(format!("{} · planning ended; no plan was implicitly approved", agent.permission_mode().label())))
+        }
+        "/act" => Some(Err("usage: /act (or /plan accept <mode> to approve a plan)".into())),
+        "/permissions" if args.is_empty() => Some(Ok(format!(
+            "{} · {}\n{}",
+            agent.permission_mode().label(), agent.permission_mode().describe(),
+            PermissionMode::ALL.iter().map(|mode| format!("{}: {}", mode.label(), mode.describe())).collect::<Vec<_>>().join("\n")
+        ))),
+        "/permissions" => Some(match PermissionMode::parse(args) {
+            Some(mode) => {
+                agent.set_permission_mode(mode);
+                Ok(format!("{} · {} · this session", mode.label(), mode.describe()))
+            }
+            None => Err(format!("unknown mode {args}; use Manual, Accept Edits, Plan Mode, Auto Mode, or Always Approve")),
+        }),
+        _ => None,
     }
 }
 
@@ -196,7 +227,7 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
 pub fn describe(sources: &PermissionSources, policy: &PermissionPolicy) -> Vec<String> {
     let mut rows = vec![format!(
         "permission mode {} · {}",
-        policy.mode.as_str(),
+        policy.mode.label(),
         policy.mode.describe()
     )];
     let list = |label: &str, rules: &[String]| -> Option<String> {
@@ -218,7 +249,7 @@ pub fn describe(sources: &PermissionSources, policy: &PermissionPolicy) -> Vec<S
         .collect();
     rows.extend(list("allow (this session)", &session));
     if rows.len() == 1 {
-        rows.push("no rules · /permissions <read-only|ask|edits|auto> sets the mode".into());
+        rows.push("no rules · /permissions <manual|accept-edits|plan-mode|auto|always-approve> sets the mode".into());
     }
     rows
 }
@@ -244,6 +275,51 @@ mod tests {
             mode: mode.map(str::to_string),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn configured_plan_mode_is_read_only_even_with_saved_write_grants() {
+        let sources = PermissionSources {
+            user: block(Some("plan-mode"), &["write", "bash"], &[]),
+            project: None,
+        };
+        let policy = sources.policy(None);
+        let project = tempfile::tempdir().unwrap();
+        for (tool, args) in [
+            (
+                "write",
+                serde_json::json!({"path":"src/new.rs", "content":"x"}),
+            ),
+            (
+                "bash",
+                serde_json::json!({"command":"echo changed > file.txt"}),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    policy.decide("configured-plan", tool, &args, project.path()),
+                    davinci_agent::PermissionVerdict::Deny { .. }
+                ),
+                "configured Plan Mode must deny {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_modes_round_trip_without_changing_the_requested_order() {
+        for (name, id) in [
+            ("Manual", "ask"),
+            ("Accept Edits", "edits"),
+            ("Plan Mode", "read-only"),
+            ("Auto Mode", "auto"),
+            ("Always Approve", "always-approve"),
+        ] {
+            let sources = PermissionSources {
+                user: block(Some(name), &[], &[]),
+                project: None,
+            };
+            assert_eq!(sources.mode().as_str(), id, "{name}");
         }
     }
 
@@ -367,7 +443,7 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "permission mode ask · read tools run; edits and shell commands ask",
+                "permission mode Manual · read tools run; edits and shell commands ask",
                 "allow (user) · read",
                 "allow (project) · bash(cargo *)",
                 "deny (project) · bash(rm *)",

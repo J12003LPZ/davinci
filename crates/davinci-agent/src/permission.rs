@@ -14,6 +14,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[path = "permission_risk.rs"]
+mod permission_risk;
+
 /// How much a run may do without asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionMode {
@@ -24,25 +27,53 @@ pub enum PermissionMode {
     Ask,
     /// Edits inside the project run; shell commands and unknown tools ask.
     Edits,
-    /// Everything runs.
+    /// Ordinary workspace edits and recognized local checks run; boundary cases ask.
     Auto,
+    /// No harness approval prompts. Explicit denies and isolation still apply.
+    AlwaysApprove,
 }
 
 impl PermissionMode {
-    pub const ALL: [PermissionMode; 4] = [
-        PermissionMode::ReadOnly,
+    pub const ALL: [PermissionMode; 5] = [
         PermissionMode::Ask,
         PermissionMode::Edits,
+        PermissionMode::ReadOnly,
         PermissionMode::Auto,
+        PermissionMode::AlwaysApprove,
     ];
 
-    /// The mode's name, or the Codex CLI sandbox name it stands in for.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Manual",
+            Self::Edits => "Accept Edits",
+            Self::ReadOnly => "Plan Mode",
+            Self::Auto => "Auto Mode",
+            Self::AlwaysApprove => "Always Approve",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Ask => Self::Edits,
+            Self::Edits => Self::ReadOnly,
+            Self::ReadOnly => Self::Auto,
+            Self::Auto => Self::AlwaysApprove,
+            Self::AlwaysApprove => Self::Ask,
+        }
+    }
+
+    /// User-facing names and legacy aliases. These select approval policy,
+    /// not an operating-system sandbox.
     pub fn parse(text: &str) -> Option<Self> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "read-only" | "readonly" | "read_only" => Some(Self::ReadOnly),
-            "ask" | "default" => Some(Self::Ask),
-            "edits" | "accept-edits" | "workspace-write" => Some(Self::Edits),
-            "auto" | "full-access" | "bypass" | "yolo" => Some(Self::Auto),
+        match text.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "plan" | "plan mode" | "plan-mode" | "read-only" | "readonly" | "read_only" => {
+                Some(Self::ReadOnly)
+            }
+            "manual" | "ask" | "default" => Some(Self::Ask),
+            "edits" | "accept edits" | "accept-edits" | "workspace-write" => Some(Self::Edits),
+            "auto" | "auto mode" | "auto-mode" => Some(Self::Auto),
+            "always-approve" | "always approve" | "autopilot" | "full-access"
+            | "danger-full-access" | "bypass" | "yolo" => Some(Self::AlwaysApprove),
             _ => None,
         }
     }
@@ -53,6 +84,7 @@ impl PermissionMode {
             Self::Ask => "ask",
             Self::Edits => "edits",
             Self::Auto => "auto",
+            Self::AlwaysApprove => "always-approve",
         }
     }
 
@@ -62,7 +94,12 @@ impl PermissionMode {
             Self::ReadOnly => "read tools only; edits and shell commands are refused",
             Self::Ask => "read tools run; edits and shell commands ask",
             Self::Edits => "edits inside the project run; shell commands ask",
-            Self::Auto => "everything runs without asking",
+            Self::Auto => {
+                "workspace edits and recognized local checks run; risky or unknown actions ask"
+            }
+            Self::AlwaysApprove => {
+                "WARNING: no harness approval prompts; explicit denies and isolation still apply"
+            }
         }
     }
 }
@@ -74,10 +111,15 @@ pub enum ToolClass {
     Edit,
     Shell,
     /// Reaches outside the machine (`web_fetch`, `web_search`): allowed in
-    /// `read-only`, which guards the workspace and not the network; asked
-    /// in `ask` and `edits`; run in `auto`.
+    /// Plan Mode for research; other prompted modes require approval.
     Network,
     Other,
+}
+
+/// Shared sensitive-file classification for auxiliary readers such as plan
+/// evidence. Auxiliary readers may be stricter, never less strict, than policy.
+pub(crate) fn is_sensitive_file_path(path: &str) -> bool {
+    permission_risk::is_protected_path(path)
 }
 
 pub fn tool_class(tool: &str) -> ToolClass {
@@ -86,13 +128,14 @@ pub fn tool_class(tool: &str) -> ToolClass {
         // user would want to be asked about.
         // A batch is judged operation by operation; the wrapper itself
         // changes nothing.
-        // `graph_submit` is a graph worker's one exit door: it writes the
-        // artifact file its parent named, nothing else. `memory_search` and
-        // `retrieve_output` read the memory index and the governor's store.
-        "read" | "grep" | "find" | "ls" | "job_output" | "job_kill" | "todo" | "mcp_read"
-        | "batch" | "graph_submit" | "memory_search" | "retrieve_output" | "update_plan"
-        | "tool_search" | "agent_status" | "agent_message" | "agent_stop" | "task_create"
-        | "task_update" | "task_list" | "workflow_status" => ToolClass::Read,
+        // `memory_search` and `retrieve_output` read the memory index and
+        // governor's store. Artifact submission is a mutation, not a read.
+        "read" | "grep" | "find" | "ls" | "job_output" | "todo" | "mcp_read" | "batch"
+        | "memory_search" | "retrieve_output" | "update_plan" | "tool_search" | "agent_status"
+        | "task_list" | "workflow_status" | "propose_plan" => ToolClass::Read,
+        // Process control, messages to workers, and task dispatch can cause effects.
+        "job_kill" | "agent_message" | "agent_stop" | "task_create" | "task_update"
+        | "graph_submit" => ToolClass::Other,
         "write" | "edit" | "notebook_edit" | "apply_patch" => ToolClass::Edit,
         "bash" | "powershell" | "exec_command" | "write_stdin" => ToolClass::Shell,
         "web_fetch" | "web_search" => ToolClass::Network,
@@ -682,8 +725,6 @@ pub struct PermissionPolicy {
     pub session_allow: Vec<PermissionRule>,
     /// MCP tools whose server marked `readOnlyHint`. `mcp_read` is Read by name.
     pub mcp_read_only: BTreeSet<String>,
-    /// Session-only freeze: mutations refused until `/act`.
-    pub plan_mode: bool,
     /// Filesystem boundary enforcement configuration.
     pub filesystem_boundary: FilesystemBoundaryPolicy,
 }
@@ -694,12 +735,11 @@ impl Default for PermissionPolicy {
     /// `build_agent`; embedders who want the gate set a mode.
     fn default() -> Self {
         Self {
-            mode: PermissionMode::Auto,
+            mode: PermissionMode::AlwaysApprove,
             allow: Vec::new(),
             deny: Vec::new(),
             session_allow: Vec::new(),
             mcp_read_only: BTreeSet::new(),
-            plan_mode: false,
             filesystem_boundary: FilesystemBoundaryPolicy::default(),
         }
     }
@@ -730,9 +770,9 @@ impl PermissionPolicy {
         self.filesystem_boundary.repo_root = repo_root.map(|p| p.to_path_buf());
         self.filesystem_boundary.enforce_root_for_mutations = true;
         self.filesystem_boundary.allow_git_metadata = true;
-        if let Some(parent) = repo_root {
-            self.deny_parent_checkout(parent);
-        }
+        // The structural boundary is distinct from explicit deny rules.
+        // Injecting broad parent denies then exempting metadata would allow
+        // unrelated user deny rules to be bypassed.
     }
 
     pub fn set_read_outside_root_policy(&mut self, policy: ReadOutsideRootPolicy) {
@@ -784,9 +824,9 @@ impl PermissionPolicy {
         self.deny.push(PermissionRule::subject("*", parent_str));
     }
 
-    /// Decide one call. Deny rules win; `auto` and allow rules quiet the
-    /// rest; `read-only` refuses anything that is not a read; and the mode
-    /// table decides what is left.
+    /// Hard constraints (deny rules, Plan Mode, filesystem boundaries) precede
+    /// every approval shortcut. Automatic grants are conservative; unknown
+    /// actions ask unless the user explicitly selected Always Approve.
     pub fn decide(
         &self,
         tool_call_id: &str,
@@ -794,16 +834,75 @@ impl PermissionPolicy {
         args: &Value,
         cwd: &Path,
     ) -> PermissionVerdict {
-        let (subject, outside_project) =
-            subject_of_with_boundary(tool, args, cwd, Some(&self.filesystem_boundary));
+        // Capturing evidence is a compound read. It must obey the same rules
+        // as the read tool, including named denies, even when propose_plan is
+        // generally permitted or Always Approve is selected.
+        let mut evidence_approval = None;
+        if tool == "propose_plan" {
+            if let Some(evidence) = args.get("evidence").and_then(Value::as_array) {
+                if evidence.len() > 32 {
+                    return PermissionVerdict::Deny {
+                        reason: "Plan evidence is limited to 32 files".into(),
+                    };
+                }
+                for item in evidence {
+                    let Some(path) = item.get("path").and_then(Value::as_str) else {
+                        return PermissionVerdict::Deny {
+                            reason: "Every plan evidence item needs a path".into(),
+                        };
+                    };
+                    match self.decide(tool_call_id, "read", &serde_json::json!({"path":path}), cwd)
+                    {
+                        PermissionVerdict::Deny { reason } => {
+                            return PermissionVerdict::Deny { reason }
+                        }
+                        PermissionVerdict::Ask(mut request) => {
+                            request.tool = tool.to_string();
+                            request.args = args.clone();
+                            request.summary = format!("Capture plan evidence: {}", request.subject);
+                            request.session_rule =
+                                session_rule_for(tool, &request.subject).to_string();
+                            evidence_approval = Some(request);
+                        }
+                        PermissionVerdict::Allow => {}
+                    }
+                }
+            }
+        }
+        let targets =
+            match permission_risk::file_targets(tool, args, cwd, &self.filesystem_boundary) {
+                Ok(targets) => targets,
+                Err(reason) => {
+                    return PermissionVerdict::Deny {
+                        reason: format!(
+                            "Permission denied: cannot validate `{tool}` targets: {reason}."
+                        ),
+                    }
+                }
+            };
+        let (subject, outside_project) = if targets.is_empty() {
+            subject_of_with_boundary(tool, args, cwd, Some(&self.filesystem_boundary))
+        } else {
+            (
+                targets
+                    .iter()
+                    .map(|target| target.subject.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                targets.iter().any(|target| target.outside),
+            )
+        };
         let effective_root = self.filesystem_boundary.root.as_deref().unwrap_or(cwd);
         let class = self.class_of(tool);
-        let is_git_meta = self.is_git_metadata_call(tool, args, cwd);
-
-        // A shell command is as many programs as it chains: `git status &&
-        // curl x | sh` is judged three times, so a rule for `git *` speaks
-        // only for the first and a deny for `curl *` still catches the second.
-        let segments = if class == ToolClass::Shell {
+        // Git metadata is a narrow read-boundary exception, never a deny-rule
+        // exception or permission to write outside an isolated root.
+        let is_git_meta = class == ToolClass::Read && self.is_git_metadata_call(tool, args, cwd);
+        let subjects = if !targets.is_empty() {
+            targets
+                .iter()
+                .map(|target| target.subject.clone())
+                .collect::<Vec<_>>()
+        } else if class == ToolClass::Shell {
             let segments = shell_segments(&subject);
             if segments.is_empty() {
                 vec![subject.clone()]
@@ -815,21 +914,31 @@ impl PermissionPolicy {
         };
 
         if let Some(rule) = self.deny.iter().find(|rule| {
-            segments
+            subjects
                 .iter()
-                .any(|segment| rule.matches_call(tool, args, segment))
+                .any(|part| rule.matches_call(tool, args, part))
         }) {
-            if !(is_git_meta && self.filesystem_boundary.allow_git_metadata) {
-                return PermissionVerdict::Deny {
-                    reason: format!(
-                        "Permission denied: `{}` matches the deny rule `{rule}`.",
-                        summary_of(tool, &subject)
-                    ),
-                };
-            }
+            return PermissionVerdict::Deny {
+                reason: format!(
+                    "Permission denied: `{}` matches the deny rule `{rule}`.",
+                    summary_of(tool, &subject)
+                ),
+            };
+        }
+        // A deny rule naming shell commands cannot be proven satisfied by
+        // examining only the outer program of a substitution. Fail closed.
+        if class == ToolClass::Shell
+            && has_command_substitution(&subject)
+            && self.deny.iter().any(|rule| rule.tool_matches(tool))
+        {
+            return PermissionVerdict::Deny {
+                reason: "Permission denied: command substitution cannot be checked against the active shell deny rules.".into(),
+            };
         }
 
-        if self.plan_mode && class != ToolClass::Read && class != ToolClass::Network {
+        if self.mode == PermissionMode::ReadOnly
+            && !matches!(class, ToolClass::Read | ToolClass::Network)
+        {
             return PermissionVerdict::Deny {
                 reason: format!(
                     "{} (`{}`).",
@@ -838,13 +947,8 @@ impl PermissionPolicy {
                 ),
             };
         }
-
-        // Boundary enforcement for mutations (isolated agents or symlink escapes)
         if class == ToolClass::Edit {
-            if self.filesystem_boundary.enforce_root_for_mutations
-                && outside_project
-                && !is_git_meta
-            {
+            if self.filesystem_boundary.enforce_root_for_mutations && outside_project {
                 return PermissionVerdict::Deny {
                     reason: format!(
                         "Permission denied: `{}` attempts to mutate outside isolated root `{}`.",
@@ -853,98 +957,86 @@ impl PermissionPolicy {
                     ),
                 };
             }
-
-            let raw_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            let given = Path::new(raw_path);
-            let joined = if given.is_absolute() {
-                given.to_path_buf()
-            } else {
-                effective_root.join(given)
-            };
-            if is_symlink_escape(effective_root, &joined) {
+            if targets.iter().any(|target| target.symlink_escape) {
                 return PermissionVerdict::Deny {
-                    reason: format!(
-                        "Permission denied: `{}` contains an untrusted symlink escape outside `{}`.",
-                        summary_of(tool, &subject),
-                        effective_root.display()
-                    ),
+                    reason: format!("Permission denied: `{}` contains an untrusted symlink escape outside `{}`.", summary_of(tool, &subject), effective_root.display()),
                 };
             }
         }
-
-        if self.mode == PermissionMode::Auto {
+        if class == ToolClass::Read
+            && outside_project
+            && !is_git_meta
+            && self.filesystem_boundary.read_outside_root == ReadOutsideRootPolicy::Deny
+        {
+            return PermissionVerdict::Deny {
+                reason: format!(
+                    "Permission denied: `{}` reads outside root `{}`.",
+                    summary_of(tool, &subject),
+                    effective_root.display()
+                ),
+            };
+        }
+        let secret = targets.iter().any(|target| target.secret);
+        if self.mode == PermissionMode::ReadOnly && secret {
+            return PermissionVerdict::Deny {
+                reason: "plan mode: credential access requires an explicit execution mode".into(),
+            };
+        }
+        if self.mode == PermissionMode::AlwaysApprove {
             return PermissionVerdict::Allow;
         }
 
-        // Every segment needs a rule of its own. A pattern rule cannot vouch
-        // for a segment that substitutes a command (`$(…)`, backticks,
-        // `<(…)`): whatever runs inside is not the program the rule names.
-        if segments.iter().all(|segment| {
+        if let Some(request) = evidence_approval {
+            return PermissionVerdict::Ask(request);
+        }
+
+        // Every patch target and every shell segment needs its own grant.
+        // A subject pattern cannot authorize hidden command substitutions.
+        if subjects.iter().all(|part| {
             self.allow
                 .iter()
                 .chain(self.session_allow.iter())
                 .any(|rule| {
-                    rule.matches_call(tool, args, segment)
-                        && (rule.specifier.is_none() || !has_command_substitution(segment))
+                    rule.matches_call(tool, args, part)
+                        && (class != ToolClass::Shell
+                            || (rule.specifier.is_none() && rule.pattern.is_none())
+                            || !has_command_substitution(part))
                 })
         }) {
             return PermissionVerdict::Allow;
         }
 
-        if class == ToolClass::Read {
-            if outside_project && !is_git_meta {
-                match self.filesystem_boundary.read_outside_root {
-                    ReadOutsideRootPolicy::Allow => return PermissionVerdict::Allow,
-                    ReadOutsideRootPolicy::Ask => {
-                        return PermissionVerdict::Ask(ToolApprovalRequest {
-                            tool_call_id: tool_call_id.to_string(),
-                            tool: tool.to_string(),
-                            args: args.clone(),
-                            summary: summary_of(tool, &subject),
-                            session_rule: session_rule_for(tool, &subject).to_string(),
-                            subject,
-                            outside_project: true,
-                            mode: self.mode,
-                        });
-                    }
-                    ReadOutsideRootPolicy::Deny => {
-                        return PermissionVerdict::Deny {
-                            reason: format!(
-                                "Permission denied: `{}` reads outside root `{}` which is forbidden by read-outside-root policy.",
-                                summary_of(tool, &subject),
-                                effective_root.display()
-                            ),
-                        };
-                    }
-                }
-            }
+        let read_needs_approval = outside_project
+            && !is_git_meta
+            && (self.filesystem_boundary.read_outside_root == ReadOutsideRootPolicy::Ask
+                || self.mode == PermissionMode::Auto);
+        if class == ToolClass::Read && !secret && !read_needs_approval {
             return PermissionVerdict::Allow;
         }
-
         if class == ToolClass::Network && self.mode == PermissionMode::ReadOnly {
             return PermissionVerdict::Allow;
         }
-
-        if self.mode == PermissionMode::ReadOnly {
-            return PermissionVerdict::Deny {
-                reason: format!(
-                    "Permission denied: `{}` is not allowed in permission mode `read-only`.",
-                    summary_of(tool, &subject)
-                ),
-            };
-        }
-
-        // `.pi/` holds the project's own permission rules and trust state; a
-        // write there could grant the next run everything, so it is asked
-        // about even in `edits` mode.
-        if self.mode == PermissionMode::Edits
+        if matches!(self.mode, PermissionMode::Edits | PermissionMode::Auto)
             && class == ToolClass::Edit
-            && !outside_project
-            && !is_project_config_path(&subject)
+            && !targets.is_empty()
+            && targets
+                .iter()
+                .all(|target| !target.outside && !target.protected && !target.destructive)
         {
             return PermissionVerdict::Allow;
         }
-
+        if self.mode == PermissionMode::Auto
+            && class == ToolClass::Shell
+            && permission_risk::routine_local_shell(
+                tool,
+                args,
+                &subject,
+                cwd,
+                &self.filesystem_boundary,
+            )
+        {
+            return PermissionVerdict::Allow;
+        }
         PermissionVerdict::Ask(ToolApprovalRequest {
             tool_call_id: tool_call_id.to_string(),
             tool: tool.to_string(),
@@ -958,7 +1050,7 @@ impl PermissionPolicy {
     }
 
     pub fn class_of(&self, tool: &str) -> ToolClass {
-        if self.mcp_read_only.contains(tool) {
+        if tool.starts_with("mcp__") && self.mcp_read_only.contains(tool) {
             ToolClass::Read
         } else {
             tool_class(tool)
@@ -990,6 +1082,7 @@ pub fn subject_of_with_boundary(
     match tool_class(tool) {
         ToolClass::Shell => (
             args.get("command")
+                .or_else(|| args.get("cmd"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .trim()
@@ -1066,11 +1159,6 @@ fn has_command_substitution(segment: &str) -> bool {
     crate::shell_policy::has_command_substitution(segment)
 }
 
-/// `.pi/settings.json`, `.pi/mcp.json` and the trust files under `.pi/`.
-fn is_project_config_path(subject: &str) -> bool {
-    subject == ".pi" || subject.starts_with(".pi/")
-}
-
 /// `bash · git status`, `write · src/lib.rs`, or the bare tool name.
 /// `docs.rs` from `https://docs.rs/similar/latest/`: the host a fetch rule
 /// names. Lower-cased, port and credentials dropped, scheme optional.
@@ -1133,7 +1221,10 @@ pub fn is_git_metadata_path(path: &Path, repo_root: Option<&Path>, root: Option<
         }
     }
 
-    normalized.components().any(|c| c.as_os_str() == ".git")
+    // A `.git` component in an unrelated checkout is not our metadata.
+    repo_root.is_none()
+        && root.is_none()
+        && normalized.components().any(|c| c.as_os_str() == ".git")
 }
 
 /// Check whether `target` escapes `root` either lexically or via symlinks.
@@ -1266,7 +1357,8 @@ pub fn project_relative_with_boundary(
     } else if has_windows_drive_prefix(raw_trimmed) {
         PathBuf::from(raw_trimmed)
     } else {
-        effective_root.join(given)
+        // The executor resolves relative paths from cwd, not the policy root.
+        cwd.join(given)
     };
 
     let (outside_lexical, symlink_escape) = check_path_boundary(effective_root, &joined);
@@ -1388,6 +1480,490 @@ mod tests {
             PathBuf::from("C:\\work\\proj")
         } else {
             PathBuf::from("/work/proj")
+        }
+    }
+
+    #[test]
+    fn plan_evidence_obeys_explicit_read_denies_even_with_blanket_allow() {
+        for mode in PermissionMode::ALL {
+            let mut p = policy(mode);
+            p.allow.push(PermissionRule::bare("*"));
+            p.deny
+                .push(PermissionRule::parse("read(private/**)").unwrap());
+            assert!(
+                is_deny(&verdict(
+                    &p,
+                    "propose_plan",
+                    json!({
+                        "expected_revision":0,
+                        "evidence":[{"path":"private/notes.txt","finding":"Not authorized"}]
+                    })
+                )),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn five_named_modes_are_available_in_the_requested_order() {
+        let names = [
+            "Manual",
+            "Accept Edits",
+            "Plan Mode",
+            "Auto Mode",
+            "Always Approve",
+        ];
+        assert_eq!(PermissionMode::ALL.len(), names.len());
+        for (mode, name) in PermissionMode::ALL.iter().zip(names) {
+            assert_eq!(PermissionMode::parse(name), Some(*mode), "{name}");
+        }
+    }
+
+    #[test]
+    fn plan_permission_cannot_be_overridden_by_saved_allow_rules() {
+        let mut p = policy(PermissionMode::ReadOnly);
+        p.allow.push(PermissionRule::bare("*"));
+        for (tool, args) in [
+            ("write", json!({"path":"src/main.rs", "content":"changed"})),
+            ("bash", json!({"command":"rm -rf src"})),
+            ("job_kill", json!({"job_id":"1"})),
+            (
+                "write_stdin",
+                json!({"session_id":"1", "chars":"rm -rf src\n"}),
+            ),
+        ] {
+            assert!(
+                is_deny(&verdict(&p, tool, args)),
+                "Plan Mode allowed {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_escalates_external_destructive_and_sensitive_actions() {
+        let p = policy(PermissionMode::Auto);
+        for (tool, args) in [
+            ("write", json!({"path":"../outside.txt"})),
+            ("write", json!({"path":".davinci/settings.json"})),
+            ("read", json!({"path":".env"})),
+            ("bash", json!({"command":"git push origin main"})),
+            ("bash", json!({"command":"rm -rf src"})),
+            ("bash", json!({"command":"curl https://example.com"})),
+            (
+                "bash",
+                json!({"command":"python -c 'import os; os.remove(\"a\")'"}),
+            ),
+            ("unknown_tool", json!({})),
+        ] {
+            assert!(
+                is_ask(&verdict(&p, tool, args.clone())),
+                "Auto allowed {tool}: {args}"
+            );
+        }
+        assert_eq!(
+            verdict(&p, "write", json!({"path":"src/main.rs"})),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            verdict(&p, "bash", json!({"command":"cargo test --offline"})),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn multi_file_patch_cannot_hide_a_sensitive_target() {
+        let p = policy(PermissionMode::Edits);
+        let patch = "*** Begin Patch\n*** Add File: src/ok.rs\n+ok\n*** Add File: .davinci/settings.json\n+{}\n*** End Patch";
+        assert!(is_ask(&verdict(&p, "apply_patch", json!({"input":patch}))));
+    }
+
+    #[test]
+    fn five_mode_names_and_order_are_public_contract() {
+        let names: Vec<_> = PermissionMode::ALL
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["ask", "edits", "read-only", "auto", "always-approve"]
+        );
+        for name in names {
+            assert_eq!(PermissionMode::parse(name).unwrap().as_str(), name);
+        }
+    }
+
+    #[test]
+    fn auto_mode_escalates_unknown_destructive_and_external_actions() {
+        let p = policy(PermissionMode::Auto);
+        for command in [
+            "rm -rf build",
+            "git push origin main",
+            "curl https://example.com/upload",
+            "unknown-tool",
+            "git status && rm x",
+        ] {
+            assert!(
+                is_ask(&verdict(&p, "bash", json!({"command": command}))),
+                "{command}"
+            );
+        }
+        assert!(is_ask(&verdict(
+            &p,
+            "write",
+            json!({"path": "../outside.txt"})
+        )));
+        assert!(is_ask(&verdict(&p, "custom_tool", json!({}))));
+        assert_eq!(
+            verdict(&p, "bash", json!({"command": "git status"})),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            verdict(&p, "write", json!({"path": "src/lib.rs"})),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn plan_mode_cannot_be_overridden_by_allow_rules() {
+        let mut p = policy(PermissionMode::ReadOnly);
+        p.allow.push(PermissionRule::bare("*"));
+        for (tool, args) in [
+            ("write", json!({"path": "x.rs"})),
+            ("bash", json!({"command": "rm x"})),
+            ("job_kill", json!({})),
+            ("agent_message", json!({})),
+        ] {
+            assert!(is_deny(&verdict(&p, tool, args)), "{tool}");
+        }
+    }
+
+    #[test]
+    fn accept_edits_requires_approval_for_davinci_git_and_secret_paths() {
+        let p = policy(PermissionMode::Edits);
+        for path in [
+            ".davinci/settings.json",
+            ".git/config",
+            ".env",
+            "config/credentials.json",
+        ] {
+            assert!(
+                is_ask(&verdict(&p, "write", json!({"path": path}))),
+                "{path}"
+            );
+        }
+        let patch = "*** Begin Patch\n*** Add File: src/a.rs\n+ok\n*** Add File: .davinci/settings.json\n+{}\n*** End Patch";
+        assert!(is_ask(&verdict(&p, "apply_patch", json!({"input": patch}))));
+    }
+
+    #[test]
+    fn mode_labels_cycle_and_legacy_ids_remain_compatible() {
+        let ids = ["ask", "edits", "read-only", "auto", "always-approve"];
+        for (index, mode) in PermissionMode::ALL.into_iter().enumerate() {
+            assert_eq!(mode.as_str(), ids[index]);
+            assert_eq!(PermissionMode::parse(mode.label()), Some(mode));
+            assert_eq!(mode.next(), PermissionMode::ALL[(index + 1) % ids.len()]);
+        }
+        for alias in [
+            "full-access",
+            "danger-full-access",
+            "yolo",
+            "bypass",
+            "autopilot",
+        ] {
+            assert_eq!(
+                PermissionMode::parse(alias),
+                Some(PermissionMode::AlwaysApprove)
+            );
+        }
+        assert_eq!(
+            PermissionPolicy::default().mode,
+            PermissionMode::AlwaysApprove
+        );
+        assert_eq!(PermissionMode::default(), PermissionMode::Ask);
+    }
+
+    #[test]
+    fn every_mode_honors_explicit_denies_and_hard_read_boundaries() {
+        for mode in PermissionMode::ALL {
+            let mut p = policy(mode);
+            p.allow.push(PermissionRule::bare("*"));
+            p.remember("*");
+            p.filesystem_boundary.allow_git_metadata = true;
+            p.filesystem_boundary.root = Some(cwd());
+            p.deny.push(PermissionRule::parse("write(.git/*)").unwrap());
+            assert!(
+                is_deny(&verdict(&p, "write", json!({"path":".git/config"}))),
+                "{mode:?}"
+            );
+            p.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+            assert!(
+                is_deny(&verdict(&p, "read", json!({"path":"../outside.txt"}))),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_freeze_precedes_session_grants_and_side_effect_class_hints() {
+        let mut p = policy(PermissionMode::ReadOnly);
+        p.remember("*");
+        // MCP hints cannot reclassify a built-in mutation as a safe read.
+        p.mcp_read_only.insert("job_kill".into());
+        for tool in [
+            "job_kill",
+            "agent_message",
+            "agent_stop",
+            "task_create",
+            "task_update",
+            "graph_submit",
+            "unknown_tool",
+        ] {
+            assert!(is_deny(&verdict(&p, tool, json!({}))), "{tool}");
+        }
+        for tool in [
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "todo",
+            "update_plan",
+            "job_output",
+            "task_list",
+        ] {
+            assert_eq!(
+                verdict(&p, tool, json!({})),
+                PermissionVerdict::Allow,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_rules_and_risk_checks_inspect_each_target() {
+        let patch = "*** Begin Patch\n*** Add File: src/good.rs\n+ok\n*** Add File: private/key.pem\n+not-a-real-key\n*** End Patch";
+        let args = json!({"input":patch});
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::Edits,
+            PermissionMode::Auto,
+        ] {
+            let mut p = policy(mode);
+            p.allow
+                .push(PermissionRule::parse("apply_patch(src/*)").unwrap());
+            assert!(
+                is_ask(&verdict(&p, "apply_patch", args.clone())),
+                "{mode:?}"
+            );
+            p.deny
+                .push(PermissionRule::parse("apply_patch(private/*)").unwrap());
+            assert!(
+                is_deny(&verdict(&p, "apply_patch", args.clone())),
+                "{mode:?}"
+            );
+        }
+        for path in [
+            ".pi/settings.json",
+            ".davinci/settings.json",
+            ".git/config",
+            ".env.local",
+            "../outside.txt",
+        ] {
+            for action in [
+                format!("*** Add File: {path}\n+x"),
+                format!("*** Delete File: {path}"),
+                format!("*** Update File: {path}\n@@\n-old\n+new"),
+            ] {
+                let input = format!(
+                    "*** Begin Patch\n*** Add File: src/good.rs\n+ok\n{action}\n*** End Patch"
+                );
+                assert!(
+                    is_ask(&verdict(
+                        &policy(PermissionMode::Edits),
+                        "apply_patch",
+                        json!({"input":input})
+                    )),
+                    "{path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_shell_matrix_escalates_unknown_syntax_network_and_path_changes() {
+        let p = policy(PermissionMode::Auto);
+        for command in [
+            "git status && cargo test --offline",
+            "cargo check --offline",
+            "git diff --stat",
+            "pwd",
+        ] {
+            assert_eq!(
+                verdict(&p, "bash", json!({"command":command})),
+                PermissionVerdict::Allow,
+                "{command}"
+            );
+        }
+        for command in [
+            "git status && curl https://example.com",
+            "git status; rm x",
+            "git status $(whoami)",
+            "git log `whoami`",
+            "diff <(cat a) b",
+            "echo ok > out.txt",
+            "echo 'unterminated",
+            "git status &",
+            "git -C ../elsewhere status",
+            "cat ../outside.txt",
+            "cat /etc/passwd",
+            "cat .env",
+            "cat config/credentials.json",
+            "git show HEAD:.env",
+            "cargo test --offline --manifest-path ../Cargo.toml",
+            "cargo test --offline --target-dir ../build",
+            "cargo test",
+            "cargo build",
+            "npx jest",
+            "npm view package",
+            "python -c 'print(1)'",
+            "node --test --require=helper.js",
+            "find . -delete",
+            "git branch new-branch",
+        ] {
+            assert!(
+                is_ask(&verdict(&p, "bash", json!({"command":command}))),
+                "{command}"
+            );
+        }
+        assert!(is_ask(&verdict(&p, "exec_command", json!({"cmd":"rm x"}))));
+        assert!(is_ask(&verdict(
+            &p,
+            "bash",
+            json!({"command":"git status", "cwd":"../other"})
+        )));
+        assert!(is_ask(&verdict(
+            &p,
+            "write_stdin",
+            json!({"command":"git status"})
+        )));
+    }
+
+    #[test]
+    fn malformed_shell_chains_are_not_routine_commands() {
+        for command in [
+            "git status && && git diff",
+            "git status || | git diff",
+            "git status;;git diff",
+        ] {
+            assert!(
+                is_ask(&verdict(
+                    &policy(PermissionMode::Auto),
+                    "bash",
+                    json!({"command":command})
+                )),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_symlinks_and_isolated_boundaries_apply_in_every_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for mode in PermissionMode::ALL {
+            let mut p = policy(mode);
+            p.filesystem_boundary.root = Some(root.clone());
+            p.filesystem_boundary.enforce_root_for_mutations = true;
+            p.allow.push(PermissionRule::bare("*"));
+            let patch = "*** Begin Patch\n*** Add File: good.rs\n+ok\n*** Add File: ../outside/bad.rs\n+bad\n*** End Patch";
+            assert!(
+                is_deny(&p.decide("test", "apply_patch", &json!({"input":patch}), &root)),
+                "{mode:?}"
+            );
+        }
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, root.join("link")).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, root.join("link")).is_ok();
+        if linked {
+            let patch = "*** Begin Patch\n*** Add File: good.rs\n+ok\n*** Add File: link/new.rs\n+bad\n*** End Patch";
+            let p = policy(PermissionMode::AlwaysApprove);
+            assert!(is_deny(&p.decide(
+                "test",
+                "apply_patch",
+                &json!({"input":patch}),
+                &root
+            )));
+        }
+    }
+
+    #[test]
+    fn relative_targets_are_resolved_from_execution_cwd_not_policy_root() {
+        let root = cwd();
+        let execution_cwd = root.join("nested");
+        let mut p = policy(PermissionMode::Edits);
+        p.filesystem_boundary.root = Some(root.clone());
+        p.deny
+            .push(PermissionRule::parse("write(nested/blocked.rs)").unwrap());
+        assert!(is_deny(&p.decide(
+            "test",
+            "write",
+            &json!({"path":"blocked.rs"}),
+            &execution_cwd
+        )));
+        assert_eq!(
+            project_relative_with_boundary(
+                &execution_cwd,
+                "../ok.rs",
+                Some(&p.filesystem_boundary)
+            ),
+            ("ok.rs".into(), false)
+        );
+    }
+
+    #[test]
+    fn shell_workdir_changes_cannot_hide_an_outside_operand() {
+        let root = cwd();
+        let execution_cwd = root.join("nested");
+        let mut p = policy(PermissionMode::Auto);
+        p.filesystem_boundary.root = Some(root);
+        for key in ["cwd", "workdir", "work_dir", "directory"] {
+            let mut args = json!({"command":"cat ../outside.txt"});
+            args[key] = json!("..");
+            assert!(
+                is_ask(&p.decide("test", "bash", &args, &execution_cwd)),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_shell_denies_survive_substitution_and_always_approve() {
+        let mut p = policy(PermissionMode::AlwaysApprove);
+        p.deny.push(PermissionRule::parse("bash(rm *)").unwrap());
+        for command in ["echo ok && rm file", "echo $(rm file)", "echo `rm file`"] {
+            assert!(
+                is_deny(&verdict(&p, "bash", json!({"command":command}))),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_patches_never_gain_automatic_edit_permission() {
+        for mode in [PermissionMode::Edits, PermissionMode::Auto] {
+            for args in [
+                json!({}),
+                json!({"input":"not a patch"}),
+                json!({"input":"*** Begin Patch\n*** End Patch"}),
+            ] {
+                assert!(
+                    is_deny(&verdict(&policy(mode), "apply_patch", args)),
+                    "{mode:?}"
+                );
+            }
         }
     }
 
@@ -1566,6 +2142,11 @@ mod tests {
 
         let p = policy(PermissionMode::Auto);
         assert_eq!(verdict(&p, "bash", shell.clone()), PermissionVerdict::Allow);
+        assert!(is_ask(&verdict(&p, "write", outside.clone())));
+        assert!(is_ask(&verdict(&p, "vector_search", other.clone())));
+
+        let p = policy(PermissionMode::AlwaysApprove);
+        assert_eq!(verdict(&p, "bash", shell), PermissionVerdict::Allow);
         assert_eq!(verdict(&p, "write", outside), PermissionVerdict::Allow);
         assert_eq!(
             verdict(&p, "vector_search", other),
@@ -1585,10 +2166,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(
-            verdict(&p, "bash", json!({"command": "git pull"})),
-            PermissionVerdict::Allow
-        );
+        assert!(is_ask(&verdict(&p, "bash", json!({"command": "git pull"}))));
 
         let mut p = policy(PermissionMode::Ask);
         p.allow
@@ -1748,7 +2326,7 @@ mod tests {
         );
         assert_eq!(
             PermissionMode::parse("full-access"),
-            Some(PermissionMode::Auto)
+            Some(PermissionMode::AlwaysApprove)
         );
         assert_eq!(PermissionMode::parse("nope"), None);
         for mode in PermissionMode::ALL {
@@ -1764,7 +2342,7 @@ mod tests {
         assert_eq!(tool_class("job_output"), ToolClass::Read);
         assert_eq!(tool_class("notebook_edit"), ToolClass::Edit);
         assert_eq!(tool_class("mcp_read"), ToolClass::Read);
-        assert_eq!(tool_class("graph_submit"), ToolClass::Read);
+        assert_eq!(tool_class("graph_submit"), ToolClass::Other);
         assert_eq!(tool_class("retrieve_output"), ToolClass::Read);
         assert_eq!(tool_class("graph_run"), ToolClass::Other);
         assert_eq!(tool_class("mcp__memory__echo"), ToolClass::Other);
@@ -1857,8 +2435,7 @@ mod tests {
 
     #[test]
     fn plan_mode_freezes_mutations_and_keeps_reads() {
-        let mut policy = PermissionPolicy::new(PermissionMode::Auto);
-        policy.plan_mode = true;
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly);
         assert!(matches!(
             policy.decide("c1", "read", &json!({"path": "a.rs"}), &cwd()),
             PermissionVerdict::Allow
@@ -1927,8 +2504,14 @@ mod tests {
         let shared_call = json!({"prompt": "search", "isolation": "shared"});
         assert!(matches!(
             policy.decide("c2", "agent", &shared_call, &root),
-            PermissionVerdict::Allow
+            PermissionVerdict::Ask(_)
         ));
+        policy.mode = PermissionMode::AlwaysApprove;
+        assert_eq!(
+            policy.decide("c3", "agent", &shared_call, &root),
+            PermissionVerdict::Allow
+        );
+        assert!(is_deny(&policy.decide("c4", "agent", &wt_call, &root)));
     }
 
     #[test]
@@ -2186,7 +2769,7 @@ mod tests {
             PermissionVerdict::Deny { .. }
         ));
 
-        let call_sync = json!({"command": "cargo build"});
+        let call_sync = json!({"command": "cargo build --offline"});
         assert_eq!(
             auto_policy.decide("c4", "bash", &call_sync, &root),
             PermissionVerdict::Allow

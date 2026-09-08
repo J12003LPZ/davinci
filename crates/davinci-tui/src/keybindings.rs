@@ -162,7 +162,11 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("app.clear", &["ctrl+c"]),
         ("app.exit", &["ctrl+d"]),
         ("app.suspend", &["ctrl+z"]),
-        ("app.thinking.cycle", &["shift+tab"]),
+        // Intentional native divergence from vendor/davinci/packages/coding-agent/
+        // src/core/keybindings.ts: Shift+Tab cycles permissions, not thinking.
+        // Alt+T already expands tools with voice enabled, so thinking uses Alt+Shift+T.
+        ("app.permissions.cycle", &["shift+tab", "ctrl+tab"]),
+        ("app.thinking.cycle", &["alt+shift+t"]),
         ("app.model.cycleForward", &["ctrl+p"]),
         ("app.model.cycleBackward", &["shift+ctrl+p"]),
         ("app.model.select", &["ctrl+l"]),
@@ -326,6 +330,7 @@ pub fn key_to_bytes(key: &str) -> String {
         "alt+v" => "\x1bv".into(),
         "alt+b" => "\x1bb".into(),
         "alt+t" => "\x1bt".into(),
+        "alt+shift+t" => "\x1b[116;4u".into(),
         "alt+f" => "\x1bf".into(),
         "alt+d" => "\x1bd".into(),
         "alt+y" => "\x1by".into(),
@@ -372,6 +377,10 @@ pub fn sequence_matches_key(data: &str, key: &str) -> bool {
     }
     let parsed = crate::keys::parse_key(key);
     match parsed.name.as_str() {
+        "tab" => {
+            let bits = crate::keys::key_modifier_bits(parsed.ctrl, parsed.alt, parsed.shift);
+            kitty_code_matches(data, 9, bits)
+        }
         "home" if !parsed.ctrl && !parsed.alt && !parsed.shift => {
             matches!(data, "\x1b[H" | "\x1bOH" | "\x1b[1~" | "\x1b[7~")
                 || kitty_matches(data, "home", 0)
@@ -464,7 +473,20 @@ mod tests {
         assert!(Keybindings::defaults().matches("\x16", "app.clipboard.pasteImage"));
         assert!(Keybindings::defaults().matches("\x0c", "app.model.select"));
         assert!(Keybindings::defaults().matches("\x0f", "app.tools.expand"));
-        assert!(Keybindings::defaults().matches("\x1b[Z", "app.thinking.cycle"));
+        assert_eq!(
+            Keybindings::defaults()
+                .keys_for("app.permissions.cycle")
+                .first()
+                .map(|key| key.as_str()),
+            Some("shift+tab")
+        );
+        assert!(Keybindings::defaults().matches("\x1b[Z", "app.permissions.cycle"));
+        assert!(!Keybindings::defaults().matches("\x1b[Z", "app.thinking.cycle"));
+        // Alt+T belongs to tool expansion when voice is enabled.
+        assert!(Keybindings::defaults().matches("\x1b[116;4u", "app.thinking.cycle"));
+        let (voice, notice) = Keybindings::defaults().with_voice(true);
+        assert!(notice.is_none());
+        assert!(!voice.matches("\x1bt", "app.thinking.cycle"));
         assert!(Keybindings::defaults().matches("\x1b[1;5D", "tui.editor.cursorWordLeft"));
         assert!(Keybindings::defaults().matches("\x17", "tui.editor.deleteWordBackward"));
         assert!(Keybindings::defaults().matches("\x7f", "tui.editor.deleteCharBackward"));

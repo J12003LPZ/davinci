@@ -283,6 +283,7 @@ pub fn get_keybindings() -> Vec<Keybinding> {
         "app.model.cycleForward",
         "app.model.cycleBackward",
         "app.tools.expand",
+        "app.permissions.cycle",
         "app.thinking.cycle",
         "app.thinking.toggle",
         "app.editor.external",

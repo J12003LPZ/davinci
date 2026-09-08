@@ -310,7 +310,7 @@ pub fn parse_args(args: &[String]) -> Args {
                 None => result.diagnostics.push(Diagnostic {
                     kind: "error",
                     message: format!(
-                        "{arg} requires one of: read-only, ask, edits, auto{}",
+                        "{arg} requires one of: manual, accept-edits, plan-mode, auto, always-approve{}",
                         if arg == "--sandbox" {
                             " (or read-only, workspace-write, full-access)"
                         } else {
@@ -325,7 +325,7 @@ pub fn parse_args(args: &[String]) -> Args {
                         None => result.diagnostics.push(Diagnostic {
                             kind: "error",
                             message: format!(
-                                "Invalid permission mode \"{value}\". Valid values: read-only, ask, edits, auto"
+                                "Invalid permission mode \"{value}\". Valid values: manual, accept-edits, plan-mode, auto, always-approve"
                             ),
                         }),
                     }
@@ -431,7 +431,7 @@ mod tests {
         );
         assert_eq!(
             args(&["--sandbox", "full-access"]).permission_mode,
-            Some(PermissionMode::Auto)
+            Some(PermissionMode::AlwaysApprove)
         );
         assert_eq!(
             args(&["--sandbox", "workspace-write", "hello"]).messages,

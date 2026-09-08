@@ -39,7 +39,8 @@ Options:
   --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
   --tools, -t <tools>            Comma-separated allowlist of tool names to enable
   --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
-  --permission-mode <mode>       What runs without asking: read-only, ask (default), edits, auto
+  --permission-mode <mode>       manual (default), accept-edits, plan-mode, auto, always-approve
+                                 Legacy aliases ask, edits, and read-only are also accepted.
   --sandbox <preset>             Same flag, Codex names: read-only, workspace-write, full-access (a policy preset, not an OS sandbox)
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
   --extension, -e <path>         Load an extension file (can be used multiple times)
@@ -127,6 +128,22 @@ Examples:
   # Export a session file to HTML
   pi --export ~/.pi/agent/sessions/--path--/session.jsonl
   pi --export session.jsonl output.html
+
+Permission Modes (interactive):
+  Shift+Tab                       Cycle Manual -> Accept Edits -> Plan Mode -> Auto Mode
+                                  -> Always Approve -> Manual (idle composer only)
+  Alt+Shift+T                     Cycle thinking level (where supported)
+  /permissions [mode]             Show the mode picker or select a named mode
+  /plan                           Enter read-only planning
+  /plan show | /plan diff          Inspect the current plan or its latest revision
+  /plan edit <id> <text>           Edit one decision without replacing the whole plan
+  /plan accept <id>               Accept one plan decision; "all" selects all decisions
+  /plan reject <id>               Reject one plan decision; "all" selects all decisions
+  /plan approve                   Approve a fresh, complete plan without changing mode
+  /plan accept [mode]             Approve and select an execution mode
+  /act                            Leave Plan Mode without implicitly approving a plan
+  Always Approve removes harness approval prompts, not explicit denials, filesystem
+  boundaries, OS restrictions, or missing credentials. Auto Mode escalates risk.
 
 Environment Variables:
   ANTHROPIC_AUTH_TOKEN             - Anthropic bearer auth token

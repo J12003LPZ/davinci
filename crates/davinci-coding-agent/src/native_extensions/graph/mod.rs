@@ -282,7 +282,13 @@ impl GraphController {
     fn deps(&self, dry_run: bool, active: &Arc<ActiveRun>) -> (ControllerDeps, Vec<String>) {
         // A malformed graph.json is reported, then ignored: the run proceeds
         // on defaults rather than refusing to start.
-        let loaded = load_config(&self.cwd);
+        // Repository configuration is not explicit user authorization to run
+        // extensions or verification commands. Ignore it until trust is granted.
+        let loaded = if self.project_trusted {
+            load_config(&self.cwd)
+        } else {
+            config::LoadedConfig::default()
+        };
         let sink = Arc::clone(active);
         let deps = ControllerDeps {
             runner: if dry_run {
@@ -686,6 +692,28 @@ mod tests {
     }
 
     #[test]
+    fn security_untrusted_project_config_cannot_authorize_execution() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".davinci")).unwrap();
+        std::fs::write(dir.path().join(".davinci/graph.json"),
+            r#"{"workerExtensions":["./fixture.mjs"],"workerExtraTools":["custom_mutator"],"verifyCommands":[{"name":"fixture","command":"echo fixture"}],"securityVerification":"off"}"#).unwrap();
+        let mut controller = controller(dir.path());
+        let active = Arc::new(ActiveRun::default());
+        let (deps, _) = controller.deps(true, &active);
+        assert!(deps.config.worker_extensions.is_empty());
+        assert!(deps.config.worker_extra_tools.is_empty());
+        assert!(deps.config.verify_commands.is_empty());
+        assert_eq!(
+            deps.config.security_verification,
+            config::GraphConfig::default().security_verification
+        );
+        controller.set_session_context(None, None, true);
+        let (trusted, _) = controller.deps(true, &active);
+        assert_eq!(trusted.config.worker_extensions, vec!["./fixture.mjs"]);
+        assert_eq!(trusted.config.verify_commands.len(), 1);
+    }
+
+    #[test]
     fn a_dry_run_walks_the_whole_pipeline_without_a_model() {
         let _guard = registry_guard();
         let dir = tempdir().unwrap();
@@ -985,7 +1013,9 @@ mod tests {
             r#"{"budgets":{"maxCostUsd":5,"runDeadlineMs":600000}}"#,
         )
         .unwrap();
-        let controller = controller(dir.path());
+        let mut controller = controller(dir.path());
+        // Project overrides are applied only after explicit project trust.
+        controller.set_session_context(None, None, true);
         let run = controller
             .run_to_completion(parse_graph_args("--dry-run budgeted"))
             .expect("runs");

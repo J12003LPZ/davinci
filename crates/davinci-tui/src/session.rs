@@ -63,6 +63,8 @@ pub enum SessionAction {
     CycleModel,
     CycleModelBackward,
     CycleThinking,
+    /// Request a policy change; the host applies the next authoritative mode.
+    CyclePermissionMode,
     ToggleHideThinking,
     ExpandTools,
     NewSession,
@@ -150,6 +152,9 @@ pub struct InteractiveSession {
     pub thinking_levels: Vec<String>,
     pub thinking_index: usize,
     pub aborted: bool,
+    /// The host keeps this true for the entire active turn, independently of
+    /// optional progress indicators and extension-supplied working text.
+    pub running: bool,
     pub width: usize,
     pub overlay_kind: OverlayKind,
     pub double_escape_action: DoubleEscapeAction,
@@ -269,6 +274,7 @@ impl InteractiveSession {
             ],
             thinking_index: 0,
             aborted: false,
+            running: false,
             width: 80,
             overlay_kind: OverlayKind::None,
             double_escape_action: DoubleEscapeAction::Tree,
@@ -1004,6 +1010,21 @@ impl InteractiveSession {
             }
         }
         if !self.overlay_open() {
+            if self.keybindings.matches(data, "app.permissions.cycle") {
+                // ESC[Z has no event metadata and represents a press. Kitty
+                // explicitly reports press=1, repeat=2, release=3: only the
+                // first may request a permission change.
+                let press = data
+                    .strip_suffix('u')
+                    .and_then(|sequence| sequence.split_once(';'))
+                    .and_then(|(_, modifiers)| modifiers.split_once(':'))
+                    .map_or(true, |(_, kind)| kind == "1");
+                return if press && !self.running && self.custom_editor_path.is_none() {
+                    SessionAction::CyclePermissionMode
+                } else {
+                    SessionAction::None
+                };
+            }
             if let Some((key, path)) = self.matching_extension_shortcut(data) {
                 return SessionAction::ExtensionShortcut { key, path };
             }
@@ -1120,6 +1141,13 @@ impl InteractiveSession {
             }
             "\x1b[B" => {
                 self.move_overlay(1);
+                SessionAction::None
+            }
+            other if self.keybindings.matches(other, "tui.input.tab") => self.handle_tab(),
+            // Unclaimed modified Tab is a control event, never draft text.
+            other
+                if crate::keys::parse_kitty_csi_u(other).is_some_and(|(code, _, _)| code == 9) =>
+            {
                 SessionAction::None
             }
             other => self.handle_printable(other),
@@ -1798,6 +1826,39 @@ mod tests {
     use crate::builtin_themes;
 
     #[test]
+    fn legacy_permission_cycle_preserves_draft_and_rejects_busy_or_nonpress_input() {
+        let theme = builtin_themes().into_iter().next().expect("theme");
+        let mut session = InteractiveSession::new(theme, "pi", Vec::new());
+        session.chrome.editor.set_text("café 🦀 draft");
+        session.chrome.editor.move_left();
+        let cursor = session.chrome.editor.cursor;
+        for press in ["\x1b[Z", "\x1b[9;2u", "\x1b[9;2:1u"] {
+            assert_eq!(
+                session.handle_bytes(press),
+                SessionAction::CyclePermissionMode
+            );
+            assert_eq!(session.chrome.editor.get_text(), "café 🦀 draft");
+            assert_eq!(session.chrome.editor.cursor, cursor);
+            assert_eq!(session.current_thinking(), "off");
+        }
+        for ignored in ["\x1b[9;2:2u", "\x1b[9;2:3u", "\x1b[9;6u", "\x1b[9;4u"] {
+            assert_eq!(session.handle_bytes(ignored), SessionAction::None);
+        }
+        session.running = true;
+        assert_eq!(session.handle_bytes("\x1b[Z"), SessionAction::None);
+        session.running = false;
+        session.open_model_overlay();
+        assert_ne!(
+            session.handle_bytes("\x1b[Z"),
+            SessionAction::CyclePermissionMode
+        );
+        session.close_overlays();
+        session.custom_editor_path = Some("fixture:custom-editor".into());
+        assert_eq!(session.handle_bytes("\x1b[Z"), SessionAction::None);
+        assert_eq!(session.chrome.editor.get_text(), "café 🦀 draft");
+    }
+
+    #[test]
     fn enter_leave_match_ts_sequences() {
         let enter = InteractiveSession::enter_sequences(true);
         assert!(enter.contains(ALT_BUFFER_ENTER));
@@ -1917,7 +1978,15 @@ mod tests {
         );
         assert_eq!(session.handle_bytes("\x10"), SessionAction::CycleModel);
         assert_eq!(session.current_model(), Some("anthropic/sonnet"));
-        assert_eq!(session.handle_bytes("\x1b[Z"), SessionAction::CycleThinking);
+        assert_eq!(
+            session.handle_bytes("\x1b[Z"),
+            SessionAction::CyclePermissionMode
+        );
+        assert_eq!(session.current_thinking(), "off");
+        assert_eq!(
+            session.handle_bytes("\x1b[116;4u"),
+            SessionAction::CycleThinking
+        );
         assert_eq!(session.current_thinking(), "minimal");
         assert_eq!(
             session.handle_bytes("\x14"),

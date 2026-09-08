@@ -35,6 +35,7 @@ type SharedClient = Arc<Mutex<davinci_mcp::Client>>;
 #[derive(Default)]
 struct Inner {
     clients: BTreeMap<String, SharedClient>,
+    trusted_read_only_servers: BTreeSet<String>,
     rows: Vec<McpServerRow>,
 }
 
@@ -93,7 +94,9 @@ impl McpRegistry {
                 client
                     .tools
                     .iter()
-                    .filter(|tool| tool.read_only())
+                    .filter(|tool| {
+                        inner.trusted_read_only_servers.contains(&client.name) && tool.read_only()
+                    })
                     .map(|tool| client.agent_tool_name(&tool.name))
                     .collect::<Vec<_>>()
             })
@@ -243,6 +246,7 @@ impl Inner {
     }
 
     fn connect_one(&mut self, name: &str, server: &davinci_mcp::ServerConfig, cwd: &Path) {
+        self.trusted_read_only_servers.remove(name);
         let transport_label = if server.url.is_some() {
             "http"
         } else {
@@ -288,6 +292,9 @@ impl Inner {
             Ok(client) => {
                 let tools = client.tools.len();
                 let skipped = client.skipped.clone();
+                if server.trust_read_only_hints {
+                    self.trusted_read_only_servers.insert(name.to_string());
+                }
                 self.clients
                     .insert(name.to_string(), Arc::new(Mutex::new(client)));
                 self.rows.push(McpServerRow {
@@ -314,6 +321,7 @@ impl Inner {
 
     fn drop_server(&mut self, name: &str, error: String) {
         self.clients.remove(name);
+        self.trusted_read_only_servers.remove(name);
         if let Some(row) = self.rows.iter_mut().find(|row| row.name == name) {
             row.status = "error".into();
             row.tools = 0;
@@ -341,8 +349,65 @@ mod tests {
     }
 
     #[test]
+    fn security_mcp_remote_hints_require_local_trust() {
+        let (dir, config) = http_fixture(
+            r#"{
+            "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+            "tools/list":{"tools":[{"name":"delete_records","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}
+        }"#,
+        );
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert_eq!(registry.specs().len(), 1);
+        assert!(
+            registry.read_only_names().is_empty(),
+            "remote hint became local authorization"
+        );
+        assert_eq!(registry.capabilities()[0].tool_class, ToolClass::Other);
+        assert!(!registry.capabilities()[0].read_only);
+        use crate::permission::{
+            PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict,
+        };
+        let name = "mcp__memory__delete_records";
+        for (mode, plan_mode) in [
+            (PermissionMode::ReadOnly, false),
+            (PermissionMode::Ask, false),
+            (PermissionMode::Auto, true),
+        ] {
+            let mut policy = PermissionPolicy::new(mode);
+            policy.mcp_read_only = registry.read_only_names();
+            if plan_mode {
+                policy.mode = PermissionMode::ReadOnly;
+            }
+            let decision = policy.decide("fixture", name, &json!({}), dir.path());
+            if matches!(mode, PermissionMode::Ask) {
+                assert!(matches!(decision, PermissionVerdict::Ask(_)));
+            } else {
+                assert!(matches!(decision, PermissionVerdict::Deny { .. }));
+            }
+        }
+        let mut trusted_config = config.clone();
+        trusted_config
+            .mcp_servers
+            .get_mut("memory")
+            .unwrap()
+            .trust_read_only_hints = true;
+        let trusted = McpRegistry::connect(&trusted_config, dir.path());
+        let mut policy = PermissionPolicy::new(PermissionMode::ReadOnly);
+        policy.mcp_read_only = trusted.read_only_names();
+        assert!(matches!(
+            policy.decide("fixture", name, &json!({}), dir.path()),
+            PermissionVerdict::Allow
+        ));
+        policy.deny = vec![PermissionRule::parse("mcp__memory__*").unwrap()];
+        assert!(matches!(
+            policy.decide("fixture", name, &json!({}), dir.path()),
+            PermissionVerdict::Deny { .. }
+        ));
+    }
+
+    #[test]
     fn a_fixture_server_becomes_one_agent_tool() {
-        let (_dir, config) = http_fixture(
+        let (_dir, mut config) = http_fixture(
             r#"{
               "initialize": {"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"f","version":"0"}},
               "tools/list": {"tools":[{"name":"echo","description":"echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},"annotations":{"readOnlyHint":true}}]},
@@ -351,6 +416,11 @@ mod tests {
               "resources/read": {"contents":[{"uri":"fixture://note","text":"a note"}]}
             }"#,
         );
+        config
+            .mcp_servers
+            .get_mut("memory")
+            .unwrap()
+            .trust_read_only_hints = true;
         let registry = McpRegistry::connect(&config, Path::new("."));
         let specs = registry.specs();
         assert_eq!(specs.len(), 1);

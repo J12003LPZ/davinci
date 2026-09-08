@@ -374,6 +374,7 @@ pub fn validate_profile_containment(
             davinci_agent::PermissionMode::Ask => 1,
             davinci_agent::PermissionMode::Edits => 2,
             davinci_agent::PermissionMode::Auto => 3,
+            davinci_agent::PermissionMode::AlwaysApprove => 4,
         }
     }
     if mode_rank(profile_mode) > mode_rank(parent_mode) {
@@ -667,5 +668,16 @@ Prompt"#,
             validate_profile_containment(&auto_profile, davinci_agent::PermissionMode::Edits)
                 .unwrap_err();
         assert!(err2.contains("cannot grant profile 'admin' with mode 'Auto'"));
+        let bypass_profile = AgentProfile {
+            permission_mode: "always-approve".into(),
+            ..auto_profile
+        };
+        for parent in davinci_agent::PermissionMode::ALL {
+            assert_eq!(
+                validate_profile_containment(&bypass_profile, parent).is_ok(),
+                parent == davinci_agent::PermissionMode::AlwaysApprove,
+                "parent {parent:?} must not silently escalate a child"
+            );
+        }
     }
 }

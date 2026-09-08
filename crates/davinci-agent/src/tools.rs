@@ -33,6 +33,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "exec_command",
     "write_stdin",
     "update_plan",
+    "propose_plan",
     "tool_search",
 ];
 
@@ -45,6 +46,7 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
     "find",
     "ls",
     "update_plan",
+    "propose_plan",
     "agent",
     "tool_search",
 ];
@@ -56,6 +58,7 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
 pub struct ToolContext {
     pub jobs: Arc<Mutex<JobBook>>,
     pub todos: Arc<Mutex<TodoList>>,
+    pub living_plan: Arc<Mutex<crate::LivingPlan>>,
     pub mcp: crate::mcp::McpRegistry,
     /// The turn's abort flag, when the host gave the agent one. A foreground
     /// shell command or a `job_output` wait stops at the next poll instead
@@ -269,9 +272,14 @@ pub fn tool_specs() -> Vec<AgentTool> {
             parameters: crate::jobs::stdin_parameters(),
         },
         AgentTool {
+            name: "propose_plan".into(),
+            description: "Create or revise the session's structured implementation plan after inspecting repository files. Include source evidence, assumptions, material open decisions, concrete steps, dependencies and validation. Use stable step IDs and expected_revision (initially 0); unspecified steps are retained. This tool never edits implementation files or approves its own output. The user reviews with /plan and approves with /plan approve.".into(),
+            parameters: crate::living_plan::tool_parameters(),
+        },
+        AgentTool {
             name: "update_plan".into(),
-            description: "Adapt and update task plan items (alias for todo ledger).".into(),
-            parameters: crate::todo::tool_parameters(),
+            description: "Track execution progress using plan:[{step,status}] or legacy items:[{text,status}]. This ledger never approves a plan or changes permissions; use propose_plan for evidence-backed implementation decisions.".into(),
+            parameters: update_plan_parameters(),
         },
         AgentTool {
             name: "tool_search".into(),
@@ -325,7 +333,23 @@ pub fn execute_tool_with(
         "find" => find_tool(cwd, input),
         "web_fetch" => crate::web::fetch_tool(input).map_err(ToolError::Failed),
         "web_search" => crate::web::search_tool(input).map_err(ToolError::Failed),
-        "todo" | "update_plan" => todo_tool(input, context),
+        "todo" => todo_tool(input, context),
+        "update_plan" => update_plan_tool(input, context),
+        "propose_plan" => {
+            let mut plan = context.living_plan.lock().unwrap_or_else(|e| e.into_inner());
+            plan.update(input, cwd).map_err(ToolError::Failed)?;
+            *context.todos.lock().unwrap_or_else(|e| e.into_inner()) = TodoList {
+                items: plan.steps.iter().map(|step| crate::TodoItem {
+                    text: format!("[{}] {}", step.id, step.change),
+                    status: crate::TodoStatus::Pending,
+                }).collect(),
+            };
+            Ok(ToolResult {
+                content: plan.render(),
+                is_error: false,
+                details: Some(serde_json::json!({"revision": plan.revision, "changes": plan.changes})),
+            })
+        },
         "tool_search" => tool_search_tool(input, context),
         "job_output" => crate::jobs::output_tool(&context.jobs, input, context.abort.as_deref())
             .map_err(ToolError::Failed),
@@ -449,6 +473,49 @@ fn mcp_call_tool(
         return Err(ToolError::Unknown(name.to_string()));
     };
     context.mcp.call(server, tool, input)
+}
+
+fn update_plan_parameters() -> Value {
+    let mut schema = crate::todo::tool_parameters();
+    schema
+        .as_object_mut()
+        .expect("todo schema is an object")
+        .remove("required");
+    schema["properties"]["plan"] = serde_json::json!({
+        "type":"array", "items":{"type":"object", "properties":{
+            "step":{"type":"string"}, "status":{"type":"string"}
+        }, "required":["step","status"]}
+    });
+    schema["properties"]["explanation"] = serde_json::json!({"type":"string"});
+    schema["anyOf"] = serde_json::json!([{"required":["items"]},{"required":["plan"]}]);
+    schema
+}
+
+fn update_plan_tool(input: &Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    let Some(steps) = input.get("plan") else {
+        return todo_tool(input, context);
+    };
+    if input.get("items").is_some() {
+        return Err(ToolError::Failed(
+            "Use either plan or items, not both.".into(),
+        ));
+    }
+    let steps = steps
+        .as_array()
+        .ok_or_else(|| ToolError::Failed("plan must be an array.".into()))?;
+    let items: Vec<Value> = steps
+        .iter()
+        .map(|step| {
+            let mut item = step.clone();
+            if let Some(text) = step.get("step") {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("text".into(), text.clone());
+                }
+            }
+            item
+        })
+        .collect();
+    todo_tool(&serde_json::json!({"items":items}), context)
 }
 
 /// `todo { items }`: the list is replaced whole and echoed back rendered.

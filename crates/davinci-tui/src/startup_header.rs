@@ -190,6 +190,12 @@ pub fn build_startup_header_with(
         key_hint(
             theme,
             bindings,
+            "app.permissions.cycle",
+            "to cycle permission mode (idle)",
+        ),
+        key_hint(
+            theme,
+            bindings,
             "tui.editor.deleteToLineEnd",
             "to delete to end",
         ),

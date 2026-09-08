@@ -1469,12 +1469,10 @@ pub struct Model {
     pub model_name: String,
     /// Active thinking/reasoning level for the model in hand (`off`, `high`, ...).
     pub thinking_level: String,
-    /// The permission mode in force (`ask`, `edits`, `auto`, `read-only`).
-    /// The header names it only when it is `auto`: the one state that is
-    /// worth a permanent reminder.
+    /// The runtime-confirmed permission mode (`ask`, `edits`, `read-only`,
+    /// `auto`, `always-approve`). This is the sole source for Plan indicators;
+    /// a keyboard request never advances it ahead of the runtime policy.
     pub permission_mode: String,
-    /// `/plan` is on: mutations are frozen until `/act`.
-    pub plan_mode: bool,
     /// Whether tool lines show what they came back with (`ctrl+t`, the
     /// `showToolOutput` setting). Off, a call is one line; on, up to twelve
     /// rows of its output follow it.
@@ -1635,7 +1633,6 @@ impl Model {
             model_name: String::new(),
             thinking_level: "off".into(),
             permission_mode: "ask".into(),
-            plan_mode: false,
             show_tool_output: false,
             jobs_running: 0,
             changes: (0, 0, 0),
@@ -1842,9 +1839,25 @@ impl Model {
         }
     }
 
+    /// Presentation-only label for the canonical ID synchronized by the host.
+    pub fn permission_label(&self) -> &'static str {
+        match self.permission_mode.as_str() {
+            "ask" => "Manual",
+            "edits" => "Accept Edits",
+            "read-only" => "Plan Mode",
+            "auto" => "Auto Mode",
+            "always-approve" => "Always Approve",
+            _ => "Unknown mode",
+        }
+    }
+
+    pub fn is_plan_mode(&self) -> bool {
+        self.permission_mode == "read-only"
+    }
+
     pub fn mode(&self) -> &'static str {
         match self.screen {
-            Screen::Agent | Screen::Recovery | Screen::Diff if self.plan_mode => "plan",
+            Screen::Agent | Screen::Recovery | Screen::Diff if self.is_plan_mode() => "plan",
             Screen::Agent | Screen::Recovery | Screen::Diff => "agent",
             Screen::Plan => "plan",
             Screen::GraphRun => "graph",
@@ -2614,8 +2627,10 @@ mod tests {
         m.toggle_screen(Screen::Mensura);
         assert_eq!(m.mode(), "mensura");
         m.screen = Screen::Agent;
-        m.plan_mode = true;
+        m.permission_mode = "read-only".into();
         assert_eq!(m.mode(), "plan");
+        m.permission_mode = "auto".into();
+        assert_eq!(m.mode(), "agent");
     }
 
     #[test]

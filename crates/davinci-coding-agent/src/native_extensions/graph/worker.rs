@@ -243,7 +243,9 @@ pub fn build_worker_args(
     // writer could not write, and no role could even `graph_submit`. The
     // worker's gate is the graph's own: the per-role `--tools` allowlist and
     // the bash policy in `worker_hooks`, both of which the parent set. Deny
-    // rules from the user's settings still win in `auto`.
+    // rules from the user's settings still win in `always-approve`. This
+    // preserves the previous non-interactive worker policy; Auto Mode now
+    // escalates risky actions instead of silently approving them.
     let mut args = vec![
         "--mode".to_string(),
         "json".to_string(),
@@ -251,9 +253,15 @@ pub fn build_worker_args(
         "--no-session".to_string(),
         "--no-extensions".to_string(),
         "--permission-mode".to_string(),
-        "auto".to_string(),
+        "always-approve".to_string(),
     ];
-    for extension in &spec.extra_extensions {
+    // Explicit -e overrides automatic-extension disabling in the worker CLI.
+    // Only an already trusted project may supply these executable modules.
+    for extension in spec
+        .extra_extensions
+        .iter()
+        .filter(|_| spec.project_trusted)
+    {
         args.push("-e".to_string());
         args.push(extension.clone());
     }
@@ -781,6 +789,7 @@ mod tests {
         spec.thinking_level = None;
         let args = build_worker_args(&spec, Path::new("brief.md"), Path::new("system.md"));
         assert!(!args.iter().any(|arg| arg == "-a"));
+        assert!(!args.iter().any(|arg| arg == "-e"));
         assert!(!args.iter().any(|arg| arg == "--model"));
     }
 

@@ -258,36 +258,34 @@ pub fn has_command_substitution(command: &str) -> bool {
 /// Does not count `2>&1` (stderr to stdout redirection).
 pub fn has_file_redirection(command: &str) -> bool {
     let stripped = command.replace("2>&1", "");
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut prev = '\0';
-    let chars: Vec<char> = stripped.chars().collect();
-    for (i, &ch) in chars.iter().enumerate() {
-        if in_single {
-            if ch == '\'' && prev != '\\' {
-                in_single = false;
+    let mut quote = None;
+    let mut escaped = false;
+    // String slices use byte offsets, not character positions.
+    for (i, ch) in stripped.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else if ch == '\\' && q == '"' {
+                escaped = true;
             }
-        } else if in_double {
-            if ch == '"' && prev != '\\' {
-                in_double = false;
-            }
-        } else {
-            match ch {
-                '\'' => in_single = true,
-                '"' => in_double = true,
-                '>' => {
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '\'' | '"' => quote = Some(ch),
+            '>' => return true,
+            '|' => {
+                let rest = stripped[i + ch.len_utf8()..].trim_start();
+                if rest.starts_with("tee ") || rest.starts_with("tee\t") || rest == "tee" {
                     return true;
                 }
-                '|' => {
-                    let rest = stripped[i + 1..].trim_start();
-                    if rest.starts_with("tee ") || rest.starts_with("tee\t") || rest == "tee" {
-                        return true;
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
-        prev = ch;
     }
     false
 }
@@ -400,6 +398,272 @@ pub fn split_shell_segments(command: &str) -> Vec<String> {
 // Command Analysis and Risk Inspection
 // ----------------------------------------------------------------------------
 
+/// Extract literal words for restricted-policy checks, without evaluating a
+/// shell. Unknown expansions and shell structures fail closed. Dequoting matters:
+/// `-de'lete'` is the same option as `-delete`, not harmless text.
+fn literal_shell_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
+    for ch in command.chars() {
+        if escaped {
+            // Escaping operators differs between Bash and PowerShell. Do not
+            // authorize a command whose structure depends on that difference.
+            if matches!(
+                ch,
+                '\n' | '\r' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '{' | '}' | '$' | '`'
+            ) {
+                return None;
+            }
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else if q == '"' && ch == '\\' {
+                escaped = true;
+            } else if q == '"' && matches!(ch, '$' | '`') {
+                return None;
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                started = true;
+            }
+            '\\' => {
+                escaped = true;
+                started = true;
+            }
+            '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | ';' | '|' | '&' => return None,
+            ch if ch.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            _ => {
+                word.push(ch);
+                started = true;
+            }
+        }
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+/// GNU-style long options may accept unambiguous abbreviations and `=value`.
+fn selects_long_option(arg: &str, option: &str) -> bool {
+    let flag = arg.split('=').next().unwrap_or(arg);
+    flag.starts_with("--") && flag.len() > 2 && option.starts_with(flag)
+}
+
+fn git_is_read_only(words: &[String]) -> bool {
+    let mut args = &words[1..];
+    while let Some(flag) = args.first() {
+        if matches!(flag.as_str(), "-C" | "--git-dir" | "--work-tree") {
+            if args.len() < 2 {
+                return false;
+            }
+            args = &args[2..];
+        } else if matches!(
+            flag.as_str(),
+            "--no-pager" | "--no-optional-locks" | "--bare"
+        ) || flag.starts_with("--git-dir=")
+            || flag.starts_with("--work-tree=")
+            || (flag.starts_with("-C") && flag.len() > 2)
+        {
+            args = &args[1..];
+        } else {
+            break;
+        }
+    }
+    let Some((verb, args)) = args.split_first() else {
+        return false;
+    };
+    if args.iter().any(|arg| {
+        ["--output", "--ext-diff", "--textconv", "--show-signature"]
+            .iter()
+            .any(|option| selects_long_option(arg, option))
+    }) {
+        return false;
+    }
+    match verb.as_str() {
+        "status" | "log" | "diff" | "show" | "blame" | "ls-files" | "ls-tree" | "rev-parse"
+        | "describe" | "shortlog" => true,
+        // A branch or remote name is a mutation operand, not a read operation.
+        "branch" => args.iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "--list"
+                    | "-a"
+                    | "--all"
+                    | "-r"
+                    | "--remotes"
+                    | "-v"
+                    | "-vv"
+                    | "--verbose"
+                    | "--show-current"
+                    | "--no-color"
+            ) || (args.iter().any(|value| value == "--list") && !arg.starts_with('-'))
+        }),
+        "remote" => args
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-v" | "--verbose")),
+        // In particular, reject aliases and global configuration overrides:
+        // either can run commands even when the displayed verb looks harmless.
+        _ => false,
+    }
+}
+
+fn read_arguments_are_safe(segment: &str) -> bool {
+    let Some(words) = literal_shell_words(&segment.replace("2>&1", "")) else {
+        return false;
+    };
+    let args = &words[1..];
+    match words[0].to_ascii_lowercase().as_str() {
+        "git" | "git.exe" => git_is_read_only(&words),
+        // These are interpreters (sed's `w`/`e`, awk's system()/output), not
+        // inherently read-only commands. Use the native read/grep tools instead.
+        "sed" | "awk" => false,
+        "find" => args.iter().all(|arg| {
+            !arg.starts_with('-')
+                || matches!(
+                    arg.as_str(),
+                    "-H" | "-L"
+                        | "-P"
+                        | "-name"
+                        | "-iname"
+                        | "-path"
+                        | "-ipath"
+                        | "-type"
+                        | "-maxdepth"
+                        | "-mindepth"
+                        | "-print"
+                        | "-print0"
+                        | "-size"
+                        | "-mtime"
+                        | "-mmin"
+                        | "-empty"
+                        | "-not"
+                        | "-a"
+                        | "-o"
+                )
+        }),
+        "fd" => !args.iter().any(|arg| {
+            selects_long_option(arg, "--exec")
+                || selects_long_option(arg, "--exec-batch")
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains(['x', 'X']))
+        }),
+        "rg" => !args.iter().any(|arg| {
+            selects_long_option(arg, "--pre") || selects_long_option(arg, "--hostname-bin")
+        }),
+        "sort" | "tree" => !args.iter().any(|arg| {
+            selects_long_option(arg, "--output")
+                || selects_long_option(arg, "--compress-program")
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('o'))
+                || arg.to_ascii_lowercase().starts_with("/o")
+        }),
+        "uniq" => {
+            let mut operands = 0;
+            let mut options = true;
+            args.iter().all(|arg| {
+                if options && arg == "--" {
+                    options = false;
+                    return true;
+                }
+                if options && arg.starts_with('-') && arg != "-" {
+                    matches!(
+                        arg.as_str(),
+                        "-c" | "-d"
+                            | "-u"
+                            | "-i"
+                            | "-z"
+                            | "--count"
+                            | "--repeated"
+                            | "--unique"
+                            | "--ignore-case"
+                            | "--zero-terminated"
+                            | "--help"
+                            | "--version"
+                    )
+                } else {
+                    operands += 1;
+                    operands <= 1
+                }
+            })
+        }
+        "node" | "rustc" => args.len() == 1 && args[0] == "--version",
+        "cat" | "head" | "tail" | "grep" | "ls" | "dir" | "pwd" | "echo" | "wc" | "diff"
+        | "stat" | "which" | "where" | "where.exe" | "type" | "jq" | "cargo" | "npm"
+        | "get-content" | "get-childitem" | "get-item" | "get-location" | "get-process"
+        | "get-command" | "select-string" => true,
+        _ => false,
+    }
+}
+
+fn test_arguments_are_safe(segment: &str) -> bool {
+    let Some(words) = literal_shell_words(&segment.replace("2>&1", "")) else {
+        return false;
+    };
+    match words[0].as_str() {
+        "python" | "python3" => {
+            words.get(1).map(String::as_str) == Some("-m")
+                && matches!(
+                    words.get(2).map(String::as_str),
+                    Some("pytest" | "unittest")
+                )
+        }
+        "node" => {
+            let args = &words[1..];
+            let Some(first) = args.first() else {
+                return false;
+            };
+            if first == "--test" {
+                // Node options are accepted only from the test-runner subset;
+                // eval, print, preload, loaders and configuration injection are not tests.
+                args[1..].iter().all(|arg| {
+                    !arg.starts_with('-')
+                        || matches!(
+                            arg.as_str(),
+                            "--test" | "--test-only" | "--test-todo" | "--test-force-exit"
+                        )
+                        || [
+                            "--test-name-pattern=",
+                            "--test-skip-pattern=",
+                            "--test-concurrency=",
+                            "--test-timeout=",
+                        ]
+                        .iter()
+                        .any(|prefix| arg.starts_with(prefix))
+                })
+            } else {
+                // The script operand itself must be the runner. A runner-like
+                // trailing argument must never authorize `node -e ...`.
+                let script = first.replace('\\', "/");
+                !script.starts_with('-')
+                    && (script == "vitest/dist/cli.js" || script.ends_with("/vitest/dist/cli.js"))
+            }
+        }
+        "npx" | "vitest" | "jest" | "mocha" | "playwright" | "tsc" | "tsgo" | "eslint"
+        | "biome" | "npm" | "yarn" | "pnpm" | "pytest" | "cargo" | "go" | "dotnet" | "make"
+        | "./test.sh" => true,
+        _ => false,
+    }
+}
+
 /// Performs comprehensive inspection of a shell command string.
 pub fn analyze_command(command: &str) -> ShellAnalysisReport {
     let trimmed = command.trim();
@@ -461,7 +725,18 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
                 format!("matches package modification pattern in segment `{segment}`"),
             ));
         }
-        if git_mutation_regex().is_match(segment) {
+        let unsafe_git = literal_shell_words(&without_stderr_join).is_some_and(|words| {
+            matches!(
+                words[0]
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "git" | "git.exe"
+            ) && !git_is_read_only(&words)
+        });
+        if git_mutation_regex().is_match(segment) || unsafe_git {
             risks.push((
                 ShellRiskCategory::GitMutation,
                 format!("matches git state mutation pattern in segment `{segment}`"),
@@ -475,7 +750,9 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
         && !has_substitution
         && !has_nested_shell
         && segments.iter().all(|s| {
-            read_regex().is_match(s) && !destructive_regex().is_match(&s.replace("2>&1", ""))
+            read_regex().is_match(s)
+                && read_arguments_are_safe(s)
+                && !destructive_regex().is_match(&s.replace("2>&1", ""))
         });
 
     let is_test = !segments.is_empty()
@@ -483,7 +760,8 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
         && !has_substitution
         && !has_nested_shell
         && segments.iter().all(|s| {
-            (read_regex().is_match(s) || test_regex().is_match(s))
+            ((read_regex().is_match(s) && read_arguments_are_safe(s))
+                || (test_regex().is_match(s) && test_arguments_are_safe(s)))
                 && !destructive_regex().is_match(&s.replace("2>&1", ""))
         });
 
@@ -627,6 +905,140 @@ mod tests {
         assert!(has_file_redirection("echo data | tee out.txt"));
         assert!(!has_file_redirection("cargo test 2>&1"));
         assert!(!has_file_redirection("echo hello"));
+    }
+
+    #[test]
+    fn security_unicode_pipeline_does_not_panic() {
+        for text in ["🙂", "é", "界", "🙂🙂", "résumé 日本語"] {
+            assert!(!has_file_redirection(&format!("echo {text} | cat")));
+            assert!(has_file_redirection(&format!("echo {text} | tee out.txt")));
+        }
+    }
+
+    #[test]
+    fn security_redirection_after_literal_backslash_is_detected() {
+        for command in [r"echo '\' > out.txt", r#"echo "\\" > out.txt"#] {
+            assert!(
+                has_file_redirection(command),
+                "missed redirection: {command}"
+            );
+            assert!(matches!(
+                evaluate(ShellPolicyProfile::ReadOnly, command),
+                ShellCommandDecision::Denied { .. }
+            ));
+        }
+        assert!(!has_file_redirection(r#"echo "literal > text""#));
+        assert!(!has_file_redirection(r"echo \>"));
+    }
+
+    #[test]
+    fn security_read_only_rejects_side_effects_in_inspection_commands() {
+        for command in [
+            "find . -delete",
+            "find . -de'lete'",
+            "fd -x python helper.py",
+            "rg --pre helper.py needle",
+            "sort --output=out.txt input.txt",
+            "uniq input.txt out.txt",
+            r#"awk 'BEGIN {system("python helper.py")}'"#,
+            "sed -n 'w out.txt' input.txt",
+            "git branch audit-branch",
+            "git remote remove origin",
+        ] {
+            for profile in [
+                ShellPolicyProfile::ReadOnly,
+                ShellPolicyProfile::ReadAndTest,
+            ] {
+                assert!(
+                    matches!(
+                        evaluate(profile, command),
+                        ShellCommandDecision::Denied { .. }
+                    ),
+                    "{profile:?} unexpectedly allowed {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn security_test_profile_rejects_arbitrary_python() {
+        for command in [
+            r#"python -c "open('audit.txt', 'w').close()""#,
+            "python helper.py",
+            "python3 -m http.server",
+        ] {
+            assert!(
+                matches!(
+                    evaluate(ShellPolicyProfile::ReadAndTest, command),
+                    ShellCommandDecision::Denied { .. }
+                ),
+                "unexpectedly allowed {command}"
+            );
+        }
+        for command in ["python -m pytest tests/", "python3 -m unittest discover"] {
+            assert_eq!(
+                evaluate(ShellPolicyProfile::ReadAndTest, command),
+                ShellCommandDecision::Allowed
+            );
+        }
+    }
+
+    #[test]
+    fn security_writer_rejects_git_reference_and_config_mutations() {
+        for command in [
+            "git branch audit-branch",
+            "git branch -D audit-branch",
+            "git remote remove origin",
+            "git update-ref refs/heads/audit HEAD",
+            "git config core.hooksPath hooks",
+        ] {
+            assert!(
+                matches!(
+                    evaluate(ShellPolicyProfile::WriteNoGitMutation, command),
+                    ShellCommandDecision::Denied { .. }
+                ),
+                "unexpectedly allowed {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_node_runner_arguments_are_not_eval_permission() {
+        for command in [
+            r#"node -e "require('fs').writeFileSync('audit.txt','x')" vitest/dist/cli.js"#,
+            "node --eval=anything vitest/dist/cli.js",
+            "node --print=anything vitest/dist/cli.js",
+            "node --require helper.js --test",
+        ] {
+            assert!(
+                matches!(
+                    evaluate(ShellPolicyProfile::ReadAndTest, command),
+                    ShellCommandDecision::Denied { .. }
+                ),
+                "unexpectedly allowed {command}"
+            );
+        }
+        for command in [
+            "node --test",
+            "node --test tests/example.test.js",
+            "node node_modules/vitest/dist/cli.js run",
+        ] {
+            assert_eq!(
+                evaluate(ShellPolicyProfile::ReadAndTest, command),
+                ShellCommandDecision::Allowed
+            );
+        }
+    }
+
+    #[test]
+    fn security_writer_recognizes_absolute_git_executable() {
+        assert!(matches!(
+            evaluate(
+                ShellPolicyProfile::WriteNoGitMutation,
+                "/usr/bin/git branch audit-branch"
+            ),
+            ShellCommandDecision::Denied { .. }
+        ));
     }
 
     #[test]

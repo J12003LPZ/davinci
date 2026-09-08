@@ -34,7 +34,7 @@ struct StderrTail {
 
 pub struct StdioTransport {
     stdin: ChildStdin,
-    lines: Receiver<String>,
+    lines: Receiver<std::io::Result<String>>,
     stderr: Arc<(Mutex<StderrTail>, Condvar)>,
     next_id: u64,
     call_timeout: Duration,
@@ -101,11 +101,18 @@ impl StdioTransport {
                     .closed = true
             }
         }
-        let (sender, lines) = mpsc::channel();
+        let (sender, lines) = stdout_channel();
         std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let line = match read_stdout_line(&mut reader, MAX_STDOUT_LINE_BYTES) {
+                    Ok(Some(line)) => Ok(line),
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                };
                 if sender.send(line).is_err() {
                     break;
                 }
@@ -186,7 +193,10 @@ impl StdioTransport {
                 return Err(self.transport_error(&timeout_message(self.call_timeout)));
             }
             let line = match self.lines.recv_timeout(deadline - now) {
-                Ok(line) => line,
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => {
+                    return Err(self.transport_error(&format!("mcp stdout: {error}")));
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(self.transport_error(&timeout_message(self.call_timeout)));
                 }
@@ -234,6 +244,44 @@ impl StdioTransport {
             "error": { "code": -32601, "message": "method not supported" }
         }))
     }
+}
+
+const MAX_STDOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+const MAX_QUEUED_STDOUT_LINES: usize = 4;
+type StdoutLine = std::io::Result<String>;
+
+fn stdout_channel() -> (mpsc::SyncSender<StdoutLine>, Receiver<StdoutLine>) {
+    // Each entry is separately bounded. Slow or idle consumers exert backpressure
+    // rather than accumulating unlimited notifications. Dropping the receiver
+    // wakes a sender blocked on a full queue, so teardown needs no reader join.
+    mpsc::sync_channel(MAX_QUEUED_STDOUT_LINES)
+}
+
+fn read_stdout_line(reader: &mut impl BufRead, limit: usize) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    if reader
+        .take(limit.saturating_add(1) as u64)
+        .read_until(b'\n', &mut bytes)?
+        == 0
+    {
+        return Ok(None);
+    }
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("MCP stdout line exceeds {limit} bytes"),
+        ));
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 fn timeout_message(timeout: Duration) -> String {
@@ -314,6 +362,50 @@ pub fn resolve_command_in(command: &str, dirs: &[PathBuf], exts: &[String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_stdout_line_is_bounded_before_buffering() {
+        for terminated in [false, true] {
+            let mut input = vec![b'x'; 1024];
+            if terminated {
+                input.push(b'\n');
+            }
+            let mut reader = std::io::Cursor::new(input);
+            assert!(read_stdout_line(&mut reader, 64).is_err());
+            assert!(reader.position() <= 65, "read beyond the line limit");
+        }
+        let mut reader = std::io::Cursor::new("é\r\nnext\nlast");
+        assert_eq!(read_stdout_line(&mut reader, 4).unwrap(), Some("é".into()));
+        assert_eq!(
+            read_stdout_line(&mut reader, 5).unwrap(),
+            Some("next".into())
+        );
+        assert_eq!(
+            read_stdout_line(&mut reader, 4).unwrap(),
+            Some("last".into())
+        );
+        assert_eq!(read_stdout_line(&mut reader, 4).unwrap(), None);
+    }
+
+    #[test]
+    fn security_stdout_queue_is_bounded_and_drop_unblocks_sender() {
+        let (sender, receiver) = stdout_channel();
+        for _ in 0..MAX_QUEUED_STDOUT_LINES {
+            sender.try_send(Ok("notification".repeat(4))).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(Ok("overflow".into())),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        let (done_sender, done_receiver) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let failed = sender.send(Ok("pending".into())).is_err();
+            let _ = done_sender.send(failed);
+        });
+        drop(receiver);
+        assert!(done_receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        handle.join().unwrap();
+    }
 
     #[test]
     fn a_bare_command_resolves_through_pathext_in_order() {

@@ -599,9 +599,13 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
                     match app::handle_key(model, key) {
                         Flow::Quit => break,
                         Flow::Submit(text) => on_submit(model, text),
-                        // The fixture runner has no agent to act on a
-                        // choice; the live shell in `davinci_session` does.
-                        Flow::Choose(_) | Flow::Continue | Flow::Interrupt => {}
+                        // The fixture runner has no agent to confirm a mode
+                        // change or choice. Never advance UI permission state
+                        // without the live host's authoritative policy update.
+                        Flow::CyclePermissionMode
+                        | Flow::Choose(_)
+                        | Flow::Continue
+                        | Flow::Interrupt => {}
                     }
                 }
                 Event::Resize(width, height) => {

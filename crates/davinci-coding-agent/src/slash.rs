@@ -69,6 +69,21 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("mcp", "Connected MCP servers, tools and errors", None),
         ("cost", "Tokens and USD spent this session", None),
         ("status", "Model, permission, jobs, MCP, tokens", None),
+        (
+            "permissions",
+            "Choose Manual, Accept Edits, Plan Mode, Auto Mode, or Always Approve",
+            Some("[mode]"),
+        ),
+        (
+            "plan",
+            "Read-only planning with revisions, edits, and explicit execution handoff",
+            Some("[show|diff|edit <id> <text>|reject|accept [mode]]"),
+        ),
+        (
+            "act",
+            "Leave Plan Mode without implicitly approving a plan",
+            None,
+        ),
         ("agents", "List custom agent profiles and status", None),
         ("help", "Show all commands and shortcuts", None),
         ("quit", "Quit pi", None),
@@ -299,14 +314,7 @@ mod tests {
 
     #[test]
     fn retired_commands_are_not_registered_or_dispatched() {
-        let retired = [
-            "plan",
-            "act",
-            "llama",
-            "trust",
-            "changelog",
-            "scoped-models",
-        ];
+        let retired = ["llama", "trust", "changelog", "scoped-models"];
         let names = builtin_slash_commands()
             .into_iter()
             .map(|command| command.name)
@@ -315,6 +323,23 @@ mod tests {
         for name in retired {
             assert!(!names.iter().any(|candidate| candidate == name));
             let input = format!("/{name}");
+            assert_eq!(parse_line(&input), SlashAction::Prompt(input));
+        }
+    }
+
+    #[test]
+    fn permission_and_plan_commands_are_advertised_for_host_owned_dispatch() {
+        let commands = builtin_slash_commands();
+        for name in ["permissions", "plan", "act"] {
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.name == name)
+                    .count(),
+                1
+            );
+            let input = format!("/{name}");
+            // Stateful commands are intercepted by the host, not this pure parser.
             assert_eq!(parse_line(&input), SlashAction::Prompt(input));
         }
     }

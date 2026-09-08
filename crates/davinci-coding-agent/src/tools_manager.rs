@@ -488,11 +488,29 @@ pub fn ensure_tool(tool: ManagedTool) -> (Option<String>, Vec<ToolStatus>) {
 }
 
 pub fn ensure_tool_in(bin_dir: &Path, tool: ManagedTool) -> (Option<String>, Vec<ToolStatus>) {
+    ensure_tool_with_context(
+        bin_dir,
+        tool,
+        get_tool_path_in(bin_dir, tool),
+        fixture_reply(tool),
+        is_offline_mode_enabled(),
+    )
+}
+
+// Keep process discovery and environment reads at the boundary. Tests can
+// exercise missing-tool handling without clearing PATH for concurrent tests.
+fn ensure_tool_with_context(
+    bin_dir: &Path,
+    tool: ManagedTool,
+    existing: Option<String>,
+    reply: Option<String>,
+    offline: bool,
+) -> (Option<String>, Vec<ToolStatus>) {
     let mut statuses = Vec::new();
-    if let Some(existing) = get_tool_path_in(bin_dir, tool) {
+    if let Some(existing) = existing {
         return (Some(existing), statuses);
     }
-    if let Some(reply) = fixture_reply(tool) {
+    if let Some(reply) = reply {
         if reply == "offline" || reply.eq_ignore_ascii_case("skip") {
             statuses.push(ToolStatus {
                 kind: ToolStatusKind::Warning,
@@ -535,7 +553,7 @@ pub fn ensure_tool_in(bin_dir: &Path, tool: ManagedTool) -> (Option<String>, Vec
             }
         }
     }
-    if is_offline_mode_enabled() {
+    if offline {
         statuses.push(ToolStatus {
             kind: ToolStatusKind::Warning,
             message: format!(
@@ -594,15 +612,7 @@ pub fn ensure_managed_tools() -> Vec<ToolStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::tempdir;
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-    }
 
     #[test]
     fn asset_names_match_ts_get_asset_name() {
@@ -645,30 +655,11 @@ mod tests {
         assert_eq!(path_with_tools_bin(Some(&already), &bin), already);
     }
 
-    fn isolate_path() -> Option<String> {
-        let previous = std::env::var("PATH").ok();
-        std::env::set_var("PATH", "");
-        previous
-    }
-
-    fn restore_path(previous: Option<String>) {
-        match previous {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
-    }
-
     #[test]
     fn offline_ensure_reports_ts_warning_without_download() {
-        let _guard = env_lock();
         let dir = tempdir().unwrap();
-        let previous_path = isolate_path();
-        std::env::set_var("PI_OFFLINE", "1");
-        std::env::remove_var("PI_ENSURE_TOOL_REPLY");
-        std::env::remove_var("PI_ENSURE_TOOL_FD_REPLY");
-        let (result, statuses) = ensure_tool_in(dir.path(), ManagedTool::Fd);
-        std::env::remove_var("PI_OFFLINE");
-        restore_path(previous_path);
+        let (result, statuses) =
+            ensure_tool_with_context(dir.path(), ManagedTool::Fd, None, None, true);
         assert!(result.is_none());
         assert_eq!(
             statuses,
@@ -681,16 +672,16 @@ mod tests {
 
     #[test]
     fn fixture_installs_binary_into_bin_dir() {
-        let _guard = env_lock();
         let dir = tempdir().unwrap();
         let src = dir.path().join("fake-fd");
         fs::write(&src, "#!/bin/sh\necho fd\n").unwrap();
-        let previous_path = isolate_path();
-        std::env::remove_var("PI_OFFLINE");
-        std::env::set_var("PI_ENSURE_TOOL_FD_REPLY", src.to_string_lossy().as_ref());
-        let (installed, statuses) = ensure_tool_in(dir.path(), ManagedTool::Fd);
-        std::env::remove_var("PI_ENSURE_TOOL_FD_REPLY");
-        restore_path(previous_path);
+        let (installed, statuses) = ensure_tool_with_context(
+            dir.path(),
+            ManagedTool::Fd,
+            None,
+            Some(src.to_string_lossy().into_owned()),
+            true,
+        );
         let dest = dir.path().join(binary_file_name(ManagedTool::Fd));
         assert_eq!(installed.as_deref(), Some(dest.to_string_lossy().as_ref()));
         assert!(dest.is_file());

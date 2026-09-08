@@ -1364,6 +1364,7 @@ const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS: &[&str] = &[
     "app.exit",
     "app.suspend",
     "app.thinking.cycle",
+    "app.permissions.cycle",
     "app.model.cycleForward",
     "app.model.cycleBackward",
     "app.model.select",

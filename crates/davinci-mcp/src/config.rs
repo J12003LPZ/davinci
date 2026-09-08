@@ -26,6 +26,10 @@ pub struct ServerConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Explicit local attestation that this server's read-only annotations may
+    /// authorize tools. Discovery and project trust do not imply this opt-in.
+    #[serde(default, rename = "trustReadOnlyHints")]
+    pub trust_read_only_hints: bool,
 }
 
 impl ServerConfig {

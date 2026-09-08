@@ -272,9 +272,9 @@ impl Agent {
                 } else {
                     let cwd = self.cwd.clone();
                     let messages = self.execute_tool_batch(&cwd, tool_calls, &mut events);
-                    for result in messages {
+                    for mut result in messages {
                         let name = result.tool_name.clone().unwrap_or_default();
-                        self.after_tool(&name, &result);
+                        self.after_tool(&name, &mut result);
                         self.messages.push(result.clone());
                         self.persist_chat(&result);
                         new_messages.push(result.clone());
@@ -372,10 +372,12 @@ impl Agent {
 
     /// What a finished tool owes the session beyond its result: the `todo`
     /// ledger is written after every change so a resume finds it.
-    fn after_tool(&mut self, name: &str, result: &ChatMessage) {
-        if name == "todo" && result.is_error != Some(true) {
+    fn after_tool(&mut self, name: &str, result: &mut ChatMessage) {
+        if matches!(name, "todo" | "update_plan") && result.is_error != Some(true) {
             self.persist_todos();
         }
+        // Structured plans were already persisted transactionally in
+        // execute_plan_batch, before the first success event was emitted.
     }
 
     fn inject_queued(
@@ -560,6 +562,9 @@ impl Agent {
         tool_calls: Vec<(String, String, Value)>,
         events: &mut Vec<AgentEvent>,
     ) -> Vec<ChatMessage> {
+        if tool_calls.iter().any(|(_, name, _)| name == "propose_plan") {
+            return self.execute_plan_batch(cwd, tool_calls, events);
+        }
         let width = tool_calls.len();
         self.stats.note_batch(width);
         let started_at = std::time::Instant::now();
@@ -641,6 +646,130 @@ impl Agent {
         messages
     }
 
+    /// Plan updates are session transactions; this mixed batch is serialized
+    /// so persistence finishes before live success. Other batches stay parallel.
+    fn execute_plan_batch(
+        &mut self,
+        cwd: &Path,
+        calls: Vec<(String, String, Value)>,
+        events: &mut Vec<AgentEvent>,
+    ) -> Vec<ChatMessage> {
+        let width = calls.len();
+        self.stats.note_batch(width);
+        let started = std::time::Instant::now();
+        let mut messages = Vec::with_capacity(width);
+        for (id, name, args) in calls {
+            if self.abort_requested() {
+                break;
+            }
+            let preparation = self.prepare_tool_call(cwd, &id, &name, &args, 0);
+            self.push_event(
+                events,
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: id.clone(),
+                    tool_name: name.clone(),
+                    args: args.clone(),
+                },
+            );
+            let before = (name == "propose_plan").then(|| {
+                self.tool_context
+                    .living_plan
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            });
+            let mut result = match preparation {
+                Preparation::Immediate(result) => result,
+                Preparation::Wait { call_id, .. } => self.wait_for_tool_call(&call_id),
+                Preparation::Ready { .. } => self.run_prepared_call(cwd, &id, &name, &args, 0),
+            };
+            let replayed = result
+                .details
+                .as_ref()
+                .and_then(|d| d.get("replayed_from_ledger"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let plan_call = before.is_some();
+            if let Some(mut before) = before {
+                let executed = !result.is_error && !replayed;
+                let execution_failed = result.is_error;
+                // Validation/output middleware must run before the session
+                // commit, exactly once, and cannot revive a denied execution.
+                if let Some(hook) = &self.post_tool {
+                    result = (hook.0)(&id, cwd, &name, &args, result);
+                }
+                result.is_error |= execution_failed;
+                if executed && result.is_error {
+                    before.approved_revision = None;
+                    *self
+                        .tool_context
+                        .living_plan
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = before.clone();
+                    self.sync_plan_todos();
+                    self.set_permission_mode(crate::PermissionMode::ReadOnly);
+                }
+                if executed && !result.is_error {
+                    match self.persist_plan() {
+                        Ok(()) => {
+                            let revision = self
+                                .tool_context
+                                .living_plan
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .revision;
+                            if before.revision != revision {
+                                self.previous_plan_revision = Some(before);
+                            }
+                            self.sync_plan_todos();
+                        }
+                        Err(error) => {
+                            before.approved_revision = None;
+                            *self
+                                .tool_context
+                                .living_plan
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = before;
+                            self.sync_plan_todos();
+                            self.set_permission_mode(crate::PermissionMode::ReadOnly);
+                            result = crate::ToolResult {
+                                content: error,
+                                is_error: true,
+                                details: Some(serde_json::json!({"plan_storage_error":true})),
+                            };
+                        }
+                    }
+                }
+                // Only amend a real execution's transaction failure. A
+                // rejected duplicate must not overwrite the original record.
+                if executed && result.is_error {
+                    self.tool_ledger
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_failure(&id, &result.content);
+                }
+            }
+            let (message, local_events) = if plan_call {
+                self.emit_tool_result(&id, &name, &args, result)
+            } else {
+                self.finalize_tool_call(cwd, &id, &name, &args, result)
+            };
+            events.extend(local_events);
+            messages.push(message);
+        }
+        self.stats.tool_wall_ms += started.elapsed().as_millis() as u64;
+        if let Some(runtime) = &self.runtime {
+            runtime.emit_observe(crate::runtime::RuntimeEvent::PostToolBatch {
+                calls: width,
+                failures: messages
+                    .iter()
+                    .filter(|m| m.is_error.unwrap_or(false))
+                    .count(),
+            });
+        }
+        messages
+    }
+
     pub(crate) fn wait_for_tool_call(&self, call_id: &str) -> crate::ToolResult {
         match crate::tool_ledger::ToolCallLedger::wait_for_terminal(
             &self.tool_ledger,
@@ -677,7 +806,7 @@ impl Agent {
                 details: denied.then(|| serde_json::json!({ "denied": true })),
             })
         };
-        if depth > 0 && matches!(name, "batch" | "agent") {
+        if depth > 0 && matches!(name, "batch" | "agent" | "propose_plan") {
             return immediate(
                 format!("`{name}` cannot run inside a batch; call it directly."),
                 false,
@@ -815,7 +944,7 @@ impl Agent {
                 .as_ref()
                 .map(|t| t.as_atomic_bool())
                 .or_else(|| self.abort_signal.clone());
-            let permission_mode = self.permissions.lock().ok().map(|p| p.mode);
+            let permission_mode = Some(self.permission_mode());
             let parent_agent_id = self.runtime.as_ref().map(|rt| rt.agent_id);
             let worktree_manager = self
                 .runtime
@@ -902,10 +1031,29 @@ impl Agent {
         args: &Value,
         mut result: crate::ToolResult,
     ) -> (ChatMessage, Vec<AgentEvent>) {
-        let mut events = Vec::new();
-        if let Some(hook) = &self.post_tool {
-            result = (hook.0)(id, cwd, name, args, result);
+        let storage_failure = result
+            .details
+            .as_ref()
+            .and_then(|d| d.get("plan_storage_error"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !storage_failure {
+            if let Some(hook) = &self.post_tool {
+                result = (hook.0)(id, cwd, name, args, result);
+            }
         }
+        self.emit_tool_result(id, name, args, result)
+    }
+
+    /// Emit a final result after hooks and any transactional persistence.
+    fn emit_tool_result(
+        &self,
+        id: &str,
+        name: &str,
+        args: &Value,
+        result: crate::ToolResult,
+    ) -> (ChatMessage, Vec<AgentEvent>) {
+        let mut events = Vec::new();
         let mut details = result.details.clone();
         for partial in crate::ToolResult::take_updates(&mut details) {
             let event = AgentEvent::ToolExecutionUpdate {

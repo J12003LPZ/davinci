@@ -414,13 +414,14 @@ impl<'a> CborReader<'a> {
             }
             1 => {
                 let argument = self.read_argument(additional)?;
-                let value = -1 - (argument as i64);
-                if !(-9007199254740991..=9007199254740991).contains(&value) {
+                // Validate while still unsigned: casting first can wrap an
+                // oversized negative CBOR argument into an accepted positive value.
+                if argument > 9007199254740990 {
                     return Err(CborError::new(
                         "Decoded CBOR integer is outside the safe range",
                     ));
                 }
-                Ok(CborValue::Integer(value))
+                Ok(CborValue::Integer(-1 - argument as i64))
             }
             2 => {
                 let length =
@@ -439,22 +440,38 @@ impl<'a> CborReader<'a> {
             4 => {
                 let length =
                     self.read_length(additional, "array", self.options.max_container_length)?;
-                let mut items = Vec::with_capacity(length);
+                // Allocate only for successfully decoded values, never for an
+                // untrusted advertised capacity (including in nested arrays).
+                let mut items = Vec::new();
                 for _ in 0..length {
-                    items.push(self.read_item(depth + 1)?);
+                    let item = self.read_item(depth + 1)?;
+                    items
+                        .try_reserve(1)
+                        .map_err(|_| CborError::new("CBOR array allocation failed"))?;
+                    items.push(item);
                 }
                 Ok(CborValue::Array(items))
             }
             5 => {
                 let length =
                     self.read_length(additional, "map", self.options.max_container_length)?;
-                let mut map = Vec::with_capacity(length);
+                let mut map = Vec::new();
+                let mut keys = std::collections::HashSet::new();
                 for _ in 0..length {
                     let key = match self.read_item(depth + 1)? {
                         CborValue::Text(key) => key,
                         _ => return Err(CborError::new("CBOR map keys must be strings")),
                     };
-                    map.push((key, self.read_item(depth + 1)?));
+                    if keys.contains(&key) {
+                        return Err(CborError::new("CBOR map contains a duplicate key"));
+                    }
+                    let value = self.read_item(depth + 1)?;
+                    map.try_reserve(1)
+                        .map_err(|_| CborError::new("CBOR map allocation failed"))?;
+                    keys.try_reserve(1)
+                        .map_err(|_| CborError::new("CBOR map allocation failed"))?;
+                    keys.insert(key.clone());
+                    map.push((key, value));
                 }
                 Ok(CborValue::Map(map))
             }
@@ -470,6 +487,11 @@ impl<'a> CborReader<'a> {
                     ]);
                     if !value.is_finite() {
                         return Err(CborError::new("CBOR numbers must be finite"));
+                    }
+                    if value.fract() == 0.0 && value.abs() > 9007199254740991.0 {
+                        return Err(CborError::new(
+                            "Decoded CBOR integer is outside the safe range",
+                        ));
                     }
                     Ok(CborValue::Float(value))
                 }
@@ -503,6 +525,109 @@ pub fn decode_cbor(bytes: &[u8], options: Option<CborOptions>) -> Result<CborVal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The bounded malformed fixtures advertise only 4096 entries. Track the
+    // opted-in thread so this regression never needs an exhaustion stress test.
+    struct TrackingAllocator;
+    std::thread_local! {
+        static LARGEST_ALLOCATION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    fn record_allocation(size: usize) {
+        let _ = LARGEST_ALLOCATION.try_with(|largest| {
+            if let Some(previous) = largest.get() {
+                largest.set(Some(previous.max(size)));
+            }
+        });
+    }
+    // SAFETY: System receives the original pointers and layouts unchanged.
+    // The counter never dereferences or changes allocation pointers.
+    unsafe impl std::alloc::GlobalAlloc for TrackingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            record_allocation(layout.size());
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            record_allocation(layout.size());
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+            record_allocation(size);
+            unsafe { std::alloc::System.realloc(ptr, layout, size) }
+        }
+    }
+    #[global_allocator]
+    static TEST_ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+    fn largest_allocation<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                LARGEST_ALLOCATION.with(|value| value.set(None));
+            }
+        }
+        LARGEST_ALLOCATION.with(|value| value.set(Some(0)));
+        let reset = Reset;
+        let result = operation();
+        let largest = LARGEST_ALLOCATION.with(|value| value.get().unwrap());
+        drop(reset);
+        (result, largest)
+    }
+
+    #[test]
+    fn security_truncated_containers_do_not_preallocate_claimed_capacity() {
+        for major in [0x99, 0xb9] {
+            let (result, largest) = largest_allocation(|| decode_cbor(&[major, 0x10, 0x00], None));
+            assert!(result.is_err());
+            assert!(
+                largest < 4096,
+                "three-byte input requested a {largest}-byte allocation"
+            );
+        }
+    }
+
+    #[test]
+    fn security_negative_integer_range_checked_before_conversion() {
+        for argument in [
+            u64::MAX,
+            u64::MAX - 1,
+            i64::MAX as u64,
+            9_007_199_254_740_991,
+        ] {
+            let mut bytes = vec![0x3b];
+            bytes.extend_from_slice(&argument.to_be_bytes());
+            assert!(
+                decode_cbor(&bytes, None).is_err(),
+                "accepted negative argument {argument}"
+            );
+        }
+        for value in [-9_007_199_254_740_991, -1, 0, 9_007_199_254_740_991] {
+            let encoded = encode_cbor(&CborValue::Integer(value), None).unwrap();
+            assert_eq!(
+                decode_cbor(&encoded, None).unwrap(),
+                CborValue::Integer(value)
+            );
+        }
+    }
+
+    #[test]
+    fn security_duplicate_map_keys_are_rejected() {
+        assert!(decode_cbor(&[0xa2, 0x61, b'a', 0, 0x61, b'a', 1], None).is_err());
+    }
+
+    #[test]
+    fn security_integral_floats_obey_the_protocol_safe_integer_range() {
+        for value in [9_007_199_254_740_992_f64, -9_007_199_254_740_992_f64] {
+            let mut bytes = vec![0xfb];
+            bytes.extend_from_slice(&value.to_be_bytes());
+            assert!(decode_cbor(&bytes, None).is_err());
+        }
+        let mut bytes = vec![0xfb];
+        bytes.extend_from_slice(&1.5_f64.to_be_bytes());
+        assert_eq!(decode_cbor(&bytes, None).unwrap(), CborValue::Float(1.5));
+    }
 
     #[test]
     fn encodes_and_decodes_hello_map() {

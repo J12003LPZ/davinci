@@ -104,7 +104,10 @@ pub fn header(model: &Model) -> Line<'static> {
 
 /// `mode · branch · Δn +a -d` on the left, a context meter on the right.
 pub fn status(model: &Model) -> Line<'static> {
-    if model.screen == Screen::Agent && model.overlay.is_none() && !model.codex_open() {
+    if model.permission_mode == "always-approve"
+        || (model.screen == Screen::Agent && model.overlay.is_none() && !model.codex_open())
+    {
+        // Keep the no-prompts warning visible even while a sheet owns input.
         return conversation_status(model);
     }
     spread(model.width, status_left(model), status_right(model))
@@ -113,17 +116,22 @@ pub fn status(model: &Model) -> Line<'static> {
 /// One quiet footer. Permissions remain explicit even on narrow terminals.
 fn conversation_status(model: &Model) -> Line<'static> {
     let th = &model.theme;
-    let permission = if model.plan_mode {
-        "plan mode"
+    let always_approve = model.permission_mode == "always-approve";
+    let mut left = if always_approve {
+        // Spend narrow widths on the safety meaning before optional context.
+        // The textual warning also works without color; never truncate it to
+        // an innocuous mode name or confuse Auto Mode with no approval prompts.
+        let warning = if model.width >= 31 {
+            "  ! Always Approve · no prompts"
+        } else if model.width >= 12 {
+            "! no prompts"
+        } else {
+            "no prompts"
+        };
+        vec![span_strong(warning, th.warning, th)]
     } else {
-        match model.permission_mode.as_str() {
-            "auto" => "auto permissions",
-            "edits" => "accept edits",
-            "read-only" => "read-only",
-            _ => "ask permissions",
-        }
+        vec![span(format!("  {}", model.permission_label()), th.primary)]
     };
-    let mut left = vec![span(format!("  {permission}"), th.primary)];
     if model.width >= 72 && !model.branch.is_empty() {
         left.push(span(format!(" · {}", model.branch), th.muted));
     }
@@ -611,9 +619,7 @@ fn composer_view(entry: &str, column: Option<usize>, width: u16) -> (String, Opt
     (shown, Some(column - start + prefix.len()))
 }
 
-/// The model's run in the header and status bar: `sonnet · high`, and
-/// ` · auto` after it while every tool runs unasked — the one permission
-/// mode worth a standing reminder.
+/// The session change tally shown beside the active model and permission label.
 /// A composer that takes no input: border rule, the sheet's reason in the dim
 /// ramp, no caret (`6a` — the composer is disabled until you decide).
 pub fn disabled_composer(model: &Model, text: &str) -> Vec<Line<'static>> {
@@ -639,11 +645,12 @@ fn jobs_note(model: &Model) -> Option<String> {
 }
 
 fn model_run(model: &Model) -> String {
-    let mut run = format!("{} · {}", model.model_name, model.thinking_level);
-    if model.permission_mode == "auto" {
-        run.push_str(" · auto");
-    }
-    run
+    format!(
+        "{} · {} · {}",
+        model.model_name,
+        model.thinking_level,
+        model.permission_label()
+    )
 }
 
 /// Split a drawn composer row into `(before, under, after)` around the caret,
@@ -827,10 +834,23 @@ fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
         return Line::from(vec![span("ctrl+c again to exit", th.primary)]);
     }
     if model.screen == Screen::Agent && hint == Hint::Default && !model.running {
-        let help = if model.width >= 48 {
-            "  /help for shortcuts · ctrl+p commands"
-        } else {
-            "  /help for shortcuts"
+        let cycle = model.keybindings.keys_for("app.permissions.cycle").first();
+        let help = match cycle {
+            Some(binding) => {
+                let binding = if binding == "shift+tab" {
+                    "Shift+Tab"
+                } else {
+                    binding
+                };
+                if model.width >= 72 {
+                    format!("  /help for shortcuts · ctrl+p commands · {binding} mode")
+                } else if model.width >= 40 {
+                    format!("  /help · {binding} mode")
+                } else {
+                    format!("{binding} mode")
+                }
+            }
+            None => "  /help for shortcuts · ctrl+p commands".into(),
         };
         return spread(
             model.width,
@@ -1052,15 +1072,16 @@ mod tests {
     }
 
     #[test]
-    fn the_header_names_the_permission_mode_only_when_everything_runs_unasked() {
-        let mut m = model(100);
+    fn the_header_distinguishes_auto_from_always_approve() {
+        let mut m = model(120);
         m.thinking_level = "high".into();
-        assert!(!text(&header(&m)).contains("· auto"));
+        assert!(text(&header(&m)).contains("· Manual"));
         m.permission_mode = "auto".into();
-        let drawn = text(&header(&m));
-        assert!(drawn.contains("sonnet · high · auto"), "{drawn}");
-        m.permission_mode = "edits".into();
-        assert!(!text(&header(&m)).contains("· edits"));
+        assert!(text(&header(&m)).contains("sonnet · high · Auto Mode"));
+        assert!(!text(&status(&m)).contains("no prompts"));
+        m.permission_mode = "always-approve".into();
+        assert!(text(&header(&m)).contains("· Always Approve"));
+        assert!(text(&status(&m)).contains("no prompts"));
     }
 
     #[test]
@@ -1087,9 +1108,47 @@ mod tests {
     }
 
     #[test]
+    fn permission_status_uses_all_five_exact_labels() {
+        for (id, label) in [
+            ("ask", "Manual"),
+            ("edits", "Accept Edits"),
+            ("read-only", "Plan Mode"),
+            ("auto", "Auto Mode"),
+            ("always-approve", "Always Approve"),
+        ] {
+            let mut m = model(100);
+            m.permission_mode = id.into();
+            let drawn = text(&status(&m));
+            assert!(drawn.contains(label), "{id}: {drawn}");
+        }
+    }
+
+    #[test]
+    fn always_approve_warning_survives_narrow_status_and_monochrome() {
+        for width in [10, 20, 32, 40, 48, 72, 100] {
+            for no_color in [false, true] {
+                let mut m = model(width);
+                m.permission_mode = "always-approve".into();
+                m.theme = Theme::da_vinci(ColorDepth::TrueColor, no_color);
+                let row = status(&m);
+                let drawn = text(&row);
+                assert!(drawn.contains("no prompts"), "width {width}: {drawn}");
+                if width >= 32 {
+                    assert!(drawn.contains("Always Approve"), "{drawn}");
+                }
+                assert!(line_width(&row) <= width);
+                assert!(row
+                    .spans
+                    .iter()
+                    .any(|s| s.style.fg == Some(m.theme.warning)));
+            }
+        }
+    }
+
+    #[test]
     fn conversation_status_names_permissions_and_context_usage() {
         let drawn = text(&status(&model(100)));
-        assert!(drawn.starts_with("  ask permissions"), "{drawn}");
+        assert!(drawn.starts_with("  Manual"), "{drawn}");
         assert!(drawn.contains("23% context"), "{drawn}");
         assert!(drawn.contains("thinking "), "{drawn}");
     }
@@ -1099,14 +1158,14 @@ mod tests {
         for width in [72u16, 90] {
             let drawn = text(&status(&model(width)));
             assert!(drawn.contains("23% context"), "{drawn}");
-            assert!(drawn.contains("ask permissions"), "{drawn}");
+            assert!(drawn.contains("Manual"), "{drawn}");
         }
     }
 
     #[test]
     fn the_status_bar_left_names_the_screen_in_hand() {
         let mut m = model(120);
-        assert!(text(&status(&m)).starts_with("  ask permissions · main · 3 files +42 -11"));
+        assert!(text(&status(&m)).starts_with("  Manual · main · 3 files +42 -11"));
         m.toggle_screen(Screen::Grafo);
         let drawn = text(&status(&m));
         assert!(drawn.contains("Code graph"), "{drawn}");

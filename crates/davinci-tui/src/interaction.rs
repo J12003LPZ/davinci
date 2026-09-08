@@ -49,6 +49,13 @@ pub fn key_event_bytes(key: &KeyEvent) -> Option<String> {
         KeyCode::Enter if alt => Some("\x1b\r".into()),
         KeyCode::Enter if shift => Some("\n".into()),
         KeyCode::Enter => Some("\r".into()),
+        // Preserve modifier identity: Ctrl+Tab is the native permission-cycle
+        // shortcut, while unbound modified chords must not accept completion.
+        KeyCode::Tab | KeyCode::BackTab if ctrl || alt => {
+            let bits =
+                crate::keys::key_modifier_bits(ctrl, alt, shift || key.code == KeyCode::BackTab);
+            Some(format!("\x1b[9;{}u", bits + 1))
+        }
         KeyCode::Tab if shift => Some("\x1b[Z".into()),
         KeyCode::Tab => Some("\t".into()),
         KeyCode::BackTab => Some("\x1b[Z".into()),
