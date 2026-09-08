@@ -16,9 +16,9 @@ use davinci_tui::davinci::model::{
     Ask, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
     Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
     HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow,
-    PickerItem, PlanStep, ProjectTrustSheet, ProviderRow, ResumeRow, ReviewFile, ReviewSheet,
-    Screen, SecurityScan, SettingRow, Severity, Step, ThinkingRow, Tone, TreeNode, TrustFile,
-    VectorIndex, WorkflowRow, WorkflowsSheet, Working, WorkshopSheet,
+    PickerItem, PlanStep, ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan,
+    SettingRow, Severity, Step, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
+    WorkflowsSheet, Working, WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
@@ -2647,15 +2647,6 @@ pub fn perform(
             None => Ok(Done::Note("no agent messages to copy yet".into())),
         },
         SlashAction::Share => Ok(Done::Said(crate::share_current_session(agent)?)),
-        SlashAction::Changelog => {
-            let entries = crate::changelog::parse_changelog(&crate::changelog::changelog_path());
-            let stored = crate::settings::load_merged_settings(&agent_dir, &agent.cwd);
-            let text = match stored.last_changelog_version.as_deref() {
-                Some(since) => crate::changelog::format_changelog_since(&entries, Some(since)),
-                None => crate::changelog::format_changelog(&entries),
-            };
-            Ok(Done::Said(text))
-        }
         SlashAction::SessionInfo => {
             let models = crate::available_models(parsed);
             let found = models
@@ -2926,22 +2917,6 @@ pub fn perform(
             open_sheet(model, Screen::Officina);
             Ok(Done::Opened)
         }
-        SlashAction::Trust => {
-            let mut host = crate::loaded_extension_host(parsed);
-            host.emit(ExtensionEvent::UiPromptStart {
-                kind: "trust".into(),
-            });
-            host.emit(ExtensionEvent::ProjectTrust {
-                path: agent.cwd.display().to_string(),
-            });
-            host.emit(ExtensionEvent::UiPromptEnd {
-                kind: "trust".into(),
-            });
-            // The sheet says what the project would load (`6a`); enter moves
-            // on to the decision itself.
-            open_trust_sheet(agent, model);
-            Ok(Done::Opened)
-        }
         // A bare `/login` lists every provider and where its credential came
         // from (`3d`); with a provider named, the handshake runs detached.
         SlashAction::Login { provider, key } if provider.is_empty() => {
@@ -2971,24 +2946,9 @@ pub fn perform(
                 }
             }
         }
-        SlashAction::ScopedModels => Ok(Done::Said(scoped_models_summary(parsed, agent))),
         SlashAction::Mcp => {
             open_mcp_sheet(agent, model);
             Ok(Done::Opened)
-        }
-        SlashAction::Plan => {
-            agent.set_plan_mode(true);
-            model.plan_mode = true;
-            Ok(Done::Said(
-                "plan mode · mutations are off until /act".into(),
-            ))
-        }
-        SlashAction::Act => {
-            agent.set_plan_mode(false);
-            model.plan_mode = false;
-            Ok(Done::Said(
-                "act · edits and shell commands may run again".into(),
-            ))
         }
         SlashAction::ShowCost => Ok(Done::Said(crate::format_session_cost(parsed, agent))),
         SlashAction::ShowStatus => Ok(Done::Said(crate::format_session_status(parsed, agent))),
@@ -3001,11 +2961,6 @@ pub fn perform(
                 crate::agent_profiles::format_agent_profiles_status(&agent.cwd, None, trusted),
             ))
         }
-        SlashAction::Llama => Ok(Done::Said(format!(
-            "llama.cpp server {}",
-            std::env::var("LLAMA_BASE_URL")
-                .unwrap_or_else(|_| crate::llama::DEFAULT_LLAMA_SERVER_URL.into())
-        ))),
     }
 }
 
@@ -3121,18 +3076,6 @@ fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model)
     model.model_name = agent.model_id.clone();
     model.context.1 = agent.context_window;
     sync_thinking_state(agent, model);
-}
-
-/// The models `--models` pinned this run to, and the one actually in hand.
-fn scoped_models_summary(parsed: &crate::args::Args, agent: &Agent) -> String {
-    let mut rows = vec![format!("in hand  {} / {}", agent.provider, agent.model_id)];
-    for spec in &parsed.models {
-        rows.push(format!("scoped   {spec}"));
-    }
-    if rows.len() == 1 {
-        rows.push("no --models scope for this run".into());
-    }
-    rows.join("\n")
 }
 
 /// Run the davinci TUI against a live agent until the user leaves.
@@ -4806,96 +4749,6 @@ fn open_tree_sheet(agent: &Agent, model: &mut Model) -> bool {
     };
     open_sheet(model, Screen::Tree);
     true
-}
-
-/// `6a` — what this project would load if trusted, walked from the real
-/// `.pi` directory and context files.
-fn open_trust_sheet(agent: &Agent, model: &mut Model) {
-    let cwd = &agent.cwd;
-    let mut files: Vec<TrustFile> = Vec::new();
-    let count_in = |dir: &std::path::Path| -> usize {
-        std::fs::read_dir(dir)
-            .map(|entries| entries.flatten().count())
-            .unwrap_or(0)
-    };
-    let extensions = cwd.join(".pi").join("extensions");
-    if extensions.is_dir() {
-        for entry in std::fs::read_dir(&extensions)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            files.push(TrustFile {
-                state: State::Attention,
-                path: format!(".pi\\extensions\\{}", entry.file_name().to_string_lossy()),
-                detail: "runs as node, no sandbox".into(),
-                risk_label: "executes code".into(),
-            });
-        }
-    }
-    let settings = cwd.join(".pi").join("settings.json");
-    if settings.is_file() {
-        let keys = std::fs::read_to_string(&settings)
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|value| value.as_object().map(|map| map.len()))
-            .unwrap_or(0);
-        files.push(TrustFile {
-            state: State::Attention,
-            path: ".pi\\settings.json".into(),
-            detail: format!("{keys} keys, incl. limits and allowlists"),
-            risk_label: "changes limits".into(),
-        });
-    }
-    let skills = cwd.join(".pi").join("skills");
-    if skills.is_dir() {
-        files.push(TrustFile {
-            state: State::Read,
-            path: format!(".pi\\skills\\ ({})", count_in(&skills)),
-            detail: "instructions loaded on demand".into(),
-            risk_label: "prompt text".into(),
-        });
-    }
-    let prompts = cwd.join(".pi").join("prompts");
-    if prompts.is_dir() {
-        files.push(TrustFile {
-            state: State::Read,
-            path: format!(".pi\\prompts\\ ({})", count_in(&prompts)),
-            detail: "slash commands that expand to prompts".into(),
-            risk_label: "prompt text".into(),
-        });
-    }
-    let mut context_lines = 0usize;
-    let mut context_names: Vec<&str> = Vec::new();
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        if let Ok(text) = std::fs::read_to_string(cwd.join(name)) {
-            context_lines += text.lines().count();
-            context_names.push(name);
-        }
-    }
-    if !context_names.is_empty() {
-        files.push(TrustFile {
-            state: State::Read,
-            path: context_names.join(" · "),
-            detail: format!("{context_lines} lines, prepended to every turn"),
-            risk_label: "prompt text".into(),
-        });
-    }
-    let store = crate::trust::ProjectTrustStore::open(&crate::default_agent_dir());
-    let (trusted, ignored) = store.counts();
-    let first_visit = store.get(cwd).is_none();
-    model.project_trust = Some(ProjectTrustSheet {
-        files,
-        first_visit,
-        path: cwd.display().to_string(),
-        trusted: format!("{trusted} projects"),
-        ignored: ignored.to_string(),
-        store: crate::default_agent_dir()
-            .join("trust.json")
-            .display()
-            .to_string(),
-    });
-    open_sheet(model, Screen::Trust);
 }
 
 /// `6d` — the Δ review, from the real working tree: every changed file with
@@ -8405,11 +8258,15 @@ mod tests {
     }
 
     #[test]
-    fn removed_thinking_command_redirects_to_model_without_sending_a_prompt() {
-        for command in ["/thinking", "/thinking high"] {
-            assert!(matches!(classify(command), Sent::Say(text) if text.contains("/model")));
+    fn thinking_command_reaches_the_agent_for_every_supported_level() {
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let command = format!("/thinking {level}");
+            assert!(matches!(
+                classify(&command),
+                Sent::Command(crate::slash::SlashAction::SetThinking(value)) if value == level
+            ));
         }
-        assert!(!crate::slash::builtin_slash_commands()
+        assert!(crate::slash::builtin_slash_commands()
             .iter()
             .any(|command| command.name == "thinking"));
     }
@@ -8427,17 +8284,12 @@ mod tests {
             "/fork",
             "/clone",
             "/copy",
-            "/trust",
             "/reload",
             "/import a.jsonl",
             "/share",
-            "/changelog",
             "/session",
-            "/scoped-models",
-            "/llama",
+            "/thinking high",
             "/mcp",
-            "/plan",
-            "/act",
             "/cost",
             "/status",
             "/agents",
@@ -8616,16 +8468,6 @@ mod tests {
         let panel = Question::Logout { providers: vec![] }.ask(&agent);
         assert!(panel.items.is_empty());
         assert_eq!(panel.key, "/logout");
-    }
-
-    #[test]
-    fn the_model_scope_names_the_model_in_hand_even_with_no_scope_set() {
-        let mut agent = davinci_agent::Agent::new("test");
-        agent.provider = "anthropic".into();
-        agent.model_id = "claude-opus-5".into();
-        let summary = scoped_models_summary(&crate::args::Args::default(), &agent);
-        assert!(summary.contains("anthropic / claude-opus-5"), "{summary}");
-        assert!(summary.contains("no --models scope"), "{summary}");
     }
 
     #[test]

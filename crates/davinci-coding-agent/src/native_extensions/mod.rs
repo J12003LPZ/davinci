@@ -87,26 +87,6 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             Some("[path] [--mode quick|standard|deep] [--format terminal|json|sarif]"),
         ),
         (
-            "sec-status",
-            "Show security review status and coverage.",
-            Some("[scan-id]"),
-        ),
-        (
-            "sec-report",
-            "Show a security review report.",
-            Some("[scan-id] [--finding finding-id]"),
-        ),
-        (
-            "sec-abort",
-            "Cancel the active security review.",
-            Some("[scan-id]"),
-        ),
-        (
-            "sec-resume",
-            "Resume an interrupted security review.",
-            Some("<scan-id>"),
-        ),
-        (
             "memory-status",
             "Show vector-memory health and record counts.",
             None,
@@ -639,14 +619,10 @@ mod tests {
     #[test]
     fn public_native_commands_have_discoverable_metadata() {
         let specs = command_specs();
-        for command in [
-            "security-scan",
-            "sec-status",
-            "sec-report",
-            "sec-abort",
-            "sec-resume",
-        ] {
-            assert!(specs.iter().any(|(name, _, _)| *name == command));
+        assert!(specs.iter().any(|(name, _, _)| *name == "security-scan"));
+        for internal in ["sec-status", "sec-report", "sec-abort", "sec-resume"] {
+            assert!(!specs.iter().any(|(name, _, _)| *name == internal));
+            assert!(NATIVE_COMMANDS.contains(&internal));
         }
         for (name, description, _) in specs {
             assert!(NATIVE_COMMANDS.contains(&name));

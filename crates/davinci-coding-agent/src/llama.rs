@@ -866,16 +866,6 @@ pub fn router_autoload(server_url: &str, catalog: &[LlamaModelInfo]) -> bool {
         .unwrap_or(false)
 }
 
-pub fn resolve_server_url(env: &HashMap<String, String>, fallback: Option<&str>) -> String {
-    if let Some(url) = env.get("LLAMA_BASE_URL") {
-        return url.clone();
-    }
-    if let Some(url) = fallback {
-        return url.to_string();
-    }
-    std::env::var("LLAMA_BASE_URL").unwrap_or_else(|_| DEFAULT_LLAMA_SERVER_URL.into())
-}
-
 const DEFAULT_HUGGING_FACE_URL: &str = "https://huggingface.co";
 
 #[derive(Debug, Clone, PartialEq)]

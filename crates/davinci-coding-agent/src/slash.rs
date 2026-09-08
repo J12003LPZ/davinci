@@ -22,12 +22,12 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Select model (opens selector UI)",
             Some("<provider/model>"),
         ),
-        ("tree", "Navigate session tree (switch branches)", None),
         (
-            "scoped-models",
-            "Enable/disable models for Ctrl+P cycling",
-            None,
+            "thinking",
+            "Set reasoning level",
+            Some("<off|minimal|low|medium|high|xhigh|max>"),
         ),
+        ("tree", "Navigate session tree (switch branches)", None),
         (
             "export",
             "Export session (HTML default, or specify path: .html/.jsonl)",
@@ -41,7 +41,6 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("share", "Share session as a secret GitHub gist", None),
         ("copy", "Copy last agent message to clipboard", None),
         ("name", "Set session display name", None),
-        ("changelog", "Show changelog entries", None),
         ("hotkeys", "Show all keyboard shortcuts", None),
         (
             "fork",
@@ -51,11 +50,6 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         (
             "clone",
             "Duplicate the current session at the current position",
-            None,
-        ),
-        (
-            "trust",
-            "Save project trust decision for future sessions",
             None,
         ),
         (
@@ -72,14 +66,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Reload keybindings, extensions, skills, prompts, themes, and context files",
             None,
         ),
-        ("llama", "Manage llama.cpp router models", None),
         ("mcp", "Connected MCP servers, tools and errors", None),
-        (
-            "plan",
-            "Freeze mutations; the model may only read and plan",
-            None,
-        ),
-        ("act", "Leave plan mode and allow edits again", None),
         ("cost", "Tokens and USD spent this session", None),
         ("status", "Model, permission, jobs, MCP, tokens", None),
         ("agents", "List custom agent profiles and status", None),
@@ -120,19 +107,13 @@ pub enum SlashAction {
     Resume,
     Tree,
     Copy,
-    Trust,
     Reload,
     Import(String),
     Share,
-    Changelog,
     Settings,
     Hotkeys,
     SessionInfo,
-    ScopedModels,
-    Llama,
     Mcp,
-    Plan,
-    Act,
     ShowCost,
     ShowStatus,
     Agents,
@@ -180,7 +161,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         }),
         "model" if args.is_empty() => SlashAction::OpenModel,
         "model" => SlashAction::SetModel(args.to_string()),
-        "thinking" => SlashAction::Status("Select a thinking level in /model.".into()),
+        "thinking" => SlashAction::SetThinking(args.to_string()),
         "export" => SlashAction::Export(if args.is_empty() {
             None
         } else {
@@ -205,20 +186,14 @@ pub fn parse_line(line: &str) -> SlashAction {
         "resume" | "sessions" => SlashAction::Resume,
         "tree" => SlashAction::Tree,
         "copy" => SlashAction::Copy,
-        "trust" => SlashAction::Trust,
         "reload" => SlashAction::Reload,
         "import" => SlashAction::Import(args.to_string()),
         "share" => SlashAction::Share,
-        "changelog" => SlashAction::Changelog,
         "settings" => SlashAction::Settings,
-        "scoped-models" => SlashAction::ScopedModels,
         "hotkeys" => SlashAction::Hotkeys,
         "session" if args == "info" || args == "stats" => SlashAction::SessionInfo,
         "session" => SlashAction::Resume,
-        "llama" => SlashAction::Llama,
         "mcp" => SlashAction::Mcp,
-        "plan" => SlashAction::Plan,
-        "act" => SlashAction::Act,
         "cost" => SlashAction::ShowCost,
         "status" => SlashAction::ShowStatus,
         "agents" => SlashAction::Agents,
@@ -320,5 +295,43 @@ mod tests {
     fn session_stats_and_info_subcommands_route_to_session_info() {
         assert_eq!(parse_line("/session info"), SlashAction::SessionInfo);
         assert_eq!(parse_line("/session stats"), SlashAction::SessionInfo);
+    }
+
+    #[test]
+    fn retired_commands_are_not_registered_or_dispatched() {
+        let retired = [
+            "plan",
+            "act",
+            "llama",
+            "trust",
+            "changelog",
+            "scoped-models",
+        ];
+        let names = builtin_slash_commands()
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+
+        for name in retired {
+            assert!(!names.iter().any(|candidate| candidate == name));
+            let input = format!("/{name}");
+            assert_eq!(parse_line(&input), SlashAction::Prompt(input));
+        }
+    }
+
+    #[test]
+    fn thinking_command_sets_every_supported_level() {
+        let names = builtin_slash_commands()
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "thinking"));
+
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(
+                parse_line(&format!("/thinking {level}")),
+                SlashAction::SetThinking(level.into())
+            );
+        }
     }
 }

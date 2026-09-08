@@ -206,8 +206,8 @@ use davinci_tui::{
     Component, CustomMessage, DoubleEscapeAction, ExtraAutocompleteProvider, FilterMode,
     InteractiveSession, Keybindings, LiveAutocompleteQuery, LoadedResourceItem, MermaidMode,
     ModelSelectorItem, ScopedModel, SessionAction, SessionItem, SessionTreeEntry, SlashCommandSpec,
-    Theme, ThemeDetection, ToolCard, TrustOption, TrustSavedDecision, TrustSelector, TrustUpdate,
-    TuiMode, FALLBACK_PREVIEW_LINES, OSC_QUERY_TIMEOUT_MS,
+    Theme, ThemeDetection, ToolCard, TrustUpdate, TuiMode, FALLBACK_PREVIEW_LINES,
+    OSC_QUERY_TIMEOUT_MS,
 };
 
 use args::{
@@ -230,10 +230,7 @@ use settings::{
     to_interactive_config,
 };
 use slash::SlashAction;
-use trust::{
-    get_project_trust_options, has_trust_requiring_project_resources, ProjectTrustStore,
-    ProjectTrustUpdate,
-};
+use trust::{has_trust_requiring_project_resources, ProjectTrustStore, ProjectTrustUpdate};
 
 const NO_SESSION_SELECTED: &str = "__pi_no_session_selected__";
 
@@ -4401,10 +4398,6 @@ fn apply_session_action(
                 open_session_tree(agent, session);
                 Ok(true)
             }
-            SlashAction::ScopedModels => {
-                open_scoped_models(session);
-                Ok(true)
-            }
             SlashAction::Login { provider, key } => {
                 handle_login_command(session, &provider, key.as_deref())?;
                 Ok(true)
@@ -4420,10 +4413,6 @@ fn apply_session_action(
             SlashAction::Reload => {
                 reload_interactive_resources(parsed, agent, session);
                 handle_user_line(parsed, agent, session, &text, tui)
-            }
-            SlashAction::Llama => {
-                open_llama_ui(session)?;
-                Ok(true)
             }
             SlashAction::Hotkeys => {
                 let mut keys = davinci_tui::get_keybindings()
@@ -4441,7 +4430,7 @@ fn apply_session_action(
                 println!("{keys}");
                 Ok(true)
             }
-            SlashAction::Import(_) | SlashAction::Share | SlashAction::Changelog => {
+            SlashAction::Import(_) | SlashAction::Share => {
                 handle_user_line(parsed, agent, session, &text, tui)
             }
             _ => handle_user_line(parsed, agent, session, &text, tui),
@@ -4877,11 +4866,6 @@ fn handle_user_line(
             apply_terminal_title(session, agent, tui);
             Ok(true)
         }
-        SlashAction::ScopedModels => {
-            session.chrome.status = "Model Configuration".into();
-            println!("{}", session.chrome.status);
-            Ok(true)
-        }
         SlashAction::Resume => {
             let items = discover_session_items(parsed, agent)?;
             let mut selector = davinci_tui::SessionSelector::new(items.clone());
@@ -4939,17 +4923,6 @@ fn handle_user_line(
             }
             Ok(true)
         }
-        SlashAction::Trust => {
-            let mut host = loaded_extension_host(parsed);
-            host.emit(ExtensionEvent::UiPromptStart {
-                kind: "trust".into(),
-            });
-            host.emit(ExtensionEvent::ProjectTrust {
-                path: agent.cwd.display().to_string(),
-            });
-            open_trust_selector(agent, session);
-            Ok(true)
-        }
         SlashAction::Reload => {
             reload_interactive_resources(parsed, agent, session);
             session.chrome.status =
@@ -4980,35 +4953,6 @@ fn handle_user_line(
         }
         SlashAction::Share => {
             session.chrome.status = share_current_session(agent)?;
-            println!("{}", session.chrome.status);
-            Ok(true)
-        }
-        SlashAction::Changelog => {
-            let entries = changelog::parse_changelog(&changelog::changelog_path());
-            let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
-            let text = match stored.last_changelog_version.as_deref() {
-                Some(since) => changelog::format_changelog_since(&entries, Some(since)),
-                None => changelog::format_changelog(&entries),
-            };
-            session.chrome.transcript.push("changelog", &text);
-            session.chrome.status = "changelog".into();
-            println!("{text}");
-            Ok(true)
-        }
-        SlashAction::Llama => {
-            session.chrome.status = "llama.cpp is available in interactive mode".into();
-            println!("{}", session.chrome.status);
-            Ok(true)
-        }
-        SlashAction::Plan => {
-            agent.set_plan_mode(true);
-            session.chrome.status = "plan mode · mutations are off until /act".into();
-            println!("{}", session.chrome.status);
-            Ok(true)
-        }
-        SlashAction::Act => {
-            agent.set_plan_mode(false);
-            session.chrome.status = "act · edits and shell commands may run again".into();
             println!("{}", session.chrome.status);
             Ok(true)
         }
@@ -7070,37 +7014,6 @@ fn paste_clipboard(session: &mut InteractiveSession) {
     }
 }
 
-fn open_trust_selector(agent: &Agent, session: &mut InteractiveSession) {
-    let cwd = agent.cwd.clone();
-    let store = ProjectTrustStore::open(&default_agent_dir());
-    let saved = store.get_entry(&cwd).map(|entry| TrustSavedDecision {
-        path: entry.path,
-        decision: entry.decision,
-    });
-    let settings = load_settings(&default_agent_dir());
-    let project_trusted = is_trusted(&settings, &cwd, None);
-    let options = get_project_trust_options(&cwd, false)
-        .into_iter()
-        .map(|option| TrustOption {
-            label: option.label,
-            trusted: option.trusted,
-            updates: option
-                .updates
-                .into_iter()
-                .map(|update| TrustUpdate {
-                    path: update.path,
-                    decision: update.decision,
-                })
-                .collect(),
-            saved_path: option.saved_path,
-        })
-        .collect();
-    session.open_trust_selector(
-        TrustSelector::new(cwd.display().to_string(), options, saved, project_trusted)
-            .with_theme(session.chrome.theme.clone()),
-    );
-}
-
 fn apply_trust_decision(
     session: &mut InteractiveSession,
     trusted: bool,
@@ -7919,23 +7832,6 @@ fn apply_catalog_result(
         scoped.refresh_status = Some(refreshed.status.clone());
     }
     session.chrome.status = refreshed.status;
-}
-
-fn open_llama_ui(session: &mut InteractiveSession) -> Result<(), String> {
-    let storage = AuthStorage::create().map_err(|err| err.to_string())?;
-    let cred = storage.get(llama::LLAMA_PROVIDER_ID);
-    let url = llama::resolve_server_url(
-        &cred.map(|item| item.env.clone()).unwrap_or_default(),
-        cred.and_then(|item| item.key.as_deref()),
-    );
-    let Ok(url) = llama::normalize_llama_server_url(&url) else {
-        session.chrome.status = format!(
-            "Configure llama.cpp with /login {}",
-            llama::LLAMA_PROVIDER_ID
-        );
-        return Ok(());
-    };
-    show_llama_catalog(session, &url)
 }
 
 fn show_llama_catalog(session: &mut InteractiveSession, url: &str) -> Result<(), String> {
@@ -9535,20 +9431,16 @@ mod tests {
         ));
         assert!(matches!(
             slash::parse_line("/thinking"),
-            slash::SlashAction::Status(_)
+            slash::SlashAction::SetThinking(level) if level.is_empty()
         ));
         assert!(matches!(
             slash::parse_line("/thinking high"),
-            slash::SlashAction::Status(_)
+            slash::SlashAction::SetThinking(level) if level == "high"
         ));
         assert_eq!(
             unknown_thinking_error("nope"),
             "Unknown thinking level \"nope\". Available levels: off, minimal, low, medium, high, xhigh, max."
         );
-        assert!(matches!(
-            slash::parse_line("/scoped-models"),
-            slash::SlashAction::ScopedModels
-        ));
         assert!(matches!(
             slash::parse_line("/tree"),
             slash::SlashAction::Tree
@@ -9561,20 +9453,7 @@ mod tests {
             slash::parse_line("/share"),
             slash::SlashAction::Share
         ));
-        assert!(matches!(
-            slash::parse_line("/changelog"),
-            slash::SlashAction::Changelog
-        ));
-        assert!(matches!(
-            slash::parse_line("/llama"),
-            slash::SlashAction::Llama
-        ));
         assert!(matches!(slash::parse_line("/mcp"), slash::SlashAction::Mcp));
-        assert!(matches!(
-            slash::parse_line("/plan"),
-            slash::SlashAction::Plan
-        ));
-        assert!(matches!(slash::parse_line("/act"), slash::SlashAction::Act));
         assert!(matches!(
             slash::parse_line("/cost"),
             slash::SlashAction::ShowCost
@@ -9587,10 +9466,6 @@ mod tests {
             slash::parse_line("/agents"),
             slash::SlashAction::Agents
         ));
-        assert!(slash::builtin_slash_commands()
-            .iter()
-            .any(|command| command.name == "llama"
-                && command.description == "Manage llama.cpp router models"));
         assert_eq!(
             slash::parse_line("/review src/index.ts"),
             slash::SlashAction::Prompt("/review src/index.ts".into())

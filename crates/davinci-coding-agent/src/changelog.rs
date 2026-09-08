@@ -327,10 +327,12 @@ fn resolve_repository_path(target_path: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+#[cfg(test)]
 pub fn format_changelog(entries: &[ChangelogEntry]) -> String {
     format_changelog_since(entries, None)
 }
 
+#[cfg(test)]
 pub fn format_changelog_since(entries: &[ChangelogEntry], since: Option<&str>) -> String {
     let filtered: Vec<&ChangelogEntry> = match since.and_then(parse_version_string) {
         Some((major, minor, patch)) => entries
