@@ -68,6 +68,17 @@ pub struct BehaviorScenario {
     pub limits: BehaviorLimits,
 }
 
+pub fn load_core_200_corpus() -> Result<Vec<BehaviorScenario>, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("behavior")
+        .join("core-200.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,4 +110,35 @@ mod tests {
         let decoded: BehaviorScenario = serde_json::from_str(&json).unwrap();
         assert_eq!(scenario, decoded);
     }
+
+    #[test]
+    fn test_core_200_corpus_validation() {
+        let scenarios = load_core_200_corpus().expect("core-200 corpus must load");
+        assert_eq!(scenarios.len(), 200, "Must contain exactly 200 scenarios");
+
+        let mut ids = std::collections::BTreeSet::new();
+        let mut category_counts = std::collections::BTreeMap::new();
+        let repo_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("repos");
+
+        for scen in &scenarios {
+            assert!(ids.insert(&scen.id), "Duplicate scenario id: {}", scen.id);
+            *category_counts.entry(scen.category).or_insert(0) += 1;
+            assert!(!scen.requirements.is_empty(), "Scenario {} has no requirements", scen.id);
+            let repo_path = repo_dir.join(&scen.repo_fixture);
+            assert!(repo_path.exists(), "Missing repo fixture for scenario {}: {}", scen.id, repo_path.display());
+        }
+
+        assert_eq!(*category_counts.get(&BehaviorCategory::Exploration).unwrap_or(&0), 25);
+        assert_eq!(*category_counts.get(&BehaviorCategory::ScopeDiscipline).unwrap_or(&0), 25);
+        assert_eq!(*category_counts.get(&BehaviorCategory::VerificationIntegrity).unwrap_or(&0), 25);
+        assert_eq!(*category_counts.get(&BehaviorCategory::ToolSelection).unwrap_or(&0), 25);
+        assert_eq!(*category_counts.get(&BehaviorCategory::Collaboration).unwrap_or(&0), 20);
+        assert_eq!(*category_counts.get(&BehaviorCategory::Planning).unwrap_or(&0), 20);
+        assert_eq!(*category_counts.get(&BehaviorCategory::SecurityBoundary).unwrap_or(&0), 20);
+        assert_eq!(*category_counts.get(&BehaviorCategory::FrontendCapability).unwrap_or(&0), 20);
+        assert_eq!(*category_counts.get(&BehaviorCategory::AntiOverengineering).unwrap_or(&0), 20);
+    }
 }
+

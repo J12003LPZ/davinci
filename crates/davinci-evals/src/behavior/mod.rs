@@ -7,7 +7,7 @@ pub mod trace;
 
 pub use runner::{aggregate_suite_scores, evaluate_scenario_trace, BehaviorSuiteSummary};
 pub use scenario::{
-    BehaviorCategory, BehaviorLimits, BehaviorRequirement, BehaviorScenario,
+    load_core_200_corpus, BehaviorCategory, BehaviorLimits, BehaviorRequirement, BehaviorScenario,
 };
 pub use scorer::{score_trace, ScoreCard};
 pub use trace::{
