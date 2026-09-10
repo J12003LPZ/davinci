@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod behavior;
 pub mod codex_eval;
+pub mod competitor;
 pub mod harness_table;
 pub mod reporter;
 pub mod security_eval;

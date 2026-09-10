@@ -21,6 +21,10 @@
     - `frontend_capability`: design intent polish and responsive/visual verification.
     - `anti_overengineering`: YAGNI compliance, no unsolicited abstractions or cascades.
   - Normalized traces (`BehaviorTrace`) and deterministic scoring (`score_trace`).
+- **Competitor Differential Harness (`competitor/`)**:
+  - Optional isolated runners for external tools like Claude Code (`claude -p`).
+  - Strict filesystem isolation using temporary workspaces.
+  - Fair comparison disclosures documenting model parity, timeout, and repo snapshot.
 - **Reporting & Tables (`reporter.rs`, `harness_table.rs`)**:
   - Generates markdown report cards and terminal tables summarizing benchmark runs.
   - Records execution artifacts for offline inspection.
@@ -32,5 +36,7 @@
 ```bash
 cargo test -p davinci-evals
 cargo test -p davinci-evals behavior::
+cargo test -p davinci-evals competitor::
 ```
+
 
