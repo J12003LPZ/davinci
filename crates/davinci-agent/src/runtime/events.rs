@@ -162,9 +162,26 @@ pub enum RuntimeEvent {
         task_id: TaskId,
         agent_id: AgentId,
     },
+    /// Approval proposal only: never replayed as a committed task state.
+    TaskCompletionRequested {
+        task_id: TaskId,
+        expected_revision: u64,
+    },
+    /// Observation emitted after the task projection has been committed.
     TaskCompleted {
         task_id: TaskId,
         success: bool,
+    },
+    /// Canonical contract decision event recording allowed or denied effects with secrets redacted.
+    ContractDecision {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor_id: Option<AgentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<TaskId>,
+        contract_revision: u64,
+        allowed: bool,
+        effect: String,
+        reason: String,
     },
     WorkflowStarted {
         workflow_id: WorkflowId,
@@ -210,6 +227,54 @@ pub enum RuntimeEvent {
         code: String,
         message: String,
     },
+    WorkerControlAcknowledged {
+        command_id: Uuid,
+        task_id: Option<TaskId>,
+        agent_id: AgentId,
+        generation: u64,
+        action: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+impl RuntimeEvent {
+    /// Creates a ContractDecision event for a denied action with secrets redacted from effect and reason.
+    pub fn contract_denied(
+        actor_id: Option<AgentId>,
+        task_id: Option<TaskId>,
+        contract_revision: u64,
+        effect: &str,
+        reason: &str,
+    ) -> Self {
+        Self::ContractDecision {
+            actor_id,
+            task_id,
+            contract_revision,
+            allowed: false,
+            effect: crate::runtime::contracts::redact_secrets(effect),
+            reason: crate::runtime::contracts::redact_secrets(reason),
+        }
+    }
+
+    /// Creates a ContractDecision event for an allowed action with secrets redacted.
+    pub fn contract_allowed(
+        actor_id: Option<AgentId>,
+        task_id: Option<TaskId>,
+        contract_revision: u64,
+        effect: &str,
+        reason: &str,
+    ) -> Self {
+        Self::ContractDecision {
+            actor_id,
+            task_id,
+            contract_revision,
+            allowed: true,
+            effect: crate::runtime::contracts::redact_secrets(effect),
+            reason: crate::runtime::contracts::redact_secrets(reason),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +333,55 @@ mod tests {
                 from: AgentState::Starting,
                 to: AgentState::Running,
             },
+        );
+
+        let serialized = serde_json::to_string(&envelope).unwrap();
+        let deserialized: RuntimeEventEnvelope = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(envelope, deserialized);
+    }
+
+    #[test]
+    fn runtime_event_envelope_roundtrip_contract_decision() {
+        let task_id = TaskId::new();
+        let agent_id = AgentId::new();
+
+        // Contract denied event with secret redaction
+        let denied = RuntimeEvent::contract_denied(
+            Some(agent_id),
+            Some(task_id),
+            2,
+            "write: /secrets/token?key=sk-secret9999",
+            "access denied: token ghp_privatetoken was forbidden",
+        );
+
+        match &denied {
+            RuntimeEvent::ContractDecision {
+                actor_id,
+                task_id: tid,
+                contract_revision,
+                allowed,
+                effect,
+                reason,
+            } => {
+                assert_eq!(*actor_id, Some(agent_id));
+                assert_eq!(*tid, Some(task_id));
+                assert_eq!(*contract_revision, 2);
+                assert!(!*allowed);
+                assert!(!effect.contains("sk-secret9999"));
+                assert!(effect.contains("sk-[REDACTED]"));
+                assert!(!reason.contains("ghp_privatetoken"));
+                assert!(reason.contains("ghp_[REDACTED]"));
+            }
+            other => panic!("expected ContractDecision, got {other:?}"),
+        }
+
+        let envelope = RuntimeEventEnvelope::new(
+            10,
+            RunId::new(),
+            Some("session-contract".into()),
+            Some(agent_id),
+            None,
+            denied,
         );
 
         let serialized = serde_json::to_string(&envelope).unwrap();

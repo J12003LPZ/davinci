@@ -778,6 +778,59 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
     }
 }
 
+impl ShellAnalysisReport {
+    /// Classifies the declared effects of this shell command based on static analysis.
+    ///
+    /// Invariant: This is a conservative classification of apparent effects;
+    /// it does NOT claim sandboxing or containment.
+    pub fn classify_declared_effects(&self) -> Vec<crate::runtime::capabilities::DeclaredEffect> {
+        use crate::runtime::capabilities::DeclaredEffect;
+        let mut effects = vec![DeclaredEffect::ProcessExecution];
+
+        if self.is_read_only && !self.has_redirection {
+            effects.push(DeclaredEffect::FileSystemRead);
+        } else {
+            effects.push(DeclaredEffect::FileSystemWrite);
+        }
+
+        let cmd_lower = self.command.to_lowercase();
+        // Detect network commands
+        if cmd_lower.contains("curl")
+            || cmd_lower.contains("wget")
+            || cmd_lower.contains("fetch")
+            || cmd_lower.contains("git clone")
+            || cmd_lower.contains("git fetch")
+            || cmd_lower.contains("git pull")
+            || cmd_lower.contains("git push")
+            || cmd_lower.contains("npm install")
+            || cmd_lower.contains("npm i")
+            || cmd_lower.contains("pip install")
+            || cmd_lower.contains("cargo install")
+        {
+            effects.push(DeclaredEffect::NetworkAccess);
+        }
+
+        // Detect publish/deploy commands
+        if cmd_lower.contains("git push")
+            || cmd_lower.contains("npm publish")
+            || cmd_lower.contains("cargo publish")
+            || cmd_lower.contains("docker push")
+            || cmd_lower.contains("deploy")
+        {
+            effects.push(DeclaredEffect::ExternalServicePublish);
+        }
+
+        effects.sort_by_key(|e| e.to_string());
+        effects.dedup();
+        effects
+    }
+}
+
+/// Classifies declared effects for a shell command string without claiming sandboxing.
+pub fn classify_shell_effects(command: &str) -> Vec<crate::runtime::capabilities::DeclaredEffect> {
+    analyze_command(command).classify_declared_effects()
+}
+
 /// Evaluates a shell command against a policy profile.
 pub fn evaluate(profile: ShellPolicyProfile, command: &str) -> ShellCommandDecision {
     let report = analyze_command(command);

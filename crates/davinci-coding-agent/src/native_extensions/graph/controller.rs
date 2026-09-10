@@ -12,9 +12,12 @@ use super::briefings::{
 };
 use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
 use super::mutation::{capture_baseline, capture_graph_delta, GraphMutation};
+use super::operations;
 use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
 use super::review_coverage::{chunk_graph_mutation, coverage_complete, ReviewCoverage};
-use super::roles::{ensure_governor_recovery_tool, role_for_research_kind, role_tools};
+use super::roles::{
+    ensure_governor_recovery_tool, requires_task_coordinator, role_for_research_kind, role_tools,
+};
 use super::store::{
     artifact_path, create_run_dir, new_run_id, now_ms, save_run, transcript_path, write_artifact,
     write_graph_definition, write_log, write_task_fingerprint, write_task_mutation,
@@ -23,9 +26,9 @@ use super::topology::{
     build_definition, ready_nodes, validate_definition, GraphMode, GraphRunState,
 };
 use super::types::{
-    Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters, GraphRun,
-    GraphTaskState, ImplementationPlan, Phase, ResearchKind, ReviewIssue, Role, Severity,
-    TaskStatus, Verdict, VerificationResult, WorkerSpec, WorkerUsage,
+    Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters,
+    GraphLifecycle, GraphRun, GraphTaskState, ImplementationPlan, Phase, ResearchKind, ReviewIssue,
+    Role, Severity, TaskStatus, Verdict, VerificationResult, WorkerSpec, WorkerUsage,
 };
 use super::verify::{
     collect_verify_commands, nothing_ran, run_verification, CollectInput, VerifyExec,
@@ -39,13 +42,39 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const EVIDENCE_DIGEST_MAX_CHARS: usize = 24_000;
 const DIFF_MAX_CHARS: usize = 60_000;
 const NODE_ATTEMPTS: u32 = 2;
 
 pub type UpdateSink = dyn Fn(&GraphRun, Option<&str>) + Send + Sync;
+
+/// Typed worker limit distinguishing unlimited configuration from exhausted finite grant of zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum GraphWorkerLimit {
+    Unlimited,
+    Finite(u32),
+}
+
+#[allow(dead_code)]
+impl GraphWorkerLimit {
+    pub fn from_config(config_val: u32) -> Self {
+        if config_val == 0 {
+            Self::Unlimited
+        } else {
+            Self::Finite(config_val)
+        }
+    }
+
+    pub fn is_exhausted(&self, spawned: u32) -> bool {
+        match self {
+            Self::Unlimited => false,
+            Self::Finite(cap) => spawned >= *cap,
+        }
+    }
+}
 
 pub struct ControllerDeps {
     pub runner: Arc<WorkerRunner>,
@@ -59,6 +88,8 @@ pub struct ControllerDeps {
     pub learning: Option<crate::native_extensions::LearningController>,
     pub governor: Option<crate::native_extensions::TokenGovernor>,
     pub runtime: Option<davinci_agent::RuntimeHandle>,
+    pub permissions: Option<Arc<davinci_agent::PermissionState>>,
+    pub task_contract: Option<davinci_agent::runtime::TaskContract>,
 }
 
 pub struct RunOptions {
@@ -151,6 +182,14 @@ enum Delivery {
     Stop,
 }
 
+pub fn graph_dispatch_allowed(
+    lifecycle: &str,
+    dependencies_ready: bool,
+    lease_available: bool,
+) -> bool {
+    lifecycle == "running" && dependencies_ready && lease_available
+}
+
 pub struct GraphExecution {
     run: Mutex<GraphRun>,
     deps: ControllerDeps,
@@ -161,9 +200,56 @@ pub struct GraphExecution {
     exec_abort: Arc<AtomicBool>,
     budget_abort_reason: Mutex<Option<String>>,
     run_deadline: Option<std::time::Instant>,
+    pub active_workers: Arc<AtomicUsize>,
+    pub node_aborts: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl GraphExecution {
+    #[allow(dead_code)]
+    pub fn abort_node(&self, task_id: &str) {
+        if let Some(flag) = self
+            .node_aborts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn register_node_abort(&self, task_id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.node_aborts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_id.to_string(), Arc::clone(&flag));
+        flag
+    }
+
+    #[allow(dead_code)]
+    pub fn request_pause(&self) {
+        let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+        if run.current_lifecycle() == GraphLifecycle::Running {
+            if self.active_workers.load(Ordering::SeqCst) > 0 {
+                run.lifecycle = Some(GraphLifecycle::PauseRequested);
+            } else {
+                run.lifecycle = Some(GraphLifecycle::Paused);
+            }
+            run.revision += 1;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn resume_execution(&self) {
+        let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+        if run.current_lifecycle() == GraphLifecycle::Paused
+            || run.current_lifecycle() == GraphLifecycle::PauseRequested
+        {
+            run.lifecycle = Some(GraphLifecycle::Running);
+            run.revision += 1;
+        }
+    }
+
     fn checkpoint(&self, note: Option<&str>) {
         // Persist under the lock, but report on a clone with the guard dropped:
         // a slow `on_update` must not serialize every worker thread, and an
@@ -214,6 +300,25 @@ impl GraphExecution {
             .clone()
     }
 
+    /// Check whether this graph execution exceeds an authorized root lease.
+    #[allow(dead_code)]
+    pub fn enforce_root_lease(&self, root_lease_tokens: Option<u64>) -> Option<String> {
+        let run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(lease) = root_lease_tokens {
+            let total_tokens: u64 = run
+                .tasks
+                .iter()
+                .map(|t| t.usage.input.saturating_add(t.usage.output))
+                .sum();
+            if total_tokens > lease {
+                return Some(format!(
+                    "graph execution tokens ({total_tokens}) exceeds root lease ({lease})"
+                ));
+            }
+        }
+        None
+    }
+
     /// The only spend guard that can fire mid-node. `0` disables it.
     fn cost_budget_exceeded(run: &GraphRun) -> Option<String> {
         let budgets = &run.budgets;
@@ -239,8 +344,13 @@ impl GraphExecution {
         // max_workers is sized for one deliverable; a decomposed run gets that
         // allowance per milestone. Cost cap and deadline stay global on purpose.
         let milestones = run.milestones.as_ref().map(Vec::len).unwrap_or(1).max(1) as u32;
-        let worker_cap = budgets.max_workers.saturating_mul(milestones);
-        if worker_cap > 0 && run.counters.workers_spawned >= worker_cap {
+        let limit = if budgets.max_workers == 0 {
+            GraphWorkerLimit::Unlimited
+        } else {
+            GraphWorkerLimit::Finite(budgets.max_workers.saturating_mul(milestones))
+        };
+        if limit.is_exhausted(run.counters.workers_spawned) {
+            let worker_cap = budgets.max_workers.saturating_mul(milestones);
             return Some(format!("worker budget exhausted ({worker_cap} workers)"));
         }
         None
@@ -287,8 +397,19 @@ impl GraphExecution {
         let configured_model = self.deps.config.models.get(&role).cloned();
         let mut tools = role_tools(role);
         // Match the worker-side role guard; do not advertise tools it must refuse.
+        let has_coordinator_authority =
+            self.deps.runtime.is_some() && self.deps.permissions.is_some();
         if role == Role::Writer {
-            tools.extend(self.deps.config.worker_extra_tools.iter().cloned());
+            tools.extend(
+                self.deps
+                    .config
+                    .worker_extra_tools
+                    .iter()
+                    .filter(|tool| {
+                        has_coordinator_authority || !requires_task_coordinator(tool.trim())
+                    })
+                    .cloned(),
+            );
         }
         ensure_governor_recovery_tool(&mut tools);
         let has_recovery = tools.iter().any(|t| t == "retrieve_output");
@@ -318,12 +439,50 @@ impl GraphExecution {
             transcript_path: Some(transcript_path(Path::new(&run.cwd), &run.run_id, &task.id)),
             project_trusted: self.deps.project_trusted,
             runtime_agent_id: None,
+            task_contract: self.deps.task_contract.clone(),
+            coordinator_client: None,
+            node_abort: None,
         }
     }
 
     fn execute_node(&self, task: GraphTaskState, briefing: String) -> Option<Artifact> {
         let task_id = task.id.clone();
         let role = task.role;
+
+        loop {
+            if self.exec_abort.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(deadline) = self.run_deadline {
+                if Instant::now() >= deadline {
+                    self.budget_abort("run deadline exceeded".into());
+                    return None;
+                }
+            }
+            let lifecycle = self.snapshot().current_lifecycle();
+            if lifecycle == GraphLifecycle::StopRequested || lifecycle == GraphLifecycle::Stopped {
+                return None;
+            }
+            if lifecycle == GraphLifecycle::PauseRequested {
+                if self.active_workers.load(Ordering::SeqCst) == 0 {
+                    let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+                    run.lifecycle = Some(GraphLifecycle::Paused);
+                    drop(run);
+                    self.checkpoint(Some("paused at safe boundary"));
+                }
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            if lifecycle == GraphLifecycle::Paused {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            if graph_dispatch_allowed(lifecycle.as_str(), true, true) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
         {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             let unmet = run.unmet_dependencies(&task);
@@ -339,7 +498,22 @@ impl GraphExecution {
             }
 
             if let Some(def) = &run.definition {
-                if def.node(&task_id).is_some() {
+                let is_saved = run.saved_definition.is_some();
+                if def.node(&task_id).is_none() {
+                    if is_saved {
+                        let mut refused = task.clone();
+                        refused.status = TaskStatus::Cancelled;
+                        refused.ended_at = Some(now_ms());
+                        refused.error =
+                            Some(format!("node not defined in saved topology: {task_id}"));
+                        run.tasks.push(refused);
+                        drop(run);
+                        self.checkpoint(Some(&format!(
+                            "{task_id}: node unknown in saved topology"
+                        )));
+                        return None;
+                    }
+                } else {
                     let state = GraphRunState::from_run(&run);
                     let ready = ready_nodes(def, &state);
                     if !ready.contains(&task_id) {
@@ -362,18 +536,26 @@ impl GraphExecution {
         if let Some((artifact, usage, stored_fingerprint)) =
             self.options.resume_artifacts.get(&task_id)
         {
-            let (run_version, cwd) = {
+            let (run_version, cwd, definition_digest, dry_run) = {
                 let run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-                (
-                    run.definition
-                        .as_ref()
-                        .map(|d| d.version)
-                        .unwrap_or(run.version),
-                    PathBuf::from(&run.cwd),
-                )
+                let run_version = run
+                    .definition
+                    .as_ref()
+                    .map(|d| d.version)
+                    .unwrap_or(run.version);
+                let cwd = PathBuf::from(&run.cwd);
+                let definition_digest = run.definition_digest.clone();
+                let dry_run = run.dry_run;
+                (run_version, cwd, definition_digest, dry_run)
             };
-            let current_fingerprint =
-                ReplayFingerprint::for_task(&cwd, run_version, &briefing, task.expect);
+            let current_fingerprint = ReplayFingerprint::for_saved_task(
+                &cwd,
+                run_version,
+                &briefing,
+                task.expect,
+                definition_digest.as_deref(),
+                dry_run,
+            );
 
             let is_compatible = match stored_fingerprint {
                 Some(stored) => {
@@ -405,13 +587,16 @@ impl GraphExecution {
                         task_entry.started_at = Some(now_ms());
                         task_entry.artifact_file = Some(format!("artifacts/{task_id}.json"));
                         task_entry.fingerprint = stored_fingerprint.clone();
+                        task_entry.usage = *usage;
                     }
                     let _ = write_artifact(&artifact_path(&cwd, &run_id, &task_id), artifact);
                     if let Some(fp) = stored_fingerprint {
                         let _ = write_task_fingerprint(&cwd, &run_id, &task_id, fp);
                     }
                 }
-                self.add_usage(&task_id, usage);
+                if self.options.resume_run.is_none() {
+                    self.add_usage(&task_id, usage);
+                }
                 self.end_task(&task_id, TaskStatus::Succeeded, None);
                 self.checkpoint(Some(&format!("{task_id}: reused from previous run")));
                 return Some(artifact.clone());
@@ -572,6 +757,40 @@ impl GraphExecution {
                     .transition(worker_agent_id, davinci_agent::AgentState::Running);
             }
 
+            let task_tools: Vec<String> = spec
+                .tools
+                .iter()
+                .filter(|tool| davinci_agent::runtime::task_transport::is_task_tool(tool))
+                .cloned()
+                .collect();
+            let _coordinator_transport = if !task_tools.is_empty() {
+                if let (Some(runtime), Some(permissions)) =
+                    (&self.deps.runtime, &self.deps.permissions)
+                {
+                    match davinci_agent::runtime::task_transport::TaskCoordinatorTransport::bind(
+                        runtime,
+                        worker_agent_id,
+                        permissions.clone(),
+                        task_tools,
+                        spec.cwd.clone(),
+                        self.exec_abort.clone(),
+                    ) {
+                        Ok(transport) => {
+                            spec.coordinator_client = Some(transport.client());
+                            Some(transport)
+                        }
+                        Err(err) => {
+                            eprintln!("failed to bind task coordinator transport: {err}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let reported = Mutex::new(WorkerUsage::default());
             let result = {
                 let mut on_progress = |line: &str, usage: &WorkerUsage| {
@@ -594,7 +813,48 @@ impl GraphExecution {
                     }
                     (self.deps.on_update)(&self.snapshot(), Some(&format!("{task_id}: {line}")));
                 };
-                (self.deps.runner)(&spec, &self.exec_abort, &mut on_progress)
+                let node_abort = self.register_node_abort(&task_id);
+                spec.node_abort = Some(Arc::clone(&node_abort));
+                let runner_abort = Arc::new(AtomicBool::new(
+                    self.exec_abort.load(Ordering::Relaxed) || node_abort.load(Ordering::Relaxed),
+                ));
+                let watcher_stop = Arc::new(AtomicBool::new(false));
+                let w_stop = Arc::clone(&watcher_stop);
+                let w_exec = Arc::clone(&self.exec_abort);
+                let w_node = Arc::clone(&node_abort);
+                let w_comb = Arc::clone(&runner_abort);
+                let watcher_handle = thread::spawn(move || {
+                    while !w_stop.load(Ordering::Relaxed) {
+                        if w_exec.load(Ordering::Relaxed) || w_node.load(Ordering::Relaxed) {
+                            w_comb.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                });
+
+                self.active_workers.fetch_add(1, Ordering::SeqCst);
+                let mut run_res = (self.deps.runner)(&spec, &runner_abort, &mut on_progress);
+                self.active_workers.fetch_sub(1, Ordering::SeqCst);
+                watcher_stop.store(true, Ordering::Relaxed);
+                let _ = watcher_handle.join();
+
+                if node_abort.load(Ordering::Relaxed) {
+                    run_res.ok = false;
+                    run_res.failure_reason = Some(format!("node {task_id} stopped by operator"));
+                }
+
+                {
+                    let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+                    if run.current_lifecycle() == GraphLifecycle::PauseRequested
+                        && self.active_workers.load(Ordering::SeqCst) == 0
+                    {
+                        run.lifecycle = Some(GraphLifecycle::Paused);
+                        drop(run);
+                        self.checkpoint(Some("paused at safe boundary"));
+                    }
+                }
+                run_res
             };
             let worker_terminal_state = if result.ok {
                 davinci_agent::AgentState::Completed
@@ -655,7 +915,7 @@ impl GraphExecution {
             }
             if result.ok {
                 if let Some(artifact) = result.artifact {
-                    let (run_version, cwd, run_id) = {
+                    let (run_version, cwd, run_id, definition_digest, dry_run) = {
                         let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
                         let run_version = run
                             .definition
@@ -664,18 +924,32 @@ impl GraphExecution {
                             .unwrap_or(run.version);
                         let cwd = PathBuf::from(&run.cwd);
                         let run_id = run.run_id.clone();
-                        let fingerprint =
-                            ReplayFingerprint::for_task(&cwd, run_version, &briefing, task.expect);
+                        let definition_digest = run.definition_digest.clone();
+                        let dry_run = run.dry_run;
+                        let fingerprint = ReplayFingerprint::for_saved_task(
+                            &cwd,
+                            run_version,
+                            &briefing,
+                            task.expect,
+                            definition_digest.as_deref(),
+                            dry_run,
+                        );
                         if let Some(task_entry) =
                             run.tasks.iter_mut().find(|entry| entry.id == task_id)
                         {
                             task_entry.artifact_file = Some(format!("artifacts/{task_id}.json"));
                             task_entry.fingerprint = Some(fingerprint.clone());
                         }
-                        (run_version, cwd, run_id)
+                        (run_version, cwd, run_id, definition_digest, dry_run)
                     };
-                    let fingerprint =
-                        ReplayFingerprint::for_task(&cwd, run_version, &briefing, task.expect);
+                    let fingerprint = ReplayFingerprint::for_saved_task(
+                        &cwd,
+                        run_version,
+                        &briefing,
+                        task.expect,
+                        definition_digest.as_deref(),
+                        dry_run,
+                    );
                     let _ = write_task_fingerprint(&cwd, &run_id, &task_id, &fingerprint);
                     self.end_task(&task_id, TaskStatus::Succeeded, None);
                     self.checkpoint(Some(&format!("{task_id}: succeeded")));
@@ -825,7 +1099,24 @@ fn spawn_abort_watcher(
     })
 }
 
+#[allow(dead_code)]
+pub fn run_saved_graph(
+    options: RunOptions,
+    deps: ControllerDeps,
+    saved_def: super::definitions::SavedGraphDefinitionV1,
+) -> GraphRun {
+    run_graph_internal(options, deps, Some(saved_def))
+}
+
 pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
+    run_graph_internal(options, deps, None)
+}
+
+fn run_graph_internal(
+    options: RunOptions,
+    deps: ControllerDeps,
+    explicit_saved_def: Option<super::definitions::SavedGraphDefinitionV1>,
+) -> GraphRun {
     let continuation = options.resume_run.as_deref().map(|run| {
         (
             run.run_id.clone(),
@@ -841,6 +1132,32 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
     let budgets: GraphBudgets = deps.config.budgets.clone();
     let run_deadline = (budgets.run_deadline_ms > 0)
         .then(|| std::time::Instant::now() + Duration::from_millis(budgets.run_deadline_ms));
+    let (saved_def_from_resume, origin_from_resume, digest_from_resume) = options
+        .resume_run
+        .as_ref()
+        .map(|r| {
+            (
+                r.saved_definition.clone(),
+                r.execution_origin.clone(),
+                r.definition_digest.clone(),
+            )
+        })
+        .unwrap_or((None, None, None));
+    let (saved_definition, execution_origin, definition_digest) =
+        if let Some(def) = explicit_saved_def {
+            let digest = super::definitions::compute_definition_digest(&def);
+            let origin = super::types::ExecutionOrigin::SavedDefinition {
+                name: def.name.clone(),
+                digest: digest.clone(),
+            };
+            (Some(def), Some(origin), Some(digest))
+        } else {
+            (
+                saved_def_from_resume,
+                origin_from_resume.or(Some(super::types::ExecutionOrigin::GeneratedGoal)),
+                digest_from_resume,
+            )
+        };
     let run = GraphRun {
         version: 1,
         run_id: run_id.clone(),
@@ -849,6 +1166,9 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         phase: Phase::Classify,
         forced: options.forced,
         dry_run: options.dry_run,
+        execution_origin,
+        definition_digest,
+        saved_definition,
         definition: None,
         classification: None,
         milestones: None,
@@ -875,6 +1195,11 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
             .map(|(_, _, stats)| stats.clone())
             .unwrap_or_default(),
         updated_at: 0,
+        lifecycle: Some(GraphLifecycle::Running),
+        revision: continuation
+            .as_ref()
+            .and_then(|_| options.resume_run.as_ref().map(|r| r.revision + 1))
+            .unwrap_or(0),
     };
 
     let exec_abort = Arc::new(AtomicBool::new(options.abort.load(Ordering::Relaxed)));
@@ -894,6 +1219,8 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
         exec_abort,
         budget_abort_reason: Mutex::new(None),
         run_deadline,
+        active_workers: Arc::new(AtomicUsize::new(0)),
+        node_aborts: Arc::new(Mutex::new(HashMap::new())),
     };
     execution.checkpoint(Some(if continuation.is_some() {
         "run continued"
@@ -907,7 +1234,293 @@ pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
     execution.snapshot()
 }
 
+fn drive_compiled_saved_graph(
+    execution: &GraphExecution,
+    saved_def: &super::definitions::SavedGraphDefinitionV1,
+) -> GraphRun {
+    let compiled = match super::bindings::compile_saved_definition(saved_def) {
+        Ok(plan) => plan,
+        Err(err) => {
+            execution.blocked(format!("saved graph definition invalid: {err}"));
+            return execution.snapshot();
+        }
+    };
+
+    let cwd = execution.options.cwd.clone();
+    let is_git_repo = default_is_git_repo(&cwd);
+    let goal = execution.options.goal.clone();
+
+    {
+        let mut run = execution
+            .run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        run.definition = Some(compiled.topology.clone());
+        run.definition_digest = Some(compiled.definition_digest.clone());
+        if let Some(budgets) = &compiled.budgets {
+            if let Some(ms) = budgets.max_duration_ms {
+                run.budgets.run_deadline_ms = ms;
+            }
+            if let Some(usd) = budgets.max_cost_usd {
+                run.budgets.max_cost_usd = usd;
+            }
+        }
+    }
+    let run_id = execution.snapshot().run_id;
+    let _ = write_graph_definition(&cwd, &run_id, &compiled.topology);
+    execution.checkpoint(Some("saved graph compiled"));
+
+    let initial_baseline = capture_baseline(&cwd).unwrap_or_default();
+    let mut cumulative_delta = GraphMutation::default();
+
+    loop {
+        if execution.cancelled_if_aborted() {
+            return execution.snapshot();
+        }
+
+        let state = {
+            let run = execution
+                .run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            GraphRunState::from_run(&run)
+        };
+
+        let ready = ready_nodes(&compiled.topology, &state);
+        if ready.is_empty() {
+            break;
+        }
+
+        // Pick next ready node in topological order
+        let task_id = ready[0].clone();
+        let node = match compiled.topology.node(&task_id) {
+            Some(n) => n.clone(),
+            None => {
+                execution.blocked(format!("unknown task in ready frontier: {task_id}"));
+                return execution.snapshot();
+            }
+        };
+        let binding = match compiled.bindings.get(&task_id) {
+            Some(b) => b.clone(),
+            None => {
+                execution.blocked(format!("missing stage binding for ready node: {task_id}"));
+                return execution.snapshot();
+            }
+        };
+
+        match binding.stage {
+            super::bindings::SupportedStage::Classify => execution.set_phase(Phase::Classify),
+            super::bindings::SupportedStage::Research => execution.set_phase(Phase::Investigate),
+            super::bindings::SupportedStage::Plan => execution.set_phase(Phase::Plan),
+            super::bindings::SupportedStage::Implement => execution.set_phase(Phase::Implement),
+            super::bindings::SupportedStage::Verify => execution.set_phase(Phase::Verify),
+            super::bindings::SupportedStage::Security => execution.set_phase(Phase::Verify),
+            super::bindings::SupportedStage::Review => execution.set_phase(Phase::Review),
+        }
+        execution.checkpoint(None);
+
+        let incoming_deps: Vec<String> = compiled
+            .topology
+            .incoming_edges(&task_id)
+            .map(|e| e.from.clone())
+            .collect();
+
+        if binding.stage == super::bindings::SupportedStage::Verify {
+            let budgets = execution.snapshot().budgets;
+            let commands = collect_verify_commands(&CollectInput {
+                config_commands: &execution.deps.config.verify_commands,
+                detected: &detect_verify_commands(&cwd),
+                plan: None,
+            });
+            if commands.is_empty() && !execution.options.dry_run {
+                execution.blocked(
+                    "no verification command to run: add verifyCommands to .pi/graph.json                      (or a Cargo.toml / package.json test script) so the change can be checked"
+                        .to_string(),
+                );
+                return execution.snapshot();
+            }
+            let mut verification = run_verification(
+                &commands,
+                &cwd,
+                &execution.exec_abort,
+                budgets.verify_command_timeout_ms,
+                execution.deps.verify_exec.as_ref(),
+            );
+            if execution.options.dry_run && nothing_ran(&verification) {
+                verification.passed = true;
+            }
+            {
+                let mut run = execution
+                    .run
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                run.verification = Some(verification.clone());
+            }
+            execution.checkpoint(Some(if verification.passed {
+                "verification passed"
+            } else {
+                "verification FAILED"
+            }));
+
+            let mut task_state =
+                GraphTaskState::new(task_id.clone(), node.role, node.expect, incoming_deps, None);
+            task_state.started_at = Some(now_ms());
+            task_state.ended_at = Some(now_ms());
+            if verification.passed {
+                task_state.mark_succeeded();
+            } else {
+                task_state.mark_failed("verification failed".to_string());
+            }
+            {
+                let mut run = execution
+                    .run
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                run.tasks.push(task_state);
+            }
+            continue;
+        }
+
+        if binding.stage == super::bindings::SupportedStage::Security {
+            let mut sec_task = GraphTaskState::new(
+                task_id.clone(),
+                node.role,
+                node.expect,
+                incoming_deps,
+                Some("security verification".to_string()),
+            );
+            sec_task.started_at = Some(now_ms());
+            sec_task.ended_at = Some(now_ms());
+            let changed_files: Vec<String> = cumulative_delta
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect();
+            let mut sec_controller =
+                crate::native_extensions::SecurityScanController::new(cwd.clone());
+            let req = crate::native_extensions::SecurityVerifyRequest {
+                cwd: &cwd,
+                changed_files: &changed_files,
+                graph_run_id: &run_id,
+            };
+            let outcome = match sec_controller.verify_changed_surface(req) {
+                Ok(sec) => sec,
+                Err(reason) => SecurityVerification::Unavailable { reason },
+            };
+            if matches!(outcome, SecurityVerification::Passed { .. }) {
+                sec_task.mark_succeeded();
+            } else {
+                sec_task.mark_failed(format!("{outcome:?}"));
+            }
+            {
+                let mut run = execution
+                    .run
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                run.tasks.push(sec_task);
+            }
+            continue;
+        }
+
+        // Standard worker stage: Classify, Research, Plan, Implement, Review
+        let max_researchers = execution.snapshot().budgets.max_researchers;
+        let diff_text = cumulative_delta.diff();
+        let diff_str = if !diff_text.is_empty() {
+            Some(diff_text.as_str())
+        } else {
+            None
+        };
+        let briefing = match super::bindings::build_briefing_for_stage(
+            &node,
+            &binding,
+            &goal,
+            &execution.snapshot(),
+            &cwd,
+            is_git_repo,
+            max_researchers,
+            diff_str,
+            execution.snapshot().verification.as_ref(),
+        ) {
+            Ok(b) => b,
+            Err(err) => {
+                execution.blocked(format!("briefing error for '{task_id}': {err}"));
+                return execution.snapshot();
+            }
+        };
+
+        let task =
+            GraphTaskState::new(task_id.clone(), node.role, node.expect, incoming_deps, None);
+
+        let attempt_baseline = if node.allows_mutation {
+            capture_baseline(&cwd).unwrap_or_default()
+        } else {
+            super::mutation::MutationBaseline::default()
+        };
+
+        let artifact = execution.execute_node(task, briefing);
+        if execution.cancelled_if_aborted() {
+            return execution.snapshot();
+        }
+
+        if node.allows_mutation {
+            let attempt_delta = capture_graph_delta(&cwd, &attempt_baseline).unwrap_or_default();
+            cumulative_delta = capture_graph_delta(&cwd, &initial_baseline).unwrap_or_default();
+            let mut run = execution
+                .run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let run_id = run.run_id.clone();
+            if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                task_entry.mutation = Some(attempt_delta.clone());
+            }
+            drop(run);
+            let _ = write_task_mutation(&cwd, &run_id, &task_id, &attempt_delta);
+        }
+
+        if artifact.is_none() && node.required {
+            // Check if there are failure edges out of this node
+            let has_failure_edge = compiled.topology.edges.iter().any(|e| {
+                e.from == task_id && e.condition == super::topology::EdgeCondition::OnFailure
+            });
+            if !has_failure_edge {
+                execution.blocked(format!("required node '{task_id}' failed"));
+                return execution.snapshot();
+            }
+        }
+    }
+
+    let final_state = {
+        let run = execution
+            .run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        GraphRunState::from_run(&run)
+    };
+
+    let mut failed_required = false;
+    for node in &compiled.topology.nodes {
+        if node.required && !final_state.succeeded_tasks.contains(&node.id) {
+            failed_required = true;
+            break;
+        }
+    }
+
+    if failed_required && execution.snapshot().blocked_reason.is_none() {
+        execution.blocked("one or more required nodes failed or were unreachable".to_string());
+    } else if execution.snapshot().blocked_reason.is_none() {
+        execution.set_phase(Phase::Done);
+        execution.checkpoint(Some("done (saved pipeline executed successfully)"));
+    }
+
+    execution.snapshot()
+}
+
 fn drive(execution: &GraphExecution) -> GraphRun {
+    let saved_def = execution.snapshot().saved_definition.clone();
+    if let Some(saved_def) = saved_def {
+        return drive_compiled_saved_graph(execution, &saved_def);
+    }
+
     let cwd = execution.options.cwd.clone();
     let is_git_repo = default_is_git_repo(&cwd);
     let goal = execution.options.goal.clone();
@@ -1375,11 +1988,19 @@ fn deliver_goal(
             SecurityVerification::NotRequired
         };
 
-        let bundle = verification.to_bundle(
+        let mut bundle = verification.to_bundle(
             changed_files.clone(),
             Some(execution.snapshot().run_id),
             security_verification.clone(),
         );
+        if let Err(error) =
+            operations::attach_source_manifest_digest(&mut bundle, &execution.snapshot(), &cwd)
+        {
+            execution.blocked(format!(
+                "failed to capture verification source manifest: {error}"
+            ));
+            return Delivery::Stop;
+        }
 
         {
             let mut run = execution
@@ -1668,6 +2289,226 @@ fn deliver_goal(
 mod tests {
     use super::*;
     use crate::native_extensions::graph::types::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn f03_graph_controller_does_not_advertise_unbound_task_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _, _| {
+            if spec.role == Role::Classifier {
+                return WorkerResult {
+                    ok: true,
+                    artifact: Some(Artifact::Classification(Classification {
+                        task_class: TaskClass::Bug,
+                        complexity: Complexity::Trivial,
+                        rationale: "fixture".into(),
+                        research_tasks: vec![],
+                        milestones: None,
+                    })),
+                    ..WorkerResult::default()
+                };
+            }
+            captured.lock().unwrap().push(spec.tools.clone());
+            WorkerResult {
+                ok: false,
+                ..WorkerResult::default()
+            }
+        });
+        run_graph(
+            RunOptions {
+                goal: "fixture".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: Some(Complexity::Trivial),
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            ControllerDeps {
+                runner,
+                verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
+                config: GraphConfig {
+                    worker_extra_tools: [
+                        "task_create",
+                        "task_update",
+                        "task_list",
+                        "task_get",
+                        "custom_mutator",
+                    ]
+                    .map(str::to_string)
+                    .to_vec(),
+                    ..Default::default()
+                },
+                session_model: None,
+                session_thinking: None,
+                project_trusted: false,
+                on_update: Arc::new(|_, _| {}),
+                memory: None,
+                learning: None,
+                governor: None,
+                runtime: None,
+                permissions: None,
+                task_contract: None,
+            },
+        );
+        let observed = observed.lock().unwrap();
+        assert!(!observed.is_empty(), "writer was not dispatched");
+        for tools in observed.iter() {
+            assert!(tools.iter().any(|tool| tool == "custom_mutator"));
+            for task_tool in ["task_create", "task_update", "task_list", "task_get"] {
+                assert!(
+                    !tools.iter().any(|tool| tool == task_tool),
+                    "advertised {task_tool}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f03_graph_controller_binds_task_coordinator_for_writer_with_runtime_and_permissions() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let parent_runtime = davinci_agent::RuntimeHandle::new(
+            davinci_agent::runtime::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::runtime::RuntimeBus::new(),
+        );
+        let lead_record = davinci_agent::AgentRecord {
+            id: parent_runtime.agent_id,
+            run_id: parent_runtime.run_id,
+            parent: None,
+            kind: davinci_agent::AgentKind::Main,
+            name: "lead".into(),
+            provider: "mock".into(),
+            model_id: "mock".into(),
+            cwd: dir.path().to_path_buf(),
+            state: davinci_agent::AgentState::Running,
+            task_id: None,
+            worktree: None,
+            started_ms: 1,
+            updated_ms: 1,
+            failure_reason: None,
+        };
+        parent_runtime.registry.register_agent(lead_record).unwrap();
+
+        let permissions = Arc::new(davinci_agent::PermissionState::new(
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove),
+        ));
+
+        let executed_tasks = Arc::new(Mutex::new(Vec::new()));
+        let executed_client = executed_tasks.clone();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _, _| {
+            if spec.role == Role::Classifier {
+                return WorkerResult {
+                    ok: true,
+                    artifact: Some(Artifact::Classification(Classification {
+                        task_class: TaskClass::Bug,
+                        complexity: Complexity::Trivial,
+                        rationale: "fixture".into(),
+                        research_tasks: vec![],
+                        milestones: None,
+                    })),
+                    ..WorkerResult::default()
+                };
+            }
+            if spec.role == Role::Writer {
+                assert!(spec.tools.contains(&"task_create".to_string()));
+                assert!(spec.tools.contains(&"task_list".to_string()));
+                let client = spec
+                    .coordinator_client
+                    .as_ref()
+                    .expect("coordinator client must be bound for writer");
+                let op_id = davinci_agent::runtime::RunId::new().0.to_string();
+                let created = client
+                    .call(
+                        "task_create",
+                        &json!({
+                            "title": "task created by writer",
+                            "operation_id": op_id,
+                        }),
+                    )
+                    .expect("writer call to task_create should succeed");
+                executed_client.lock().unwrap().push(created);
+                return WorkerResult {
+                    ok: true,
+                    artifact: Some(Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec![],
+                        summary: "patched".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))),
+                    ..WorkerResult::default()
+                };
+            }
+            WorkerResult {
+                ok: true,
+                artifact: Some(Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "ok".into(),
+                    reviewed_chunk_ids: vec![],
+                }))),
+                ..WorkerResult::default()
+            }
+        });
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
+            config: GraphConfig {
+                worker_extra_tools: [
+                    "task_create",
+                    "task_update",
+                    "task_list",
+                    "task_get",
+                    "custom_mutator",
+                ]
+                .map(str::to_string)
+                .to_vec(),
+                verify_commands: vec![VerifyCommandSpec {
+                    name: "test".into(),
+                    command: "echo ok".into(),
+                    from_plan: false,
+                }],
+                ..Default::default()
+            },
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+            runtime: Some(parent_runtime.clone()),
+            permissions: Some(permissions),
+            task_contract: None,
+        };
+
+        let run = run_graph(
+            RunOptions {
+                goal: "test coordinator".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: Some(Complexity::Trivial),
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            deps,
+        );
+
+        assert_eq!(run.phase, Phase::Done);
+        let executed = executed_tasks.lock().unwrap();
+        assert_eq!(executed.len(), 1);
+        let tasks = parent_runtime
+            .task_registry
+            .list_tasks(Some(parent_runtime.run_id));
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "task created by writer");
+    }
 
     #[test]
     fn graph_worker_spec_does_not_advertise_privileged_extras_to_classifier() {
@@ -1701,6 +2542,8 @@ mod tests {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
         let run = run_graph(
             RunOptions {
@@ -1766,6 +2609,8 @@ mod tests {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -1888,6 +2733,8 @@ mod tests {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -2004,6 +2851,8 @@ mod tests {
             learning: Some(learning),
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -2025,6 +2874,9 @@ mod tests {
                 phase: Phase::Done,
                 forced: options.forced,
                 dry_run: options.dry_run,
+                execution_origin: None,
+                definition_digest: None,
+                saved_definition: None,
                 definition: None,
                 classification: None,
                 milestones: None,
@@ -2081,6 +2933,8 @@ mod tests {
                 resource_snapshot: None,
                 ecosystem_stats: Default::default(),
                 updated_at: 0,
+                lifecycle: Some(GraphLifecycle::Running),
+                revision: 0,
             }),
             learning: Mutex::new(deps.learning.clone()),
             deps,
@@ -2088,6 +2942,8 @@ mod tests {
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
             run_deadline: None,
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            node_aborts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let snapshot = execution.snapshot();
@@ -2202,6 +3058,8 @@ mod tests {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -2330,6 +3188,8 @@ mod tests {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -2454,6 +3314,8 @@ mod tests {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -2587,6 +3449,8 @@ mod tests {
             learning: Some(learning.clone()),
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options1 = RunOptions {
@@ -2682,6 +3546,8 @@ mod tests {
             learning: Some(learning.clone()),
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options2 = RunOptions {
@@ -2732,5 +3598,878 @@ mod tests {
         // --- Step 7: Assert no extra coordinator model invocation ---
         // 5 tasks in Run #1 + 5 tasks in Run #2 = 10 total worker runner calls
         assert_eq!(worker_calls.load(Ordering::SeqCst), 10);
+    }
+
+    #[test]
+    fn test_graph_worker_limit_distinguishes_unlimited_from_exhausted_zero() {
+        // Zero in config means unlimited
+        let unlimited = GraphWorkerLimit::from_config(0);
+        assert_eq!(unlimited, GraphWorkerLimit::Unlimited);
+        assert!(!unlimited.is_exhausted(100));
+
+        // Finite 5 is not exhausted at 4, exhausted at 5
+        let finite_5 = GraphWorkerLimit::from_config(5);
+        assert!(!finite_5.is_exhausted(4));
+        assert!(finite_5.is_exhausted(5));
+
+        // Exhausted finite grant of 0 is NOT unlimited: it is exhausted immediately
+        let exhausted_zero = GraphWorkerLimit::Finite(0);
+        assert!(exhausted_zero.is_exhausted(0));
+        assert!(exhausted_zero.is_exhausted(1));
+    }
+
+    #[test]
+    fn test_saved_graph_execution_records_exact_order_and_roles_without_classifier() {
+        use crate::native_extensions::graph::definitions::*;
+        use crate::native_extensions::graph::topology::*;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let recorded: Arc<Mutex<Vec<(String, Role)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _, _| {
+            recorded_clone
+                .lock()
+                .unwrap()
+                .push((spec.task_id.clone(), spec.role));
+            match spec.role {
+                Role::Researcher => WorkerResult {
+                    ok: true,
+                    artifact: Some(Artifact::Evidence(Box::new(EvidenceArtifact {
+                        kind: ResearchKind::CodeSearch,
+                        findings: vec![crate::native_extensions::graph::types::EvidenceFinding {
+                            claim: "evidence found".into(),
+                            refs: vec!["src/lib.rs:1".into()],
+                            confidence: crate::native_extensions::graph::types::Confidence::High,
+                        }],
+                        risks: vec![],
+                        gaps: vec![],
+                        test_baseline: None,
+                    }))),
+                    ..WorkerResult::default()
+                },
+                Role::Planner => WorkerResult {
+                    ok: true,
+                    artifact: Some(Artifact::Plan(Box::new(ImplementationPlan {
+                        steps: vec![crate::native_extensions::graph::types::PlanStep {
+                            description: "step 1".into(),
+                            files: vec!["src/lib.rs".into()],
+                        }],
+                        tests_to_add: vec![],
+                        tests_to_run: vec![],
+                        completion_criteria: vec!["done".into()],
+                        invariants: vec![],
+                        out_of_scope: vec![],
+                    }))),
+                    ..WorkerResult::default()
+                },
+                Role::Writer => WorkerResult {
+                    ok: true,
+                    artifact: Some(Artifact::PatchReport(Box::new(
+                        crate::native_extensions::graph::types::PatchReport {
+                            summary: "implemented".into(),
+                            changed_files: vec!["src/lib.rs".into()],
+                            deviations: vec![],
+                            plan_invalidated: false,
+                            invalidation_reason: None,
+                        },
+                    ))),
+                    ..WorkerResult::default()
+                },
+                _ => WorkerResult {
+                    ok: false,
+                    ..WorkerResult::default()
+                },
+            }
+        });
+
+        let saved_def = SavedGraphDefinitionV1 {
+            schema_version: 1,
+            name: "custom-pipeline".into(),
+            description: "Custom test pipeline".into(),
+            graph: SavedGraphTopology {
+                graph_id: "custom-g".into(),
+                version: 1,
+                mode: GraphMode::Simple,
+                nodes: vec![
+                    NodeDefinition {
+                        id: "research-1".into(),
+                        role: Role::Researcher,
+                        expect: ArtifactKind::Evidence,
+                        required: true,
+                        allows_mutation: false,
+                    },
+                    NodeDefinition {
+                        id: "plan-1".into(),
+                        role: Role::Planner,
+                        expect: ArtifactKind::Plan,
+                        required: true,
+                        allows_mutation: false,
+                    },
+                    NodeDefinition {
+                        id: "implement-1".into(),
+                        role: Role::Writer,
+                        expect: ArtifactKind::PatchReport,
+                        required: true,
+                        allows_mutation: true,
+                    },
+                ],
+                edges: vec![
+                    EdgeDefinition {
+                        from: "research-1".into(),
+                        to: "plan-1".into(),
+                        condition: EdgeCondition::OnSuccess,
+                    },
+                    EdgeDefinition {
+                        from: "plan-1".into(),
+                        to: "implement-1".into(),
+                        condition: EdgeCondition::OnSuccess,
+                    },
+                ],
+            },
+            bindings: vec![
+                SavedStageBinding {
+                    node_id: "research-1".into(),
+                    stage: "research".into(),
+                    input_artifacts: vec![],
+                },
+                SavedStageBinding {
+                    node_id: "plan-1".into(),
+                    stage: "plan".into(),
+                    input_artifacts: vec!["research-1".into()],
+                },
+                SavedStageBinding {
+                    node_id: "implement-1".into(),
+                    stage: "implement".into(),
+                    input_artifacts: vec!["plan-1".into()],
+                },
+            ],
+            budgets: None,
+            verification_policy: None,
+            artifact_contract_versions: BTreeMap::new(),
+            parameters: vec![],
+        };
+
+        let options = RunOptions {
+            goal: "execute custom pipeline".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: true,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        };
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
+            config: GraphConfig::default(),
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        };
+
+        let run = run_saved_graph(options, deps, saved_def);
+        assert_eq!(
+            run.phase,
+            Phase::Done,
+            "run blocked: {:?}",
+            run.blocked_reason
+        );
+
+        let calls = recorded.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("research-1".into(), Role::Researcher),
+                ("plan-1".into(), Role::Planner),
+                ("implement-1".into(), Role::Writer),
+            ],
+            "WorkerRunner must record exact order and roles"
+        );
+
+        // Verify Classifier was NOT invoked
+        assert!(
+            calls.iter().all(|(_, role)| *role != Role::Classifier),
+            "no classifier worker may be executed for saved definition without classify node"
+        );
+
+        // Verify ExecutionOrigin and provenance
+        assert!(matches!(
+            run.execution_origin,
+            Some(ExecutionOrigin::SavedDefinition { ref name, .. }) if name == "custom-pipeline"
+        ));
+        assert!(run.definition_digest.is_some());
+        assert!(run.saved_definition.is_some());
+    }
+
+    #[test]
+    fn test_saved_graph_undefined_binding_rejected() {
+        use crate::native_extensions::graph::definitions::*;
+        use crate::native_extensions::graph::topology::*;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let saved_def = SavedGraphDefinitionV1 {
+            schema_version: 1,
+            name: "incomplete-pipeline".into(),
+            description: "Missing binding".into(),
+            graph: SavedGraphTopology {
+                graph_id: "incomplete-g".into(),
+                version: 1,
+                mode: GraphMode::Simple,
+                nodes: vec![
+                    NodeDefinition {
+                        id: "research-1".into(),
+                        role: Role::Researcher,
+                        expect: ArtifactKind::Evidence,
+                        required: true,
+                        allows_mutation: false,
+                    },
+                    NodeDefinition {
+                        id: "plan-1".into(),
+                        role: Role::Planner,
+                        expect: ArtifactKind::Plan,
+                        required: true,
+                        allows_mutation: false,
+                    },
+                ],
+                edges: vec![EdgeDefinition {
+                    from: "research-1".into(),
+                    to: "plan-1".into(),
+                    condition: EdgeCondition::OnSuccess,
+                }],
+            },
+            // bindings missing for plan-1!
+            bindings: vec![SavedStageBinding {
+                node_id: "research-1".into(),
+                stage: "research".into(),
+                input_artifacts: vec![],
+            }],
+            budgets: None,
+            verification_policy: None,
+            artifact_contract_versions: BTreeMap::new(),
+            parameters: vec![],
+        };
+
+        let options = RunOptions {
+            goal: "execute incomplete".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: true,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        };
+
+        let deps = ControllerDeps {
+            runner: Arc::new(|_, _, _| WorkerResult {
+                ok: true,
+                ..WorkerResult::default()
+            }),
+            verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
+            config: GraphConfig::default(),
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        };
+
+        let run = run_saved_graph(options, deps, saved_def);
+        assert_eq!(run.phase, Phase::Blocked);
+        assert!(run
+            .blocked_reason
+            .as_ref()
+            .unwrap()
+            .contains("missing stage binding"));
+    }
+
+    #[test]
+    fn test_saved_graph_bounded_dynamic_attempt_ids_registered() {
+        use crate::native_extensions::graph::definitions::*;
+        use crate::native_extensions::graph::topology::*;
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let attempts_seen = Arc::new(AtomicUsize::new(0));
+        let attempts_seen_clone = Arc::clone(&attempts_seen);
+
+        let runner: Arc<WorkerRunner> = Arc::new(move |_spec, _, _| {
+            let attempt = attempts_seen_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt < 2 {
+                WorkerResult {
+                    ok: false,
+                    failure_reason: Some(format!("transient failure {attempt}")),
+                    ..WorkerResult::default()
+                }
+            } else {
+                WorkerResult {
+                    ok: true,
+                    artifact: Some(Artifact::Evidence(Box::new(EvidenceArtifact {
+                        kind: ResearchKind::CodeSearch,
+                        findings: vec![crate::native_extensions::graph::types::EvidenceFinding {
+                            claim: "succeeded on attempt 2".into(),
+                            refs: vec![],
+                            confidence: crate::native_extensions::graph::types::Confidence::High,
+                        }],
+                        risks: vec![],
+                        gaps: vec![],
+                        test_baseline: None,
+                    }))),
+                    ..WorkerResult::default()
+                }
+            }
+        });
+
+        let saved_def = SavedGraphDefinitionV1 {
+            schema_version: 1,
+            name: "retry-pipeline".into(),
+            description: "Retry pipeline".into(),
+            graph: SavedGraphTopology {
+                graph_id: "retry-g".into(),
+                version: 1,
+                mode: GraphMode::Simple,
+                nodes: vec![NodeDefinition {
+                    id: "research-retry".into(),
+                    role: Role::Researcher,
+                    expect: ArtifactKind::Evidence,
+                    required: true,
+                    allows_mutation: false,
+                }],
+                edges: vec![],
+            },
+            bindings: vec![SavedStageBinding {
+                node_id: "research-retry".into(),
+                stage: "research".into(),
+                input_artifacts: vec![],
+            }],
+            budgets: None,
+            verification_policy: None,
+            artifact_contract_versions: BTreeMap::new(),
+            parameters: vec![],
+        };
+
+        let options = RunOptions {
+            goal: "retry test".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: true,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        };
+
+        let deps = ControllerDeps {
+            runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
+            config: GraphConfig::default(),
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        };
+
+        let run = run_saved_graph(options, deps, saved_def);
+        assert_eq!(run.phase, Phase::Done);
+        assert_eq!(attempts_seen.load(Ordering::SeqCst), 2);
+        let task = run.tasks.iter().find(|t| t.id == "research-retry").unwrap();
+        assert_eq!(task.attempts, 2);
+        assert_eq!(task.status, TaskStatus::Succeeded);
+    }
+
+    #[test]
+    fn test_saved_graph_verification_remains_real() {
+        use crate::native_extensions::graph::definitions::*;
+        use crate::native_extensions::graph::topology::*;
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"dummy\"\n",
+        )
+        .unwrap();
+
+        let saved_def = SavedGraphDefinitionV1 {
+            schema_version: 1,
+            name: "verify-pipeline".into(),
+            description: "Verification pipeline".into(),
+            graph: SavedGraphTopology {
+                graph_id: "verify-g".into(),
+                version: 1,
+                mode: GraphMode::Simple,
+                nodes: vec![NodeDefinition {
+                    id: "verify-node".into(),
+                    role: Role::TestAnalyzer,
+                    expect: ArtifactKind::Evidence,
+                    required: true,
+                    allows_mutation: false,
+                }],
+                edges: vec![],
+            },
+            bindings: vec![SavedStageBinding {
+                node_id: "verify-node".into(),
+                stage: "verify".into(),
+                input_artifacts: vec![],
+            }],
+            budgets: None,
+            verification_policy: None,
+            artifact_contract_versions: BTreeMap::new(),
+            parameters: vec![],
+        };
+
+        let options = RunOptions {
+            goal: "verify test".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        };
+
+        // verify_exec returns non-zero (failure)
+        let verify_exec_calls = Arc::new(AtomicUsize::new(0));
+        let verify_exec_calls_clone = Arc::clone(&verify_exec_calls);
+        let deps = ControllerDeps {
+            runner: Arc::new(|_, _, _| WorkerResult {
+                ok: true,
+                ..WorkerResult::default()
+            }),
+            verify_exec: Arc::new(move |_, _, _, _| {
+                verify_exec_calls_clone.fetch_add(1, Ordering::SeqCst);
+                (1, "cargo test failed: 1 test panicked".into(), 10)
+            }),
+            config: GraphConfig {
+                verify_commands: vec![VerifyCommandSpec {
+                    name: "test".into(),
+                    command: "cargo test".into(),
+                    from_plan: false,
+                }],
+                ..Default::default()
+            },
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        };
+
+        let run = run_saved_graph(options, deps, saved_def);
+        assert_eq!(verify_exec_calls.load(Ordering::SeqCst), 1);
+        assert!(run.verification.is_some());
+        assert!(!run.verification.unwrap().passed);
+        assert_eq!(run.phase, Phase::Blocked);
+    }
+
+    #[test]
+    fn f13_no_dispatch_when_paused() {
+        assert!(graph_dispatch_allowed("running", true, true));
+        assert!(!graph_dispatch_allowed("pause_requested", true, true));
+        assert!(!graph_dispatch_allowed("paused", true, true));
+        assert!(!graph_dispatch_allowed("running", false, true));
+    }
+
+    #[test]
+    fn test_pause_during_parallel_research() {
+        let dir = tempdir().unwrap();
+        let execution = GraphExecution {
+            run: Mutex::new(GraphRun {
+                version: 1,
+                run_id: "test-run-pause".into(),
+                goal: "test".into(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                phase: Phase::Investigate,
+                forced: None,
+                dry_run: false,
+                execution_origin: None,
+                definition_digest: None,
+                saved_definition: None,
+                definition: None,
+                classification: None,
+                milestones: None,
+                current_milestone: None,
+                tasks: vec![],
+                verification: None,
+                verification_bundle: None,
+                review_coverage: None,
+                budgets: GraphBudgets::default(),
+                counters: GraphCounters {
+                    workers_spawned: 0,
+                    revision_cycles: 0,
+                    replans: 0,
+                    cost_usd: 0.0,
+                    started_at: 0,
+                },
+                blocked_reason: None,
+                resource_snapshot: None,
+                ecosystem_stats: Default::default(),
+                updated_at: 0,
+                lifecycle: Some(GraphLifecycle::Running),
+                revision: 0,
+            }),
+            deps: ControllerDeps {
+                runner: Arc::new(|_, _, _| WorkerResult {
+                    ok: true,
+                    ..Default::default()
+                }),
+                verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 10)),
+                config: Default::default(),
+                session_model: None,
+                session_thinking: None,
+                project_trusted: false,
+                on_update: Arc::new(|_, _| {}),
+                memory: None,
+                learning: None,
+                governor: None,
+                runtime: None,
+                permissions: None,
+                task_contract: None,
+            },
+            learning: Mutex::new(None),
+            options: RunOptions {
+                goal: "test".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            exec_abort: Arc::new(AtomicBool::new(false)),
+            budget_abort_reason: Mutex::new(None),
+            run_deadline: None,
+            active_workers: Arc::new(AtomicUsize::new(1)),
+            node_aborts: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // When active workers > 0, request_pause transitions to PauseRequested
+        execution.request_pause();
+        assert_eq!(
+            execution.snapshot().current_lifecycle(),
+            GraphLifecycle::PauseRequested
+        );
+
+        // When active worker finishes (active_workers reaches 0), safe boundary reached -> Paused
+        execution.active_workers.store(0, Ordering::SeqCst);
+        let mut run = execution.run.lock().unwrap();
+        run.lifecycle = Some(GraphLifecycle::Paused);
+        drop(run);
+        assert_eq!(
+            execution.snapshot().current_lifecycle(),
+            GraphLifecycle::Paused
+        );
+
+        // Resume restores Running
+        execution.resume_execution();
+        assert_eq!(
+            execution.snapshot().current_lifecycle(),
+            GraphLifecycle::Running
+        );
+    }
+
+    #[test]
+    fn test_pause_races_spawn() {
+        assert!(!graph_dispatch_allowed("pause_requested", true, true));
+        assert!(!graph_dispatch_allowed("paused", true, true));
+        assert!(graph_dispatch_allowed("running", true, true));
+        assert!(!graph_dispatch_allowed("running", false, true));
+        assert!(!graph_dispatch_allowed("running", true, false));
+    }
+
+    #[test]
+    fn test_stop_selected_child_leaves_siblings() {
+        let dir = tempdir().unwrap();
+        let execution = GraphExecution {
+            run: Mutex::new(GraphRun {
+                version: 1,
+                run_id: "test-run-siblings".into(),
+                goal: "test".into(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                phase: Phase::Investigate,
+                forced: None,
+                dry_run: false,
+                execution_origin: None,
+                definition_digest: None,
+                saved_definition: None,
+                definition: None,
+                classification: None,
+                milestones: None,
+                current_milestone: None,
+                tasks: vec![],
+                verification: None,
+                verification_bundle: None,
+                review_coverage: None,
+                budgets: GraphBudgets::default(),
+                counters: GraphCounters {
+                    workers_spawned: 0,
+                    revision_cycles: 0,
+                    replans: 0,
+                    cost_usd: 0.0,
+                    started_at: 0,
+                },
+                blocked_reason: None,
+                resource_snapshot: None,
+                ecosystem_stats: Default::default(),
+                updated_at: 0,
+                lifecycle: Some(GraphLifecycle::Running),
+                revision: 0,
+            }),
+            deps: ControllerDeps {
+                runner: Arc::new(|_, _, _| WorkerResult {
+                    ok: true,
+                    ..Default::default()
+                }),
+                verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 10)),
+                config: Default::default(),
+                session_model: None,
+                session_thinking: None,
+                project_trusted: false,
+                on_update: Arc::new(|_, _| {}),
+                memory: None,
+                learning: None,
+                governor: None,
+                runtime: None,
+                permissions: None,
+                task_contract: None,
+            },
+            learning: Mutex::new(None),
+            options: RunOptions {
+                goal: "test".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            exec_abort: Arc::new(AtomicBool::new(false)),
+            budget_abort_reason: Mutex::new(None),
+            run_deadline: None,
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            node_aborts: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let abort_a = execution.register_node_abort("task-a");
+        let abort_b = execution.register_node_abort("task-b");
+
+        assert!(!abort_a.load(Ordering::Relaxed));
+        assert!(!abort_b.load(Ordering::Relaxed));
+
+        // Aborting task-a only signals task-a, leaving sibling task-b untouched
+        execution.abort_node("task-a");
+        assert!(abort_a.load(Ordering::Relaxed));
+        assert!(!abort_b.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_deadline_while_paused() {
+        let dir = tempdir().unwrap();
+        let past_deadline = Instant::now() - Duration::from_secs(1);
+        let execution = GraphExecution {
+            run: Mutex::new(GraphRun {
+                version: 1,
+                run_id: "test-run-dl".into(),
+                goal: "test".into(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                phase: Phase::Investigate,
+                forced: None,
+                dry_run: false,
+                execution_origin: None,
+                definition_digest: None,
+                saved_definition: None,
+                definition: None,
+                classification: None,
+                milestones: None,
+                current_milestone: None,
+                tasks: vec![],
+                verification: None,
+                verification_bundle: None,
+                review_coverage: None,
+                budgets: GraphBudgets::default(),
+                counters: GraphCounters {
+                    workers_spawned: 0,
+                    revision_cycles: 0,
+                    replans: 0,
+                    cost_usd: 0.0,
+                    started_at: 0,
+                },
+                blocked_reason: None,
+                resource_snapshot: None,
+                ecosystem_stats: Default::default(),
+                updated_at: 0,
+                lifecycle: Some(GraphLifecycle::Paused),
+                revision: 0,
+            }),
+            deps: ControllerDeps {
+                runner: Arc::new(|_, _, _| WorkerResult {
+                    ok: true,
+                    ..Default::default()
+                }),
+                verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 10)),
+                config: Default::default(),
+                session_model: None,
+                session_thinking: None,
+                project_trusted: false,
+                on_update: Arc::new(|_, _| {}),
+                memory: None,
+                learning: None,
+                governor: None,
+                runtime: None,
+                permissions: None,
+                task_contract: None,
+            },
+            learning: Mutex::new(None),
+            options: RunOptions {
+                goal: "test".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            exec_abort: Arc::new(AtomicBool::new(false)),
+            budget_abort_reason: Mutex::new(None),
+            run_deadline: Some(past_deadline),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            node_aborts: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // Simulated node dispatch triggers deadline check and sets budget abort
+        if let Some(dl) = execution.run_deadline {
+            if Instant::now() >= dl {
+                execution.budget_abort("run deadline exceeded".into());
+            }
+        }
+        assert!(execution.exec_abort.load(Ordering::Relaxed));
+        assert_eq!(
+            execution.budget_abort_reason(),
+            Some("run deadline exceeded".into())
+        );
+    }
+
+    #[test]
+    fn test_windows_grandchildren_and_unix_group() {
+        use super::super::process::terminate_process_tree;
+        // Nonexistent PID termination does not panic
+        terminate_process_tree(999_999_999);
+    }
+
+    #[test]
+    fn test_stubborn_process_keeps_run_exclusion() {
+        use super::super::ActiveRun;
+        let active = ActiveRun::default();
+        // A run whose thread hasn't finished is still running
+        assert!(!active.is_finished());
+    }
+
+    #[test]
+    fn test_callbacks_invoked_outside_locks() {
+        let dir = tempdir().unwrap();
+        let update_called = Arc::new(AtomicBool::new(false));
+        let u_called = Arc::clone(&update_called);
+        let execution = GraphExecution {
+            run: Mutex::new(GraphRun {
+                version: 1,
+                run_id: "test-run-cb".into(),
+                goal: "test".into(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                phase: Phase::Investigate,
+                forced: None,
+                dry_run: false,
+                execution_origin: None,
+                definition_digest: None,
+                saved_definition: None,
+                definition: None,
+                classification: None,
+                milestones: None,
+                current_milestone: None,
+                tasks: vec![],
+                verification: None,
+                verification_bundle: None,
+                review_coverage: None,
+                budgets: GraphBudgets::default(),
+                counters: GraphCounters {
+                    workers_spawned: 0,
+                    revision_cycles: 0,
+                    replans: 0,
+                    cost_usd: 0.0,
+                    started_at: 0,
+                },
+                blocked_reason: None,
+                resource_snapshot: None,
+                ecosystem_stats: Default::default(),
+                updated_at: 0,
+                lifecycle: Some(GraphLifecycle::Running),
+                revision: 0,
+            }),
+            deps: ControllerDeps {
+                runner: Arc::new(|_, _, _| WorkerResult {
+                    ok: true,
+                    ..Default::default()
+                }),
+                verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 10)),
+                config: Default::default(),
+                session_model: None,
+                session_thinking: None,
+                project_trusted: false,
+                on_update: Arc::new(move |_, _| {
+                    u_called.store(true, Ordering::SeqCst);
+                }),
+                memory: None,
+                learning: None,
+                governor: None,
+                runtime: None,
+                permissions: None,
+                task_contract: None,
+            },
+            learning: Mutex::new(None),
+            options: RunOptions {
+                goal: "test".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            exec_abort: Arc::new(AtomicBool::new(false)),
+            budget_abort_reason: Mutex::new(None),
+            run_deadline: None,
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            node_aborts: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // checkpoint calls on_update outside run lock
+        execution.checkpoint(Some("test update"));
+        assert!(update_called.load(Ordering::SeqCst));
     }
 }

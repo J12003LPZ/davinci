@@ -143,6 +143,24 @@ pub fn dry_run_verify_exec(
     (0, format!("(dry-run) skipped: {command}"), 0)
 }
 
+/// Hard task contracts cannot use the ordinary graph verifier until a real process/filesystem/
+/// network containment backend owns the spawn. Refuse before spawning rather than treating a
+/// command allowlist as confinement.
+pub fn contracted_verify_exec(
+    command: &str,
+    _cwd: &Path,
+    _abort: &Arc<AtomicBool>,
+    _timeout_ms: u64,
+) -> (i32, String, u64) {
+    (
+        1,
+        format!(
+            "execution_contract_unenforceable: graph verification command `{command}` requires a contracted process sandbox"
+        ),
+        0,
+    )
+}
+
 pub fn run_verification(
     commands: &[VerifyCommandSpec],
     cwd: &Path,
@@ -194,6 +212,56 @@ pub fn nothing_ran(result: &VerificationResult) -> bool {
     result.commands.iter().all(|command| command.skipped)
 }
 
+#[allow(dead_code)]
+pub fn is_simulated_verification(result: &VerificationResult) -> bool {
+    result.commands.iter().any(|cmd| {
+        cmd.output_tail.contains("(dry-run) skipped:") || cmd.output_tail.starts_with("(dry-run)")
+    })
+}
+
+#[allow(dead_code)]
+pub fn is_valid_verification_proof(result: &VerificationResult) -> bool {
+    if result.commands.is_empty() {
+        return false;
+    }
+    if is_simulated_verification(result) {
+        return false;
+    }
+    if nothing_ran(result) {
+        return false;
+    }
+    result.passed
+}
+
+#[allow(dead_code)]
+pub fn run_verification_with_deadline(
+    commands: &[VerifyCommandSpec],
+    cwd: &Path,
+    abort: &Arc<AtomicBool>,
+    timeout_ms: u64,
+    root_remaining_ms: Option<u64>,
+    exec: &VerifyExec,
+) -> VerificationResult {
+    let effective_timeout = match root_remaining_ms {
+        Some(remaining) => timeout_ms.min(remaining),
+        None => timeout_ms,
+    };
+    if let Some(0) = root_remaining_ms {
+        return VerificationResult {
+            commands: vec![VerificationCommandResult {
+                name: "deadline".into(),
+                command: "timeout".into(),
+                exit_code: 1,
+                duration_ms: 0,
+                output_tail: "root deadline exceeded".into(),
+                skipped: false,
+            }],
+            passed: false,
+        };
+    }
+    run_verification(commands, cwd, abort, effective_timeout, exec)
+}
+
 impl VerificationResult {
     pub fn to_bundle(
         &self,
@@ -214,6 +282,7 @@ impl VerificationResult {
             security,
             changed_files,
             graph_run_id,
+            source_manifest_digest: None,
         }
     }
 }
@@ -367,6 +436,24 @@ mod tests {
             1,
             "bash: ghost: command not found"
         ));
+    }
+
+    #[test]
+    fn f05_contracted_graph_verification_refuses_before_spawn() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let result = run_verification(
+            &[spec("test", "cargo test")],
+            Path::new("."),
+            &abort,
+            0,
+            &contracted_verify_exec,
+        );
+        assert!(!result.passed);
+        assert_eq!(result.commands.len(), 1);
+        assert_eq!(result.commands[0].exit_code, 1);
+        assert!(result.commands[0]
+            .output_tail
+            .contains("execution_contract_unenforceable"));
     }
 
     #[test]

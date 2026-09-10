@@ -4,6 +4,7 @@ mod auth_cmd;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
+mod completion_delivery;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
@@ -586,12 +587,14 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     // is only for embedders. Who answers an ask is the mode's business:
     // davinci, RPC and the legacy chrome each install an approver, and a
     // `--print` run fails closed.
-    agent.permissions = Arc::new(Mutex::new(permissions::policy_for(
-        &default_agent_dir(),
-        cwd,
-        parsed.project_trust_override,
-        parsed.permission_mode,
-    )));
+    agent.permissions = Arc::new(davinci_agent::PermissionState::new(
+        permissions::policy_for(
+            &default_agent_dir(),
+            cwd,
+            parsed.project_trust_override,
+            parsed.permission_mode,
+        ),
+    ));
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     agent.attach_mcp(davinci_agent::McpRegistry::connect(
         &mcp::load(&default_agent_dir(), cwd, trusted),
@@ -617,7 +620,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }));
     apply_discovered_resources(parsed, &mut agent);
     if !parsed.no_session {
-        agent.session = Some(resolve_or_create_session(parsed, session_dir, cwd)?);
+        agent.load_from_session(resolve_or_create_session(parsed, session_dir, cwd)?)?;
         // A resumed session opens on the ledger it closed on, in every
         // mode; davinci re-reads it to draw the rows.
         agent.restore_todos();
@@ -689,6 +692,17 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             parsed.tools.contains(tool)
                 || !crate::native_extensions::NATIVE_TOOLS.contains(&tool.as_str())
         });
+    }
+    if let Some(coord) = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env() {
+        agent.tool_context.task_coordinator = Some(coord);
+    }
+    if let Ok(raw_contract) = std::env::var("DAVINCI_TASK_CONTRACT_JSON") {
+        let contract: davinci_agent::runtime::TaskContract = serde_json::from_str(&raw_contract)
+            .map_err(|err| format!("invalid inherited task contract: {err}"))?;
+        contract
+            .validate()
+            .map_err(|err| format!("invalid inherited task contract: {err}"))?;
+        agent.set_active_contract(contract);
     }
     attach_tool_executor(&mut agent, &host);
     host.emit(ExtensionEvent::SessionStart);
@@ -861,17 +875,19 @@ fn resolve_or_create_session(
         if let Ok(summary) = resolve_session_ref(session_dir, Some(&cwd.to_string_lossy()), id) {
             return JsonlSession::open(&summary.path).map_err(|err| err.to_string());
         }
-        let mut session = JsonlSession::create(
-            session_dir,
-            &cwd.to_string_lossy(),
-            parsed
-                .name
-                .as_deref()
-                .and_then(args::normalize_session_name)
-                .as_deref(),
-        )
-        .map_err(|err| err.to_string())?;
-        session.header.id = id.clone();
+        let created = davinci_session::JsonlSessionRepo::new(session_dir)
+            .create(davinci_session::JsonlCreateOptions {
+                id: Some(id.clone()),
+                cwd: cwd.to_string_lossy().into_owned(),
+                parent_session_id: None,
+                metadata: parsed
+                    .name
+                    .as_deref()
+                    .and_then(args::normalize_session_name)
+                    .map(|name| serde_json::json!({ "name": name })),
+            })
+            .map_err(|err| err.to_string())?;
+        let session = JsonlSession::open(&created.info.path).map_err(|err| err.to_string())?;
         persist_selected_backend(&session, session_dir);
         return Ok(session);
     }
@@ -1510,6 +1526,19 @@ fn run_nested_subagent(
     child.tools = tools.clone();
     child.tool_registry = tools;
     child.session = None;
+    if let Some(runtime) = &req.runtime {
+        if req.runtime_agent_id != Some(runtime.agent_id) || runtime.parent_agent_id.is_none() {
+            return Err("worker runtime identity does not match its host request".into());
+        }
+        child.set_runtime(runtime.clone());
+    } else if child.tools.iter().any(|tool| {
+        matches!(
+            tool.as_str(),
+            "task_create" | "task_update" | "task_list" | "task_get"
+        )
+    }) {
+        return Err("worker task tools require a parent coordinator".into());
+    }
     // A worker's output is bounded by the parent; its own overflow has
     // nowhere useful to go.
     child.evidence = None;
@@ -1525,8 +1554,9 @@ fn run_nested_subagent(
     if let Some(wt) = &req.worktree_path {
         policy.set_worktree_boundary(wt, Some(cwd));
     }
-    child.permissions = Arc::new(Mutex::new(policy));
+    child.permissions = Arc::new(davinci_agent::PermissionState::new(policy));
     child.approver = None;
+    child.approval_responder = None;
     // `mcp_read` and read-only MCP tools need the parent's connections.
     child.tool_context.mcp = mcp.clone();
     child.abort_signal = req.abort.clone();
@@ -1730,14 +1760,6 @@ fn complete_prompt_with_host(
         host.native_cancel_learning_review();
         host.emit(ExtensionEvent::AgentStart);
         host.emit(ExtensionEvent::TurnStart);
-        host.emit(ExtensionEvent::BeforeProviderRequest {
-            provider: agent.provider.clone(),
-            model: agent.model_id.clone(),
-        });
-        host.emit(ExtensionEvent::BeforeProviderHeaders {
-            provider: agent.provider.clone(),
-            model: agent.model_id.clone(),
-        });
     }
     let schema_bytes = serde_json::to_vec(&tools)
         .expect("tool specs are JSON")
@@ -1778,29 +1800,59 @@ fn complete_prompt_with_host(
             .with_bus(runtime_bus.clone());
     runtime_handle = runtime_handle.with_worktree_manager(wt_mgr);
     runtime_handle = runtime_handle.with_project_trusted(trusted);
+    if agent.session.is_none() {
+        if let Some(worker) = agent
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.parent_agent_id.is_some())
+        {
+            runtime_handle = runtime_handle.with_worker_state_from(worker);
+        }
+    }
     let wf_store = davinci_agent::WorkflowStateStore::with_options(
         davinci_agent::runtime::workflow::state::DEFAULT_MAX_INLINE_ARTIFACT_BYTES,
         default_agent_dir().join("workflow_artifacts"),
     );
-    let wf_executor = std::sync::Arc::new(davinci_agent::WorkflowExecutor::new(
-        runtime_handle.clone(),
+    runtime_handle = match runtime_host::configure_session_workflow(
+        runtime_handle,
+        agent.session.as_ref(),
+        agent.runtime_for_session(),
         wf_store,
         agent.subagent_runner.clone(),
-    ));
-    runtime_handle = runtime_handle.with_workflow_executor(wf_executor);
-    if let Some(session) = &agent.session {
-        runtime_handle = runtime_handle.with_session(&session.header.id);
-        let log_path = davinci_session::runtime_log_path(&session.path);
-        if log_path.is_file() {
-            if let Ok(events) =
-                davinci_session::read_runtime_log::<davinci_agent::RuntimeEventEnvelope>(&log_path)
-            {
-                let _ = runtime_handle.rehydrate_from_log(&events);
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let reply = format!("Runtime recovery required: {error}");
+            let end = AgentEvent::AgentEnd {
+                messages: vec![davinci_ai::ChatMessage::text("assistant", &reply)],
+                will_retry: false,
+            };
+            if stream_json {
+                if let Ok(value) = to_json_print_event(&end) {
+                    if let Ok(encoded) = serde_json::to_string(&value) {
+                        let _ = output::write_raw_stdout_line(&encoded);
+                    }
+                }
+            } else {
+                agent.emit_live(end.clone());
             }
+            let mut host = host.lock().unwrap_or_else(|error| error.into_inner());
+            host.emit(ExtensionEvent::TurnEnd);
+            host.emit(ExtensionEvent::AgentEnd);
+            host.emit(ExtensionEvent::AgentSettled);
+            return (reply, vec![end]);
         }
-        if let Ok(subscriber) = runtime_host::RuntimeLogSubscriber::open(&log_path) {
-            runtime_bus.subscribe(Arc::new(subscriber));
-        }
+    };
+    {
+        let mut host = host.lock().unwrap_or_else(|error| error.into_inner());
+        host.emit(ExtensionEvent::BeforeProviderRequest {
+            provider: agent.provider.clone(),
+            model: agent.model_id.clone(),
+        });
+        host.emit(ExtensionEvent::BeforeProviderHeaders {
+            provider: agent.provider.clone(),
+            model: agent.model_id.clone(),
+        });
     }
     host.lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -1881,7 +1933,23 @@ fn complete_prompt_with_host(
         })));
     }
     let mut context_visibility = (agent.stats.pruned_results, agent.stats.compactions);
-    let events = agent
+    // Session calls settle after the loop. Hold the final terminal event until
+    // their result is known so streaming clients receive one final outcome.
+    let terminal_sink = agent.event_sink.clone();
+    if let Some(sink) = terminal_sink.clone() {
+        agent.event_sink = Some(EventSink(Arc::new(move |event| {
+            if !matches!(
+                event,
+                AgentEvent::AgentEnd {
+                    will_retry: false,
+                    ..
+                }
+            ) {
+                (sink.0)(event);
+            }
+        })));
+    }
+    let mut events = agent
         .run_loop(|current| {
             let visibility = (current.stats.pruned_results, current.stats.compactions);
             if visibility != context_visibility {
@@ -2000,7 +2068,7 @@ fn complete_prompt_with_host(
     // The last assistant message may be a tool call with no text — the
     // reply is then whatever the run ended on, not an empty string that
     // hides a provider error behind "the model returned no text".
-    let reply = agent
+    let mut reply = agent
         .last_assistant_text()
         .filter(|text| !text.trim().is_empty())
         .or_else(|| {
@@ -2016,6 +2084,7 @@ fn complete_prompt_with_host(
         .unwrap_or_default();
     agent.pre_tool = None;
     agent.post_tool = None;
+    let mut session_failure = None;
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
         host.emit(ExtensionEvent::AfterProviderResponse {
@@ -2177,13 +2246,28 @@ fn complete_prompt_with_host(
         // re-reading the vector re-applied every past call — a fork would
         // fork again on each later turn.
         let session_calls = std::mem::take(&mut host.session_calls);
-        apply_session_calls(
+        let failures = apply_session_calls(
             Some(parsed),
             agent,
             SessionCallUi::Silent,
             &session_calls,
             false,
         );
+        if !failures.is_empty() {
+            session_failure = Some(
+                failures
+                    .iter()
+                    .map(|(_, error)| error.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        let session_calls: Vec<_> = session_calls
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !failures.iter().any(|(failed, _)| failed == index))
+            .map(|(_, call)| call)
+            .collect();
         if session_calls.iter().any(|call| {
             matches!(
                 call.get("op").and_then(|value| value.as_str()),
@@ -2202,6 +2286,40 @@ fn complete_prompt_with_host(
             }
         }
         let _ = host.kinds();
+    }
+    if let Some(error) = session_failure {
+        reply = error;
+        let end = AgentEvent::AgentEnd {
+            messages: vec![davinci_ai::ChatMessage::text("assistant", &reply)],
+            will_retry: false,
+        };
+        if let Some(previous) = events.iter_mut().rev().find(|event| {
+            matches!(
+                event,
+                AgentEvent::AgentEnd {
+                    will_retry: false,
+                    ..
+                }
+            )
+        }) {
+            *previous = end;
+        } else {
+            events.push(end);
+        }
+    }
+    if let (Some(sink), Some(end)) = (
+        &terminal_sink,
+        events.iter().rev().find(|event| {
+            matches!(
+                event,
+                AgentEvent::AgentEnd {
+                    will_retry: false,
+                    ..
+                }
+            )
+        }),
+    ) {
+        (sink.0)(end);
     }
     let _ = ExtensionHost::js_summary(&crate::js_host::JsExtensionResult::default());
     (reply, events)
@@ -2236,6 +2354,103 @@ fn parse_model_ref(provider: &str, model: Option<&str>) -> (String, String) {
     }
 }
 
+/// Print cannot collect consent. Stop at the first policy-owned challenge and
+/// report it without creating grants or leaving a sticky cancellation signal.
+fn with_print_approval<T>(
+    agent: &mut Agent,
+    configuration_path: &Path,
+    run: impl FnOnce(&mut Agent) -> T,
+) -> (T, Option<serde_json::Value>) {
+    let required = Arc::new(Mutex::new(None));
+    let captured = required.clone();
+    let path = configuration_path.to_string_lossy().into_owned();
+    let abort = Arc::new(std::sync::atomic::AtomicBool::new(agent.abort_requested()));
+    let cancelled = abort.clone();
+    let previous_abort = agent.abort_signal.replace(abort);
+    let previous_approver = agent.approver.take();
+    let previous_responder = agent.approval_responder.replace(
+        davinci_agent::approval::ApprovalResponder(Arc::new(move |_, challenge| {
+            let mut report = captured.lock().unwrap_or_else(|err| err.into_inner());
+            if report.is_none() {
+                *report = Some(serde_json::json!({
+                    "type": "approval_required",
+                    "tool_call_id": challenge.call_id,
+                    "action": challenge.action_label,
+                    "target": native_extensions::vector_memory::redact_secrets(&challenge.display_target),
+                    "permission_mode": challenge.mode,
+                    "configuration_path": path,
+                    "guidance": "Use an interactive host to approve this action, or configure a narrow permissions.allow rule. Explicit deny rules still take precedence.",
+                }));
+            }
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            davinci_agent::approval::ApprovalReply::from_legacy(
+                challenge, davinci_agent::ToolApprovalDecision::Deny,
+            )
+        })),
+    );
+    let result = run(agent);
+    agent.approval_responder = previous_responder;
+    agent.approver = previous_approver;
+    agent.abort_signal = previous_abort;
+    let report = required
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take();
+    (result, report)
+}
+
+fn scope_expansion_preview_from_events(
+    agent: &Agent,
+    events: &[AgentEvent],
+) -> Option<davinci_agent::runtime::contracts::ScopeExpansionPreview> {
+    let contract = agent.active_contract()?;
+    events.iter().find_map(|event| {
+        let AgentEvent::ToolExecutionEnd {
+            is_error: true,
+            details: Some(details),
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let violation: davinci_agent::runtime::contracts::ScopeViolation =
+            serde_json::from_value(details.get("scope_violation")?.clone()).ok()?;
+        contract
+            .preview_scope_expansion(&violation.requested_target, &violation.reason)
+            .ok()
+    })
+}
+
+fn scope_expansion_required_report(
+    preview: &davinci_agent::runtime::contracts::ScopeExpansionPreview,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "scope_expansion_required",
+        "preview": preview,
+        "guidance": "Scope cannot be expanded by the model, permission mode, print mode, or an unsupported RPC client. Use the interactive scope-expansion decision flow.",
+    })
+}
+
+fn blocking_host_report(
+    agent: &Agent,
+    events: &[AgentEvent],
+    approval_required: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    scope_expansion_preview_from_events(agent, events)
+        .map(|preview| scope_expansion_required_report(&preview))
+        .or(approval_required)
+}
+
+fn rpc_scope_expansion_result(
+    id: Option<String>,
+    preview: &davinci_agent::runtime::contracts::ScopeExpansionPreview,
+) -> (serde_json::Value, rpc::RpcResponse) {
+    (
+        scope_expansion_required_report(preview),
+        rpc::fail_response(id, "prompt", "scope_expansion_required".into()),
+    )
+}
+
 fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     if let Some(code) = immediate_shutdown_if_fixture(parsed) {
         return Ok(code);
@@ -2266,6 +2481,8 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         }
     }
     let mut last_reply = String::new();
+    let mut approval_required = None;
+    let configuration_path = settings::settings_path(&default_agent_dir());
     let mut all_events = Vec::new();
     if let Some(prompt) = &prepared.text {
         if !prompt.trim().is_empty() || !prepared.images.is_empty() {
@@ -2274,7 +2491,11 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 PreparedInput::Handled => {}
                 PreparedInput::Ready { text, images } => {
                     agent.prompt_with(&text, &images);
-                    let (reply, events) = complete_prompt_with_host(parsed, agent, None, json_mode);
+                    let ((reply, events), required) =
+                        with_print_approval(agent, &configuration_path, |agent| {
+                            complete_prompt_with_host(parsed, agent, None, json_mode)
+                        });
+                    approval_required = blocking_host_report(agent, &events, required);
                     last_reply = reply;
                     all_events.extend(events);
                 }
@@ -2282,6 +2503,9 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         }
     }
     for extra in &prepared.remaining_messages {
+        if approval_required.is_some() || last_reply.starts_with("Runtime recovery required: ") {
+            break;
+        }
         if extra.trim().is_empty() {
             continue;
         }
@@ -2290,29 +2514,13 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             PreparedInput::Handled => {}
             PreparedInput::Ready { text, images } => {
                 agent.prompt_with(&text, &images);
-                let (reply, events) = complete_prompt_with_host(parsed, agent, None, json_mode);
+                let ((reply, events), required) =
+                    with_print_approval(agent, &configuration_path, |agent| {
+                        complete_prompt_with_host(parsed, agent, None, json_mode)
+                    });
+                approval_required = blocking_host_report(agent, &events, required);
                 last_reply = reply;
                 all_events.extend(events);
-            }
-        }
-    }
-    // A `--print` run has nobody to ask, so a call the policy could not
-    // decide was refused; `--verbose` says which, on stderr, so a script's
-    // author can add a rule or a mode rather than guess from the reply.
-    if parsed.verbose {
-        for event in &all_events {
-            if let AgentEvent::ToolExecutionEnd {
-                tool_name,
-                result,
-                is_error: true,
-                ..
-            } = event
-            {
-                if result.as_str().is_some_and(|text| {
-                    text.starts_with("Permission denied") && text.contains("cannot ask")
-                }) {
-                    eprintln!("pi: denied {tool_name} (no approver in a --print run)");
-                }
             }
         }
     }
@@ -2320,16 +2528,27 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     // A provider failure that the loop gave up on carries no error stop
     // reason of its own: it is the reply text. Report it as the failure it is.
     let (exit_code, error) = match error {
-        None if last_reply.starts_with("Provider error: ") => (1, Some(last_reply.clone())),
+        None if last_reply.starts_with("Provider error: ")
+            || last_reply.starts_with("Runtime recovery required: ") =>
+        {
+            (1, Some(last_reply.clone()))
+        }
         other => (exit_code, other),
     };
-    if !json_mode {
-        if let Some(error) = error {
-            eprintln!("{error}");
-        } else if !last_reply.is_empty() {
-            println!("{last_reply}");
+    let exit_code = if let Some(required) = approval_required {
+        let encoded = serde_json::to_string(&required).map_err(|err| err.to_string())?;
+        output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
+        1
+    } else {
+        if !json_mode {
+            if let Some(error) = error {
+                eprintln!("{error}");
+            } else if !last_reply.is_empty() {
+                println!("{last_reply}");
+            }
         }
-    }
+        exit_code
+    };
     loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
         reason: "quit".into(),
     });
@@ -2570,10 +2789,12 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     });
     let rx = Arc::new(Mutex::new(rx));
     let leftover = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
+    let ui_abort = Arc::new(Mutex::new(None));
     crate::js_host::install_ui_waiter({
+        let ui_abort = ui_abort.clone();
         let leftover = leftover.clone();
         let rx = rx.clone();
-        Box::new(move |call| rpc_emit_and_wait_ui(call, &leftover, &rx))
+        Box::new(move |call| rpc_emit_and_wait_ui(call, &leftover, &rx, &ui_abort))
     });
     // A tool call the policy cannot decide is put to the client as the
     // `select` request it already renders for extensions; the answer text is
@@ -2586,16 +2807,24 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             &cwd,
             parsed.project_trust_override,
         );
-        runtime.agent.approver = Some(davinci_agent::ToolApprover(Arc::new(move |request| {
-            let answer = crate::js_host::dispatch_ui_waiter(&rpc_approval_call(request, trusted));
-            let decision = rpc_approval_decision(&answer, trusted);
-            if decision == davinci_agent::ToolApprovalDecision::AllowAlways
-                && permissions::remember_project_rule(&cwd, &request.session_rule).is_err()
-            {
-                return davinci_agent::ToolApprovalDecision::AllowForSession;
-            }
-            decision
-        })));
+        let policy = runtime.agent.permissions.clone();
+        runtime.agent.approver = None;
+        runtime.agent.approval_responder = Some(davinci_agent::approval::ApprovalResponder(
+            Arc::new(move |request, challenge| {
+                rpc_resolve_challenge(
+                    request,
+                    challenge,
+                    trusted,
+                    &cwd,
+                    &policy,
+                    crate::js_host::dispatch_ui_waiter,
+                )
+            }),
+        ));
+        runtime.agent.tool_context.decision_responder =
+            Some(davinci_agent::DecisionResponder::new(move |request| {
+                crate::rpc::rpc_resolve_decision(&request, crate::js_host::dispatch_ui_waiter)
+            }));
     }
     loop {
         let Some(line) = rpc_next_line(&leftover, &rx) else {
@@ -2703,7 +2932,7 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 continue;
             }
         }
-        let response = handle_rpc(&mut runtime, command.clone());
+        let mut response = handle_rpc(&mut runtime, command.clone());
         if matches!(
             command.kind.as_str(),
             "new_session" | "clone" | "fork" | "switch_session"
@@ -2741,12 +2970,17 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 no_extensions: parsed.no_extensions,
                 ..Args::default()
             };
-            let (_reply, events) = complete_prompt_with_host(
-                &prompt_args,
-                &mut runtime.agent,
-                Some(host.clone()),
-                false,
-            );
+            let (_reply, events) = rpc_with_ui_abort(&mut runtime.agent, &ui_abort, |agent| {
+                complete_prompt_with_host(&prompt_args, agent, Some(host.clone()), false)
+            });
+            if let Some(preview) = scope_expansion_preview_from_events(&runtime.agent, &events) {
+                let (report, failed) = rpc_scope_expansion_result(command.id.clone(), &preview);
+                output::write_raw_stdout_line(
+                    &serde_json::to_string(&report).map_err(|err| err.to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
+                response = failed;
+            }
             {
                 let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
                 let remaining: Vec<_> = std::mem::take(&mut host.ui_calls)
@@ -2796,11 +3030,16 @@ fn rpc_approval_call(
     request: &davinci_agent::ToolApprovalRequest,
     trusted: bool,
 ) -> serde_json::Value {
-    let mut options = vec![RPC_APPROVAL_ONCE, RPC_APPROVAL_SESSION];
-    if trusted {
-        options.push(RPC_APPROVAL_ALWAYS);
-    }
-    options.push(RPC_APPROVAL_DENY);
+    let options = request
+        .host_choices(trusted)
+        .into_iter()
+        .map(|choice| match choice {
+            davinci_agent::ToolApprovalDecision::AllowOnce => RPC_APPROVAL_ONCE,
+            davinci_agent::ToolApprovalDecision::AllowForSession => RPC_APPROVAL_SESSION,
+            davinci_agent::ToolApprovalDecision::AllowAlways => RPC_APPROVAL_ALWAYS,
+            davinci_agent::ToolApprovalDecision::Deny => RPC_APPROVAL_DENY,
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "op": "select",
         "title": format!("Allow {}?", request.summary),
@@ -2809,8 +3048,7 @@ fn rpc_approval_call(
 }
 
 /// The client's answer as a decision. Text is matched exactly; a cancelled
-/// or unknown answer is a refusal, and "always" from an untrusted project
-/// is read as "this session" because nothing would persist it.
+/// or unoffered answer is a refusal.
 fn rpc_approval_decision(
     answer: &serde_json::Value,
     trusted: bool,
@@ -2820,9 +3058,119 @@ fn rpc_approval_decision(
         Some(RPC_APPROVAL_ONCE) => AllowOnce,
         Some(RPC_APPROVAL_SESSION) => AllowForSession,
         Some(RPC_APPROVAL_ALWAYS) if trusted => AllowAlways,
-        Some(RPC_APPROVAL_ALWAYS) => AllowForSession,
         _ => Deny,
     }
+}
+
+fn rpc_resolve_approval(
+    request: &davinci_agent::ToolApprovalRequest,
+    trusted: bool,
+    cwd: &Path,
+    mut ask: impl FnMut(&serde_json::Value) -> serde_json::Value,
+) -> davinci_agent::ToolApprovalDecision {
+    let decision = rpc_approval_decision(&ask(&rpc_approval_call(request, trusted)), trusted);
+    if !request.allows(decision) {
+        return davinci_agent::ToolApprovalDecision::Deny;
+    }
+    if decision != davinci_agent::ToolApprovalDecision::AllowAlways
+        || permissions::remember_project_rule(cwd, &request.session_rule).is_ok()
+    {
+        return decision;
+    }
+    let mut retry = rpc_approval_call(request, false);
+    retry["title"] = serde_json::json!(format!(
+        "Project permission could not be saved. Choose another scope. Allow {}?",
+        request.summary
+    ));
+    let decision = rpc_approval_decision(&ask(&retry), false);
+    if request.allows(decision) {
+        decision
+    } else {
+        davinci_agent::ToolApprovalDecision::Deny
+    }
+}
+
+/// Keep the existing select wire format while binding its synchronous reply to
+/// the engine-issued challenge. Never persist an answer already known stale.
+fn rpc_resolve_challenge(
+    request: &davinci_agent::ToolApprovalRequest,
+    challenge: &davinci_agent::approval::ApprovalChallenge,
+    trusted: bool,
+    cwd: &Path,
+    permissions: &davinci_agent::PermissionState,
+    mut ask: impl FnMut(&serde_json::Value) -> serde_json::Value,
+) -> davinci_agent::approval::ApprovalReply {
+    let started = std::time::Instant::now();
+    let available = std::time::Duration::from_millis(
+        challenge
+            .expires_at_ms
+            .saturating_sub(davinci_session::now_ms()),
+    );
+    let fresh = || {
+        if davinci_session::now_ms() >= challenge.expires_at_ms || started.elapsed() >= available {
+            return false;
+        }
+        let policy = permissions.lock().unwrap_or_else(|err| err.into_inner());
+        policy.revision() == Some(challenge.policy_revision)
+            && matches!(policy.decide(&request.tool_call_id, &request.tool, &request.args, cwd), davinci_agent::PermissionVerdict::Ask(current) if current == *request)
+    };
+    let mut ask_fresh = |call: &serde_json::Value| {
+        if !fresh() {
+            return serde_json::Value::Null;
+        }
+        let mut bounded = call.clone();
+        bounded["timeout"] =
+            serde_json::json!(available.saturating_sub(started.elapsed()).as_millis() as u64);
+        let answer = ask(&bounded);
+        if fresh() {
+            answer
+        } else {
+            serde_json::Value::Null
+        }
+    };
+    let offers_instructions = [&request.legal_choices, &challenge.legal_choices]
+        .iter()
+        .all(|choices| {
+            choices.iter().any(|choice| {
+                choice.id == "deny_with_instructions"
+                    && choice.scope == davinci_agent::approval::GrantScope::DenyWithInstructions
+            })
+        });
+    let mut instructions = None;
+    let decision = rpc_resolve_approval(request, trusted, cwd, |call| {
+        let mut call = call.clone();
+        if offers_instructions {
+            if let Some(options) = call["options"].as_array_mut() {
+                options.push(serde_json::json!("deny with instructions"));
+            }
+        }
+        let answer = ask_fresh(&call);
+        if !offers_instructions || answer.as_str() != Some("deny with instructions") {
+            return answer;
+        }
+        let input = ask_fresh(&serde_json::json!({
+            "op": "input", "title": "Deny this call: what should the model do instead?",
+            "placeholder": "Instructions (up to 4096 bytes)",
+        }));
+        if let Some(text) = input
+            .as_str()
+            .filter(|text| !text.trim().is_empty() && text.len() <= 4096)
+        {
+            let confirmed = ask_fresh(&serde_json::json!({
+                "op": "confirm", "title": "Deny this call with these instructions?", "message": text,
+            }));
+            if confirmed.as_bool() == Some(true) {
+                instructions = Some(text.to_string());
+            }
+        }
+        serde_json::Value::Null
+    });
+    let mut reply = davinci_agent::approval::ApprovalReply::from_legacy(challenge, decision);
+    if instructions.is_some() {
+        reply.choice_id = "deny_with_instructions".into();
+        reply.instructions = instructions;
+    }
+    reply
 }
 
 fn is_dialog_ui_call(call: &serde_json::Value) -> bool {
@@ -2854,23 +3202,56 @@ fn rpc_next_line(
     rx.lock().ok()?.recv().ok()
 }
 
+type RpcUiAbort = Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>;
+
+fn rpc_with_ui_abort<T>(
+    agent: &mut Agent,
+    active: &RpcUiAbort,
+    run: impl FnOnce(&mut Agent) -> T,
+) -> T {
+    let signal = Arc::new(std::sync::atomic::AtomicBool::new(agent.abort_requested()));
+    let previous = agent.abort_signal.replace(signal.clone());
+    *active.lock().unwrap_or_else(|err| err.into_inner()) = Some(signal);
+    let result = run(agent);
+    *active.lock().unwrap_or_else(|err| err.into_inner()) = None;
+    agent.abort_signal = previous;
+    result
+}
+
 fn rpc_emit_and_wait_ui(
     call: &serde_json::Value,
     leftover: &Mutex<std::collections::VecDeque<String>>,
     rx: &Mutex<std::sync::mpsc::Receiver<String>>,
+    active: &RpcUiAbort,
 ) -> serde_json::Value {
+    let abort = active.lock().unwrap_or_else(|err| err.into_inner()).clone();
     let requests = rpc::extension_ui_requests_from_calls(std::slice::from_ref(call));
     let default = if call.get("op").and_then(|value| value.as_str()) == Some("confirm") {
         serde_json::Value::Bool(false)
     } else {
         serde_json::Value::Null
     };
+    if abort
+        .as_ref()
+        .is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return default;
+    }
     let Some(request) = requests.first() else {
         return default;
     };
-    if let Ok(encoded) = serde_json::to_string(request) {
-        println!("{encoded}");
-        io::stdout().flush().ok();
+    let Ok(encoded) = serde_json::to_string(request) else {
+        return default;
+    };
+    {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        if writeln!(out, "{encoded}")
+            .and_then(|_| out.flush())
+            .is_err()
+        {
+            return default;
+        }
     }
     let id = request
         .get("id")
@@ -2878,48 +3259,93 @@ fn rpc_emit_and_wait_ui(
         .unwrap_or_default()
         .to_string();
     let timeout_ms = call.get("timeout").and_then(|value| value.as_u64());
-    let deadline =
-        timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
-    let mut parked = std::collections::VecDeque::new();
-    loop {
-        if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
-            if let Ok(mut queue) = leftover.lock() {
-                queue.extend(parked);
+    let (answer, aborted) =
+        rpc_wait_ui_response(&id, default, timeout_ms, leftover, rx, abort.is_some());
+    if let (Some(command), Some(abort)) = (aborted, abort) {
+        abort.store(true, std::sync::atomic::Ordering::Relaxed);
+        let response = rpc::ok_response(command.id, "abort", None);
+        let Ok(encoded) = serde_json::to_string(&response) else {
+            return answer;
+        };
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        if writeln!(out, "{encoded}")
+            .and_then(|_| out.flush())
+            .is_err()
+        {
+            return answer;
+        }
+    }
+    answer
+}
+
+fn rpc_wait_ui_response(
+    id: &str,
+    default: serde_json::Value,
+    timeout_ms: Option<u64>,
+    leftover: &Mutex<std::collections::VecDeque<String>>,
+    rx: &Mutex<std::sync::mpsc::Receiver<String>>,
+    intercept_abort: bool,
+) -> (serde_json::Value, Option<RpcCommand>) {
+    let deadline = match timeout_ms {
+        Some(ms) => {
+            match std::time::Instant::now().checked_add(std::time::Duration::from_millis(ms)) {
+                Some(end) => Some(end),
+                None => return (default, None),
             }
-            return default;
+        }
+        None => None,
+    };
+    let mut parked = std::collections::VecDeque::new();
+    let result = loop {
+        if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+            break (default, None);
         }
         let remaining = deadline.map_or(std::time::Duration::from_millis(200), |end| {
             end.saturating_duration_since(std::time::Instant::now())
         });
-        let line = leftover
+        let queued = leftover
             .lock()
-            .ok()
-            .and_then(|mut queue| queue.pop_front())
-            .or_else(|| {
-                rx.lock()
-                    .ok()
-                    .and_then(|rx| rx.recv_timeout(remaining).ok())
-            });
-        let Some(line) = line else {
-            continue;
+            .unwrap_or_else(|err| err.into_inner())
+            .pop_front();
+        let line = match queued {
+            Some(line) => line,
+            None => match rx
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .recv_timeout(remaining)
+            {
+                Ok(line) => line,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break (default, None),
+            },
         };
-        if let Some(value) = parse_rpc_ui_response(&line, &id) {
-            if let Ok(mut queue) = leftover.lock() {
-                queue.extend(parked);
+        if let Some(value) = parse_rpc_ui_response(&line, id) {
+            break (value, None);
+        }
+        if let Ok(command) = serde_json::from_str::<RpcCommand>(&line) {
+            if intercept_abort && command.kind == "abort" {
+                break (default, Some(command));
             }
-            return value;
         }
         parked.push_back(line);
-    }
+    };
+    let mut queue = leftover.lock().unwrap_or_else(|err| err.into_inner());
+    parked.append(&mut queue);
+    *queue = parked;
+    result
 }
 
 fn parse_rpc_ui_response(line: &str, id: &str) -> Option<serde_json::Value> {
     let command: RpcCommand = serde_json::from_str(line).ok()?;
-    if command.kind != "extension_ui_response" {
+    if command.kind != "extension_ui_response" && command.kind != "decision_response" {
         return None;
     }
     if command.id.as_deref() != Some(id) {
         return None;
+    }
+    if command.kind == "decision_response" {
+        return serde_json::from_str(line).ok();
     }
     if command.cancelled == Some(true) {
         return Some(serde_json::Value::Null);
@@ -3327,6 +3753,30 @@ fn run_streaming_turn(
             .unwrap_or(davinci_agent::ToolApprovalDecision::Deny)
     })));
     let mut approval: Option<std::sync::mpsc::Sender<davinci_agent::ToolApprovalDecision>> = None;
+    let (decision_tx, decision_rx) = std::sync::mpsc::channel::<(
+        davinci_agent::DecisionHostRequest,
+        std::sync::mpsc::Sender<davinci_agent::DecisionHostResponse>,
+    )>();
+    agent.tool_context.decision_responder =
+        Some(davinci_agent::DecisionResponder::new(move |request| {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            if decision_tx.send((request, reply_tx)).is_err() {
+                return davinci_agent::DecisionHostResponse::Unavailable;
+            }
+            reply_rx
+                .recv()
+                .unwrap_or(davinci_agent::DecisionHostResponse::Cancelled)
+        }));
+    enum LegacyDecisionState {
+        Selecting {
+            request: davinci_agent::DecisionHostRequest,
+            reply: std::sync::mpsc::Sender<davinci_agent::DecisionHostResponse>,
+        },
+        Inputting {
+            reply: std::sync::mpsc::Sender<davinci_agent::DecisionHostResponse>,
+        },
+    }
+    let mut legacy_decision: Option<LegacyDecisionState> = None;
     session.running = true;
     let outcome = std::thread::scope(|scope| {
         let worker = scope.spawn(|| complete_prompt_with_host(parsed, agent, Some(host), false));
@@ -3347,7 +3797,7 @@ fn run_streaming_turn(
                 dirty = true;
             }
             dirty |= drain_hosted_lines(session);
-            if approval.is_none() {
+            if approval.is_none() && legacy_decision.is_none() {
                 if let Ok((request, reply)) = approval_rx.try_recv() {
                     session.open_extension_confirm(
                         format!("Allow {}?", request.summary),
@@ -3357,6 +3807,24 @@ fn run_streaming_turn(
                         ),
                     );
                     approval = Some(reply);
+                    dirty = true;
+                } else if let Ok((request, reply)) = decision_rx.try_recv() {
+                    let mut options: Vec<String> = request
+                        .question
+                        .options
+                        .iter()
+                        .map(|o| o.label.clone())
+                        .collect();
+                    if request.question.allow_custom {
+                        options.push("Custom response".into());
+                    }
+                    options.push("Defer decision".into());
+                    options.push("Cancel".into());
+                    session.open_extension_selector(
+                        format!("{}: {}", request.question.title, request.question.question),
+                        options,
+                    );
+                    legacy_decision = Some(LegacyDecisionState::Selecting { request, reply });
                     dirty = true;
                 }
             }
@@ -3400,6 +3868,16 @@ fn run_streaming_turn(
                                 let _ = reply.send(davinci_agent::ToolApprovalDecision::Deny);
                                 session.close_overlays();
                             }
+                            if let Some(state) = legacy_decision.take() {
+                                match state {
+                                    LegacyDecisionState::Selecting { reply, .. }
+                                    | LegacyDecisionState::Inputting { reply } => {
+                                        let _ = reply
+                                            .send(davinci_agent::DecisionHostResponse::Cancelled);
+                                    }
+                                }
+                                session.close_overlays();
+                            }
                             session.chrome.status =
                                 "interrupting · waiting for the current step".into();
                             sync_hosted_chrome(tui, panes, session);
@@ -3416,6 +3894,112 @@ fn run_streaming_turn(
                                     davinci_agent::ToolApprovalDecision::Deny
                                 });
                                 session.chrome.status.clear();
+                            }
+                            davinci_tui::SessionAction::ExtensionSelect(selected)
+                                if legacy_decision.is_some() =>
+                            {
+                                if let Some(LegacyDecisionState::Selecting { request, reply }) =
+                                    legacy_decision.take()
+                                {
+                                    match selected.as_deref() {
+                                        Some("Cancel") | None => {
+                                            let _ = reply.send(
+                                                davinci_agent::DecisionHostResponse::Cancelled,
+                                            );
+                                            session.close_overlays();
+                                            session.chrome.status.clear();
+                                        }
+                                        Some("Defer decision") => {
+                                            let _ = reply.send(
+                                                davinci_agent::DecisionHostResponse::Reply(
+                                                    davinci_agent::DecisionHostReply {
+                                                        action:
+                                                            davinci_agent::decisions::HostDecisionAction::Defer,
+                                                        host_event_id: format!(
+                                                            "legacy_{}",
+                                                            davinci_session::now_ms()
+                                                        ),
+                                                        answered_at_ms: davinci_session::now_ms(),
+                                                    },
+                                                ),
+                                            );
+                                            session.close_overlays();
+                                            session.chrome.status.clear();
+                                        }
+                                        Some("Custom response")
+                                            if request.question.allow_custom =>
+                                        {
+                                            session.open_extension_input(
+                                                "Enter custom response",
+                                                "Custom answer...",
+                                            );
+                                            legacy_decision =
+                                                Some(LegacyDecisionState::Inputting { reply });
+                                        }
+                                        Some(choice_str) => {
+                                            if let Some(opt) =
+                                                request.question.options.iter().find(|o| {
+                                                    o.label == choice_str || o.id == choice_str
+                                                })
+                                            {
+                                                let _ = reply.send(
+                                                    davinci_agent::DecisionHostResponse::Reply(
+                                                        davinci_agent::DecisionHostReply {
+                                                            action:
+                                                                davinci_agent::decisions::HostDecisionAction::AnswerChoice(
+                                                                    opt.id.clone(),
+                                                                ),
+                                                            host_event_id: format!(
+                                                                "legacy_{}",
+                                                                davinci_session::now_ms()
+                                                            ),
+                                                            answered_at_ms: davinci_session::now_ms(
+                                                            ),
+                                                        },
+                                                    ),
+                                                );
+                                            } else {
+                                                let _ = reply.send(
+                                                    davinci_agent::DecisionHostResponse::Cancelled,
+                                                );
+                                            }
+                                            session.close_overlays();
+                                            session.chrome.status.clear();
+                                        }
+                                    }
+                                }
+                            }
+                            davinci_tui::SessionAction::ExtensionInput(text)
+                                if legacy_decision.is_some() =>
+                            {
+                                if let Some(LegacyDecisionState::Inputting { reply }) =
+                                    legacy_decision.take()
+                                {
+                                    if let Some(custom) =
+                                        text.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                                    {
+                                        let _ = reply.send(
+                                            davinci_agent::DecisionHostResponse::Reply(
+                                                davinci_agent::DecisionHostReply {
+                                                    action:
+                                                        davinci_agent::decisions::HostDecisionAction::AnswerCustom(
+                                                            custom,
+                                                        ),
+                                                    host_event_id: format!(
+                                                        "legacy_{}",
+                                                        davinci_session::now_ms()
+                                                    ),
+                                                    answered_at_ms: davinci_session::now_ms(),
+                                                },
+                                            ),
+                                        );
+                                    } else {
+                                        let _ = reply
+                                            .send(davinci_agent::DecisionHostResponse::Cancelled);
+                                    }
+                                    session.close_overlays();
+                                    session.chrome.status.clear();
+                                }
                             }
                             davinci_tui::SessionAction::Submit(text) => {
                                 if !text.trim().is_empty() {
@@ -3449,7 +4033,9 @@ fn run_streaming_turn(
     agent.abort_signal = None;
     agent.event_sink = None;
     agent.approver = None;
-    if approval.take().is_some() {
+    agent.approval_responder = None;
+    agent.tool_context.decision_responder = None;
+    if approval.take().is_some() || legacy_decision.take().is_some() {
         session.close_overlays();
     }
     session.running = false;
@@ -4052,7 +4638,7 @@ fn apply_session_action(
                 resolve_session_ref(&session_dir, Some(&agent.cwd.to_string_lossy()), &id)
                     .map_err(|err| err.to_string())?;
             let next = JsonlSession::open(&summary.path).map_err(|err| err.to_string())?;
-            agent.load_from_session(next);
+            agent.load_from_session(next)?;
             session.chrome.status = format!(
                 "session={}",
                 agent
@@ -4772,8 +5358,7 @@ fn handle_user_line(
             let session_dir = resolved_session_dir(parsed, &agent.cwd);
             let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
-            agent.messages.clear();
-            agent.session = Some(store);
+            agent.load_from_session(store)?;
             println!("Started new session");
             refresh_chrome_footer(session, agent);
             apply_terminal_title(session, agent, tui);
@@ -4865,7 +5450,7 @@ fn handle_user_line(
                         &session_dir,
                     )
                     .map_err(|e| e.to_string())?;
-                agent.load_from_session(next);
+                agent.load_from_session(next)?;
                 println!("session={}", agent.session.as_ref().unwrap().header.id);
             }
             refresh_chrome_footer(session, agent);
@@ -4878,7 +5463,7 @@ fn handle_user_line(
                 let next = session
                     .clone_session(&session_dir)
                     .map_err(|e| e.to_string())?;
-                agent.load_from_session(next);
+                agent.load_from_session(next)?;
                 println!("session={}", agent.session.as_ref().unwrap().header.id);
             }
             refresh_chrome_footer(session, agent);
@@ -4958,7 +5543,7 @@ fn handle_user_line(
             }
             let expanded = davinci_session::expand_tilde(&path);
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
-            agent.load_from_session(next);
+            agent.load_from_session(next)?;
             session.chrome.status = format!(
                 "imported {}",
                 agent
@@ -5016,6 +5601,34 @@ fn handle_user_line(
             let text = agent_profiles::format_agent_profiles_status(&agent.cwd, None, trusted);
             session.chrome.transcript.push("agents", &text);
             session.chrome.status = "agents".into();
+            println!("{text}");
+            Ok(true)
+        }
+        SlashAction::Tasks => {
+            let tasks = if let Some(runtime) = &agent.runtime {
+                davinci_surfaces::task_board(runtime)
+            } else {
+                Vec::new()
+            };
+            let text = if tasks.is_empty() {
+                "no tasks tracked".into()
+            } else {
+                tasks
+                    .into_iter()
+                    .map(|t| {
+                        format!(
+                            "{}  [{}]  {}  (owner: {})",
+                            t.id,
+                            t.status,
+                            t.title,
+                            t.owner.as_deref().unwrap_or("unassigned")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            session.chrome.transcript.push("tasks", &text);
+            session.chrome.status = "tasks".into();
             println!("{text}");
             Ok(true)
         }
@@ -6782,6 +7395,13 @@ fn configure_security_review(
 fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHost) {
     if let Ok(mut native) = host.native.lock() {
         native.security.set_review_storage(default_agent_dir());
+        native
+            .graph
+            .set_runtime(agent.runtime_for_session().cloned());
+        native
+            .graph
+            .set_permissions(Some(agent.permissions.clone()));
+        native.graph.set_task_contract(agent.active_contract());
     }
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),
@@ -7511,8 +8131,9 @@ fn apply_session_calls(
     mut ui: SessionCallUi,
     calls: &[serde_json::Value],
     trigger_turns: bool,
-) {
-    for call in calls {
+) -> Vec<(usize, String)> {
+    let mut failures = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
         match call.get("op").and_then(|value| value.as_str()) {
             Some("sendMessage") | Some("sendUserMessage") => {
                 let text = call
@@ -7608,36 +8229,62 @@ fn apply_session_calls(
                     }
                 }
             }
-            Some("newSession") => {
+            Some(op @ ("newSession" | "fork" | "switchSession")) => {
                 let parsed = parsed.cloned().unwrap_or_default();
                 let session_dir = resolved_session_dir(&parsed, &agent.cwd);
-                if let Ok(store) =
-                    JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
-                {
-                    agent.messages.clear();
-                    agent.session = Some(store);
-                    ui.status("newSession");
-                }
-            }
-            Some("fork") => {
-                let parsed = parsed.cloned().unwrap_or_default();
-                let session_dir = resolved_session_dir(&parsed, &agent.cwd);
-                if let Some(store) = agent.session.as_ref() {
-                    let entry_id = call
-                        .get("entryId")
+                let next = match op {
+                    "newSession" => {
+                        JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
+                            .map_err(|error| error.to_string())
+                    }
+                    "fork" => agent
+                        .session
+                        .as_ref()
+                        .ok_or_else(|| "No session to fork".to_string())
+                        .and_then(|store| {
+                            let entry_id = call
+                                .get("entryId")
+                                .and_then(|value| value.as_str())
+                                .or(store.leaf_id.as_deref())
+                                .unwrap_or(&store.header.id);
+                            store
+                                .fork(entry_id, &session_dir)
+                                .map_err(|error| error.to_string())
+                        }),
+                    _ => call
+                        .get("sessionPath")
                         .and_then(|value| value.as_str())
-                        .or(store.leaf_id.as_deref())
-                        .unwrap_or(&store.header.id)
-                        .to_string();
-                    if let Ok(next) = store.fork(&entry_id, &session_dir) {
-                        agent.load_from_session(next);
+                        .ok_or_else(|| "No session path to switch to".to_string())
+                        .and_then(|path| {
+                            JsonlSession::open(Path::new(path)).map_err(|error| error.to_string())
+                        }),
+                };
+                if let Err(error) = next.and_then(|next| agent.load_from_session(next)) {
+                    let error = if error.starts_with("Runtime recovery required:") {
+                        error
+                    } else {
+                        format!("Runtime recovery required: {error}")
+                    };
+                    ui.status(&error);
+                    failures.push((index, error));
+                    failures.extend((index + 1..calls.len()).map(|index| {
+                        (
+                            index,
+                            "Session call skipped after failed session activation".into(),
+                        )
+                    }));
+                    break;
+                }
+                match op {
+                    "newSession" => ui.status("newSession"),
+                    "fork" => ui.status(&format!(
+                        "fork={}",
+                        agent.session.as_ref().unwrap().header.id
+                    )),
+                    _ => {
                         ui.status(&format!(
-                            "fork={}",
-                            agent
-                                .session
-                                .as_ref()
-                                .map(|session| session.header.id.clone())
-                                .unwrap_or_default()
+                            "session={}",
+                            agent.session.as_ref().unwrap().path.display()
                         ));
                     }
                 }
@@ -7657,14 +8304,6 @@ fn apply_session_calls(
                 }
             }
             Some("waitForIdle") => {}
-            Some("switchSession") => {
-                if let Some(path) = call.get("sessionPath").and_then(|value| value.as_str()) {
-                    if let Ok(next) = JsonlSession::open(Path::new(path)) {
-                        agent.load_from_session(next);
-                        ui.status(&format!("session={}", path));
-                    }
-                }
-            }
             Some("navigateTree") => {
                 if let Some(target) = call.get("targetId").and_then(|value| value.as_str()) {
                     let summarize = call
@@ -7712,6 +8351,7 @@ fn apply_session_calls(
             _ => {}
         }
     }
+    failures
 }
 
 fn compute_catalog_refresh(parsed: &Args) -> catalog_refresh::CatalogRefreshResult {
@@ -9213,6 +9853,8 @@ fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    static OFFLINE_TOOL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct EnvRestore {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -9233,6 +9875,422 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn f03_graph_session_context_binds_current_parent_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let mut agent = Agent::new("fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent
+            .load_from_session(JsonlSession::create(dir.path(), "fixture", None).unwrap())
+            .unwrap();
+        let host = ExtensionHost::default();
+        apply_graph_session_context(&Args::default(), &agent, &host);
+        let first_run = agent.runtime_for_session().unwrap().run_id;
+        assert_eq!(
+            host.native
+                .lock()
+                .unwrap()
+                .graph
+                .runtime
+                .as_ref()
+                .map(|rt| rt.run_id),
+            Some(first_run)
+        );
+        agent
+            .load_from_session(JsonlSession::create(dir.path(), "other", None).unwrap())
+            .unwrap();
+        apply_graph_session_context(&Args::default(), &agent, &host);
+        let next_run = agent.runtime_for_session().unwrap().run_id;
+        assert_ne!(next_run, first_run);
+        assert_eq!(
+            host.native
+                .lock()
+                .unwrap()
+                .graph
+                .runtime
+                .as_ref()
+                .map(|rt| rt.run_id),
+            Some(next_run)
+        );
+    }
+
+    #[test]
+    fn f05_graph_session_context_carries_active_task_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let mut agent = Agent::new("fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent
+            .load_from_session(JsonlSession::create(dir.path(), "fixture", None).unwrap())
+            .unwrap();
+        let contract = davinci_agent::runtime::TaskContract::new(
+            "graph-session-contract",
+            1,
+            davinci_agent::TaskId::new(),
+            1,
+            vec!["crates/".into()],
+            vec![".git/".into()],
+            false,
+            vec![],
+            vec![],
+            vec!["target/".into()],
+        )
+        .unwrap();
+        let digest = contract.digest.clone();
+        agent.set_active_contract(contract);
+        let host = ExtensionHost::default();
+
+        apply_graph_session_context(&Args::default(), &agent, &host);
+
+        assert_eq!(
+            host.native
+                .lock()
+                .unwrap()
+                .graph
+                .task_contract
+                .as_ref()
+                .map(|contract| contract.digest.as_str()),
+            Some(digest.as_str())
+        );
+    }
+
+    #[test]
+    fn f05_scope_expansion_report_preempts_permission_fallback_for_print_and_rpc() {
+        let mut agent = Agent::new("fixture");
+        let contract = davinci_agent::runtime::TaskContract::new(
+            "scope-report",
+            6,
+            davinci_agent::TaskId::new(),
+            2,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        agent.set_active_contract(contract);
+        let violation = davinci_agent::runtime::contracts::ScopeViolation {
+            requested_target: "migrations/001.sql".into(),
+            tool: "write".into(),
+            writable_scope: vec!["src/".into()],
+            protected_scope: vec![],
+            reason: "target is outside writable scope".into(),
+        };
+        let events = vec![AgentEvent::ToolExecutionEnd {
+            tool_call_id: "scope-call".into(),
+            tool_name: "write".into(),
+            result: serde_json::Value::Null,
+            is_error: true,
+            details: Some(serde_json::json!({"scope_violation": violation})),
+        }];
+        let generic = serde_json::json!({"type":"approval_required"});
+
+        let report = blocking_host_report(&agent, &events, Some(generic)).unwrap();
+        assert_eq!(report["type"], "scope_expansion_required");
+        assert_eq!(report["preview"]["expected_revision"], 6);
+        assert_eq!(report["preview"]["requested_target"], "migrations/001.sql");
+        assert!(report["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be expanded by the model"));
+
+        let preview = scope_expansion_preview_from_events(&agent, &events).unwrap();
+        let (rpc_report, rpc_response) =
+            rpc_scope_expansion_result(Some("rpc-scope".into()), &preview);
+        assert_eq!(
+            rpc_report["preview"]["preview_digest"],
+            preview.preview_digest
+        );
+        assert_eq!(rpc_response.id.as_deref(), Some("rpc-scope"));
+        assert!(!rpc_response.success);
+        assert_eq!(
+            rpc_response.error.as_deref(),
+            Some("scope_expansion_required")
+        );
+        let encoded = serde_json::to_string(&rpc_response).unwrap();
+        assert!(!encoded.contains("allow once"));
+        assert!(!encoded.contains("always allow"));
+        assert!(!encoded.contains("approved"));
+    }
+
+    #[test]
+    fn f03_sessionless_worker_prompt_uses_parent_coordinator() {
+        let _env_lock = OFFLINE_TOOL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _teams = EnvRestore::set("DAVINCI_EXPERIMENTAL_AGENT_TEAMS", "1");
+        let _tool = EnvRestore::set("PI_OFFLINE_TOOL_CALL", &serde_json::json!({"name":"task_create", "arguments":{"title":"shared worker task", "operation_id":uuid::Uuid::new_v4()}}).to_string());
+        let mut parent = Agent::new("fixture");
+        parent
+            .load_from_session(JsonlSession::create(dir.path(), "fixture", None).unwrap())
+            .unwrap();
+        let runtime = parent.runtime_for_session().unwrap().clone();
+        let run = runtime.run_id;
+        let parent_id = runtime.agent_id;
+        let tasks = runtime.task_registry.clone();
+        let child_id = davinci_agent::AgentId::new();
+        runtime
+            .registry
+            .register_agent(davinci_agent::AgentRecord {
+                id: child_id,
+                run_id: run,
+                parent: Some(parent_id),
+                kind: davinci_agent::AgentKind::Subagent,
+                name: "fixture worker".into(),
+                provider: "fixture".into(),
+                model_id: "fixture".into(),
+                cwd: dir.path().to_path_buf(),
+                state: davinci_agent::AgentState::Running,
+                task_id: None,
+                worktree: None,
+                started_ms: 0,
+                updated_ms: 0,
+                failure_reason: None,
+            })
+            .unwrap();
+        let mut child_runtime = runtime;
+        child_runtime.agent_id = child_id;
+        child_runtime.parent_agent_id = Some(parent_id);
+        let mut child = Agent::new("fixture");
+        child.cwd = dir.path().to_path_buf();
+        child.tools = vec!["task_create".into()];
+        child.tool_registry = child.tools.clone();
+        child.set_permission_mode(davinci_agent::PermissionMode::AlwaysApprove);
+        child.set_runtime(child_runtime);
+        child.prompt("create task");
+        let (_, events) = complete_prompt_with_host(
+            &Args {
+                offline: true,
+                no_extensions: true,
+                ..Args::default()
+            },
+            &mut child,
+            Some(Arc::new(Mutex::new(ExtensionHost::default()))),
+            false,
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolExecutionEnd {
+                    is_error: false,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+        assert_eq!(child.runtime.as_ref().unwrap().agent_id, child_id);
+        assert_eq!(child.runtime.as_ref().unwrap().run_id, run);
+        assert!(child.session.is_none());
+        assert_eq!(tasks.list_tasks(Some(run)).len(), 1);
+        let _next_tool = EnvRestore::set("PI_OFFLINE_TOOL_CALL", &serde_json::json!({
+            "name":"task_create", "arguments":{"title":"nested worker task", "operation_id":uuid::Uuid::new_v4()}
+        }).to_string());
+        run_nested_subagent(
+            &Args {
+                offline: true,
+                no_extensions: true,
+                ..Args::default()
+            },
+            dir.path(),
+            &davinci_agent::McpRegistry::default(),
+            &davinci_agent::SubagentRequest {
+                prompt: "create another task".into(),
+                tools: vec!["task_create".into()],
+                runtime_agent_id: Some(child_id),
+                runtime: child.runtime.clone(),
+                worktree_path: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The nested worker's edits policy still requires approval for task
+        // mutations; sharing the coordinator must not bypass that boundary.
+        assert_eq!(tasks.list_tasks(Some(run)).len(), 1);
+        let unbound = run_nested_subagent(
+            &Args {
+                offline: true,
+                no_extensions: true,
+                ..Args::default()
+            },
+            dir.path(),
+            &davinci_agent::McpRegistry::default(),
+            &davinci_agent::SubagentRequest {
+                prompt: "create task".into(),
+                tools: vec!["task_create".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            unbound.unwrap_err(),
+            "worker task tools require a parent coordinator"
+        );
+    }
+
+    #[test]
+    fn f03_post_turn_session_failure_reaches_reply_and_event_sink() {
+        for missing in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+            let _current_config =
+                EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+            let mut agent = Agent::new("fixture");
+            agent.cwd = dir.path().to_path_buf();
+            let first = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+            let first_path = first.path.clone();
+            agent.load_from_session(first).unwrap();
+            agent.prompt("fixture prompt");
+            let next = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+            std::fs::write(
+                davinci_session::runtime_log_path(&next.path),
+                b"{bad}\n{bad}\n",
+            )
+            .unwrap();
+            let host = Arc::new(Mutex::new(ExtensionHost::default()));
+            host.lock().unwrap().session_calls.push(serde_json::json!({
+            "op": "switchSession", "sessionPath": if missing { dir.path().join("missing.jsonl") } else { next.path }
+        }));
+            host.lock().unwrap().session_calls.push(serde_json::json!({
+                "op": "sendUserMessage", "text": "must not enter the old session"
+            }));
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let sink = observed.clone();
+            agent.event_sink = Some(EventSink(Arc::new(move |event| {
+                sink.lock().unwrap().push(event.clone())
+            })));
+            let (reply, events) = complete_prompt_with_host(
+                &Args {
+                    offline: true,
+                    no_extensions: true,
+                    ..Args::default()
+                },
+                &mut agent,
+                Some(host),
+                false,
+            );
+            assert!(reply.starts_with("Runtime recovery required:"), "{reply}");
+            assert_eq!(agent.session.as_ref().unwrap().path, first_path);
+            assert!(!serde_json::to_string(&agent.messages)
+                .unwrap()
+                .contains("must not enter the old session"));
+            for events in [&events, &*observed.lock().unwrap()] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(
+                            event,
+                            AgentEvent::AgentEnd {
+                                will_retry: false,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1
+                );
+                let Some(AgentEvent::AgentEnd { messages, .. }) = events.last() else {
+                    panic!("missing recovery event");
+                };
+                assert_eq!(content_text(&messages[0].content), reply);
+            }
+        }
+    }
+
+    #[test]
+    fn f03_prompt_recovery_failure_preserves_runtime_and_settles_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current_config =
+            EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let mut agent = Agent::new("fixture");
+        agent.cwd = dir.path().to_path_buf();
+        let runtime = davinci_agent::RuntimeHandle::new(
+            davinci_agent::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::RuntimeBus::new(),
+        );
+        let original_run = runtime.run_id;
+        agent.set_runtime(runtime);
+        let session = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let log = davinci_session::runtime_log_path(&session.path);
+        let corrupt = b"{broken record}\n{broken record}\n";
+        std::fs::write(&log, corrupt).unwrap();
+        agent.session = Some(session);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        agent.event_sink = Some(EventSink(Arc::new(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        })));
+        let host = Arc::new(Mutex::new(ExtensionHost::default()));
+        let (reply, events) = complete_prompt_with_host(
+            &Args {
+                offline: true,
+                no_extensions: true,
+                ..Args::default()
+            },
+            &mut agent,
+            Some(host.clone()),
+            false,
+        );
+        assert!(reply.starts_with("Runtime recovery required:"), "{reply}");
+        assert_eq!(agent.runtime.as_ref().unwrap().run_id, original_run);
+        assert_eq!(std::fs::read(log).unwrap(), corrupt);
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::AgentEnd {
+                will_retry: false,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            observed.lock().unwrap().as_slice(),
+            [AgentEvent::AgentEnd { .. }]
+        ));
+        let host = host.lock().unwrap();
+        assert!(!host.events.iter().any(|event| matches!(
+            event,
+            ExtensionEvent::BeforeProviderRequest { .. }
+                | ExtensionEvent::BeforeProviderHeaders { .. }
+                | ExtensionEvent::AfterProviderResponse { .. }
+        )));
+        assert!(matches!(
+            host.events.last(),
+            Some(ExtensionEvent::AgentSettled)
+        ));
+    }
+
+    #[test]
+    fn f03_custom_session_id_survives_durable_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = Args {
+            session_id: Some("custom-session-id".into()),
+            ..Args::default()
+        };
+        let session = resolve_or_create_session(&args, dir.path(), dir.path()).unwrap();
+        let path = session.path.clone();
+        let mut agent = Agent::new("fixture");
+        agent.load_from_session(session).unwrap();
+        let run = agent.runtime_for_session().unwrap().run_id;
+        drop(agent);
+        let reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.header.id, "custom-session-id");
+        let mut resumed = Agent::new("fixture");
+        resumed.load_from_session(reopened).unwrap();
+        assert_eq!(resumed.runtime_for_session().unwrap().run_id, run);
+        assert_eq!(
+            resolve_or_create_session(&args, dir.path(), dir.path())
+                .unwrap()
+                .path,
+            path
+        );
     }
 
     #[test]
@@ -9268,8 +10326,10 @@ mod tests {
 
     #[test]
     fn the_offline_tool_call_fixture_scripts_one_call_then_the_usual_stub() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = OFFLINE_TOOL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        std::env::remove_var("PI_OFFLINE_TOOL_CALL");
         let mut agent = Agent::new(default_system_prompt());
         agent.prompt("run git status");
 
@@ -9307,6 +10367,7 @@ mod tests {
     fn rpc_permission_questions_are_a_select_and_only_listed_answers_allow() {
         use davinci_agent::ToolApprovalDecision::*;
         let request = davinci_agent::ToolApprovalRequest {
+            legal_choices: davinci_agent::approval::offer_scopes(false, true, true),
             tool_call_id: "call_1".into(),
             tool: "bash".into(),
             args: serde_json::json!({"command": "git status"}),
@@ -9348,11 +10409,884 @@ mod tests {
         );
         assert_eq!(
             rpc_approval_decision(&answer("always allow in this project"), false),
-            AllowForSession
+            Deny
         );
         assert_eq!(rpc_approval_decision(&answer("deny"), true), Deny);
         assert_eq!(rpc_approval_decision(&answer("yes please"), true), Deny);
         assert_eq!(rpc_approval_decision(&serde_json::Value::Null, true), Deny);
+    }
+
+    /// Build offline first, then set DAVINCI_PRINT_TEST_EXECUTABLE to that binary.
+    #[test]
+    #[ignore = "requires a freshly built davinci executable via DAVINCI_PRINT_TEST_EXECUTABLE"]
+    fn f03_print_recovery_failure_exits_and_stops_prompts() {
+        use std::process::{Command, Stdio};
+        let binary = std::env::var_os("DAVINCI_PRINT_TEST_EXECUTABLE")
+            .expect("set DAVINCI_PRINT_TEST_EXECUTABLE to the freshly built product");
+        for json in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config");
+            std::fs::create_dir(&config).unwrap();
+            let session =
+                JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None).unwrap();
+            let log = davinci_session::runtime_log_path(&session.path);
+            let corrupt = b"{broken record}\n{broken record}\n";
+            std::fs::write(&log, corrupt).unwrap();
+            let stdout = dir.path().join("stdout");
+            let stderr = dir.path().join("stderr");
+            let mut command = Command::new(&binary);
+            command.current_dir(dir.path())
+                .args(["--offline", "--no-extensions", "--no-skills", "--no-prompt-templates",
+                    "--print", "first recovery fixture", "second recovery fixture", "--session"])
+                .arg(&session.path)
+                .env("PI_CODING_AGENT_DIR", &config)
+                .env("DAVINCI_CODING_AGENT_DIR", &config)
+                .env("PI_OFFLINE", "1").env("DAVINCI_OFFLINE", "1")
+                .env("PI_DISABLE_NETWORK", "1").env("PI_HOOKS_DRY_RUN", "1")
+                .env("PI_OFFLINE_TOOL_CALL", r#"{"name":"write","arguments":{"path":"must-not-exist.txt","content":"fixture"}}"#)
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap());
+            if json {
+                command.args(["--mode", "json"]);
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("recovery fixture did not terminate");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            let output = std::fs::read_to_string(if json { stdout } else { stderr }).unwrap();
+            assert_eq!(status.code(), Some(1), "{output}");
+            assert!(output.contains("Runtime recovery required:"), "{output}");
+            assert_eq!(std::fs::read(log).unwrap(), corrupt);
+            assert!(!dir.path().join("must-not-exist.txt").exists());
+            let saved = std::fs::read_to_string(&session.path).unwrap();
+            assert!(saved.contains("first recovery fixture"));
+            assert!(!saved.contains("second recovery fixture"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a freshly built davinci executable via DAVINCI_PRINT_TEST_EXECUTABLE"]
+    fn f03_graph_process_rejects_unbound_task_tools() {
+        use std::process::{Command, Stdio};
+        let binary = std::env::var_os("DAVINCI_PRINT_TEST_EXECUTABLE")
+            .expect("set DAVINCI_PRINT_TEST_EXECUTABLE to the freshly built product");
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        for tool in ["task_create", "task_update", "task_list", "task_get"] {
+            let stdout = dir.path().join(format!("{tool}.stdout"));
+            let stderr = dir.path().join(format!("{tool}.stderr"));
+            let mut child = Command::new(&binary)
+                .current_dir(dir.path())
+                .args([
+                    "--offline", "--no-session", "--no-extensions", "--no-skills",
+                    "--no-prompt-templates", "--permission-mode", "always-approve",
+                    "--tools", "task_create,task_update,task_list,task_get",
+                    "--mode", "json", "--print", "graph coordinator fixture",
+                ])
+                .env("PI_CODING_AGENT_DIR", &config)
+                .env("DAVINCI_CODING_AGENT_DIR", &config)
+                .env("PI_OFFLINE", "1")
+                .env("DAVINCI_OFFLINE", "1")
+                .env("PI_DISABLE_NETWORK", "1")
+                .env("PI_HOOKS_DRY_RUN", "1")
+                .env("DAVINCI_EXPERIMENTAL_AGENT_TEAMS", "1")
+                .env("PI_GRAPH_ROLE", "writer")
+                .env("PI_GRAPH_EXPECT", "patch-report")
+                .env("PI_GRAPH_ARTIFACT_PATH", dir.path().join("artifact.json"))
+                .env("PI_GRAPH_EXTRA_TOOLS", "task_create,task_update,task_list,task_get")
+                .env("PI_OFFLINE_TOOL_CALL", serde_json::json!({
+                    "name": tool, "arguments": {"title":"must not exist", "operation_id":uuid::Uuid::new_v4()}
+                }).to_string())
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("graph coordinator fixture did not terminate");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            let output = std::fs::read_to_string(&stdout).unwrap();
+            assert!(
+                status.success(),
+                "{}",
+                std::fs::read_to_string(stderr).unwrap()
+            );
+            let results: Vec<serde_json::Value> = output
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|event: &serde_json::Value| {
+                    event["type"] == "tool_execution_end" && event["toolName"] == tool
+                })
+                .collect();
+            assert_eq!(results.len(), 1, "{output}");
+            assert_eq!(results[0]["isError"], true, "{output}");
+            assert!(
+                results[0]
+                    .to_string()
+                    .contains("parent coordinator transport"),
+                "{output}"
+            );
+            assert!(!dir.path().join("artifact.json").exists());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a freshly built davinci executable via DAVINCI_PRINT_TEST_EXECUTABLE"]
+    fn f03_print_process_resumes_task_journal() {
+        use serde_json::json;
+        use std::process::{Command, Stdio};
+        let binary = std::env::var_os("DAVINCI_PRINT_TEST_EXECUTABLE")
+            .expect("set DAVINCI_PRINT_TEST_EXECUTABLE to the freshly built product");
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let session =
+            JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None).unwrap();
+        let journal = session.path.with_extension("tasks.jsonl");
+        let key = serde_json::to_string(&(
+            std::fs::canonicalize(&session.path).unwrap(),
+            &session.header.id,
+        ))
+        .unwrap();
+        let mut expected = None;
+        for tool in ["task_create", "task_list"] {
+            let stdout = dir.path().join(format!("{tool}.stdout"));
+            let stderr = dir.path().join(format!("{tool}.stderr"));
+            let arguments = if tool == "task_create" {
+                json!({"title":"persisted print task", "operation_id": uuid::Uuid::new_v4()})
+            } else {
+                json!({})
+            };
+            let mut child = Command::new(&binary)
+                .current_dir(dir.path())
+                .args([
+                    "--offline",
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "--permission-mode",
+                    "always-approve",
+                    "--tools",
+                    "task_create,task_list",
+                    "--mode",
+                    "json",
+                    "--print",
+                    "task fixture",
+                    "--session",
+                ])
+                .arg(&session.path)
+                .env("PI_CODING_AGENT_DIR", &config)
+                .env("DAVINCI_CODING_AGENT_DIR", &config)
+                .env("PI_OFFLINE", "1")
+                .env("DAVINCI_OFFLINE", "1")
+                .env("PI_DISABLE_NETWORK", "1")
+                .env("PI_HOOKS_DRY_RUN", "1")
+                .env("DAVINCI_EXPERIMENTAL_AGENT_TEAMS", "1")
+                .env(
+                    "PI_OFFLINE_TOOL_CALL",
+                    json!({"name":tool,"arguments":arguments}).to_string(),
+                )
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("task journal print fixture did not terminate");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            let output = std::fs::read_to_string(&stdout).unwrap();
+            assert!(
+                status.success(),
+                "{}",
+                std::fs::read_to_string(&stderr).unwrap()
+            );
+            assert!(output.contains("persisted print task"), "{output}");
+            let results: Vec<serde_json::Value> = output
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|event: &serde_json::Value| {
+                    event["type"] == "tool_execution_end" && event["toolName"] == tool
+                })
+                .collect();
+            assert_eq!(results.len(), 1, "{output}");
+            assert_eq!(results[0]["isError"], false, "{output}");
+            assert!(
+                results[0].to_string().contains("persisted print task"),
+                "{output}"
+            );
+            let (registry, run) =
+                davinci_agent::TaskRegistry::open_session_durable(&journal, &key).unwrap();
+            let tasks = registry.list_tasks(Some(run));
+            assert_eq!(tasks.len(), 1, "{output}");
+            assert_eq!(tasks[0].run_id, run);
+            if let Some((saved_run, saved_task)) = &expected {
+                assert_eq!(run, *saved_run);
+                assert_eq!(&tasks[0], saved_task);
+            } else {
+                expected = Some((run, tasks[0].clone()));
+            }
+        }
+    }
+
+    /// Build offline first, then set DAVINCI_PRINT_TEST_EXECUTABLE to that binary.
+    #[test]
+    #[ignore = "requires a freshly built davinci executable via DAVINCI_PRINT_TEST_EXECUTABLE"]
+    fn f01_print_process_output_and_exit() {
+        use std::process::{Command, Stdio};
+        let binary = std::env::var_os("DAVINCI_PRINT_TEST_EXECUTABLE")
+            .expect("set DAVINCI_PRINT_TEST_EXECUTABLE to the freshly built product");
+        assert!(Path::new(&binary).is_file());
+        for (json, allow, legacy) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("agent");
+            std::fs::create_dir(&config).unwrap();
+            let stdout_path = dir.path().join("stdout.jsonl");
+            let stderr_path = dir.path().join("stderr.txt");
+            let mut command = Command::new(&binary);
+            command.current_dir(dir.path()).args([
+                "--offline", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates",
+                "--permission-mode", if allow { "always-approve" } else { "manual" },
+                "--print", "first fixture prompt", "second fixture prompt",
+            ]).env("PI_CODING_AGENT_DIR", &config)
+                .env("PI_OFFLINE", "1").env("DAVINCI_OFFLINE", "1")
+                .env("PI_DISABLE_NETWORK", "1").env("PI_HOOKS_DRY_RUN", "1")
+                .env("PI_OFFLINE_TOOL_CALL", r#"{"name":"write","arguments":{"path":"must-not-exist.txt","content":"fixture"}}"#)
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(&stdout_path).unwrap())
+                .stderr(std::fs::File::create(&stderr_path).unwrap());
+            if legacy {
+                command.env_remove("DAVINCI_CODING_AGENT_DIR");
+            } else {
+                command.env("DAVINCI_CODING_AGENT_DIR", &config);
+            }
+            if json {
+                command.args(["--mode", "json"]);
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("print fixture did not terminate on EOF");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            let stdout = std::fs::read_to_string(stdout_path).unwrap();
+            assert_eq!(
+                status.code(),
+                Some(if allow { 0 } else { 1 }),
+                "{}",
+                std::fs::read_to_string(stderr_path).unwrap()
+            );
+            let rows: Vec<serde_json::Value> = stdout
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).expect("every stdout line must be JSON"))
+                .collect();
+            let required: Vec<_> = rows
+                .iter()
+                .filter(|row| row["type"] == "approval_required")
+                .collect();
+            assert_eq!(required.len(), usize::from(!allow));
+            assert_eq!(dir.path().join("must-not-exist.txt").exists(), allow);
+            assert!(!config.join("settings.json").exists());
+            if !allow {
+                assert_eq!(required[0]["action"], "write");
+                assert!(required[0]["target"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("must-not-exist.txt"));
+                assert_eq!(
+                    required[0]["configuration_path"],
+                    config.join("settings.json").to_string_lossy().as_ref()
+                );
+                assert!(!stdout.contains("second fixture prompt"));
+                if !json {
+                    assert_eq!(rows.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f01_noninteractive_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("offline print approval");
+        agent.cwd = dir.path().to_path_buf();
+        agent.tools = vec!["write".into()];
+        agent.permissions = Arc::new(davinci_agent::PermissionState::new(
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::Ask),
+        ));
+        agent.prompt("write the file");
+        let path = dir.path().join("agent/settings.json");
+        let mut calls = 0;
+        let (events, required) = with_print_approval(&mut agent, &path, |agent| {
+            agent.run_loop(|_| {
+                calls += 1;
+                assert_eq!(calls, 1, "unresolved approval must stop further provider calls");
+                Ok(AssistantMessage {
+                    id: "fixture".into(), role: "assistant".into(),
+                    content: vec![ContentBlock::ToolCall {
+                        id: "write-1".into(), name: "write".into(),
+                        arguments: serde_json::json!({"path": "must-not-exist.txt", "content": "blocked"}),
+                    }],
+                    model: "fixture".into(), usage: None,
+                    stop_reason: Some(StopReason::ToolUse), error_message: None,
+                })
+            }).unwrap()
+        });
+        let required = required.expect("print must report unresolved approval");
+        assert_eq!(required["type"], "approval_required");
+        assert_eq!(required["tool_call_id"], "write-1");
+        assert_eq!(required["action"], "write");
+        assert!(required["target"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("must-not-exist.txt"));
+        assert_eq!(
+            required["configuration_path"],
+            path.to_string_lossy().as_ref()
+        );
+        assert!(!dir.path().join("must-not-exist.txt").exists());
+        assert!(!path.exists());
+        assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
+        assert!(!agent.abort_requested());
+        assert!(agent.approval_responder.is_none());
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { is_error: true, .. })));
+        for event in events {
+            serde_json::from_str::<serde_json::Value>(
+                &serde_json::to_string(&to_json_print_event(&event).unwrap()).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn f01_rpc_abort_releases_pending_dialog_before_late_approval() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(r#"{"type":"abort","id":"stop"}"#.to_string())
+            .unwrap();
+        tx.send(
+            r#"{"type":"extension_ui_response","id":"pending","value":"allow once"}"#.to_string(),
+        )
+        .unwrap();
+        let leftover = Mutex::new(std::collections::VecDeque::new());
+        let rx = Mutex::new(rx);
+        let (answer, intercepted) = rpc_wait_ui_response(
+            "pending",
+            serde_json::Value::Null,
+            Some(1000),
+            &leftover,
+            &rx,
+            true,
+        );
+        assert_eq!(
+            answer,
+            serde_json::Value::Null,
+            "abort must reject the pending dialog before consuming a later approval"
+        );
+        assert_eq!(intercepted.unwrap().id.as_deref(), Some("stop"));
+        assert!(leftover.lock().unwrap().is_empty());
+        assert!(rx
+            .lock()
+            .unwrap()
+            .try_recv()
+            .unwrap()
+            .contains("allow once"));
+    }
+
+    #[test]
+    fn f01_rpc_dialog_abort_signals_turn_and_is_not_replayed() {
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut agent = Agent::new("test");
+        agent.abort_signal = Some(abort.clone());
+        let active = Mutex::new(Some(abort.clone()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let before = r#"{"type":"get_state","id":"before"}"#;
+        let after = r#"{"type":"prompt","id":"after","message":"next"}"#;
+        let leftover = Mutex::new(std::collections::VecDeque::from([
+            before.to_string(),
+            r#"{"type":"abort","id":"stop"}"#.to_string(),
+            after.to_string(),
+        ]));
+        let rx = Mutex::new(rx);
+        let call = serde_json::json!({"op": "confirm", "title": "Allow?", "timeout": 60_000});
+        assert_eq!(
+            rpc_emit_and_wait_ui(&call, &leftover, &rx, &active),
+            serde_json::json!(false)
+        );
+        assert!(agent.abort_requested());
+        agent.prompt("cancelled turn");
+        let events = agent
+            .run_loop(|_| -> Result<davinci_ai::AssistantMessage, String> {
+                panic!("a cancelled RPC turn must not call the provider")
+            })
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, davinci_agent::AgentEvent::AgentEnd { .. })));
+        assert_eq!(
+            *leftover.lock().unwrap(),
+            [before.to_string(), after.to_string()]
+        );
+        // An already cancelled turn must not open another dialog or consume queued work.
+        assert_eq!(
+            rpc_emit_and_wait_ui(&call, &leftover, &rx, &active),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            *leftover.lock().unwrap(),
+            [before.to_string(), after.to_string()]
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn f01_rpc_dialog_abort_scope_restores_previous_signal() {
+        let mut agent = Agent::new("test");
+        let previous = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        agent.abort_signal = Some(previous.clone());
+        let active = Mutex::new(None);
+        for _ in 0..2 {
+            rpc_with_ui_abort(&mut agent, &active, |agent| {
+                assert!(!agent.abort_requested());
+                let signal = active.lock().unwrap().clone().unwrap();
+                assert!(Arc::ptr_eq(agent.abort_signal.as_ref().unwrap(), &signal));
+                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                assert!(agent.abort_requested());
+            });
+            assert!(active.lock().unwrap().is_none());
+            assert!(Arc::ptr_eq(agent.abort_signal.as_ref().unwrap(), &previous));
+            assert!(!agent.abort_requested());
+        }
+        previous.store(true, std::sync::atomic::Ordering::Relaxed);
+        rpc_with_ui_abort(
+            &mut agent,
+            &active,
+            |agent| assert!(agent.abort_requested()),
+        );
+        assert!(agent.abort_requested());
+        assert!(Arc::ptr_eq(agent.abort_signal.as_ref().unwrap(), &previous));
+        // Idle extension dialogs retain ordinary command handling outside an active turn.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let line = r#"{"type":"abort","id":"idle"}"#;
+        tx.send(line.to_string()).unwrap();
+        drop(tx);
+        let leftover = Mutex::new(std::collections::VecDeque::new());
+        let (_, intercepted) = rpc_wait_ui_response(
+            "pending",
+            serde_json::Value::Null,
+            None,
+            &leftover,
+            &Mutex::new(rx),
+            false,
+        );
+        assert!(intercepted.is_none());
+        assert_eq!(leftover.lock().unwrap().front().unwrap(), line);
+    }
+
+    #[test]
+    fn f01_rpc_disconnect_releases_wait_and_preserves_commands() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let commands = [
+            r#"{"type":"get_state","id":"first"}"#,
+            r#"{"type":"get_state","id":"second"}"#,
+        ];
+        tx.send(commands[1].to_string()).unwrap();
+        drop(tx);
+        let leftover = Mutex::new(std::collections::VecDeque::from([commands[0].to_string()]));
+        let start = std::time::Instant::now();
+        assert_eq!(
+            rpc_wait_ui_response(
+                "pending",
+                serde_json::Value::Null,
+                Some(1000),
+                &leftover,
+                &Mutex::new(rx),
+                false,
+            )
+            .0,
+            serde_json::Value::Null
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "disconnect must terminate without waiting for the deadline"
+        );
+        assert_eq!(*leftover.lock().unwrap(), commands.map(String::from));
+    }
+
+    #[test]
+    fn f01_rpc_wait_matches_only_current_valid_response() {
+        for (line, expected, consumed) in [
+            (
+                r#"{"type":"extension_ui_response","id":"pending","value":"allow once"}"#,
+                serde_json::json!("allow once"),
+                true,
+            ),
+            (
+                r#"{"type":"extension_ui_response","id":"pending","cancelled":true,"value":"allow once"}"#,
+                serde_json::Value::Null,
+                true,
+            ),
+            (
+                r#"{"type":"extension_ui_response","id":"old","value":"allow once"}"#,
+                serde_json::Value::Null,
+                false,
+            ),
+            (
+                r#"{"type":"extension_ui_response","id":"pending","value":42}"#,
+                serde_json::Value::Null,
+                false,
+            ),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(line.to_string()).unwrap();
+            drop(tx);
+            let leftover = Mutex::new(std::collections::VecDeque::new());
+            assert_eq!(
+                rpc_wait_ui_response(
+                    "pending",
+                    serde_json::Value::Null,
+                    None,
+                    &leftover,
+                    &Mutex::new(rx),
+                    false,
+                )
+                .0,
+                expected
+            );
+            assert_eq!(leftover.lock().unwrap().is_empty(), consumed);
+        }
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let leftover = Mutex::new(std::collections::VecDeque::from(["queued".to_string()]));
+        assert_eq!(
+            rpc_wait_ui_response(
+                "pending",
+                serde_json::json!(false),
+                Some(0),
+                &leftover,
+                &Mutex::new(rx),
+                false,
+            )
+            .0,
+            serde_json::json!(false)
+        );
+        assert_eq!(leftover.lock().unwrap().front().unwrap(), "queued");
+    }
+
+    #[test]
+    fn f01_rpc_denial_instructions_use_confirmed_bounded_dialogs() {
+        use davinci_agent::approval::{ApprovalChallenge, GrantScope};
+        for case in [
+            "accept",
+            "cancel_input",
+            "empty",
+            "oversize",
+            "reject_confirm",
+            "malformed_confirm",
+            "stale_confirm",
+            "unoffered",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = davinci_agent::PermissionState::new(davinci_agent::PermissionPolicy::new(
+                davinci_agent::PermissionMode::Ask,
+            ));
+            let davinci_agent::PermissionVerdict::Ask(request) = policy.lock().unwrap().decide(
+                "call",
+                "write",
+                &serde_json::json!({"path":"ordinary.txt", "content":"fixture"}),
+                dir.path(),
+            ) else {
+                panic!("expected Ask")
+            };
+            let mut challenge = ApprovalChallenge {
+                schema_version: 1,
+                id: uuid::Uuid::new_v4(),
+                call_id: request.tool_call_id.clone(),
+                action_digest: "fixture".into(),
+                policy_revision: policy.lock().unwrap().revision().unwrap(),
+                contract_revision: None,
+                mode: "ask".into(),
+                action_label: "write".into(),
+                display_target: request.subject.clone(),
+                reason: request.summary.clone(),
+                legal_choices: request.legal_choices.clone(),
+                expires_at_ms: davinci_session::now_ms() + 60_000,
+            };
+            if case == "unoffered" {
+                challenge
+                    .legal_choices
+                    .retain(|choice| choice.scope != GrantScope::DenyWithInstructions);
+            }
+            let mut calls = 0;
+            let reply =
+                rpc_resolve_challenge(&request, &challenge, false, dir.path(), &policy, |call| {
+                    calls += 1;
+                    assert!(call["timeout"].as_u64().is_some_and(|ms| ms <= 60_000));
+                    let wire = rpc::extension_ui_requests_from_calls(&[call.clone()]);
+                    assert_eq!(wire.len(), 1);
+                    assert_eq!(wire[0]["method"], call["op"]);
+                    match calls {
+                        1 => {
+                            assert_eq!(
+                                call["options"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|option| option == "deny with instructions"),
+                                case != "unoffered"
+                            );
+                            serde_json::json!("deny with instructions")
+                        }
+                        2 => {
+                            assert_eq!(call["op"], "input");
+                            match case {
+                                "cancel_input" => serde_json::Value::Null,
+                                "empty" => serde_json::json!("   "),
+                                "oversize" => serde_json::json!("x".repeat(4097)),
+                                _ => serde_json::json!("read the docs first"),
+                            }
+                        }
+                        3 => {
+                            assert_eq!(call["op"], "confirm");
+                            assert_eq!(call["message"], "read the docs first");
+                            if case == "stale_confirm" {
+                                policy.lock().unwrap().mode = davinci_agent::PermissionMode::Auto;
+                            }
+                            if case == "malformed_confirm" {
+                                serde_json::json!("true")
+                            } else {
+                                serde_json::json!(case != "reject_confirm")
+                            }
+                        }
+                        _ => panic!("unexpected dialog"),
+                    }
+                });
+            assert_eq!(reply.challenge_id, challenge.id);
+            assert_eq!(
+                reply.choice_id,
+                if case == "accept" {
+                    "deny_with_instructions"
+                } else {
+                    "deny"
+                }
+            );
+            assert_eq!(
+                reply.instructions.as_deref(),
+                if case == "accept" {
+                    Some("read the docs first")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                calls,
+                match case {
+                    "unoffered" => 1,
+                    "cancel_input" | "empty" | "oversize" => 2,
+                    _ => 3,
+                }
+            );
+            assert!(!dir.path().join("ordinary.txt").exists());
+            assert!(!dir.path().join(".davinci/settings.json").exists());
+            assert!(policy.lock().unwrap().session_allow.is_empty());
+        }
+    }
+
+    #[test]
+    fn f01_rpc_typed_challenge_bounds_wait_and_rejects_stale_save() {
+        use davinci_agent::approval::ApprovalChallenge;
+        for case in ["current", "expired", "policy_changed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut initial =
+                davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::Ask);
+            initial.project_trusted = true;
+            let policy = davinci_agent::PermissionState::new(initial);
+            let davinci_agent::PermissionVerdict::Ask(request) = policy.lock().unwrap().decide(
+                "call",
+                "write",
+                &serde_json::json!({"path":"ordinary.txt", "content":"fixture"}),
+                dir.path(),
+            ) else {
+                panic!("expected Ask")
+            };
+            let challenge = ApprovalChallenge {
+                schema_version: 1,
+                id: uuid::Uuid::new_v4(),
+                call_id: request.tool_call_id.clone(),
+                action_digest: "engine digest fixture".into(),
+                policy_revision: policy.lock().unwrap().revision().unwrap(),
+                contract_revision: None,
+                mode: "ask".into(),
+                action_label: "write".into(),
+                display_target: request.subject.clone(),
+                reason: request.summary.clone(),
+                legal_choices: request.legal_choices.clone(),
+                expires_at_ms: if case == "expired" {
+                    0
+                } else {
+                    davinci_session::now_ms() + 60_000
+                },
+            };
+            let mut asks = 0;
+            let reply =
+                rpc_resolve_challenge(&request, &challenge, true, dir.path(), &policy, |call| {
+                    asks += 1;
+                    assert!(call["timeout"].as_u64().is_some_and(|ms| ms <= 60_000));
+                    if case == "policy_changed" {
+                        let mut state = policy.lock().unwrap();
+                        state.mode = davinci_agent::PermissionMode::Auto;
+                        state.mode = davinci_agent::PermissionMode::Ask;
+                    }
+                    serde_json::json!(RPC_APPROVAL_ALWAYS)
+                });
+            assert_eq!(reply.challenge_id, challenge.id);
+            assert_eq!(
+                reply.choice_id,
+                if case == "current" { "project" } else { "deny" }
+            );
+            assert_eq!(asks, usize::from(case != "expired"));
+            assert_eq!(
+                dir.path().join(".davinci/settings.json").exists(),
+                case == "current"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_permission_cannot_add_scopes_to_policy_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::Ask);
+        let davinci_agent::PermissionVerdict::Ask(request) = policy.decide(
+            "risky",
+            "write",
+            &serde_json::json!({"path":".env", "content":"fixture"}),
+            dir.path(),
+        ) else {
+            panic!("expected Ask")
+        };
+        assert_eq!(
+            rpc_approval_call(&request, true)["options"],
+            serde_json::json!([RPC_APPROVAL_ONCE, RPC_APPROVAL_DENY])
+        );
+        for answer in [RPC_APPROVAL_SESSION, RPC_APPROVAL_ALWAYS] {
+            assert_eq!(
+                rpc_resolve_approval(&request, true, dir.path(), |_| serde_json::json!(answer)),
+                davinci_agent::ToolApprovalDecision::Deny
+            );
+        }
+        assert!(!dir.path().join(".davinci/settings.json").exists());
+    }
+
+    #[test]
+    fn rpc_permission_save_failure_requires_another_explicit_choice() {
+        use davinci_agent::ToolApprovalDecision::*;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".davinci"), "not a directory").unwrap();
+        let request = davinci_agent::ToolApprovalRequest {
+            legal_choices: davinci_agent::approval::offer_scopes(false, true, true),
+            tool_call_id: "save-failure".into(),
+            tool: "write".into(),
+            args: serde_json::json!({}),
+            subject: "file.txt".into(),
+            summary: "write file.txt".into(),
+            session_rule: "write(file.txt)".into(),
+            outside_project: false,
+            mode: davinci_agent::PermissionMode::Ask,
+        };
+        for (answer, expected) in [
+            (RPC_APPROVAL_ONCE, AllowOnce),
+            (RPC_APPROVAL_SESSION, AllowForSession),
+            (RPC_APPROVAL_DENY, Deny),
+            (RPC_APPROVAL_ALWAYS, Deny),
+        ] {
+            let mut calls = 0;
+            let decision = rpc_resolve_approval(&request, true, dir.path(), |call| {
+                calls += 1;
+                if calls == 1 {
+                    serde_json::json!(RPC_APPROVAL_ALWAYS)
+                } else {
+                    assert!(call["title"]
+                        .as_str()
+                        .unwrap()
+                        .contains("could not be saved"));
+                    assert_eq!(
+                        call["options"],
+                        rpc_approval_call(&request, false)["options"]
+                    );
+                    serde_json::json!(answer)
+                }
+            });
+            assert_eq!(calls, 2);
+            assert_eq!(decision, expected);
+        }
+        let saved = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+        assert_eq!(
+            rpc_resolve_approval(&request, true, saved.path(), |_| {
+                calls += 1;
+                serde_json::json!(RPC_APPROVAL_ALWAYS)
+            }),
+            AllowAlways
+        );
+        assert_eq!(calls, 1);
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(saved.path().join(".davinci/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["permissions"]["allow"],
+            serde_json::json!([request.session_rule])
+        );
+        assert_eq!(
+            rpc_resolve_approval(&request, true, dir.path(), |call| {
+                if call["options"].as_array().unwrap().len() == 4 {
+                    serde_json::json!(RPC_APPROVAL_ALWAYS)
+                } else {
+                    serde_json::Value::Null
+                }
+            }),
+            Deny
+        );
     }
 
     #[test]
@@ -9485,6 +11419,10 @@ mod tests {
             slash::parse_line("/agents"),
             slash::SlashAction::Agents
         ));
+        assert!(matches!(
+            slash::parse_line("/tasks"),
+            slash::SlashAction::Tasks
+        ));
         assert_eq!(
             slash::parse_line("/review src/index.ts"),
             slash::SlashAction::Prompt("/review src/index.ts".into())
@@ -9569,6 +11507,86 @@ mod tests {
         assert!(row.contains("200K"));
         assert!(row.contains("16.4K") || row.contains("16384") || row.contains("16K"));
         assert!(row.contains("yes"));
+    }
+
+    #[test]
+    fn f01_new_session_hosts_revoke_consent_only_after_creation() {
+        for host in ["native", "legacy", "extension"] {
+            for fail_creation in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let session_dir = dir.path().join("sessions");
+                if fail_creation {
+                    std::fs::write(&session_dir, "occupied").unwrap();
+                }
+                let parsed = Args {
+                    session_dir: Some(session_dir.display().to_string()),
+                    ..Args::default()
+                };
+                let mut agent = Agent::new("fixture");
+                agent.cwd = dir.path().into();
+                let original = JsonlSession::create(
+                    &dir.path().join("original"),
+                    &agent.cwd.to_string_lossy(),
+                    None,
+                )
+                .unwrap();
+                let original_id = original.header.id.clone();
+                agent.load_from_session(original).unwrap();
+                agent.set_permission_mode(davinci_agent::PermissionMode::Ask);
+                agent
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .remember("write(ordinary.txt)");
+                let revision = agent.permissions.lock().unwrap().revision();
+                let mut session =
+                    InteractiveSession::new(builtin_themes()[0].clone(), "fixture", vec![]);
+                match host {
+                    "native" => {
+                        use davinci_tui::davinci::{
+                            model::Model,
+                            theme::{ColorDepth, Theme},
+                        };
+                        let mut model = Model::new(
+                            Theme::da_vinci(ColorDepth::TrueColor, false),
+                            80,
+                            24,
+                            false,
+                        );
+                        let result = davinci_interactive::perform(
+                            &parsed,
+                            &mut agent,
+                            &mut model,
+                            SlashAction::NewSession,
+                        );
+                        assert_eq!(result.is_err(), fail_creation);
+                    }
+                    "legacy" => {
+                        let result =
+                            handle_user_line(&parsed, &mut agent, &mut session, "/new", None);
+                        assert_eq!(result.is_err(), fail_creation);
+                    }
+                    _ => {
+                        apply_session_calls(
+                            Some(&parsed),
+                            &mut agent,
+                            SessionCallUi::Chrome(&mut session.chrome),
+                            &[serde_json::json!({"op":"newSession"})],
+                            false,
+                        );
+                    }
+                }
+                let policy = agent.permissions.lock().unwrap();
+                assert_eq!(policy.session_allow.is_empty(), !fail_creation, "{host}");
+                assert_eq!(policy.revision() == revision, fail_creation, "{host}");
+                assert_eq!(
+                    agent.session.as_ref().unwrap().header.id == original_id,
+                    fail_creation,
+                    "{host}"
+                );
+                assert_eq!(policy.mode, davinci_agent::PermissionMode::Ask);
+            }
+        }
     }
 
     #[test]

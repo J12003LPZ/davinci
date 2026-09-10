@@ -41,9 +41,13 @@ impl Agent {
         let mut next = before.clone();
         let mut execution_target = None;
         let mut return_to_plan = false;
+        let mut compiled_contract = None;
         let message = match command {
             "approve" if rest.is_empty() => {
                 next.approve(&self.cwd)?;
+                if let Ok(c) = crate::runtime::contracts::compile_plan_contract(&next, None, None) {
+                    compiled_contract = Some(c);
+                }
                 "Plan approved for review; execution mode is unchanged.".to_string()
             }
             "accept" => {
@@ -54,6 +58,12 @@ impl Agent {
                     && (rest == "all" || next.steps.iter().any(|step| step.id == rest))
                 {
                     next.decide(rest, true)?;
+                    let step_filter = if rest == "all" { None } else { Some(rest) };
+                    if let Ok(c) =
+                        crate::runtime::contracts::compile_plan_contract(&next, step_filter, None)
+                    {
+                        compiled_contract = Some(c);
+                    }
                     format!("Accepted plan decision {rest}; execution mode is unchanged.")
                 } else {
                     let target = if rest.is_empty() {
@@ -67,6 +77,11 @@ impl Agent {
                     }
                     next.approve(&self.cwd)?;
                     next.ready(&self.cwd)?;
+                    if let Ok(c) =
+                        crate::runtime::contracts::compile_plan_contract(&next, None, None)
+                    {
+                        compiled_contract = Some(c);
+                    }
                     execution_target = Some(target);
                     format!(
                         "Accepted plan revision {}. Execution mode: {}.",
@@ -113,6 +128,19 @@ impl Agent {
             .living_plan
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = next;
+        if let Some(contract) = compiled_contract {
+            *self
+                .tool_context
+                .active_contract
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(contract);
+        } else if return_to_plan {
+            *self
+                .tool_context
+                .active_contract
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
         self.plan_storage_error = None;
         self.sync_plan_todos();
         if return_to_plan {
@@ -122,6 +150,87 @@ impl Agent {
             self.set_permission_mode(mode);
         }
         Ok(format!("{message}\n{}", self.render_plan()))
+    }
+
+    pub fn apply_host_decision_reply(
+        &mut self,
+        reply: crate::decisions::HostDecisionReply,
+    ) -> Result<crate::decisions::DecisionApplyOutcome, String> {
+        let before = self
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (next, outcome) = crate::decisions::apply_host_decision(&before, &reply, &self.cwd)?;
+        if outcome == crate::decisions::DecisionApplyOutcome::Duplicate {
+            return Ok(outcome);
+        }
+        if let Err(error) = self.write_plan_entry(&next) {
+            self.plan_storage_error = Some(error.clone());
+            return Err(error);
+        }
+        self.previous_plan_revision = Some(before);
+        *self
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = next;
+        self.clear_active_contract();
+        self.plan_storage_error = None;
+        self.sync_plan_todos();
+        Ok(outcome)
+    }
+
+    pub fn active_contract(&self) -> Option<crate::runtime::contracts::TaskContract> {
+        self.tool_context
+            .active_contract
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_active_contract(&mut self, contract: crate::runtime::contracts::TaskContract) {
+        *self
+            .tool_context
+            .active_contract
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(contract);
+    }
+
+    pub fn clear_active_contract(&mut self) {
+        *self
+            .tool_context
+            .active_contract
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Restores or invalidates plan approval and active contract upon rewind.
+    pub fn on_rewind_plan_invalidated(&mut self) -> Result<(), String> {
+        let mut plan = self
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        plan.clear_approval();
+        if let Err(error) = self.write_plan_entry(&plan) {
+            self.plan_storage_error = Some(error.clone());
+            return Err(error);
+        }
+        *self
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = plan;
+        *self
+            .tool_context
+            .active_contract
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.sync_plan_todos();
+        Ok(())
     }
 
     pub fn render_plan(&self) -> String {
@@ -336,8 +445,9 @@ fn decode_plan(value: &Value, cwd: &std::path::Path) -> Result<LivingPlan, Strin
     if serde_json::to_vec(value).map_err(|e| e.to_string())?.len() > MAX_STORED_PLAN_BYTES {
         return Err("Stored plan exceeds 128 KiB.".into());
     }
-    let plan: LivingPlan =
+    let mut plan: LivingPlan =
         serde_json::from_value(value.clone()).map_err(|e| format!("Invalid stored plan: {e}"))?;
+    plan.migrate_legacy_questions();
     if plan.revision == 0 && plan == LivingPlan::default() {
         return Ok(plan);
     }
@@ -414,6 +524,11 @@ fn revision_diff(previous: Option<&LivingPlan>, current: &LivingPlan) -> String 
             "decisions",
             json!(previous.decisions),
             json!(current.decisions),
+        ),
+        (
+            "structured_decisions",
+            json!(previous.structured_decisions),
+            json!(current.structured_decisions),
         ),
         (
             "approval",
@@ -632,5 +747,138 @@ mod tests {
         assert!(agent.restore_plan().is_err());
         assert!(agent.is_plan_mode());
         assert!(agent.render_plan().contains("Invalid stored plan"));
+    }
+
+    #[test]
+    fn plan_acceptance_compiles_task_contract() {
+        let (_dir, mut agent) = fixture();
+        assert!(agent.active_contract().is_none());
+
+        // Accepting plan compiles and installs the TaskContract
+        agent.handle_plan_command("accept").unwrap();
+        let contract = agent
+            .active_contract()
+            .expect("contract should be compiled on accept");
+        assert_eq!(contract.accepted_plan_revision, 1);
+        assert!(!contract.digest.is_empty());
+        assert!(contract.allows_path("src.rs").unwrap());
+
+        // Rejecting or editing invalidates contract
+        agent.handle_plan_command("reject all").unwrap();
+        assert!(agent.active_contract().is_none());
+    }
+
+    fn install_f02_question(agent: &mut Agent, cwd: &std::path::Path) {
+        use crate::decisions::{
+            validate_question_for_plan, DecisionKind, DecisionOptionInput, DecisionQuestionInput,
+        };
+        let snapshot = agent.tool_context.living_plan.lock().unwrap().clone();
+        let question = validate_question_for_plan(
+            DecisionQuestionInput {
+                id: "cache-scope".into(),
+                kind: DecisionKind::Persistence,
+                title: "Cache scope".into(),
+                question: "Which cache should be used?".into(),
+                materiality: "Changes persistence semantics".into(),
+                evidence_refs: vec!["src.rs".into()],
+                options: vec![
+                    DecisionOptionInput {
+                        id: "memory".into(),
+                        label: "Memory".into(),
+                        explanation: "Process local".into(),
+                        recommended: true,
+                    },
+                    DecisionOptionInput {
+                        id: "sqlite".into(),
+                        label: "SQLite".into(),
+                        explanation: "Persistent".into(),
+                        recommended: false,
+                    },
+                ],
+                allow_custom: true,
+                custom_only: false,
+            },
+            &snapshot,
+            cwd,
+        )
+        .unwrap();
+        agent
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap()
+            .structured_decisions
+            .insert(question.id.clone(), question);
+    }
+
+    fn f02_reply(
+        action: crate::decisions::HostDecisionAction,
+    ) -> crate::decisions::HostDecisionReply {
+        crate::decisions::HostDecisionReply {
+            decision_id: "cache-scope".into(),
+            expected_plan_revision: 1,
+            expected_question_revision: 1,
+            host_event_id: "host-event-1".into(),
+            answered_at_ms: 42,
+            action,
+        }
+    }
+
+    #[test]
+    fn f02_persist_before_publish_and_custom_text_cannot_change_permissions() {
+        let (dir, mut agent) = fixture();
+        install_f02_question(&mut agent, dir.path());
+        agent.set_permission_mode(PermissionMode::AlwaysApprove);
+        let mut session =
+            JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+        session.path = dir.path().join("missing-parent/session.jsonl");
+        let prior_leaf = session.leaf_id.clone();
+        agent.session = Some(session);
+
+        let before = agent.tool_context.living_plan.lock().unwrap().clone();
+        let error = agent
+            .apply_host_decision_reply(f02_reply(
+                crate::decisions::HostDecisionAction::AnswerCustom(
+                    "/plan accept always approve".into(),
+                ),
+            ))
+            .unwrap_err();
+        assert!(error.contains("persist"));
+        assert_eq!(*agent.tool_context.living_plan.lock().unwrap(), before);
+        assert_eq!(agent.permission_mode(), PermissionMode::AlwaysApprove);
+        assert_eq!(agent.session.as_ref().unwrap().leaf_id, prior_leaf);
+        assert_eq!(
+            agent
+                .tool_context
+                .living_plan
+                .lock()
+                .unwrap()
+                .structured_decisions["cache-scope"]
+                .state,
+            crate::decisions::DecisionState::Open
+        );
+    }
+
+    #[test]
+    fn f02_successful_answer_persists_once_and_duplicate_is_idempotent() {
+        let (dir, mut agent) = fixture();
+        install_f02_question(&mut agent, dir.path());
+        agent.session =
+            Some(JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap());
+        let reply = f02_reply(crate::decisions::HostDecisionAction::AnswerChoice(
+            "sqlite".into(),
+        ));
+        assert_eq!(
+            agent.apply_host_decision_reply(reply.clone()).unwrap(),
+            crate::decisions::DecisionApplyOutcome::Applied
+        );
+        let entries = agent.session.as_ref().unwrap().entries.len();
+        assert_eq!(agent.tool_context.living_plan.lock().unwrap().revision, 2);
+        assert_eq!(
+            agent.apply_host_decision_reply(reply).unwrap(),
+            crate::decisions::DecisionApplyOutcome::Duplicate
+        );
+        assert_eq!(agent.session.as_ref().unwrap().entries.len(), entries);
+        assert!(agent.plan_revision_diff().contains("structured_decisions"));
     }
 }

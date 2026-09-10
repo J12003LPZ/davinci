@@ -576,6 +576,7 @@ impl WorkflowExecutor {
                 worker.prompt.clone()
             };
 
+            let child_token = wf_token.child_token();
             let req = SubagentRequest {
                 prompt: effective_prompt,
                 tools: worker.tools.clone(),
@@ -583,15 +584,22 @@ impl WorkflowExecutor {
                 provider: None,
                 model_id: None,
                 abort: Some(wf_token.as_atomic_bool()),
-                cancellation_token: Some(wf_token.child_token()),
+                cancellation_token: Some(child_token.clone()),
                 agent: worker.agent_profile.clone(),
                 mode: crate::subagent::AgentSpawnMode::Oneshot,
                 model_override: worker.model.clone(),
                 isolation: worker.isolation.clone(),
                 instance_name: Some(worker.id.clone()),
                 runtime_agent_id: Some(aid),
+                runtime: Some(
+                    self.runtime
+                        .for_worker(aid, Some(child_token))
+                        .map_err(WorkflowExecutionError::ExecutionError)?,
+                ),
                 parent_permission_mode: None,
                 worktree_path: None,
+                contract_digest: None,
+                active_contract: None,
             };
 
             let retry_limit = worker.retry_budget.unwrap_or(0);

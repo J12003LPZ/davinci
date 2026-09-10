@@ -244,6 +244,22 @@ pub enum MemoryKind {
     Conversation,
 }
 
+/// Reduces provenance after reviewer or user action. Explicit user confirmation promotes to "user_decision", tombstones mark as "removed", otherwise original provenance is retained.
+#[allow(dead_code)]
+pub fn provenance_after_review(
+    original: &str,
+    explicit_user_confirmation: bool,
+    tombstoned: bool,
+) -> &str {
+    if tombstoned {
+        "removed"
+    } else if explicit_user_confirmation {
+        "user_decision"
+    } else {
+        original
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryRecord {
@@ -673,6 +689,10 @@ pub struct VectorMemory {
     pub cwd: PathBuf,
     pub repo_id: String,
     records: Vec<MemoryRecord>,
+    pub tombstones: HashSet<String>,
+    pub supersessions: std::collections::HashMap<String, String>,
+    #[allow(dead_code)]
+    pub provenances: std::collections::HashMap<String, String>,
     /// `kind\0content_hash` of every record, so indexing a turn is a set
     /// probe per chunk rather than a scan of the store per chunk.
     known: HashSet<String>,
@@ -710,6 +730,9 @@ impl VectorMemory {
             cwd,
             repo_id,
             records: Vec::new(),
+            tombstones: HashSet::new(),
+            supersessions: std::collections::HashMap::new(),
+            provenances: std::collections::HashMap::new(),
             known: HashSet::new(),
             last_indexed: 0,
             last_indexed_at: None,
@@ -904,6 +927,78 @@ impl VectorMemory {
         &self.records
     }
 
+    /// Marks a record ID as tombstoned, filtering it from all subsequent dense and lexical searches.
+    #[allow(dead_code)]
+    pub fn add_tombstone(&mut self, id: impl Into<String>) {
+        let id_str = id.into();
+        self.tombstones.insert(id_str);
+    }
+
+    /// Applies context overlay preferences (importing tombstones).
+    #[allow(dead_code)]
+    pub fn apply_overlay(&mut self, overlay: &davinci_agent::runtime::ContextOverlay) {
+        for id in &overlay.tombstones {
+            self.add_tombstone(id);
+        }
+    }
+
+    /// Returns the provenance classification for a record ID ("user_decision", "inference", etc.).
+    #[allow(dead_code)]
+    pub fn get_provenance(&self, id: &str) -> &str {
+        self.provenances
+            .get(id)
+            .map(|s| s.as_str())
+            .unwrap_or("unproven")
+    }
+
+    /// Updates a memory record by superseding the prior record with a new corrected record.
+    #[allow(dead_code)]
+    pub fn supersede_record(
+        &mut self,
+        prior_id: &str,
+        new_text: impl Into<String>,
+        user_confirmed: bool,
+    ) -> Option<String> {
+        let prior = self.records.iter().find(|r| r.id == prior_id)?.clone();
+        let new_id = format!("{}-c{}", prior_id, self.records.len());
+        let new_text = new_text.into();
+        let prior_prov = self
+            .provenances
+            .get(prior_id)
+            .map(|s| s.as_str())
+            .unwrap_or("inference");
+        let prov = provenance_after_review(prior_prov, user_confirmed, false);
+
+        let new_record = MemoryRecord {
+            id: new_id.clone(),
+            repo_id: prior.repo_id.clone(),
+            kind: prior.kind,
+            text: new_text,
+            source: prior.source.clone(),
+            content_hash: format!("{:x}", sha2::Sha256::digest(prior.id.as_bytes())),
+            importance: prior.importance,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            embedding: None,
+            confidence: prior.confidence,
+            source_session_id: prior.source_session_id.clone(),
+            source_turn: prior.source_turn,
+            verification: prior.verification.clone(),
+            use_count: 0,
+            last_used_at: None,
+            agent_profile_name: prior.agent_profile_name.clone(),
+            memory_scope: prior.memory_scope.clone(),
+        };
+
+        self.supersessions
+            .insert(prior_id.to_string(), new_id.clone());
+        self.provenances.insert(new_id.clone(), prov.to_string());
+        self.records.push(new_record);
+        Some(new_id)
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<MemoryHit> {
         self.search_scoped(query, limit, None, None)
     }
@@ -927,26 +1022,35 @@ impl VectorMemory {
         let candidates: Vec<&MemoryRecord> = self
             .records
             .iter()
-            .filter(|record| match memory_scope {
-                Some("none") => false,
-                Some("agent_global") => record.agent_profile_name.as_deref() == agent_profile_name,
-                Some("agent_project") => {
-                    (record.repo_id == self.repo_id || record.repo_id == "*")
-                        && record.agent_profile_name.as_deref() == agent_profile_name
+            .filter(|record| {
+                if self.tombstones.contains(&record.id)
+                    || self.supersessions.contains_key(&record.id)
+                {
+                    return false;
                 }
-                Some("project") => {
-                    record.repo_id == self.repo_id
-                        && (record.agent_profile_name.is_none()
-                            || record.agent_profile_name.as_deref() == agent_profile_name)
-                }
-                _ => {
-                    if let Some(profile) = agent_profile_name {
+                match memory_scope {
+                    Some("none") => false,
+                    Some("agent_global") => {
+                        record.agent_profile_name.as_deref() == agent_profile_name
+                    }
+                    Some("agent_project") => {
                         (record.repo_id == self.repo_id || record.repo_id == "*")
+                            && record.agent_profile_name.as_deref() == agent_profile_name
+                    }
+                    Some("project") => {
+                        record.repo_id == self.repo_id
                             && (record.agent_profile_name.is_none()
-                                || record.agent_profile_name.as_deref() == Some(profile))
-                    } else {
-                        // Main agent behavior remains unchanged: only project-wide memory where agent_profile_name is None
-                        record.repo_id == self.repo_id && record.agent_profile_name.is_none()
+                                || record.agent_profile_name.as_deref() == agent_profile_name)
+                    }
+                    _ => {
+                        if let Some(profile) = agent_profile_name {
+                            (record.repo_id == self.repo_id || record.repo_id == "*")
+                                && (record.agent_profile_name.is_none()
+                                    || record.agent_profile_name.as_deref() == Some(profile))
+                        } else {
+                            // Main agent behavior remains unchanged: only project-wide memory where agent_profile_name is None
+                            record.repo_id == self.repo_id && record.agent_profile_name.is_none()
+                        }
                     }
                 }
             })
@@ -1987,5 +2091,143 @@ mod tests {
         // Scope 'none' returns empty
         let hits_none = memory.search_scoped("confidential", 10, Some("profile-a"), Some("none"));
         assert!(hits_none.is_empty());
+    }
+
+    #[test]
+    fn f08_inference_not_fact() {
+        assert_eq!(
+            provenance_after_review("inference", false, false),
+            "inference"
+        );
+        assert_eq!(
+            provenance_after_review("inference", true, false),
+            "user_decision"
+        );
+        assert_eq!(
+            provenance_after_review("repository_fact", false, true),
+            "removed"
+        );
+    }
+
+    #[test]
+    fn test_inference_high_confidence_remains_inference() {
+        // A confidence score of 0.999 must NOT relabel inference as user-approved fact
+        let confidence = 0.999f32;
+        let prov = provenance_after_review("inference", false, false);
+        assert_eq!(prov, "inference");
+        assert!(confidence > 0.9);
+    }
+
+    #[test]
+    fn test_same_fact_in_sparse_dense_index_tombstoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(dir.path().to_path_buf());
+        memory.records.push(MemoryRecord {
+            id: "mem-1".into(),
+            repo_id: memory.repo_id.clone(),
+            kind: MemoryKind::Fact,
+            text: "Important build instructions".into(),
+            source: "user".into(),
+            content_hash: "hash-1".into(),
+            importance: 1.0,
+            created_at: 1000,
+            embedding: None,
+            confidence: Some(1.0),
+            source_session_id: None,
+            source_turn: None,
+            verification: None,
+            use_count: 0,
+            last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
+        });
+
+        assert_eq!(memory.search("build instructions", 10).len(), 1);
+
+        // Tombstoning filters out from search
+        memory.add_tombstone("mem-1");
+        assert!(memory.search("build instructions", 10).is_empty());
+    }
+
+    #[test]
+    fn test_reindex_preserves_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(dir.path().to_path_buf());
+        memory.add_tombstone("resurrect-id");
+
+        // Reindexing or adding record with the same ID
+        memory.records.push(MemoryRecord {
+            id: "resurrect-id".into(),
+            repo_id: memory.repo_id.clone(),
+            kind: MemoryKind::Fact,
+            text: "Resurrected fact".into(),
+            source: "user".into(),
+            content_hash: "hash-r".into(),
+            importance: 1.0,
+            created_at: 2000,
+            embedding: None,
+            confidence: None,
+            source_session_id: None,
+            source_turn: None,
+            verification: None,
+            use_count: 0,
+            last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
+        });
+
+        // Search is still suppressed by persistent tombstone
+        let hits = memory.search("Resurrected", 10);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_correction_supersedes_prior_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(dir.path().to_path_buf());
+        memory.records.push(MemoryRecord {
+            id: "fact-orig".into(),
+            repo_id: memory.repo_id.clone(),
+            kind: MemoryKind::Fact,
+            text: "Original incorrect text".into(),
+            source: "inference".into(),
+            content_hash: "hash-orig".into(),
+            importance: 1.0,
+            created_at: 1000,
+            embedding: None,
+            confidence: Some(0.8),
+            source_session_id: None,
+            source_turn: None,
+            verification: None,
+            use_count: 0,
+            last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
+        });
+
+        let new_id = memory
+            .supersede_record("fact-orig", "Corrected factual text", true)
+            .unwrap();
+        assert!(new_id.starts_with("fact-orig-c"));
+
+        // Prior record is marked superseded in sidecar map
+        assert_eq!(memory.supersessions.get("fact-orig"), Some(&new_id));
+
+        // Searching for original returns only the corrected record
+        let hits = memory.search("factual text", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.id, new_id);
+        assert_eq!(memory.get_provenance(&hits[0].record.id), "user_decision");
+    }
+
+    #[test]
+    fn test_old_memory_without_provenance_shown_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = VectorMemory::new(dir.path().to_path_buf());
+        assert_eq!(memory.get_provenance("legacy-1"), "unproven");
+        assert_eq!(
+            provenance_after_review("unproven", false, false),
+            "unproven"
+        );
     }
 }

@@ -1,11 +1,140 @@
 //! Host adapters connecting Davinci extensions, hooks, and persistence into the shared runtime.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use davinci_agent::runtime::bus::is_decision_event;
 use davinci_agent::{RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeSubscriber};
 
 use crate::hooks::{self, HooksFile};
+
+/// Bind the session projections and workflow executor used by the product host.
+/// `previous` must come from `Agent::runtime_for_session`, which validates its source.
+pub fn configure_session_workflow(
+    runtime: davinci_agent::RuntimeHandle,
+    session: Option<&davinci_session::JsonlSession>,
+    previous: Option<&davinci_agent::RuntimeHandle>,
+    store: davinci_agent::WorkflowStateStore,
+    runner: Option<davinci_agent::SubagentRunner>,
+) -> Result<davinci_agent::RuntimeHandle, String> {
+    configure_session_workflow_with_legacy_recovery(
+        runtime,
+        session,
+        previous,
+        store,
+        runner,
+        &HashMap::new(),
+    )
+}
+
+/// Configure a session with an explicit host-authored mapping for record-less
+/// legacy task creations. Existing journals remain authoritative and ignore
+/// the mapping, while missing or unused entries fail closed during migration.
+pub fn configure_session_workflow_with_legacy_recovery(
+    mut runtime: davinci_agent::RuntimeHandle,
+    session: Option<&davinci_session::JsonlSession>,
+    previous: Option<&davinci_agent::RuntimeHandle>,
+    store: davinci_agent::WorkflowStateStore,
+    runner: Option<davinci_agent::SubagentRunner>,
+    recovery: &HashMap<davinci_agent::TaskId, davinci_agent::runtime::LegacyTaskRecovery>,
+) -> Result<davinci_agent::RuntimeHandle, String> {
+    if let Some(previous) = previous {
+        runtime = runtime.with_session_state_from(previous);
+    }
+    if let Some(session) = session {
+        runtime = runtime.with_session(&session.header.id);
+        if previous.is_none() {
+            runtime =
+                davinci_agent::runtime::session::restore_session_runtime_with_legacy_recovery(
+                    runtime, session, recovery,
+                )?;
+        }
+    }
+    let executor = Arc::new(davinci_agent::WorkflowExecutor::new(
+        runtime.clone(),
+        store,
+        runner,
+    ));
+    Ok(runtime.with_workflow_executor(executor))
+}
+
+#[allow(unused_imports)]
+pub use crate::completion_delivery::installed_matches;
+
+/// Host adapter bridging runtime task evaluation with budget reservations and delivery proof.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct HostBudgetEvidenceAdapter {
+    pub reservation: davinci_agent::runtime::completion::BudgetReservation,
+}
+
+#[allow(dead_code)]
+impl HostBudgetEvidenceAdapter {
+    pub fn new(reservation: davinci_agent::runtime::completion::BudgetReservation) -> Self {
+        Self { reservation }
+    }
+
+    /// Validates whether an implementation step can proceed without starving verification/handoff.
+    pub fn can_dispatch_implementation(&self, estimated_tokens: u64) -> Result<(), String> {
+        if self
+            .reservation
+            .can_reserve_implementation(estimated_tokens)
+        {
+            Ok(())
+        } else {
+            Err(
+                "Cannot dispatch implementation: verification or handoff reserve would be breached"
+                    .into(),
+            )
+        }
+    }
+
+    /// Evaluates a task completion incorporating budget reserves.
+    pub fn evaluate_task(
+        &self,
+        task: &davinci_agent::runtime::tasks::TaskRecord,
+        contract: Option<&davinci_agent::runtime::contracts::TaskContract>,
+        receipts: &[davinci_agent::runtime::evidence_store::ExecutionReceipt],
+        manifest: &davinci_agent::runtime::source_manifest::SourceManifest,
+        expected_attempt: u32,
+    ) -> davinci_agent::runtime::completion::CompletionEvaluation {
+        davinci_agent::runtime::completion::evaluate_task_completion_with_budget(
+            task,
+            contract,
+            receipts,
+            manifest,
+            expected_attempt,
+            Some(&self.reservation),
+        )
+    }
+}
+
+/// Provenance and token estimates for host-provided overhead (system framing, tool schemas, protocol wrapping).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostOverheadProvenance {
+    pub system_tokens: u64,
+    pub tool_schema_tokens: u64,
+    pub wrapper_tokens: u64,
+    pub total_overhead_tokens: u64,
+    pub source: String,
+}
+
+#[allow(dead_code)]
+impl HostOverheadProvenance {
+    pub fn new(system_tokens: u64, tool_schema_tokens: u64, wrapper_tokens: u64) -> Self {
+        let total = system_tokens
+            .saturating_add(tool_schema_tokens)
+            .saturating_add(wrapper_tokens);
+        Self {
+            system_tokens,
+            tool_schema_tokens,
+            wrapper_tokens,
+            total_overhead_tokens: total,
+            source: "host::runtime_configuration".to_string(),
+        }
+    }
+}
 
 /// RuntimeSubscriber that executes configured lifecycle hooks.
 pub struct HooksRuntimeSubscriber {
@@ -132,34 +261,9 @@ impl RuntimeSubscriber for CompactionRuntimeSubscriber {
     }
 }
 
-/// RuntimeSubscriber that appends runtime lifecycle events into the session's `.runtime.jsonl` sidecar.
-pub struct RuntimeLogSubscriber {
-    writer: Arc<Mutex<davinci_session::RuntimeLogWriter>>,
-}
-
-impl RuntimeLogSubscriber {
-    pub fn new(writer: davinci_session::RuntimeLogWriter) -> Self {
-        Self {
-            writer: Arc::new(Mutex::new(writer)),
-        }
-    }
-
-    pub fn open(
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, davinci_session::RuntimeLogError> {
-        let writer = davinci_session::RuntimeLogWriter::open(path)?;
-        Ok(Self::new(writer))
-    }
-}
-
-impl RuntimeSubscriber for RuntimeLogSubscriber {
-    fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.append(event);
-        }
-        RuntimeDecision::Continue
-    }
-}
+// Preserve the library's host adapter path; the binary uses shared activation.
+#[allow(unused_imports)]
+pub use davinci_agent::runtime::session::RuntimeLogSubscriber;
 
 /// Helper to register native vector memory and skill learning context sources into the runtime.
 #[allow(dead_code)]
@@ -255,11 +359,608 @@ impl GovernorHostAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f03_host_imports_legacy_tasks_once_and_reconciles_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = davinci_session::runtime_log_path(&session.path);
+        let mut task =
+            davinci_agent::TaskRecord::new(davinci_agent::RunId::new(), "orphaned legacy work");
+        task.state = davinci_agent::TaskState::Running;
+        task.assigned_to = Some(davinci_agent::AgentId::new());
+        task.revision = 9;
+        let mut dependent = davinci_agent::TaskRecord::new(davinci_agent::RunId::new(), "waiting");
+        dependent.dependencies.push(task.id);
+        dependent.state = davinci_agent::TaskState::Pending;
+        let events: Vec<_> = [&task, &dependent]
+            .into_iter()
+            .map(|record| {
+                RuntimeEventEnvelope::new(
+                    1,
+                    record.run_id,
+                    None,
+                    None,
+                    None,
+                    RuntimeEvent::TaskCreated {
+                        task_id: record.id,
+                        record: Some(record.clone()),
+                    },
+                )
+            })
+            .collect();
+        let bytes = events.iter().fold(String::new(), |mut bytes, event| {
+            bytes.push_str(&serde_json::to_string(event).unwrap());
+            bytes.push('\n');
+            bytes
+        });
+        std::fs::write(&path, &bytes).unwrap();
+        let activate = || {
+            configure_session_workflow(
+                davinci_agent::RuntimeHandle::new(
+                    davinci_agent::RunId::new(),
+                    davinci_agent::AgentId::new(),
+                    davinci_agent::RuntimeBus::new(),
+                ),
+                Some(&session),
+                None,
+                davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts")),
+                None,
+            )
+            .unwrap()
+        };
+        let runtime = activate();
+        let run = runtime.run_id;
+        assert_ne!(run, task.run_id);
+        assert_eq!(runtime.task_registry.list_tasks(Some(run)).len(), 2);
+        let recovered = runtime.task_registry.get_task(&task.id).unwrap();
+        assert_eq!(recovered.run_id, task.run_id);
+        assert_eq!(recovered.state, davinci_agent::TaskState::Failed);
+        assert_eq!(recovered.revision, 10);
+        assert_eq!(recovered.result.as_deref(), Some("process_terminated"));
+        assert_eq!(
+            runtime.task_registry.get_task(&dependent.id).unwrap().state,
+            davinci_agent::TaskState::Blocked
+        );
+        drop(runtime);
+        let resumed = activate();
+        assert_eq!(resumed.run_id, run);
+        assert_eq!(resumed.task_registry.get_task(&task.id), Some(recovered));
+        drop(resumed);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn f03_host_legacy_tasks_require_migration_without_erasing_history() {
+        for empty_journal in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let session =
+                davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+            let path = davinci_session::runtime_log_path(&session.path);
+            let journal = session.path.with_extension("tasks.jsonl");
+            let runtime = davinci_agent::RuntimeHandle::new(
+                davinci_agent::RunId::new(),
+                davinci_agent::AgentId::new(),
+                davinci_agent::RuntimeBus::new(),
+            );
+            let event = RuntimeEventEnvelope::new(
+                1,
+                runtime.run_id,
+                Some(session.header.id.clone()),
+                Some(runtime.agent_id),
+                None,
+                RuntimeEvent::TaskCreated {
+                    task_id: davinci_agent::TaskId::new(),
+                    record: None,
+                },
+            );
+            let bytes = format!("{}\n", serde_json::to_string(&event).unwrap());
+            std::fs::write(&path, &bytes).unwrap();
+            if empty_journal {
+                std::fs::write(&journal, []).unwrap();
+            }
+            let result = configure_session_workflow(
+                runtime,
+                Some(&session),
+                None,
+                davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts")),
+                None,
+            );
+            assert!(result.unwrap_err().contains("migration"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            if empty_journal {
+                assert_eq!(std::fs::metadata(&journal).unwrap().len(), 0);
+            } else {
+                assert!(!journal.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn f03_host_legacy_recovery_imports_recordless_tasks_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = davinci_session::runtime_log_path(&session.path);
+        let task_id = davinci_agent::TaskId::new();
+        let run_id = davinci_agent::RunId::new();
+        let event = RuntimeEventEnvelope::new(
+            1,
+            run_id,
+            Some(session.header.id.clone()),
+            None,
+            None,
+            RuntimeEvent::TaskCreated {
+                task_id,
+                record: None,
+            },
+        );
+        let bytes = format!("{}\n", serde_json::to_string(&event).unwrap());
+        std::fs::write(&path, &bytes).unwrap();
+        let mut recovery = std::collections::HashMap::new();
+        recovery.insert(
+            task_id,
+            davinci_agent::runtime::LegacyTaskRecovery::new("explicitly recovered"),
+        );
+        let runtime = configure_session_workflow_with_legacy_recovery(
+            davinci_agent::RuntimeHandle::new(
+                davinci_agent::RunId::new(),
+                davinci_agent::AgentId::new(),
+                davinci_agent::RuntimeBus::new(),
+            ),
+            Some(&session),
+            None,
+            davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts")),
+            None,
+            &recovery,
+        )
+        .unwrap();
+        let recovered = runtime.task_registry.get_task(&task_id).unwrap();
+        assert_eq!(recovered.title, "explicitly recovered");
+        assert_eq!(recovered.run_id, run_id);
+        assert_eq!(recovered.state, davinci_agent::TaskState::Ready);
+        assert_eq!(recovered.assigned_to, None);
+        assert_eq!(recovered.result, None);
+        assert!(recovered.evidence_refs.is_empty());
+        assert!(session.path.with_extension("tasks.jsonl").exists());
+        drop(runtime);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn f03_host_sessionless_worker_remains_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let worker = || {
+            davinci_agent::RuntimeHandle::new(
+                davinci_agent::RunId::new(),
+                davinci_agent::AgentId::new(),
+                davinci_agent::RuntimeBus::new(),
+            )
+            .with_parent(davinci_agent::AgentId::new())
+        };
+        let store =
+            || davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts"));
+        let rejected = configure_session_workflow(worker(), Some(&session), None, store(), None);
+        assert!(rejected.unwrap_err().contains("parent coordinator"));
+        assert!(!session.path.with_extension("tasks.jsonl").exists());
+        let ephemeral = configure_session_workflow(worker(), None, None, store(), None).unwrap();
+        assert!(ephemeral.session_id.is_none());
+        assert!(ephemeral.task_registry.rehydrate_from_events(&[]).is_ok());
+    }
+
+    #[test]
+    fn f03_host_resumes_authoritative_task_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let prepare = || {
+            configure_session_workflow(
+                davinci_agent::RuntimeHandle::new(
+                    davinci_agent::RunId::new(),
+                    davinci_agent::AgentId::new(),
+                    davinci_agent::RuntimeBus::new(),
+                ),
+                Some(&session),
+                None,
+                davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts")),
+                None,
+            )
+            .unwrap()
+        };
+        let first = prepare();
+        let run = first.run_id;
+        let task = first
+            .task_registry
+            .create_task(davinci_agent::TaskRecord::new(run, "durable host task"))
+            .unwrap();
+        first.task_registry.cancel_task(task).unwrap();
+        let expected = first.task_registry.get_task(&task).unwrap();
+        let orphan = first
+            .task_registry
+            .create_task(davinci_agent::TaskRecord::new(run, "orphan"))
+            .unwrap();
+        first
+            .task_registry
+            .assign_task(orphan, first.agent_id)
+            .unwrap();
+        let dependent = first
+            .task_registry
+            .create_task(
+                davinci_agent::TaskRecord::new(run, "dependent").with_dependencies(vec![orphan]),
+            )
+            .unwrap();
+        drop(first);
+        let resumed = prepare();
+        assert_eq!(
+            resumed.run_id, run,
+            "host must select the saved run before queries"
+        );
+        assert_eq!(resumed.task_registry.get_task(&task), Some(expected));
+        assert_eq!(
+            resumed.task_registry.list_tasks(Some(resumed.run_id)).len(),
+            3
+        );
+        let failed = resumed.task_registry.get_task(&orphan).unwrap();
+        assert_eq!(failed.state, davinci_agent::TaskState::Failed);
+        assert_eq!(failed.result.as_deref(), Some("process_terminated"));
+        assert_eq!(
+            resumed.task_registry.get_task(&dependent).unwrap().state,
+            davinci_agent::TaskState::Blocked
+        );
+        assert_eq!(
+            resumed.workflow_executor.as_ref().unwrap().runtime.run_id,
+            run
+        );
+        drop(resumed);
+        assert_eq!(prepare().task_registry.get_task(&orphan), Some(failed));
+    }
+
     use super::*;
+
+    #[test]
+    fn f03_runtime_preparation_reports_corrupt_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = davinci_session::runtime_log_path(&session.path);
+        let corrupt = b"{broken record}\n{broken record}\n";
+        std::fs::write(&path, corrupt).unwrap();
+        let result = configure_session_workflow(
+            davinci_agent::RuntimeHandle::new(
+                davinci_agent::RunId::new(),
+                davinci_agent::AgentId::new(),
+                davinci_agent::RuntimeBus::new(),
+            ),
+            Some(&session),
+            None,
+            davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts")),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "corrupt replay must not silently activate an empty runtime"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn f03_workflow_uses_final_host_session_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session =
+            davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        session.header.id = "custom-session-id".into();
+        let runtime = davinci_agent::RuntimeHandle::new(
+            davinci_agent::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::RuntimeBus::new(),
+        );
+        let runtime = configure_session_workflow(
+            runtime,
+            Some(&session),
+            None,
+            davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts")),
+            None,
+        )
+        .unwrap();
+        let executor = runtime.workflow_executor.as_ref().unwrap();
+        assert_eq!(executor.runtime.session_id, runtime.session_id);
+        assert_eq!(
+            executor.runtime.session_id.as_deref(),
+            Some("custom-session-id")
+        );
+        assert_eq!(executor.runtime.run_id, runtime.run_id);
+        executor.runtime.emit_observe(RuntimeEvent::PostToolBatch {
+            calls: 0,
+            failures: 0,
+        });
+        let events = davinci_session::read_runtime_log::<RuntimeEventEnvelope>(
+            &davinci_session::runtime_log_path(&session.path),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("custom-session-id"));
+    }
+
+    #[test]
+    fn f03_same_session_turn_retains_tasks_and_lineage() {
+        for switch_session in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = davinci_agent::Agent::new("fixture");
+            agent.session =
+                Some(davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap());
+            let journal = agent
+                .session
+                .as_ref()
+                .unwrap()
+                .path
+                .with_extension("tasks.jsonl");
+            let key = serde_json::to_string(&(
+                std::fs::canonicalize(&agent.session.as_ref().unwrap().path).unwrap(),
+                &agent.session.as_ref().unwrap().header.id,
+            ))
+            .unwrap();
+            let prepare = |agent: &davinci_agent::Agent| {
+                let candidate = davinci_agent::RuntimeHandle::new(
+                    davinci_agent::RunId::new(),
+                    davinci_agent::AgentId::new(),
+                    davinci_agent::RuntimeBus::new(),
+                );
+                configure_session_workflow(
+                    candidate,
+                    agent.session.as_ref(),
+                    agent.runtime_for_session(),
+                    davinci_agent::WorkflowStateStore::with_options(
+                        1024,
+                        dir.path().join("artifacts"),
+                    ),
+                    None,
+                )
+                .unwrap()
+            };
+            agent.set_runtime(prepare(&agent));
+            let first = agent.runtime.as_ref().unwrap().clone();
+            let task = first
+                .task_registry
+                .create_task(davinci_agent::TaskRecord::new(
+                    first.run_id,
+                    "first turn task",
+                ))
+                .unwrap();
+            let worker = davinci_agent::AgentId::new();
+            first
+                .registry
+                .register_agent(davinci_agent::AgentRecord {
+                    id: worker,
+                    run_id: first.run_id,
+                    parent: Some(first.agent_id),
+                    kind: davinci_agent::AgentKind::Background,
+                    name: "fixture worker".into(),
+                    provider: "fixture".into(),
+                    model_id: "fixture".into(),
+                    cwd: dir.path().into(),
+                    state: davinci_agent::AgentState::Running,
+                    task_id: Some(task),
+                    worktree: None,
+                    started_ms: 0,
+                    updated_ms: 0,
+                    failure_reason: None,
+                })
+                .unwrap();
+            first.task_registry.assign_task(task, worker).unwrap();
+            first.send_message(worker, "retained message").unwrap();
+            first.cancel();
+            first.emit_observe(RuntimeEvent::PostToolBatch {
+                calls: 0,
+                failures: 0,
+            });
+            agent.set_runtime(prepare(&agent));
+            let second = agent.runtime.as_ref().unwrap();
+            assert_eq!(
+                second.registry.get(&worker).unwrap().state,
+                davinci_agent::AgentState::Running
+            );
+            assert_eq!(second.agent_id, first.agent_id);
+            assert_eq!(second.mailbox.drain(worker, 10).len(), 1);
+            assert!(
+                first.mailbox.drain(worker, 10).is_empty(),
+                "drained messages must not replay next turn"
+            );
+            assert_eq!(second.run_id, first.run_id);
+            assert!(!second.is_cancelled());
+            assert_eq!(
+                second.task_registry.list_tasks(Some(second.run_id)).len(),
+                1
+            );
+            assert!(second.task_registry.get_task(&task).is_some());
+            let added = second
+                .task_registry
+                .create_task(davinci_agent::TaskRecord::new(
+                    second.run_id,
+                    "second turn task",
+                ))
+                .unwrap();
+            assert!(
+                first.task_registry.get_task(&added).is_some(),
+                "registry must be shared, not replayed"
+            );
+            assert_eq!(
+                second.workflow_executor.as_ref().unwrap().runtime.run_id,
+                first.run_id
+            );
+            assert_eq!(
+                agent.tool_context.runtime.as_ref().unwrap().run_id,
+                first.run_id
+            );
+            assert!(journal.is_file());
+            assert!(davinci_agent::TaskRegistry::open_session_durable(&journal, &key).is_err());
+            let log_path = davinci_session::runtime_log_path(&agent.session.as_ref().unwrap().path);
+            let before = davinci_session::read_runtime_log::<RuntimeEventEnvelope>(&log_path)
+                .unwrap()
+                .len();
+            second.emit_observe(RuntimeEvent::PostToolBatch {
+                calls: 0,
+                failures: 0,
+            });
+            let events =
+                davinci_session::read_runtime_log::<RuntimeEventEnvelope>(&log_path).unwrap();
+            assert_eq!(events.len(), before + 1);
+            let sequences = events
+                .iter()
+                .filter(|event| matches!(event.payload, RuntimeEvent::PostToolBatch { .. }))
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sequences,
+                vec![1, 2],
+                "same lineage must retain its event counter"
+            );
+            if switch_session {
+                let mut other =
+                    davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+                other.header.id = agent.session.as_ref().unwrap().header.id.clone();
+                agent.session = Some(other);
+                let next_session = prepare(&agent);
+                assert_ne!(next_session.run_id, first.run_id);
+                assert!(next_session.task_registry.list_tasks(None).is_empty());
+                assert!(next_session.registry.get(&worker).is_none());
+                assert!(next_session.mailbox.drain(worker, 10).is_empty());
+            }
+        }
+    }
     use crate::native_extensions::token_governor::{TokenGovernor, TokenGovernorConfig};
     use davinci_agent::ToolResult;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn f03_background_completion_reaches_current_turn_observers() {
+        struct Collect(Arc<Mutex<Vec<RuntimeEventEnvelope>>>);
+        impl RuntimeSubscriber for Collect {
+            fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                self.0.lock().unwrap().push(event.clone());
+                RuntimeDecision::Continue
+            }
+        }
+        let dir = tempdir().unwrap();
+        let mut agent = davinci_agent::Agent::new("fixture");
+        agent.session =
+            Some(davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap());
+        let prepare = |agent: &davinci_agent::Agent, bus| {
+            configure_session_workflow(
+                davinci_agent::RuntimeHandle::new(
+                    davinci_agent::RunId::new(),
+                    davinci_agent::AgentId::new(),
+                    bus,
+                ),
+                agent.session.as_ref(),
+                agent.runtime_for_session(),
+                davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts")),
+                None,
+            )
+            .unwrap()
+        };
+        agent.set_runtime(prepare(&agent, davinci_agent::RuntimeBus::new()));
+        let old = agent.runtime.as_ref().unwrap().clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, worker_id) = std::sync::mpsc::channel();
+        let wait = Mutex::new(wait);
+        let runner = davinci_agent::SubagentRunner::new(move |request| {
+            started.send(request.runtime_agent_id.unwrap()).unwrap();
+            wait.lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| e.to_string())?;
+            Ok("fixture complete".into())
+        });
+        agent.subagent_runner = Some(runner);
+        agent.approver = Some(davinci_agent::ToolApprover(Arc::new(|_| {
+            davinci_agent::ToolApprovalDecision::AllowOnce
+        })));
+        let mut first = true;
+        agent
+            .run_loop(|_| {
+                let spawn = std::mem::replace(&mut first, false);
+                Ok(davinci_ai::AssistantMessage {
+                    id: "fixture".into(),
+                    role: "assistant".into(),
+                    model: "fixture".into(),
+                    usage: None,
+                    error_message: None,
+                    content: if spawn {
+                        vec![davinci_ai::ContentBlock::ToolCall {
+                            id: "background-fixture".into(),
+                            name: "agent".into(),
+                            arguments: json!({"prompt": "fixture", "mode": "background"}),
+                        }]
+                    } else {
+                        vec![davinci_ai::ContentBlock::Text {
+                            text: "done".into(),
+                        }]
+                    },
+                    stop_reason: Some(if spawn {
+                        davinci_ai::StopReason::ToolUse
+                    } else {
+                        davinci_ai::StopReason::Stop
+                    }),
+                })
+            })
+            .unwrap();
+        let worker = worker_id
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let bus = davinci_agent::RuntimeBus::new();
+        bus.subscribe(Arc::new(Collect(seen.clone())));
+        agent.set_runtime(prepare(&agent, bus));
+        release.send(()).unwrap();
+        let log = davinci_session::runtime_log_path(&agent.session.as_ref().unwrap().path);
+        let completed = |event: &RuntimeEventEnvelope| {
+            event.agent_id == Some(worker)
+                && matches!(
+                    event.payload,
+                    RuntimeEvent::AgentStateChanged {
+                        to: davinci_agent::AgentState::Completed,
+                        ..
+                    }
+                )
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let events = davinci_session::read_runtime_log::<RuntimeEventEnvelope>(&log).unwrap();
+            if events.iter().any(&completed) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background worker did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            seen.lock().unwrap().iter().filter(|e| completed(e)).count(),
+            1
+        );
+        assert_eq!(
+            davinci_session::read_runtime_log::<RuntimeEventEnvelope>(&log)
+                .unwrap()
+                .iter()
+                .filter(|e| completed(e))
+                .count(),
+            1
+        );
+        assert_eq!(
+            agent
+                .runtime
+                .as_ref()
+                .unwrap()
+                .registry
+                .get(&worker)
+                .unwrap()
+                .state,
+            davinci_agent::AgentState::Completed
+        );
+        assert_eq!(
+            old.registry.get(&worker).unwrap().state,
+            davinci_agent::AgentState::Completed
+        );
+    }
 
     fn make_adapter() -> (GovernorHostAdapter, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -568,6 +1269,51 @@ mod tests {
     }
 
     #[test]
+    fn f03_observer_log_does_not_restore_rejected_completion() {
+        struct DenyCompletion;
+        impl RuntimeSubscriber for DenyCompletion {
+            fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+                if matches!(event.payload, RuntimeEvent::TaskCompletionRequested { .. }) {
+                    RuntimeDecision::Deny {
+                        reason: "fixture rejection".into(),
+                    }
+                } else {
+                    RuntimeDecision::Continue
+                }
+            }
+        }
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("rejected.runtime.jsonl");
+        let run_id = davinci_agent::RunId::new();
+        let task_id = {
+            let bus = davinci_agent::RuntimeBus::new();
+            bus.subscribe(Arc::new(RuntimeLogSubscriber::open(&log_path).unwrap()));
+            bus.subscribe(Arc::new(DenyCompletion));
+            let registry = davinci_agent::TaskRegistry::with_bus(bus);
+            let id = registry
+                .create_task(davinci_agent::TaskRecord::new(run_id, "rejected"))
+                .unwrap();
+            assert!(registry
+                .complete_task(id, Some("must not persist".into()))
+                .is_err());
+            id
+        };
+        let events: Vec<RuntimeEventEnvelope> =
+            davinci_session::read_runtime_log(&log_path).unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.payload, RuntimeEvent::TaskCompletionRequested { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.payload, RuntimeEvent::TaskCompleted { .. })));
+        let registry = davinci_agent::TaskRegistry::new();
+        registry.rehydrate_from_events(&events).unwrap();
+        let restored = registry.get_task(&task_id).unwrap();
+        assert_eq!(restored.state, davinci_agent::TaskState::Ready);
+        assert_eq!(restored.result, None);
+    }
+
+    #[test]
     fn test_runtime_log_subscriber_persists_envelopes() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test_session.runtime.jsonl");
@@ -817,5 +1563,30 @@ mod tests {
         // Verify artifacts exist for both phases
         assert_eq!(store.list_phase_artifacts(wf_id, "discover").len(), 1);
         assert_eq!(store.list_phase_artifacts(wf_id, "analyze").len(), 1);
+    }
+
+    #[test]
+    fn f06_installed_hash_match() {
+        assert!(installed_matches(Some("sha-a"), Some("sha-a"), true));
+        assert!(!installed_matches(Some("sha-a"), Some("sha-b"), true));
+        assert!(!installed_matches(None, None, true));
+        assert!(!installed_matches(Some("sha-a"), Some("sha-a"), false));
+    }
+
+    #[test]
+    fn test_host_budget_evidence_adapter_reserves() {
+        let reservation = davinci_agent::runtime::completion::BudgetReservation::new(
+            Some(50_000),
+            30_000,
+            15_000,
+            5_000,
+            true,
+            Some(0.50),
+        );
+        let adapter = HostBudgetEvidenceAdapter::new(reservation);
+
+        // 30k spent + 15k verify + 5k handoff = 50k ceiling. Available for impl: 0 tokens!
+        assert!(adapter.can_dispatch_implementation(0).is_ok());
+        assert!(adapter.can_dispatch_implementation(100).is_err());
     }
 }

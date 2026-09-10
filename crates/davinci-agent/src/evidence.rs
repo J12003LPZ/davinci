@@ -54,6 +54,46 @@ impl EvidenceStore {
         Ok(path)
     }
 
+    /// Store output and return both the file path and its cryptographic ArtifactRef.
+    pub fn store_with_artifact_ref(
+        &self,
+        tag: &str,
+        text: &str,
+        media_type: &str,
+    ) -> Result<(PathBuf, crate::runtime::evidence::ArtifactRef), String> {
+        let path = self.store(tag, text)?;
+        let artifact = self.to_artifact_ref(&path, media_type)?;
+        Ok((path, artifact))
+    }
+
+    /// Convert an existing stored file into a verifiable ArtifactRef.
+    pub fn to_artifact_ref(
+        &self,
+        path: &Path,
+        media_type: &str,
+    ) -> Result<crate::runtime::evidence::ArtifactRef, String> {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let sha256 = format!("{:x}", hasher.finalize());
+
+        let rel_path = path
+            .strip_prefix(&self.dir)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+
+        let id = format!("overflow_{}", &sha256[..12]);
+        Ok(crate::runtime::evidence::ArtifactRef {
+            id,
+            sha256,
+            media_type: media_type.to_string(),
+            size: bytes.len() as u64,
+            relative_store_path: rel_path,
+            redaction: None,
+        })
+    }
+
     /// Delete files older than `ttl`. Best effort; a store that cannot be
     /// listed simply keeps its files.
     pub fn sweep(&self, ttl: Duration) -> usize {
@@ -123,5 +163,20 @@ mod tests {
         let cut = cut_at_char_boundary(text, 2);
         assert_eq!(cut, "h");
         assert_eq!(cut_at_char_boundary(text, 100), text);
+    }
+
+    #[test]
+    fn test_oversize_output_retains_retrieval_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvidenceStore::new(dir.path().join("evidence"));
+        let large_content = "a".repeat(10_000);
+        let (path, artifact) = store
+            .store_with_artifact_ref("test_overflow", &large_content, "text/plain")
+            .unwrap();
+
+        assert!(path.exists());
+        assert_eq!(artifact.size, 10_000);
+        assert!(!artifact.sha256.is_empty());
+        assert!(artifact.relative_store_path.contains("test_overflow-"));
     }
 }

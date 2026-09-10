@@ -132,7 +132,7 @@ pub fn tool_class(tool: &str) -> ToolClass {
         // governor's store. Artifact submission is a mutation, not a read.
         "read" | "grep" | "find" | "ls" | "job_output" | "todo" | "mcp_read" | "batch"
         | "memory_search" | "retrieve_output" | "update_plan" | "tool_search" | "agent_status"
-        | "task_list" | "workflow_status" | "propose_plan" => ToolClass::Read,
+        | "task_list" | "task_get" | "workflow_status" | "propose_plan" => ToolClass::Read,
         // Process control, messages to workers, and task dispatch can cause effects.
         "job_kill" | "agent_message" | "agent_stop" | "task_create" | "task_update"
         | "graph_submit" => ToolClass::Other,
@@ -412,7 +412,7 @@ impl std::fmt::Display for PermissionRule {
     }
 }
 
-fn normalize_tool_name(tool: &str) -> String {
+pub(crate) fn normalize_tool_name(tool: &str) -> String {
     let mut out = String::new();
     let chars: Vec<char> = tool.chars().collect();
     for (i, &ch) in chars.iter().enumerate() {
@@ -641,6 +641,8 @@ pub fn glob_matches(pattern: &str, text: &str) -> bool {
 /// put to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolApprovalRequest {
+    /// Choices issued by policy. Hosts may remove unsupported choices, never add grants.
+    pub legal_choices: Vec<crate::approval::ApprovalChoice>,
     pub tool_call_id: String,
     pub tool: String,
     pub args: Value,
@@ -653,6 +655,30 @@ pub struct ToolApprovalRequest {
     /// A file tool whose target is not under the project.
     pub outside_project: bool,
     pub mode: PermissionMode,
+}
+
+impl ToolApprovalRequest {
+    pub fn allows(&self, decision: ToolApprovalDecision) -> bool {
+        use crate::approval::GrantScope;
+        let scope = match decision {
+            ToolApprovalDecision::AllowOnce => GrantScope::Once,
+            ToolApprovalDecision::AllowForSession => GrantScope::Session,
+            ToolApprovalDecision::AllowAlways => GrantScope::Project,
+            ToolApprovalDecision::Deny => GrantScope::Deny,
+        };
+        self.legal_choices
+            .iter()
+            .any(|choice| choice.scope == scope)
+    }
+
+    /// Compatibility choices supported by the current four-decision host bridge.
+    pub fn host_choices(&self, project_available: bool) -> Vec<ToolApprovalDecision> {
+        use ToolApprovalDecision::*;
+        [AllowOnce, AllowForSession, AllowAlways, Deny]
+            .into_iter()
+            .filter(|choice| self.allows(*choice) && (*choice != AllowAlways || project_available))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,6 +745,8 @@ pub struct FilesystemBoundaryPolicy {
 /// `session_allow` is what the user granted for this run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionPolicy {
+    /// Supplied by trusted host configuration, never by tool arguments.
+    pub project_trusted: bool,
     pub mode: PermissionMode,
     pub allow: Vec<PermissionRule>,
     pub deny: Vec<PermissionRule>,
@@ -735,6 +763,7 @@ impl Default for PermissionPolicy {
     /// `build_agent`; embedders who want the gate set a mode.
     fn default() -> Self {
         Self {
+            project_trusted: false,
             mode: PermissionMode::AlwaysApprove,
             allow: Vec::new(),
             deny: Vec::new(),
@@ -859,9 +888,13 @@ impl PermissionPolicy {
                         PermissionVerdict::Ask(mut request) => {
                             request.tool = tool.to_string();
                             request.args = args.clone();
-                            request.summary = format!("Capture plan evidence: {}", request.subject);
-                            request.session_rule =
-                                session_rule_for(tool, &request.subject).to_string();
+                            request.summary = crate::approval::display_text(&format!(
+                                "Capture plan evidence: {}",
+                                request.subject
+                            ));
+                            request.session_rule.clear();
+                            request.legal_choices =
+                                crate::approval::offer_scopes(true, false, false);
                             evidence_approval = Some(request);
                         }
                         PermissionVerdict::Allow => {}
@@ -1037,12 +1070,51 @@ impl PermissionPolicy {
         {
             return PermissionVerdict::Allow;
         }
+        let safe_file = matches!(
+            tool,
+            "write" | "edit" | "notebook_edit" | "read" | "grep" | "find" | "ls"
+        ) && targets.len() == 1
+            && targets.iter().all(|target| {
+                !target.outside
+                    && !target.protected
+                    && !target.secret
+                    && !target.destructive
+                    && !target.symlink_escape
+            });
+        let safe_shell = class == ToolClass::Shell
+            // Allow rules are matched against individual parsed segments.
+            // Persist only a subject that will match that same representation.
+            && subjects.as_slice() == [subject.clone()]
+            && permission_risk::routine_local_shell(
+                tool,
+                args,
+                &subject,
+                cwd,
+                &self.filesystem_boundary,
+            );
+        let rule = PermissionRule::subject(normalize_tool_name(tool), &subject);
+        let narrow = !subject.is_empty()
+            && subject.len() <= 512
+            && !subject
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '*' | '?'))
+            && PermissionRule::parse(&rule.to_string()).as_ref() == Some(&rule);
+        let persistent = (safe_file || safe_shell) && narrow;
         PermissionVerdict::Ask(ToolApprovalRequest {
+            legal_choices: crate::approval::offer_scopes(
+                !persistent,
+                persistent,
+                persistent && self.project_trusted,
+            ),
             tool_call_id: tool_call_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
-            summary: summary_of(tool, &subject),
-            session_rule: session_rule_for(tool, &subject).to_string(),
+            summary: crate::approval::display_text(&summary_of(tool, &subject)),
+            session_rule: if persistent {
+                rule.to_string()
+            } else {
+                String::new()
+            },
             subject,
             outside_project,
             mode: self.mode,
@@ -1729,6 +1801,7 @@ mod tests {
             "update_plan",
             "job_output",
             "task_list",
+            "task_get",
         ] {
             assert_eq!(
                 verdict(&p, tool, json!({})),
@@ -2286,7 +2359,7 @@ mod tests {
             PermissionVerdict::Ask(request) => {
                 assert_eq!(request.tool_call_id, "call_1");
                 assert_eq!(request.summary, "bash · git status --short");
-                assert_eq!(request.session_rule, "bash(git status *)");
+                assert_eq!(request.session_rule, "bash(git status --short)");
                 assert_eq!(request.mode, PermissionMode::Ask);
                 assert!(!request.outside_project);
             }
@@ -2295,7 +2368,8 @@ mod tests {
         match verdict(&p, "write", json!({"path": "../out.txt", "content": "x"})) {
             PermissionVerdict::Ask(request) => {
                 assert!(request.outside_project);
-                assert_eq!(request.session_rule, "write");
+                assert!(request.session_rule.is_empty());
+                assert!(!request.allows(ToolApprovalDecision::AllowForSession));
             }
             other => panic!("{other:?}"),
         }

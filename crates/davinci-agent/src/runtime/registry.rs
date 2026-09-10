@@ -51,6 +51,10 @@ pub struct RuntimeRegistry {
     records: Arc<RwLock<HashMap<AgentId, AgentRecord>>>,
     bus: Option<RuntimeBus>,
     seq: Arc<AtomicU64>,
+    generations: Arc<RwLock<HashMap<AgentId, u64>>>,
+    revisions: Arc<RwLock<HashMap<AgentId, u64>>>,
+    last_activity_ms: Arc<RwLock<HashMap<AgentId, i64>>>,
+    tool_counts: Arc<RwLock<HashMap<AgentId, u64>>>,
 }
 
 impl RuntimeRegistry {
@@ -59,6 +63,10 @@ impl RuntimeRegistry {
             records: Arc::new(RwLock::new(HashMap::new())),
             bus: None,
             seq: Arc::new(AtomicU64::new(0)),
+            generations: Arc::new(RwLock::new(HashMap::new())),
+            revisions: Arc::new(RwLock::new(HashMap::new())),
+            last_activity_ms: Arc::new(RwLock::new(HashMap::new())),
+            tool_counts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -67,6 +75,10 @@ impl RuntimeRegistry {
             records: Arc::new(RwLock::new(HashMap::new())),
             bus: Some(bus),
             seq: Arc::new(AtomicU64::new(0)),
+            generations: Arc::new(RwLock::new(HashMap::new())),
+            revisions: Arc::new(RwLock::new(HashMap::new())),
+            last_activity_ms: Arc::new(RwLock::new(HashMap::new())),
+            tool_counts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -92,6 +104,19 @@ impl RuntimeRegistry {
                 return Err(RegistryError::DuplicateAgent(record.id));
             }
             map.insert(record.id, record.clone());
+        }
+
+        if let Ok(mut gens) = self.generations.write() {
+            gens.entry(record.id).or_insert(1);
+        }
+        if let Ok(mut revs) = self.revisions.write() {
+            revs.entry(record.id).or_insert(1);
+        }
+        if let Ok(mut act) = self.last_activity_ms.write() {
+            act.entry(record.id).or_insert(record.started_ms);
+        }
+        if let Ok(mut tools) = self.tool_counts.write() {
+            tools.entry(record.id).or_insert(0);
         }
 
         if let Some(bus) = &self.bus {
@@ -149,6 +174,9 @@ impl RuntimeRegistry {
             (from, record.run_id, record.parent)
         };
 
+        self.record_activity(&id);
+        self.advance_revision(&id);
+
         if let Some(bus) = &self.bus {
             let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
             let envelope = RuntimeEventEnvelope::new(
@@ -163,6 +191,109 @@ impl RuntimeRegistry {
         }
 
         Ok(())
+    }
+
+    pub fn get_generation(&self, id: &AgentId) -> u64 {
+        self.generations
+            .read()
+            .ok()
+            .and_then(|g| g.get(id).copied())
+            .unwrap_or(1)
+    }
+
+    pub fn advance_generation(&self, id: &AgentId) -> u64 {
+        if let Ok(mut g) = self.generations.write() {
+            let val = g.entry(*id).or_insert(1);
+            *val += 1;
+            *val
+        } else {
+            1
+        }
+    }
+
+    pub fn get_revision(&self, id: &AgentId) -> u64 {
+        self.revisions
+            .read()
+            .ok()
+            .and_then(|r| r.get(id).copied())
+            .unwrap_or(1)
+    }
+
+    pub fn advance_revision(&self, id: &AgentId) -> u64 {
+        if let Ok(mut r) = self.revisions.write() {
+            let val = r.entry(*id).or_insert(1);
+            *val += 1;
+            *val
+        } else {
+            1
+        }
+    }
+
+    pub fn record_activity(&self, id: &AgentId) {
+        if let Ok(mut a) = self.last_activity_ms.write() {
+            a.insert(*id, Self::now_ms());
+        }
+    }
+
+    pub fn get_last_activity(&self, id: &AgentId) -> i64 {
+        self.last_activity_ms
+            .read()
+            .ok()
+            .and_then(|a| a.get(id).copied())
+            .unwrap_or_else(Self::now_ms)
+    }
+
+    pub fn increment_tool_count(&self, id: &AgentId) -> u64 {
+        self.record_activity(id);
+        if let Ok(mut t) = self.tool_counts.write() {
+            let val = t.entry(*id).or_insert(0);
+            *val += 1;
+            *val
+        } else {
+            0
+        }
+    }
+
+    pub fn get_tool_count(&self, id: &AgentId) -> u64 {
+        self.tool_counts
+            .read()
+            .ok()
+            .and_then(|t| t.get(id).copied())
+            .unwrap_or(0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_control_ack(
+        &self,
+        command_id: uuid::Uuid,
+        task_id: Option<super::ids::TaskId>,
+        agent_id: AgentId,
+        generation: u64,
+        action: String,
+        status: String,
+        reason: Option<String>,
+    ) {
+        if let Some(bus) = &self.bus {
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let run_id = self.get(&agent_id).map(|r| r.run_id).unwrap_or_default();
+            let envelope = RuntimeEventEnvelope::new(
+                seq,
+                run_id,
+                None,
+                Some(agent_id),
+                None,
+                RuntimeEvent::WorkerControlAcknowledged {
+                    command_id,
+                    task_id,
+                    agent_id,
+                    generation,
+                    action,
+                    status,
+                    reason,
+                },
+            );
+            bus.emit_observe(envelope);
+        }
     }
 
     /// Get an agent record by ID.

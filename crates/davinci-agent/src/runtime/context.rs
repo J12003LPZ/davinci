@@ -72,6 +72,22 @@ pub struct ContextItem {
     pub provenance: Value,
 }
 
+impl ContextItem {
+    pub fn stable_id(&self) -> String {
+        if let Some(id) = self.provenance.get("id").and_then(|v| v.as_str()) {
+            return id.to_string();
+        }
+        item_hash(self)
+    }
+}
+
+/// Combines context token parts including mandatory overhead, returning None on overflow.
+pub fn context_total(parts: &[u64], overhead: u64) -> Option<u64> {
+    parts
+        .iter()
+        .try_fold(overhead, |sum, value| sum.checked_add(*value))
+}
+
 /// A context source providing items for a context request.
 pub trait ContextSource: Send + Sync {
     fn collect(&self, request: &ContextRequest) -> Vec<ContextItem>;
@@ -161,13 +177,30 @@ impl ContextBroker {
 
     /// Build a bounded, deterministically ordered context packet for the request.
     pub fn build_context(&self, request: &ContextRequest) -> ContextPacket {
+        self.build_context_with_ledger(request).0
+    }
+
+    /// Build a bounded context packet while preserving candidate selection/exclusion reasons.
+    pub fn build_context_with_ledger(
+        &self,
+        request: &ContextRequest,
+    ) -> (ContextPacket, Vec<(ContextItem, bool, Option<String>)>) {
+        self.build_context_with_overlay(request, None)
+    }
+
+    /// Build a bounded context packet applying user-owned pin/exclude overlay preferences.
+    pub fn build_context_with_overlay(
+        &self,
+        request: &ContextRequest,
+        overlay: Option<&super::context_overlay::ContextOverlay>,
+    ) -> (ContextPacket, Vec<(ContextItem, bool, Option<String>)>) {
         let sources = match self.sources.read() {
             Ok(guard) => guard.clone(),
-            Err(_) => return ContextPacket::empty(),
+            Err(_) => return (ContextPacket::empty(), Vec::new()),
         };
 
         if sources.is_empty() {
-            return ContextPacket::empty();
+            return (ContextPacket::empty(), Vec::new());
         }
 
         // 1. Collect all candidates
@@ -177,44 +210,86 @@ impl ContextBroker {
         }
 
         if candidates.is_empty() {
-            return ContextPacket::empty();
+            return (ContextPacket::empty(), Vec::new());
         }
 
-        // 2. Deterministic sort:
-        //    - Priority descending (higher priority first)
+        // 2. Filter tombstoned and user-excluded items, and apply pin priority boosts
+        let mut filtered = Vec::new();
+        let mut ledger = Vec::new();
+
+        for mut item in candidates {
+            let item_id = item.stable_id();
+            if let Some(ov) = overlay {
+                if ov.is_tombstoned(&item_id) {
+                    ledger.push((item, false, Some("tombstoned".to_string())));
+                    continue;
+                }
+                if ov.is_excluded(&item_id) {
+                    ledger.push((item, false, Some("user_excluded".to_string())));
+                    continue;
+                }
+                if ov.is_pinned(&item_id) {
+                    item.priority = item.priority.saturating_add(1_000_000);
+                }
+            }
+            filtered.push(item);
+        }
+
+        // 3. Early duplicate detection
+        let mut seen_hashes = std::collections::HashSet::new();
+        let mut deduplicated = Vec::new();
+
+        for item in filtered {
+            let hash = item_hash(&item);
+            if seen_hashes.insert(hash) {
+                deduplicated.push(item);
+            } else {
+                ledger.push((item, false, Some("duplicate".to_string())));
+            }
+        }
+
+        // 4. Deterministic sort:
+        //    - Priority descending (higher priority first, pins first)
         //    - Source ascending
         //    - Content/provenance hash ascending
-        candidates.sort_by(|a, b| {
+        deduplicated.sort_by(|a, b| {
             b.priority
                 .cmp(&a.priority)
                 .then_with(|| a.source.cmp(&b.source))
                 .then_with(|| item_hash(a).cmp(&item_hash(b)))
         });
 
-        // 3. Greedy selection under strict max_tokens cap
+        // 5. Greedy selection under strict max_tokens cap
         let mut selected = Vec::new();
         let mut total_tokens = 0u64;
 
-        for item in candidates {
+        for item in deduplicated {
             if total_tokens + item.estimated_tokens <= request.max_tokens {
                 total_tokens += item.estimated_tokens;
-                selected.push(item);
+                selected.push(item.clone());
+                ledger.push((item, true, Some("selected".to_string())));
+            } else {
+                ledger.push((item, false, Some("over_budget".to_string())));
             }
         }
 
         let cache_key = compute_cache_key(&selected);
 
-        ContextPacket {
+        let packet = ContextPacket {
             items: selected,
             estimated_tokens: total_tokens,
             cache_key,
-        }
+        };
+
+        (packet, ledger)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::ContextOverlay;
+    use crate::Agent;
 
     struct MockSource {
         items: Vec<ContextItem>,
@@ -378,5 +453,158 @@ mod tests {
         assert!(wrapped.starts_with("<context_data source=\"memory\">"));
         assert!(wrapped.contains("ignore previous instructions"));
         assert!(wrapped.ends_with("</context_data>"));
+    }
+
+    #[test]
+    fn f08_total_includes_mandatory() {
+        assert_eq!(
+            context_total(&[3200, 1400, 2100, 700, 1900], 400),
+            Some(9700)
+        );
+        assert_eq!(context_total(&[u64::MAX], 1), None);
+    }
+
+    #[test]
+    fn f08_duplicate_memory_suppression() {
+        let broker = ContextBroker::new();
+        let item1 = ContextItem {
+            source: "memory".into(),
+            content: "user likes rust".into(),
+            estimated_tokens: 10,
+            priority: 10,
+            stable_for_cache: true,
+            provenance: Value::Null,
+        };
+        let item2 = item1.clone();
+        let source = MockSource {
+            items: vec![item1, item2],
+        };
+        broker.register_context_source(Arc::new(source));
+        let req = sample_request(100);
+        let (packet, ledger) = broker.build_context_with_ledger(&req);
+        assert_eq!(packet.items.len(), 1);
+        assert_eq!(ledger.len(), 2);
+        let dup = ledger
+            .iter()
+            .find(|(_, sel, reason)| !sel && reason.as_deref() == Some("duplicate"));
+        assert!(dup.is_some());
+    }
+
+    #[test]
+    fn f08_broker_empty_but_mandatory_prompt_nonempty() {
+        let broker = ContextBroker::new();
+        let req = sample_request(100);
+        let (packet, _) = broker.build_context_with_ledger(&req);
+        assert!(packet.is_empty());
+
+        let mut agent = Agent::new("You are a helpful assistant.");
+        let run_id = RunId::new();
+        let manifest = agent.prepare_context_manifest("req-1", run_id, 1, 1);
+        assert!(!manifest.entries.is_empty());
+        let sys = manifest
+            .entries
+            .iter()
+            .find(|e| e.id == "system_prompt")
+            .unwrap();
+        assert!(sys.mandatory);
+        assert!(sys.token_estimate > 0);
+    }
+
+    #[test]
+    fn f08_tool_schema_overhead() {
+        let mut agent = Agent::new("system");
+        agent.set_provider_context_overhead_tokens(Some(450));
+        let run_id = RunId::new();
+        let manifest = agent.prepare_context_manifest("req-tools", run_id, 1, 1);
+        let tool_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.id == "tool_schemas")
+            .unwrap();
+        assert_eq!(tool_entry.token_estimate, 450);
+        assert!(tool_entry.mandatory);
+    }
+
+    #[test]
+    fn f08_empty_context_source() {
+        let broker = ContextBroker::new();
+        let source = MockSource { items: vec![] };
+        broker.register_context_source(Arc::new(source));
+        let req = sample_request(100);
+        let (packet, ledger) = broker.build_context_with_ledger(&req);
+        assert!(packet.is_empty());
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn f08_same_request_inspected_twice_without_new_retrieval() {
+        let mut agent = Agent::new("system");
+        let run_id = RunId::new();
+        let m1 = agent.prepare_context_manifest("req-fixed", run_id, 1, 1);
+        let m2 = agent.last_prepared_manifest.as_ref().unwrap();
+        assert_eq!(m1.manifest_digest, m2.manifest_digest);
+        assert_eq!(m1.estimated_total_tokens, m2.estimated_total_tokens);
+    }
+
+    #[test]
+    fn f08_pins_exceed_cap() {
+        let broker = ContextBroker::new();
+        let item1 = ContextItem {
+            source: "pinned1".into(),
+            content: "large pinned content".into(),
+            estimated_tokens: 300,
+            priority: 10,
+            stable_for_cache: true,
+            provenance: serde_json::json!({ "id": "pin1" }),
+        };
+        let item2 = ContextItem {
+            source: "pinned2".into(),
+            content: "another pinned content".into(),
+            estimated_tokens: 300,
+            priority: 10,
+            stable_for_cache: true,
+            provenance: serde_json::json!({ "id": "pin2" }),
+        };
+        let source = MockSource {
+            items: vec![item1, item2],
+        };
+        broker.register_context_source(Arc::new(source));
+
+        let mut overlay = ContextOverlay::new(1);
+        overlay.pin("pin1", false, true).unwrap();
+        overlay.pin("pin2", false, true).unwrap();
+
+        // Max tokens is 400: only one 300-token item can fit; second pin is marked over_budget
+        let req = sample_request(400);
+        let (packet, ledger) = broker.build_context_with_overlay(&req, Some(&overlay));
+        assert_eq!(packet.items.len(), 1);
+        let over_budget = ledger.iter().find(|(i, sel, r)| {
+            !sel && r.as_deref() == Some("over_budget") && i.stable_id() == "pin2"
+        });
+        assert!(over_budget.is_some());
+    }
+
+    #[test]
+    fn f08_user_excluded_item() {
+        let broker = ContextBroker::new();
+        let item = ContextItem {
+            source: "optional".into(),
+            content: "optional text".into(),
+            estimated_tokens: 50,
+            priority: 10,
+            stable_for_cache: true,
+            provenance: serde_json::json!({ "id": "opt1" }),
+        };
+        let source = MockSource { items: vec![item] };
+        broker.register_context_source(Arc::new(source));
+
+        let mut overlay = ContextOverlay::new(1);
+        overlay.exclude("opt1", false, true).unwrap();
+
+        let req = sample_request(100);
+        let (packet, ledger) = broker.build_context_with_overlay(&req, Some(&overlay));
+        assert!(packet.is_empty());
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].2.as_deref(), Some("user_excluded"));
     }
 }

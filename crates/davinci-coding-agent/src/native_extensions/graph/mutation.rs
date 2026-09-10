@@ -259,6 +259,54 @@ pub fn capture_graph_delta(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedDiffReport {
+    pub owned_diff: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattributed_diff: Option<String>,
+    pub changed_files: Vec<ChangedFile>,
+    pub has_unattributed: bool,
+}
+
+/// Computes task-owned diff, partitioning out any prior dirty files as unattributed diff.
+#[allow(dead_code)]
+pub fn compute_owned_diff(
+    cwd: &Path,
+    baseline: &MutationBaseline,
+    prior_dirty_files: &[String],
+) -> Result<OwnedDiffReport, String> {
+    let delta = capture_graph_delta(cwd, baseline)?;
+    let mut owned_chunks = Vec::new();
+    let mut unattributed_chunks = Vec::new();
+
+    for chunk in delta.patch_chunks {
+        let is_prior_dirty = prior_dirty_files
+            .iter()
+            .any(|f| normalize_rel_path(f) == chunk.file);
+        if is_prior_dirty {
+            unattributed_chunks.push(chunk.patch);
+        } else {
+            owned_chunks.push(chunk.patch);
+        }
+    }
+
+    let owned_diff = owned_chunks.join("\n");
+    let has_unattributed = !unattributed_chunks.is_empty();
+    let unattributed_diff = if has_unattributed {
+        Some(unattributed_chunks.join("\n"))
+    } else {
+        None
+    };
+
+    Ok(OwnedDiffReport {
+        owned_diff,
+        unattributed_diff,
+        changed_files: delta.files,
+        has_unattributed,
+    })
+}
+
 fn format_added_file_diff(file: &str, bytes: &[u8]) -> String {
     if bytes.contains(&0) {
         return format!(
@@ -474,5 +522,31 @@ mod tests {
         let diff = delta.diff();
         assert!(diff.contains("+line 2 modified"));
         assert!(diff.contains("-temporary"));
+    }
+
+    #[test]
+    fn compute_owned_diff_partitions_correctly() {
+        let dir = tempdir().unwrap();
+        setup_git_repo(dir.path());
+
+        let baseline = capture_baseline(dir.path()).expect("baseline");
+
+        // Write file_owned.txt and file_unattributed.txt
+        let file_owned = dir.path().join("file_owned.txt");
+        let file_unatt = dir.path().join("file_unatt.txt");
+        std::fs::write(&file_owned, "owned content\n").unwrap();
+        std::fs::write(&file_unatt, "dirty content\n").unwrap();
+
+        let report = compute_owned_diff(dir.path(), &baseline, &["file_unatt.txt".to_string()])
+            .expect("report");
+
+        assert!(report.has_unattributed);
+        assert!(report.owned_diff.contains("file_owned.txt"));
+        assert!(!report.owned_diff.contains("file_unatt.txt"));
+        assert!(report
+            .unattributed_diff
+            .as_ref()
+            .unwrap()
+            .contains("file_unatt.txt"));
     }
 }

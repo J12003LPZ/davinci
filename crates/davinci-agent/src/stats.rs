@@ -74,6 +74,15 @@ pub struct RunStats {
     pub evidence_files: u64,
     /// Automatic compactions performed.
     pub compactions: u64,
+    /// Total tokens charged by the root resource ledger across turns.
+    #[serde(default)]
+    pub budget_tokens_charged: u64,
+    /// Whether any usage or pricing was unknown.
+    #[serde(default)]
+    pub has_unknown_cost: bool,
+    /// Known cost in minor units, if pricing was available.
+    #[serde(default)]
+    pub cost_minor_units: Option<u64>,
 }
 
 impl RunStats {
@@ -88,6 +97,12 @@ impl RunStats {
 
     pub fn note_context(&mut self, tokens: u64) {
         self.peak_context_tokens = self.peak_context_tokens.max(tokens);
+    }
+
+    pub fn apply_budget_snapshot(&mut self, snapshot: &crate::runtime::BudgetSnapshot) {
+        self.budget_tokens_charged = snapshot.tokens_charged;
+        self.has_unknown_cost = snapshot.has_unknown_cost;
+        self.cost_minor_units = snapshot.cost_minor_units;
     }
 
     pub fn mean_batch_width(&self) -> f64 {
@@ -128,5 +143,38 @@ mod tests {
         json.as_object_mut().unwrap().remove("providerRetries");
         let restored: RunStats = serde_json::from_value(json).unwrap();
         assert_eq!(restored.provider_retries, 0);
+        assert_eq!(restored.budget_tokens_charged, 0);
+        assert!(!restored.has_unknown_cost);
+        assert_eq!(restored.cost_minor_units, None);
+    }
+
+    #[test]
+    fn test_stats_budget_snapshot_mapping() {
+        let mut stats = RunStats::default();
+        let snap = crate::runtime::BudgetSnapshot {
+            root_run_id: crate::runtime::RunId::new(),
+            revision: 1,
+            token_ceiling: 10000,
+            tokens_charged: 4500,
+            tokens_reserved: 500,
+            verification_reserve: 1500,
+            handoff_reserve: 500,
+            implementation_remaining: Some(3500),
+            elapsed: std::time::Duration::from_secs(60),
+            deadline: std::time::Duration::from_secs(900),
+            active_workers: 2,
+            max_concurrency: 4,
+            retries_used: 1,
+            retry_ceiling: 5,
+            cache_read_tokens: 100,
+            cache_write_tokens: 50,
+            cost_minor_units: Some(120),
+            has_unknown_cost: false,
+        };
+
+        stats.apply_budget_snapshot(&snap);
+        assert_eq!(stats.budget_tokens_charged, 4500);
+        assert_eq!(stats.cost_minor_units, Some(120));
+        assert!(!stats.has_unknown_cost);
     }
 }

@@ -23,28 +23,92 @@ pub struct ReplayFingerprint {
     pub repo_state_hash: String,
     pub input_hash: String,
     pub contract_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 impl ReplayFingerprint {
+    #[allow(dead_code)]
     pub fn for_task(cwd: &Path, graph_version: u32, briefing: &str, expect: ArtifactKind) -> Self {
+        Self::for_saved_task(cwd, graph_version, briefing, expect, None, false)
+    }
+
+    pub fn for_saved_task(
+        cwd: &Path,
+        graph_version: u32,
+        briefing: &str,
+        expect: ArtifactKind,
+        definition_digest: Option<&str>,
+        simulated: bool,
+    ) -> Self {
         Self {
             graph_version,
             config_hash: compute_config_hash(cwd),
             repo_state_hash: compute_repo_state_hash(cwd),
             input_hash: compute_input_hash(briefing),
             contract_hash: compute_contract_hash(expect),
+            definition_digest: definition_digest.map(str::to_string),
+            simulated: if simulated { Some(true) } else { None },
+            model_id: None,
         }
     }
 }
 
+pub fn saved_replay_allowed(
+    definition_matches: bool,
+    source_matches: bool,
+    policy_matches: bool,
+    simulated: bool,
+) -> bool {
+    definition_matches && source_matches && policy_matches && !simulated
+}
+
 pub fn replay_compatible(stored: &ReplayFingerprint, current: &ReplayFingerprint) -> bool {
-    stored == current
+    let definition_matches = stored.definition_digest == current.definition_digest;
+    let source_matches = stored.repo_state_hash == current.repo_state_hash;
+    let policy_matches = stored.config_hash == current.config_hash
+        && stored.contract_hash == current.contract_hash
+        && stored.graph_version == current.graph_version;
+    let simulated = stored.simulated.unwrap_or(false) && !current.simulated.unwrap_or(false);
+
+    if !saved_replay_allowed(
+        definition_matches,
+        source_matches,
+        policy_matches,
+        simulated,
+    ) {
+        return false;
+    }
+    if let (Some(s_mod), Some(c_mod)) = (&stored.model_id, &current.model_id) {
+        if s_mod != c_mod {
+            return false;
+        }
+    }
+    stored.input_hash == current.input_hash
 }
 
 pub fn incompatibility_reason(
     stored: &ReplayFingerprint,
     current: &ReplayFingerprint,
 ) -> Option<String> {
+    if stored.simulated.unwrap_or(false) && !current.simulated.unwrap_or(false) {
+        return Some("cannot replay simulated artifact from dry-run in real execution".into());
+    }
+    if let (Some(s_mod), Some(c_mod)) = (&stored.model_id, &current.model_id) {
+        if s_mod != c_mod {
+            return Some(format!("model changed: stored={s_mod}, current={c_mod}"));
+        }
+    }
+    if stored.definition_digest != current.definition_digest {
+        return Some(format!(
+            "saved definition digest changed: stored={:?}, current={:?}",
+            stored.definition_digest, current.definition_digest
+        ));
+    }
     if stored.graph_version != current.graph_version {
         return Some(format!(
             "graph version changed: stored={}, current={}",
@@ -131,21 +195,55 @@ pub fn compute_repo_state_hash(cwd: &Path) -> String {
             .ok()
             .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
             .unwrap_or_default();
-        sha256_hex(format!("{head}\0{status}").as_bytes())
-    } else {
-        let mut entries = Vec::new();
-        if let Ok(dir) = std::fs::read_dir(cwd) {
-            for entry in dir.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    entries.push(format!(
-                        "{}:{}:{}",
-                        entry.file_name().to_string_lossy(),
-                        meta.len(),
-                        meta.is_dir()
-                    ));
+        let mut dirty_manifest = Vec::new();
+        for line in status.lines() {
+            if line.len() > 3 {
+                let file_path_str = line[3..].trim();
+                let file_path = cwd.join(file_path_str);
+                if file_path.is_file() {
+                    if let Ok(bytes) = std::fs::read(&file_path) {
+                        dirty_manifest.push(format!(
+                            "{}:{}:{}",
+                            file_path_str,
+                            bytes.len(),
+                            sha256_hex(&bytes)
+                        ));
+                    }
                 }
             }
         }
+        dirty_manifest.sort();
+        sha256_hex(format!("{head}\0{status}\0{}", dirty_manifest.join("\n")).as_bytes())
+    } else {
+        fn collect_entries(root: &Path, dir: &Path, entries: &mut Vec<String>) {
+            if let Ok(read_dir) = std::fs::read_dir(dir) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    if file_name == ".git"
+                        || file_name == "target"
+                        || file_name == ".pi"
+                        || file_name == ".davinci"
+                    {
+                        continue;
+                    }
+                    if path.is_file() {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            let rel = path
+                                .strip_prefix(root)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            entries.push(format!("{}:{}:{}", rel, bytes.len(), sha256_hex(&bytes)));
+                        }
+                    } else if path.is_dir() {
+                        collect_entries(root, &path, entries);
+                    }
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        collect_entries(cwd, cwd, &mut entries);
         entries.sort();
         sha256_hex(entries.join("\n").as_bytes())
     }
@@ -163,6 +261,9 @@ mod tests {
             repo_state_hash: "repo_123".into(),
             input_hash: "input_xyz".into(),
             contract_hash: "contract_789".into(),
+            definition_digest: None,
+            simulated: None,
+            model_id: None,
         }
     }
 
@@ -315,6 +416,8 @@ mod tests {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         // Candidate with incompatible repo_state_hash
@@ -325,6 +428,9 @@ mod tests {
             repo_state_hash: "wrong_repo_state".into(),
             input_hash: "any".into(),
             contract_hash: compute_contract_hash(ArtifactKind::Classification),
+            definition_digest: None,
+            simulated: None,
+            model_id: None,
         };
         resume_artifacts.insert(
             "classify".to_string(),
@@ -377,6 +483,9 @@ mod tests {
             phase: Phase::Implement,
             forced: None,
             dry_run: false,
+            execution_origin: None,
+            definition_digest: None,
+            saved_definition: None,
             classification: None,
             milestones: None,
             current_milestone: None,
@@ -461,6 +570,8 @@ mod tests {
             ecosystem_stats: Default::default(),
             updated_at: 0,
             definition: None,
+            lifecycle: None,
+            revision: 0,
         };
 
         // Evaluate resume candidates under conservative revision-loop rule
@@ -479,5 +590,127 @@ mod tests {
 
         // Only classify is reused; plan-1 and implement-1 are NOT reused!
         assert_eq!(reusable, vec!["classify"]);
+    }
+
+    #[test]
+    fn test_saved_replay_allowed() {
+        assert!(saved_replay_allowed(true, true, true, false));
+        assert!(!saved_replay_allowed(false, true, true, false));
+        assert!(!saved_replay_allowed(true, false, true, false));
+        assert!(!saved_replay_allowed(true, true, false, false));
+        assert!(!saved_replay_allowed(true, true, true, true));
+        assert!(!saved_replay_allowed(false, false, false, true));
+    }
+
+    #[test]
+    fn test_replay_refused_on_edited_definition() {
+        let mut fp1 = sample_fingerprint();
+        fp1.definition_digest = Some("digest_original".into());
+        let mut fp2 = sample_fingerprint();
+        fp2.definition_digest = Some("digest_modified".into());
+
+        assert!(!replay_compatible(&fp1, &fp2));
+        let reason = incompatibility_reason(&fp1, &fp2).unwrap();
+        assert!(reason.contains("saved definition digest changed"));
+
+        // When definition digest matches, it is compatible
+        fp2.definition_digest = Some("digest_original".into());
+        assert!(replay_compatible(&fp1, &fp2));
+    }
+
+    #[test]
+    fn test_replay_refused_on_dirty_bytes_change() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("tracked_file.txt");
+
+        // Write first content (5 bytes)
+        std::fs::write(&file_path, b"apple").unwrap();
+        let hash_1 = compute_repo_state_hash(dir.path());
+
+        // Overwrite with same byte length, different content (5 bytes)
+        std::fs::write(&file_path, b"lemon").unwrap();
+        let hash_2 = compute_repo_state_hash(dir.path());
+
+        // Hash must be different because file content bytes changed
+        assert_ne!(hash_1, hash_2);
+
+        let mut fp1 = sample_fingerprint();
+        fp1.repo_state_hash = hash_1;
+        let mut fp2 = sample_fingerprint();
+        fp2.repo_state_hash = hash_2;
+
+        assert!(!replay_compatible(&fp1, &fp2));
+        let reason = incompatibility_reason(&fp1, &fp2).unwrap();
+        assert!(reason.contains("repo state changed"));
+    }
+
+    #[test]
+    fn test_replay_refused_on_policy_change() {
+        let fp_base = sample_fingerprint();
+
+        // Config hash change
+        let mut fp_config_changed = fp_base.clone();
+        fp_config_changed.config_hash = "config_updated".into();
+        assert!(!replay_compatible(&fp_base, &fp_config_changed));
+        assert!(incompatibility_reason(&fp_base, &fp_config_changed)
+            .unwrap()
+            .contains("config hash changed"));
+
+        // Contract hash change
+        let mut fp_contract_changed = fp_base.clone();
+        fp_contract_changed.contract_hash = "contract_updated".into();
+        assert!(!replay_compatible(&fp_base, &fp_contract_changed));
+        assert!(incompatibility_reason(&fp_base, &fp_contract_changed)
+            .unwrap()
+            .contains("contract hash changed"));
+
+        // Graph version change
+        let mut fp_version_changed = fp_base.clone();
+        fp_version_changed.graph_version += 1;
+        assert!(!replay_compatible(&fp_base, &fp_version_changed));
+        assert!(incompatibility_reason(&fp_base, &fp_version_changed)
+            .unwrap()
+            .contains("graph version changed"));
+    }
+
+    #[test]
+    fn test_replay_refused_on_simulated_artifact() {
+        let mut stored = sample_fingerprint();
+        stored.simulated = Some(true);
+
+        let current_real = sample_fingerprint();
+        assert!(!replay_compatible(&stored, &current_real));
+        let reason = incompatibility_reason(&stored, &current_real).unwrap();
+        assert!(reason.contains("cannot replay simulated artifact from dry-run in real execution"));
+
+        // Both simulated: dry-run on dry-run allowed
+        let mut current_sim = sample_fingerprint();
+        current_sim.simulated = Some(true);
+        assert!(replay_compatible(&stored, &current_sim));
+    }
+
+    #[test]
+    fn test_legacy_state_v1_loads_cleanly() {
+        let legacy_json = r#"{
+            "graphVersion": 1,
+            "configHash": "cfg123",
+            "repoStateHash": "repo456",
+            "inputHash": "in789",
+            "contractHash": "contract000"
+        }"#;
+
+        let parsed: ReplayFingerprint = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.graph_version, 1);
+        assert_eq!(parsed.config_hash, "cfg123");
+        assert_eq!(parsed.repo_state_hash, "repo456");
+        assert_eq!(parsed.input_hash, "in789");
+        assert_eq!(parsed.contract_hash, "contract000");
+        assert_eq!(parsed.definition_digest, None);
+        assert_eq!(parsed.simulated, None);
+
+        // Serialized output omits None fields
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("definitionDigest"));
+        assert!(!serialized.contains("simulated"));
     }
 }

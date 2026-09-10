@@ -114,8 +114,8 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         ),
         (
             "graph",
-            "Start, watch, or continue a coding task as an execution graph.",
-            Some("[goal] [--simple|--complex] [--dry-run]"),
+            "Start, watch, save, or run an execution graph.",
+            Some("[goal|save <name>|run <name>] [--simple|--complex] [--dry-run]"),
         ),
         (
             "learning-status",
@@ -649,6 +649,40 @@ mod tests {
                 && command["source"] == "native"
                 && command["argumentHint"] == "<query>"
         }));
+    }
+
+    #[test]
+    fn test_graph_internal_lifecycle_not_advertised() {
+        let specs = command_specs();
+        let advertised_names: Vec<&str> = specs.iter().map(|(name, _, _)| *name).collect();
+
+        // /graph is advertised
+        assert!(advertised_names.contains(&"graph"));
+
+        // Internal lifecycle operations are deliberately omitted from public autocomplete / help
+        for internal in ["graph-resume", "graph-status", "graph-view", "graph-abort"] {
+            assert!(
+                !advertised_names.contains(&internal),
+                "internal lifecycle command '{internal}' should not be advertised in command_specs"
+            );
+        }
+
+        // But they are retained in NATIVE_COMMANDS for internal/backward compatibility
+        for internal in ["graph-resume", "graph-status", "graph-view", "graph-abort"] {
+            assert!(
+                NATIVE_COMMANDS.contains(&internal),
+                "internal lifecycle command '{internal}' must remain in NATIVE_COMMANDS"
+            );
+        }
+
+        // native_invocable_commands also excludes them
+        let invocable = native_invocable_commands();
+        for internal in ["graph-resume", "graph-status", "graph-view", "graph-abort"] {
+            assert!(
+                !invocable.iter().any(|c| c["name"] == internal),
+                "invocable commands must not advertise '{internal}'"
+            );
+        }
     }
 
     #[test]

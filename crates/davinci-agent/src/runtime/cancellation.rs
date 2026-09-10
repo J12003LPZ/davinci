@@ -132,10 +132,11 @@ impl CancellationToken {
     where
         F: Fn() + Send + Sync + 'static,
     {
+        let mut guard = self.callbacks.lock().unwrap_or_else(|e| e.into_inner());
         if self.is_cancelled() {
+            drop(guard);
             f();
         } else {
-            let mut guard = self.callbacks.lock().unwrap_or_else(|e| e.into_inner());
             guard.push(Box::new(f));
         }
     }
@@ -148,11 +149,76 @@ impl CancellationToken {
             }
         });
     }
+
+    /// Bind the host's shared job book to its current runtime only.
+    pub(crate) fn bind_job_book(&self, jobs: &Arc<Mutex<crate::jobs::JobBook>>) {
+        let owner = Arc::downgrade(&self.inner);
+        {
+            let mut book = jobs.lock().unwrap_or_else(|e| e.into_inner());
+            if book
+                .cancellation_owner
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&owner))
+            {
+                return;
+            }
+            book.cancellation_owner = Some(owner.clone());
+        }
+        let jobs = Arc::downgrade(jobs);
+        self.on_cancel(move || {
+            if let Some(jobs) = jobs.upgrade() {
+                let mut book = jobs.lock().unwrap_or_else(|e| e.into_inner());
+                if book
+                    .cancellation_owner
+                    .as_ref()
+                    .is_some_and(|current| current.ptr_eq(&owner))
+                {
+                    book.kill_all();
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f03_job_binding_is_bounded_and_does_not_retain_book() {
+        let token = CancellationToken::new();
+        let jobs = Arc::new(Mutex::new(crate::jobs::JobBook::default()));
+        let weak = Arc::downgrade(&jobs);
+        token.bind_job_book(&jobs);
+        token.bind_job_book(&jobs);
+        assert_eq!(token.callbacks.lock().unwrap().len(), 1);
+        drop(jobs);
+        assert!(weak.upgrade().is_none());
+        token.cancel();
+    }
+
+    #[test]
+    fn cancellation_registration_runs_once_across_cancel_race() {
+        for _ in 0..64 {
+            let token = CancellationToken::new();
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let start = Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|scope| {
+                let token = &token;
+                let start = &start;
+                let count = count.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    token.on_cancel(move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    });
+                });
+                start.wait();
+                token.cancel();
+            });
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
 
     #[test]
     fn test_parent_cancellation_reaches_child() {

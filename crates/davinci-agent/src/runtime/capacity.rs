@@ -164,6 +164,65 @@ impl Drop for RequestPermit<'_> {
     }
 }
 
+/// Dedicated worker slot capacity allocator supporting dynamic concurrency limits and atomic acquisition.
+pub struct WorkerSlotCapacity {
+    active: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl Default for WorkerSlotCapacity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkerSlotCapacity {
+    pub const fn new() -> Self {
+        Self {
+            active: Mutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub fn acquire(
+        &self,
+        max_concurrency: usize,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<WorkerSlotPermit<'_>> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if cancelled() {
+                return None;
+            }
+            if *active < max_concurrency {
+                *active += 1;
+                return Some(WorkerSlotPermit { pool: self });
+            }
+            let (next_active, _timeout) = self
+                .changed
+                .wait_timeout(active, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner());
+            active = next_active;
+        }
+    }
+
+    pub fn active_count(&self) -> usize {
+        *self.active.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+pub struct WorkerSlotPermit<'a> {
+    pool: &'a WorkerSlotCapacity,
+}
+
+impl Drop for WorkerSlotPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self.pool.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        self.pool.changed.notify_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +410,26 @@ mod tests {
             std::fs::read_to_string(dir.path().join("child-stdout.log")).unwrap_or_default(),
             std::fs::read_to_string(dir.path().join("child-stderr.log")).unwrap_or_default()
         );
+    }
+
+    #[test]
+    fn worker_slot_capacity_enforces_limit_and_releases() {
+        let pool = WorkerSlotCapacity::new();
+        let slot1 = pool.acquire(2, || false).unwrap();
+        let slot2 = pool.acquire(2, || false).unwrap();
+        assert_eq!(pool.active_count(), 2);
+
+        // Third slot cancelled immediately
+        assert!(pool.acquire(2, || true).is_none());
+
+        // Drop one slot, acquire succeeds
+        drop(slot1);
+        assert_eq!(pool.active_count(), 1);
+        let slot3 = pool.acquire(2, || false).unwrap();
+        assert_eq!(pool.active_count(), 2);
+
+        drop(slot2);
+        drop(slot3);
+        assert_eq!(pool.active_count(), 0);
     }
 }

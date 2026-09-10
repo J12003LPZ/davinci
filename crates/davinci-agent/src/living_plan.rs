@@ -13,6 +13,8 @@ pub struct LivingPlan {
     pub evidence: Vec<Evidence>,
     pub assumptions: Vec<String>,
     pub questions: Vec<String>,
+    #[serde(default)]
+    pub structured_decisions: BTreeMap<String, crate::decisions::DecisionQuestion>,
     pub steps: Vec<PlanStep>,
     pub decisions: BTreeMap<String, bool>,
     pub approved_revision: Option<u64>,
@@ -200,6 +202,53 @@ impl LivingPlan {
         Ok(())
     }
 
+    /// Migrate legacy unstructured questions to Open structured decisions if no structured decisions exist.
+    /// Never infers answers; questions remain open awaiting explicit user interaction.
+    pub fn migrate_legacy_questions(&mut self) {
+        if self.structured_decisions.is_empty() && !self.questions.is_empty() {
+            for (idx, q) in self.questions.iter().enumerate() {
+                let id = format!("legacy_q_{}", idx + 1);
+                self.structured_decisions.insert(
+                    id.clone(),
+                    crate::decisions::DecisionQuestion {
+                        id: id.clone(),
+                        kind: crate::decisions::DecisionKind::Scope,
+                        title: format!("Legacy question {}", idx + 1),
+                        question: q.clone(),
+                        materiality: "Imported from legacy plan questions".into(),
+                        evidence_refs: Vec::new(),
+                        evidence_fingerprints: BTreeMap::new(),
+                        options: Vec::new(),
+                        allow_custom: true,
+                        custom_only: true,
+                        plan_revision: self.revision,
+                        state: crate::decisions::DecisionState::Open,
+                        answer: None,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Invalidate step approval decisions that depend on a modified step or decision.
+    /// Does not invalidate decisions for independent steps.
+    pub fn invalidate_dependent_step_decisions(&mut self, target_id: &str) {
+        let mut changed = std::collections::BTreeSet::new();
+        changed.insert(target_id.to_string());
+        loop {
+            let before = changed.len();
+            for step in &self.steps {
+                if step.depends_on.iter().any(|id| changed.contains(id)) {
+                    changed.insert(step.id.clone());
+                }
+            }
+            if changed.len() == before {
+                break;
+            }
+        }
+        self.decisions.retain(|id, _| !changed.contains(id));
+    }
+
     pub fn edit_step(&mut self, id: &str, change: &str, cwd: &Path) -> Result<(), String> {
         let mut step = self
             .steps
@@ -223,6 +272,16 @@ impl LivingPlan {
         if !self.questions.is_empty() {
             return Err("Resolve the plan's open decisions before approving".into());
         }
+        if self.structured_decisions.values().any(|d| {
+            matches!(
+                d.state,
+                crate::decisions::DecisionState::Open | crate::decisions::DecisionState::Deferred
+            )
+        }) {
+            return Err(
+                "Resolve or answer the plan's structured decisions before approving".into(),
+            );
+        }
         if self.decisions.values().any(|accepted| !accepted) {
             return Err("Revise or explicitly accept rejected steps before approving".into());
         }
@@ -233,6 +292,12 @@ impl LivingPlan {
         self.approved_revision = Some(self.revision);
         self.changes = vec![format!("approved revision {} for execution", self.revision)];
         Ok(())
+    }
+
+    /// Clears any active approval when state or workspace is rewound.
+    pub fn clear_approval(&mut self) {
+        self.approved_revision = None;
+        self.changes = vec!["approval cleared by rewind".into()];
     }
 
     pub fn ready(&self, cwd: &Path) -> Result<(), String> {
@@ -248,10 +313,33 @@ impl LivingPlan {
                 .steps
                 .iter()
                 .any(|s| self.decisions.get(&s.id) != Some(&true))
+            || self.structured_decisions.values().any(|d| {
+                matches!(
+                    d.state,
+                    crate::decisions::DecisionState::Open
+                        | crate::decisions::DecisionState::Deferred
+                )
+            })
         {
             return Err("The plan contains unresolved or unapproved decisions".into());
         }
         self.check_fresh(cwd)
+    }
+
+    pub(crate) fn decision_evidence_fingerprint(
+        &self,
+        evidence_ref: &str,
+        cwd: &Path,
+    ) -> Result<String, String> {
+        let evidence = self
+            .evidence
+            .iter()
+            .find(|evidence| evidence.path == evidence_ref)
+            .ok_or_else(|| format!("Unknown plan evidence reference: {evidence_ref}"))?;
+        match fingerprint(cwd, &evidence.path) {
+            Ok(current) if current == evidence.fingerprint => Ok(current),
+            _ => Err(format!("Plan evidence is stale: {}", evidence.path)),
+        }
     }
 
     pub fn check_fresh(&self, cwd: &Path) -> Result<(), String> {
@@ -391,6 +479,29 @@ impl LivingPlan {
             lines.push("\n## Open decisions (block approval)".into());
             lines.extend(self.questions.iter().map(|s| format!("- {s}")));
         }
+        if !self.structured_decisions.is_empty() {
+            lines.push("\n## Structured decisions".into());
+            for d in self.structured_decisions.values() {
+                let status = match d.state {
+                    crate::decisions::DecisionState::Open => "open",
+                    crate::decisions::DecisionState::AnsweredByUser => "answered",
+                    crate::decisions::DecisionState::Deferred => "deferred",
+                    crate::decisions::DecisionState::Cancelled => "cancelled",
+                };
+                let ans = if let Some(a) = &d.answer {
+                    if let Some(c) = &a.choice_id {
+                        format!(" [selected: {c}]")
+                    } else if let Some(txt) = &a.custom_text {
+                        format!(" [custom: {txt}]")
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                lines.push(format!("- [{}] {} ({status}){ans}", d.id, d.title));
+            }
+        }
         lines.push("\n## Implementation steps".into());
         for s in &self.steps {
             let decision = match self.decisions.get(&s.id) {
@@ -414,6 +525,17 @@ impl LivingPlan {
         }
         lines.push("\n/plan accept <id|all> · /plan reject <id> · /plan edit <id> <change> · /plan approve · /act".into());
         lines.join("\n")
+    }
+}
+
+pub fn approval_after_decision(
+    approved_revision: Option<u64>,
+    material_change: bool,
+) -> Option<u64> {
+    if material_change {
+        None
+    } else {
+        approved_revision
     }
 }
 
@@ -745,5 +867,92 @@ mod tests {
             );
             assert_eq!(before, plan);
         }
+    }
+
+    #[test]
+    fn f02_old_session_without_structured_decisions_loads_open_and_empty() {
+        let (dir, plan) = fixture();
+        let mut value = serde_json::to_value(&plan).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("structured_decisions");
+        value["questions"] = json!(["Legacy unresolved question"]);
+        value["decisions"] = json!({"one": true});
+
+        let restored =
+            LivingPlan::from_value(&value).expect("legacy LivingPlan should deserialize");
+        assert!(restored.structured_decisions.is_empty());
+        assert_eq!(restored.questions, vec!["Legacy unresolved question"]);
+        assert_eq!(restored.decisions.get("one"), Some(&true));
+        assert_eq!(restored.approved_revision, None);
+        assert!(restored.ready(dir.path()).is_err());
+    }
+
+    #[test]
+    fn f02_answer_invalidates_approval() {
+        assert_eq!(approval_after_decision(Some(7), true), None);
+        assert_eq!(approval_after_decision(Some(7), false), Some(7));
+    }
+
+    #[test]
+    fn f02_legacy_question_migration() {
+        let (_dir, mut plan) = fixture();
+        plan.questions = vec!["Should we use sqlite or jsonl?".into()];
+        plan.structured_decisions.clear();
+        plan.migrate_legacy_questions();
+
+        assert_eq!(plan.structured_decisions.len(), 1);
+        let migrated = plan.structured_decisions.get("legacy_q_1").unwrap();
+        assert_eq!(migrated.state, crate::decisions::DecisionState::Open);
+        assert_eq!(migrated.question, "Should we use sqlite or jsonl?");
+        assert!(migrated.custom_only);
+        assert_eq!(migrated.answer, None);
+    }
+
+    #[test]
+    fn f02_user_correction_invalidates_only_dependent_decisions() {
+        let (dir, mut plan) = fixture();
+        plan.update(
+            &json!({
+                "expected_revision": plan.revision,
+                "steps": [
+                    {
+                        "id": "step_1",
+                        "change": "Create database schema",
+                        "why": "Storage foundation",
+                        "files": ["src/main.rs"],
+                        "verify": ["cargo check"]
+                    },
+                    {
+                        "id": "step_2",
+                        "change": "Implement repository layer",
+                        "why": "Depends on schema",
+                        "files": ["src/main.rs"],
+                        "depends_on": ["step_1"],
+                        "verify": ["cargo check"]
+                    },
+                    {
+                        "id": "step_3",
+                        "change": "Add telemetry counters",
+                        "why": "Independent feature",
+                        "files": ["src/main.rs"],
+                        "verify": ["cargo check"]
+                    }
+                ]
+            }),
+            dir.path(),
+        )
+        .unwrap();
+
+        plan.decisions.insert("step_1".into(), true);
+        plan.decisions.insert("step_2".into(), true);
+        plan.decisions.insert("step_3".into(), true);
+
+        // Correcting/modifying step_1 invalidates step_1 and step_2, but NOT step_3
+        plan.invalidate_dependent_step_decisions("step_1");
+        assert!(!plan.decisions.contains_key("step_1"));
+        assert!(!plan.decisions.contains_key("step_2"));
+        assert_eq!(plan.decisions.get("step_3"), Some(&true));
     }
 }

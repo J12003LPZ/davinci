@@ -319,6 +319,25 @@ fn temp_dir_for(task_id: &str) -> PathBuf {
     std::env::temp_dir().join(unique)
 }
 
+fn configure_task_contract_env(command: &mut Command, spec: &WorkerSpec) -> Result<(), String> {
+    // Never inherit ambient authority. The parent controller is the sole producer of the worker
+    // contract snapshot and explicitly clears both legacy/current variables when no contract is
+    // active for this worker attempt.
+    command.env_remove("DAVINCI_TASK_CONTRACT_JSON");
+    command.env_remove("PI_CONTRACT_DIGEST");
+    let Some(contract) = &spec.task_contract else {
+        return Ok(());
+    };
+    contract
+        .validate()
+        .map_err(|err| format!("invalid worker task contract: {err}"))?;
+    let encoded = serde_json::to_string(contract)
+        .map_err(|err| format!("could not serialize worker task contract: {err}"))?;
+    command.env("DAVINCI_TASK_CONTRACT_JSON", encoded);
+    command.env("PI_CONTRACT_DIGEST", &contract.digest);
+    Ok(())
+}
+
 /// Spawn one real `pi` child for this node.
 pub fn run_worker(
     spec: &WorkerSpec,
@@ -371,18 +390,42 @@ pub fn run_worker(
         spec.expect,
     );
     let mut command = Command::new(executable);
+    let effect_report_path = spec.artifact_path.with_extension("effects.jsonl");
+    // Each worker attempt owns one report. Remove a prior attempt so a retry
+    // cannot accidentally combine effects from different checkpoints.
+    let _ = fs::remove_file(&effect_report_path);
     command
         .args(build_worker_args(spec, &briefing_file, &system_prompt_file))
         .current_dir(&spec.cwd)
         .env("PI_GRAPH_ROLE", spec.role.as_str())
         .env("PI_GRAPH_EXPECT", spec.expect.as_str())
         .env("PI_GRAPH_ARTIFACT_PATH", &spec.artifact_path)
+        .env("PI_GRAPH_EFFECT_REPORT", &effect_report_path)
         .env("PI_GRAPH_EXTRA_TOOLS", spec.tools.join(","))
         .env("PI_GRAPH_CACHE_KEY", &cache_key)
         .env("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1");
+    if let Err(error) = configure_task_contract_env(&mut command, spec) {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return WorkerResult {
+            failure_reason: Some(error),
+            ..WorkerResult::default()
+        };
+    }
 
     if let Some(agent_id) = &spec.runtime_agent_id {
         command.env("DAVINCI_AGENT_ID", agent_id.to_string());
+    }
+
+    if let Some(coordinator) = &spec.coordinator_client {
+        command.env(
+            "DAVINCI_TASK_COORDINATOR_ADDR",
+            coordinator.address().to_string(),
+        );
+        command.env(
+            "DAVINCI_TASK_COORDINATOR_CREDENTIAL",
+            coordinator.credential(),
+        );
+        command.env("DAVINCI_EXPERIMENTAL_AGENT_TEAMS", "1");
     }
 
     if let Some(path) = &spec.transcript_path {
@@ -737,6 +780,9 @@ mod tests {
             transcript_path: None,
             project_trusted: true,
             runtime_agent_id: None,
+            task_contract: None,
+            coordinator_client: None,
+            node_abort: None,
         }
     }
 
@@ -779,6 +825,65 @@ mod tests {
         assert!(args.contains(&"--no-session".to_string()));
         assert!(args.contains(&"--no-extensions".to_string()));
         assert!(args.contains(&"--no-skills".to_string()));
+    }
+
+    #[test]
+    fn f05_worker_contract_env_is_parent_owned_and_ambient_authority_is_cleared() {
+        let mut worker = spec();
+        let mut command = Command::new("fixture");
+        configure_task_contract_env(&mut command, &worker).unwrap();
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(envs.get("DAVINCI_TASK_CONTRACT_JSON"), Some(&None));
+        assert_eq!(envs.get("PI_CONTRACT_DIGEST"), Some(&None));
+
+        let contract = davinci_agent::runtime::TaskContract::new(
+            "graph-worker-contract",
+            1,
+            davinci_agent::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec![".git/".into()],
+            false,
+            vec![],
+            vec![],
+            vec!["target/".into()],
+        )
+        .unwrap();
+        worker.task_contract = Some(contract.clone());
+        let mut command = Command::new("fixture");
+        configure_task_contract_env(&mut command, &worker).unwrap();
+        let envs: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("PI_CONTRACT_DIGEST")
+                .and_then(Clone::clone)
+                .as_deref(),
+            Some(contract.digest.as_str())
+        );
+        let inherited: davinci_agent::runtime::TaskContract = serde_json::from_str(
+            envs.get("DAVINCI_TASK_CONTRACT_JSON")
+                .and_then(Clone::clone)
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inherited.digest, contract.digest);
+        assert_eq!(inherited.writable_paths, contract.writable_paths);
     }
 
     #[test]

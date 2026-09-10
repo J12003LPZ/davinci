@@ -13,10 +13,17 @@
 //! Budgets that bound time or money are OFF by default — a run continues until
 //! it finishes, blocks, or the operator aborts it. See [`types::GraphBudgets`].
 
+pub(crate) mod bindings;
 pub(crate) mod briefings;
 pub(crate) mod config;
+pub(crate) mod control;
 pub(crate) mod controller;
+pub(crate) mod definitions;
+pub(crate) mod export;
+pub(crate) mod history;
 pub(crate) mod mutation;
+pub(crate) mod operations;
+pub(crate) mod preflight;
 pub(crate) mod process;
 pub(crate) mod render;
 pub(crate) mod replay;
@@ -30,6 +37,8 @@ pub(crate) mod verify;
 pub(crate) mod worker;
 pub(crate) mod worker_hooks;
 
+#[allow(unused_imports)]
+pub use control::*;
 #[allow(unused_imports)]
 pub use mutation::{
     capture_baseline, capture_graph_delta, ChangedFile, FileFingerprint, GraphMutation,
@@ -46,13 +55,19 @@ pub use topology::{
 };
 pub use types::*;
 
+use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, SecurityVerification};
 use config::load_config;
-use controller::{run_graph, ControllerDeps, RunOptions};
+#[allow(unused_imports)]
+pub use controller::{run_graph, run_saved_graph, ControllerDeps, RunOptions};
 use davinci_agent::{ToolError, ToolResult};
-use render::{parse_graph_args, render_now, render_run_summary, ParsedGraphArgs};
+#[allow(unused_imports)]
+pub use render::{
+    graph_command_kind, parse_graph_args, parse_graph_command, render_now, render_run_summary,
+    GraphCommand, ParsedGraphArgs,
+};
 use serde_json::{json, Value};
 use store::{list_runs, load_run, read_transcript, transcript_path};
-use verify::{default_verify_exec, dry_run_verify_exec};
+use verify::{contracted_verify_exec, default_verify_exec, dry_run_verify_exec};
 use worker::{run_dry_worker, run_worker};
 
 use std::collections::HashMap;
@@ -81,6 +96,7 @@ pub(crate) struct ActiveRun {
     finished: AtomicBool,
     /// The background run thread, joined on session shutdown.
     handle: Mutex<Option<thread::JoinHandle<()>>>,
+    pub(crate) control_tracker: Mutex<control::ControlTracker>,
 }
 
 impl ActiveRun {
@@ -222,6 +238,58 @@ fn is_live(run: &GraphRun) -> bool {
     )
 }
 
+fn saved_definition_from_run(
+    run: &GraphRun,
+    name: &str,
+) -> Result<definitions::SavedGraphDefinitionV1, String> {
+    if let Some(def) = &run.saved_definition {
+        let mut def = def.clone();
+        def.name = name.to_string();
+        return Ok(def);
+    }
+    let Some(graph_def) = &run.definition else {
+        return Err(format!(
+            "Run '{}' does not contain a validated graph definition to export.",
+            run.run_id
+        ));
+    };
+    let topology = definitions::SavedGraphTopology {
+        graph_id: format!("{name}-graph"),
+        version: graph_def.version,
+        mode: graph_def.mode,
+        nodes: graph_def.nodes.clone(),
+        edges: graph_def.edges.clone(),
+    };
+    let bindings = graph_def
+        .nodes
+        .iter()
+        .map(|node| definitions::SavedStageBinding {
+            node_id: node.id.clone(),
+            stage: node.role.to_string(),
+            input_artifacts: vec![],
+        })
+        .collect();
+    Ok(definitions::SavedGraphDefinitionV1 {
+        schema_version: 1,
+        name: name.to_string(),
+        description: format!("Exported from run {}", run.run_id),
+        graph: topology,
+        bindings,
+        budgets: Some(definitions::SavedBudgets {
+            max_duration_ms: (run.budgets.run_deadline_ms > 0)
+                .then_some(run.budgets.run_deadline_ms),
+            max_cost_usd: (run.budgets.max_cost_usd > 0.0).then_some(run.budgets.max_cost_usd),
+            max_tokens: None,
+        }),
+        verification_policy: Some(definitions::SavedVerificationPolicy {
+            command_profile: "default".into(),
+            required: true,
+        }),
+        artifact_contract_versions: std::collections::BTreeMap::new(),
+        parameters: vec![],
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct GraphController {
     cwd: PathBuf,
@@ -232,6 +300,8 @@ pub struct GraphController {
     pub learning: Option<crate::native_extensions::LearningController>,
     pub governor: Option<crate::native_extensions::TokenGovernor>,
     pub runtime: Option<davinci_agent::RuntimeHandle>,
+    pub permissions: Option<Arc<davinci_agent::PermissionState>>,
+    pub task_contract: Option<davinci_agent::runtime::TaskContract>,
 }
 
 impl Default for GraphController {
@@ -251,6 +321,8 @@ impl GraphController {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         }
     }
 
@@ -263,6 +335,21 @@ impl GraphController {
     #[allow(dead_code)]
     pub fn set_runtime(&mut self, runtime: Option<davinci_agent::RuntimeHandle>) {
         self.runtime = runtime;
+    }
+
+    #[allow(dead_code)]
+    pub fn with_permissions(mut self, permissions: Arc<davinci_agent::PermissionState>) -> Self {
+        self.permissions = Some(permissions);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn set_permissions(&mut self, permissions: Option<Arc<davinci_agent::PermissionState>>) {
+        self.permissions = permissions;
+    }
+
+    pub fn set_task_contract(&mut self, contract: Option<davinci_agent::runtime::TaskContract>) {
+        self.task_contract = contract;
     }
 
     /// Workers inherit the session's model and thinking level unless the
@@ -299,7 +386,10 @@ impl GraphController {
             verify_exec: if dry_run {
                 Arc::new(dry_run_verify_exec)
             } else {
-                Arc::new(default_verify_exec)
+                match self.task_contract.is_some() {
+                    true => Arc::new(contracted_verify_exec),
+                    false => Arc::new(default_verify_exec),
+                }
             },
             config: loaded.config,
             session_model: self.session_model.clone(),
@@ -315,6 +405,8 @@ impl GraphController {
             learning: self.learning.clone(),
             governor: self.governor.clone(),
             runtime: self.runtime.clone(),
+            permissions: self.permissions.clone(),
+            task_contract: self.task_contract.clone(),
         };
         (deps, loaded.errors)
     }
@@ -424,7 +516,7 @@ impl GraphController {
                 format!("No graph run \"{wanted}\" in this project.")
             });
         };
-        let Some(old_run) = load_run(&self.cwd, &summary.run_id) else {
+        let Some(mut old_run) = load_run(&self.cwd, &summary.run_id) else {
             return Err(format!("Could not load state for run {}.", summary.run_id));
         };
         if old_run.phase == types::Phase::Done {
@@ -432,6 +524,42 @@ impl GraphController {
                 "Run {} already finished (done). Start a new /graph instead.",
                 old_run.run_id
             ));
+        }
+
+        // Reconcile running workers using restored_worker_state so crashed "running" workers
+        // become "reconciliation_required" unless live identity is verified.
+        let mut reconciled = false;
+        for task in &mut old_run.tasks {
+            let state = store::restored_worker_state(task.status.as_str(), false);
+            if state == "reconciliation_required" {
+                task.status = types::TaskStatus::Failed;
+                task.error =
+                    Some("worker stopped unexpectedly; reconciliation required".to_string());
+                reconciled = true;
+            }
+        }
+        if reconciled && old_run.current_lifecycle() == types::GraphLifecycle::Running {
+            old_run.lifecycle = Some(types::GraphLifecycle::RecoveryRequired);
+            store::save_run(&mut old_run)
+                .map_err(|e| format!("Failed to persist reconciled run: {e}"))?;
+            return Ok(json!({
+                "resumed": false,
+                "reconciliationRequired": true,
+                "runId": old_run.run_id,
+                "status": render_now(&old_run),
+                "message": "Run workers crashed and require reconciliation before resuming.",
+            }));
+        }
+
+        // Bare /graph reopens an explicitly Paused run without auto-resuming it
+        if wanted.is_empty() && old_run.current_lifecycle() == types::GraphLifecycle::Paused {
+            return Ok(json!({
+                "resumed": false,
+                "paused": true,
+                "runId": old_run.run_id,
+                "status": render_now(&old_run),
+                "message": "Run is paused. Use /graph-control or 'p' to resume.",
+            }));
         }
         // A run that revised or replanned holds several succeeded plan-N /
         // implement-N / review-N attempts, and the resumed run numbers its own
@@ -624,24 +752,602 @@ impl GraphController {
         }
     }
 
+    pub fn save_command(&self, name: &str, overwrite: bool) -> Result<Value, String> {
+        let run = active_run(&self.cwd)
+            .and_then(|r| r.snapshot())
+            .or_else(|| {
+                list_runs(&self.cwd)
+                    .first()
+                    .and_then(|s| load_run(&self.cwd, &s.run_id))
+            });
+        let Some(run) = run else {
+            return Err("No graph run found in this project to save.".into());
+        };
+        if run.phase != types::Phase::Done {
+            return Err(format!(
+                "Cannot save graph run '{}': only runs with phase 'done' may be saved (current phase: {})",
+                run.run_id, run.phase
+            ));
+        }
+        let saved_def = if let Some(ref def) = run.saved_definition {
+            let mut def = def.clone();
+            def.name = name.to_string();
+            def.description = format!("Saved from run {}", run.run_id);
+            def
+        } else if let Some(ref graph_def) = run.definition {
+            let topology = definitions::SavedGraphTopology {
+                graph_id: format!("{name}-graph"),
+                version: graph_def.version,
+                mode: graph_def.mode,
+                nodes: graph_def.nodes.clone(),
+                edges: graph_def.edges.clone(),
+            };
+            let bindings = graph_def
+                .nodes
+                .iter()
+                .map(|n| definitions::SavedStageBinding {
+                    node_id: n.id.clone(),
+                    stage: n.role.to_string(),
+                    input_artifacts: vec![],
+                })
+                .collect();
+            definitions::SavedGraphDefinitionV1 {
+                schema_version: 1,
+                name: name.to_string(),
+                description: format!("Saved from run {}", run.run_id),
+                graph: topology,
+                bindings,
+                budgets: Some(definitions::SavedBudgets {
+                    max_duration_ms: None,
+                    max_cost_usd: if run.budgets.max_cost_usd > 0.0 {
+                        Some(run.budgets.max_cost_usd)
+                    } else {
+                        None
+                    },
+                    max_tokens: None,
+                }),
+                verification_policy: Some(definitions::SavedVerificationPolicy {
+                    command_profile: "default".into(),
+                    required: true,
+                }),
+                artifact_contract_versions: std::collections::BTreeMap::new(),
+                parameters: vec![],
+            }
+        } else {
+            return Err(format!(
+                "Run '{}' does not contain a validated graph definition to save.",
+                run.run_id
+            ));
+        };
+
+        definitions::validate_saved_definition(&saved_def)?;
+        let dir = definitions::project_graphs_dir(&self.cwd);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("failed to create graphs directory: {e}"))?;
+        let saved_path = definitions::save_graph_definition_to_dir(
+            &dir,
+            name,
+            &saved_def,
+            overwrite,
+            Some(&self.cwd),
+        )?;
+        Ok(json!({
+            "saved": true,
+            "name": name,
+            "path": saved_path.display().to_string(),
+            "runId": run.run_id,
+        }))
+    }
+
+    pub fn run_saved_command(
+        &self,
+        name: &str,
+        params: HashMap<String, String>,
+        dry_run: bool,
+    ) -> Result<Value, String> {
+        let def = definitions::resolve_and_load_graph_definition(name, &self.cwd)
+            .map_err(|e| format!("Could not load graph definition '{name}': {e}"))?;
+        definitions::validate_saved_definition(&def)
+            .map_err(|e| format!("Graph definition '{name}' failed validation: {e}"))?;
+        let bound_params = definitions::bind_parameters(&def, &params)?;
+        self.start_saved_background(def, bound_params, dry_run)
+    }
+
+    pub fn start_saved_background(
+        &self,
+        def: definitions::SavedGraphDefinitionV1,
+        bound_params: HashMap<String, String>,
+        dry_run: bool,
+    ) -> Result<Value, String> {
+        refuse_if_active(&self.cwd)?;
+        let active = Arc::new(ActiveRun::default());
+        let (deps, config_errors) = self.deps(dry_run, &active);
+        let options = RunOptions {
+            goal: def.description.clone(),
+            cwd: self.cwd.clone(),
+            forced: None,
+            dry_run,
+            abort: Arc::clone(&active.abort),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        };
+        register_run(&self.cwd, Arc::clone(&active));
+        let finished = Arc::clone(&active);
+        let name = def.name.clone();
+        let digest = definitions::compute_definition_digest(&def);
+        let origin = ExecutionOrigin::SavedDefinition {
+            name: name.clone(),
+            digest: digest.clone(),
+        };
+        let _ = origin;
+        let handle = thread::spawn(move || {
+            let _guard = FinishedOnDrop(finished);
+            let _ = run_saved_graph(options, deps, def);
+        });
+        active
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(handle);
+
+        let deadline = Instant::now() + START_REPORT_WAIT;
+        let mut snapshot = active.snapshot();
+        while snapshot.is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            snapshot = active.snapshot();
+        }
+        Ok(json!({
+            "started": true,
+            "savedGraph": name,
+            "digest": digest,
+            "dryRun": dry_run,
+            "params": bound_params,
+            "runId": snapshot.as_ref().map(|run| run.run_id.clone()),
+            "configErrors": config_errors,
+            "status": snapshot.as_ref().map(render_now).unwrap_or_default(),
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub fn run_saved_to_completion(
+        &self,
+        def: definitions::SavedGraphDefinitionV1,
+        params: HashMap<String, String>,
+        dry_run: bool,
+    ) -> Result<GraphRun, String> {
+        refuse_if_active(&self.cwd)?;
+        definitions::validate_saved_definition(&def)?;
+        let _bound = definitions::bind_parameters(&def, &params)?;
+        let active = Arc::new(ActiveRun::default());
+        let (deps, _config_errors) = self.deps(dry_run, &active);
+        let options = RunOptions {
+            goal: def.description.clone(),
+            cwd: self.cwd.clone(),
+            forced: None,
+            dry_run,
+            abort: Arc::clone(&active.abort),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        };
+        register_run(&self.cwd, Arc::clone(&active));
+        let _guard = FinishedOnDrop(Arc::clone(&active));
+        Ok(run_saved_graph(options, deps, def))
+    }
+
+    pub fn handle_advanced_command(
+        &self,
+        cmd: render::GraphAdvancedCommand,
+    ) -> Result<Option<Value>, String> {
+        match cmd {
+            render::GraphAdvancedCommand::Diff { revision } => {
+                let report = self.diff_command(revision)?;
+                Ok(Some(serde_json::to_value(report).unwrap_or_default()))
+            }
+            render::GraphAdvancedCommand::Explain { node_id } => {
+                let report = self.explain_command(node_id.as_deref())?;
+                Ok(Some(serde_json::to_value(report).unwrap_or_default()))
+            }
+            render::GraphAdvancedCommand::DryRun { name } => {
+                let report = self.dry_run_preflight_command(name.as_deref())?;
+                Ok(Some(serde_json::to_value(report).unwrap_or_default()))
+            }
+            render::GraphAdvancedCommand::Fork {
+                node_id,
+                strategy,
+                authorized,
+            } => {
+                let report = self.fork_command(&node_id, strategy.as_deref(), authorized)?;
+                Ok(Some(serde_json::to_value(report).unwrap_or_default()))
+            }
+            render::GraphAdvancedCommand::Rewind {
+                node_id,
+                authorized,
+            } => {
+                let report = self.rewind_command(&node_id, authorized)?;
+                Ok(Some(serde_json::to_value(report).unwrap_or_default()))
+            }
+            render::GraphAdvancedCommand::Verify => {
+                let report = self.verify_command()?;
+                Ok(Some(serde_json::to_value(report).unwrap_or_default()))
+            }
+            render::GraphAdvancedCommand::Budget {
+                resource,
+                value,
+                expected_revision,
+                authorized,
+            } => self.budget_command(
+                resource.as_deref(),
+                value.as_deref(),
+                expected_revision,
+                authorized,
+            ),
+            render::GraphAdvancedCommand::Export { name, overwrite } => {
+                self.export_command(name.as_deref(), overwrite)
+            }
+        }
+    }
+
+    pub fn diff_command(
+        &self,
+        revision: Option<u64>,
+    ) -> Result<operations::GraphDiffReport, String> {
+        let latest = list_runs(&self.cwd)
+            .first()
+            .cloned()
+            .ok_or_else(|| "No graph run found in this project to diff.".to_string())?;
+        let current = load_run(&self.cwd, &latest.run_id)
+            .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
+        let prior = if let Some(rev) = revision {
+            list_runs(&self.cwd)
+                .iter()
+                .filter_map(|s| load_run(&self.cwd, &s.run_id))
+                .find(|r| r.revision == rev)
+        } else if current.revision > 1 {
+            list_runs(&self.cwd)
+                .iter()
+                .filter_map(|s| load_run(&self.cwd, &s.run_id))
+                .find(|r| r.revision == current.revision - 1)
+        } else {
+            None
+        };
+        Ok(operations::generate_graph_diff(
+            &current,
+            prior.as_ref(),
+            Some(&self.cwd),
+            &[],
+        ))
+    }
+
+    pub fn explain_command(
+        &self,
+        node_id: Option<&str>,
+    ) -> Result<operations::GraphExplainReport, String> {
+        let latest = list_runs(&self.cwd)
+            .first()
+            .cloned()
+            .ok_or_else(|| "No graph run found in this project to explain.".to_string())?;
+        let current = load_run(&self.cwd, &latest.run_id)
+            .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
+        Ok(operations::generate_graph_explain(&current, node_id))
+    }
+
+    pub fn dry_run_preflight_command(
+        &self,
+        name: Option<&str>,
+    ) -> Result<preflight::PreflightReport, String> {
+        let current = list_runs(&self.cwd)
+            .first()
+            .and_then(|s| load_run(&self.cwd, &s.run_id));
+        preflight::run_preflight(
+            &self.cwd,
+            name,
+            current.as_ref(),
+            self.project_trusted,
+            "auto",
+        )
+    }
+
+    pub fn fork_command(
+        &self,
+        node_id: &str,
+        strategy_str: Option<&str>,
+        authorized: bool,
+    ) -> Result<operations::ForkPreview, String> {
+        if is_running(&self.cwd) {
+            return Err(
+                "fork requires a quiescent graph; pause or stop the active run first".into(),
+            );
+        }
+        let latest = list_runs(&self.cwd)
+            .first()
+            .cloned()
+            .ok_or_else(|| "No graph run found in this project to fork.".to_string())?;
+        let current = load_run(&self.cwd, &latest.run_id)
+            .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
+        let strategy = match strategy_str {
+            Some(raw) => operations::ForkStrategy::parse(raw)
+                .ok_or_else(|| format!("unknown fork strategy '{raw}'"))?,
+            None => operations::ForkStrategy::RepairMinimal,
+        };
+        let preview =
+            operations::generate_fork_preview(&current, node_id, strategy, Some(&self.cwd))?;
+        if !authorized {
+            return Ok(preview);
+        }
+        let _new_run = operations::execute_fork(&current, &preview, &self.cwd)?;
+        Ok(operations::ForkPreview {
+            applied: true,
+            ..preview
+        })
+    }
+
+    pub fn rewind_command(
+        &self,
+        node_id: &str,
+        authorized: bool,
+    ) -> Result<operations::GraphRewindPreview, String> {
+        if is_running(&self.cwd) {
+            return Err(
+                "rewind requires a quiescent graph; pause or stop the active run first".into(),
+            );
+        }
+        let latest = list_runs(&self.cwd)
+            .first()
+            .cloned()
+            .ok_or_else(|| "No graph run found in this project to rewind.".to_string())?;
+        let mut current = load_run(&self.cwd, &latest.run_id)
+            .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
+        let preview = operations::generate_rewind_preview(&current, node_id, &self.cwd, &[])?;
+        if !authorized {
+            return Ok(preview);
+        }
+        let _result =
+            operations::execute_rewind_with_runtime(&mut current, &preview, &self.cwd, true, true)?;
+        Ok(operations::GraphRewindPreview {
+            applied: true,
+            ..preview
+        })
+    }
+
+    pub fn verify_command(&self) -> Result<operations::VerifyOnlyReport, String> {
+        let latest = list_runs(&self.cwd)
+            .first()
+            .cloned()
+            .ok_or_else(|| "No graph run found in this project to verify.".to_string())?;
+        let mut current = load_run(&self.cwd, &latest.run_id)
+            .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
+
+        let commands = config::detect_verify_commands(&self.cwd);
+        let abort = Arc::new(AtomicBool::new(false));
+        let exec = verify::default_verify_exec;
+        let source_before = operations::source_manifest_for_run(&current, &self.cwd)?;
+        let source_current = current
+            .verification_bundle
+            .as_ref()
+            .map(|bundle| operations::verification_source_current(bundle, source_before.as_ref()))
+            .unwrap_or(source_before.is_none());
+
+        let policy_mode = load_config(&self.cwd).config.security_verification;
+        let security_available = match policy_mode {
+            SecurityPolicyMode::Off => true,
+            SecurityPolicyMode::Risk | SecurityPolicyMode::Always => {
+                source_current
+                    && current.verification_bundle.as_ref().is_some_and(|bundle| {
+                        matches!(
+                            bundle.security,
+                            SecurityVerification::Passed { .. } | SecurityVerification::NotRequired
+                        )
+                    })
+            }
+        };
+        let complexity = current
+            .forced
+            .or_else(|| current.classification.as_ref().map(|item| item.complexity));
+        let review_complete = match complexity {
+            Some(types::Complexity::Trivial) => source_current,
+            _ => {
+                current
+                    .review_coverage
+                    .as_ref()
+                    .map(review_coverage::coverage_complete)
+                    .unwrap_or(false)
+                    && source_current
+            }
+        };
+
+        let mut report = operations::execute_verify_only(
+            &mut current,
+            &self.cwd,
+            &commands,
+            &exec,
+            &abort,
+            None,
+            security_available,
+            review_complete,
+        );
+        let source_after = operations::source_manifest_for_run(&current, &self.cwd)?;
+        let source_changed = match (source_before.as_ref(), source_after.as_ref()) {
+            (Some(before), Some(after)) => !before.is_current(after),
+            (None, None) => false,
+            _ => true,
+        };
+        if source_changed {
+            report.passed = false;
+            report.security_passed = false;
+            report.review_passed = false;
+            report.message =
+                "Verification rejected: source changed during verification".to_string();
+        }
+        store::save_run(&mut current)
+            .map_err(|error| format!("failed to persist verification result: {error}"))?;
+        Ok(report)
+    }
+
+    pub fn budget_command(
+        &self,
+        resource: Option<&str>,
+        value: Option<&str>,
+        expected_revision: Option<u64>,
+        authorized: bool,
+    ) -> Result<Option<Value>, String> {
+        let latest = list_runs(&self.cwd)
+            .first()
+            .cloned()
+            .ok_or_else(|| "No graph run found in this project to inspect.".to_string())?;
+        if is_running(&self.cwd) && value.is_some() {
+            return Err("budget updates are serialized at run boundaries; pause the active graph before updating".into());
+        }
+        let mut current = load_run(&self.cwd, &latest.run_id)
+            .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
+        if resource.is_none() && value.is_none() {
+            let report = operations::graph_budget_report(&current);
+            return Ok(Some(
+                serde_json::to_value(report).map_err(|error| error.to_string())?,
+            ));
+        }
+        let (Some(resource), Some(value)) = (resource, value) else {
+            return Err(
+                "Usage: /graph budget [set] <resource> <value> [--revision N] [--authorize]".into(),
+            );
+        };
+        if !self.project_trusted {
+            return Err("budget adjustments require explicit project trust".into());
+        }
+        if expected_revision.is_none() {
+            return Err("budget adjustments require an expected graph revision".into());
+        }
+        let report = operations::apply_budget_update(
+            &mut current,
+            resource,
+            value,
+            expected_revision,
+            authorized,
+        )?;
+        store::save_run(&mut current)
+            .map_err(|error| format!("failed to save budget update: {error}"))?;
+        Ok(Some(
+            serde_json::to_value(report).map_err(|error| error.to_string())?,
+        ))
+    }
+
+    pub fn export_command(
+        &self,
+        name: Option<&str>,
+        overwrite: bool,
+    ) -> Result<Option<Value>, String> {
+        let latest = list_runs(&self.cwd)
+            .first()
+            .cloned()
+            .ok_or_else(|| "No graph run found in this project to export.".to_string())?;
+        let current = load_run(&self.cwd, &latest.run_id)
+            .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
+        let export_name = name.unwrap_or("graph-export");
+        let definition = saved_definition_from_run(&current, export_name)?;
+        let document = export::export_definition(&definition)?;
+        let rendered = export::render_export_document(&document)?;
+        let checksum = export::export_checksum(&rendered);
+        if let Some(name) = name {
+            let path = export::write_project_export(&self.cwd, name, &document, overwrite)?;
+            return Ok(Some(json!({
+                "exported": true,
+                "name": name,
+                "path": path.display().to_string(),
+                "runId": current.run_id,
+                "checksum": checksum,
+            })));
+        }
+        Ok(Some(json!({
+            "exported": true,
+            "runId": current.run_id,
+            "checksum": checksum,
+            "document": serde_json::from_str::<Value>(&rendered).map_err(|error| error.to_string())?,
+        })))
+    }
+
     pub fn command(&self, name: &str, args: &str) -> Result<Option<Value>, String> {
         let value = match name {
-            "graph" if !args.trim().is_empty() => {
-                self.start_background(parse_graph_args(args), HashMap::new(), None)?
-            }
-            "graph" if is_running(&self.cwd) => self.status(None),
             "graph" => {
-                let Some(latest) = list_runs(&self.cwd).first().cloned() else {
-                    return Err("Usage: /graph <goal> [--simple|--complex] [--dry-run]".into());
-                };
-                let Some(run) = load_run(&self.cwd, &latest.run_id) else {
-                    return Err(format!("Could not load state for run {}.", latest.run_id));
-                };
-                if run.phase == types::Phase::Done {
-                    self.status(Some(&run.run_id))
-                } else {
-                    self.resume(&run.run_id)?
+                match render::parse_advanced_graph_command(args) {
+                    Ok(Some(adv)) => return self.handle_advanced_command(adv),
+                    Ok(None) => {}
+                    Err(error) => return Err(error),
                 }
+                let cmd = parse_graph_command(args)?;
+                match cmd {
+                    GraphCommand::Current => {
+                        if is_running(&self.cwd) {
+                            self.status(None)
+                        } else {
+                            let Some(latest) = list_runs(&self.cwd).first().cloned() else {
+                                return Err(
+                                    "Usage: /graph <goal> [--simple|--complex] [--dry-run]".into(),
+                                );
+                            };
+                            let Some(run) = load_run(&self.cwd, &latest.run_id) else {
+                                return Err(format!(
+                                    "Could not load state for run {}.",
+                                    latest.run_id
+                                ));
+                            };
+                            if run.phase == types::Phase::Done
+                                || run.current_lifecycle() == types::GraphLifecycle::Paused
+                            {
+                                self.status(Some(&run.run_id))
+                            } else {
+                                self.resume(&run.run_id)?
+                            }
+                        }
+                    }
+                    GraphCommand::Save { name, overwrite } => {
+                        self.save_command(&name, overwrite)?
+                    }
+                    GraphCommand::RunSaved {
+                        name,
+                        params,
+                        dry_run,
+                    } => self.run_saved_command(&name, params, dry_run)?,
+                    GraphCommand::Goal(parsed) => {
+                        if parsed.goal.trim().is_empty() {
+                            return Err(
+                                "Usage: /graph <goal> [--simple|--complex] [--dry-run]".into()
+                            );
+                        }
+                        self.start_background(parsed, HashMap::new(), None)?
+                    }
+                }
+            }
+            "graph-control" => {
+                let control: control::GraphControl = serde_json::from_str(args.trim())
+                    .map_err(|e| format!("Invalid graph control JSON: {e}"))?;
+                if let Some(active) = active_run(&self.cwd) {
+                    let mut snap = active.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref mut run) = *snap {
+                        if run.run_id == control.run_id {
+                            let mut tracker = active
+                                .control_tracker
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let receipt =
+                                control::reduce_control(run, &control, &mut tracker, 0, true);
+                            if receipt.state == control::ControlReceiptState::Applied {
+                                store::save_run(run).map_err(|e| {
+                                    format!("Failed to persist graph run checkpoint: {e}")
+                                })?;
+                            }
+                            return Ok(Some(serde_json::to_value(&receipt).unwrap_or_default()));
+                        }
+                    }
+                }
+                let Some(mut run) = load_run(&self.cwd, &control.run_id) else {
+                    return Err(format!("Run '{}' not found", control.run_id));
+                };
+                let mut tracker = control::ControlTracker::new();
+                let receipt = control::reduce_control(&mut run, &control, &mut tracker, 0, true);
+                if receipt.state == control::ControlReceiptState::Applied {
+                    store::save_run(&mut run)
+                        .map_err(|e| format!("Failed to persist graph run checkpoint: {e}"))?;
+                }
+                serde_json::to_value(&receipt).map_err(|e| e.to_string())?
             }
             "graph-resume" => self.resume(args.trim())?,
             "graph-status" => self.status(Some(args.trim())),
@@ -1037,5 +1743,248 @@ mod tests {
         assert_eq!(run.budgets.max_workers, 0);
         assert_eq!(run.budgets.verify_command_timeout_ms, 0);
         drain_active(dir.path());
+    }
+
+    #[test]
+    fn test_command_save_and_run_saved_roundtrip() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+
+        // 1. Initial dry-run to completion
+        let run = controller
+            .run_to_completion(parse_graph_args("--dry-run audit code"))
+            .expect("runs");
+        assert_eq!(run.phase, types::Phase::Done);
+
+        // 2. Save the successful run
+        let save_res = controller
+            .command("graph", "save security-audit")
+            .unwrap()
+            .expect("save result");
+        assert_eq!(save_res["saved"], true);
+        assert_eq!(save_res["name"], "security-audit");
+
+        let graph_file = dir
+            .path()
+            .join(".davinci")
+            .join("graphs")
+            .join("security-audit.yaml");
+        assert!(graph_file.exists());
+
+        // 3. Second save without overwrite fails
+        let err = controller
+            .command("graph", "save security-audit")
+            .unwrap_err();
+        assert!(err.contains("already exists"));
+
+        // 4. Second save with overwrite succeeds
+        let save_res2 = controller
+            .command("graph", "save security-audit --overwrite")
+            .unwrap()
+            .expect("overwrite save result");
+        assert_eq!(save_res2["saved"], true);
+
+        // 5. Run saved graph
+        let run_res = controller
+            .command("graph", "run security-audit --dry-run")
+            .unwrap()
+            .expect("run saved result");
+        assert_eq!(run_res["started"], true);
+        assert_eq!(run_res["savedGraph"], "security-audit");
+
+        drain_active(dir.path());
+    }
+
+    #[test]
+    fn test_command_save_without_completed_run_fails() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+
+        let err = controller.command("graph", "save no-run").unwrap_err();
+        assert!(err.contains("No graph run found"));
+    }
+
+    #[test]
+    fn test_resume_bare_paused_does_not_unpause() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let run_id = store::new_run_id();
+        store::create_run_dir(dir.path(), &run_id).unwrap();
+
+        let mut run = types::GraphRun {
+            version: 1,
+            run_id: run_id.clone(),
+            goal: "paused run".into(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            phase: types::Phase::Implement,
+            forced: None,
+            dry_run: true,
+            execution_origin: None,
+            definition_digest: None,
+            saved_definition: None,
+            definition: None,
+            classification: None,
+            milestones: None,
+            current_milestone: None,
+            tasks: vec![],
+            verification: None,
+            verification_bundle: None,
+            review_coverage: None,
+            budgets: types::GraphBudgets::default(),
+            counters: types::GraphCounters {
+                workers_spawned: 1,
+                revision_cycles: 0,
+                replans: 0,
+                cost_usd: 0.0,
+                started_at: store::now_ms(),
+            },
+            blocked_reason: None,
+            resource_snapshot: None,
+            ecosystem_stats: Default::default(),
+            updated_at: 0,
+            lifecycle: Some(types::GraphLifecycle::Paused),
+            revision: 1,
+        };
+        store::save_run(&mut run).unwrap();
+
+        let controller = controller(dir.path());
+        let res = controller.command("graph-resume", "").unwrap().unwrap();
+        assert_eq!(res["resumed"], false);
+        assert_eq!(res["paused"], true);
+        assert_eq!(res["runId"], run_id);
+    }
+
+    #[test]
+    fn test_resume_reconciles_crashed_running_workers() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let run_id = store::new_run_id();
+        store::create_run_dir(dir.path(), &run_id).unwrap();
+
+        let mut run = types::GraphRun {
+            version: 1,
+            run_id: run_id.clone(),
+            goal: "crashed run".into(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            phase: types::Phase::Implement,
+            forced: None,
+            dry_run: true,
+            execution_origin: None,
+            definition_digest: None,
+            saved_definition: None,
+            definition: None,
+            classification: None,
+            milestones: None,
+            current_milestone: None,
+            tasks: vec![types::GraphTaskState {
+                id: "implement-1".into(),
+                role: types::Role::Writer,
+                expect: types::ArtifactKind::PatchReport,
+                depends_on: vec![],
+                focus: None,
+                status: types::TaskStatus::Running,
+                attempts: 1,
+                artifact_file: None,
+                error: None,
+                usage: types::WorkerUsage::default(),
+                started_at: Some(10),
+                ended_at: None,
+                last_activity: None,
+                fingerprint: None,
+                mutation: None,
+                context_fingerprint: None,
+                context_tokens: 0,
+                memory_refs: vec![],
+                skill_refs: vec![],
+            }],
+            verification: None,
+            verification_bundle: None,
+            review_coverage: None,
+            budgets: types::GraphBudgets::default(),
+            counters: types::GraphCounters {
+                workers_spawned: 1,
+                revision_cycles: 0,
+                replans: 0,
+                cost_usd: 0.0,
+                started_at: store::now_ms(),
+            },
+            blocked_reason: None,
+            resource_snapshot: None,
+            ecosystem_stats: Default::default(),
+            updated_at: 0,
+            lifecycle: Some(types::GraphLifecycle::Running),
+            revision: 1,
+        };
+        store::save_run(&mut run).unwrap();
+
+        let controller = controller(dir.path());
+        let _ = controller.command("graph-resume", &run_id);
+        drain_active(dir.path());
+
+        // Re-read run from disk: task should have been marked Failed with reconciliation required
+        let reloaded = store::load_run(dir.path(), &run_id).unwrap();
+        assert_eq!(reloaded.tasks[0].status, types::TaskStatus::Failed);
+        assert!(reloaded.tasks[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("reconciliation required"));
+        assert_eq!(
+            reloaded.current_lifecycle(),
+            types::GraphLifecycle::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn f14_budget_inspection_update_and_declarative_export() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let mut controller = controller(dir.path());
+        let run = controller
+            .run_to_completion(parse_graph_args("--dry-run budget and export"))
+            .expect("runs");
+        drain_active(dir.path());
+
+        let inspected = controller.command("graph", "budget").unwrap().unwrap();
+        assert_eq!(inspected["runId"], run.run_id);
+        assert_eq!(inspected["ceilings"]["maxCostUsd"], 0.0);
+
+        let unauthorized = controller
+            .command(
+                "graph",
+                &format!(
+                    "budget set max-workers 20 --revision {} --authorize",
+                    run.revision
+                ),
+            )
+            .unwrap_err();
+        assert!(unauthorized.contains("project trust"));
+
+        controller.set_session_context(None, None, true);
+        let updated = controller
+            .command(
+                "graph",
+                &format!(
+                    "budget set max-workers 20 --revision {} --authorize",
+                    run.revision
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated["ceilings"]["maxWorkers"], 20);
+
+        let review = controller.command("graph", "export").unwrap().unwrap();
+        assert_eq!(review["exported"], true);
+        assert!(review["document"].get("runId").is_none());
+        assert!(review["document"].get("resourceSnapshot").is_none());
+
+        let written = controller
+            .command("graph", "export review --overwrite")
+            .unwrap()
+            .unwrap();
+        let path = written["path"].as_str().unwrap();
+        assert!(std::path::Path::new(path).exists());
     }
 }

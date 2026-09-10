@@ -177,6 +177,14 @@ pub(super) fn file_targets(
         tool,
         "read" | "grep" | "find" | "ls" | "write" | "edit" | "notebook_edit"
     ) {
+        if matches!(tool, "write" | "edit" | "notebook_edit")
+            && args
+                .get("path")
+                .and_then(Value::as_str)
+                .is_none_or(|path| path.trim().is_empty())
+        {
+            return Err(format!("{tool} is missing a nonempty path"));
+        }
         let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
         return Ok(vec![target(cwd, raw, boundary, false)]);
     }

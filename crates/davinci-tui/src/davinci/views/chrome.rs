@@ -698,6 +698,9 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::Mcp => Some("/mcp"),
         Screen::Permissions => Some("/permissions ask"),
         Screen::Workflows => Some("/workflow <goal>"),
+        Screen::TaskBoard => Some("/tasks"),
+        Screen::Agents => Some("/agents"),
+        Screen::ContextInspector => Some("/context"),
         Screen::Recovery | Screen::Diff | Screen::Agent | Screen::Plan | Screen::Memoria => None,
     }
 }

@@ -17,9 +17,10 @@ use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::sheet::{self, Composer};
 use super::views::{
-    ask, codex, cogitator, compact, diff, disegno, export, governor, grafo, graph_run, instrumenta,
-    keys, login, mcp, memoria, mensura, officina, opera, permissions, recovery, resume, securitas,
-    settings, startup, transcript, tree, trust, vectors, workflows,
+    agents, ask, codex, cogitator, compact, context_inspector, decision_modal, diff, disegno,
+    export, governor, grafo, graph_run, instrumenta, keys, login, mcp, memoria, mensura, officina,
+    opera, permissions, recovery, resume, rewind, securitas, settings, startup, task_board,
+    transcript, tree, trust, vectors, workflows,
 };
 
 /// What the runtime should do after a key.
@@ -38,6 +39,11 @@ pub enum Flow {
     /// Request the next permission mode. Only the runtime may apply it and
     /// synchronize `Model::permission_mode`; the draft and UI state stay put.
     CyclePermissionMode,
+}
+
+/// Computes the next 0-indexed permission mode in the 5-mode cycle.
+pub fn next_mode_index(index: usize) -> usize {
+    (index + 1) % 5
 }
 
 /// Compose exactly `height` rows. Conversation chrome follows the content;
@@ -257,6 +263,9 @@ fn section_rows(model: &Model) -> Option<Vec<Line<'static>>> {
         Screen::Mcp => Some(mcp::lines(model)),
         Screen::Permissions => Some(permissions::lines(model)),
         Screen::Workflows => Some(workflows::lines(model)),
+        Screen::TaskBoard => Some(task_board::lines(model)),
+        Screen::Agents => Some(agents::lines(model)),
+        Screen::ContextInspector => Some(context_inspector::lines(model)),
         Screen::Keys => Some(keys::lines(model)),
         Screen::Agent => None,
     }
@@ -357,6 +366,8 @@ fn panel(model: &Model, rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'st
             | Screen::Permissions
             | Screen::Diff
             | Screen::Securitas
+            | Screen::Agents
+            | Screen::ContextInspector
     );
     let anchor = model.section_offset.unwrap_or_else(|| {
         if picking {
@@ -398,7 +409,15 @@ fn overlay_rows(model: &Model, overlay: Overlay) -> Vec<Line<'static>> {
         Overlay::Instrumenta => instrumenta::all_lines(model),
         Overlay::Sessions => memoria::session_lines(model),
         Overlay::Cogitator => cogitator::lines(model, &model.config_path),
-        Overlay::Ask => ask::lines(model),
+        Overlay::Ask => {
+            if let Some(rewind) = &model.rewind_modal {
+                rewind::lines(rewind, model.width, &model.theme)
+            } else if let Some(decision) = &model.decision_modal {
+                decision_modal::lines(decision, model.width, &model.theme)
+            } else {
+                ask::lines(model)
+            }
+        }
     }
 }
 
@@ -736,6 +755,122 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         return Flow::Continue;
     }
 
+    if model.screen == Screen::Agents && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
+    {
+        let len = model.agents.as_ref().map(|s| s.agents.len()).unwrap_or(0);
+        if len > 0 {
+            let index = model.agents_index % len;
+            match key.code {
+                KeyCode::Char('s') => {
+                    return Flow::Choose(Choice::AgentAction {
+                        action: "steer",
+                        index,
+                    })
+                }
+                KeyCode::Char('x') => {
+                    return Flow::Choose(Choice::AgentAction {
+                        action: "stop",
+                        index,
+                    })
+                }
+                KeyCode::Char('r') => {
+                    return Flow::Choose(Choice::AgentAction {
+                        action: "retry",
+                        index,
+                    })
+                }
+                KeyCode::Char('d') => {
+                    return Flow::Choose(Choice::AgentAction {
+                        action: "diff",
+                        index,
+                    })
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if model.screen == Screen::GraphRun
+        && key.modifiers.is_empty()
+        && key.kind == KeyEventKind::Press
+    {
+        let len = model.graph_run.as_ref().map(|s| s.tasks.len()).unwrap_or(0);
+        let raw_index = model
+            .graph_run
+            .as_ref()
+            .map(|s| s.selected_index)
+            .unwrap_or(0);
+        let index = if len > 0 { raw_index % len } else { raw_index };
+        match key.code {
+            KeyCode::Char('p') => {
+                return Flow::Choose(Choice::GraphAction {
+                    action: "pause_resume",
+                    index,
+                });
+            }
+            KeyCode::Char('x') => {
+                return Flow::Choose(Choice::GraphAction {
+                    action: "stop",
+                    index,
+                });
+            }
+            KeyCode::Char('r') => {
+                return Flow::Choose(Choice::GraphAction {
+                    action: "retry",
+                    index,
+                });
+            }
+            KeyCode::Char('d') => {
+                return Flow::Choose(Choice::GraphAction {
+                    action: "diff",
+                    index,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if model.screen == Screen::ContextInspector
+        && key.modifiers.is_empty()
+        && key.kind == KeyEventKind::Press
+    {
+        let len = model
+            .context_inspector
+            .as_ref()
+            .map(|s| s.rows.len())
+            .unwrap_or(0);
+        if len > 0 {
+            let index = model.context_inspector_index % len;
+            match key.code {
+                KeyCode::Char('p') => {
+                    return Flow::Choose(Choice::ContextInspectorAction {
+                        action: "pin",
+                        index,
+                    })
+                }
+                KeyCode::Char('x') => {
+                    return Flow::Choose(Choice::ContextInspectorAction {
+                        action: "exclude",
+                        index,
+                    })
+                }
+                KeyCode::Char('r') => {
+                    return Flow::Choose(Choice::ContextInspectorAction {
+                        action: "refresh",
+                        index,
+                    })
+                }
+                KeyCode::Tab => {
+                    return Flow::Choose(Choice::ContextInspectorAction {
+                        action: "toggle_pending",
+                        index,
+                    })
+                }
+                _ => {}
+            }
+        }
+    }
+
     // The active surface owns every other key. Surface-specific actions are
     // deliberately added here rather than falling through into the composer.
     let _ = key;
@@ -756,6 +891,8 @@ fn is_picker(screen: Screen) -> bool {
             | Screen::Permissions
             | Screen::Diff
             | Screen::Securitas
+            | Screen::Agents
+            | Screen::ContextInspector
     )
 }
 
@@ -788,14 +925,14 @@ fn screen_move(model: &mut Model, delta: isize) {
                 .filter(|(_, row)| row.id.is_some())
                 .map(|(index, _)| index)
                 .collect();
-            if nodes.is_empty() {
-                return;
+            if !nodes.is_empty() {
+                let current_pos = nodes
+                    .iter()
+                    .position(|&idx| idx == model.tree_index)
+                    .unwrap_or(0);
+                let next_pos = wrap_index(current_pos, delta, nodes.len());
+                model.tree_index = nodes[next_pos];
             }
-            let at = nodes
-                .iter()
-                .position(|&index| index == model.tree_index)
-                .unwrap_or(0);
-            model.tree_index = nodes[wrap_index(at, delta, nodes.len())];
         }
         Screen::Securitas => {
             let len = model
@@ -819,11 +956,26 @@ fn screen_move(model: &mut Model, delta: isize) {
                 .saturating_add_signed(delta)
                 .min(keys::lines(model).len().saturating_sub(1));
         }
-        Screen::GraphRun | Screen::Governor | Screen::Vectors | Screen::Workflows => {
+        Screen::GraphRun => {
+            if let Some(sheet) = model.graph_run.as_mut() {
+                let len = sheet.tasks.len();
+                if len > 0 {
+                    sheet.selected_index = wrap_index(sheet.selected_index, delta, len);
+                    sheet.selected_node_id =
+                        sheet.tasks.get(sheet.selected_index).map(|t| t.id.clone());
+                }
+            }
+            let count = graph_run::lines(model).len();
+            model.feature_scroll = model
+                .feature_scroll
+                .saturating_add_signed(delta)
+                .min(count.saturating_sub(1));
+        }
+        Screen::Governor | Screen::Vectors | Screen::Workflows | Screen::TaskBoard => {
             let count = match model.screen {
-                Screen::GraphRun => graph_run::lines(model).len(),
                 Screen::Governor => governor::lines(model).len(),
                 Screen::Workflows => workflows::lines(model).len(),
+                Screen::TaskBoard => task_board::lines(model).len(),
                 _ => vectors::lines(model).len(),
             };
             model.feature_scroll = model
@@ -834,6 +986,24 @@ fn screen_move(model: &mut Model, delta: isize) {
         Screen::Permissions => {
             model.permission_index =
                 wrap_index(model.permission_index, delta, model.permission_rows.len());
+        }
+        Screen::Agents => {
+            let len = model.agents.as_ref().map(|s| s.agents.len()).unwrap_or(0);
+            model.agents_index = wrap_index(model.agents_index, delta, len);
+            if let Some(s) = model.agents.as_mut() {
+                s.selected_index = model.agents_index;
+            }
+        }
+        Screen::ContextInspector => {
+            let len = model
+                .context_inspector
+                .as_ref()
+                .map(|s| s.rows.len())
+                .unwrap_or(0);
+            model.context_inspector_index = wrap_index(model.context_inspector_index, delta, len);
+            if let Some(s) = model.context_inspector.as_mut() {
+                s.selected_index = model.context_inspector_index;
+            }
         }
         _ => {
             let last = section_rows(model)
@@ -869,6 +1039,36 @@ fn screen_accept(model: &Model) -> Option<Choice> {
         Screen::Permissions => {
             pick(model.permission_index, model.permission_rows.len()).map(Choice::Permission)
         }
+        Screen::Agents => {
+            let len = model.agents.as_ref().map(|s| s.agents.len()).unwrap_or(0);
+            (len > 0).then(|| Choice::AgentAction {
+                action: "inspect",
+                index: model.agents_index % len,
+            })
+        }
+        Screen::ContextInspector => {
+            let len = model
+                .context_inspector
+                .as_ref()
+                .map(|s| s.rows.len())
+                .unwrap_or(0);
+            (len > 0).then(|| Choice::ContextInspectorAction {
+                action: "preview",
+                index: model.context_inspector_index % len,
+            })
+        }
+        Screen::GraphRun => {
+            let len = model.graph_run.as_ref().map(|s| s.tasks.len()).unwrap_or(0);
+            (len > 0).then(|| Choice::GraphAction {
+                action: "inspect",
+                index: model
+                    .graph_run
+                    .as_ref()
+                    .map(|s| s.selected_index)
+                    .unwrap_or(0)
+                    % len,
+            })
+        }
         _ => None,
     }
 }
@@ -879,6 +1079,118 @@ fn handle_overlay_key(
     key: KeyEvent,
     data: Option<&str>,
 ) -> Flow {
+    if overlay == Overlay::Ask && model.rewind_modal.is_some() {
+        let rewind = model.rewind_modal.as_mut().unwrap();
+        if key.code == KeyCode::Esc {
+            let _ = rewind.handle_key("escape");
+            model.overlay = None;
+            return Flow::Continue;
+        }
+        if key.code == KeyCode::Enter && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
+        {
+            let action = rewind.handle_key("enter");
+            if action == "confirm" {
+                model.overlay = None;
+            }
+            return Flow::Continue;
+        }
+        if key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Char('1') | KeyCode::Char('c') => {
+                    let _ = rewind.handle_key("1");
+                    return Flow::Continue;
+                }
+                KeyCode::Char('2') | KeyCode::Char('t') => {
+                    let _ = rewind.handle_key("2");
+                    return Flow::Continue;
+                }
+                KeyCode::Char('3') | KeyCode::Char('s') => {
+                    let _ = rewind.handle_key("3");
+                    return Flow::Continue;
+                }
+                _ => {}
+            }
+        }
+        return Flow::Continue;
+    }
+    if overlay == Overlay::Ask && model.decision_modal.is_some() {
+        let decision = model.decision_modal.as_mut().unwrap();
+        if key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+        {
+            return Flow::Continue;
+        }
+        if key.code == KeyCode::Esc {
+            let _ = decision.cancel();
+            model.overlay = None;
+            return Flow::Continue;
+        }
+        if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+            decision.toggle_custom();
+            return Flow::Continue;
+        }
+        if key.code == KeyCode::Up {
+            decision.move_selection(-1);
+            return Flow::Continue;
+        }
+        if key.code == KeyCode::Down {
+            decision.move_selection(1);
+            return Flow::Continue;
+        }
+        if (key.code == KeyCode::Char('i') && !decision.custom_focused)
+            || (key.code == KeyCode::Char('i') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            decision.toggle_inspect();
+            return Flow::Continue;
+        }
+        if (key.code == KeyCode::Char('d') && !decision.custom_focused)
+            || (key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            let _ = decision.defer();
+            model.overlay = None;
+            return Flow::Continue;
+        }
+        if !decision.custom_focused && key.modifiers.is_empty() {
+            if let KeyCode::Char(num @ '1'..='9') = key.code {
+                let digit = (num as u8 - b'0') as usize;
+                decision.select_number(digit);
+                return Flow::Continue;
+            }
+        }
+        if decision.custom_focused {
+            match key.code {
+                KeyCode::Backspace => {
+                    decision.backspace();
+                    return Flow::Continue;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    decision.insert_char(c);
+                    return Flow::Continue;
+                }
+                _ => {}
+            }
+        }
+        if key.code == KeyCode::Enter && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
+        {
+            if decision_modal::commits_decision("enter", decision.is_valid()) {
+                let _ = decision.commit();
+                model.overlay = None;
+            }
+            return Flow::Continue;
+        }
+        return Flow::Continue;
+    }
+    let permission_approval = overlay == Overlay::Ask && model.ask.key == "/permissions";
+    if permission_approval && key.modifiers.is_empty() {
+        if let KeyCode::Char(number @ '1'..='5') = key.code {
+            let index = (number as u8 - b'1') as usize;
+            if key.kind == KeyEventKind::Press && index < model.ask.items.len() {
+                model.ask_index = index;
+                model.overlay_offset = None;
+            }
+            return Flow::Continue;
+        }
+    }
     let toggle_action = match overlay {
         Overlay::Instrumenta => Some("davinci.instrumenta.toggle"),
         Overlay::Sessions => Some("davinci.sessions.toggle"),
@@ -920,7 +1232,12 @@ fn handle_overlay_key(
         model.move_selection(1);
         return Flow::Continue;
     }
-    if action_matches(model, data, "tui.select.confirm") {
+    let confirms = if permission_approval {
+        key.code == KeyCode::Enter && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
+    } else {
+        action_matches(model, data, "tui.select.confirm")
+    };
+    if confirms {
         if model.overlay_offset.take().is_some() {
             return Flow::Continue;
         }
@@ -2379,6 +2696,108 @@ mod section_input_regressions {
     fn press(m: &mut Model, key: KeyCode) -> Flow {
         handle_key(m, KeyEvent::new(key, KeyModifiers::NONE))
     }
+    fn press_mods(m: &mut Model, key: KeyCode, mods: KeyModifiers) -> Flow {
+        handle_key(m, KeyEvent::new(key, mods))
+    }
+
+    #[test]
+    fn f11_five_mode_cycle() {
+        let mut mode = 0;
+        let mut labels = Vec::new();
+        for _ in 0..5 {
+            mode = next_mode_index(mode);
+            labels.push(mode);
+        }
+        assert_eq!(labels, vec![1, 2, 3, 4, 0]);
+    }
+
+    #[test]
+    fn f11_shift_tab_mode_cycling_preserves_draft() {
+        let mut m = model("1a");
+        m.screen = Screen::Agent;
+        m.permission_mode = "ask".into();
+        assert_eq!(m.permission_label(), "Manual");
+
+        let unicode_draft = "Fix #42: add 🚀 unicode draft\nsecond line";
+        m.composer.set_text(unicode_draft);
+        let initial_caret = m.composer.cursor();
+
+        let expected_cycles = [
+            ("edits", "Accept Edits"),
+            ("read-only", "Plan Mode"),
+            ("auto", "Auto Mode"),
+            ("always-approve", "Always Approve"),
+            ("ask", "Manual"),
+        ];
+
+        for (expected_mode, expected_label) in expected_cycles {
+            let flow = press_mods(&mut m, KeyCode::BackTab, KeyModifiers::SHIFT);
+            assert_eq!(flow, Flow::CyclePermissionMode);
+
+            m.permission_mode = expected_mode.to_string();
+            assert_eq!(m.permission_label(), expected_label);
+
+            assert_eq!(&*m.composer, unicode_draft);
+            assert_eq!(m.composer.cursor(), initial_caret);
+        }
+    }
+
+    #[test]
+    fn f11_normal_tab_preserved() {
+        let mut m = model("1a");
+        m.screen = Screen::Agent;
+        m.permission_mode = "ask".into();
+        m.composer.set_text("help");
+
+        let flow = press(&mut m, KeyCode::Tab);
+        assert_ne!(flow, Flow::CyclePermissionMode);
+        assert_eq!(m.permission_mode, "ask");
+    }
+
+    #[test]
+    fn f11_modal_intercepts_mode_cycling() {
+        let mut m = model("1a");
+        m.screen = Screen::Agent;
+        m.permission_mode = "ask".into();
+        m.overlay = Some(Overlay::Ask);
+
+        let flow = press_mods(&mut m, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_ne!(flow, Flow::CyclePermissionMode);
+        assert_eq!(m.permission_mode, "ask");
+    }
+
+    #[test]
+    fn f11_running_turn_blocks_mode_cycling() {
+        let mut m = model("1a");
+        m.screen = Screen::Agent;
+        m.running = true;
+        m.permission_mode = "ask".into();
+
+        let flow = press_mods(&mut m, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_ne!(flow, Flow::CyclePermissionMode);
+        assert_eq!(m.permission_mode, "ask");
+    }
+
+    #[test]
+    fn f11_ctrl_c_interrupts() {
+        let mut m = model("1a");
+        let flow = press_mods(&mut m, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(flow, Flow::Interrupt);
+    }
+
+    #[test]
+    fn f11_narrow_terminal_mode_cycling() {
+        let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 40, 12, false);
+        fixtures::dress_screen(&mut m, "1a");
+        m.screen = Screen::Agent;
+        m.permission_mode = "ask".into();
+        m.composer.set_text("short draft");
+
+        let flow = press_mods(&mut m, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(flow, Flow::CyclePermissionMode);
+        m.permission_mode = "edits".into();
+        assert_eq!(&*m.composer, "short draft");
+    }
     #[test]
     fn paging_reads_expanded_details_without_changing_the_pending_selection() {
         let mut m = model("3b");
@@ -2427,8 +2846,73 @@ mod section_input_regressions {
             .join("\n");
         assert!(drawn.contains("Provider unavailable"));
         assert!(drawn.contains("esc close"));
-        assert!(!drawn.contains("saved draft"));
         press(&mut m, KeyCode::Esc);
         assert_eq!(&*m.composer, "saved draft");
+    }
+
+    #[test]
+    fn graph_run_keys_do_not_edit_composer_draft() {
+        let mut m = model("5a");
+        m.screen = Screen::GraphRun;
+        m.composer.push_str("my draft");
+
+        // Press 'p', 'x', 'r', 'd', 'enter'
+        let flow_p = handle_key(
+            &mut m,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('p'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert!(matches!(
+            flow_p,
+            Flow::Choose(Choice::GraphAction {
+                action: "pause_resume",
+                ..
+            })
+        ));
+        assert_eq!(&*m.composer, "my draft");
+
+        let flow_x = handle_key(
+            &mut m,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert!(matches!(
+            flow_x,
+            Flow::Choose(Choice::GraphAction { action: "stop", .. })
+        ));
+        assert_eq!(&*m.composer, "my draft");
+
+        let flow_r = handle_key(
+            &mut m,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('r'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert!(matches!(
+            flow_r,
+            Flow::Choose(Choice::GraphAction {
+                action: "retry",
+                ..
+            })
+        ));
+        assert_eq!(&*m.composer, "my draft");
+
+        let flow_enter = handle_key(
+            &mut m,
+            crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            flow_enter,
+            Flow::Choose(Choice::GraphAction {
+                action: "inspect",
+                ..
+            })
+        ));
+        assert_eq!(&*m.composer, "my draft");
     }
 }

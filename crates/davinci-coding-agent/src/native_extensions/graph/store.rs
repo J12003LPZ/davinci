@@ -10,10 +10,15 @@
 
 use super::types::{Artifact, ArtifactKind, GraphRun};
 use super::validate::validate_artifact;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::history;
+#[allow(unused_imports)]
+pub use history::*;
 
 pub const CONFIG_DIR: &str = ".davinci";
 pub const LEGACY_CONFIG_DIR: &str = ".pi";
@@ -115,14 +120,70 @@ pub fn create_run_dir(cwd: &Path, run_id: &str) -> std::io::Result<()> {
 /// Delete the oldest runs beyond [`RETAINED_RUNS`]. Only runs whose persisted
 /// phase is terminal are touched: a live run — including one owned by another
 /// process — never is, whatever its age.
+#[allow(dead_code)]
+pub fn restored_worker_state(recorded: &str, live_identity_verified: bool) -> &str {
+    if recorded == "running" && !live_identity_verified {
+        "reconciliation_required"
+    } else {
+        recorded
+    }
+}
+
+#[allow(dead_code)]
+pub fn pin_run(cwd: &Path, run_id: &str) -> std::io::Result<()> {
+    let pin_file = run_dir(cwd, run_id).join(".pinned");
+    atomic_write(&pin_file, b"1")
+}
+
+#[allow(dead_code)]
+pub fn is_run_pinned(cwd: &Path, run_id: &str) -> bool {
+    run_dir(cwd, run_id).join(".pinned").exists()
+}
+
+#[allow(dead_code)]
+pub fn record_ancestor_run(cwd: &Path, run_id: &str, ancestor_run_id: &str) -> std::io::Result<()> {
+    let file = run_dir(cwd, run_id).join("ancestor_run.txt");
+    atomic_write(&file, ancestor_run_id.as_bytes())
+}
+
+#[allow(dead_code)]
+pub fn read_ancestor_run(cwd: &Path, run_id: &str) -> Option<String> {
+    if !is_safe_run_id(run_id) {
+        return None;
+    }
+    let file = run_dir(cwd, run_id).join("ancestor_run.txt");
+    fs::read_to_string(file).ok().map(|s| s.trim().to_string())
+}
+
 fn prune_finished_runs(cwd: &Path) {
     let runs = list_runs(cwd);
     if runs.len() <= RETAINED_RUNS {
         return;
     }
+    let mut pinned_ancestors = std::collections::HashSet::new();
+    for run in &runs {
+        if let Some(ancestor) = read_ancestor_run(cwd, &run.run_id) {
+            pinned_ancestors.insert(ancestor);
+        }
+        let state_path = run_dir(cwd, &run.run_id).join("state.json");
+        if let Ok(raw) = fs::read_to_string(&state_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                if let Some(anc) = v.get("ancestorRunId").and_then(|s| s.as_str()) {
+                    pinned_ancestors.insert(anc.to_string());
+                }
+            }
+        }
+        for entry in list_history_entries(cwd, &run.run_id) {
+            if let Some(parent) = entry.parent_id {
+                pinned_ancestors.insert(parent);
+            }
+        }
+    }
+
     for run in runs.iter().skip(RETAINED_RUNS) {
         let terminal = matches!(run.phase.as_str(), "done" | "blocked" | "cancelled");
-        if terminal && is_safe_run_id(&run.run_id) {
+        let is_pinned = is_run_pinned(cwd, &run.run_id) || pinned_ancestors.contains(&run.run_id);
+        if terminal && !is_pinned && is_safe_run_id(&run.run_id) {
             let _ = fs::remove_dir_all(run_dir(cwd, &run.run_id));
         }
     }
@@ -131,7 +192,14 @@ fn prune_finished_runs(cwd: &Path) {
 /// Publish `content` at `path` without ever leaving a half-written file there.
 /// Windows will not replace an existing file through `rename`, so the previous
 /// snapshot is moved aside first and restored if the publish fails.
-fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    atomic_write_with(path, content, |from, to| fs::rename(from, to))
+}
+
+fn atomic_write_with<F>(path: &Path, content: &[u8], mut rename: F) -> std::io::Result<()>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
     let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let nonce = SystemTime::now()
@@ -147,21 +215,21 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    match fs::rename(&temporary, path) {
+    match rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(_) if path.exists() => {
             let backup = parent.join(format!(".{file_name}.{nonce}.bak"));
-            if let Err(error) = fs::rename(path, &backup) {
+            if let Err(error) = rename(path, &backup) {
                 let _ = fs::remove_file(&temporary);
                 return Err(error);
             }
-            match fs::rename(&temporary, path) {
+            match rename(&temporary, path) {
                 Ok(()) => {
                     let _ = fs::remove_file(&backup);
                     Ok(())
                 }
                 Err(error) => {
-                    let _ = fs::rename(&backup, path);
+                    let _ = rename(&backup, path);
                     let _ = fs::remove_file(&temporary);
                     Err(error)
                 }
@@ -204,7 +272,15 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     if let Some(definition) = &run.definition {
         let graph_path = run_dir(&cwd, &run.run_id).join("graph.json");
         if !graph_path.exists() {
-            let _ = write_graph_definition(&cwd, &run.run_id, definition);
+            write_graph_definition(&cwd, &run.run_id, definition)?;
+        }
+    }
+
+    if let Some(saved_def) = &run.saved_definition {
+        let saved_path = run_dir(&cwd, &run.run_id).join("saved_definition.yaml");
+        if !saved_path.exists() {
+            let yaml_str = super::definitions::to_yaml_string(saved_def);
+            atomic_write(&saved_path, yaml_str.as_bytes())?;
         }
     }
     Ok(())
@@ -235,6 +311,58 @@ pub fn read_task_fingerprint(
     let path = run_dir(cwd, run_id)
         .join("artifacts")
         .join(format!("{task_id}.fingerprint.json"));
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAttemptRecord {
+    pub task_id: String,
+    pub attempt: u32,
+    pub status: super::types::TaskStatus,
+    pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub usage: super::types::WorkerUsage,
+    pub started_at: Option<u64>,
+    pub ended_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<super::replay::ReplayFingerprint>,
+}
+
+#[allow(dead_code)]
+pub fn write_task_attempt(
+    cwd: &Path,
+    run_id: &str,
+    task_id: &str,
+    attempt: u32,
+    record: &TaskAttemptRecord,
+) -> std::io::Result<()> {
+    let path = run_dir(cwd, run_id)
+        .join("artifacts")
+        .join(format!("{task_id}.attempt_{attempt}.json"));
+    let content = serde_json::to_vec_pretty(record)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    atomic_write(&path, &content)
+}
+
+#[allow(dead_code)]
+pub fn read_task_attempt(
+    cwd: &Path,
+    run_id: &str,
+    task_id: &str,
+    attempt: u32,
+) -> Option<TaskAttemptRecord> {
+    if !is_safe_run_id(run_id) {
+        return None;
+    }
+    let path = run_dir(cwd, run_id)
+        .join("artifacts")
+        .join(format!("{task_id}.attempt_{attempt}.json"));
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
@@ -307,6 +435,16 @@ pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
     let mut run: GraphRun = serde_json::from_str(&raw).ok()?;
     if run.definition.is_none() {
         run.definition = load_graph_definition(cwd, run_id);
+    }
+    if run.saved_definition.is_none() {
+        let saved_path = run_dir(cwd, run_id).join("saved_definition.yaml");
+        if saved_path.exists() {
+            if let Ok(raw_yaml) = fs::read_to_string(&saved_path) {
+                if let Ok(def) = super::definitions::parse_saved_definition(&raw_yaml) {
+                    run.saved_definition = Some(def);
+                }
+            }
+        }
     }
     for task in &mut run.tasks {
         if task.fingerprint.is_none() {
@@ -425,6 +563,9 @@ mod tests {
             phase: Phase::Classify,
             forced: None,
             dry_run: false,
+            execution_origin: None,
+            definition_digest: None,
+            saved_definition: None,
             definition: None,
             classification: None,
             milestones: None,
@@ -445,6 +586,8 @@ mod tests {
             resource_snapshot: None,
             ecosystem_stats: Default::default(),
             updated_at: 0,
+            lifecycle: None,
+            revision: 0,
         }
     }
 
@@ -471,6 +614,31 @@ mod tests {
         run.goal = "second".into();
         save_run(&mut run).unwrap();
         assert_eq!(load_run(dir.path(), &run_id).unwrap().goal, "second");
+    }
+
+    #[test]
+    fn atomic_write_restores_old_content_when_publish_is_interrupted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, b"old").unwrap();
+        let mut calls = 0;
+        let result = atomic_write_with(&path, b"new", |from, to| {
+            calls += 1;
+            if calls == 1 || calls == 3 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "simulated interrupted publish",
+                ))
+            } else {
+                fs::rename(from, to)
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert!(fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".bak")));
     }
 
     #[test]
@@ -572,5 +740,225 @@ mod tests {
         // 2. Verify state.json loaded run carries the definition
         let reloaded = load_run(dir.path(), &run_id).expect("run loaded");
         assert_eq!(reloaded.definition.as_ref(), Some(&def));
+    }
+
+    #[test]
+    fn task_attempt_roundtrips_through_disk() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+
+        let record = TaskAttemptRecord {
+            task_id: "research-1".into(),
+            attempt: 1,
+            status: crate::native_extensions::graph::types::TaskStatus::Failed,
+            exit_code: 1,
+            artifact_file: None,
+            error: Some("test error".into()),
+            usage: crate::native_extensions::graph::types::WorkerUsage::default(),
+            started_at: Some(100),
+            ended_at: Some(200),
+            fingerprint: None,
+        };
+
+        write_task_attempt(dir.path(), &run_id, "research-1", 1, &record).unwrap();
+        let reloaded =
+            read_task_attempt(dir.path(), &run_id, "research-1", 1).expect("attempt found");
+        assert_eq!(reloaded, record);
+    }
+
+    #[test]
+    fn f13_restart_never_resurrects_worker() {
+        assert_eq!(
+            restored_worker_state("running", false),
+            "reconciliation_required"
+        );
+        assert_eq!(restored_worker_state("succeeded", false), "succeeded");
+        assert_eq!(restored_worker_state("running", true), "running");
+    }
+
+    #[test]
+    fn f13_crash_before_after_pause_commit() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+
+        let mut run = sample_run(dir.path(), &run_id, "pause crash test");
+        run.lifecycle = Some(crate::native_extensions::graph::types::GraphLifecycle::Running);
+        save_run(&mut run).unwrap();
+
+        // 1. Crash before pause commit: in-memory is pause requested, but on disk it's still running
+        let reloaded = load_run(dir.path(), &run_id).unwrap();
+        assert_eq!(
+            reloaded.current_lifecycle(),
+            crate::native_extensions::graph::types::GraphLifecycle::Running
+        );
+
+        // 2. Crash after pause commit: disk state was committed with Paused
+        run.lifecycle = Some(crate::native_extensions::graph::types::GraphLifecycle::Paused);
+        save_run(&mut run).unwrap();
+
+        let reloaded_after = load_run(dir.path(), &run_id).unwrap();
+        assert_eq!(
+            reloaded_after.current_lifecycle(),
+            crate::native_extensions::graph::types::GraphLifecycle::Paused
+        );
+    }
+
+    #[test]
+    fn f13_stop_receipt_after_restart() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+
+        let mut run = sample_run(dir.path(), &run_id, "stop test");
+        run.lifecycle = Some(crate::native_extensions::graph::types::GraphLifecycle::Stopped);
+        save_run(&mut run).unwrap();
+
+        let mut reloaded = load_run(dir.path(), &run_id).unwrap();
+        let mut tracker = crate::native_extensions::graph::control::ControlTracker::new();
+        let control = crate::native_extensions::graph::control::GraphControl {
+            operation_id: "op-stop-restart".into(),
+            run_id: run_id.clone(),
+            expected_run_revision: 0,
+            node_id: None,
+            expected_attempt: None,
+            action: crate::native_extensions::graph::control::GraphControlAction::StopGraph,
+        };
+        let receipt = crate::native_extensions::graph::control::reduce_control(
+            &mut reloaded,
+            &control,
+            &mut tracker,
+            0,
+            true,
+        );
+        assert_eq!(
+            reloaded.current_lifecycle(),
+            crate::native_extensions::graph::types::GraphLifecycle::Stopped
+        );
+        assert_eq!(receipt.operation_id, "op-stop-restart");
+    }
+
+    #[test]
+    fn f13_corrupt_state() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+
+        let state_path = run_dir(dir.path(), &run_id).join("state.json");
+        fs::write(&state_path, "{ broken json ... ").unwrap();
+
+        assert!(load_run(dir.path(), &run_id).is_none());
+        let runs = list_runs(dir.path());
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn f13_terminal_retention_with_referenced_ancestor() {
+        let dir = tempdir().unwrap();
+        let ancestor_id = "run-ancestor-000".to_string();
+        create_run_dir(dir.path(), &ancestor_id).unwrap();
+        let mut ancestor_run = sample_run(dir.path(), &ancestor_id, "ancestor run");
+        ancestor_run.phase = Phase::Done;
+        ancestor_run.lifecycle =
+            Some(crate::native_extensions::graph::types::GraphLifecycle::Stopped);
+        ancestor_run.updated_at = 1;
+        save_run(&mut ancestor_run).unwrap();
+
+        for i in 1..=25 {
+            let id = format!("run-child-{:03}", i);
+            create_run_dir(dir.path(), &id).unwrap();
+            let mut run = sample_run(dir.path(), &id, &format!("run {i}"));
+            run.phase = Phase::Done;
+            run.lifecycle = Some(crate::native_extensions::graph::types::GraphLifecycle::Stopped);
+            run.updated_at = 100 + i as u64;
+            save_run(&mut run).unwrap();
+            record_ancestor_run(dir.path(), &id, &ancestor_id).unwrap();
+        }
+
+        let latest_id = "run-latest".to_string();
+        create_run_dir(dir.path(), &latest_id).unwrap();
+
+        assert!(
+            run_dir(dir.path(), &ancestor_id).exists(),
+            "ancestor run must be retained"
+        );
+        assert!(load_run(dir.path(), &ancestor_id).is_some());
+        assert!(
+            !run_dir(dir.path(), "run-child-001").exists(),
+            "unreferenced old run should be pruned"
+        );
+    }
+
+    #[test]
+    fn f13_nonzero_usage_retained_exactly() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+
+        let mut run = sample_run(dir.path(), &run_id, "usage retention");
+        let mut task = crate::native_extensions::graph::types::GraphTaskState::new(
+            "research-1",
+            crate::native_extensions::graph::types::Role::Researcher,
+            ArtifactKind::Evidence,
+            vec![],
+            None,
+        );
+        task.usage = crate::native_extensions::graph::types::WorkerUsage {
+            input: 12345,
+            output: 678,
+            cache_read: 50,
+            cache_write: 100,
+            cost_usd: 0.045,
+            turns: 1,
+        };
+        task.status = crate::native_extensions::graph::types::TaskStatus::Failed;
+        run.tasks.push(task);
+        run.counters.cost_usd = 0.045;
+        save_run(&mut run).unwrap();
+
+        let mut tracker = crate::native_extensions::graph::control::ControlTracker::new();
+        let control = crate::native_extensions::graph::control::GraphControl {
+            operation_id: "op-retry-usage".into(),
+            run_id: run_id.clone(),
+            expected_run_revision: 0,
+            node_id: Some("research-1".into()),
+            expected_attempt: Some(0),
+            action: crate::native_extensions::graph::control::GraphControlAction::RetryNode,
+        };
+        let receipt = crate::native_extensions::graph::control::reduce_control(
+            &mut run,
+            &control,
+            &mut tracker,
+            0,
+            true,
+        );
+        assert_eq!(
+            receipt.state,
+            crate::native_extensions::graph::control::ControlReceiptState::Applied
+        );
+
+        assert_eq!(run.total_input(), 12345);
+        assert_eq!(run.total_output(), 678);
+        assert_eq!(run.counters.cost_usd, 0.045);
+    }
+
+    #[test]
+    fn f13_legacy_stopped_run_continuation_regression() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+
+        let mut run = sample_run(dir.path(), &run_id, "legacy done run");
+        run.phase = Phase::Done;
+        run.lifecycle = None;
+        save_run(&mut run).unwrap();
+
+        let loaded = load_run(dir.path(), &run_id).unwrap();
+        assert_eq!(
+            loaded.current_lifecycle(),
+            crate::native_extensions::graph::types::GraphLifecycle::Stopped
+        );
+        assert!(loaded.current_lifecycle().is_terminal());
     }
 }

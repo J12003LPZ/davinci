@@ -35,6 +35,7 @@ const KNOWN_TOOLS: &[&str] = &[
     "agent_stop",
     "task_create",
     "task_update",
+    "task_get",
     "task_list",
     "workflow_status",
 ];
@@ -105,7 +106,13 @@ pub fn is_mutating_tool(tool: &str) -> bool {
 }
 
 pub fn is_mutating_tool_with_registry(tool: &str, registry: &RuntimeCapabilityRegistry) -> bool {
-    registry.is_mutating(tool)
+    if let Some(cap) = registry.get(tool) {
+        !cap.read_only
+    } else if KNOWN_TOOLS.contains(&tool) {
+        is_mutating_tool(tool)
+    } else {
+        true
+    }
 }
 
 /// Validate a workflow specification against static structure and invariants.
@@ -582,5 +589,13 @@ mod tests {
             err_ro,
             WorkflowValidationError::PermissionViolation { .. }
         ));
+    }
+
+    #[test]
+    fn test_workflow_allows_task_get_tool() {
+        let mut spec: WorkflowSpec = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        spec.phases[0].workers[0].tools.push("task_get".into());
+        let res = validate_workflow(&spec);
+        assert!(res.is_ok(), "task_get must be a recognized known tool");
     }
 }

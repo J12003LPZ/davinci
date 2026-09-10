@@ -82,6 +82,7 @@ impl PermissionSources {
                 .collect()
         };
         PermissionPolicy {
+            project_trusted: self.project.is_some(),
             mode,
             allow: rules(|settings| &settings.allow),
             deny: rules(|settings| &settings.deny),
@@ -161,7 +162,11 @@ pub fn remember_project_rule(cwd: &Path, rule: &str) -> Result<PathBuf, String> 
         let mut value = match std::fs::read_to_string(&path) {
             Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw)
                 .map_err(|err| format!("{} is not valid JSON: {err}", path.display()))?,
-            _ => serde_json::Value::Object(Default::default()),
+            Ok(_) => serde_json::Value::Object(Default::default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::Value::Object(Default::default())
+            }
+            Err(err) => return Err(format!("Cannot read {}: {err}", path.display())),
         };
         let object = value
             .as_object_mut()
@@ -381,6 +386,23 @@ mod tests {
             rows.iter().any(|row| row.contains("not trusted")),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn remembering_a_project_rule_preserves_unreadable_settings() {
+        for config in [".davinci", ".pi"] {
+            let project = tempfile::tempdir().unwrap();
+            let directory = project.path().join(config);
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("settings.json");
+            let original = b"{\"private-setting\":\"\xff\"}";
+            std::fs::write(&path, original).unwrap();
+            assert!(remember_project_rule(project.path(), "write(file.txt)").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(!path
+                .with_extension(format!("json.{}.tmp", std::process::id()))
+                .exists());
+        }
     }
 
     #[test]
