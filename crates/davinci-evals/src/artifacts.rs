@@ -24,10 +24,18 @@ pub struct EvalArtifact {
     pub attachments: Vec<EvalAttachment>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactReference {
     pub name: String,
     pub path: String,
+}
+
+pub const LEGACY_PROMPT_BASELINE_NAME: &str = "davinci-default-v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PromptBaselineIdentity {
+    pub name: String,
+    pub sha256: String,
 }
 
 pub fn record_eval_session_artifact(

@@ -9,7 +9,8 @@ pub mod summary;
 
 pub use artifacts::{
     persist_eval_artifact_references, record_eval_session_artifact, record_eval_source_artifact,
-    ArtifactReference, EvalArtifact, EvalAttachment, PI_SESSION_SNAPSHOT_ARTIFACT,
+    ArtifactReference, EvalArtifact, EvalAttachment, PromptBaselineIdentity,
+    LEGACY_PROMPT_BASELINE_NAME, PI_SESSION_SNAPSHOT_ARTIFACT,
 };
 pub use harness_table::{
     derive_eval_group_key, eval_harness_table, parse_eval_harness_iteration_artifact,
