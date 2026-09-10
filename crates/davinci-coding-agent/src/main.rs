@@ -5930,6 +5930,18 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push_str(&compact.join("\n"));
         }
     }
+    let behavior_runs = davinci_telemetry::get_behavior_telemetry();
+    if !behavior_runs.is_empty() {
+        let profile_filter = agent
+            .prompt_manifest
+            .as_ref()
+            .map(|m| m.profile.as_str())
+            .unwrap_or("stable");
+        let report =
+            davinci_telemetry::LocalBehaviorReport::from_runs(profile_filter, &behavior_runs);
+        text.push_str("\n\n");
+        text.push_str(&report.format_report());
+    }
     text
 }
 
@@ -9534,6 +9546,43 @@ mod tests {
             initial_len,
             "status output must not append to agent messages"
         );
+    }
+
+    #[test]
+    fn status_includes_behavior_telemetry_metrics_when_runs_exist() {
+        davinci_telemetry::clear_behavior_telemetry();
+        for _ in 0..5 {
+            davinci_telemetry::record_behavior_telemetry(davinci_telemetry::BehaviorTelemetry {
+                prompt_profile: "stable".to_string(),
+                prompt_version: 2,
+                prompt_stable_hash_prefix: "a1b2c3d4".to_string(),
+                model_family: "claude".to_string(),
+                model_turns: 6,
+                tool_calls: 10,
+                permission_prompts: 1,
+                permission_denials: 0,
+                files_changed_count: 2,
+                verification_commands_run: 2,
+                verification_failures: 1,
+                aborted: false,
+                user_steers: 1,
+            });
+        }
+
+        let mut agent = Agent::new("sys");
+        agent.prompt_manifest = Some(davinci_agent::prompt::manifest::PromptManifest::from_parts(
+            "stable",
+            2,
+            &[],
+            "stable system prompt prefix",
+            "full system prompt",
+        ));
+        let parsed = Args::default();
+        let status = format_session_status(&parsed, &agent);
+        assert!(status.contains("Prompt profile: stable"));
+        assert!(status.contains("Runs: 5"));
+        assert!(status.contains("Median turns: 6"));
+        assert!(status.contains("Verification failures recovered: 5"));
     }
 
     #[test]

@@ -22,6 +22,11 @@ pub struct SharedCounters {
     pub batch_operations: AtomicU64,
     pub subagents: AtomicU64,
     pub evidence_files: AtomicU64,
+    pub permission_prompts: AtomicU64,
+    pub permission_denials: AtomicU64,
+    pub files_changed_count: AtomicU64,
+    pub verification_commands_run: AtomicU64,
+    pub verification_failures: AtomicU64,
 }
 
 impl SharedCounters {
@@ -37,6 +42,11 @@ impl SharedCounters {
         stats.batch_operations = self.batch_operations.load(Ordering::Relaxed);
         stats.subagents = self.subagents.load(Ordering::Relaxed);
         stats.evidence_files = self.evidence_files.load(Ordering::Relaxed);
+        stats.permission_prompts += self.permission_prompts.load(Ordering::Relaxed);
+        stats.permission_denials += self.permission_denials.load(Ordering::Relaxed);
+        stats.files_changed_count += self.files_changed_count.load(Ordering::Relaxed);
+        stats.verification_commands_run += self.verification_commands_run.load(Ordering::Relaxed);
+        stats.verification_failures += self.verification_failures.load(Ordering::Relaxed);
     }
 }
 
@@ -74,6 +84,24 @@ pub struct RunStats {
     pub evidence_files: u64,
     /// Automatic compactions performed.
     pub compactions: u64,
+    /// Permission prompts presented to the user/approver.
+    #[serde(default)]
+    pub permission_prompts: u64,
+    /// Tool calls denied by permission rules or user rejection.
+    #[serde(default)]
+    pub permission_denials: u64,
+    /// Distinct files modified during the run.
+    #[serde(default)]
+    pub files_changed_count: u64,
+    /// Test or build verification commands executed.
+    #[serde(default)]
+    pub verification_commands_run: u64,
+    /// Verification commands that resulted in test/build failures.
+    #[serde(default)]
+    pub verification_failures: u64,
+    /// Mid-run steering inputs injected by the user.
+    #[serde(default)]
+    pub user_steers: u64,
 }
 
 impl RunStats {
@@ -120,6 +148,8 @@ mod tests {
         let json = serde_json::to_value(RunStats::default()).unwrap();
         assert!(json.get("modelTurns").is_some());
         assert!(json.get("peakContextTokens").is_some());
+        assert!(json.get("permissionPrompts").is_some());
+        assert!(json.get("filesChangedCount").is_some());
     }
 
     #[test]
@@ -128,5 +158,21 @@ mod tests {
         json.as_object_mut().unwrap().remove("providerRetries");
         let restored: RunStats = serde_json::from_value(json).unwrap();
         assert_eq!(restored.provider_retries, 0);
+    }
+
+    #[test]
+    fn older_stats_default_behavioral_fields_to_zero() {
+        let json = serde_json::json!({
+            "modelTurns": 5,
+            "toolBatches": 2,
+            "toolCalls": 3
+        });
+        let restored: RunStats = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.permission_prompts, 0);
+        assert_eq!(restored.permission_denials, 0);
+        assert_eq!(restored.files_changed_count, 0);
+        assert_eq!(restored.verification_commands_run, 0);
+        assert_eq!(restored.verification_failures, 0);
+        assert_eq!(restored.user_steers, 0);
     }
 }

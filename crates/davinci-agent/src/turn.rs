@@ -110,6 +110,7 @@ impl Agent {
                 );
                 self.is_streaming = false;
                 self.flush_pending_bash_messages();
+                self.emit_behavior_telemetry();
                 return Ok(events);
             }
 
@@ -345,6 +346,7 @@ impl Agent {
         );
         self.is_streaming = false;
         self.flush_pending_bash_messages();
+        self.emit_behavior_telemetry();
         Ok(events)
     }
 
@@ -393,6 +395,9 @@ impl Agent {
             let mode = self.queues.follow_up_mode;
             self.queues.drain_follow_up(mode)
         };
+        if steer {
+            self.stats.user_steers += drained.len() as u64;
+        }
         for queued in drained {
             let message = self.prompt_with(&queued.text, &queued.images);
             let _ = self.pending_prompt_messages.pop();
@@ -1018,6 +1023,18 @@ impl Agent {
                 ledger.record_completion(id, &outcome.content, false);
             }
         }
+        if matches!(name, "write" | "edit" | "apply_patch" | "notebook_edit") && !outcome.is_error {
+            crate::stats::SharedCounters::add(&self.counters.files_changed_count, 1);
+        }
+        if matches!(name, "bash" | "powershell" | "exec_command") {
+            let cmd = args.get("command").and_then(Value::as_str).unwrap_or_default();
+            if is_verification_command(cmd) {
+                crate::stats::SharedCounters::add(&self.counters.verification_commands_run, 1);
+                if outcome.is_error {
+                    crate::stats::SharedCounters::add(&self.counters.verification_failures, 1);
+                }
+            }
+        }
         outcome
     }
 
@@ -1109,6 +1126,7 @@ impl Agent {
         let request = match verdict {
             PermissionVerdict::Allow => return None,
             PermissionVerdict::Deny { reason } => {
+                crate::stats::SharedCounters::add(&self.counters.permission_denials, 1);
                 if let Some(runtime) = &self.runtime {
                     runtime.emit_observe(crate::runtime::RuntimeEvent::PermissionDenied {
                         call_id: id.to_string(),
@@ -1118,6 +1136,7 @@ impl Agent {
                 return Some(reason);
             }
             PermissionVerdict::Ask(request) => {
+                crate::stats::SharedCounters::add(&self.counters.permission_prompts, 1);
                 if let Some(runtime) = &self.runtime {
                     let _ =
                         runtime.emit_decision(crate::runtime::RuntimeEvent::PermissionRequested {
@@ -1129,6 +1148,7 @@ impl Agent {
             }
         };
         let Some(approver) = &self.approver else {
+            crate::stats::SharedCounters::add(&self.counters.permission_denials, 1);
             let reason = format!(
                 "Permission denied: `{}` needs approval in permission mode `{}`, and this run cannot ask. \
                  Start pi with --permission-mode auto, or add an allow rule such as `{}` to \
@@ -1155,6 +1175,7 @@ impl Agent {
                 None
             }
             ToolApprovalDecision::Deny => {
+                crate::stats::SharedCounters::add(&self.counters.permission_denials, 1);
                 let reason = format!(
                     "Permission denied: the user declined `{}`.",
                     request.summary
@@ -1208,6 +1229,50 @@ impl Agent {
                 extra: serde_json::Map::new(),
             });
         }
+    }
+
+    fn emit_behavior_telemetry(&self) {
+        let final_stats = self.run_stats();
+        let profile = self
+            .prompt_manifest
+            .as_ref()
+            .map(|m| m.profile.clone())
+            .unwrap_or_else(|| "stable".into());
+        let version = self
+            .prompt_manifest
+            .as_ref()
+            .map(|m| m.profile_version)
+            .unwrap_or(2);
+        let hash_prefix = self
+            .prompt_manifest
+            .as_ref()
+            .map(|m| {
+                if m.stable_sha256.len() >= 8 {
+                    m.stable_sha256[..8].to_string()
+                } else {
+                    m.stable_sha256.clone()
+                }
+            })
+            .unwrap_or_default();
+        let family = crate::prompt::provider::prompt_model_family(&self.provider, &self.model_id)
+            .name()
+            .to_string();
+
+        davinci_telemetry::record_behavior_telemetry(davinci_telemetry::BehaviorTelemetry {
+            prompt_profile: profile,
+            prompt_version: version,
+            prompt_stable_hash_prefix: hash_prefix,
+            model_family: family,
+            model_turns: final_stats.model_turns,
+            tool_calls: final_stats.tool_calls,
+            permission_prompts: final_stats.permission_prompts,
+            permission_denials: final_stats.permission_denials,
+            files_changed_count: final_stats.files_changed_count,
+            verification_commands_run: final_stats.verification_commands_run,
+            verification_failures: final_stats.verification_failures,
+            aborted: self.abort_requested(),
+            user_steers: final_stats.user_steers,
+        });
     }
 }
 
@@ -1280,6 +1345,23 @@ fn sleep_retry_delay(delay_ms: u64, cancelled: impl Fn() -> bool) {
         }
         std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
     }
+}
+
+fn is_verification_command(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    lower.contains("cargo test")
+        || lower.contains("cargo check")
+        || lower.contains("cargo clippy")
+        || lower.contains("pytest")
+        || lower.contains("npm test")
+        || lower.contains("pnpm test")
+        || lower.contains("yarn test")
+        || lower.contains("go test")
+        || lower.contains("make test")
+        || lower.contains("make check")
+        || lower.contains("ctest")
+        || lower.contains("mvn test")
+        || lower.contains("gradle test")
 }
 
 #[cfg(test)]
@@ -1441,5 +1523,31 @@ mod tests {
         assert_eq!(events[0], AgentEvent::AgentStart);
         assert_eq!(events[1], AgentEvent::TurnStart);
         assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
+    }
+
+    #[test]
+    fn run_loop_records_behavioral_telemetry() {
+        davinci_telemetry::clear_behavior_telemetry();
+        let mut agent = Agent::new("Test prompt");
+        let _ = agent.run_loop(|_ag| {
+            Ok(AssistantMessage {
+                id: "msg_1".into(),
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+                model: "claude-3-5-sonnet".into(),
+                usage: None,
+                stop_reason: Some(StopReason::Stop),
+                error_message: None,
+            })
+        });
+
+        let telemetry = davinci_telemetry::get_behavior_telemetry();
+        assert_eq!(telemetry.len(), 1);
+        let entry = &telemetry[0];
+        assert_eq!(entry.model_turns, 1);
+        assert!(!entry.aborted);
+        assert_eq!(entry.prompt_version, 2);
     }
 }
