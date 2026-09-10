@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod notebook;
 mod permission;
 pub mod planning;
+pub mod prompt;
 mod pruning;
 mod queues;
 mod scheduler;
@@ -1387,14 +1388,7 @@ impl From<AssistantMessage> for CompleteOutput {
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
 
 pub fn default_system_prompt() -> String {
-    [
-        "You are pi, a coding assistant with read, bash, edit, and write tools. Be concise and make precise edits.",
-        "Keep a todo list with the todo tool on any task of three or more steps: send the whole list, mark the step you are on active, and mark steps done as you finish them.",
-        "Run builds, test suites and anything that takes more than a few seconds with bash background: true; you will be told when the job finishes, and job_output reads what it printed meanwhile.",
-        "Use web_search to find pages and web_fetch to read one before quoting it. Notebooks (.ipynb) read as numbered cells; edit matches inside a cell and notebook_edit changes whole cells.",
-        TOOL_USE_STRATEGY,
-    ]
-    .join("\n")
+    prompt::compose_legacy_default().text
 }
 
 /// The orchestration rules every pi prompt carries: they are what turns a
@@ -1402,14 +1396,7 @@ pub fn default_system_prompt() -> String {
 /// to agree — the scheduler overlaps independent calls (`scheduler.rs`),
 /// `batch` hides several operations behind one boundary, `agent` fans out
 /// workers — and this is the prompt's half of that agreement.
-pub const TOOL_USE_STRATEGY: &str = "\
-Tool-use strategy — every model turn is expensive, every tool call is cheap:
-- Minimize round trips. When the next several reads, searches or listings are already known, issue them all in one response, or put them in one batch call. Never do one search or read per turn when more are obviously coming.
-- Independent read-only calls in the same response run concurrently; edits and shell commands run in order. Order calls the way you need their effects.
-- Read with offset/limit around what you need instead of whole files, and do not re-read a file you already have unless it changed.
-- Search before reading: one grep across the tree beats opening files one by one.
-- Delegate research that would flood your context to agent workers (up to 8 concurrent tasks), each with a self-contained question and a request for a short answer with file paths; do not wait on them for anything you can do meanwhile.
-- Keep tool output small: use grep limit/glob, ls limit, read ranges; ask for more only when needed.";
+pub const TOOL_USE_STRATEGY: &str = prompt::tool_strategy::TOOL_USE_STRATEGY;
 
 pub fn new_message_id() -> String {
     Uuid::new_v4().to_string()
