@@ -101,8 +101,29 @@ pub fn compose_legacy_default() -> ComposedPrompt {
     compose_modules(&[legacy_default_module()])
 }
 
-pub fn compose_default_prompt(_ctx: &PromptContext<'_>) -> ComposedPrompt {
-    compose_legacy_default()
+pub fn stable_v2_modules() -> Vec<PromptModule> {
+    vec![
+        core::core_identity_module(),
+        core::core_autonomy_module(),
+        crate::prompt::coding::coding_exploration_module(),
+        crate::prompt::coding::coding_scope_discipline_module(),
+        crate::prompt::coding::coding_change_quality_module(),
+        crate::prompt::collaboration::collaboration_user_intent_module(),
+        crate::prompt::verification::verification_completion_module(),
+    ]
+}
+
+pub fn compose_default_prompt(ctx: &PromptContext<'_>) -> ComposedPrompt {
+    let mut modules = stable_v2_modules();
+    modules.push(crate::prompt::runtime_state::runtime_state_module(
+        &crate::prompt::runtime_state::RuntimePromptState {
+            permission_mode: ctx.permission_mode,
+            plan_revision: None,
+            plan_approved: false,
+            active_contract: false,
+        },
+    ));
+    compose_modules(&modules)
 }
 
 #[cfg(test)]
