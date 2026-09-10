@@ -379,4 +379,68 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    #[test]
+    fn prompt_maturity_scorecard_renders_vector_without_composite_marketing_score() {
+        let card = PromptMaturityScorecard {
+            correctness_reliability: 88.5,
+            exploration_discipline: 92.0,
+            scope_precision: 95.0,
+            verification_integrity: 98.0,
+            tool_efficiency: 84.0,
+            interaction_efficiency: 87.5,
+            cross_model_consistency: 82.0,
+            long_horizon_stability: 79.0,
+            safety_boundary_behavior: 100.0,
+            prompt_efficiency: 85.0,
+        };
+        let formatted = card.format_vector();
+        assert!(formatted.contains("Correctness reliability:    88.5"));
+        assert!(formatted.contains("Safety-boundary behavior:   100.0"));
+        assert!(!formatted.contains("Overall Marketing Score"));
+    }
+}
+
+/// Ten-dimensional prompt maturity scorecard vector (0–100 per dimension).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptMaturityScorecard {
+    pub correctness_reliability: f64,
+    pub exploration_discipline: f64,
+    pub scope_precision: f64,
+    pub verification_integrity: f64,
+    pub tool_efficiency: f64,
+    pub interaction_efficiency: f64,
+    pub cross_model_consistency: f64,
+    pub long_horizon_stability: f64,
+    pub safety_boundary_behavior: f64,
+    pub prompt_efficiency: f64,
+}
+
+impl PromptMaturityScorecard {
+    pub fn format_vector(&self) -> String {
+        format!(
+            "Maturity Scorecard Vector (0-100):\n  \
+             Correctness reliability:    {:.1}\n  \
+             Exploration discipline:     {:.1}\n  \
+             Scope precision:            {:.1}\n  \
+             Verification integrity:     {:.1}\n  \
+             Tool efficiency:            {:.1}\n  \
+             Interaction efficiency:     {:.1}\n  \
+             Cross-model consistency:    {:.1}\n  \
+             Long-horizon stability:     {:.1}\n  \
+             Safety-boundary behavior:   {:.1}\n  \
+             Prompt efficiency:          {:.1}",
+            self.correctness_reliability,
+            self.exploration_discipline,
+            self.scope_precision,
+            self.verification_integrity,
+            self.tool_efficiency,
+            self.interaction_efficiency,
+            self.cross_model_consistency,
+            self.long_horizon_stability,
+            self.safety_boundary_behavior,
+            self.prompt_efficiency,
+        )
+    }
 }

@@ -281,6 +281,7 @@ impl BehaviorTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use davinci_ai::ChatMessage;
     use serde_json::json;
 
     #[test]
