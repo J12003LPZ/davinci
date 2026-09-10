@@ -361,7 +361,7 @@ pub fn plan_file_rewind(
 }
 
 pub fn check_rename_conflict(
-    source_path: &str,
+    _source_path: &str,
     dest_path: &str,
     base_dir: &Path,
 ) -> Option<String> {
@@ -370,7 +370,7 @@ pub fn check_rename_conflict(
         // Check for Windows case-only rename
         #[cfg(windows)]
         {
-            if source_path.eq_ignore_ascii_case(dest_path) {
+            if _source_path.eq_ignore_ascii_case(dest_path) {
                 return None;
             }
         }
