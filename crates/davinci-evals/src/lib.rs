@@ -1,6 +1,7 @@
 //! Fixture-driven eval harness matching `@earendil-works/pi-evals`.
 
 pub mod artifacts;
+pub mod behavior;
 pub mod codex_eval;
 pub mod harness_table;
 pub mod reporter;
@@ -8,9 +9,10 @@ pub mod security_eval;
 pub mod summary;
 
 pub use artifacts::{
-    persist_eval_artifact_references, record_eval_session_artifact, record_eval_source_artifact,
-    ArtifactReference, EvalArtifact, EvalAttachment, PromptBaselineIdentity,
-    LEGACY_PROMPT_BASELINE_NAME, PI_SESSION_SNAPSHOT_ARTIFACT,
+    persist_behavior_trace_artifacts, persist_eval_artifact_references,
+    record_eval_session_artifact, record_eval_source_artifact, ArtifactReference, EvalArtifact,
+    EvalAttachment, PromptBaselineIdentity, LEGACY_PROMPT_BASELINE_NAME,
+    PI_SESSION_SNAPSHOT_ARTIFACT,
 };
 pub use harness_table::{
     derive_eval_group_key, eval_harness_table, parse_eval_harness_iteration_artifact,

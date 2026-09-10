@@ -130,6 +130,30 @@ pub fn persist_eval_artifact_references(
     Ok(references)
 }
 
+pub fn persist_behavior_trace_artifacts(
+    run_directory: &Path,
+    scenario_id: &str,
+    trace: &crate::behavior::trace::BehaviorTrace,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let scenario_dir = run_directory.join(scenario_id);
+    std::fs::create_dir_all(&scenario_dir).map_err(|err| err.to_string())?;
+
+    let trace_path = scenario_dir.join("behavior-trace.json");
+    let trace_json = serde_json::to_string_pretty(trace).map_err(|err| err.to_string())?;
+    std::fs::write(&trace_path, trace_json).map_err(|err| err.to_string())?;
+
+    let manifest_path = if let Some(manifest) = &trace.prompt_manifest {
+        let p = scenario_dir.join("prompt-manifest.json");
+        let manifest_json = serde_json::to_string_pretty(manifest).map_err(|err| err.to_string())?;
+        std::fs::write(&p, manifest_json).map_err(|err| err.to_string())?;
+        Some(p)
+    } else {
+        None
+    };
+
+    Ok((trace_path, manifest_path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +243,16 @@ mod tests {
             .unwrap_err(),
             "Invalid eval artifact name: nested/hello.ts"
         );
+
+        let trace = crate::behavior::trace::BehaviorTrace::new("scen-1", None);
+        let run_dir = root.path().join("run-test");
+        let (trace_file, manifest_file) =
+            persist_behavior_trace_artifacts(&run_dir, "scen-1", &trace).unwrap();
+        assert!(trace_file.exists());
+        assert!(manifest_file.is_none());
+        let read_trace: crate::behavior::trace::BehaviorTrace =
+            serde_json::from_str(&std::fs::read_to_string(&trace_file).unwrap()).unwrap();
+        assert_eq!(read_trace.scenario_id, "scen-1");
     }
 }
+
