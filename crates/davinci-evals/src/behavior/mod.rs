@@ -1,6 +1,7 @@
 //! Behavioral reliability evaluation module.
 
 pub mod compare;
+pub mod mutation;
 pub mod runner;
 pub mod scenario;
 pub mod scorer;
@@ -8,6 +9,9 @@ pub mod trace;
 
 pub use compare::{
     compare_eval_runs, format_comparison_markdown, EvalVariant, PairedComparison, Regression,
+};
+pub use mutation::{
+    audit_dead_prompt_modules, evaluate_ablation, AblationResult, DeadPromptAudit,
 };
 pub use runner::{aggregate_suite_scores, evaluate_scenario_trace, BehaviorSuiteSummary};
 pub use scenario::{
@@ -18,5 +22,6 @@ pub use trace::{
     classify_shell_command, detect_verification_claims, BehaviorEvent, BehaviorStats, BehaviorTrace,
     VerificationEvent,
 };
+
 
 

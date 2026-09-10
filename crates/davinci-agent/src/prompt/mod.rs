@@ -21,8 +21,8 @@ pub use coding::{
 };
 pub use collaboration::collaboration_user_intent_module;
 pub use composer::{
-    compose_default_prompt, compose_legacy_default, compose_modules, ComposedPrompt,
-    PromptCacheClass, PromptContext, PromptModule,
+    compose_default_prompt, compose_legacy_default, compose_modules, compose_with_mutations,
+    ComposedPrompt, PromptCacheClass, PromptContext, PromptModule, PromptMutation,
 };
 pub use core::{core_autonomy_module, core_identity_module};
 pub use manifest::{PromptManifest, PromptModuleIdentity};

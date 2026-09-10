@@ -130,6 +130,56 @@ pub fn compose_default_prompt(ctx: &PromptContext<'_>) -> ComposedPrompt {
     compose_modules(&modules)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptMutation {
+    RemoveModule { id: String },
+    ReplaceModuleBody { id: String, body: String },
+    DowngradeModuleVersion { id: String, version: u32 },
+}
+
+pub fn compose_with_mutations(
+    ctx: &PromptContext<'_>,
+    mutations: &[PromptMutation],
+) -> ComposedPrompt {
+    let mut modules = stable_v2_modules();
+    let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
+    if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
+        modules.push(adapter);
+    }
+    modules.push(crate::prompt::runtime_state::runtime_state_module(
+        &crate::prompt::runtime_state::RuntimePromptState {
+            permission_mode: ctx.permission_mode,
+            plan_revision: None,
+            plan_approved: false,
+            active_contract: false,
+        },
+    ));
+
+    for mutation in mutations {
+        match mutation {
+            PromptMutation::RemoveModule { id } => {
+                modules.retain(|m| &m.id != id);
+            }
+            PromptMutation::ReplaceModuleBody { id, body } => {
+                for m in &mut modules {
+                    if &m.id == id {
+                        m.body = body.clone();
+                    }
+                }
+            }
+            PromptMutation::DowngradeModuleVersion { id, version } => {
+                for m in &mut modules {
+                    if &m.id == id {
+                        m.version = *version;
+                    }
+                }
+            }
+        }
+    }
+
+    compose_modules(&modules)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
