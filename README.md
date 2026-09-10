@@ -52,6 +52,15 @@ Project-local configuration is trusted explicitly. If a repository contains `.da
 
 `AGENTS.md` and `CLAUDE.md` are discovered and loaded as context (disable with `--no-context-files`).
 
+### Prompt profiles & behavioral control
+
+The prompt system supports versioned behavioral profiles with deterministic caching and instant rollback:
+
+- `--prompt-profile <stable|preview|legacy-v1>` (or setting `"promptProfile": "stable"`, or emergency override `DAVINCI_PROMPT_PROFILE=legacy-v1` / `PI_PROMPT_PROFILE=legacy-v1`).
+  - `stable`: Default versioned production prompt contract (v2) with scope discipline, exploration-before-mutation, and verification guarantees.
+  - `preview`: Candidate prompt revisions for dogfooding and early evaluation before graduation.
+  - `legacy-v1`: Bit-for-bit frozen compatibility baseline reproducing the initial launch harness prompt.
+
 ### Sessions
 
 Sessions are JSONL files under `~/.davinci/agent/sessions/` (or legacy `~/.pi/agent/sessions/`), grouped by a cwd-encoded directory (`--C--Users-me-project--/`) byte-compatible with TypeScript pi. Override with `--session-dir`, `DAVINCI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_SESSION_DIR`, or the `sessionDir` setting.

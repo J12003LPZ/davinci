@@ -538,10 +538,30 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
 }
 
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
-    let mut prompt = parsed
-        .system_prompt
-        .clone()
-        .unwrap_or_else(default_system_prompt);
+    let settings = load_merged_settings_with_override(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+    );
+    let profile = crate::settings::resolve_prompt_profile(
+        parsed.prompt_profile,
+        settings.prompt_profile.as_deref(),
+    );
+
+    let (base_prompt, manifest) = if let Some(custom) = &parsed.system_prompt {
+        (custom.clone(), None)
+    } else {
+        let ctx = davinci_agent::prompt::PromptContext {
+            provider: parsed.provider.as_deref().unwrap_or(""),
+            model_id: parsed.model.as_deref().unwrap_or(""),
+            permission_mode: parsed.permission_mode.unwrap_or(davinci_agent::PermissionMode::Ask),
+            plan_active: false,
+        };
+        let comp = davinci_agent::prompt::compose_profile_prompt(profile, &ctx);
+        (comp.text, Some(comp.manifest))
+    };
+
+    let mut prompt = base_prompt;
     for extra in &parsed.append_system_prompt {
         let text = if Path::new(extra).exists() {
             std::fs::read_to_string(extra).map_err(|err| err.to_string())?
@@ -552,11 +572,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         prompt.push_str(&text);
     }
     let mut agent = Agent::new(prompt);
-    let settings = load_merged_settings_with_override(
-        &default_agent_dir(),
-        cwd,
-        parsed.project_trust_override,
-    );
+    agent.prompt_manifest = manifest;
     apply_http_proxy_settings(settings.http_proxy.as_deref());
     crate::settings::apply_web_search_settings(settings.web_search.as_ref());
     if let Some(level) = parsed.thinking {
@@ -5894,6 +5910,17 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         jobs,
         format_session_cost(parsed, agent),
     );
+    if let Some(manifest) = &agent.prompt_manifest {
+        let hash_prefix = if manifest.stable_sha256.len() >= 8 {
+            &manifest.stable_sha256[..8]
+        } else {
+            &manifest.stable_sha256
+        };
+        text.push_str(&format!(
+            " · prompt: {} v{} · {hash_prefix}",
+            manifest.profile, manifest.profile_version
+        ));
+    }
     let cwd = std::env::current_dir().unwrap_or_default();
     if let Some(run) = crate::native_extensions::graph::active_run(&cwd).and_then(|r| r.snapshot())
     {
@@ -10233,4 +10260,40 @@ mod tests {
         std::env::remove_var("PI_RESUME_SESSION");
         assert_eq!(selected.unwrap(), session.path);
     }
+
+    #[test]
+    fn prompt_profile_rollback_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let preview_args = Args {
+            prompt_profile: Some(davinci_agent::PromptProfile::Preview),
+            ..Args::default()
+        };
+        let preview_agent = build_agent(&preview_args, &session_dir, &cwd).unwrap();
+        let preview_manifest = preview_agent.prompt_manifest.as_ref().unwrap();
+        assert_eq!(preview_manifest.profile, "preview");
+        assert_eq!(preview_manifest.profile_version, 3);
+
+        let rollback_args = Args {
+            prompt_profile: Some(davinci_agent::PromptProfile::LegacyV1),
+            ..Args::default()
+        };
+        let rollback_agent = build_agent(&rollback_args, &session_dir, &cwd).unwrap();
+        let rollback_manifest = rollback_agent.prompt_manifest.as_ref().unwrap();
+        assert_eq!(rollback_manifest.profile, "legacy-v1");
+        assert_eq!(rollback_manifest.profile_version, 1);
+
+        assert_ne!(preview_manifest.stable_sha256, rollback_manifest.stable_sha256);
+
+        let status_preview = format_session_status(&preview_args, &preview_agent);
+        assert!(status_preview.contains("prompt: preview v3"));
+
+        let status_rollback = format_session_status(&rollback_args, &rollback_agent);
+        assert!(status_rollback.contains("prompt: legacy-v1 v1"));
+    }
 }
+

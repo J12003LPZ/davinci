@@ -66,6 +66,7 @@ pub use permission::{
     ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
     ToolApprovalRequest, ToolApprover, ToolClass,
 };
+pub use prompt::PromptProfile;
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
 pub use scheduler::{lane_for, ToolLane, MAX_TOOL_PARALLELISM};

@@ -21,8 +21,9 @@ pub use coding::{
 };
 pub use collaboration::collaboration_user_intent_module;
 pub use composer::{
-    compose_default_prompt, compose_legacy_default, compose_modules, compose_with_mutations,
-    ComposedPrompt, PromptCacheClass, PromptContext, PromptModule, PromptMutation,
+    compose_default_prompt, compose_legacy_default, compose_modules, compose_profile_prompt,
+    compose_with_mutations, ComposedPrompt, PromptCacheClass, PromptContext, PromptModule,
+    PromptMutation,
 };
 pub use core::{core_autonomy_module, core_identity_module};
 pub use manifest::{PromptManifest, PromptModuleIdentity};
@@ -32,3 +33,6 @@ pub use provider::{
 pub use runtime_state::{runtime_state_module, runtime_state_text, RuntimePromptState};
 pub use tool_strategy::tool_strategy_module;
 pub use verification::verification_completion_module;
+pub use version::{
+    PromptProfile, LEGACY_PROMPT_VERSION, PREVIEW_PROMPT_VERSION, STABLE_PROMPT_VERSION,
+};

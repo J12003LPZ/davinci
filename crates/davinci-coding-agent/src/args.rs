@@ -79,6 +79,8 @@ pub struct Args {
     pub project_trust_override: Option<bool>,
     /// `--permission-mode <mode>` or its `--sandbox <preset>` alias.
     pub permission_mode: Option<PermissionMode>,
+    /// `--prompt-profile <stable|preview|legacy-v1>`
+    pub prompt_profile: Option<davinci_agent::PromptProfile>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
     pub unknown_flags: BTreeMap<String, FlagValue>,
@@ -155,6 +157,29 @@ pub fn parse_args(args: &[String]) -> Args {
         } else if arg == "--append-system-prompt" && i + 1 < args.len() {
             i += 1;
             result.append_system_prompt.push(args[i].clone());
+        } else if arg == "--prompt-profile" && i + 1 < args.len() {
+            i += 1;
+            match davinci_agent::PromptProfile::parse(&args[i]) {
+                Some(profile) => result.prompt_profile = Some(profile),
+                None => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message: format!(
+                        "Invalid prompt profile '{}'. Valid profiles: stable, preview, legacy-v1",
+                        args[i]
+                    ),
+                }),
+            }
+        } else if let Some(val) = arg.strip_prefix("--prompt-profile=") {
+            match davinci_agent::PromptProfile::parse(val) {
+                Some(profile) => result.prompt_profile = Some(profile),
+                None => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message: format!(
+                        "Invalid prompt profile '{}'. Valid profiles: stable, preview, legacy-v1",
+                        val
+                    ),
+                }),
+            }
         } else if arg == "--name" || arg == "-n" {
             if i + 1 < args.len() {
                 i += 1;
@@ -467,4 +492,33 @@ mod tests {
             "π - project"
         );
     }
+
+    #[test]
+    fn prompt_profile_flag_parsing() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(args(&[]).prompt_profile, None);
+        assert_eq!(
+            args(&["--prompt-profile", "stable"]).prompt_profile,
+            Some(davinci_agent::PromptProfile::Stable)
+        );
+        assert_eq!(
+            args(&["--prompt-profile", "preview"]).prompt_profile,
+            Some(davinci_agent::PromptProfile::Preview)
+        );
+        assert_eq!(
+            args(&["--prompt-profile", "legacy-v1"]).prompt_profile,
+            Some(davinci_agent::PromptProfile::LegacyV1)
+        );
+        assert_eq!(
+            args(&["--prompt-profile=preview"]).prompt_profile,
+            Some(davinci_agent::PromptProfile::Preview)
+        );
+
+        let bad = args(&["--prompt-profile", "unknown"]);
+        assert_eq!(bad.prompt_profile, None);
+        assert!(bad.diagnostics.iter().any(|d| d.kind == "error" && d.message.contains("Invalid prompt profile")));
+    }
 }
+

@@ -113,21 +113,41 @@ pub fn stable_v2_modules() -> Vec<PromptModule> {
     ]
 }
 
-pub fn compose_default_prompt(ctx: &PromptContext<'_>) -> ComposedPrompt {
-    let mut modules = stable_v2_modules();
-    let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
-    if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
-        modules.push(adapter);
+pub fn compose_profile_prompt(
+    profile: version::PromptProfile,
+    ctx: &PromptContext<'_>,
+) -> ComposedPrompt {
+    match profile {
+        version::PromptProfile::LegacyV1 => {
+            let mut composed = compose_legacy_default();
+            composed.manifest.profile = profile.id().to_string();
+            composed.manifest.profile_version = profile.version();
+            composed
+        }
+        version::PromptProfile::Stable | version::PromptProfile::Preview => {
+            let mut modules = stable_v2_modules();
+            let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
+            if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
+                modules.push(adapter);
+            }
+            modules.push(crate::prompt::runtime_state::runtime_state_module(
+                &crate::prompt::runtime_state::RuntimePromptState {
+                    permission_mode: ctx.permission_mode,
+                    plan_revision: None,
+                    plan_approved: false,
+                    active_contract: false,
+                },
+            ));
+            let mut composed = compose_modules(&modules);
+            composed.manifest.profile = profile.id().to_string();
+            composed.manifest.profile_version = profile.version();
+            composed
+        }
     }
-    modules.push(crate::prompt::runtime_state::runtime_state_module(
-        &crate::prompt::runtime_state::RuntimePromptState {
-            permission_mode: ctx.permission_mode,
-            plan_revision: None,
-            plan_approved: false,
-            active_contract: false,
-        },
-    ));
-    compose_modules(&modules)
+}
+
+pub fn compose_default_prompt(ctx: &PromptContext<'_>) -> ComposedPrompt {
+    compose_profile_prompt(version::PromptProfile::Stable, ctx)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

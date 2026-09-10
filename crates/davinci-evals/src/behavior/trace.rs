@@ -2,7 +2,7 @@
 
 use davinci_agent::prompt::manifest::PromptManifest;
 use davinci_agent::AgentEvent;
-use davinci_ai::{content_text, ChatMessage, MessageContent};
+use davinci_ai::{content_text, MessageContent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

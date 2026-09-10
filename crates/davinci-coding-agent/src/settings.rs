@@ -58,6 +58,8 @@ pub struct Settings {
     pub prompts: Option<Vec<String>>,
     #[serde(default)]
     pub themes: Option<Vec<String>>,
+    #[serde(default, rename = "promptProfile")]
+    pub prompt_profile: Option<String>,
     #[serde(default, rename = "defaultTools")]
     pub default_tools: Option<Vec<String>>,
     #[serde(default, rename = "steeringMode")]
@@ -293,6 +295,26 @@ pub fn format_compaction_threshold(
         Some(davinci_agent::CompactionThreshold::Tokens(tokens)) => format_token_count(tokens),
         None => "default".into(),
     }
+}
+
+pub fn resolve_prompt_profile(
+    cli_flag: Option<davinci_agent::PromptProfile>,
+    settings_profile: Option<&str>,
+) -> davinci_agent::PromptProfile {
+    if let Some(profile) = cli_flag {
+        return profile;
+    }
+    if let Some(setting_str) = settings_profile {
+        if let Some(profile) = davinci_agent::PromptProfile::parse(setting_str) {
+            return profile;
+        }
+    }
+    if let Ok(env_val) = std::env::var("DAVINCI_PROMPT_PROFILE").or_else(|_| std::env::var("PI_PROMPT_PROFILE")) {
+        if let Some(profile) = davinci_agent::PromptProfile::parse(&env_val) {
+            return profile;
+        }
+    }
+    davinci_agent::PromptProfile::Stable
 }
 
 fn format_token_count(tokens: u64) -> String {
@@ -1646,4 +1668,32 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert!(settings.learning.is_none());
     }
+
+    #[test]
+    fn stable_is_default_prompt_profile() {
+        assert_eq!(
+            resolve_prompt_profile(None, None),
+            davinci_agent::PromptProfile::Stable
+        );
+    }
+
+    #[test]
+    fn explicit_cli_profile_wins_over_settings() {
+        assert_eq!(
+            resolve_prompt_profile(
+                Some(davinci_agent::PromptProfile::Preview),
+                Some("legacy-v1")
+            ),
+            davinci_agent::PromptProfile::Preview
+        );
+
+        assert_eq!(
+            resolve_prompt_profile(
+                None,
+                Some("legacy-v1")
+            ),
+            davinci_agent::PromptProfile::LegacyV1
+        );
+    }
 }
+

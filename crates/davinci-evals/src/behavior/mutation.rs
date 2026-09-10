@@ -1,10 +1,6 @@
 //! Prompt mutation and ablation testing harness.
 
 use std::collections::BTreeMap;
-use davinci_agent::PermissionMode;
-use davinci_agent::prompt::{
-    compose_default_prompt, compose_with_mutations, PromptContext, PromptMutation,
-};
 use serde::{Deserialize, Serialize};
 
 use super::runner::BehaviorSuiteSummary;
@@ -107,6 +103,10 @@ pub fn audit_dead_prompt_modules(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use davinci_agent::PermissionMode;
+    use davinci_agent::prompt::{
+        compose_default_prompt, compose_with_mutations, PromptContext, PromptMutation,
+    };
 
     fn test_context() -> PromptContext<'static> {
         PromptContext {
