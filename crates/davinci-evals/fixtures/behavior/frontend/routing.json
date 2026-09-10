@@ -1,0 +1,152 @@
+[
+  {
+    "id": "fe-pos-01",
+    "request": "Redesign this dashboard so it feels premium and intentional.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-02",
+    "request": "Improve the visual design of the settings panel with modern typography and spacing.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-03",
+    "request": "Make it look much cleaner and more professional.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-04",
+    "request": "Polish the UI for the billing modal.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-05",
+    "request": "Update the look and feel of the navigation bar.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-06",
+    "request": "Modernize the design of the user profile card.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-07",
+    "request": "Create a design system for our component library.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-08",
+    "request": "Give the landing page an aesthetic overhaul with high-contrast accents.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-09",
+    "request": "Overhaul the styling of the onboarding walkthrough.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-10",
+    "request": "Complete UI overhaul for our customer portal.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-11",
+    "request": "Implement a dark mode theme overhaul.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-12",
+    "request": "Redesign the checkout flow for better conversion and aesthetic appeal.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-13",
+    "request": "Craft a landing page design for our new developer tool.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-14",
+    "request": "Build a new hero section design with responsive layout.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-15",
+    "request": "Refine the visual design of the data table component.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-neg-01",
+    "request": "Fix the hydration error in Dashboard.tsx.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-02",
+    "request": "Fix the css bug causing text overflow in Sidebar.module.css.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-03",
+    "request": "Rename the component Button to ActionButton in Button.tsx.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-04",
+    "request": "Add a new prop 'disabled' to IconButton.tsx.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-05",
+    "request": "Backend endpoint returning HTML for status dashboard.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-06",
+    "request": "Write unit tests for Header.tsx using vitest.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-07",
+    "request": "Fix broken onClick handler in SubmitButton.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-08",
+    "request": "Extract shared types from Table.tsx into types.ts.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-09",
+    "request": "Optimize re-renders in MessageList.tsx with useMemo.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-10",
+    "request": "Update react-router dependency to v7 in package.json.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-11",
+    "request": "Handle 404 response in fetchUserData function.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-12",
+    "request": "Add aria-label to the search input element.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-13",
+    "request": "Fix z-index collision between dropdown and modal.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-14",
+    "request": "Correct spelling of 'receive' in notification toast.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-15",
+    "request": "Export UserCard component from index.ts.",
+    "expect_frontend": false
+  }
+]

@@ -1,5 +1,6 @@
 //! Versioned prompt engineering subsystem.
 
+pub mod capabilities;
 pub mod coding;
 pub mod collaboration;
 pub mod composer;
@@ -11,6 +12,10 @@ pub mod tool_strategy;
 pub mod verification;
 pub mod version;
 
+pub use capabilities::{
+    capability_module, detect_native_capabilities, CapabilityDecision, NativeBehaviorCapability,
+    CAPABILITY_POLICY_MAX_TOKENS,
+};
 pub use coding::{
     coding_change_quality_module, coding_exploration_module, coding_scope_discipline_module,
 };

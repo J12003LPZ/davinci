@@ -1,0 +1,76 @@
+[
+  {
+    "id": "dbg-01",
+    "request": "Debug the race condition in the worker pool scheduler.",
+    "expect_debugging": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "dbg-02",
+    "request": "Diagnose the memory leak observed during long-running tasks.",
+    "expect_debugging": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "dbg-03",
+    "request": "Investigate the failure in test_batch_execution on Windows.",
+    "expect_debugging": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "dbg-04",
+    "request": "Find the root cause of the JSON-RPC parse error.",
+    "expect_debugging": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "dbg-05",
+    "request": "Why does it crash when an empty buffer is submitted?",
+    "expect_debugging": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "rev-01",
+    "request": "Perform a code review of this PR focusing on security risks.",
+    "expect_review": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "rev-02",
+    "request": "Review this code for potential memory safety issues.",
+    "expect_review": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "rev-03",
+    "request": "Audit this change before we merge it into main.",
+    "expect_review": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "rev-04",
+    "request": "Review the diff between HEAD and origin/main.",
+    "expect_review": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "rev-05",
+    "request": "Review my PR and suggest improvements for error handling.",
+    "expect_review": true,
+    "expect_frontend": false
+  },
+  {
+    "id": "none-01",
+    "request": "Bump the version in Cargo.toml to 1.0.1.",
+    "expect_debugging": false,
+    "expect_review": false,
+    "expect_frontend": false
+  },
+  {
+    "id": "none-02",
+    "request": "Add a new CLI flag --quiet to silence non-error output.",
+    "expect_debugging": false,
+    "expect_review": false,
+    "expect_frontend": false
+  }
+]
