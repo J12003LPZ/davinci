@@ -18,7 +18,7 @@ use serde_json::Value;
 mod permission_risk;
 
 /// How much a run may do without asking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PermissionMode {
     /// Read tools only; everything else is refused without a question.
     ReadOnly,

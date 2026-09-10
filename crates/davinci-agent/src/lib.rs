@@ -97,8 +97,9 @@ pub use turn::retry_delay_ms;
 
 pub mod runtime;
 pub use prompt::{
-    compose_default_prompt, compose_legacy_default, compose_modules, ComposedPrompt,
-    PromptCacheClass, PromptContext, PromptManifest, PromptModule, PromptModuleIdentity,
+    compose_default_prompt, compose_legacy_default, compose_modules, runtime_state_module,
+    runtime_state_text, ComposedPrompt, PromptCacheClass, PromptContext, PromptManifest,
+    PromptModule, PromptModuleIdentity, RuntimePromptState,
 };
 pub use runtime::{
     find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
