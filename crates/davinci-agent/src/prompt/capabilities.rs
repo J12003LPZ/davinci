@@ -163,38 +163,60 @@ mod tests {
 
     #[test]
     fn frontend_design_triggers_on_visual_redesign() {
-        let d = detect_native_capabilities("Redesign this dashboard so it feels premium and intentional.");
-        assert!(d.capabilities.contains(&NativeBehaviorCapability::FrontendDesign));
+        let d = detect_native_capabilities(
+            "Redesign this dashboard so it feels premium and intentional.",
+        );
+        assert!(d
+            .capabilities
+            .contains(&NativeBehaviorCapability::FrontendDesign));
     }
 
     #[test]
     fn frontend_design_does_not_trigger_for_react_bugfix() {
         let d = detect_native_capabilities("Fix the hydration error in Dashboard.tsx.");
-        assert!(!d.capabilities.contains(&NativeBehaviorCapability::FrontendDesign));
+        assert!(!d
+            .capabilities
+            .contains(&NativeBehaviorCapability::FrontendDesign));
     }
 
     #[test]
     fn frontend_design_does_not_trigger_for_component_rename_or_css_bug() {
-        let d1 = detect_native_capabilities("Rename the component Button to ActionButton in Button.tsx.");
-        assert!(!d1.capabilities.contains(&NativeBehaviorCapability::FrontendDesign));
+        let d1 = detect_native_capabilities(
+            "Rename the component Button to ActionButton in Button.tsx.",
+        );
+        assert!(!d1
+            .capabilities
+            .contains(&NativeBehaviorCapability::FrontendDesign));
 
-        let d2 = detect_native_capabilities("Fix the css bug causing text overflow in Sidebar.module.css.");
-        assert!(!d2.capabilities.contains(&NativeBehaviorCapability::FrontendDesign));
+        let d2 = detect_native_capabilities(
+            "Fix the css bug causing text overflow in Sidebar.module.css.",
+        );
+        assert!(!d2
+            .capabilities
+            .contains(&NativeBehaviorCapability::FrontendDesign));
 
         let d3 = detect_native_capabilities("Backend endpoint returning HTML for health check.");
-        assert!(!d3.capabilities.contains(&NativeBehaviorCapability::FrontendDesign));
+        assert!(!d3
+            .capabilities
+            .contains(&NativeBehaviorCapability::FrontendDesign));
     }
 
     #[test]
     fn debugging_triggers_on_diagnostic_intent() {
         let d = detect_native_capabilities("Diagnose and find the root cause of the memory spike.");
-        assert!(d.capabilities.contains(&NativeBehaviorCapability::Debugging));
+        assert!(d
+            .capabilities
+            .contains(&NativeBehaviorCapability::Debugging));
     }
 
     #[test]
     fn code_review_triggers_on_audit_intent() {
-        let d = detect_native_capabilities("Perform a code review of this PR focusing on security risks.");
-        assert!(d.capabilities.contains(&NativeBehaviorCapability::CodeReview));
+        let d = detect_native_capabilities(
+            "Perform a code review of this PR focusing on security risks.",
+        );
+        assert!(d
+            .capabilities
+            .contains(&NativeBehaviorCapability::CodeReview));
     }
 
     #[test]
@@ -218,7 +240,8 @@ mod tests {
 
     #[test]
     fn routing_fixtures_meet_accuracy_threshold() {
-        let fe_json = include_str!("../../../davinci-evals/fixtures/behavior/frontend/routing.json");
+        let fe_json =
+            include_str!("../../../davinci-evals/fixtures/behavior/frontend/routing.json");
         let fe_cases: Vec<serde_json::Value> = serde_json::from_str(fe_json).unwrap();
         assert!(fe_cases.len() >= 30);
 
@@ -229,7 +252,9 @@ mod tests {
             let req = case["request"].as_str().unwrap();
             let expect_fe = case["expect_frontend"].as_bool().unwrap();
             let decision = detect_native_capabilities(req);
-            let has_fe = decision.capabilities.contains(&NativeBehaviorCapability::FrontendDesign);
+            let has_fe = decision
+                .capabilities
+                .contains(&NativeBehaviorCapability::FrontendDesign);
             if has_fe == expect_fe {
                 correct += 1;
             }

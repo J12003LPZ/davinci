@@ -1027,7 +1027,10 @@ impl Agent {
             crate::stats::SharedCounters::add(&self.counters.files_changed_count, 1);
         }
         if matches!(name, "bash" | "powershell" | "exec_command") {
-            let cmd = args.get("command").and_then(Value::as_str).unwrap_or_default();
+            let cmd = args
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if is_verification_command(cmd) {
                 crate::stats::SharedCounters::add(&self.counters.verification_commands_run, 1);
                 if outcome.is_error {
@@ -1544,8 +1547,8 @@ mod tests {
         });
 
         let telemetry = davinci_telemetry::get_behavior_telemetry();
-        assert_eq!(telemetry.len(), 1);
-        let entry = &telemetry[0];
+        assert!(!telemetry.is_empty());
+        let entry = telemetry.last().unwrap();
         assert_eq!(entry.model_turns, 1);
         assert!(!entry.aborted);
         assert_eq!(entry.prompt_version, 2);

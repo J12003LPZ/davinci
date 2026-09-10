@@ -554,7 +554,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         let ctx = davinci_agent::prompt::PromptContext {
             provider: parsed.provider.as_deref().unwrap_or(""),
             model_id: parsed.model.as_deref().unwrap_or(""),
-            permission_mode: parsed.permission_mode.unwrap_or(davinci_agent::PermissionMode::Ask),
+            permission_mode: parsed
+                .permission_mode
+                .unwrap_or(davinci_agent::PermissionMode::Ask),
             plan_active: false,
         };
         let comp = davinci_agent::prompt::compose_profile_prompt(profile, &ctx);
@@ -10336,7 +10338,10 @@ mod tests {
         assert_eq!(rollback_manifest.profile, "legacy-v1");
         assert_eq!(rollback_manifest.profile_version, 1);
 
-        assert_ne!(preview_manifest.stable_sha256, rollback_manifest.stable_sha256);
+        assert_ne!(
+            preview_manifest.stable_sha256,
+            rollback_manifest.stable_sha256
+        );
 
         let status_preview = format_session_status(&preview_args, &preview_agent);
         assert!(status_preview.contains("prompt: preview v3"));
@@ -10345,4 +10350,3 @@ mod tests {
         assert!(status_rollback.contains("prompt: legacy-v1 v1"));
     }
 }
-

@@ -309,7 +309,9 @@ pub fn resolve_prompt_profile(
             return profile;
         }
     }
-    if let Ok(env_val) = std::env::var("DAVINCI_PROMPT_PROFILE").or_else(|_| std::env::var("PI_PROMPT_PROFILE")) {
+    if let Ok(env_val) =
+        std::env::var("DAVINCI_PROMPT_PROFILE").or_else(|_| std::env::var("PI_PROMPT_PROFILE"))
+    {
         if let Some(profile) = davinci_agent::PromptProfile::parse(&env_val) {
             return profile;
         }
@@ -1688,12 +1690,8 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_prompt_profile(
-                None,
-                Some("legacy-v1")
-            ),
+            resolve_prompt_profile(None, Some("legacy-v1")),
             davinci_agent::PromptProfile::LegacyV1
         );
     }
 }
-

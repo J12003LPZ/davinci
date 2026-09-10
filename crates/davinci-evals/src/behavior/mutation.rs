@@ -1,7 +1,7 @@
 //! Prompt mutation and ablation testing harness.
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::runner::BehaviorSuiteSummary;
 
@@ -37,9 +37,8 @@ pub fn evaluate_ablation(
     let unrelated_edits_delta = ablated.unrelated_edit_rate - baseline.unrelated_edit_rate;
 
     // Degradation occurs if pass rate drops or bad behaviors increase
-    let degradation_observed = pass_rate_delta < -0.01
-        || unverified_claims_delta > 0.01
-        || unrelated_edits_delta > 0.01;
+    let degradation_observed =
+        pass_rate_delta < -0.01 || unverified_claims_delta > 0.01 || unrelated_edits_delta > 0.01;
 
     AblationResult {
         ablated_module_id: ablated_module_id.to_string(),
@@ -103,10 +102,10 @@ pub fn audit_dead_prompt_modules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use davinci_agent::PermissionMode;
     use davinci_agent::prompt::{
         compose_default_prompt, compose_with_mutations, PromptContext, PromptMutation,
     };
+    use davinci_agent::PermissionMode;
 
     fn test_context() -> PromptContext<'static> {
         PromptContext {
@@ -142,7 +141,10 @@ mod tests {
             .any(|m| m.id == "verification.completion"));
 
         // Stable hash changes
-        assert_ne!(baseline.manifest.stable_sha256, ablated.manifest.stable_sha256);
+        assert_ne!(
+            baseline.manifest.stable_sha256,
+            ablated.manifest.stable_sha256
+        );
 
         // Other modules remain present and unchanged
         let other_modules = [
@@ -185,7 +187,10 @@ mod tests {
             .iter()
             .find(|m| m.id == "coding.exploration")
             .unwrap();
-        assert_eq!(exp.sha256, davinci_agent::prompt::manifest::hash_text("custom exploration body"));
+        assert_eq!(
+            exp.sha256,
+            davinci_agent::prompt::manifest::hash_text("custom exploration body")
+        );
 
         let scope = mutated
             .manifest
@@ -231,7 +236,15 @@ mod tests {
         );
 
         assert_eq!(audit.flagged_modules, vec!["fluff.module"]);
-        assert!(audit.details.get("core.identity").unwrap().contains("protected"));
-        assert!(audit.details.get("fluff.module").unwrap().contains("Review recommended"));
+        assert!(audit
+            .details
+            .get("core.identity")
+            .unwrap()
+            .contains("protected"));
+        assert!(audit
+            .details
+            .get("fluff.module")
+            .unwrap()
+            .contains("Review recommended"));
     }
 }

@@ -54,12 +54,15 @@ Project-local configuration is trusted explicitly. If a repository contains `.da
 
 ### Prompt profiles & behavioral control
 
-The prompt system supports versioned behavioral profiles with deterministic caching and instant rollback:
+The prompt system supports versioned behavioral profiles with deterministic caching, privacy-safe dogfood telemetry, and instant rollback:
 
 - `--prompt-profile <stable|preview|legacy-v1>` (or setting `"promptProfile": "stable"`, or emergency override `DAVINCI_PROMPT_PROFILE=legacy-v1` / `PI_PROMPT_PROFILE=legacy-v1`).
   - `stable`: Default versioned production prompt contract (v2) with scope discipline, exploration-before-mutation, and verification guarantees.
   - `preview`: Candidate prompt revisions for dogfooding and early evaluation before graduation.
   - `legacy-v1`: Bit-for-bit frozen compatibility baseline reproducing the initial launch harness prompt.
+- **Identity & Status**: `/status` in the interactive shell displays the active prompt profile, version, and hash prefix (e.g. `prompt: stable v2 · <sha256:8>`), along with aggregate local metrics.
+- **Behavioral Evaluation Suite**: Run `cargo test -p davinci-evals behavior::` for the offline PR gate, or `cargo run -p davinci-evals -- run-ab` for paired A/B comparisons.
+- Full specifications: [`docs/prompt-engineering.md`](docs/prompt-engineering.md), [`docs/behavioral-evals.md`](docs/behavioral-evals.md), [`docs/release-quality.md`](docs/release-quality.md).
 
 ### Sessions
 

@@ -1,7 +1,7 @@
 //! Release-grade regression budgets and CI quality gates.
 
-use serde::{Deserialize, Serialize};
 use super::runner::BehaviorSuiteSummary;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegressionBudget {
@@ -135,7 +135,13 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn summary(pass: f64, unverified: f64, unrelated: f64, turns: f64, tools: f64) -> BehaviorSuiteSummary {
+    fn summary(
+        pass: f64,
+        unverified: f64,
+        unrelated: f64,
+        turns: f64,
+        tools: f64,
+    ) -> BehaviorSuiteSummary {
         BehaviorSuiteSummary {
             total_scenarios: 200,
             passed_scenarios: (pass * 200.0) as usize,
@@ -183,7 +189,10 @@ mod tests {
         let res_fail = evaluate_gate(&base, &cand_10_01, &budget);
         assert!(!res_fail.turns_efficiency_ok);
         assert!(!res_fail.passed);
-        assert!(res_fail.violations.iter().any(|v| v.contains("Median model turn increase")));
+        assert!(res_fail
+            .violations
+            .iter()
+            .any(|v| v.contains("Median model turn increase")));
     }
 
     #[test]

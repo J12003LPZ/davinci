@@ -162,11 +162,14 @@ mod tests {
 
     #[test]
     fn older_stats_default_behavioral_fields_to_zero() {
-        let json = serde_json::json!({
-            "modelTurns": 5,
-            "toolBatches": 2,
-            "toolCalls": 3
-        });
+        let mut json = serde_json::to_value(RunStats::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("permissionPrompts");
+        obj.remove("permissionDenials");
+        obj.remove("filesChangedCount");
+        obj.remove("verificationCommandsRun");
+        obj.remove("verificationFailures");
+        obj.remove("userSteers");
         let restored: RunStats = serde_json::from_value(json).unwrap();
         assert_eq!(restored.permission_prompts, 0);
         assert_eq!(restored.permission_denials, 0);

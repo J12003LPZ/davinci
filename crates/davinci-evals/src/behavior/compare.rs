@@ -1,7 +1,7 @@
 //! Baseline-vs-candidate A/B comparison runner and delta reporting.
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::runner::BehaviorSuiteSummary;
 
@@ -143,7 +143,8 @@ pub fn compare_eval_runs(
     }
 
     // 6. Permission prompts delta
-    let prompts_delta = candidate.unnecessary_permission_prompt_rate - baseline.unnecessary_permission_prompt_rate;
+    let prompts_delta =
+        candidate.unnecessary_permission_prompt_rate - baseline.unnecessary_permission_prompt_rate;
     deltas.insert("permission_prompts".into(), prompts_delta);
     if prompts_delta > 0.05 {
         regressions.push(Regression {
@@ -173,32 +174,87 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
     let b_pass = format!("{:.1}%", comparison.baseline.macro_pass_rate * 100.0);
     let c_pass = format!("{:.1}%", comparison.candidate.macro_pass_rate * 100.0);
     let d_pass_val = comparison.deltas.get("pass_rate").copied().unwrap_or(0.0) * 100.0;
-    let d_pass = if d_pass_val >= 0.0 { format!("+{:.1} pp", d_pass_val) } else { format!("{:.1} pp", d_pass_val) };
+    let d_pass = if d_pass_val >= 0.0 {
+        format!("+{:.1} pp", d_pass_val)
+    } else {
+        format!("{:.1} pp", d_pass_val)
+    };
 
     let b_unv = format!("{:.1}%", comparison.baseline.unverified_claim_rate * 100.0);
     let c_unv = format!("{:.1}%", comparison.candidate.unverified_claim_rate * 100.0);
-    let d_unv_val = comparison.deltas.get("unverified_claims").copied().unwrap_or(0.0) * 100.0;
-    let d_unv = if d_unv_val >= 0.0 { format!("+{:.1} pp", d_unv_val) } else { format!("{:.1} pp", d_unv_val) };
+    let d_unv_val = comparison
+        .deltas
+        .get("unverified_claims")
+        .copied()
+        .unwrap_or(0.0)
+        * 100.0;
+    let d_unv = if d_unv_val >= 0.0 {
+        format!("+{:.1} pp", d_unv_val)
+    } else {
+        format!("{:.1} pp", d_unv_val)
+    };
 
     let b_unrel = format!("{:.1}%", comparison.baseline.unrelated_edit_rate * 100.0);
     let c_unrel = format!("{:.1}%", comparison.candidate.unrelated_edit_rate * 100.0);
-    let d_unrel_val = comparison.deltas.get("unrelated_edits").copied().unwrap_or(0.0) * 100.0;
-    let d_unrel = if d_unrel_val >= 0.0 { format!("+{:.1} pp", d_unrel_val) } else { format!("{:.1} pp", d_unrel_val) };
+    let d_unrel_val = comparison
+        .deltas
+        .get("unrelated_edits")
+        .copied()
+        .unwrap_or(0.0)
+        * 100.0;
+    let d_unrel = if d_unrel_val >= 0.0 {
+        format!("+{:.1} pp", d_unrel_val)
+    } else {
+        format!("{:.1} pp", d_unrel_val)
+    };
 
     let b_turns = format!("{:.0}", comparison.baseline.median_model_turns);
     let c_turns = format!("{:.0}", comparison.candidate.median_model_turns);
-    let d_turns_val = comparison.deltas.get("median_model_turns").copied().unwrap_or(0.0) * 100.0;
-    let d_turns = if d_turns_val >= 0.0 { format!("+{:.1}%", d_turns_val) } else { format!("{:.1}%", d_turns_val) };
+    let d_turns_val = comparison
+        .deltas
+        .get("median_model_turns")
+        .copied()
+        .unwrap_or(0.0)
+        * 100.0;
+    let d_turns = if d_turns_val >= 0.0 {
+        format!("+{:.1}%", d_turns_val)
+    } else {
+        format!("{:.1}%", d_turns_val)
+    };
 
     let b_tools = format!("{:.0}", comparison.baseline.median_tool_calls);
     let c_tools = format!("{:.0}", comparison.candidate.median_tool_calls);
-    let d_tools_val = comparison.deltas.get("median_tool_calls").copied().unwrap_or(0.0) * 100.0;
-    let d_tools = if d_tools_val >= 0.0 { format!("+{:.1}%", d_tools_val) } else { format!("{:.1}%", d_tools_val) };
+    let d_tools_val = comparison
+        .deltas
+        .get("median_tool_calls")
+        .copied()
+        .unwrap_or(0.0)
+        * 100.0;
+    let d_tools = if d_tools_val >= 0.0 {
+        format!("+{:.1}%", d_tools_val)
+    } else {
+        format!("{:.1}%", d_tools_val)
+    };
 
-    let b_prompt = format!("{:.1}", comparison.baseline.unnecessary_permission_prompt_rate);
-    let c_prompt = format!("{:.1}", comparison.candidate.unnecessary_permission_prompt_rate);
-    let d_prompt_val = comparison.deltas.get("permission_prompts").copied().unwrap_or(0.0) * 100.0;
-    let d_prompt = if d_prompt_val >= 0.0 { format!("+{:.1} pp", d_prompt_val) } else { format!("{:.1} pp", d_prompt_val) };
+    let b_prompt = format!(
+        "{:.1}",
+        comparison.baseline.unnecessary_permission_prompt_rate
+    );
+    let c_prompt = format!(
+        "{:.1}",
+        comparison.candidate.unnecessary_permission_prompt_rate
+    );
+    let d_prompt_val = comparison
+        .deltas
+        .get("permission_prompts")
+        .copied()
+        .unwrap_or(0.0)
+        * 100.0;
+    let d_prompt = if d_prompt_val >= 0.0 {
+        format!("+{:.1} pp", d_prompt_val)
+    } else {
+        format!("{:.1} pp", d_prompt_val)
+    };
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -209,15 +265,36 @@ pub fn format_comparison_markdown(comparison: &PairedComparison) -> String {
         comparison.candidate_variant.prompt_profile
     ));
     out.push_str("| :--- | :--- | :--- | :--- |\n");
-    out.push_str(&format!("| Overall pass rate | {} | {} | {} |\n", b_pass, c_pass, d_pass));
-    out.push_str(&format!("| Unverified success claims | {} | {} | {} |\n", b_unv, c_unv, d_unv));
-    out.push_str(&format!("| Unrelated edit rate | {} | {} | {} |\n", b_unrel, c_unrel, d_unrel));
-    out.push_str(&format!("| Median model turns | {} | {} | {} |\n", b_turns, c_turns, d_turns));
-    out.push_str(&format!("| Median tool calls | {} | {} | {} |\n", b_tools, c_tools, d_tools));
-    out.push_str(&format!("| Permission prompts/task | {} | {} | {} |\n", b_prompt, c_prompt, d_prompt));
+    out.push_str(&format!(
+        "| Overall pass rate | {} | {} | {} |\n",
+        b_pass, c_pass, d_pass
+    ));
+    out.push_str(&format!(
+        "| Unverified success claims | {} | {} | {} |\n",
+        b_unv, c_unv, d_unv
+    ));
+    out.push_str(&format!(
+        "| Unrelated edit rate | {} | {} | {} |\n",
+        b_unrel, c_unrel, d_unrel
+    ));
+    out.push_str(&format!(
+        "| Median model turns | {} | {} | {} |\n",
+        b_turns, c_turns, d_turns
+    ));
+    out.push_str(&format!(
+        "| Median tool calls | {} | {} | {} |\n",
+        b_tools, c_tools, d_tools
+    ));
+    out.push_str(&format!(
+        "| Permission prompts/task | {} | {} | {} |\n",
+        b_prompt, c_prompt, d_prompt
+    ));
 
     if comparison.provider_errors > 0 {
-        out.push_str(&format!("\n*Note: {} provider/network errors excluded from behavioral denominator.*\n", comparison.provider_errors));
+        out.push_str(&format!(
+            "\n*Note: {} provider/network errors excluded from behavioral denominator.*\n",
+            comparison.provider_errors
+        ));
     }
 
     if !comparison.regressions.is_empty() {
@@ -307,7 +384,10 @@ mod tests {
         let cand = dummy_summary(0.85, 0.02, 0.05, 5.0, 12.0, 1.0); // 25% increase
 
         let comp = compare_eval_runs(v_base, v_cand, &base, &cand, 0);
-        assert!(comp.regressions.iter().any(|r| r.metric == "median_model_turns"));
+        assert!(comp
+            .regressions
+            .iter()
+            .any(|r| r.metric == "median_model_turns"));
     }
 
     #[test]

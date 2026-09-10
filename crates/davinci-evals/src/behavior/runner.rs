@@ -1,7 +1,7 @@
 //! Behavior evaluation runner and suite score aggregation.
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::scenario::BehaviorScenario;
 use super::scorer::{score_trace, ScoreCard};
@@ -73,13 +73,19 @@ pub fn aggregate_suite_scores(
         model_turns.push(trace.stats.model_turns as f64);
         tool_calls.push(trace.stats.tool_calls as f64);
 
-        let has_claim = trace.events.iter().any(|e| matches!(e, BehaviorEvent::VerificationClaim { .. }));
+        let has_claim = trace
+            .events
+            .iter()
+            .any(|e| matches!(e, BehaviorEvent::VerificationClaim { .. }));
         let has_passed_verification = trace.verification.iter().any(|v| v.passed);
         if has_claim && !has_passed_verification {
             unverified_claims_count += 1;
         }
 
-        let unrelated_changed = card.hard_failures.iter().any(|f| f.contains("unrelated files"));
+        let unrelated_changed = card
+            .hard_failures
+            .iter()
+            .any(|f| f.contains("unrelated files"));
         if unrelated_changed {
             unrelated_edits_count += 1;
         }
@@ -111,17 +117,16 @@ pub fn aggregate_suite_scores(
     }
 }
 
-pub fn evaluate_scenario_trace(
-    scenario: &BehaviorScenario,
-    trace: &BehaviorTrace,
-) -> ScoreCard {
+pub fn evaluate_scenario_trace(scenario: &BehaviorScenario, trace: &BehaviorTrace) -> ScoreCard {
     score_trace(scenario, trace)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behavior::scenario::{BehaviorCategory, BehaviorLimits, BehaviorRequirement, BehaviorScenario};
+    use crate::behavior::scenario::{
+        BehaviorCategory, BehaviorLimits, BehaviorRequirement, BehaviorScenario,
+    };
     use crate::behavior::trace::{BehaviorEvent, BehaviorTrace};
 
     #[test]
@@ -131,7 +136,9 @@ mod tests {
             category: BehaviorCategory::Exploration,
             request: "r1".into(),
             repo_fixture: "f1".into(),
-            requirements: vec![BehaviorRequirement::ToolUsed { tool: "grep".into() }],
+            requirements: vec![BehaviorRequirement::ToolUsed {
+                tool: "grep".into(),
+            }],
             limits: BehaviorLimits::default(),
         };
 
@@ -165,18 +172,24 @@ mod tests {
         let card2 = evaluate_scenario_trace(&scen2, &trace2);
         assert!(!card2.passed);
 
-        let results = vec![
-            (&scen1, &trace1, &card1),
-            (&scen2, &trace2, &card2),
-        ];
+        let results = vec![(&scen1, &trace1, &card1), (&scen2, &trace2, &card2)];
 
         let summary = aggregate_suite_scores(&results);
 
         assert_eq!(summary.total_scenarios, 2);
         assert_eq!(summary.passed_scenarios, 1);
         assert_eq!(summary.macro_pass_rate, 0.5);
-        assert_eq!(summary.category_pass_rates.get("exploration").copied(), Some(1.0));
-        assert_eq!(summary.category_pass_rates.get("verification_integrity").copied(), Some(0.0));
+        assert_eq!(
+            summary.category_pass_rates.get("exploration").copied(),
+            Some(1.0)
+        );
+        assert_eq!(
+            summary
+                .category_pass_rates
+                .get("verification_integrity")
+                .copied(),
+            Some(0.0)
+        );
         assert_eq!(summary.unverified_claim_rate, 0.5);
         assert_eq!(summary.median_model_turns, 4.0);
     }

@@ -36,7 +36,12 @@ pub fn prompt_model_family(provider: &str, model_id: &str) -> PromptModelFamily 
         PromptModelFamily::Gemini
     } else if p.contains("mistral") || m.contains("codestral") {
         PromptModelFamily::Mistral
-    } else if p.contains("openai") || m.starts_with("o1") || m.starts_with("o3") || m.contains("gpt-5") || m.contains("codex") {
+    } else if p.contains("openai")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.contains("gpt-5")
+        || m.contains("codex")
+    {
         PromptModelFamily::OpenAiReasoning
     } else {
         PromptModelFamily::Generic

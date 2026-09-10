@@ -144,7 +144,8 @@ pub fn persist_behavior_trace_artifacts(
 
     let manifest_path = if let Some(manifest) = &trace.prompt_manifest {
         let p = scenario_dir.join("prompt-manifest.json");
-        let manifest_json = serde_json::to_string_pretty(manifest).map_err(|err| err.to_string())?;
+        let manifest_json =
+            serde_json::to_string_pretty(manifest).map_err(|err| err.to_string())?;
         std::fs::write(&p, manifest_json).map_err(|err| err.to_string())?;
         Some(p)
     } else {
@@ -255,4 +256,3 @@ mod tests {
         assert_eq!(read_trace.scenario_id, "scen-1");
     }
 }
-

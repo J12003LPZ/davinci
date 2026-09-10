@@ -518,7 +518,9 @@ mod tests {
 
         let bad = args(&["--prompt-profile", "unknown"]);
         assert_eq!(bad.prompt_profile, None);
-        assert!(bad.diagnostics.iter().any(|d| d.kind == "error" && d.message.contains("Invalid prompt profile")));
+        assert!(bad
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == "error" && d.message.contains("Invalid prompt profile")));
     }
 }
-

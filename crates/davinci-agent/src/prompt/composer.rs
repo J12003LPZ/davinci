@@ -204,7 +204,12 @@ pub fn compose_with_mutations(
 mod tests {
     use super::*;
 
-    fn fixture_module(id: &str, version: u32, cache_class: PromptCacheClass, body: &str) -> PromptModule {
+    fn fixture_module(
+        id: &str,
+        version: u32,
+        cache_class: PromptCacheClass,
+        body: &str,
+    ) -> PromptModule {
         PromptModule {
             id: id.to_string(),
             version,

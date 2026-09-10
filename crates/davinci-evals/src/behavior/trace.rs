@@ -165,9 +165,7 @@ impl BehaviorTrace {
                     trace.stats.model_turns += 1;
                 }
                 AgentEvent::ToolExecutionStart {
-                    tool_name,
-                    args,
-                    ..
+                    tool_name, args, ..
                 } => {
                     trace.stats.tool_calls += 1;
                     match tool_name.as_str() {
@@ -178,8 +176,14 @@ impl BehaviorTrace {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let start = args.get("start").or_else(|| args.get("offset")).and_then(|v| v.as_u64());
-                            let end = args.get("end").or_else(|| args.get("limit")).and_then(|v| v.as_u64());
+                            let start = args
+                                .get("start")
+                                .or_else(|| args.get("offset"))
+                                .and_then(|v| v.as_u64());
+                            let end = args
+                                .get("end")
+                                .or_else(|| args.get("limit"))
+                                .and_then(|v| v.as_u64());
                             trace.events.push(BehaviorEvent::Read { path, start, end });
                         }
                         "grep" | "find" | "web_search" | "code_search" => {
@@ -227,12 +231,23 @@ impl BehaviorTrace {
                     is_error,
                     ..
                 } => {
-                    if tool_name == "bash" || tool_name == "powershell" || tool_name == "exec_command" {
+                    if tool_name == "bash"
+                        || tool_name == "powershell"
+                        || tool_name == "exec_command"
+                    {
                         let class = pending_shell_class.take().unwrap_or("other");
                         let exit_code = if *is_error {
-                            result.get("exit_code").and_then(|v| v.as_i64()).map(|c| c as i32).or(Some(1))
+                            result
+                                .get("exit_code")
+                                .and_then(|v| v.as_i64())
+                                .map(|c| c as i32)
+                                .or(Some(1))
                         } else {
-                            result.get("exit_code").and_then(|v| v.as_i64()).map(|c| c as i32).or(Some(0))
+                            result
+                                .get("exit_code")
+                                .and_then(|v| v.as_i64())
+                                .map(|c| c as i32)
+                                .or(Some(0))
                         };
 
                         trace.events.push(BehaviorEvent::Shell {
@@ -262,9 +277,14 @@ impl BehaviorTrace {
                     if message.role == "assistant" {
                         let text = content_text(&message.content);
                         for claim in detect_verification_claims(&text) {
-                            trace.events.push(BehaviorEvent::VerificationClaim { claim });
+                            trace
+                                .events
+                                .push(BehaviorEvent::VerificationClaim { claim });
                         }
-                        let has_tool_calls = message.content.iter().any(|b| matches!(b, MessageContent::ToolCall { .. }));
+                        let has_tool_calls = message
+                            .content
+                            .iter()
+                            .any(|b| matches!(b, MessageContent::ToolCall { .. }));
                         if !has_tool_calls && !text.is_empty() {
                             trace.events.push(BehaviorEvent::FinalResponse);
                         }
@@ -391,7 +411,10 @@ mod tests {
         assert_eq!(classify_shell_command("pytest -v tests/"), "test");
         assert_eq!(classify_shell_command("npm test"), "test");
         assert_eq!(classify_shell_command("cargo build --release"), "build");
-        assert_eq!(classify_shell_command("cargo clippy -- -D warnings"), "lint");
+        assert_eq!(
+            classify_shell_command("cargo clippy -- -D warnings"),
+            "lint"
+        );
         assert_eq!(classify_shell_command("git status"), "git");
         assert_eq!(classify_shell_command("ls -la"), "search");
         assert_eq!(classify_shell_command("curl http://example.com"), "other");

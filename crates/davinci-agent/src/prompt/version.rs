@@ -65,9 +65,18 @@ mod tests {
     #[test]
     fn parse_and_id_profiles() {
         assert_eq!(PromptProfile::parse("stable"), Some(PromptProfile::Stable));
-        assert_eq!(PromptProfile::parse("preview"), Some(PromptProfile::Preview));
-        assert_eq!(PromptProfile::parse("legacy-v1"), Some(PromptProfile::LegacyV1));
-        assert_eq!(PromptProfile::parse("legacy"), Some(PromptProfile::LegacyV1));
+        assert_eq!(
+            PromptProfile::parse("preview"),
+            Some(PromptProfile::Preview)
+        );
+        assert_eq!(
+            PromptProfile::parse("legacy-v1"),
+            Some(PromptProfile::LegacyV1)
+        );
+        assert_eq!(
+            PromptProfile::parse("legacy"),
+            Some(PromptProfile::LegacyV1)
+        );
         assert_eq!(PromptProfile::parse("v1"), Some(PromptProfile::LegacyV1));
         assert_eq!(PromptProfile::parse("unknown"), None);
 

@@ -1,11 +1,11 @@
 //! Generic isolated command runner for external harnesses.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct ExternalTask {
@@ -83,7 +83,11 @@ pub struct CommandHarness {
 }
 
 impl CommandHarness {
-    pub fn new(name: impl Into<String>, binary: impl Into<PathBuf>, extra_args: Vec<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        binary: impl Into<PathBuf>,
+        extra_args: Vec<String>,
+    ) -> Self {
         Self {
             harness_name: name.into(),
             binary: binary.into(),
@@ -112,8 +116,8 @@ impl ExternalHarness for CommandHarness {
 
     fn run(&self, task: &ExternalTask) -> Result<ExternalRun, String> {
         // 1. Isolate into temporary workspace directory
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| format!("Failed to create temp sandbox: {e}"))?;
+        let temp_dir =
+            tempfile::tempdir().map_err(|e| format!("Failed to create temp sandbox: {e}"))?;
         let isolated_repo = temp_dir.path().join("workspace");
         copy_dir_all(&task.repo_path, &isolated_repo)
             .map_err(|e| format!("Failed to copy repo to sandbox: {e}"))?;
@@ -132,7 +136,8 @@ impl ExternalHarness for CommandHarness {
         cmd.stderr(Stdio::piped());
 
         let start = Instant::now();
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("Failed to spawn {}: {e}", self.binary.display()))?;
 
         // 4. Wait with timeout
@@ -154,7 +159,8 @@ impl ExternalHarness for CommandHarness {
         let exit_code = status.code().unwrap_or(-1);
 
         // 5. Read output and save transcript
-        let output = child.wait_with_output()
+        let output = child
+            .wait_with_output()
             .map_err(|e| format!("Failed to read command output: {e}"))?;
         let transcript_path = temp_dir.path().join("transcript.log");
         let mut full_output = Vec::new();
@@ -213,7 +219,8 @@ mod tests {
             "import sys\nwith open('new_file.txt', 'w') as f:\n    f.write('created')\nwith open('hello.txt', 'w') as f:\n    f.write('modified')\nprint('done')\nsys.exit(0)\n"
         ).unwrap();
 
-        let harness = CommandHarness::new("fake", "python", vec![script.to_string_lossy().to_string()]);
+        let harness =
+            CommandHarness::new("fake", "python", vec![script.to_string_lossy().to_string()]);
         assert!(harness.available().unwrap());
 
         let task = ExternalTask {
@@ -238,7 +245,8 @@ mod tests {
         let script = repo.path().join("slow_runner.py");
         fs::write(&script, "import time\ntime.sleep(5)\n").unwrap();
 
-        let harness = CommandHarness::new("slow", "python", vec![script.to_string_lossy().to_string()]);
+        let harness =
+            CommandHarness::new("slow", "python", vec![script.to_string_lossy().to_string()]);
 
         let task = ExternalTask {
             repo_path: repo.path().to_path_buf(),

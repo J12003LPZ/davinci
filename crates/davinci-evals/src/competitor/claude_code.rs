@@ -1,7 +1,7 @@
 //! Optional Claude Code differential adapter and fair comparison reporter.
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use super::command::{CommandHarness, ExternalHarness, ExternalRun, ExternalTask};
 
@@ -82,29 +82,70 @@ pub fn format_competitor_report_markdown(report: &CompetitorComparisonReport) ->
     md.push_str("## External Harness Differential Report\n\n");
 
     md.push_str("### Fair Comparison Disclosure\n");
-    md.push_str(&format!("- **DaVinci version**: {}\n", report.metadata.davinci_version));
-    md.push_str(&format!("- **Competitor**: {} ({})\n",
+    md.push_str(&format!(
+        "- **DaVinci version**: {}\n",
+        report.metadata.davinci_version
+    ));
+    md.push_str(&format!(
+        "- **Competitor**: {} ({})\n",
         report.metadata.competitor_name,
-        report.metadata.competitor_version.as_deref().unwrap_or("unknown")
+        report
+            .metadata
+            .competitor_version
+            .as_deref()
+            .unwrap_or("unknown")
     ));
-    md.push_str(&format!("- **DaVinci Model**: {}\n", report.metadata.davinci_model));
-    md.push_str(&format!("- **Competitor Model**: {}\n", report.metadata.competitor_model));
-    md.push_str(&format!("- **Models Controlled (Identical)**: {}\n",
-        if report.metadata.models_controlled { "YES (Identical underlying model)" } else { "NO (Different models: harness-only comparison not claimed)" }
+    md.push_str(&format!(
+        "- **DaVinci Model**: {}\n",
+        report.metadata.davinci_model
     ));
-    md.push_str(&format!("- **Permission Mode**: {}\n", report.metadata.permission_mode));
-    md.push_str(&format!("- **Timeout**: {}s\n", report.metadata.timeout_seconds));
-    md.push_str(&format!("- **Repo Snapshot**: {}\n\n", report.metadata.repo_snapshot_hash));
+    md.push_str(&format!(
+        "- **Competitor Model**: {}\n",
+        report.metadata.competitor_model
+    ));
+    md.push_str(&format!(
+        "- **Models Controlled (Identical)**: {}\n",
+        if report.metadata.models_controlled {
+            "YES (Identical underlying model)"
+        } else {
+            "NO (Different models: harness-only comparison not claimed)"
+        }
+    ));
+    md.push_str(&format!(
+        "- **Permission Mode**: {}\n",
+        report.metadata.permission_mode
+    ));
+    md.push_str(&format!(
+        "- **Timeout**: {}s\n",
+        report.metadata.timeout_seconds
+    ));
+    md.push_str(&format!(
+        "- **Repo Snapshot**: {}\n\n",
+        report.metadata.repo_snapshot_hash
+    ));
 
     md.push_str("### Observable Results\n");
     md.push_str("| Metric | DaVinci | Competitor |\n");
     md.push_str("| :--- | :--- | :--- |\n");
-    md.push_str(&format!("| Task Correctness | {} | {} |\n",
-        if report.davinci_passed { "PASS" } else { "FAIL" },
-        if report.competitor_passed { "PASS" } else { "FAIL" }
+    md.push_str(&format!(
+        "| Task Correctness | {} | {} |\n",
+        if report.davinci_passed {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        if report.competitor_passed {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     ));
-    md.push_str(&format!("| Wall Time | {} ms | {} ms |\n", report.davinci_wall_ms, report.competitor_wall_ms));
-    md.push_str(&format!("| Files Changed Count | {} | {} |\n",
+    md.push_str(&format!(
+        "| Wall Time | {} ms | {} ms |\n",
+        report.davinci_wall_ms, report.competitor_wall_ms
+    ));
+    md.push_str(&format!(
+        "| Files Changed Count | {} | {} |\n",
         report.davinci_files_changed.len(),
         report.competitor_files_changed.len()
     ));

@@ -254,7 +254,9 @@ impl LocalBehaviorReport {
         let matching: Vec<&BehaviorTelemetry> = if profile.is_empty() {
             runs.iter().collect()
         } else {
-            runs.iter().filter(|r| r.prompt_profile == profile).collect()
+            runs.iter()
+                .filter(|r| r.prompt_profile == profile)
+                .collect()
         };
         let profile_label = if profile.is_empty() {
             if let Some(first) = matching.first() {

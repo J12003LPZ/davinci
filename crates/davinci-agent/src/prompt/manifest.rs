@@ -80,7 +80,12 @@ mod tests {
     use crate::permission::PermissionMode;
     use crate::prompt::composer::{compose_default_prompt, compose_modules, PromptContext};
 
-    fn fixture_module(id: &str, version: u32, cache_class: PromptCacheClass, body: &str) -> PromptModule {
+    fn fixture_module(
+        id: &str,
+        version: u32,
+        cache_class: PromptCacheClass,
+        body: &str,
+    ) -> PromptModule {
         PromptModule {
             id: id.to_string(),
             version,
