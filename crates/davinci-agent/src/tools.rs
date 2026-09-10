@@ -181,17 +181,17 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "grep".into(),
-            description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore.".into(),
+            description: "Search repository text and return matching file paths, line numbers, and optional context. Respects .gitignore. Use it to locate symbols, strings, config keys, and call sites before opening broader files.".into(),
             parameters: serde_json::json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"number"},"limit":{"type":"number"}},"required":["pattern"]}),
         },
         AgentTool {
             name: "find".into(),
-            description: "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore.".into(),
+            description: "Search for files by glob pattern relative to the search directory. Respects .gitignore. Use to find file locations without reading contents.".into(),
             parameters: serde_json::json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"number"}},"required":["pattern"]}),
         },
         AgentTool {
             name: "ls".into(),
-            description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles.".into(),
+            description: "List directory contents sorted alphabetically with '/' suffix for directories. Includes dotfiles. Use to inspect folder layout.".into(),
             parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"number"}}}),
         },
         AgentTool {
@@ -241,7 +241,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "apply_patch".into(),
-            description: "Apply a patch using the Codex patch format (*** Begin Patch ... *** End Patch). Supports Add File, Update File with hunks, and Delete File.".into(),
+            description: "Apply structured multi-file or multi-hunk patches in Codex format (*** Begin Patch ... *** End Patch). Supports Add, Update, and Delete file operations. Prefer edit for small single-file replacements.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -255,7 +255,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "exec_command".into(),
-            description: "Start a bounded shell command using the platform-appropriate shell (PowerShell on Windows, bash/sh on Unix).".into(),
+            description: "Start a bounded shell command using the platform-appropriate shell (PowerShell on Windows, bash/sh on Unix). Supports background execution.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -273,12 +273,12 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "propose_plan".into(),
-            description: "Create or revise the session's structured implementation plan after inspecting repository files. Include source evidence, assumptions, material open decisions, concrete steps, dependencies and validation. Use stable step IDs and expected_revision (initially 0); unspecified steps are retained. This tool never edits implementation files or approves its own output. The user reviews with /plan and approves with /plan approve.".into(),
+            description: "Create or revise the session's structured implementation plan after inspecting repository files. Include source evidence, assumptions, concrete steps, dependencies, and validation. Never edits implementation files or approves itself.".into(),
             parameters: crate::living_plan::tool_parameters(),
         },
         AgentTool {
             name: "update_plan".into(),
-            description: "Track execution progress using plan:[{step,status}] or legacy items:[{text,status}]. This ledger never approves a plan or changes permissions; use propose_plan for evidence-backed implementation decisions.".into(),
+            description: "Track execution progress using plan:[{step,status}]. This progress ledger never approves a plan or changes permissions; use propose_plan for evidence-backed implementation decisions.".into(),
             parameters: update_plan_parameters(),
         },
         AgentTool {
@@ -301,6 +301,35 @@ pub fn tool_specs() -> Vec<AgentTool> {
         specs.extend(crate::runtime::workflow_tool_specs());
     }
     specs
+}
+
+pub fn validate_builtin_tool_descriptions(specs: &[AgentTool]) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    for tool in specs {
+        if tool.description.trim().is_empty() {
+            errors.push(format!("Tool '{}' has an empty description", tool.name));
+            continue;
+        }
+        if tool.description.len() > 700 {
+            errors.push(format!(
+                "Tool '{}' description exceeds 700 characters (length: {})",
+                tool.name,
+                tool.description.len()
+            ));
+        }
+        let lower = tool.description.to_lowercase();
+        if lower.contains("unrestricted") || lower.contains("bypass permission") {
+            errors.push(format!(
+                "Tool '{}' claims authority that contradicts permission engine",
+                tool.name
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 pub fn execute_tool(

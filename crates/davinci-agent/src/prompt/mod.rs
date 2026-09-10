@@ -21,4 +21,5 @@ pub use composer::{
 pub use core::{core_autonomy_module, core_identity_module};
 pub use manifest::{PromptManifest, PromptModuleIdentity};
 pub use runtime_state::{runtime_state_module, runtime_state_text, RuntimePromptState};
+pub use tool_strategy::tool_strategy_module;
 pub use verification::verification_completion_module;

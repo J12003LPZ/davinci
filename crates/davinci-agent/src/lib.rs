@@ -26,7 +26,7 @@ mod subagent;
 mod templates;
 pub mod todo;
 pub mod tool_ledger;
-mod tools;
+pub mod tools;
 mod turn;
 pub mod web;
 
@@ -90,8 +90,8 @@ pub use tool_ledger::{
     classify_side_effect, ToolCallLedger, ToolCallRecord, ToolExecutionStatus, ToolSideEffect,
 };
 pub use tools::{
-    execute_tool, execute_tool_with, tool_specs, AgentTool, ToolContext, ToolError, ToolResult,
-    BUILTIN_TOOLS, CODEX_HOT_TOOLS,
+    execute_tool, execute_tool_with, tool_specs, validate_builtin_tool_descriptions, AgentTool,
+    ToolContext, ToolError, ToolResult, BUILTIN_TOOLS, CODEX_HOT_TOOLS,
 };
 pub use turn::retry_delay_ms;
 
