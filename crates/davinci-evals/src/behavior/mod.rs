@@ -1,6 +1,7 @@
 //! Behavioral reliability evaluation module.
 
 pub mod compare;
+pub mod gate;
 pub mod mutation;
 pub mod runner;
 pub mod scenario;
@@ -10,6 +11,7 @@ pub mod trace;
 pub use compare::{
     compare_eval_runs, format_comparison_markdown, EvalVariant, PairedComparison, Regression,
 };
+pub use gate::{evaluate_gate, GateResult, RegressionBudget};
 pub use mutation::{
     audit_dead_prompt_modules, evaluate_ablation, AblationResult, DeadPromptAudit,
 };

@@ -1,0 +1,43 @@
+name: Behavioral Reliability Evals
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Behavior suite to run'
+        required: true
+        default: 'core-200'
+      candidate_profile:
+        description: 'Candidate prompt profile'
+        required: true
+        default: 'preview'
+  schedule:
+    # Weekly run on Sunday midnight UTC
+    - cron: '0 0 * * 0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  eval-matrix:
+    if: github.repository == 'earendil-works/pi' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        model_family: [anthropic, openai, gemini]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Run offline behavioral suite verification
+        run: cargo test -p davinci-evals behavior:: -- --nocapture
+      - name: Run gate verification
+        run: cargo test -p davinci-evals behavior::gate -- --nocapture
+      - name: Upload eval test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: behavior-eval-${{ matrix.model_family }}
+          path: |
+            crates/davinci-evals/fixtures/behavior/core-200.json

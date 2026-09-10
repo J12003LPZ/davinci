@@ -37,6 +37,8 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Prompt and behavioral contracts
+        run: cargo test -p davinci-agent prompt:: && cargo test -p davinci-evals behavior::
       - name: Ecosystem integration
         run: cargo test -p davinci-coding-agent ecosystem_loop_ -- --nocapture
       - name: Ecosystem invariants
