@@ -2925,6 +2925,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_drive_and_unc_path_containment() {
         let root = PathBuf::from("C:\\work\\proj");

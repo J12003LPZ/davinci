@@ -70,7 +70,11 @@ pub fn normalize_relative_path(raw: &str) -> Result<String, ContractError> {
         return Err(ContractError::AlternateDataStream(raw.to_string()));
     }
 
-    let p = Path::new(raw);
+    // Contract paths use a platform-neutral syntax: both separators are accepted
+    // at the boundary, then normalized to forward slashes before host Path parsing.
+    // Unix otherwise treats a backslash as an ordinary filename character.
+    let portable = raw.replace(char::from(92), "/");
+    let p = Path::new(&portable);
     let mut normalized_parts = Vec::new();
 
     for component in p.components() {
