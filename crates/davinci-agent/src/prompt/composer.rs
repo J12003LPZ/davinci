@@ -30,6 +30,7 @@ pub struct ComposedPrompt {
     pub text: String,
     pub stable_text: String,
     pub dynamic_text: String,
+    pub manifest: crate::prompt::manifest::PromptManifest,
 }
 
 fn join_modules(modules: &[&PromptModule]) -> String {
@@ -62,10 +63,19 @@ pub fn compose_modules(modules: &[PromptModule]) -> ComposedPrompt {
         (true, true) => String::new(),
     };
 
+    let manifest = crate::prompt::manifest::PromptManifest::from_parts(
+        "default",
+        version::STABLE_PROMPT_VERSION,
+        modules,
+        &stable_text,
+        &text,
+    );
+
     ComposedPrompt {
         text,
         stable_text,
         dynamic_text,
+        manifest,
     }
 }
 

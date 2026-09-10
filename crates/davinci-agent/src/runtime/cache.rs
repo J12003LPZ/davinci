@@ -167,6 +167,18 @@ pub fn hash_system_prompt(prompt: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// Compute a SHA-256 hash of a system prompt, preferring stable_sha256 from manifest if available.
+pub fn hash_system_prompt_with_manifest(
+    prompt: &str,
+    manifest: Option<&crate::prompt::manifest::PromptManifest>,
+) -> String {
+    if let Some(m) = manifest {
+        m.stable_sha256.clone()
+    } else {
+        hash_system_prompt(prompt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

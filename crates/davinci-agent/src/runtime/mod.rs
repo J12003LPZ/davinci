@@ -21,7 +21,10 @@ pub mod workflow;
 pub mod worktree;
 
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
-pub use cache::{hash_system_prompt, hash_tool_names, CacheIdentity, CacheMissReason};
+pub use cache::{
+    hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names, CacheIdentity,
+    CacheMissReason,
+};
 pub use cancellation::CancellationToken;
 pub use capabilities::{
     builtin_capabilities, compute_schema_hash, CapabilitySource, RuntimeCapability,

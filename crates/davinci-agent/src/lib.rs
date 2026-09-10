@@ -96,12 +96,16 @@ pub use tools::{
 pub use turn::retry_delay_ms;
 
 pub mod runtime;
+pub use prompt::{
+    compose_default_prompt, compose_legacy_default, compose_modules, ComposedPrompt,
+    PromptCacheClass, PromptContext, PromptManifest, PromptModule, PromptModuleIdentity,
+};
 pub use runtime::{
-    find_saved_workflow, hash_system_prompt, hash_tool_names, save_workflow_to_project,
-    wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState, CacheIdentity,
-    CacheMissReason, CancellationToken, CapabilitySource, ContextBroker, ContextItem,
-    ContextPacket, ContextRequest, ContextSource, PhaseStatus, RegistryError, RunId, RuntimeBus,
-    RuntimeCapability, RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent,
+    find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
+    save_workflow_to_project, wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState,
+    CacheIdentity, CacheMissReason, CancellationToken, CapabilitySource, ContextBroker,
+    ContextItem, ContextPacket, ContextRequest, ContextSource, PhaseStatus, RegistryError, RunId,
+    RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent,
     RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, TaskError, TaskId,
     TaskRecord, TaskRegistry, TaskState, WorkflowExecutor, WorkflowId, WorkflowSpec,
     WorkflowStateStore, WorkflowStatus, WorktreeError, WorktreeLease, WorktreeManager,
@@ -271,13 +275,22 @@ pub struct Agent {
     provider_context_overhead_tokens: Option<u64>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
     pub runtime: Option<RuntimeHandle>,
+    /// Active prompt manifest identifying modules, hashes, and token budgets.
+    pub prompt_manifest: Option<PromptManifest>,
 }
 
 impl Agent {
     pub fn new(system_prompt: impl Into<String>) -> Self {
         let system_prompt = system_prompt.into();
+        let legacy = prompt::compose_legacy_default();
+        let (prompt_manifest, system_prompt) = if system_prompt == legacy.text {
+            (Some(legacy.manifest), legacy.text)
+        } else {
+            (None, system_prompt)
+        };
         Self {
             system_prompt: system_prompt.clone(),
+            prompt_manifest,
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             auto_compaction: true,
