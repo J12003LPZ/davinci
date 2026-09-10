@@ -115,6 +115,10 @@ pub fn stable_v2_modules() -> Vec<PromptModule> {
 
 pub fn compose_default_prompt(ctx: &PromptContext<'_>) -> ComposedPrompt {
     let mut modules = stable_v2_modules();
+    let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
+    if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
+        modules.push(adapter);
+    }
     modules.push(crate::prompt::runtime_state::runtime_state_module(
         &crate::prompt::runtime_state::RuntimePromptState {
             permission_mode: ctx.permission_mode,
