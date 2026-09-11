@@ -8,6 +8,7 @@ pub mod core;
 pub mod manifest;
 pub mod provider;
 pub mod runtime_state;
+pub mod session;
 pub mod tool_strategy;
 pub mod verification;
 pub mod version;
@@ -31,6 +32,7 @@ pub use provider::{
     prompt_model_family, provider_adapter, PromptModelFamily, PROVIDER_ADAPTER_MAX_TOKENS,
 };
 pub use runtime_state::{runtime_state_module, runtime_state_text, RuntimePromptState};
+pub use session::{PromptSessionState, PromptSource};
 pub use tool_strategy::tool_strategy_module;
 pub use verification::verification_completion_module;
 pub use version::{

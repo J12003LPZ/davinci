@@ -98,7 +98,10 @@ pub fn legacy_default_module() -> PromptModule {
 }
 
 pub fn compose_legacy_default() -> ComposedPrompt {
-    compose_modules(&[legacy_default_module()])
+    let mut composed = compose_modules(&[legacy_default_module()]);
+    composed.manifest.profile = version::PromptProfile::LegacyV1.id().to_string();
+    composed.manifest.profile_version = version::PromptProfile::LegacyV1.version();
+    composed
 }
 
 pub fn stable_v2_modules() -> Vec<PromptModule> {

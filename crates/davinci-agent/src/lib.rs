@@ -295,6 +295,8 @@ pub struct Agent {
     pub runtime: Option<RuntimeHandle>,
     /// Active prompt manifest identifying modules, hashes, and token budgets.
     pub prompt_manifest: Option<PromptManifest>,
+    /// Active prompt session state distinguishing built-in profiles from custom replacement prompts.
+    pub prompt_session: prompt::PromptSessionState,
     /// Exact host session source and lineage captured at runtime installation.
     /// Separate from mutable public session/runtime fields to reject stale reuse.
     runtime_session: Option<(PathBuf, String, RunId)>,
@@ -304,14 +306,31 @@ impl Agent {
     pub fn new(system_prompt: impl Into<String>) -> Self {
         let system_prompt = system_prompt.into();
         let legacy = prompt::compose_legacy_default();
-        let (prompt_manifest, system_prompt) = if system_prompt == legacy.text {
-            (Some(legacy.manifest), legacy.text)
+        let (prompt_manifest, system_prompt, prompt_session) = if system_prompt == legacy.text {
+            let session = prompt::PromptSessionState {
+                source: prompt::PromptSource::Builtin {
+                    profile: prompt::PromptProfile::LegacyV1,
+                },
+                append_text: Vec::new(),
+                last_manifest: Some(legacy.manifest.clone()),
+                stable_bundle_hash: Some(legacy.manifest.stable_sha256.clone()),
+            };
+            (Some(legacy.manifest), legacy.text, session)
         } else {
-            (None, system_prompt)
+            let session = prompt::PromptSessionState {
+                source: prompt::PromptSource::CustomReplacement {
+                    text: system_prompt.clone(),
+                },
+                append_text: Vec::new(),
+                last_manifest: None,
+                stable_bundle_hash: None,
+            };
+            (None, system_prompt, session)
         };
         Self {
             system_prompt: system_prompt.clone(),
             prompt_manifest,
+            prompt_session,
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             auto_compaction: true,
@@ -376,6 +395,22 @@ impl Agent {
             runtime: None,
             runtime_session: None,
         }
+    }
+
+    pub fn new_builtin(profile: prompt::PromptProfile) -> Self {
+        let default_mode = PermissionPolicy::default().mode;
+        let ctx = prompt::composer::PromptContext {
+            provider: "google",
+            model_id: "",
+            permission_mode: default_mode,
+            plan_active: default_mode == PermissionMode::ReadOnly,
+        };
+        let mut session = prompt::PromptSessionState::builtin(profile);
+        let composed = session.render_and_record(&ctx);
+        let mut agent = Self::new(&composed.text);
+        agent.prompt_manifest = Some(composed.manifest);
+        agent.prompt_session = session;
+        agent
     }
 
     pub fn set_runtime(&mut self, runtime: RuntimeHandle) {
@@ -2027,6 +2062,44 @@ mod tests {
         agent.reset_system_prompt_to_base();
 
         assert_eq!(agent.system_prompt, "base prompt");
+    }
+
+    #[test]
+    fn agent_new_compatibility_distinguishes_custom_and_legacy() {
+        let custom = Agent::new("custom prompt");
+        assert!(custom.prompt_session.is_custom());
+        assert!(custom.prompt_manifest.is_none());
+        assert_eq!(custom.system_prompt, "custom prompt");
+
+        let legacy = Agent::new(default_system_prompt());
+        assert!(legacy.prompt_session.is_builtin());
+        assert_eq!(
+            legacy.prompt_session.profile(),
+            Some(prompt::PromptProfile::LegacyV1)
+        );
+        assert!(legacy.prompt_manifest.is_some());
+        assert_eq!(
+            legacy.prompt_manifest.as_ref().unwrap().profile,
+            "legacy-v1"
+        );
+    }
+
+    #[test]
+    fn agent_new_builtin_activates_specified_profile() {
+        let agent = Agent::new_builtin(prompt::PromptProfile::Stable);
+        assert!(agent.prompt_session.is_builtin());
+        assert_eq!(
+            agent.prompt_session.profile(),
+            Some(prompt::PromptProfile::Stable)
+        );
+        assert!(agent.prompt_manifest.is_some());
+        let manifest = agent.prompt_manifest.as_ref().unwrap();
+        assert_eq!(manifest.profile, "stable");
+        assert_eq!(
+            agent.prompt_session.stable_bundle_hash.as_deref(),
+            Some(manifest.stable_sha256.as_str())
+        );
+        assert!(agent.system_prompt.contains("DaVinci"));
     }
 
     #[test]
