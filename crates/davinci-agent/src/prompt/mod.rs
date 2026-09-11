@@ -19,7 +19,8 @@ pub use bundle::{
     PromptCandidateDescriptor,
 };
 pub use capabilities::{
-    capability_module, detect_native_capabilities, CapabilityDecision, NativeBehaviorCapability,
+    capability_module, detect_native_capabilities, route_capabilities, CapabilityDecision,
+    CapabilityEvidence, CapabilityEvidenceKind, CapabilityRouterInput, NativeBehaviorCapability,
     CAPABILITY_POLICY_MAX_TOKENS,
 };
 pub use coding::{

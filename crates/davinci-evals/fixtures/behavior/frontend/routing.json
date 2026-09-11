@@ -75,6 +75,152 @@
     "expect_frontend": true
   },
   {
+    "id": "fe-pos-16",
+    "request": "Give the checkout screen an aesthetic refresh with clean typography.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-17",
+    "request": "Revamp our settings page to look modern and refined.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-18",
+    "request": "The current UI looks dated and amateurish, please redesign it.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-19",
+    "request": "Elevate the visual design of our marketing landing page.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-20",
+    "request": "Spruce up the user dashboard with a cleaner visual hierarchy.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-21",
+    "request": "Modernize the layout and styling of our pricing comparison table.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-22",
+    "request": "Make our app look sleek and contemporary with new colors and fonts.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-23",
+    "request": "Overhaul the look and feel of the onboarding flow.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-24",
+    "request": "Apply a cohesive design system across these navigation components.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-25",
+    "request": "Redesign the profile header with intentional typography and subtle shadows.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-26",
+    "request": "The interface lacks visual polish, make it look crisp and intentional.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-27",
+    "request": "Give our analytics overview an aesthetic overhaul.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-28",
+    "request": "Design a beautiful, responsive hero banner for our homepage.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-29",
+    "request": "Polish the UI of the notification drawer so it matches modern design standards.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-30",
+    "request": "Transform this clunky form into a clean, modern visual design.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-31",
+    "request": "Redesign the search results cards to improve visual hierarchy and aesthetics.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-32",
+    "request": "Implement a complete dark mode styling overhaul for the admin console.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-33",
+    "request": "Make the product catalog look much cleaner and visually appealing.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-34",
+    "request": "Overhaul our button and input styling to create a unified design system.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-35",
+    "request": "Craft a modern landing page design for our mobile app launch.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-36",
+    "request": "Polish the UI spacing, typography, and contrast on the team settings page.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-37",
+    "request": "The customer portal looks chaotic, give it a sleek redesign.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-38",
+    "request": "Make the billing dashboard look premium with balanced margins and refined colors.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-39",
+    "request": "Update the look and feel of our modal dialogs and dropdown menus.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-40",
+    "request": "Visual redesign of the feedback widget to feel integrated and elegant.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-41",
+    "request": "Modernize the UI of our documentation sidebar and breadcrumb navigation.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-42",
+    "request": "Redesign our sign-up wizard with a delightful aesthetic.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-43",
+    "request": "Restyle the header and footer to match our new brand guidelines.",
+    "expect_frontend": true
+  },
+  {
+    "id": "fe-pos-44",
+    "request": "Make the cards look sleek and elevate the design.",
+    "previous_request": "We need a visual refresh for the auth screen",
+    "expect_frontend": true
+  },
+  {
     "id": "fe-neg-01",
     "request": "Fix the hydration error in Dashboard.tsx.",
     "expect_frontend": false
@@ -147,6 +293,111 @@
   {
     "id": "fe-neg-15",
     "request": "Export UserCard component from index.ts.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-16",
+    "request": "Fix the memory leak in the WebSocket connection handler.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-17",
+    "request": "Debug why the worker process crashes when reading large files.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-18",
+    "request": "Review this PR for potential race conditions and deadlocks.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-19",
+    "request": "Perform a security audit of the authentication token handling.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-20",
+    "request": "Add a new REST endpoint /api/users to fetch user profiles.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-21",
+    "request": "Bump serde dependency to version 1.0.200 in Cargo.toml.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-22",
+    "request": "Update the README with installation instructions for macOS.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-23",
+    "request": "Fix the flexbox alignment bug in Safari where items wrap prematurely.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-24",
+    "request": "Refactor the database connection pool to use deadpool-postgres.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-25",
+    "request": "Fix hydration mismatch warning on SSR server render.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-26",
+    "request": "Implement pagination logic in the backend GraphQL resolver.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-27",
+    "request": "Write a bash script to automate deployment to AWS ECS.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-28",
+    "request": "Fix the bug where the dropdown menu does not close on blur.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-29",
+    "request": "Add form validation schema using Zod for user registration.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-30",
+    "request": "Investigate the root cause of the 502 Bad Gateway error on nginx.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-31",
+    "request": "Audit this pull request before merging into staging.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-32",
+    "request": "Fix typo in the user error message in AuthController.ts.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-33",
+    "request": "Extract the auth middleware logic into a separate file.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-34",
+    "request": "Configure CORS headers for the frontend domain in express.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-35",
+    "request": "Write Cypress end-to-end tests for the login flow.",
+    "expect_frontend": false
+  },
+  {
+    "id": "fe-neg-36",
+    "request": "Fix the CSS truncation bug in the table cell when text exceeds 200px.",
     "expect_frontend": false
   }
 ]

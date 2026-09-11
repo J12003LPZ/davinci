@@ -1,0 +1,403 @@
+[
+  {
+    "id": "rev-pos-01",
+    "request": "Perform a code review of this PR focusing on security risks.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-02",
+    "request": "Review this code for potential memory safety issues.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-03",
+    "request": "Audit this change before we merge it into main.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-04",
+    "request": "Review the diff between HEAD and origin/main.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-05",
+    "request": "Review my PR and suggest improvements for error handling.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-06",
+    "request": "Conduct a code review of the new authentication service.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-07",
+    "request": "Inspect recent changes for issues or performance bottlenecks.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-08",
+    "request": "Review this pull request for adherence to architectural conventions.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-09",
+    "request": "Security audit of the payment processing changes in this branch.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-10",
+    "request": "Review the git diff for any unintended breaking changes.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-11",
+    "request": "Critique my implementation of the distributed lock mechanism.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-12",
+    "request": "Look over this patch before I commit it to master.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-13",
+    "request": "Peer review this feature branch and check for concurrency traps.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-14",
+    "request": "Check changes before merge to ensure test coverage is adequate.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-15",
+    "request": "Give feedback on this pull request regarding code cleanliness.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-16",
+    "request": "Sanity check these commits for any regression risks.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-17",
+    "request": "Review the code in crates/davinci-agent/src/scheduler.rs.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-18",
+    "request": "Audit the patch to ensure no credentials or secrets are leaked.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-19",
+    "request": "Perform a thorough code review of the database migration scripts.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-20",
+    "request": "Review the diff in PR #142 and point out any edge cases.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-21",
+    "request": "Inspect this branch for potential race conditions or memory leaks.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-22",
+    "request": "Review my PR focusing on type safety and error propagation.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-23",
+    "request": "Conduct a code review of the refactored token bucket rate limiter.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-24",
+    "request": "Audit this change for compliance with API backward compatibility.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-25",
+    "request": "Review the staged changes and ensure proper error types are used.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-26",
+    "request": "Check this commit for subtle bugs and edge cases before pushing.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-27",
+    "request": "Perform a peer review on the new caching strategy implementation.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-28",
+    "request": "Review this code to verify all resource handles are properly closed.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-29",
+    "request": "Audit recent changes to the permission validation layer.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-30",
+    "request": "Review the diff against release/1.0 branch for cherry-pick suitability.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-31",
+    "request": "Critique this refactoring PR and identify any over-engineering.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-32",
+    "request": "Look over this patch and check if any error paths are ignored.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-33",
+    "request": "Review pull request #58 focusing on performance and scalability.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-34",
+    "request": "Inspect changes in src/crypto.rs for cryptographic flaws.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-35",
+    "request": "Conduct a code review of the new protocol serializer.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-36",
+    "request": "Review my PR before submitting to the team for approval.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-37",
+    "request": "Audit this change to ensure no unbounded collections or loops exist.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-38",
+    "request": "Sanity check this diff to make sure no debugging code was left in.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-39",
+    "request": "Review this code and verify thread safety of the global state.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-40",
+    "request": "Peer review the changes in the background worker module.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-41",
+    "request": "Review the git diff for unhandled error variants.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-42",
+    "request": "Check if this PR is ready to merge and point out any missing tests.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-43",
+    "request": "Perform a code review on the user authentication middleware.",
+    "expect_review": true
+  },
+  {
+    "id": "rev-pos-44",
+    "request": "How does my implementation look? Sanity check what I just wrote.",
+    "has_uncommitted_changes": true,
+    "expect_review": true
+  },
+  {
+    "id": "rev-neg-01",
+    "request": "Fix the review comments from the latest PR.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-02",
+    "request": "Address the review feedback on the pull request.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-03",
+    "request": "Apply the suggested changes from the code review.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-04",
+    "request": "Debug the race condition in the worker pool scheduler.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-05",
+    "request": "Redesign this dashboard so it feels premium and intentional.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-06",
+    "request": "Implement a new OAuth2 authentication flow.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-07",
+    "request": "Bump the version in Cargo.toml to 1.0.1.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-08",
+    "request": "Diagnose the memory leak observed during long-running tasks.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-09",
+    "request": "Write unit tests for the UserService class using vitest.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-10",
+    "request": "Add a new CLI command to generate reports.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-11",
+    "request": "Fix the hydration error in Dashboard.tsx.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-12",
+    "request": "Optimize database queries with an index on user_id.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-13",
+    "request": "Why does it crash when an empty buffer is submitted?",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-14",
+    "request": "Update the documentation for the REST API.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-15",
+    "request": "Refactor the monolithic file into smaller modules.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-16",
+    "request": "Polish the UI for the billing modal.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-17",
+    "request": "Run cargo test across all workspace crates.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-18",
+    "request": "Create a Docker compose file for local development.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-19",
+    "request": "Fix the css bug causing text overflow in Sidebar.module.css.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-20",
+    "request": "Investigate the failure in test_batch_execution.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-21",
+    "request": "Rename the component Button to ActionButton.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-22",
+    "request": "Implement rate limiting using Redis token bucket.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-23",
+    "request": "Fix broken onClick handler in SubmitButton.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-24",
+    "request": "Troubleshoot the intermittent connection drops.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-25",
+    "request": "Modernize the design of the user profile card.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-26",
+    "request": "Add a health check endpoint returning 200 OK.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-27",
+    "request": "Write a migration script to seed the database with initial data.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-28",
+    "request": "Fix typo in the welcome message string.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-29",
+    "request": "Format all files with prettier --write.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-30",
+    "request": "Export telemetry data to an S3 bucket on schedule.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-31",
+    "request": "Create a design system for our component library.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-32",
+    "request": "Configure dependabot for automatic dependency updates.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-33",
+    "request": "Scaffold a new Next.js project with Tailwind CSS.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-34",
+    "request": "Fix the compiler warning about unused variable 'count'.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-35",
+    "request": "Generate swagger documentation from code annotations.",
+    "expect_review": false
+  },
+  {
+    "id": "rev-neg-36",
+    "request": "Add error retry logic with exponential backoff.",
+    "expect_review": false
+  }
+]
