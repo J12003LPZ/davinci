@@ -1,10 +1,10 @@
 //! Library embed API matching `vendor/pi/packages/coding-agent/src/core/sdk.ts`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use davinci_agent::{
-    default_system_prompt, discover_prompt_templates, discover_skills, expand_user_text,
-    load_context_files, Agent, CompactionResult, BUILTIN_TOOLS,
+    discover_prompt_templates, discover_skills, expand_user_text, load_context_files, Agent,
+    CompactionResult, BUILTIN_TOOLS,
 };
 use davinci_ai::{
     find_model, load_builtin_models, snapshot_availability, AuthStorage, ModelConfig,
@@ -150,7 +150,16 @@ pub fn create_agent_session(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let agent_dir = options.agent_dir.clone().unwrap_or_else(default_agent_dir);
     let settings = load_merged_settings(&agent_dir, &cwd);
-    let mut agent = Agent::new(default_system_prompt());
+    let env_profile = std::env::var("DAVINCI_PROMPT_PROFILE")
+        .ok()
+        .or_else(|| std::env::var("PI_PROMPT_PROFILE").ok());
+    let resolved_profile = crate::prompt_host::resolve_prompt_profile(
+        options.prompt_profile,
+        settings.prompt_profile.as_deref(),
+        env_profile.as_deref(),
+    )?
+    .profile;
+    let mut agent = Agent::new_builtin(resolved_profile);
     agent.cwd = cwd.clone();
     agent.context_files = load_context_files(&cwd, true);
     agent.skills = discover_skills(&[cwd.join(".pi").join("skills"), agent_dir.join("skills")]);
@@ -181,6 +190,30 @@ pub fn create_agent_session(
             model_fallback_message = Some(davinci_ai::NO_MODELS_AVAILABLE.to_string());
         }
     }
+
+    let mut session = if let Some(custom) = &options.system_prompt {
+        davinci_agent::PromptSessionState::custom(custom)
+    } else {
+        davinci_agent::PromptSessionState::builtin(resolved_profile)
+    };
+    for extra in &options.append_system_prompt {
+        let text = if Path::new(extra).exists() {
+            std::fs::read_to_string(extra).map_err(|err| err.to_string())?
+        } else {
+            extra.clone()
+        };
+        session.append(text);
+    }
+    let ctx = davinci_agent::prompt::PromptContext {
+        provider: &agent.provider,
+        model_id: &agent.model_id,
+        permission_mode: agent.permission_mode(),
+        plan_active: agent.is_plan_mode(),
+    };
+    let composed = session.render_and_record(&ctx);
+    agent.system_prompt = composed.text;
+    agent.prompt_manifest = Some(composed.manifest);
+    agent.prompt_session = session;
 
     let thinking = options
         .thinking_level
@@ -388,6 +421,65 @@ mod tests {
             options.append_system_prompt,
             vec!["first append".to_string(), "second append".to_string()]
         );
+    }
+
+    #[test]
+    fn default_sdk_session_activates_stable_prompt_profile() {
+        let dir = tempdir().unwrap();
+        let result = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap();
+
+        assert!(result.session.agent.prompt_session.is_builtin());
+        assert_eq!(
+            result.session.agent.prompt_session.profile(),
+            Some(davinci_agent::PromptProfile::Stable)
+        );
+        let manifest = result
+            .session
+            .agent
+            .prompt_manifest
+            .as_ref()
+            .expect("manifest must be present");
+        assert_eq!(manifest.profile, "stable");
+    }
+
+    #[test]
+    fn custom_replacement_sdk_session_receives_no_builtin_modules() {
+        let dir = tempdir().unwrap();
+        let result = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            system_prompt: Some("You are a specialized auditor.".into()),
+            append_system_prompt: vec!["extra instruction".into()],
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap();
+
+        assert!(result.session.agent.prompt_session.is_custom());
+        let manifest = result
+            .session
+            .agent
+            .prompt_manifest
+            .as_ref()
+            .expect("manifest must be present");
+        assert_eq!(manifest.profile, "custom");
+        assert!(manifest.modules.is_empty());
+        assert!(result
+            .session
+            .agent
+            .system_prompt
+            .contains("specialized auditor"));
+        assert!(result
+            .session
+            .agent
+            .system_prompt
+            .contains("extra instruction"));
     }
 
     #[test]

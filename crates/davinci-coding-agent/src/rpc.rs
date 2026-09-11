@@ -1332,7 +1332,7 @@ pub fn rpc_resolve_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use davinci_agent::default_system_prompt;
+    use davinci_agent::PromptProfile;
     use davinci_session::JsonlSession;
 
     #[test]
@@ -1380,7 +1380,7 @@ mod tests {
         use davinci_agent::{PermissionMode, PermissionRule, ToolApprovalDecision, ToolApprover};
         use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
-        let mut agent = Agent::new(default_system_prompt());
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
         agent.set_permission_mode(PermissionMode::Ask);
         {
             let mut policy = agent.permissions.lock().unwrap();
@@ -1446,7 +1446,7 @@ mod tests {
         })]);
         assert_eq!(timed[0]["timeout"], 1500);
         let mut runtime = RpcRuntime::new(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
         );
@@ -1472,7 +1472,7 @@ mod tests {
     #[test]
     fn prompt_images_and_abort_retry_match_ts() {
         let mut runtime = RpcRuntime::new(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
         );
@@ -1510,7 +1510,7 @@ mod tests {
     #[test]
     fn prompt_expands_skill_and_template() {
         let mut runtime = RpcRuntime::new(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
         );
@@ -1540,7 +1540,7 @@ mod tests {
     #[test]
     fn cycle_model_reports_is_scoped_from_scoped_pool() {
         let mut runtime = RpcRuntime::new(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
         );
@@ -1585,7 +1585,7 @@ mod tests {
     #[test]
     fn cycle_model_applies_scoped_thinking() {
         let mut runtime = RpcRuntime::new(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
         );
@@ -1617,7 +1617,7 @@ mod tests {
     #[test]
     fn thinking_levels_are_model_scoped() {
         let mut runtime = RpcRuntime::new(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
         );
@@ -1690,7 +1690,7 @@ mod tests {
             ))
             .unwrap();
         let mut runtime = RpcRuntime::new(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             dir.path().to_path_buf(),
             PathBuf::from("/tmp"),
         );
@@ -1783,7 +1783,7 @@ mod tests {
     fn available_models_and_set_model_use_runtime_snapshot() {
         let only = vec![load_builtin_models().into_iter().next().expect("model")];
         let mut runtime = RpcRuntime::with_models(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
             only.clone(),
@@ -1818,7 +1818,7 @@ mod tests {
     #[test]
     fn prompt_preflight_rejects_compaction_and_streaming_without_behavior() {
         let mut runtime = RpcRuntime::new(
-            davinci_agent::Agent::new(default_system_prompt()),
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
         );
@@ -1865,7 +1865,7 @@ mod tests {
         let run_id = davinci_agent::RunId::new();
         let agent_id = davinci_agent::AgentId::new();
         let handle = davinci_agent::RuntimeHandle::new(run_id, agent_id, bus);
-        let mut agent = davinci_agent::Agent::new(default_system_prompt());
+        let mut agent = davinci_agent::Agent::new_builtin(PromptProfile::Stable);
         agent.runtime = Some(handle);
 
         let mut runtime = RpcRuntime::new(agent, PathBuf::from("/tmp"), PathBuf::from("/tmp"));

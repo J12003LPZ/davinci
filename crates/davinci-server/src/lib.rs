@@ -9,7 +9,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use davinci_agent::{default_system_prompt, Agent, AgentEvent};
+use davinci_agent::{Agent, AgentEvent, PromptProfile};
 use davinci_ai::{
     content_text, get_supported_thinking_levels, AssistantMessage, ContentBlock, StopReason,
 };
@@ -57,7 +57,7 @@ struct ConnectionState {
 }
 
 fn new_runtime_agent(cwd: &str) -> Agent {
-    let mut agent = Agent::new(default_system_prompt());
+    let mut agent = Agent::new_builtin(PromptProfile::Stable);
     agent.cwd = PathBuf::from(cwd);
     agent
 }
@@ -1344,5 +1344,15 @@ mod tests {
             }
             other => panic!("expected session_locked: {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_runtime_agent_activates_stable_prompt_profile() {
+        let agent = new_runtime_agent("/test");
+        assert!(agent.prompt_session.is_builtin());
+        assert_eq!(agent.prompt_session.profile(), Some(PromptProfile::Stable));
+        let manifest = agent.prompt_manifest.as_ref().expect("manifest");
+        assert_eq!(manifest.profile, "stable");
+        assert!(agent.system_prompt.contains("DaVinci"));
     }
 }

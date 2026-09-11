@@ -179,9 +179,9 @@ macro_rules! eprintln {
 }
 
 use davinci_agent::{
-    default_system_prompt, discover_prompt_templates, discover_skills, env_summarizer,
-    load_context_files, Agent, AgentEvent, CompleteOutput, CustomToolExecutor, EventSink,
-    SummarizeRequest, SummarizeResponse, Summarizer,
+    discover_prompt_templates, discover_skills, env_summarizer, load_context_files, Agent,
+    AgentEvent, CompleteOutput, CustomToolExecutor, EventSink, SummarizeRequest, SummarizeResponse,
+    Summarizer,
 };
 use davinci_ai::{
     apply_config_auth_with_shell, apply_models_config, check_auth, complete_simple, content_text,
@@ -556,9 +556,16 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     )?
     .profile;
 
-    let (base_prompt, manifest) = if let Some(custom) = &parsed.system_prompt {
-        (custom.clone(), None)
-    } else {
+    let mut agent = if let Some(custom) = &parsed.system_prompt {
+        let mut session = davinci_agent::PromptSessionState::custom(custom);
+        for extra in &parsed.append_system_prompt {
+            let text = if Path::new(extra).exists() {
+                std::fs::read_to_string(extra).map_err(|err| err.to_string())?
+            } else {
+                extra.clone()
+            };
+            session.append(text);
+        }
         let ctx = davinci_agent::prompt::PromptContext {
             provider: parsed.provider.as_deref().unwrap_or(""),
             model_id: parsed.model.as_deref().unwrap_or(""),
@@ -567,22 +574,36 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
                 .unwrap_or(davinci_agent::PermissionMode::Ask),
             plan_active: false,
         };
-        let comp = davinci_agent::prompt::compose_profile_prompt(profile, &ctx);
-        (comp.text, Some(comp.manifest))
-    };
-
-    let mut prompt = base_prompt;
-    for extra in &parsed.append_system_prompt {
-        let text = if Path::new(extra).exists() {
-            std::fs::read_to_string(extra).map_err(|err| err.to_string())?
-        } else {
-            extra.clone()
+        let comp = session.render_and_record(&ctx);
+        let mut agent = Agent::new(&comp.text);
+        agent.prompt_manifest = Some(comp.manifest);
+        agent.prompt_session = session;
+        agent
+    } else {
+        let mut session = davinci_agent::PromptSessionState::builtin(profile);
+        for extra in &parsed.append_system_prompt {
+            let text = if Path::new(extra).exists() {
+                std::fs::read_to_string(extra).map_err(|err| err.to_string())?
+            } else {
+                extra.clone()
+            };
+            session.append(text);
+        }
+        let ctx = davinci_agent::prompt::PromptContext {
+            provider: parsed.provider.as_deref().unwrap_or(""),
+            model_id: parsed.model.as_deref().unwrap_or(""),
+            permission_mode: parsed
+                .permission_mode
+                .unwrap_or(davinci_agent::PermissionMode::Ask),
+            plan_active: false,
         };
-        prompt.push('\n');
-        prompt.push_str(&text);
-    }
-    let mut agent = Agent::new(prompt);
-    agent.prompt_manifest = manifest;
+        let comp = session.render_and_record(&ctx);
+        let mut agent = Agent::new_builtin(profile);
+        agent.system_prompt = comp.text;
+        agent.prompt_manifest = Some(comp.manifest);
+        agent.prompt_session = session;
+        agent
+    };
     apply_http_proxy_settings(settings.http_proxy.as_deref());
     crate::settings::apply_web_search_settings(settings.web_search.as_ref());
     if let Some(level) = parsed.thinking {
@@ -733,6 +754,15 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     host.emit(ExtensionEvent::SessionStart);
     let _ = host.describe_js();
     apply_resolved_models(parsed, &mut agent)?;
+    let ctx = davinci_agent::prompt::PromptContext {
+        provider: &agent.provider,
+        model_id: &agent.model_id,
+        permission_mode: agent.permission_mode(),
+        plan_active: agent.is_plan_mode(),
+    };
+    let comp = agent.prompt_session.render_and_record(&ctx);
+    agent.system_prompt = comp.text;
+    agent.prompt_manifest = Some(comp.manifest);
     if let Some(key) = &parsed.api_key {
         if let Ok(mut storage) = AuthStorage::create() {
             storage.set_runtime_override(&agent.provider, key);
@@ -2756,7 +2786,10 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         .unwrap_or_else(davinci_session::default_session_dir);
     let cwd = agent.cwd.clone();
     let mut runtime = RpcRuntime::with_models(
-        std::mem::replace(agent, Agent::new(default_system_prompt())),
+        std::mem::replace(
+            agent,
+            Agent::new_builtin(davinci_agent::PromptProfile::Stable),
+        ),
         session_dir,
         cwd,
         available_models(parsed),
@@ -9492,7 +9525,7 @@ fn select_resume_session(
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Ok(None);
     }
-    let mut dummy = Agent::new(default_system_prompt());
+    let mut dummy = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
     dummy.cwd = cwd.to_path_buf();
     let items = discover_session_items(parsed, &dummy)?;
     if items.is_empty() {
@@ -10378,7 +10411,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         std::env::remove_var("PI_OFFLINE_TOOL_CALL");
-        let mut agent = Agent::new(default_system_prompt());
+        let mut agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
         agent.prompt("run git status");
 
         let plain = offline_stub_message(&agent, 14);
@@ -11340,7 +11373,7 @@ mod tests {
     #[test]
     fn rpc_prompt_auth_error_matches_ts_no_model_copy() {
         let runtime = RpcRuntime::new(
-            Agent::new(default_system_prompt()),
+            Agent::new_builtin(davinci_agent::PromptProfile::Stable),
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp"),
         );
@@ -12304,7 +12337,7 @@ mod tests {
             model: Some("sonnet:high".into()),
             ..Args::default()
         };
-        let mut agent = Agent::new(default_system_prompt());
+        let mut agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
         apply_resolved_models(&parsed, &mut agent).expect("resolve");
         assert!(agent.model_id.to_ascii_lowercase().contains("sonnet"));
         assert_eq!(agent.thinking_level, davinci_protocol::ThinkingLevel::High);
@@ -12317,7 +12350,7 @@ mod tests {
             model: Some("definitely-not-a-real-model-xyz".into()),
             ..Args::default()
         };
-        let mut agent = Agent::new(default_system_prompt());
+        let mut agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
         let err = apply_resolved_models(&parsed, &mut agent).unwrap_err();
         assert!(err.contains("not found"));
     }
@@ -12399,5 +12432,32 @@ mod tests {
             error,
             "Invalid prompt profile 'experimental'. Valid profiles: stable, preview, legacy-v1"
         );
+    }
+
+    #[test]
+    fn json_mode_and_status_expose_safe_prompt_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let parsed = Args {
+            mode: Some(Mode::Json),
+            ..Args::default()
+        };
+        let agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
+        assert!(agent.prompt_session.is_builtin());
+        assert_eq!(
+            agent.prompt_session.profile(),
+            Some(davinci_agent::PromptProfile::Stable)
+        );
+        let manifest = agent.prompt_manifest.as_ref().expect("manifest");
+        assert_eq!(manifest.profile, "stable");
+        assert!(!manifest.stable_sha256.is_empty());
+
+        let status = format_session_status(&parsed, &agent);
+        assert!(status.contains("prompt: stable"));
+        assert!(!status.contains(&agent.system_prompt));
     }
 }
