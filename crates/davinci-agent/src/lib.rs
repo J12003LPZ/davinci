@@ -104,11 +104,13 @@ pub use turn::retry_delay_ms;
 
 pub mod runtime;
 pub use prompt::{
-    compose_default_prompt, compose_legacy_default, compose_modules, runtime_state_module,
-    runtime_state_text, ComposedPrompt, PromptBundle, PromptCacheClass, PromptCandidateDescriptor,
-    PromptContext, PromptManifest, PromptModule, PromptModuleIdentity, PromptSessionState,
-    PromptSource, RuntimePromptState,
+    compose_default_prompt, compose_legacy_default, compose_modules, resolve_resume_prompt_session,
+    runtime_state_module, runtime_state_text, ComposedPrompt, PromptBundle, PromptCacheClass,
+    PromptCandidateDescriptor, PromptContext, PromptManifest, PromptModule, PromptModuleIdentity,
+    PromptSessionRecord, PromptSessionState, PromptSource, RuntimePromptState,
 };
+
+pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
 pub use runtime::{
     contract_gate, effect_profile_allows, find_saved_workflow, hash_system_prompt,
     hash_system_prompt_with_manifest, hash_tool_names, normalize_relative_path, path_scope_allows,
@@ -308,24 +310,12 @@ impl Agent {
         let system_prompt = system_prompt.into();
         let legacy = prompt::compose_legacy_default();
         let (prompt_manifest, system_prompt, prompt_session) = if system_prompt == legacy.text {
-            let session = prompt::PromptSessionState {
-                source: prompt::PromptSource::Builtin {
-                    profile: prompt::PromptProfile::LegacyV1,
-                },
-                append_text: Vec::new(),
-                last_manifest: Some(legacy.manifest.clone()),
-                stable_bundle_hash: Some(legacy.manifest.stable_sha256.clone()),
-            };
+            let mut session = prompt::PromptSessionState::builtin(prompt::PromptProfile::LegacyV1);
+            session.last_manifest = Some(legacy.manifest.clone());
+            session.stable_bundle_hash = Some(legacy.manifest.stable_sha256.clone());
             (Some(legacy.manifest), legacy.text, session)
         } else {
-            let session = prompt::PromptSessionState {
-                source: prompt::PromptSource::CustomReplacement {
-                    text: system_prompt.clone(),
-                },
-                append_text: Vec::new(),
-                last_manifest: None,
-                stable_bundle_hash: None,
-            };
+            let session = prompt::PromptSessionState::custom(system_prompt.clone());
             (None, system_prompt, session)
         };
         Self {
@@ -1393,7 +1383,79 @@ impl Agent {
         self.session = Some(session);
         self.set_runtime(candidate);
         self.restore_living_plan();
+        let _ = self.restore_prompt_session();
         Ok(())
+    }
+
+    /// Persist current prompt identity as a custom session entry if an active session exists.
+    pub fn persist_prompt_session(&mut self) -> Result<(), String> {
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        let Some(record) = PromptSessionRecord::from_session_state(&self.prompt_session) else {
+            return Ok(());
+        };
+        let data = serde_json::to_value(&record).map_err(|e| e.to_string())?;
+        let mut extra = serde_json::Map::new();
+        extra.insert("data".into(), data);
+        let _ = session.append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some(PROMPT_SESSION_ENTRY_TYPE.into()),
+            extra,
+        });
+        Ok(())
+    }
+
+    /// Restore prompt session state and identity from persisted custom session entries.
+    /// Returns Ok(true) if a prompt session record was found and restored, Ok(false) otherwise.
+    pub fn restore_prompt_session(&mut self) -> Result<bool, String> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let record = session.entries.iter().rev().find_map(|entry| {
+            if entry.entry_type == "custom"
+                && entry.custom_type.as_deref() == Some(PROMPT_SESSION_ENTRY_TYPE)
+            {
+                if let Some(data) = entry.extra.get("data") {
+                    serde_json::from_value::<PromptSessionRecord>(data.clone()).ok()
+                } else {
+                    serde_json::from_value::<PromptSessionRecord>(serde_json::Value::Object(
+                        entry.extra.clone(),
+                    ))
+                    .ok()
+                }
+            } else {
+                None
+            }
+        });
+
+        let profile_override = if record.is_none() && self.prompt_session.is_builtin() {
+            self.prompt_session.profile()
+        } else {
+            None
+        };
+
+        let (mut resumed_session, diag) =
+            resolve_resume_prompt_session(record.as_ref(), profile_override);
+        resumed_session.append_text = self.prompt_session.append_text.clone();
+        let ctx = PromptContext {
+            provider: &self.provider,
+            model_id: &self.model_id,
+            permission_mode: self.permission_mode(),
+            plan_active: self.is_plan_mode(),
+        };
+        let composed = resumed_session.render_and_record(&ctx);
+        self.system_prompt = composed.text;
+        self.prompt_manifest = Some(composed.manifest);
+        resumed_session.transition_diagnostic = diag;
+        self.prompt_session = resumed_session;
+
+        Ok(record.is_some())
     }
 
     /// Navigate the session tree. When `summarize` is true, generates a branch
@@ -2101,6 +2163,55 @@ mod tests {
             Some(manifest.stable_sha256.as_str())
         );
         assert!(agent.system_prompt.contains("DaVinci"));
+    }
+
+    #[test]
+    fn prompt_session_identity_persists_and_resumes_across_session_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = session.path.clone();
+
+        let mut agent = Agent::new_builtin(prompt::PromptProfile::Stable);
+        agent.session = Some(session);
+        agent.persist_prompt_session().unwrap();
+
+        let mut resumed = Agent::new("placeholder");
+        resumed
+            .load_from_session(JsonlSession::open(&path).unwrap())
+            .unwrap();
+
+        assert!(resumed.prompt_session.is_builtin());
+        assert_eq!(
+            resumed.prompt_session.profile(),
+            Some(prompt::PromptProfile::Stable)
+        );
+        let manifest = resumed.prompt_manifest.as_ref().expect("manifest");
+        assert_eq!(manifest.profile, "stable");
+        assert_eq!(manifest.profile_version, 2);
+    }
+
+    #[test]
+    fn prompt_session_explicit_legacy_pin_preserved_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = session.path.clone();
+
+        let mut agent = Agent::new_builtin(prompt::PromptProfile::LegacyV1);
+        agent.session = Some(session);
+        agent.persist_prompt_session().unwrap();
+
+        let mut resumed = Agent::new_builtin(prompt::PromptProfile::Stable);
+        resumed
+            .load_from_session(JsonlSession::open(&path).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            resumed.prompt_session.profile(),
+            Some(prompt::PromptProfile::LegacyV1)
+        );
+        let manifest = resumed.prompt_manifest.as_ref().expect("manifest");
+        assert_eq!(manifest.profile, "legacy-v1");
+        assert_eq!(manifest.profile_version, 1);
     }
 
     #[test]

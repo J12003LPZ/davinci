@@ -6571,10 +6571,18 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         } else {
             &manifest.stable_sha256
         };
+        let candidate_suffix = if let Some(candidate) = &agent.prompt_session.candidate_id {
+            format!(" [{candidate}]")
+        } else {
+            String::new()
+        };
         text.push_str(&format!(
-            " · prompt: {} v{} · {hash_prefix}",
+            " · prompt: {} v{}{candidate_suffix} · {hash_prefix}",
             manifest.profile, manifest.profile_version
         ));
+        if let Some(diag) = &agent.prompt_session.transition_diagnostic {
+            text.push_str(&format!(" · transition: {diag}"));
+        }
     }
     let cwd = std::env::current_dir().unwrap_or_default();
     if let Some(run) = crate::native_extensions::graph::active_run(&cwd).and_then(|r| r.snapshot())
@@ -12459,5 +12467,22 @@ mod tests {
         let status = format_session_status(&parsed, &agent);
         assert!(status.contains("prompt: stable"));
         assert!(!status.contains(&agent.system_prompt));
+
+        let mut preview_agent = build_agent(
+            &Args {
+                prompt_profile: Some(davinci_agent::PromptProfile::Preview),
+                ..Args::default()
+            },
+            &session_dir,
+            &cwd,
+        )
+        .unwrap();
+        preview_agent.prompt_session.candidate_id = Some("cand-99".into());
+        preview_agent.prompt_session.transition_diagnostic =
+            Some("Prompt hash transition on resume".into());
+        let preview_status = format_session_status(&parsed, &preview_agent);
+        assert!(preview_status.contains("prompt: preview v3 [cand-99]"));
+        assert!(preview_status.contains("transition: Prompt hash transition on resume"));
+        assert!(!preview_status.contains(&preview_agent.system_prompt));
     }
 }
