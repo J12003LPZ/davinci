@@ -309,7 +309,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                     &runtime.agent.skills,
                     &runtime.agent.templates,
                 );
-                runtime.agent.prompt_with(&text, &images);
+                runtime.agent.prompt_user_with(&text, &images);
                 runtime.prompt_needs_turn = true;
             }
             ok(id, &kind, None)
@@ -1334,6 +1334,7 @@ mod tests {
     use super::*;
     use davinci_agent::PromptProfile;
     use davinci_session::JsonlSession;
+    use tempfile::tempdir;
 
     #[test]
     fn f01_noninteractive_fail_closed_contract() {
@@ -2204,5 +2205,46 @@ mod tests {
         );
         assert!(!res_missing.success);
         assert!(res_missing.error.unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn rpc_prompt_activates_capabilities_on_user_turn() {
+        let dir = tempdir().unwrap();
+        let agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+        let mut runtime =
+            RpcRuntime::new(agent, dir.path().join("sessions"), dir.path().to_path_buf());
+
+        assert!(!runtime
+            .agent
+            .system_prompt
+            .contains("frontend_design_policy"));
+
+        let res = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "prompt".into(),
+                message: Some(
+                    "Redesign this dashboard so it feels premium and intentional.".into(),
+                ),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(res.success);
+        assert!(runtime.prompt_needs_turn);
+        assert!(
+            runtime
+                .agent
+                .system_prompt
+                .contains("frontend_design_policy"),
+            "RPC user prompt must activate capability"
+        );
+        assert!(runtime
+            .agent
+            .prompt_manifest
+            .as_ref()
+            .unwrap()
+            .modules
+            .iter()
+            .any(|m| m.id == "capability.frontend-design"));
     }
 }

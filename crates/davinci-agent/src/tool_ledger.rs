@@ -131,6 +131,18 @@ impl ToolCallLedger {
         }
     }
 
+    pub fn records(&self) -> &HashMap<String, ToolCallRecord> {
+        &self.records
+    }
+
+    pub fn recent_tool_names(&self, limit: usize) -> Vec<String> {
+        self.records
+            .values()
+            .take(limit)
+            .map(|r| r.tool_name.clone())
+            .collect()
+    }
+
     pub fn is_already_executed(&self, call_id: &str) -> bool {
         self.records
             .get(call_id)

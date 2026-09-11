@@ -25,7 +25,7 @@ pub struct PromptContext<'a> {
     pub plan_active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComposedPrompt {
     pub text: String,
     pub stable_text: String,

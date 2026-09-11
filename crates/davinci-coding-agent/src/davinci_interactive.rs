@@ -7357,7 +7357,7 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
             return Next::Go;
         }
     }
-    shell.agent.prompt_with(&expanded, &images);
+    shell.agent.prompt_user_with(&expanded, &images);
     let next = run_turns(shell);
     shell.redress();
     next

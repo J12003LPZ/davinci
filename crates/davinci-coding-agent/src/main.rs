@@ -2545,7 +2545,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 PreparedInput::Completed(code) => return Ok(code),
                 PreparedInput::Handled => {}
                 PreparedInput::Ready { text, images } => {
-                    agent.prompt_with(&text, &images);
+                    agent.prompt_user_with(&text, &images);
                     let ((reply, events), required) =
                         with_print_approval(agent, &configuration_path, |agent| {
                             complete_prompt_with_host(parsed, agent, None, json_mode)
@@ -2568,7 +2568,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             PreparedInput::Completed(code) => return Ok(code),
             PreparedInput::Handled => {}
             PreparedInput::Ready { text, images } => {
-                agent.prompt_with(&text, &images);
+                agent.prompt_user_with(&text, &images);
                 let ((reply, events), required) =
                     with_print_approval(agent, &configuration_path, |agent| {
                         complete_prompt_with_host(parsed, agent, None, json_mode)
@@ -5298,7 +5298,7 @@ fn submit_user_message(
         return Ok(true);
     };
     session.chrome.transcript.push("user", &text);
-    agent.prompt_with(&text, &images);
+    agent.prompt_user_with(&text, &images);
     // Inside the raw-mode TUI the turn runs on a worker thread so the
     // interface keeps painting (spinner, live tool lines, Esc interrupt).
     let streaming = with_active_panes(|panes| panes.cloned());

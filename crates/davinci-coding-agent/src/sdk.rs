@@ -113,7 +113,7 @@ impl AgentSession {
         images: &[davinci_ai::MessageContent],
     ) -> davinci_ai::ChatMessage {
         let expanded = expand_user_text(text, &self.agent.skills, &self.agent.templates);
-        self.agent.prompt_with(&expanded, images)
+        self.agent.prompt_user_with(&expanded, images)
     }
 
     pub fn steer(&mut self, text: &str, images: Vec<davinci_ai::MessageContent>) {
@@ -666,5 +666,41 @@ mod tests {
             result.session.model_runtime.get_error().is_none()
                 || result.session.model_runtime.availability_error.is_none()
         );
+    }
+
+    #[test]
+    fn sdk_session_prompt_activates_capabilities_on_user_turn() {
+        let dir = tempdir().unwrap();
+        let mut session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+
+        assert!(!session
+            .agent
+            .system_prompt
+            .contains("frontend_design_policy"));
+
+        session.prompt("Redesign this dashboard so it feels premium and intentional.");
+
+        assert!(
+            session
+                .agent
+                .system_prompt
+                .contains("frontend_design_policy"),
+            "SDK user prompt must activate capability"
+        );
+        assert!(session
+            .agent
+            .prompt_manifest
+            .as_ref()
+            .unwrap()
+            .modules
+            .iter()
+            .any(|m| m.id == "capability.frontend-design"));
     }
 }

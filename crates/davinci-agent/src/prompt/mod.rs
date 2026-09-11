@@ -11,6 +11,7 @@ pub mod provider;
 pub mod runtime_state;
 pub mod session;
 pub mod tool_strategy;
+pub mod turn;
 pub mod verification;
 pub mod version;
 
@@ -42,6 +43,7 @@ pub use session::{
     resolve_resume_prompt_session, PromptSessionRecord, PromptSessionState, PromptSource,
 };
 pub use tool_strategy::tool_strategy_module;
+pub use turn::{compose_turn_prompt, PreparedTurnPrompt};
 pub use verification::verification_completion_module;
 pub use version::{
     PromptProfile, LEGACY_PROMPT_VERSION, PREVIEW_PROMPT_VERSION, STABLE_PROMPT_VERSION,

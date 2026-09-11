@@ -71,7 +71,7 @@ pub use permission::{
     ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
     ToolApprovalRequest, ToolApprover, ToolClass,
 };
-pub use prompt::PromptProfile;
+pub use prompt::{PreparedTurnPrompt, PromptProfile};
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
 pub use scheduler::{lane_for, ToolLane, MAX_TOOL_PARALLELISM};
@@ -573,8 +573,91 @@ impl Agent {
         self.aborted = false;
     }
 
+    pub fn prepare_builtin_prompt_for_user_turn(
+        &mut self,
+        user_text: &str,
+    ) -> Result<prompt::PreparedTurnPrompt, String> {
+        if !self.prompt_session.is_builtin() {
+            return Err(
+                "Cannot prepare builtin prompt: session uses custom replacement prompt".to_string(),
+            );
+        }
+
+        let previous_user_request = self.messages.iter().rev().find_map(|m| {
+            if m.role == "user" {
+                m.content.iter().find_map(|c| match c {
+                    davinci_ai::MessageContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        });
+
+        let recent_tools: Vec<String> = self
+            .tool_ledger
+            .lock()
+            .map(|ledger| ledger.recent_tool_names(10))
+            .unwrap_or_default();
+
+        let router_input = prompt::CapabilityRouterInput::new(user_text)
+            .with_previous_request(previous_user_request)
+            .with_recent_tools(&recent_tools)
+            .with_uncommitted_changes(false);
+
+        let capabilities = prompt::route_capabilities(&router_input);
+
+        let permission_mode = self.permissions.lock().map(|p| p.mode).unwrap_or_default();
+
+        let runtime_state = prompt::RuntimePromptState {
+            permission_mode,
+            plan_revision: self.previous_plan_revision.as_ref().map(|p| p.revision),
+            plan_approved: self
+                .previous_plan_revision
+                .as_ref()
+                .map(|p| p.approved_revision == Some(p.revision))
+                .unwrap_or(false),
+            active_contract: self.previous_execution_mode.is_some(),
+        };
+
+        let ctx = prompt::composer::PromptContext {
+            provider: &self.provider,
+            model_id: &self.model_id,
+            permission_mode,
+            plan_active: permission_mode == PermissionMode::ReadOnly,
+        };
+
+        let composed = prompt::turn::compose_turn_prompt(
+            &self.prompt_session,
+            &ctx,
+            &capabilities,
+            &runtime_state,
+        )?;
+
+        self.system_prompt = composed.text.clone();
+        self.base_system_prompt = composed.text.clone();
+        self.prompt_manifest = Some(composed.manifest.clone());
+        self.prompt_session.last_manifest = Some(composed.manifest.clone());
+        self.prompt_session.stable_bundle_hash = Some(composed.manifest.stable_sha256.clone());
+
+        Ok(prompt::PreparedTurnPrompt {
+            composed,
+            capabilities,
+            runtime_state,
+        })
+    }
+
     pub fn prompt(&mut self, text: &str) -> ChatMessage {
-        self.prompt_with(text, &[])
+        self.prompt_user_with(text, &[])
+    }
+
+    pub fn prompt_user_with(
+        &mut self,
+        text: &str,
+        images: &[davinci_ai::MessageContent],
+    ) -> ChatMessage {
+        let _ = self.prepare_builtin_prompt_for_user_turn(text);
+        self.prompt_with(text, images)
     }
 
     pub fn prompt_with(
@@ -4096,5 +4179,117 @@ mod tests {
 
         // Executed exactly once!
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepare_builtin_prompt_for_user_turn_activates_dormant_capabilities() {
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+        assert!(
+            !agent.system_prompt.contains("frontend_design_policy"),
+            "Initial stable prompt should not contain dormant capability policy"
+        );
+
+        // User asks for visual redesign
+        let prepared = agent
+            .prepare_builtin_prompt_for_user_turn(
+                "Redesign this dashboard so it feels premium and intentional.",
+            )
+            .unwrap();
+
+        assert!(prepared
+            .capabilities
+            .is_active(prompt::capabilities::NativeBehaviorCapability::FrontendDesign));
+        assert!(agent.system_prompt.contains("frontend_design_policy"));
+        assert!(agent
+            .prompt_manifest
+            .as_ref()
+            .unwrap()
+            .modules
+            .iter()
+            .any(|m| m.id == "capability.frontend-design"));
+
+        // Stable prefix and hash MUST remain invariant
+        assert_eq!(
+            agent.prompt_manifest.as_ref().unwrap().stable_sha256,
+            PromptProfile::Stable.bundle().stable_sha256()
+        );
+    }
+
+    #[test]
+    fn internal_mailbox_messages_do_not_route_capabilities() {
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+        assert!(!agent.system_prompt.contains("code_review_policy"));
+
+        // Internal message via prompt_with (mimicking mailbox drain)
+        let _msg = agent.prompt_with(
+            "Perform a code review of this PR focusing on security risks.",
+            &[],
+        );
+
+        // Capabilities must NOT have been activated on the internal prompt_with
+        assert!(
+            !agent.system_prompt.contains("code_review_policy"),
+            "Internal prompt_with must not route capabilities"
+        );
+        assert!(!agent
+            .prompt_manifest
+            .as_ref()
+            .unwrap()
+            .modules
+            .iter()
+            .any(|m| m.id == "capability.code-review"));
+
+        // Real user turn via prompt_user_with DOES route capabilities
+        let _user_msg = agent.prompt_user_with(
+            "Perform a code review of this PR focusing on security risks.",
+            &[],
+        );
+        assert!(
+            agent.system_prompt.contains("code_review_policy"),
+            "Real user turn prompt_user_with must route capabilities"
+        );
+        assert!(agent
+            .prompt_manifest
+            .as_ref()
+            .unwrap()
+            .modules
+            .iter()
+            .any(|m| m.id == "capability.code-review"));
+    }
+
+    #[test]
+    fn custom_replacement_prompt_does_not_route_capabilities() {
+        let mut agent = Agent::new("CUSTOM SYSTEM PROMPT");
+        let result = agent.prepare_builtin_prompt_for_user_turn(
+            "Redesign this dashboard so it feels premium and intentional.",
+        );
+        assert!(result.is_err());
+        assert_eq!(agent.system_prompt, "CUSTOM SYSTEM PROMPT");
+
+        // Calling prompt_user_with also preserves custom replacement
+        agent.prompt_user_with(
+            "Redesign this dashboard so it feels premium and intentional.",
+            &[],
+        );
+        assert_eq!(agent.system_prompt, "CUSTOM SYSTEM PROMPT");
+    }
+
+    #[test]
+    fn subsequent_non_capability_turn_deactivates_capability() {
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+
+        // Turn 1: Redesign triggers FrontendDesign
+        agent.prompt_user_with(
+            "Redesign this dashboard so it feels premium and intentional.",
+            &[],
+        );
+        assert!(agent.system_prompt.contains("frontend_design_policy"));
+
+        // Turn 2: Non-capability request deactivates FrontendDesign
+        agent.prompt_user_with("What is 2 + 2?", &[]);
+        assert!(
+            !agent.system_prompt.contains("frontend_design_policy"),
+            "Non-capability turn should not carry forward previous capability"
+        );
     }
 }
