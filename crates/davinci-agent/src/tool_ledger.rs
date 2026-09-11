@@ -106,6 +106,8 @@ pub struct ToolCallLedger {
     pub session_id: String,
     pub lineage_id: String,
     records: HashMap<String, ToolCallRecord>,
+    #[serde(default)]
+    record_order: Vec<String>,
     #[serde(skip, default = "default_condvar")]
     condvar: Arc<Condvar>,
 }
@@ -116,6 +118,7 @@ impl Default for ToolCallLedger {
             session_id: String::new(),
             lineage_id: String::new(),
             records: HashMap::new(),
+            record_order: Vec::new(),
             condvar: default_condvar(),
         }
     }
@@ -127,6 +130,7 @@ impl ToolCallLedger {
             session_id: session_id.into(),
             lineage_id: lineage_id.into(),
             records: HashMap::new(),
+            record_order: Vec::new(),
             condvar: default_condvar(),
         }
     }
@@ -136,10 +140,27 @@ impl ToolCallLedger {
     }
 
     pub fn recent_tool_names(&self, limit: usize) -> Vec<String> {
-        self.records
-            .values()
+        if self.record_order.is_empty() {
+            let mut legacy_records = self.records.values().collect::<Vec<_>>();
+            legacy_records.sort_by(|left, right| {
+                right
+                    .executed_at
+                    .cmp(&left.executed_at)
+                    .then_with(|| right.call_id.cmp(&left.call_id))
+            });
+            return legacy_records
+                .into_iter()
+                .take(limit)
+                .map(|record| record.tool_name.clone())
+                .collect();
+        }
+
+        self.record_order
+            .iter()
+            .rev()
+            .filter_map(|call_id| self.records.get(call_id))
             .take(limit)
-            .map(|r| r.tool_name.clone())
+            .map(|record| record.tool_name.clone())
             .collect()
     }
 
@@ -228,6 +249,7 @@ impl ToolCallLedger {
                 }
             }
         }
+        self.record_order.push(call_id.to_string());
         self.records.insert(
             call_id.to_string(),
             ToolCallRecord {
@@ -281,6 +303,7 @@ impl ToolCallLedger {
                 }
             }
         } else {
+            self.record_order.push(call_id.to_string());
             self.records.insert(
                 call_id.to_string(),
                 ToolCallRecord {
@@ -304,6 +327,8 @@ impl ToolCallLedger {
         if let Some(rec) = self.records.get(call_id) {
             if rec.status == ToolExecutionStatus::Pending {
                 self.records.remove(call_id);
+                self.record_order
+                    .retain(|recorded_id| recorded_id != call_id);
                 self.condvar.notify_all();
             }
         }
@@ -356,6 +381,7 @@ impl ToolCallLedger {
                 entry.status = ToolExecutionStatus::Executing;
             }
         } else {
+            self.record_order.push(call_id.to_string());
             self.records.insert(
                 call_id.to_string(),
                 ToolCallRecord {
@@ -529,6 +555,26 @@ mod tests {
         let (result, is_err) = ledger.get_completed_result(call_id).unwrap();
         assert_eq!(result, "file.txt\n");
         assert!(!is_err);
+    }
+
+    #[test]
+    fn recent_tool_names_returns_newest_calls_first() {
+        let mut ledger = ToolCallLedger::new("sess_recent", "lin_recent");
+        for (index, tool) in ["read", "grep", "bash", "edit", "ls", "write"]
+            .into_iter()
+            .enumerate()
+        {
+            ledger.record_start(
+                &format!("call_recent_{index}"),
+                tool,
+                &json!({"index": index}),
+            );
+        }
+
+        assert_eq!(
+            ledger.recent_tool_names(3),
+            vec!["write".to_string(), "ls".to_string(), "edit".to_string()]
+        );
     }
 
     #[test]
