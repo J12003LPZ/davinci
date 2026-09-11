@@ -2208,6 +2208,112 @@ mod tests {
     }
 
     #[test]
+    fn rpc_queued_steer_and_follow_up_prepare_each_user_turn_before_provider() {
+        fn assistant(id: &str) -> davinci_ai::AssistantMessage {
+            davinci_ai::AssistantMessage {
+                id: id.into(),
+                role: "assistant".into(),
+                content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let mut steer_agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+        steer_agent.prompt_session.append("RPC APPEND SENTINEL");
+        steer_agent.queues.steer_mode = davinci_agent::QueueMode::OneAtATime;
+        let mut steer_runtime = RpcRuntime::new(
+            steer_agent,
+            dir.path().join("sessions-steer"),
+            dir.path().to_path_buf(),
+        );
+        for message in [
+            "Redesign this dashboard so it feels premium and intentional.",
+            "What is 2 + 2?",
+        ] {
+            let response = handle_rpc(
+                &mut steer_runtime,
+                RpcCommand {
+                    kind: "steer".into(),
+                    message: Some(message.into()),
+                    ..RpcCommand::default()
+                },
+            );
+            assert!(response.success);
+        }
+        let mut steer_provider_prompts = Vec::new();
+        steer_runtime
+            .agent
+            .run_loop(|agent| {
+                steer_provider_prompts.push(agent.system_prompt.clone());
+                Ok(assistant("rpc-steer"))
+            })
+            .unwrap();
+        assert_eq!(steer_provider_prompts.len(), 2);
+        let active = &steer_provider_prompts[0];
+        assert!(active.contains("frontend_design_policy"));
+        assert!(
+            active.find("frontend_design_policy").unwrap()
+                < active.find("RPC APPEND SENTINEL").unwrap(),
+            "dynamic capability suffix must precede user append"
+        );
+        assert!(!steer_provider_prompts[1].contains("frontend_design_policy"));
+
+        let mut follow_agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+        follow_agent.prompt_session.append("RPC FOLLOW APPEND");
+        follow_agent.queues.follow_up_mode = davinci_agent::QueueMode::OneAtATime;
+        let mut follow_runtime = RpcRuntime::new(
+            follow_agent,
+            dir.path().join("sessions-follow"),
+            dir.path().to_path_buf(),
+        );
+        let prompt_response = handle_rpc(
+            &mut follow_runtime,
+            RpcCommand {
+                kind: "prompt".into(),
+                message: Some("Start with a plain factual answer.".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(prompt_response.success);
+        for message in [
+            "Redesign this dashboard so it feels premium and intentional.",
+            "What is 2 + 2?",
+        ] {
+            let response = handle_rpc(
+                &mut follow_runtime,
+                RpcCommand {
+                    kind: "follow_up".into(),
+                    message: Some(message.into()),
+                    ..RpcCommand::default()
+                },
+            );
+            assert!(response.success);
+        }
+        let mut follow_provider_prompts = Vec::new();
+        follow_runtime
+            .agent
+            .run_loop(|agent| {
+                follow_provider_prompts.push(agent.system_prompt.clone());
+                Ok(assistant("rpc-follow"))
+            })
+            .unwrap();
+        assert_eq!(follow_provider_prompts.len(), 3);
+        assert!(!follow_provider_prompts[0].contains("frontend_design_policy"));
+        let active = &follow_provider_prompts[1];
+        assert!(active.contains("frontend_design_policy"));
+        assert!(
+            active.find("frontend_design_policy").unwrap()
+                < active.find("RPC FOLLOW APPEND").unwrap(),
+            "dynamic capability suffix must precede user append"
+        );
+        assert!(!follow_provider_prompts[2].contains("frontend_design_policy"));
+    }
+
+    #[test]
     fn rpc_prompt_activates_capabilities_on_user_turn() {
         let dir = tempdir().unwrap();
         let agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);

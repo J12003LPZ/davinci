@@ -411,7 +411,7 @@ impl Agent {
             self.stats.user_steers += drained.len() as u64;
         }
         for queued in drained {
-            let message = self.prompt_with(&queued.text, &queued.images);
+            let message = self.prompt_user_with(&queued.text, &queued.images);
             let _ = self.pending_prompt_messages.pop();
             new_messages.push(message.clone());
             self.push_event(

@@ -300,6 +300,9 @@ pub struct Agent {
     pub prompt_manifest: Option<PromptManifest>,
     /// Active prompt session state distinguishing built-in profiles from custom replacement prompts.
     pub prompt_session: prompt::PromptSessionState,
+    /// Most recent real user-origin request eligible as capability-routing history.
+    /// Internal mailbox/system-origin role=`user` messages must never update this.
+    last_real_user_request: Option<String>,
     /// Exact host session source and lineage captured at runtime installation.
     /// Separate from mutable public session/runtime fields to reject stale reuse.
     runtime_session: Option<(PathBuf, String, RunId)>,
@@ -322,6 +325,7 @@ impl Agent {
             system_prompt: system_prompt.clone(),
             prompt_manifest,
             prompt_session,
+            last_real_user_request: None,
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             auto_compaction: true,
@@ -583,16 +587,7 @@ impl Agent {
             );
         }
 
-        let previous_user_request = self.messages.iter().rev().find_map(|m| {
-            if m.role == "user" {
-                m.content.iter().find_map(|c| match c {
-                    davinci_ai::MessageContent::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-            } else {
-                None
-            }
-        });
+        let previous_user_request = self.last_real_user_request.as_deref();
 
         let recent_tools: Vec<String> = self
             .tool_ledger
@@ -658,7 +653,9 @@ impl Agent {
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
         let _ = self.prepare_builtin_prompt_for_user_turn(text);
-        self.prompt_with(text, images)
+        let message = self.prompt_with(text, images);
+        self.last_real_user_request = Some(text.to_string());
+        message
     }
 
     pub fn prompt_with(
@@ -1517,6 +1514,10 @@ impl Agent {
                 None
             }
         });
+
+        if record.is_none() && self.prompt_session.is_custom() {
+            return Ok(false);
+        }
 
         let profile_override = if record.is_none() && self.prompt_session.is_builtin() {
             self.prompt_session.profile()
@@ -4278,6 +4279,47 @@ mod tests {
             .modules
             .iter()
             .any(|m| m.id == "capability.code-review"));
+    }
+
+    #[test]
+    fn mailbox_history_is_not_previous_real_user_evidence_for_capability_routing() {
+        let run_id = runtime::RunId::new();
+        let agent_id = runtime::AgentId::new();
+        let sender_id = runtime::AgentId::new();
+        let mailbox = runtime::AgentMailbox::new();
+        mailbox
+            .send(runtime::AgentMessage::new(
+                run_id,
+                sender_id,
+                agent_id,
+                "Redesign the UI dashboard layout with visual hierarchy and cards.",
+            ))
+            .unwrap();
+        let runtime = runtime::RuntimeHandle::new(run_id, agent_id, runtime::RuntimeBus::new())
+            .with_mailbox(mailbox);
+
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+        agent.set_runtime(runtime);
+        agent.prompt_user_with("Say hello.", &[]);
+        agent
+            .run_loop(|_| {
+                Ok(davinci_ai::AssistantMessage {
+                    id: "mailbox-fixture".into(),
+                    role: "assistant".into(),
+                    content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(davinci_ai::StopReason::Stop),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        agent.prompt_user_with("cards", &[]);
+        assert!(
+            !agent.system_prompt.contains("frontend_design_policy"),
+            "internal mailbox text must not become previous_user_request evidence"
+        );
     }
 
     #[test]

@@ -669,6 +669,94 @@ mod tests {
     }
 
     #[test]
+    fn sdk_queued_steer_and_follow_up_prepare_each_user_turn_before_provider() {
+        fn assistant(id: &str) -> davinci_ai::AssistantMessage {
+            davinci_ai::AssistantMessage {
+                id: id.into(),
+                role: "assistant".into(),
+                content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let mut steer_session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent-steer")),
+            session_dir: Some(dir.path().join("sessions-steer")),
+            append_system_prompt: vec!["SDK APPEND SENTINEL".into()],
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        steer_session.agent.queues.steer_mode = davinci_agent::QueueMode::OneAtATime;
+        steer_session.steer(
+            "Redesign this dashboard so it feels premium and intentional.",
+            Vec::new(),
+        );
+        steer_session.steer("What is 2 + 2?", Vec::new());
+        let mut steer_provider_prompts = Vec::new();
+        steer_session
+            .run(|agent| {
+                steer_provider_prompts.push(agent.system_prompt.clone());
+                Ok(assistant("sdk-steer"))
+            })
+            .unwrap();
+        assert_eq!(steer_provider_prompts.len(), 2);
+        let active = &steer_provider_prompts[0];
+        assert!(active.contains("frontend_design_policy"));
+        assert!(
+            active.find("frontend_design_policy").unwrap()
+                < active.find("SDK APPEND SENTINEL").unwrap(),
+            "dynamic capability suffix must precede user append"
+        );
+        assert!(
+            !steer_provider_prompts[1].contains("frontend_design_policy"),
+            "later non-capability queued steer must deactivate frontend capability"
+        );
+
+        let mut follow_session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent-follow")),
+            session_dir: Some(dir.path().join("sessions-follow")),
+            append_system_prompt: vec!["SDK FOLLOW APPEND".into()],
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        follow_session.agent.queues.follow_up_mode = davinci_agent::QueueMode::OneAtATime;
+        follow_session.prompt("Start with a plain factual answer.");
+        follow_session.follow_up(
+            "Redesign this dashboard so it feels premium and intentional.",
+            Vec::new(),
+        );
+        follow_session.follow_up("What is 2 + 2?", Vec::new());
+        let mut follow_provider_prompts = Vec::new();
+        follow_session
+            .run(|agent| {
+                follow_provider_prompts.push(agent.system_prompt.clone());
+                Ok(assistant("sdk-follow"))
+            })
+            .unwrap();
+        assert_eq!(follow_provider_prompts.len(), 3);
+        assert!(!follow_provider_prompts[0].contains("frontend_design_policy"));
+        let active = &follow_provider_prompts[1];
+        assert!(active.contains("frontend_design_policy"));
+        assert!(
+            active.find("frontend_design_policy").unwrap()
+                < active.find("SDK FOLLOW APPEND").unwrap(),
+            "dynamic capability suffix must precede user append"
+        );
+        assert!(
+            !follow_provider_prompts[2].contains("frontend_design_policy"),
+            "later non-capability queued follow-up must deactivate frontend capability"
+        );
+    }
+
+    #[test]
     fn sdk_session_prompt_activates_capabilities_on_user_turn() {
         let dir = tempdir().unwrap();
         let mut session = create_agent_session(CreateAgentSessionOptions {
