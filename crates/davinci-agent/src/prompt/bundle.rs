@@ -50,6 +50,7 @@ impl PromptBundle {
                 plan_revision: None,
                 plan_approved: false,
                 active_contract: false,
+                visual_verification_available: false,
             },
         ));
         let mut composed = compose_modules(&modules);

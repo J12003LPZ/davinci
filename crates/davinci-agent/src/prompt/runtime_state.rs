@@ -10,6 +10,8 @@ pub struct RuntimePromptState {
     pub plan_revision: Option<u64>,
     pub plan_approved: bool,
     pub active_contract: bool,
+    #[serde(default)]
+    pub visual_verification_available: bool,
 }
 
 pub fn runtime_state_text(state: &RuntimePromptState) -> String {
@@ -45,6 +47,15 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
         lines.push("Active task contract: in effect.".to_string());
     }
 
+    lines.push(format!(
+        "Visual verification backend: {}.",
+        if state.visual_verification_available {
+            "available"
+        } else {
+            "unavailable"
+        }
+    ));
+
     format!("<runtime_state>\n{}\n</runtime_state>", lines.join("\n"))
 }
 
@@ -69,6 +80,7 @@ mod tests {
             plan_revision: Some(3),
             plan_approved: false,
             active_contract: false,
+            visual_verification_available: false,
         });
 
         assert!(text.contains("Plan Mode"));
@@ -92,6 +104,7 @@ mod tests {
                 plan_revision: Some(1),
                 plan_approved: true,
                 active_contract: true,
+                visual_verification_available: true,
             };
             let text1 = runtime_state_text(&state);
             let text2 = runtime_state_text(&state);
@@ -114,6 +127,7 @@ mod tests {
             plan_revision: Some(42),
             plan_approved: false,
             active_contract: true,
+            visual_verification_available: false,
         };
         let text = runtime_state_text(&state);
         assert!(estimate_tokens_from_str(&text) <= 500);

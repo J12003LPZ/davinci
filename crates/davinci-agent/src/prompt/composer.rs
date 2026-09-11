@@ -153,6 +153,7 @@ pub fn compose_with_mutations(
             plan_revision: None,
             plan_approved: false,
             active_contract: false,
+            visual_verification_available: false,
         },
     ));
 

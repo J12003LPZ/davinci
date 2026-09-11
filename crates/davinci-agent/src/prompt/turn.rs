@@ -110,6 +110,7 @@ mod tests {
             plan_revision: None,
             plan_approved: false,
             active_contract: false,
+            visual_verification_available: false,
         };
 
         let composed = compose_turn_prompt(&session, &ctx, &capabilities, &state).unwrap();
@@ -157,6 +158,7 @@ mod tests {
             plan_revision: None,
             plan_approved: false,
             active_contract: false,
+            visual_verification_available: false,
         };
 
         let result = compose_turn_prompt(&session, &ctx, &capabilities, &state);
@@ -186,6 +188,7 @@ mod tests {
             plan_revision: None,
             plan_approved: false,
             active_contract: false,
+            visual_verification_available: false,
         };
 
         let composed = compose_turn_prompt(&session, &ctx, &capabilities, &state).unwrap();

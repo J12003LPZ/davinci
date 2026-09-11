@@ -284,6 +284,8 @@ pub struct Agent {
     previous_execution_mode: Option<PermissionMode>,
     /// Historical snapshot for a bounded revision diff, never an active plan.
     previous_plan_revision: Option<LivingPlan>,
+    /// Whether the host has registered a backend capable of visual verification.
+    visual_verification_available: bool,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -381,6 +383,7 @@ impl Agent {
             base_system_prompt: system_prompt,
             previous_execution_mode: None,
             previous_plan_revision: None,
+            visual_verification_available: false,
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -481,6 +484,30 @@ impl Agent {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .mode
+    }
+
+    /// Snapshot prompt-facing state from the live permission, plan, contract,
+    /// and host capability owners without mutating any of them.
+    pub fn runtime_prompt_state(&self) -> prompt::RuntimePromptState {
+        let plan = self
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let plan_revision = (plan.revision != 0).then_some(plan.revision);
+
+        prompt::RuntimePromptState {
+            permission_mode: self.permission_mode(),
+            plan_revision,
+            plan_approved: plan_revision.is_some() && plan.approved_revision == plan_revision,
+            active_contract: self.active_contract().is_some(),
+            visual_verification_available: self.visual_verification_available,
+        }
+    }
+
+    /// Update host capability availability before the next prompt is prepared.
+    pub fn set_visual_verification_available(&mut self, available: bool) {
+        self.visual_verification_available = available;
     }
 
     pub fn is_plan_mode(&self) -> bool {
@@ -603,18 +630,8 @@ impl Agent {
 
         let capabilities = prompt::route_capabilities(&router_input);
 
-        let permission_mode = self.permissions.lock().map(|p| p.mode).unwrap_or_default();
-
-        let runtime_state = prompt::RuntimePromptState {
-            permission_mode,
-            plan_revision: self.previous_plan_revision.as_ref().map(|p| p.revision),
-            plan_approved: self
-                .previous_plan_revision
-                .as_ref()
-                .map(|p| p.approved_revision == Some(p.revision))
-                .unwrap_or(false),
-            active_contract: self.previous_execution_mode.is_some(),
-        };
+        let runtime_state = self.runtime_prompt_state();
+        let permission_mode = runtime_state.permission_mode;
 
         let ctx = prompt::composer::PromptContext {
             provider: &self.provider,
@@ -4365,6 +4382,61 @@ mod tests {
             agent.prompt_manifest.as_ref().unwrap().stable_sha256,
             PromptProfile::Stable.bundle().stable_sha256()
         );
+    }
+
+    #[test]
+    fn runtime_prompt_state_reads_live_plan_and_permission_owners() {
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+        agent.set_permission_mode(PermissionMode::Edits);
+        {
+            let mut plan = agent.tool_context.living_plan.lock().unwrap();
+            plan.revision = 7;
+            plan.approved_revision = Some(7);
+        }
+
+        let state = agent.runtime_prompt_state();
+
+        assert_eq!(state.permission_mode, PermissionMode::Edits);
+        assert_eq!(state.plan_revision, Some(7));
+        assert!(state.plan_approved);
+        assert!(!state.visual_verification_available);
+
+        agent.set_visual_verification_available(true);
+        let prepared = agent
+            .prepare_builtin_prompt_for_user_turn("Check the current runtime state.")
+            .unwrap();
+        assert!(prepared.runtime_state.visual_verification_available);
+        assert!(prepared
+            .composed
+            .dynamic_text
+            .contains("Visual verification backend: available."));
+    }
+
+    #[test]
+    fn runtime_prompt_state_reads_live_contract_owner_not_execution_mode() {
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+        agent.set_permission_mode(PermissionMode::ReadOnly);
+        assert!(!agent.runtime_prompt_state().active_contract);
+
+        let contract = crate::runtime::TaskContract::new(
+            "runtime-prompt-state-contract",
+            1,
+            crate::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec!["secret.env".into()],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        agent.set_active_contract(contract);
+
+        let prepared = agent
+            .prepare_builtin_prompt_for_user_turn("Continue the approved task.")
+            .unwrap();
+        assert!(prepared.runtime_state.active_contract);
     }
 
     #[test]
