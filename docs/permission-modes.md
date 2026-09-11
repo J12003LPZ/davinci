@@ -24,6 +24,16 @@ This is an **approval policy, not an OS sandbox**. Allowed project checks can ex
 
 The policy classifies every patch target separately, including deletion actions; a harmless target cannot conceal a secret or outside-workspace target in a compound display string. Path checks include protected harness settings, Git metadata, common credential paths, Windows aliases and existing symlink ancestors. Deny rules take precedence over grants. Subagent profiles cannot request a mode more permissive than their parent's mode. Existing graph subprocesses explicitly request the former non-interactive behavior using `always-approve`, retaining their separate role-tool and shell-policy guards.
 
+## Approval prompts
+
+In print mode, an action requiring approval stops the turn and exits with status 1. Standard output contains an `approval_required` JSON object with the tool call ID, action name, redacted target, permission mode, and resolved global settings path. With `--mode json`, this object follows the normal JSON event stream. Approve the action in an interactive host or configure a narrow `permissions.allow` rule; explicit denies still win. Print mode never records consent, waits for an approval response, or processes later supplied prompts after this result.
+
+The native permission panel offers only choices allowed by the policy. Arrow keys or numbers focus a choice; plain Enter confirms it. Escape denies the call. Mode shortcuts, paste and arriving voice transcripts cannot change the conversation draft while the panel is open.
+
+When offered, **deny with instructions** opens a separate editor. Type what the model should do instead, then press Enter to confirm the denial. Instructions must be non-empty and fit within 4,096 UTF-8 bytes. Escape discards the instructions and denies; Ctrl+C also interrupts the turn. This choice never runs the declined call or saves a permission grant.
+
+RPC clients receive the same denial option through the existing `select`, `input` and `confirm` dialogs. Instructions are attached only after an affirmative confirmation. Cancellation, invalid text, an expired challenge or changed policy denies without attaching the instructions. These approval additions are source-branch changes; the historical installed-build record below does not validate their installation.
+
 ## Living Plan Mode
 
 `/plan` enters Plan Mode. The model uses **propose_plan** for a structured, revision-checked plan, while the legacy `update_plan`/todo checklist remains compatible. A plan records the goal, repository evidence and file fingerprints, assumptions, unresolved questions, and stable step IDs. Each step describes its change, files, reason, dependencies and verification. Targeted updates preserve unaffected steps and decisions; revisions invalidate obsolete approval.

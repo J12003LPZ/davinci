@@ -1075,6 +1075,7 @@ pub fn graph_run_sheet() -> GraphRunSheet {
         artifact: artifact.into(),
         usage: usage.into(),
         state,
+        ..Default::default()
     };
     GraphRunSheet {
         goal: "add prompt-cache parity to the openai adapter --complex".into(),
@@ -1157,6 +1158,7 @@ pub fn graph_run_sheet() -> GraphRunSheet {
         milestone: "2 of 4".into(),
         elapsed: "6m18s".into(),
         ecosystem: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -1989,6 +1991,83 @@ fn sheet(model: &mut Model, screen: crate::davinci::model::Screen) {
     model.screen = screen;
     if model.branch.is_empty() {
         model.branch = "main".into();
+    }
+}
+
+/// Deterministic permission cycle fixture view.
+pub fn dress_permission_cycle(model: &mut Model, mode_id: &str) {
+    dress(model);
+    model.permission_mode = mode_id.to_string();
+}
+
+/// Deterministic task board fixture view for `/tasks`.
+pub fn task_board_fixture() -> crate::davinci::model::TaskBoardSheet {
+    use crate::davinci::model::{TaskBoardRow, TaskBoardSheet};
+    use crate::davinci::theme::State;
+    TaskBoardSheet {
+        tasks: vec![
+            TaskBoardRow::new(
+                "task-001",
+                "Investigate graph dependency cycle",
+                "running",
+                State::Read,
+            ),
+            TaskBoardRow::new(
+                "task-002",
+                "Apply patch to storage module",
+                "queued",
+                State::Queued,
+            ),
+        ],
+        selected_index: 0,
+    }
+}
+
+/// Deterministic context memory inspector fixture view for `/context`.
+pub fn context_inspector_fixture() -> crate::davinci::model::ContextInspectorSheet {
+    use crate::davinci::model::{ContextInspectorRow, ContextInspectorSheet};
+    ContextInspectorSheet {
+        request_id: "req-f11-001".into(),
+        root_run_id: "run-root-42".into(),
+        source_revision: 1,
+        overlay_revision: 1,
+        manifest_digest: "sha256:7f3a9e".into(),
+        rows: vec![
+            ContextInspectorRow {
+                item_id: "ctx-core-rules".into(),
+                category: "rules".into(),
+                provenance: "workspace_root".into(),
+                source_ref: "AGENTS.md".into(),
+                fingerprint: "fp-1234".into(),
+                estimated_tokens: 450,
+                selected: true,
+                inclusion_reason: Some("mandatory baseline rules".into()),
+                mandatory: true,
+                pinned: true,
+                freshness: "fresh".into(),
+                last_refreshed_at: Some("12:00:00".into()),
+                preview_body: Some("# AGENTS.md instructions".into()),
+            },
+            ContextInspectorRow {
+                item_id: "ctx-optional-skill".into(),
+                category: "skills".into(),
+                provenance: "user_skills".into(),
+                source_ref: "browser-testing.md".into(),
+                fingerprint: "fp-5678".into(),
+                estimated_tokens: 320,
+                selected: false,
+                inclusion_reason: None,
+                mandatory: false,
+                pinned: false,
+                freshness: "stale".into(),
+                last_refreshed_at: None,
+                preview_body: Some("Skill instructions".into()),
+            },
+        ],
+        selected_index: 0,
+        preview_active: false,
+        show_pending: false,
+        confirmation_dialog: None,
     }
 }
 

@@ -17,6 +17,15 @@ const READ_TOOLS: &[&str] = &["read", "grep", "find", "ls"];
 
 pub const GRAPH_SUBMIT_TOOL: &str = "graph_submit";
 
+/// Sessionless graph subprocesses have no parent task-coordinator transport.
+/// Reads must use that authority too, rather than an unrelated local registry.
+pub(super) fn requires_task_coordinator(tool: &str) -> bool {
+    matches!(
+        tool,
+        "task_create" | "task_update" | "task_list" | "task_get"
+    )
+}
+
 pub use crate::native_extensions::token_governor::ensure_governor_recovery_tool;
 
 pub fn role_tools(role: Role) -> Vec<String> {

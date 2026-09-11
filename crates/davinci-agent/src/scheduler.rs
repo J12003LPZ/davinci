@@ -47,8 +47,8 @@ pub fn lane_for(tool: &str, class: ToolClass) -> ToolLane {
         // The ledger and the job book are shared state behind a mutex, but
         // two `todo` writes in one message would race for last-wins; keep
         // them ordered.
-        "todo" | "update_plan" | "propose_plan" | "job_kill" | "agent_message" | "agent_stop"
-        | "task_create" | "task_update" => ToolLane::Serial,
+        "todo" | "update_plan" | "propose_plan" | "ask_user_question" | "job_kill"
+        | "agent_message" | "agent_stop" | "task_create" | "task_update" => ToolLane::Serial,
         _ => match class {
             ToolClass::Read | ToolClass::Network => ToolLane::Parallel,
             ToolClass::Edit | ToolClass::Shell | ToolClass::Other => ToolLane::Serial,
@@ -84,18 +84,34 @@ pub struct ScheduleReport {
 /// missing calls the way it reports an interrupted sequential run).
 /// `sequential` forces every group to width one, which is what
 /// `ToolExecutionMode::Sequential` means.
-pub fn run_lanes<'a, T: Send>(
-    calls: Vec<ScheduledCall<'a, T>>,
+pub fn run_lanes<T: Send>(
+    calls: Vec<ScheduledCall<'_, T>>,
     sequential: bool,
     max_parallelism: usize,
     abort: Option<&AtomicBool>,
+    on_group_start: impl FnMut(&[usize]),
+) -> (Vec<T>, ScheduleReport) {
+    run_lanes_with_cancel(
+        calls,
+        sequential,
+        max_parallelism,
+        || abort.is_some_and(|flag| flag.load(Ordering::SeqCst)),
+        on_group_start,
+    )
+}
+
+/// Check the host's combined cancellation sources before each group.
+pub(crate) fn run_lanes_with_cancel<'a, T: Send>(
+    calls: Vec<ScheduledCall<'a, T>>,
+    sequential: bool,
+    max_parallelism: usize,
+    aborted: impl Fn() -> bool,
     mut on_group_start: impl FnMut(&[usize]),
 ) -> (Vec<T>, ScheduleReport) {
     let mut results: Vec<T> = Vec::with_capacity(calls.len());
     let mut report = ScheduleReport::default();
     let total = calls.len();
     let mut pending = calls.into_iter().enumerate().peekable();
-    let aborted = || abort.is_some_and(|flag| flag.load(Ordering::SeqCst));
 
     while pending.peek().is_some() {
         if aborted() {
@@ -305,5 +321,9 @@ mod tests {
         assert_eq!(lane_for("agent", ToolClass::Other), ToolLane::Parallel);
         assert_eq!(lane_for("batch", ToolClass::Read), ToolLane::Serial);
         assert_eq!(lane_for("todo", ToolClass::Read), ToolLane::Serial);
+        assert_eq!(
+            lane_for("ask_user_question", ToolClass::Read),
+            ToolLane::Serial
+        );
     }
 }

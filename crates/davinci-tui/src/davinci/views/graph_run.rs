@@ -27,6 +27,20 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         th,
         &format!("{done} of {} workers complete", run.tasks.len()),
     ));
+    if !run.lifecycle.is_empty() {
+        let label = match run.lifecycle.as_str() {
+            "pause_requested" => "pause_requested · waiting for safe boundary",
+            "paused" => "paused",
+            "stop_requested" => "stop_requested",
+            "stopped" => "stopped",
+            "recovery_required" => "recovery_required",
+            other => other,
+        };
+        rows.extend(section_detail(width, th, &format!("Lifecycle: {label}")));
+    }
+    if let Some(status) = &run.control_status {
+        rows.extend(section_detail(width, th, &format!("Control: {status}")));
+    }
     for (phase, state) in &run.phases {
         rows.extend(section_state(width, th, *state, phase));
     }
@@ -45,7 +59,18 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         rows.extend(section_detail(width, th, "No workers reported yet."));
     }
     for task in &run.tasks {
-        rows.extend(section_state(width, th, task.state, &task.id));
+        let is_selected = run.selected_node_id.as_deref() == Some(&task.id);
+        if is_selected {
+            rows.push(ui::section_row(
+                width,
+                th,
+                true,
+                &format!("{} {}", task.state.glyph(), task.id),
+                &task.usage,
+            ));
+        } else {
+            rows.extend(section_state(width, th, task.state, &task.id));
+        }
         for (label, value) in [
             ("Policy", &task.policy),
             ("Artifact", &task.artifact),
@@ -53,6 +78,41 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         ] {
             if !value.is_empty() {
                 rows.extend(section_detail(width, th, &format!("{label}: {value}")));
+            }
+        }
+        if is_selected && run.inspecting_node {
+            if !task.role.is_empty() {
+                rows.extend(section_detail(width, th, &format!("Role: {}", task.role)));
+            }
+            if !task.dependencies.is_empty() {
+                rows.extend(section_detail(
+                    width,
+                    th,
+                    &format!("Dependencies: {}", task.dependencies.join(", ")),
+                ));
+            }
+            if !task.owner.is_empty() {
+                rows.extend(section_detail(width, th, &format!("Owner: {}", task.owner)));
+            }
+            if task.attempts > 0 {
+                rows.extend(section_detail(
+                    width,
+                    th,
+                    &format!("Attempts: {}", task.attempts),
+                ));
+            }
+            if let Some(err) = &task.error {
+                rows.extend(section_detail(width, th, &format!("Error: {err}")));
+            }
+            if let Some(contract) = &task.public_contract {
+                rows.extend(section_detail(
+                    width,
+                    th,
+                    &format!("Public Contract: {contract}"),
+                ));
+            }
+            for tool in &task.recent_tools {
+                rows.extend(section_detail(width, th, &format!("Recent Tool: {tool}")));
             }
         }
     }
@@ -104,7 +164,14 @@ pub fn chrome(model: &Model) -> SheetChrome {
         status_right: run
             .filter(|run| !run.cost.is_empty() && !run.cost_cap.is_empty())
             .map(|run| status_meter(th, "run cost", run.cost_fraction, &run.cost, &run.cost_cap)),
-        hints: vec![hint(th, "↑↓ scroll")],
+        hints: vec![
+            hint(th, "↑↓ select"),
+            hint(th, "enter inspect"),
+            hint(th, "p pause/resume"),
+            hint(th, "x stop"),
+            hint(th, "r retry"),
+            hint(th, "d diff"),
+        ],
         escape: Some("esc close"),
         composer: Composer::Hidden,
         ..SheetChrome::default()
@@ -170,5 +237,94 @@ mod tests {
                 assert!(ui::run_width(&row.spans) <= width);
             }
         }
+    }
+
+    #[test]
+    fn test_no_node_selected() {
+        let m = model(80);
+        assert!(m.graph_run.as_ref().unwrap().selected_node_id.is_none());
+        assert!(ui::focused_row(&lines(&m)).is_none());
+    }
+
+    #[test]
+    fn test_node_selection_and_inspection() {
+        let mut m = model(80);
+        let run = m.graph_run.as_mut().unwrap();
+        run.selected_node_id = Some("t1 classifier".into());
+        run.inspecting_node = true;
+        let task = &mut run.tasks[0];
+        task.role = "classifier".into();
+        task.public_contract = Some("inputs: user prompt, outputs: Classification".into());
+        task.recent_tools = vec!["read(crates/davinci-ai/src/openai.rs)".into()];
+
+        assert!(ui::focused_row(&lines(&m)).is_some());
+        let drawn = text(&m);
+        assert!(drawn.contains("Contract: inputs: user prompt"));
+        assert!(drawn.contains("Recent Tool: read"));
+    }
+
+    #[test]
+    fn test_one_second_refresh_while_selected_node_finishes() {
+        let mut m = model(80);
+        m.graph_run.as_mut().unwrap().selected_node_id = Some("t6 writer".into());
+        // Simulating refresh where t6 writer finishes
+        let run = m.graph_run.as_mut().unwrap();
+        let writer = run.tasks.iter_mut().find(|t| t.id == "t6 writer").unwrap();
+        writer.state = State::Done;
+        writer.artifact = "patch committed".into();
+
+        // Selection is maintained on t6 writer
+        assert_eq!(
+            m.graph_run.as_ref().unwrap().selected_node_id.as_deref(),
+            Some("t6 writer")
+        );
+        let drawn = text(&m);
+        assert!(drawn.contains("t6 writer"));
+        assert!(drawn.contains("patch committed"));
+    }
+
+    #[test]
+    fn test_forty_column_screen() {
+        let mut m = model(40);
+        m.graph_run.as_mut().unwrap().selected_node_id = Some("t2 researcher".into());
+        m.graph_run.as_mut().unwrap().inspecting_node = true;
+        for row in lines(&m) {
+            assert!(ui::run_width(&row.spans) <= 40);
+        }
+    }
+
+    #[test]
+    fn test_long_artifacts() {
+        let mut m = model(80);
+        let long_artifact = "a".repeat(400);
+        m.graph_run.as_mut().unwrap().tasks[0].artifact = long_artifact.clone();
+        let drawn = text(&m);
+        assert!(drawn.contains("a"));
+        for row in lines(&m) {
+            assert!(ui::run_width(&row.spans) <= 80);
+        }
+    }
+
+    #[test]
+    fn test_pause_label_requested_until_ack() {
+        let mut m = model(80);
+        m.graph_run.as_mut().unwrap().lifecycle = "pause_requested".into();
+        let drawn_requested = text(&m);
+        assert!(drawn_requested.contains("pause_requested"));
+
+        m.graph_run.as_mut().unwrap().lifecycle = "paused".into();
+        let drawn_paused = text(&m);
+        assert!(drawn_paused.contains("paused"));
+    }
+
+    #[test]
+    fn test_hidden_reasoning_never_displayed() {
+        let mut m = model(80);
+        m.graph_run.as_mut().unwrap().selected_node_id = Some("t1 classifier".into());
+        m.graph_run.as_mut().unwrap().inspecting_node = true;
+        let drawn = text(&m);
+        assert!(!drawn.contains("thinking:"));
+        assert!(!drawn.contains("reasoning:"));
+        assert!(!drawn.contains("<thought>"));
     }
 }

@@ -1,11 +1,17 @@
 //! One module per instrument. Every view takes data and a theme and knows
 //! nothing else.
 
+pub mod agents;
+pub mod approval_modal;
 pub mod ask;
+pub mod budget;
 pub mod chrome;
 pub mod codex;
 pub mod cogitator;
 pub mod compact;
+pub mod completion;
+pub mod context_inspector;
+pub mod decision_modal;
 pub mod diff;
 pub mod disegno;
 pub mod export;
@@ -25,11 +31,14 @@ pub mod opera;
 pub mod permissions;
 pub mod recovery;
 pub mod resume;
+pub mod rewind;
 pub mod securitas;
+pub mod semantic;
 pub mod settings;
 pub mod sheet;
 pub mod startup;
 pub mod studio;
+pub mod task_board;
 pub mod thinking;
 pub mod transcript;
 pub mod tree;

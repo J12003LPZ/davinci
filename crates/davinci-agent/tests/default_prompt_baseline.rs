@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 #[test]
 fn default_prompt_v1_matches_committed_baseline() {
     let actual = default_system_prompt();
-    let expected = include_str!("fixtures/default_system_prompt_v1.txt");
+    let expected = include_str!("fixtures/default_system_prompt_v1.txt").replace("\r\n", "\n");
 
     assert_eq!(actual, expected);
 

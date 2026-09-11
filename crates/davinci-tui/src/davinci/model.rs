@@ -78,6 +78,10 @@ impl Composer {
         self.editor.set_text(String::new());
     }
 
+    pub fn cursor(&self) -> usize {
+        self.editor.cursor
+    }
+
     pub fn truncate(&mut self, len: usize) {
         let mut end = len.min(self.editor.buffer.len());
         while end > 0 && !self.editor.buffer.is_char_boundary(end) {
@@ -185,6 +189,12 @@ pub enum Screen {
     Permissions,
     /// `5e` — deterministic agent workflows (`/workflows`).
     Workflows,
+    /// Execution checklist and live task board (`/tasks`).
+    TaskBoard,
+    /// Live task and agent control panel (`/agents`).
+    Agents,
+    /// Context memory inspector (`/context`).
+    ContextInspector,
 }
 
 /// An instrument summoned over the transcript, dismissed with esc.
@@ -259,6 +269,12 @@ pub enum Choice {
     TrustDecide,
     /// A row of the `/permissions` sheet.
     Permission(usize),
+    /// An action on the `/agents` panel.
+    AgentAction { action: &'static str, index: usize },
+    /// An action on the `/context` panel.
+    ContextInspectorAction { action: &'static str, index: usize },
+    /// An action on the `/graph` run sheet (`5a`).
+    GraphAction { action: &'static str, index: usize },
 }
 
 /// A block of rows an extension owns. Extensions get rows, not colours and
@@ -878,6 +894,24 @@ pub struct BudgetMeta {
     pub history: String,
 }
 
+/// Whole-task budget and progress watchdog view state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskBudgetView {
+    pub tokens_charged: u64,
+    pub token_ceiling: u64,
+    pub reserved_tokens: u64,
+    pub elapsed_ms: u64,
+    pub deadline_ms: u64,
+    pub active_workers: usize,
+    pub max_concurrency: usize,
+    pub retries_used: u32,
+    pub retry_ceiling: u32,
+    pub cost_label: String,
+    pub verification_reserve: u64,
+    pub handoff_reserve: u64,
+    pub watchdog_signal: Option<String>,
+}
+
 /// Whether a credential stands behind a provider or a catalog row (`3a`,
 /// `3d`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1096,6 +1130,13 @@ pub struct GraphTask {
     pub artifact: String,
     pub usage: String,
     pub state: State,
+    pub role: String,
+    pub dependencies: Vec<String>,
+    pub owner: String,
+    pub attempts: u32,
+    pub error: Option<String>,
+    pub recent_tools: Vec<String>,
+    pub public_contract: Option<String>,
 }
 
 /// A task running as a graph of isolated workers (`5a`).
@@ -1119,6 +1160,23 @@ pub struct GraphRunSheet {
     pub milestone: String,
     pub elapsed: String,
     pub ecosystem: Vec<String>,
+    pub selected_index: usize,
+    pub selected_node_id: Option<String>,
+    pub lifecycle: String,
+    pub control_status: Option<String>,
+    pub inspecting_node: bool,
+    pub showing_diff: bool,
+}
+
+pub fn graph_view_action(key: &str) -> Option<&'static str> {
+    match key {
+        "p" => Some("pause_resume"),
+        "x" => Some("stop"),
+        "r" => Some("retry"),
+        "d" => Some("diff"),
+        "enter" => Some("inspect"),
+        _ => None,
+    }
 }
 
 /// The vector index itself (`5b`).
@@ -1234,6 +1292,121 @@ pub struct WorkflowRow {
 pub struct WorkflowsSheet {
     pub workflows: Vec<WorkflowRow>,
     pub selected_index: usize,
+}
+
+/// One execution task row on the live task board.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskBoardRow {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub state: State,
+    pub owner: Option<String>,
+    pub dependencies: Vec<String>,
+    pub parent_plan_step: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub blocked_reasons: Vec<String>,
+    pub activity: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+impl TaskBoardRow {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        status: impl Into<String>,
+        state: State,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            status: status.into(),
+            state,
+            owner: None,
+            dependencies: Vec::new(),
+            parent_plan_step: None,
+            evidence_refs: Vec::new(),
+            blocked_reasons: Vec::new(),
+            activity: None,
+            updated_at_ms: 0,
+        }
+    }
+}
+
+/// The execution task board sheet (`/tasks` or live task board).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskBoardSheet {
+    pub tasks: Vec<TaskBoardRow>,
+    pub selected_index: usize,
+}
+
+/// One worker entry on the `/agents` panel.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentRow {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub state: State,
+    pub status: String,
+    pub activity: String,
+    pub elapsed: String,
+    pub owned_paths: Vec<String>,
+    pub tool_count: u64,
+    pub tokens: Option<u64>,
+    pub waiting_on: Option<String>,
+    pub disconnected: bool,
+    pub usage_unknown: bool,
+}
+
+impl AgentRow {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, state: State) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            state,
+            ..Default::default()
+        }
+    }
+}
+
+/// Live agent/worker panel sheet (`/agents`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentsSheet {
+    pub agents: Vec<AgentRow>,
+    pub selected_index: usize,
+}
+
+/// A row in the context memory inspector sheet (`/context`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextInspectorRow {
+    pub item_id: String,
+    pub category: String,
+    pub provenance: String,
+    pub source_ref: String,
+    pub fingerprint: String,
+    pub estimated_tokens: u64,
+    pub selected: bool,
+    pub inclusion_reason: Option<String>,
+    pub mandatory: bool,
+    pub pinned: bool,
+    pub freshness: String,
+    pub last_refreshed_at: Option<String>,
+    pub preview_body: Option<String>,
+}
+
+/// The context memory inspector sheet state (`/context`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextInspectorSheet {
+    pub request_id: String,
+    pub root_run_id: String,
+    pub source_revision: u64,
+    pub overlay_revision: u64,
+    pub manifest_digest: String,
+    pub rows: Vec<ContextInspectorRow>,
+    pub selected_index: usize,
+    pub preview_active: bool,
+    pub show_pending: bool,
+    pub confirmation_dialog: Option<String>,
 }
 
 /// Which of the theme's inks a figure is drawn in.
@@ -1463,6 +1636,12 @@ pub struct Model {
     /// The question in hand, when `Overlay::Ask` is open.
     pub ask: Ask,
     pub ask_index: usize,
+    /// Ephemeral permission-modal text; never the conversation composer.
+    pub approval_instructions: Option<Composer>,
+    /// Structured decision modal state for living plan questions.
+    pub decision_modal: Option<crate::davinci::views::decision_modal::DecisionModalState>,
+    /// Task rewind confirmation modal state.
+    pub rewind_modal: Option<crate::davinci::views::rewind::RewindModalState>,
 
     pub cwd: String,
     pub branch: String,
@@ -1530,6 +1709,7 @@ pub struct Model {
     pub budget: Vec<BudgetRow>,
     pub budget_meta: BudgetMeta,
     pub proposal: Option<Proposal>,
+    pub task_budget: Option<TaskBudgetView>,
 
     // --- screens 3a–6d ------------------------------------------------------
     /// `3a` — the full model catalog, and its selection.
@@ -1585,6 +1765,15 @@ pub struct Model {
     /// `5e` — deterministic agent workflows (`/workflows`).
     pub workflows: Option<WorkflowsSheet>,
     pub workflow_index: usize,
+    /// Live execution task board (`/tasks`).
+    pub task_board: Option<TaskBoardSheet>,
+    pub task_board_index: usize,
+    /// Live worker panel (`/agents`).
+    pub agents: Option<AgentsSheet>,
+    pub agents_index: usize,
+    /// Context memory inspector (`/context`).
+    pub context_inspector: Option<ContextInspectorSheet>,
+    pub context_inspector_index: usize,
     /// What the command sheets state about the session (design.md §11).
     pub facts: Facts,
 }
@@ -1628,6 +1817,9 @@ impl Model {
             recall_index: 0,
             ask: Ask::default(),
             ask_index: 0,
+            approval_instructions: None,
+            decision_modal: None,
+            rewind_modal: None,
             cwd: String::new(),
             branch: String::new(),
             model_name: String::new(),
@@ -1662,6 +1854,7 @@ impl Model {
             budget: Vec::new(),
             budget_meta: BudgetMeta::default(),
             proposal: None,
+            task_budget: None,
             catalog: Vec::new(),
             catalog_index: 0,
             settings_rows: Vec::new(),
@@ -1695,6 +1888,12 @@ impl Model {
             permission_index: 0,
             workflows: None,
             workflow_index: 0,
+            task_board: None,
+            task_board_index: 0,
+            agents: None,
+            agents_index: 0,
+            context_inspector: None,
+            context_inspector_index: 0,
             facts: Facts::default(),
         }
     }
@@ -1835,6 +2034,9 @@ impl Model {
             Screen::Diff => self.diff_index,
             Screen::Permissions => self.permission_index,
             Screen::Workflows => self.feature_scroll,
+            Screen::TaskBoard => self.feature_scroll,
+            Screen::Agents => self.agents_index,
+            Screen::ContextInspector => self.context_inspector_index,
             _ => self.feature_scroll,
         }
     }
@@ -1875,6 +2077,8 @@ impl Model {
             Screen::Mcp => "instrumenta",
             Screen::Permissions => "fiducia",
             Screen::Workflows => "opus",
+            Screen::TaskBoard | Screen::Agents => "opera",
+            Screen::ContextInspector => "memoria",
         }
     }
 
@@ -2876,5 +3080,14 @@ mod tests {
         assert_eq!(wrap_index(4, 1, 5), 0);
         assert_eq!(wrap_index(2, 1, 5), 3);
         assert_eq!(wrap_index(0, 1, 0), 0);
+    }
+
+    #[test]
+    fn f13_graph_keys() {
+        assert_eq!(graph_view_action("p"), Some("pause_resume"));
+        assert_eq!(graph_view_action("x"), Some("stop"));
+        assert_eq!(graph_view_action("r"), Some("retry"));
+        assert_eq!(graph_view_action("d"), Some("diff"));
+        assert_eq!(graph_view_action("enter"), Some("inspect"));
     }
 }

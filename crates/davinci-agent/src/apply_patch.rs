@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const JOURNAL_FILE_NAME: &str = ".davinci_patch_journal.json";
-const LEGACY_JOURNAL_FILE_NAME: &str = ".pi_patch_journal.json";
+pub const JOURNAL_FILE_NAME: &str = ".davinci_patch_journal.json";
+pub const LEGACY_JOURNAL_FILE_NAME: &str = ".pi_patch_journal.json";
+pub const REWIND_JOURNAL_FILE_NAME: &str = ".davinci_rewind_journal.json";
+pub const LEGACY_REWIND_JOURNAL_FILE_NAME: &str = ".pi_rewind_journal.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileAction {
@@ -90,6 +92,8 @@ pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<P
             let trimmed = name.trim_end_matches(['.', ' ']);
             trimmed.eq_ignore_ascii_case(JOURNAL_FILE_NAME)
                 || trimmed.eq_ignore_ascii_case(LEGACY_JOURNAL_FILE_NAME)
+                || trimmed.eq_ignore_ascii_case(REWIND_JOURNAL_FILE_NAME)
+                || trimmed.eq_ignore_ascii_case(LEGACY_REWIND_JOURNAL_FILE_NAME)
         })
     {
         return Err("The patch journal path is reserved".into());
@@ -430,7 +434,13 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
     let parsed = parse_codex_patch(input)?;
     let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
     let legacy_journal = workspace_root.join(LEGACY_JOURNAL_FILE_NAME);
-    if journal_path.exists() || legacy_journal.exists() {
+    let rewind_journal = workspace_root.join(REWIND_JOURNAL_FILE_NAME);
+    let legacy_rewind = workspace_root.join(LEGACY_REWIND_JOURNAL_FILE_NAME);
+    if journal_path.exists()
+        || legacy_journal.exists()
+        || rewind_journal.exists()
+        || legacy_rewind.exists()
+    {
         return Err(
             "An existing patch journal requires explicit, authorized recovery; no files changed"
                 .into(),
@@ -586,6 +596,135 @@ pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String,
         modified_count,
         added_count,
         deleted_count
+    ))
+}
+
+pub type ByteReplacement = (usize, usize, String);
+pub type FileByteReplacements = (PathBuf, Vec<ByteReplacement>);
+
+/// Translates byte-range replacements into updated content, validating non-overlapping ranges
+/// and applying replacements in descending byte-offset order.
+pub fn apply_byte_replacements(
+    original: &str,
+    replacements: &[ByteReplacement],
+) -> Result<String, String> {
+    if replacements.is_empty() {
+        return Ok(original.to_string());
+    }
+    let mut sorted = replacements.to_vec();
+    sorted.sort_by_key(|r| r.0);
+    for window in sorted.windows(2) {
+        if window[0].1 > window[1].0 {
+            return Err("Overlapping replacement ranges".into());
+        }
+    }
+    sorted.reverse();
+    let mut modified = original.to_string();
+    for (start, end, ref new_text) in sorted {
+        if start > end || end > modified.len() {
+            return Err(format!(
+                "Replacement range [{}, {}] out of bounds for document length {}",
+                start,
+                end,
+                modified.len()
+            ));
+        }
+        if !modified.is_char_boundary(start) || !modified.is_char_boundary(end) {
+            return Err("Replacement range splits UTF-8 character boundary".into());
+        }
+        modified.replace_range(start..end, new_text);
+    }
+    Ok(modified)
+}
+
+/// Applies file text replacements transactionally using the journal rollback mechanism.
+pub fn apply_transactional_replacements(
+    workspace_root: &Path,
+    file_replacements: &[FileByteReplacements],
+) -> Result<String, String> {
+    let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
+    let legacy_journal = workspace_root.join(LEGACY_JOURNAL_FILE_NAME);
+    let rewind_journal = workspace_root.join(REWIND_JOURNAL_FILE_NAME);
+    let legacy_rewind = workspace_root.join(LEGACY_REWIND_JOURNAL_FILE_NAME);
+    if journal_path.exists()
+        || legacy_journal.exists()
+        || rewind_journal.exists()
+        || legacy_rewind.exists()
+    {
+        return Err(
+            "An existing patch journal requires explicit, authorized recovery; no files changed"
+                .into(),
+        );
+    }
+
+    let mut journal_entries = Vec::new();
+    let mut modified_files = Vec::new();
+
+    for (target, replacements) in file_replacements {
+        if !target.exists() {
+            return Err(format!("Target file does not exist: {}", target.display()));
+        }
+        let original_content = fs::read_to_string(target)
+            .map_err(|e| format!("Failed reading {}: {e}", target.display()))?;
+
+        let rel_path = target
+            .strip_prefix(workspace_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let updated_content = apply_byte_replacements(&original_content, replacements)?;
+
+        journal_entries.push(JournalEntry {
+            relative_path: rel_path,
+            original_content: Some(original_content),
+        });
+        modified_files.push((target.clone(), updated_content));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let journal = PatchJournal {
+        timestamp: now,
+        entries: journal_entries,
+    };
+    let journal_raw = serde_json::to_string_pretty(&journal)
+        .map_err(|e| format!("Failed serializing journal: {e}"))?;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&journal_path)
+        .map_err(|e| {
+            format!("Failed to persist journal; no files changed, journal retained: {e}")
+        })?;
+    file.write_all(journal_raw.as_bytes()).map_err(|e| {
+        format!("Failed to persist journal; no files changed, journal retained: {e}")
+    })?;
+    file.sync_all().map_err(|e| {
+        format!("Failed to persist journal; no files changed, journal retained: {e}")
+    })?;
+    drop(file);
+
+    let count = modified_files.len();
+    for (path, content) in modified_files {
+        if let Err(err) = fs::write(&path, content) {
+            let _ = recover_incomplete_journal_if_any(workspace_root);
+            return Err(format!(
+                "Failed applying replacement to {}: {err}",
+                path.display()
+            ));
+        }
+    }
+
+    fs::remove_file(&journal_path)
+        .map_err(|error| format!("Replacements applied but journal cleanup failed: {error}"))?;
+
+    Ok(format!(
+        "Applied replacements across {} files successfully",
+        count
     ))
 }
 
@@ -871,5 +1010,35 @@ mod tests {
             updated,
             "fn a() {\n    return 10;\n}\n\nfn b() {\n    return 20;\n}\n"
         );
+    }
+
+    #[test]
+    fn test_apply_byte_replacements_non_overlapping() {
+        let text = "alpha beta gamma delta";
+        let replacements = vec![(0, 5, "first".to_string()), (11, 16, "third".to_string())];
+        let res = apply_byte_replacements(text, &replacements).unwrap();
+        assert_eq!(res, "first beta third delta");
+    }
+
+    #[test]
+    fn test_apply_transactional_replacements_roundtrip() {
+        let dir = tempdir().unwrap();
+        let file_a = dir.path().join("a.rs");
+        let file_b = dir.path().join("b.rs");
+        fs::write(&file_a, "let foo = 1;").unwrap();
+        fs::write(&file_b, "let foo = foo + 1;").unwrap();
+
+        let batch = vec![
+            (file_a.clone(), vec![(4, 7, "bar".to_string())]),
+            (
+                file_b.clone(),
+                vec![(4, 7, "bar".to_string()), (10, 13, "bar".to_string())],
+            ),
+        ];
+
+        apply_transactional_replacements(dir.path(), &batch).unwrap();
+
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "let bar = 1;");
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "let bar = bar + 1;");
     }
 }

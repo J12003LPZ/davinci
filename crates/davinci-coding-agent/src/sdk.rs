@@ -204,24 +204,23 @@ pub fn create_agent_session(
 
     if let Some(path) = &options.session_path {
         let store = JsonlSession::open(path).map_err(|err| err.to_string())?;
-        agent.load_from_session(store);
+        agent.load_from_session(store)?;
     } else if options.continue_session {
         if let Some(summary) = latest_session(&session_dir, Some(&cwd.to_string_lossy()))
             .map_err(|err| err.to_string())?
         {
             let store = JsonlSession::open(&summary.path).map_err(|err| err.to_string())?;
-            agent.load_from_session(store);
+            agent.load_from_session(store)?;
         }
     }
     if agent.session.is_none() {
-        agent.session = Some(
-            JsonlSession::create(
-                &session_dir,
-                &cwd.to_string_lossy(),
-                options.session_name.as_deref(),
-            )
-            .map_err(|err| err.to_string())?,
-        );
+        let store = JsonlSession::create(
+            &session_dir,
+            &cwd.to_string_lossy(),
+            options.session_name.as_deref(),
+        )
+        .map_err(|err| err.to_string())?;
+        agent.load_from_session(store)?;
     }
 
     let scoped_models = options.scoped_models.clone().unwrap_or_default();
@@ -390,6 +389,16 @@ mod tests {
             davinci_protocol::ThinkingLevel::High
         );
         assert!(result.session.agent.session.is_some());
+        assert!(result.session.agent.runtime_for_session().is_some());
+        assert!(result
+            .session
+            .agent
+            .session
+            .as_ref()
+            .unwrap()
+            .path
+            .with_extension("tasks.jsonl")
+            .is_file());
         let message = result.session.agent.messages.len();
         let mut session = result.session;
         session.prompt("hello from sdk");
@@ -440,6 +449,8 @@ mod tests {
             Some("Review this code: extra.rs")
         );
 
+        // A cold resume must release the original session's single-writer lease.
+        drop(session);
         let restored = create_agent_session(CreateAgentSessionOptions {
             cwd: Some(dir.path().to_path_buf()),
             agent_dir: Some(dir.path().join("agent")),

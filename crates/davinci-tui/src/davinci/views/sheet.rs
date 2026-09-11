@@ -15,8 +15,9 @@ use crate::davinci::theme::Theme;
 use crate::davinci::ui::{self, span};
 
 use super::{
-    cogitator, compact, diff, export, governor, graph_run, keys, login, mcp, officina, permissions,
-    recovery, resume, securitas, settings, thinking, tree, trust, vectors, workflows,
+    agents, cogitator, compact, context_inspector, diff, export, governor, graph_run, keys, login,
+    mcp, officina, permissions, recovery, resume, securitas, settings, task_board, thinking, tree,
+    trust, vectors, workflows,
 };
 
 /// What sits under a sheet.
@@ -123,6 +124,9 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         Screen::Mcp => mcp::chrome(model),
         Screen::Permissions => permissions::chrome(model),
         Screen::Workflows => workflows::chrome(model),
+        Screen::TaskBoard => task_board::chrome(model),
+        Screen::Agents => agents::chrome(model),
+        Screen::ContextInspector => context_inspector::chrome(model),
     };
     // These surfaces own the keyboard. A drawn-but-inert composer is misleading.
     chrome.composer = Composer::Hidden;
@@ -217,6 +221,9 @@ pub fn title(screen: Screen) -> &'static str {
         Screen::Mcp => "MCP servers",
         Screen::Permissions => "Permissions",
         Screen::Workflows => "Workflows",
+        Screen::TaskBoard => "Tasks",
+        Screen::Agents => "Agents",
+        Screen::ContextInspector => "Context & Memory Inspector",
     }
 }
 

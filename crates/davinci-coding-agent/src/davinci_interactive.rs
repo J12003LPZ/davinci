@@ -9,8 +9,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use davinci_agent::{
-    Agent, AgentEvent, EventSink, PermissionMode, ToolApprovalDecision, ToolApprovalRequest,
-    ToolApprover,
+    Agent, AgentEvent, DecisionHostRequest, DecisionHostResponse, EventSink, PermissionMode,
+    ToolApprovalDecision, ToolApprovalRequest,
 };
 use davinci_tui::davinci::model::{
     Ask, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
@@ -23,6 +23,196 @@ use davinci_tui::davinci::model::{
 use davinci_tui::davinci::theme::State;
 
 use crate::extension_host::ExtensionHost;
+
+struct NativeApproval {
+    request: ToolApprovalRequest,
+    reply: mpsc::Sender<NativeApprovalAnswer>,
+    live: Arc<AtomicBool>,
+    expires_at_ms: u64,
+    deadline: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NativeApprovalAnswer {
+    decision: ToolApprovalDecision,
+    instructions: Option<String>,
+}
+
+impl From<ToolApprovalDecision> for NativeApprovalAnswer {
+    fn from(decision: ToolApprovalDecision) -> Self {
+        Self {
+            decision,
+            instructions: None,
+        }
+    }
+}
+
+impl NativeApprovalAnswer {
+    fn into_reply(
+        self,
+        challenge: &davinci_agent::approval::ApprovalChallenge,
+    ) -> davinci_agent::approval::ApprovalReply {
+        let mut reply =
+            davinci_agent::approval::ApprovalReply::from_legacy(challenge, self.decision);
+        if self.decision == ToolApprovalDecision::Deny && self.instructions.is_some() {
+            reply.choice_id = "deny_with_instructions".into();
+            reply.instructions = self.instructions;
+        }
+        reply
+    }
+}
+
+impl NativeApproval {
+    fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
+            && davinci_session::now_ms() < self.expires_at_ms
+            && Instant::now() < self.deadline
+    }
+}
+
+// Declared inside the scoped UI closure: an error/panic cancels the approval
+// waiter before std::thread::scope joins its worker.
+struct ApprovalUiExit(Option<Arc<AtomicBool>>);
+
+impl ApprovalUiExit {
+    fn new(abort: Arc<AtomicBool>) -> Self {
+        Self(Some(abort))
+    }
+}
+
+impl Drop for ApprovalUiExit {
+    fn drop(&mut self) {
+        if let Some(abort) = &self.0 {
+            abort.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+fn wait_native_approval(
+    request: &ToolApprovalRequest,
+    expires_at_ms: u64,
+    tx: &mpsc::Sender<NativeApproval>,
+    abort: &AtomicBool,
+) -> NativeApprovalAnswer {
+    let available = Duration::from_millis(expires_at_ms.saturating_sub(davinci_session::now_ms()));
+    let Some(deadline) = Instant::now().checked_add(available) else {
+        return ToolApprovalDecision::Deny.into();
+    };
+    if abort.load(Ordering::Relaxed) || available.is_zero() {
+        return ToolApprovalDecision::Deny.into();
+    }
+    let (reply, rx) = mpsc::channel();
+    let live = Arc::new(AtomicBool::new(true));
+    let pending = NativeApproval {
+        request: request.clone(),
+        reply,
+        live: live.clone(),
+        expires_at_ms,
+        deadline,
+    };
+    if tx.send(pending).is_err() {
+        return ToolApprovalDecision::Deny.into();
+    }
+    let decision = loop {
+        if abort.load(Ordering::Relaxed)
+            || davinci_session::now_ms() >= expires_at_ms
+            || Instant::now() >= deadline
+        {
+            break ToolApprovalDecision::Deny.into();
+        }
+        match rx.recv_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25)),
+        ) {
+            Ok(decision) => {
+                if abort.load(Ordering::Relaxed)
+                    || davinci_session::now_ms() >= expires_at_ms
+                    || Instant::now() >= deadline
+                {
+                    break ToolApprovalDecision::Deny.into();
+                }
+                break decision;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break ToolApprovalDecision::Deny.into(),
+        }
+    };
+    live.store(false, Ordering::Relaxed);
+    decision
+}
+
+struct NativeDecision {
+    request: DecisionHostRequest,
+    reply: mpsc::Sender<DecisionHostResponse>,
+    live: Arc<AtomicBool>,
+    expires_at_ms: u64,
+    deadline: Instant,
+}
+
+impl NativeDecision {
+    fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
+            && davinci_session::now_ms() < self.expires_at_ms
+            && Instant::now() < self.deadline
+    }
+}
+
+fn wait_native_decision(
+    request: DecisionHostRequest,
+    expires_at_ms: u64,
+    tx: &mpsc::Sender<NativeDecision>,
+    abort: &AtomicBool,
+) -> DecisionHostResponse {
+    let available = Duration::from_millis(expires_at_ms.saturating_sub(davinci_session::now_ms()));
+    let Some(deadline) = Instant::now().checked_add(available) else {
+        return DecisionHostResponse::Cancelled;
+    };
+    if abort.load(Ordering::Relaxed) || available.is_zero() {
+        return DecisionHostResponse::Cancelled;
+    }
+    let (reply, rx) = mpsc::channel();
+    let live = Arc::new(AtomicBool::new(true));
+    let pending = NativeDecision {
+        request,
+        reply,
+        live: live.clone(),
+        expires_at_ms,
+        deadline,
+    };
+    if tx.send(pending).is_err() {
+        return DecisionHostResponse::Unavailable;
+    }
+    let decision = loop {
+        if abort.load(Ordering::Relaxed) {
+            break DecisionHostResponse::Cancelled;
+        }
+        if davinci_session::now_ms() >= expires_at_ms || Instant::now() >= deadline {
+            break DecisionHostResponse::Timeout;
+        }
+        match rx.recv_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25)),
+        ) {
+            Ok(decision) => {
+                if abort.load(Ordering::Relaxed) {
+                    break DecisionHostResponse::Cancelled;
+                }
+                if davinci_session::now_ms() >= expires_at_ms || Instant::now() >= deadline {
+                    break DecisionHostResponse::Timeout;
+                }
+                break decision;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break DecisionHostResponse::Cancelled;
+            }
+        }
+    };
+    live.store(false, Ordering::Relaxed);
+    decision
+}
 
 /// Which instrument a tool belongs to (design.md §5). Shell execution is
 /// Manus; everything else the agent reaches for is Instrumenta.
@@ -1211,16 +1401,30 @@ fn run_turn(
         host_guard.set_project_trusted(trusted);
     }
     let cwd = agent.cwd.clone();
-    let (approval_tx, approval_rx) =
-        mpsc::channel::<(ToolApprovalRequest, mpsc::Sender<ToolApprovalDecision>)>();
-    agent.approver = Some(ToolApprover(Arc::new(move |request| {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if approval_tx.send((request.clone(), reply_tx)).is_err() {
-            return ToolApprovalDecision::Deny;
-        }
-        reply_rx.recv().unwrap_or(ToolApprovalDecision::Deny)
-    })));
-    let mut approval: Option<(ToolApprovalRequest, mpsc::Sender<ToolApprovalDecision>)> = None;
+    let (approval_tx, approval_rx) = mpsc::channel::<NativeApproval>();
+    let approval_abort = abort.clone();
+    agent.approver = None;
+    agent.approval_responder = Some(davinci_agent::approval::ApprovalResponder(Arc::new(
+        move |request, challenge| {
+            let decision = wait_native_approval(
+                request,
+                challenge.expires_at_ms,
+                &approval_tx,
+                &approval_abort,
+            );
+            decision.into_reply(challenge)
+        },
+    )));
+    let mut approval: Option<NativeApproval> = None;
+    let mut approval_project_allowed = trusted;
+    let (decision_tx, decision_rx) = mpsc::channel::<NativeDecision>();
+    let decision_abort = abort.clone();
+    agent.tool_context.decision_responder =
+        Some(davinci_agent::DecisionResponder::new(move |request| {
+            let expires_at_ms = davinci_session::now_ms().saturating_add(300_000);
+            wait_native_decision(request, expires_at_ms, &decision_tx, &decision_abort)
+        }));
+    let mut decision: Option<NativeDecision> = None;
     let mut last_tick = Instant::now();
     // The job book, read on every tick while the worker holds the agent.
     let jobs = agent.tool_context.jobs.clone();
@@ -1244,8 +1448,11 @@ fn run_turn(
     // model returned no text".
     let mut failure: Option<String> = None;
     let mut reply = String::new();
+    let mut scope_expansion = None;
+    let scope_contract = agent.active_contract();
 
     std::thread::scope(|scope| -> std::io::Result<()> {
+        let mut ui_exit = ApprovalUiExit::new(abort.clone());
         let worker = scope
             .spawn(|| crate::complete_prompt_with_host(parsed, agent, Some(host.clone()), false));
 
@@ -1253,13 +1460,39 @@ fn run_turn(
             while let Ok(event) = event_rx.try_recv() {
                 apply(model, &mut turn, &event);
             }
-            if approval.is_none() {
-                if let Ok((request, reply)) = approval_rx.try_recv() {
-                    turn.await_approval(model, &request);
-                    model.ask = permission_ask(&request, trusted);
+            if approval.as_ref().is_some_and(|pending| !pending.is_live()) {
+                approval = None;
+                model.approval_instructions = None;
+                if model.overlay == Some(Overlay::Ask) {
+                    model.overlay = None;
+                }
+            }
+            if decision.as_ref().is_some_and(|pending| !pending.is_live()) {
+                decision = None;
+                model.decision_modal = None;
+                if model.overlay == Some(Overlay::Ask) {
+                    model.overlay = None;
+                }
+            }
+            if approval.is_none() && decision.is_none() {
+                if let Ok(pending) = approval_rx.try_recv() {
+                    if !pending.is_live() {
+                        continue;
+                    }
+                    approval_project_allowed = trusted;
+                    let request = &pending.request;
+                    turn.await_approval(model, request);
+                    model.ask = permission_ask(request, trusted);
                     open_ask_overlay(model);
                     voice.cancel(model);
-                    approval = Some((request, reply));
+                    approval = Some(pending);
+                } else if let Ok(pending) = decision_rx.try_recv() {
+                    if !pending.is_live() {
+                        continue;
+                    }
+                    open_decision_modal(model, &pending.request.question);
+                    voice.cancel(model);
+                    decision = Some(pending);
                 }
             }
             if let Some(working) = model.working.as_mut() {
@@ -1284,55 +1517,107 @@ fn run_turn(
                 match event {
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release
+                            && decision.is_some() =>
+                    {
+                        let _ = davinci_tui::davinci::app::handle_key(model, key);
+                        let pending = decision.as_ref().unwrap();
+                        if !pending.is_live() || abort.load(Ordering::Relaxed) {
+                            let pending = decision.take().unwrap();
+                            let _ = pending
+                                .reply
+                                .send(davinci_agent::DecisionHostResponse::Cancelled);
+                            model.decision_modal = None;
+                            if model.overlay == Some(Overlay::Ask) {
+                                model.overlay = None;
+                            }
+                            continue;
+                        }
+                        if let Some(state) = model.decision_modal.as_ref() {
+                            if state.submitted {
+                                let pending = decision.take().expect("checked above");
+                                let outcome = state.outcome.clone();
+                                model.decision_modal = None;
+                                model.overlay = None;
+                                let response = match outcome {
+                                    Some(davinci_tui::davinci::views::decision_modal::DecisionResult::Choice(choice_id)) => {
+                                        davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply {
+                                            action: davinci_agent::decisions::HostDecisionAction::AnswerChoice(choice_id),
+                                            host_event_id: format!("tui_{}", davinci_session::now_ms()),
+                                            answered_at_ms: davinci_session::now_ms(),
+                                        })
+                                    }
+                                    Some(davinci_tui::davinci::views::decision_modal::DecisionResult::Custom(custom_text)) => {
+                                        davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply {
+                                            action: davinci_agent::decisions::HostDecisionAction::AnswerCustom(custom_text),
+                                            host_event_id: format!("tui_{}", davinci_session::now_ms()),
+                                            answered_at_ms: davinci_session::now_ms(),
+                                        })
+                                    }
+                                    Some(davinci_tui::davinci::views::decision_modal::DecisionResult::Defer) => {
+                                        davinci_agent::DecisionHostResponse::Reply(davinci_agent::DecisionHostReply {
+                                            action: davinci_agent::decisions::HostDecisionAction::Defer,
+                                            host_event_id: format!("tui_{}", davinci_session::now_ms()),
+                                            answered_at_ms: davinci_session::now_ms(),
+                                        })
+                                    }
+                                    Some(davinci_tui::davinci::views::decision_modal::DecisionResult::Cancel) => {
+                                        davinci_agent::DecisionHostResponse::Cancelled
+                                    }
+                                    None => davinci_agent::DecisionHostResponse::Cancelled,
+                                };
+                                let _ = pending.reply.send(response);
+                            }
+                        }
+                    }
+                    crossterm::event::Event::Key(key)
+                        if key.kind != crossterm::event::KeyEventKind::Release
                             && approval.is_some() =>
                     {
-                        let decision = approval_key(model, key, trusted, &abort);
+                        let choices = approval
+                            .as_ref()
+                            .expect("checked above")
+                            .request
+                            .host_choices(approval_project_allowed);
+                        let decision = approval_answer_key(
+                            model,
+                            key,
+                            &choices,
+                            &approval.as_ref().expect("checked above").request,
+                            &abort,
+                        );
                         if davinci_ai::trace::enabled() {
                             davinci_ai::trace::log(&format!(
-                                "davinci permission panel: key {:?} {:?} -> {decision:?}",
-                                key.code, key.modifiers
+                                "davinci permission panel: decision {:?}",
+                                decision.as_ref().map(|answer| answer.decision)
                             ));
                         }
-                        if let Some(decision) = decision {
-                            let (request, reply) = approval.take().expect("checked above");
-                            let decision = match decision {
-                                ToolApprovalDecision::AllowAlways => {
-                                    match crate::permissions::remember_project_rule(
-                                        &cwd,
-                                        &request.session_rule,
-                                    ) {
-                                        Ok(_) => {
-                                            turn.settle_approval(
-                                                model,
-                                                &request,
-                                                Some(&request.session_rule),
-                                            );
-                                            ToolApprovalDecision::AllowAlways
-                                        }
-                                        // The file could not be written: the
-                                        // grant still holds for this run, and
-                                        // the user is told why it is no more.
-                                        Err(err) => {
-                                            turn.settle_approval(model, &request, None);
-                                            model.transcript.push(Entry::tool(
-                                                State::Attention,
-                                                "instrumenta",
-                                                &format!(
-                                                    "could not save {} · {err}",
-                                                    request.session_rule
-                                                ),
-                                                None,
-                                            ));
-                                            ToolApprovalDecision::AllowForSession
-                                        }
-                                    }
+                        if let Some(answer) = decision {
+                            let pending = approval.take().expect("checked above");
+                            if !pending.is_live() || abort.load(Ordering::Relaxed) {
+                                model.approval_instructions = None;
+                                if model.overlay == Some(Overlay::Ask) {
+                                    model.overlay = None;
                                 }
-                                other => {
-                                    turn.settle_approval(model, &request, None);
-                                    other
-                                }
-                            };
-                            let _ = reply.send(decision);
+                                continue;
+                            }
+                            let request = &pending.request;
+                            if let Some(decision) = persist_permission_choice(
+                                model,
+                                request,
+                                answer.decision,
+                                &cwd,
+                                &mut approval_project_allowed,
+                            ) {
+                                let saved_rule = (decision == ToolApprovalDecision::AllowAlways)
+                                    .then_some(request.session_rule.as_str());
+                                turn.settle_approval(model, request, saved_rule);
+                                let _ = pending.reply.send(NativeApprovalAnswer {
+                                    decision,
+                                    instructions: answer.instructions,
+                                });
+                            } else {
+                                approval = Some(pending);
+                            }
                         }
                     }
                     crossterm::event::Event::Key(key)
@@ -1389,9 +1674,21 @@ fn run_turn(
                     text.strip_prefix("Provider error: ")
                         .map(|reason| reason.trim().to_string())
                 });
+                scope_expansion =
+                    scope_expansion_preview_from_events(scope_contract.as_ref(), &events);
                 reply = text;
             }
         }
+        if let Some(pending) = decision.take() {
+            let _ = pending
+                .reply
+                .send(davinci_agent::DecisionHostResponse::Cancelled);
+            model.decision_modal = None;
+            if model.overlay == Some(Overlay::Ask) {
+                model.overlay = None;
+            }
+        }
+        ui_exit.0 = None;
         Ok(())
     })?;
 
@@ -1458,14 +1755,42 @@ fn run_turn(
     agent.abort_signal = None;
     agent.event_sink = None;
     agent.approver = None;
+    agent.approval_responder = None;
+    agent.tool_context.decision_responder = None;
     // A question the worker never got an answer to (it was interrupted under
     // the panel) is closed with it.
     if approval.take().is_some() && model.overlay == Some(Overlay::Ask) {
         model.overlay = None;
     }
+    if decision.take().is_some() {
+        model.decision_modal = None;
+        if model.overlay == Some(Overlay::Ask) {
+            model.overlay = None;
+        }
+    }
+    model.approval_instructions = None;
     model.running = false;
     if model.terminal_progress {
         let _ = session.set_progress(false);
+    }
+    if !interrupted {
+        if let Some(preview) = scope_expansion.take() {
+            let task_guard = capture_scope_expansion_task_guard(agent, &preview)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            if let Some(guidance) = resolve_scope_expansion_modal(
+                agent,
+                model,
+                session,
+                &preview,
+                task_guard.as_ref(),
+                voice,
+            )? {
+                model.transcript.push(Entry::Detail(guidance.clone()));
+                model.queued.insert(0, guidance);
+            }
+            let host_guard = host.lock().unwrap_or_else(|err| err.into_inner());
+            crate::apply_graph_session_context(parsed, agent, &host_guard);
+        }
     }
 
     // Extensions may have asked for rows while the turn ran. Taking the queue
@@ -2334,22 +2659,31 @@ impl Question {
 }
 
 /// The permission panel for one tool call the policy could not
-/// decide on its own (spec: trust-and-control, *davinci*). Four rows; three
-/// when the project is not trusted, because a rule written to
-/// `.pi/settings.json` would never be read back from an untrusted checkout.
+/// decide on its own (spec: trust-and-control, *davinci*). The policy supplies
+/// legal choices; an untrusted host additionally removes project persistence.
 pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
     let rule = &request.session_rule;
-    let mut items = vec![
-        PickerItem::new("allow once", "runs this call only"),
-        PickerItem::new("allow for this session", &format!("{rule} until pi exits")),
-    ];
-    if trusted {
+    let mut items: Vec<_> = request
+        .host_choices(trusted)
+        .into_iter()
+        .map(|choice| match choice {
+            ToolApprovalDecision::AllowOnce => PickerItem::new("allow once", "runs this call only"),
+            ToolApprovalDecision::AllowForSession => {
+                PickerItem::new("allow for this session", &format!("{rule} until pi exits"))
+            }
+            ToolApprovalDecision::AllowAlways => PickerItem::new(
+                "always allow here",
+                &format!("{rule} saved to .pi/settings.json"),
+            ),
+            ToolApprovalDecision::Deny => PickerItem::new("deny", "the model is told no"),
+        })
+        .collect();
+    if offers_denial_instructions(request) {
         items.push(PickerItem::new(
-            "always allow here",
-            &format!("{rule} saved to .pi/settings.json"),
+            "deny with instructions",
+            "tell the model what to do instead; this call will not run",
         ));
     }
-    items.push(PickerItem::new("deny", "the model is told no"));
     let mut note = request.summary.clone();
     if request.outside_project {
         note.push_str(" · outside the project");
@@ -2365,14 +2699,601 @@ pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
 
 /// What the chosen row of `permission_ask` means; `None` for a row that the
 /// panel did not offer.
-pub fn permission_choice(index: usize, trusted: bool) -> Option<ToolApprovalDecision> {
-    match (index, trusted) {
-        (0, _) => Some(ToolApprovalDecision::AllowOnce),
-        (1, _) => Some(ToolApprovalDecision::AllowForSession),
-        (2, true) => Some(ToolApprovalDecision::AllowAlways),
-        (2, false) | (3, true) => Some(ToolApprovalDecision::Deny),
+pub fn permission_choice(
+    index: usize,
+    choices: &[ToolApprovalDecision],
+) -> Option<ToolApprovalDecision> {
+    choices.get(index).copied()
+}
+
+/// Render an explicit task-contract expansion separately from ordinary permission consent.
+pub fn scope_expansion_ask(
+    preview: &davinci_agent::runtime::contracts::ScopeExpansionPreview,
+) -> Ask {
+    Ask {
+        title: "Scope expansion required".into(),
+        name: "TASK CONTRACT".into(),
+        key: "/scope-expansion".into(),
+        note: format!(
+            "{}\nrevision {} → {}\n+ writable: {}\ncurrent: {}\nproposed: {}\npreview: {}",
+            preview.reason,
+            preview.expected_revision,
+            preview.proposed.revision,
+            preview.requested_target,
+            preview.current_digest,
+            preview.proposed.digest,
+            preview.preview_digest,
+        ),
+        items: vec![
+            PickerItem::new(
+                "approve expansion",
+                "persist this exact contract revision before resuming execution",
+            ),
+            PickerItem::new(
+                "request in-scope approach",
+                "keep the current contract and ask for an alternative",
+            ),
+            PickerItem::new(
+                "deny with instructions",
+                "keep the current contract and provide host-authored guidance",
+            ),
+        ],
+    }
+}
+
+/// Map only the three scope-expansion rows to trusted-host decisions.
+pub fn scope_expansion_choice(
+    index: usize,
+) -> Option<davinci_agent::runtime::contracts::ScopeExpansionDecision> {
+    use davinci_agent::runtime::contracts::ScopeExpansionDecision;
+    match index {
+        0 => Some(ScopeExpansionDecision::Approve),
+        1 => Some(ScopeExpansionDecision::RequestInScopeApproach),
+        2 => Some(ScopeExpansionDecision::Deny),
         _ => None,
     }
+}
+
+fn scope_expansion_answer_key(
+    model: &mut Model,
+    key: crossterm::event::KeyEvent,
+) -> Option<(
+    davinci_agent::runtime::contracts::ScopeExpansionDecision,
+    Option<String>,
+)> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    use davinci_agent::runtime::contracts::ScopeExpansionDecision;
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.code == KeyCode::Esc && key.modifiers.is_empty()
+        || key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL
+    {
+        model.approval_instructions = None;
+        model.overlay = None;
+        return Some((ScopeExpansionDecision::Deny, None));
+    }
+    if let Some(input) = model.approval_instructions.as_mut() {
+        if key.code == KeyCode::Enter && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
+        {
+            if !input.trim().is_empty() {
+                let instructions = model.approval_instructions.take().unwrap().into_string();
+                model.overlay = None;
+                return Some((ScopeExpansionDecision::Deny, Some(instructions)));
+            }
+            return None;
+        }
+        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+            let editor = input.editor_mut();
+            match key.code {
+                KeyCode::Char(ch)
+                    if !ch.is_control() && editor.buffer.len() + ch.len_utf8() <= 4096 =>
+                {
+                    editor.insert(ch)
+                }
+                KeyCode::Left => editor.move_left(),
+                KeyCode::Right => editor.move_right(),
+                KeyCode::Home => editor.move_line_start(),
+                KeyCode::End => editor.move_line_end(),
+                KeyCode::Backspace => editor.backspace(),
+                KeyCode::Delete => editor.delete_forward(),
+                _ => {}
+            }
+        }
+        return None;
+    }
+    if model.overlay == Some(Overlay::Ask)
+        && model.ask.key == "/scope-expansion"
+        && model.ask_index == 2
+        && model.overlay_offset.is_none()
+        && key.code == KeyCode::Enter
+        && key.modifiers.is_empty()
+        && key.kind == KeyEventKind::Press
+    {
+        model.approval_instructions = Some(Default::default());
+        return None;
+    }
+    use davinci_tui::davinci::app::{handle_key, Flow};
+    match handle_key(model, key) {
+        Flow::Choose(Choice::Ask(index)) => {
+            scope_expansion_choice(index).map(|decision| (decision, None))
+        }
+        Flow::Interrupt | Flow::Quit => {
+            model.overlay = None;
+            Some((ScopeExpansionDecision::Deny, None))
+        }
+        Flow::Continue if model.overlay.is_none() => Some((ScopeExpansionDecision::Deny, None)),
+        Flow::Continue | Flow::Choose(_) | Flow::Submit(_) | Flow::CyclePermissionMode => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopeExpansionTaskGuard {
+    task_id: davinci_agent::TaskId,
+    run_id: davinci_agent::RunId,
+    assigned_to: Option<davinci_agent::AgentId>,
+    revision: u64,
+    owner_generation: u64,
+    contract_digest: Option<String>,
+}
+
+fn capture_scope_expansion_task_guard(
+    agent: &Agent,
+    preview: &davinci_agent::runtime::contracts::ScopeExpansionPreview,
+) -> Result<Option<ScopeExpansionTaskGuard>, String> {
+    let current = agent
+        .active_contract()
+        .ok_or_else(|| "scope expansion has no active task contract".to_string())?;
+    preview
+        .verify_against(&current)
+        .map_err(|error| error.to_string())?;
+    let Some(runtime) = agent.runtime_for_session() else {
+        return Ok(None);
+    };
+    Ok(runtime
+        .task_registry
+        .get_task(&current.task_id)
+        .map(|task| ScopeExpansionTaskGuard {
+            task_id: task.id,
+            run_id: task.run_id,
+            assigned_to: task.assigned_to,
+            revision: task.revision,
+            owner_generation: task.owner_generation,
+            contract_digest: task.contract_digest,
+        }))
+}
+
+fn apply_scope_expansion_decision(
+    agent: &mut Agent,
+    preview: &davinci_agent::runtime::contracts::ScopeExpansionPreview,
+    task_guard: Option<&ScopeExpansionTaskGuard>,
+    decision: davinci_agent::runtime::contracts::ScopeExpansionDecision,
+    instructions: Option<&str>,
+) -> Result<Option<String>, String> {
+    use davinci_agent::runtime::contracts::ScopeExpansionDecision;
+    match decision {
+        ScopeExpansionDecision::Approve => {
+            commit_scope_expansion(agent, preview, task_guard)?;
+            Ok(Some(format!(
+                "Scope expansion was explicitly approved and durably committed as contract revision {} (digest {}). Continue from the blocked action using only that exact expanded scope.",
+                preview.proposed.revision, preview.proposed.digest
+            )))
+        }
+        ScopeExpansionDecision::RequestInScopeApproach => Ok(Some(format!(
+            "Scope expansion for `{}` was not approved. Continue only with an in-scope approach under contract revision {} (digest {}). Do not retry the blocked target unless a new explicit scope expansion is approved.",
+            preview.requested_target, preview.expected_revision, preview.current_digest
+        ))),
+        ScopeExpansionDecision::Deny => {
+            let mut guidance = format!(
+                "Scope expansion for `{}` was denied. Keep contract revision {} (digest {}) unchanged.",
+                preview.requested_target, preview.expected_revision, preview.current_digest
+            );
+            if let Some(instructions) = instructions.filter(|text| !text.trim().is_empty()) {
+                guidance.push_str(" Host instructions: ");
+                guidance.push_str(instructions.trim());
+            }
+            Ok(Some(guidance))
+        }
+    }
+}
+
+fn commit_scope_expansion(
+    agent: &mut Agent,
+    preview: &davinci_agent::runtime::contracts::ScopeExpansionPreview,
+    task_guard: Option<&ScopeExpansionTaskGuard>,
+) -> Result<(), String> {
+    let current = agent
+        .active_contract()
+        .ok_or_else(|| "scope expansion has no active task contract".to_string())?;
+    preview
+        .verify_against(&current)
+        .map_err(|error| error.to_string())?;
+
+    let data = serde_json::json!({
+        "event": "scope_expansion_approved",
+        "preview_digest": preview.preview_digest,
+        "expected_revision": preview.expected_revision,
+        "current_digest": preview.current_digest,
+        "requested_target": preview.requested_target,
+        "reason": preview.reason,
+        "proposed": preview.proposed,
+        "authorized_by": "interactive_user",
+    });
+    let session = agent
+        .session
+        .as_mut()
+        .ok_or_else(|| "scope expansion requires durable session storage".to_string())?;
+    let prior_leaf = session.leaf_id.clone();
+    let mut extra = serde_json::Map::new();
+    extra.insert("data".into(), data);
+    if let Err(error) = session.append_entry(davinci_session::SessionEntry {
+        id: String::new(),
+        entry_type: "custom".into(),
+        parent_id: None,
+        seq: 0,
+        timestamp: 0,
+        message: None,
+        custom_type: Some("task_contract_scope_expansion".into()),
+        extra,
+    }) {
+        session.leaf_id = prior_leaf;
+        return Err(format!("Unable to persist scope expansion: {error}"));
+    }
+
+    match (agent.runtime_for_session().cloned(), task_guard) {
+        (Some(runtime), Some(guard)) => {
+            if guard.task_id != current.task_id
+                || guard.run_id != runtime.run_id
+                || guard.assigned_to != Some(runtime.agent_id)
+                || guard.contract_digest.as_deref() != Some(current.digest.as_str())
+            {
+                return Err("Unable to persist bound task contract digest: stale scope expansion task binding".into());
+            }
+            runtime
+                .task_registry
+                .revise_contract_digest(
+                    guard.task_id,
+                    guard.run_id,
+                    runtime.agent_id,
+                    guard.revision,
+                    guard.owner_generation,
+                    &current.digest,
+                    &preview.proposed.digest,
+                )
+                .map_err(|error| {
+                    format!("Unable to persist bound task contract digest: {error}")
+                })?;
+        }
+        (Some(runtime), None) => {
+            if runtime.task_registry.get_task(&current.task_id).is_some() {
+                return Err("Unable to persist bound task contract digest: task binding changed after scope expansion preview".into());
+            }
+        }
+        (None, Some(_)) => {
+            return Err("Unable to persist bound task contract digest: runtime binding changed after scope expansion preview".into());
+        }
+        (None, None) => {}
+    }
+
+    {
+        let mut permissions = agent
+            .permissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        permissions.session_allow.clear();
+    }
+    agent.set_active_contract(preview.proposed.clone());
+    Ok(())
+}
+
+fn scope_expansion_preview_from_events(
+    contract: Option<&davinci_agent::runtime::contracts::TaskContract>,
+    events: &[AgentEvent],
+) -> Option<davinci_agent::runtime::contracts::ScopeExpansionPreview> {
+    let contract = contract?;
+    events.iter().find_map(|event| {
+        let AgentEvent::ToolExecutionEnd {
+            is_error: true,
+            details: Some(details),
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let violation: davinci_agent::runtime::contracts::ScopeViolation =
+            serde_json::from_value(details.get("scope_violation")?.clone()).ok()?;
+        contract
+            .preview_scope_expansion(&violation.requested_target, &violation.reason)
+            .ok()
+    })
+}
+
+fn resolve_scope_expansion_modal(
+    agent: &mut Agent,
+    model: &mut Model,
+    session: &mut davinci_tui::davinci::runtime::Session,
+    preview: &davinci_agent::runtime::contracts::ScopeExpansionPreview,
+    task_guard: Option<&ScopeExpansionTaskGuard>,
+    voice: &mut crate::voice_input::VoiceInput,
+) -> std::io::Result<Option<String>> {
+    model.ask = scope_expansion_ask(preview);
+    model.ask_index = 0;
+    model.approval_instructions = None;
+    open_ask_overlay(model);
+    voice.cancel(model);
+    loop {
+        session.draw(model)?;
+        voice.drawn();
+        let Some(event) = session.poll_event(Duration::from_millis(40))? else {
+            continue;
+        };
+        match event {
+            crossterm::event::Event::Key(key) => {
+                if let Some((decision, instructions)) = scope_expansion_answer_key(model, key) {
+                    model.approval_instructions = None;
+                    model.overlay = None;
+                    return apply_scope_expansion_decision(
+                        agent,
+                        preview,
+                        task_guard,
+                        decision,
+                        instructions.as_deref(),
+                    )
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
+                }
+            }
+            crossterm::event::Event::Resize(width, height) => {
+                model.width = width.max(20);
+                model.height = height.max(4);
+            }
+            crossterm::event::Event::Mouse(mouse) => {
+                if session.handle_mouse(mouse) {
+                    voice.toggle(model);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn watchdog_ask(signal: &davinci_agent::runtime::progress_watchdog::LoopSignal) -> Ask {
+    Ask {
+        title: "Progress watchdog".into(),
+        name: "WATCHDOG".into(),
+        key: "/watchdog".into(),
+        note: format!("! {}", signal.description()),
+        items: vec![
+            PickerItem::new(
+                "1. Continue with remaining budget",
+                "continue execution within remaining resources",
+            ),
+            PickerItem::new(
+                "2. Return to Plan Mode with evidence",
+                "quiesce mutation workers and switch back to plan mode",
+            ),
+            PickerItem::new(
+                "3. Stop and preserve checkpoint",
+                "terminate task and persist available checkpoint",
+            ),
+        ],
+    }
+}
+
+#[allow(dead_code)]
+pub fn watchdog_choice(index: usize) -> Option<&'static str> {
+    match index {
+        0 => Some("continue"),
+        1 => Some("plan"),
+        2 => Some("stop"),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+pub fn watchdog_answer_key(
+    model: &mut Model,
+    key: crossterm::event::KeyEvent,
+) -> Option<&'static str> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    use davinci_tui::davinci::app::{handle_key, Flow};
+    use davinci_tui::davinci::model::Choice;
+
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if (key.code == KeyCode::Esc && key.modifiers.is_empty())
+        || (key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL)
+    {
+        model.overlay = None;
+        return Some("stop");
+    }
+    if key.code == KeyCode::Char('1') && key.modifiers.is_empty() {
+        model.overlay = None;
+        return Some("continue");
+    }
+    if key.code == KeyCode::Char('2') && key.modifiers.is_empty() {
+        model.overlay = None;
+        return Some("plan");
+    }
+    if key.code == KeyCode::Char('3') && key.modifiers.is_empty() {
+        model.overlay = None;
+        return Some("stop");
+    }
+
+    match handle_key(model, key) {
+        Flow::Choose(Choice::Ask(index)) => {
+            model.overlay = None;
+            watchdog_choice(index)
+        }
+        Flow::Interrupt | Flow::Quit => {
+            model.overlay = None;
+            Some("stop")
+        }
+        Flow::Continue if model.overlay.is_none() => Some("stop"),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+pub fn apply_watchdog_choice(
+    agent: &mut Agent,
+    choice: &str,
+    signal: &davinci_agent::runtime::progress_watchdog::LoopSignal,
+) -> Result<String, String> {
+    let tokens_remaining = if let Some(ledger) = agent
+        .runtime
+        .as_ref()
+        .and_then(|rt| rt.budget_ledger.as_ref())
+    {
+        let snap = ledger.snapshot();
+        snap.token_ceiling.saturating_sub(snap.tokens_charged)
+    } else {
+        u64::MAX
+    };
+
+    let decision = if let Some(runtime) = &agent.runtime {
+        if let Ok(mut wd) = runtime.progress_watchdog.lock() {
+            wd.reduce_choice(tokens_remaining, choice)
+        } else {
+            "hard_stop"
+        }
+    } else {
+        match choice {
+            "continue" => "continue",
+            "plan" => "return_to_plan",
+            "stop" => "stop_checkpoint",
+            _ => "paused",
+        }
+    };
+
+    match decision {
+        "continue" => Ok("Continuing task with remaining budget".into()),
+        "return_to_plan" => {
+            agent.set_permission_mode(davinci_agent::PermissionMode::ReadOnly);
+            Ok(format!(
+                "Switched to Plan Mode due to watchdog signal: {}",
+                signal.description()
+            ))
+        }
+        "stop_checkpoint" => {
+            agent.abort();
+            Ok("Task stopped; preserved checkpoint".into())
+        }
+        "hard_stop" => {
+            agent.abort();
+            Err("Budget exhausted: hard stop enforced".into())
+        }
+        _ => Ok("Watchdog paused".into()),
+    }
+}
+
+/// A failed save keeps the request pending until the user selects another scope.
+fn persist_permission_choice(
+    model: &mut Model,
+    request: &ToolApprovalRequest,
+    decision: ToolApprovalDecision,
+    cwd: &std::path::Path,
+    project_allowed: &mut bool,
+) -> Option<ToolApprovalDecision> {
+    if !request.allows(decision) {
+        return Some(ToolApprovalDecision::Deny);
+    }
+    if decision != ToolApprovalDecision::AllowAlways {
+        return Some(decision);
+    }
+    if !*project_allowed {
+        return Some(ToolApprovalDecision::Deny);
+    }
+    if crate::permissions::remember_project_rule(cwd, &request.session_rule).is_ok() {
+        return Some(decision);
+    }
+    *project_allowed = false;
+    model.ask = permission_ask(request, false);
+    model.ask.note = format!(
+        "Project permission could not be saved. Choose another scope. {}",
+        model.ask.note
+    );
+    open_ask_overlay(model);
+    None
+}
+
+fn offers_denial_instructions(request: &ToolApprovalRequest) -> bool {
+    request.legal_choices.iter().any(|choice| {
+        choice.id == "deny_with_instructions"
+            && choice.scope == davinci_agent::approval::GrantScope::DenyWithInstructions
+    })
+}
+
+fn approval_answer_key(
+    model: &mut Model,
+    key: crossterm::event::KeyEvent,
+    choices: &[ToolApprovalDecision],
+    request: &ToolApprovalRequest,
+    abort: &Arc<AtomicBool>,
+) -> Option<NativeApprovalAnswer> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.code == KeyCode::Esc && key.modifiers.is_empty()
+        || key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL
+    {
+        model.approval_instructions = None;
+        model.overlay = None;
+        if key.code == KeyCode::Char('c') {
+            abort.store(true, Ordering::Relaxed);
+            model.interrupt();
+        }
+        return Some(ToolApprovalDecision::Deny.into());
+    }
+    if let Some(input) = model.approval_instructions.as_mut() {
+        if key.code == KeyCode::Enter && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
+        {
+            if !input.trim().is_empty() && offers_denial_instructions(request) {
+                let instructions = model.approval_instructions.take().unwrap().into_string();
+                model.overlay = None;
+                return Some(NativeApprovalAnswer {
+                    decision: ToolApprovalDecision::Deny,
+                    instructions: Some(instructions),
+                });
+            }
+            return None;
+        }
+        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+            let editor = input.editor_mut();
+            match key.code {
+                KeyCode::Char(ch)
+                    if !ch.is_control() && editor.buffer.len() + ch.len_utf8() <= 4096 =>
+                {
+                    editor.insert(ch)
+                }
+                KeyCode::Left => editor.move_left(),
+                KeyCode::Right => editor.move_right(),
+                KeyCode::Home => editor.move_line_start(),
+                KeyCode::End => editor.move_line_end(),
+                KeyCode::Backspace => editor.backspace(),
+                KeyCode::Delete => editor.delete_forward(),
+                _ => {}
+            }
+        }
+        return None;
+    }
+    // Ask owns navigation and explicit Enter semantics; only its chosen extra
+    // policy-issued row opens the editor. No conversation draft is moved.
+    if model.overlay == Some(Overlay::Ask)
+        && model.ask.key == "/permissions"
+        && model.ask_index == choices.len()
+        && model.overlay_offset.is_none()
+        && offers_denial_instructions(request)
+        && key.code == KeyCode::Enter
+        && key.modifiers.is_empty()
+        && key.kind == KeyEventKind::Press
+    {
+        model.approval_instructions = Some(Default::default());
+        return None;
+    }
+    approval_key(model, key, choices, abort).map(Into::into)
 }
 
 /// One key while the permission panel is up. The panel takes the keys every
@@ -2383,13 +3304,13 @@ pub fn permission_choice(index: usize, trusted: bool) -> Option<ToolApprovalDeci
 fn approval_key(
     model: &mut Model,
     key: crossterm::event::KeyEvent,
-    trusted: bool,
+    choices: &[ToolApprovalDecision],
     abort: &Arc<AtomicBool>,
 ) -> Option<ToolApprovalDecision> {
     use davinci_tui::davinci::app::{handle_key, Flow};
     match handle_key(model, key) {
         Flow::Choose(Choice::Ask(index)) => {
-            Some(permission_choice(index, trusted).unwrap_or(ToolApprovalDecision::Deny))
+            Some(permission_choice(index, choices).unwrap_or(ToolApprovalDecision::Deny))
         }
         Flow::Interrupt | Flow::Quit => {
             abort.store(true, Ordering::Relaxed);
@@ -2452,9 +3373,8 @@ pub fn perform(
             let session_dir = crate::resolved_session_dir(parsed, &agent.cwd);
             let store = JsonlSession::create(&session_dir, &agent.cwd.to_string_lossy(), None)
                 .map_err(|err| err.to_string())?;
-            agent.messages.clear();
+            agent.load_from_session(store)?;
             model.composer_epoch = model.composer_epoch.saturating_add(1);
-            agent.session = Some(store);
             model.transcript.clear();
             Ok(Done::Said("started a new session".into()))
         }
@@ -2610,8 +3530,8 @@ pub fn perform(
                     &session_dir,
                 )
                 .map_err(|err| err.to_string())?;
+            agent.load_from_session(next)?;
             model.composer_epoch = model.composer_epoch.saturating_add(1);
-            agent.load_from_session(next);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("forked to {}", session_id(agent))))
         }
@@ -2623,8 +3543,8 @@ pub fn perform(
             let next = store
                 .clone_session(&session_dir)
                 .map_err(|err| err.to_string())?;
+            agent.load_from_session(next)?;
             model.composer_epoch = model.composer_epoch.saturating_add(1);
-            agent.load_from_session(next);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("cloned to {}", session_id(agent))))
         }
@@ -2634,8 +3554,8 @@ pub fn perform(
             }
             let expanded = davinci_session::expand_tilde(&path);
             let next = JsonlSession::open(&expanded).map_err(|err| err.to_string())?;
+            agent.load_from_session(next)?;
             model.composer_epoch = model.composer_epoch.saturating_add(1);
-            agent.load_from_session(next);
             model.transcript = transcript_from(&agent.messages);
             Ok(Done::Said(format!("imported {}", session_id(agent))))
         }
@@ -2960,6 +3880,10 @@ pub fn perform(
             Ok(Done::Said(
                 crate::agent_profiles::format_agent_profiles_status(&agent.cwd, None, trusted),
             ))
+        }
+        SlashAction::Tasks => {
+            open_task_board_sheet(agent, model);
+            Ok(Done::Opened)
         }
     }
 }
@@ -3924,13 +4848,19 @@ fn apply_host_effects(shell: &mut Shell<'_>) -> Next {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
     });
-    crate::apply_session_calls(
+    let failures = crate::apply_session_calls(
         Some(shell.parsed),
         shell.agent,
         crate::SessionCallUi::Davinci(shell.model),
         &calls,
         false,
     );
+    let calls: Vec<_> = calls
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !failures.iter().any(|(failed, _)| failed == index))
+        .map(|(_, call)| call)
+        .collect();
 
     if calls.iter().any(|call| op_of(call) == "reload") {
         crate::apply_discovered_resources(shell.parsed, shell.agent);
@@ -3963,6 +4893,9 @@ fn apply_host_effects(shell: &mut Shell<'_>) -> Next {
         // which wipes the status lines `apply_session_calls` just pushed.
         // State the change again on the fresh transcript.
         shell.model.transcript = transcript_from(&shell.agent.messages);
+        for (_, error) in &failures {
+            shell.note(error);
+        }
         for call in &calls {
             if matches!(
                 op_of(call).as_str(),
@@ -3976,7 +4909,7 @@ fn apply_host_effects(shell: &mut Shell<'_>) -> Next {
     }
     shell.redress();
 
-    if wants_turn {
+    if wants_turn && failures.is_empty() {
         shell.model.running = true;
         match run_turns(shell) {
             Next::Go => {}
@@ -4103,8 +5036,82 @@ fn open_sheet(model: &mut Model, screen: Screen) {
 }
 
 fn open_ask_overlay(model: &mut Model) {
+    model.approval_instructions = None;
     model.overlay_offset = None;
     model.ask_index = 0;
+    model.overlay = Some(Overlay::Ask);
+}
+
+pub(crate) fn open_decision_modal(
+    model: &mut Model,
+    question: &davinci_agent::decisions::DecisionQuestion,
+) {
+    let options = question
+        .options
+        .iter()
+        .map(
+            |opt| davinci_tui::davinci::views::decision_modal::DecisionModalOption {
+                id: opt.id.clone(),
+                label: opt.label.clone(),
+                explanation: opt.explanation.clone(),
+                recommended: opt.recommended,
+            },
+        )
+        .collect();
+    let state = davinci_tui::davinci::views::decision_modal::DecisionModalState::new(
+        question.id.clone(),
+        question.id.clone(),
+        question.plan_revision,
+        question.title.clone(),
+        question.question.clone(),
+        question.materiality.clone(),
+        question.evidence_refs.clone(),
+        options,
+        question.allow_custom,
+        question.custom_only,
+    );
+    model.decision_modal = Some(state);
+    model.overlay = Some(Overlay::Ask);
+}
+
+#[allow(dead_code)]
+pub(crate) fn open_rewind_modal(
+    model: &mut Model,
+    preview: &davinci_agent::runtime::rewind::RewindPreview,
+    checkpoint_name: &str,
+    checkpoint_time: &str,
+) {
+    let files = preview
+        .files
+        .iter()
+        .map(|f| davinci_tui::davinci::views::rewind::RewindFileSummary {
+            path: f.path.clone(),
+            classification: f.classification.clone(),
+            is_conflict: f.is_conflict,
+            conflict_reason: f.conflict_reason.clone(),
+        })
+        .collect();
+    let irreversible_effects = preview
+        .irreversible_effects
+        .iter()
+        .map(
+            |e| davinci_tui::davinci::views::rewind::RewindIrreversibleSummary {
+                operation_id: e.operation_id.clone(),
+                kind: e.kind.clone(),
+                details: e.redacted_details().to_string(),
+            },
+        )
+        .collect();
+    let state = davinci_tui::davinci::views::rewind::RewindModalState::new(
+        preview.checkpoint_id.clone(),
+        checkpoint_name,
+        checkpoint_time,
+        preview.preview_digest.clone(),
+        files,
+        preview.conflict_count,
+        irreversible_effects,
+    );
+    model.rewind_modal = Some(state);
     model.overlay = Some(Overlay::Ask);
 }
 
@@ -5636,12 +6643,49 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
                 .trim_end()
                 .to_string()
             };
+            let owner = json_str(task, "owner");
+            let attempts = number(task, "attempts") as u32;
+            let error = task
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let public_contract = task
+                .get("publicContract")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let recent_tools = task
+                .get("recentTools")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let dependencies: Vec<String> = task
+                .get("dependsOn")
+                .and_then(serde_json::Value::as_array)
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
             GraphTask {
                 id,
                 policy: policy_of_role(&role).into(),
                 artifact,
                 usage,
                 state,
+                role,
+                dependencies,
+                owner,
+                attempts,
+                error,
+                recent_tools,
+                public_contract,
             }
         })
         .collect();
@@ -5816,6 +6860,12 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             })
             .map(|stats| stats.render_compact_lines())
             .unwrap_or_default(),
+        lifecycle: json_str(run, "lifecycle"),
+        control_status: run
+            .get("controlStatus")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        ..Default::default()
     })
 }
 
@@ -5840,7 +6890,25 @@ fn refresh_graph_sheet(model: &mut Model, host: &Arc<Mutex<ExtensionHost>>) -> b
         .execute_native_command("graph-status", "");
     match status {
         Ok(Some(value)) => match graph_sheet(&value) {
-            Some(sheet) => {
+            Some(mut sheet) => {
+                if let Some(prev) = &model.graph_run {
+                    sheet.inspecting_node = prev.inspecting_node;
+                    sheet.showing_diff = prev.showing_diff;
+                    if let Some(ref prev_id) = prev.selected_node_id {
+                        if let Some(pos) = sheet.tasks.iter().position(|t| &t.id == prev_id) {
+                            sheet.selected_index = pos;
+                            sheet.selected_node_id = Some(prev_id.clone());
+                        } else if !sheet.tasks.is_empty() {
+                            sheet.selected_index = prev.selected_index.min(sheet.tasks.len() - 1);
+                            sheet.selected_node_id =
+                                sheet.tasks.get(sheet.selected_index).map(|t| t.id.clone());
+                        }
+                    } else if !sheet.tasks.is_empty() {
+                        sheet.selected_index = prev.selected_index.min(sheet.tasks.len() - 1);
+                        sheet.selected_node_id =
+                            sheet.tasks.get(sheet.selected_index).map(|t| t.id.clone());
+                    }
+                }
                 model.graph_run = Some(sheet);
                 true
             }
@@ -6002,9 +7070,12 @@ impl Shell<'_> {
         }
         match davinci_session::JsonlSession::open(std::path::Path::new(path)) {
             Ok(store) => {
+                if let Err(error) = self.agent.load_from_session(store) {
+                    self.note(&error);
+                    return Next::Go;
+                }
                 self.voice.cancel(self.model);
                 self.model.composer_epoch = self.model.composer_epoch.saturating_add(1);
-                self.agent.load_from_session(store);
                 self.model.transcript = transcript_from(&self.agent.messages);
                 self.model.running = false;
                 self.redress();
@@ -6193,6 +7264,21 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
         if let Some(rest) = line.trim().strip_prefix("/workflows") {
             if rest.is_empty() || rest.starts_with(char::is_whitespace) {
                 return workflows_command(shell, rest.trim());
+            }
+        }
+        if let Some(rest) = line.trim().strip_prefix("/tasks") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return tasks_command(shell, rest.trim());
+            }
+        }
+        if let Some(rest) = line.trim().strip_prefix("/agents") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return agents_command(shell, rest.trim());
+            }
+        }
+        if let Some(rest) = line.trim().strip_prefix("/context") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return context_inspector_command(shell, rest.trim());
             }
         }
         if let Some(rest) = line.trim().strip_prefix("/workflow") {
@@ -6496,6 +7582,11 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             shell.finish(Done::Ask(question))
         }
         Choice::Permission(index) => apply_permission_row(shell, index),
+        Choice::AgentAction { action, index } => apply_agent_action(shell, action, index),
+        Choice::ContextInspectorAction { action, index } => {
+            apply_context_inspector_action(shell, action, index)
+        }
+        Choice::GraphAction { action, index } => apply_graph_action(shell, action, index),
     }
 }
 
@@ -6843,6 +7934,302 @@ fn open_workflows_sheet(agent: &Agent, model: &mut Model) {
 
 fn workflows_command(shell: &mut Shell<'_>, _arg: &str) -> Next {
     open_workflows_sheet(shell.agent, shell.model);
+    Next::Go
+}
+
+fn open_task_board_sheet(agent: &Agent, model: &mut Model) {
+    let tasks = if let Some(runtime) = &agent.runtime {
+        crate::davinci_surfaces::task_board(runtime)
+    } else {
+        Vec::new()
+    };
+
+    model.task_board = Some(davinci_tui::davinci::model::TaskBoardSheet {
+        tasks,
+        selected_index: 0,
+    });
+    open_sheet(model, Screen::TaskBoard);
+}
+
+fn tasks_command(shell: &mut Shell<'_>, _arg: &str) -> Next {
+    open_task_board_sheet(shell.agent, shell.model);
+    Next::Go
+}
+
+fn open_agents_sheet(agent: &Agent, model: &mut Model) {
+    let agents = if let Some(runtime) = &agent.runtime {
+        crate::davinci_surfaces::agents_sheet(runtime)
+    } else {
+        Vec::new()
+    };
+
+    model.agents = Some(davinci_tui::davinci::model::AgentsSheet {
+        agents,
+        selected_index: 0,
+    });
+    open_sheet(model, Screen::Agents);
+}
+
+fn agents_command(shell: &mut Shell<'_>, _arg: &str) -> Next {
+    open_agents_sheet(shell.agent, shell.model);
+    Next::Go
+}
+
+fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next {
+    let Some(sheet) = shell.model.agents.as_ref() else {
+        return Next::Go;
+    };
+    let Some(agent_row) = sheet.agents.get(index).cloned() else {
+        return Next::Go;
+    };
+    let Ok(agent_id) = agent_row.id.parse::<davinci_agent::runtime::AgentId>() else {
+        return Next::Go;
+    };
+
+    match action {
+        "inspect" => {
+            let owned_str = if agent_row.owned_paths.is_empty() {
+                "none".to_string()
+            } else {
+                agent_row.owned_paths.join(", ")
+            };
+            shell.say(&format!(
+                "Worker '{}' (id: {}):\n  Role: {}\n  Status: {}\n  Elapsed: {}\n  Tools: {}\n  Owned paths: {}\n  Waiting on: {}",
+                agent_row.name,
+                agent_row.id,
+                agent_row.role,
+                agent_row.status,
+                agent_row.elapsed,
+                agent_row.tool_count,
+                owned_str,
+                agent_row.waiting_on.as_deref().unwrap_or("none")
+            ));
+        }
+        "steer" => {
+            if let Some(runtime) = &shell.agent.runtime {
+                let _ = runtime.mailbox.send_steer(
+                    agent_id,
+                    0,
+                    "focus on primary objective".into(),
+                    true,
+                );
+                shell.note(&format!(
+                    "Steering message queued for worker '{}'",
+                    agent_row.name
+                ));
+            }
+        }
+        "stop" => {
+            if let Some(runtime) = &shell.agent.runtime {
+                let controller =
+                    davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
+                let cmd = davinci_agent::runtime::WorkerControlCommand {
+                    id: uuid::Uuid::new_v4(),
+                    root_run_id: runtime.run_id,
+                    agent_id,
+                    generation: 0,
+                    task_id: None,
+                    expected_revision: 0,
+                    action: davinci_agent::runtime::WorkerControlAction::Stop {
+                        reason: Some("stopped via live agent panel".into()),
+                    },
+                };
+                let receipt = controller.execute_command(cmd, true);
+                shell.note(&format!(
+                    "Stop requested for worker '{}': status {:?}",
+                    agent_row.name, receipt.status
+                ));
+            }
+            open_agents_sheet(shell.agent, shell.model);
+        }
+        "retry" => {
+            if let Some(runtime) = &shell.agent.runtime {
+                let controller =
+                    davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
+                let cmd = davinci_agent::runtime::WorkerControlCommand {
+                    id: uuid::Uuid::new_v4(),
+                    root_run_id: runtime.run_id,
+                    agent_id,
+                    generation: 0,
+                    task_id: None,
+                    expected_revision: 0,
+                    action: davinci_agent::runtime::WorkerControlAction::Retry {
+                        reason: Some("retry via live agent panel".into()),
+                    },
+                };
+                let receipt = controller.execute_command(cmd, true);
+                shell.note(&format!(
+                    "Retry requested for worker '{}': status {:?}",
+                    agent_row.name, receipt.status
+                ));
+            }
+            open_agents_sheet(shell.agent, shell.model);
+        }
+        "diff" => {
+            if let Ok(baseline) =
+                crate::native_extensions::graph::mutation::capture_baseline(&shell.agent.cwd)
+            {
+                if let Ok(report) = crate::native_extensions::graph::mutation::compute_owned_diff(
+                    &shell.agent.cwd,
+                    &baseline,
+                    &[],
+                ) {
+                    if report.owned_diff.is_empty() && report.unattributed_diff.is_none() {
+                        shell.say(&format!(
+                            "Worker '{}': no working tree changes.",
+                            agent_row.name
+                        ));
+                    } else {
+                        shell.say(&format!(
+                            "Worker '{}' owned diff:\n{}\n{}",
+                            agent_row.name,
+                            report.owned_diff,
+                            report.unattributed_diff.as_deref().unwrap_or("")
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Next::Go
+}
+
+fn open_context_inspector_sheet(agent: &davinci_agent::Agent, model: &mut Model) {
+    if let Some(manifest) = &agent.last_prepared_manifest {
+        model.context_inspector = Some(
+            crate::davinci_surfaces::context_inspector_sheet_from_manifest(
+                manifest, None, false, false,
+            ),
+        );
+    } else {
+        model.context_inspector =
+            Some(davinci_tui::davinci::model::ContextInspectorSheet::default());
+    }
+    open_sheet(model, Screen::ContextInspector);
+}
+
+fn context_inspector_command(shell: &mut Shell<'_>, _arg: &str) -> Next {
+    open_context_inspector_sheet(shell.agent, shell.model);
+    Next::Go
+}
+
+fn apply_context_inspector_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next {
+    let Some(sheet) = shell.model.context_inspector.as_mut() else {
+        return Next::Go;
+    };
+    let Some(row) = sheet.rows.get_mut(index) else {
+        return Next::Go;
+    };
+
+    match action {
+        "preview" => {
+            sheet.preview_active = !sheet.preview_active;
+        }
+        "pin" => {
+            if !davinci_agent::runtime::overlay_change_allowed(row.mandatory, "pin", true) {
+                sheet.confirmation_dialog =
+                    Some("Cannot pin or exclude mandatory policy items".into());
+            } else {
+                row.pinned = !row.pinned;
+                if row.pinned {
+                    row.selected = true;
+                }
+                sheet.overlay_revision += 1;
+                sheet.confirmation_dialog = None;
+            }
+        }
+        "exclude" => {
+            if !davinci_agent::runtime::overlay_change_allowed(row.mandatory, "exclude", true) {
+                sheet.confirmation_dialog =
+                    Some("Cannot exclude mandatory policy items: exclusion rejected".into());
+            } else {
+                row.selected = !row.selected;
+                if !row.selected {
+                    row.pinned = false;
+                }
+                sheet.overlay_revision += 1;
+                sheet.confirmation_dialog = None;
+            }
+        }
+        "refresh" => {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            row.last_refreshed_at = Some(format!("{now_secs}s"));
+            row.freshness = "fresh".into();
+            sheet.overlay_revision += 1;
+            sheet.confirmation_dialog =
+                Some(format!("Refreshed authorized evidence for {}", row.item_id));
+        }
+        "toggle_pending" => {
+            sheet.show_pending = !sheet.show_pending;
+        }
+        _ => {}
+    }
+    Next::Go
+}
+
+fn apply_graph_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next {
+    let Some(sheet) = shell.model.graph_run.as_mut() else {
+        return Next::Go;
+    };
+    let node_id = sheet.tasks.get(index).map(|t| t.id.clone());
+    match action {
+        "inspect" => {
+            sheet.inspecting_node = !sheet.inspecting_node;
+        }
+        "diff" => {
+            sheet.showing_diff = !sheet.showing_diff;
+        }
+        "pause_resume" => {
+            let is_paused = sheet.lifecycle == "paused" || sheet.lifecycle == "pause_requested";
+            let cmd = if is_paused {
+                "graph-resume"
+            } else {
+                "graph-pause"
+            };
+            let _ = shell
+                .host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .execute_native_command(cmd, &sheet.id);
+            sheet.control_status = Some(if is_paused {
+                "Resume requested".into()
+            } else {
+                "Pause requested".into()
+            });
+        }
+        "stop" => {
+            let arg = if let Some(ref nid) = node_id {
+                format!("{} {}", sheet.id, nid)
+            } else {
+                sheet.id.clone()
+            };
+            let _ = shell
+                .host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .execute_native_command("graph-stop", &arg);
+            sheet.control_status = Some(format!(
+                "Stop requested for {}",
+                node_id.as_deref().unwrap_or("graph")
+            ));
+        }
+        "retry" => {
+            if let Some(ref nid) = node_id {
+                let arg = format!("{} {}", sheet.id, nid);
+                let _ = shell
+                    .host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .execute_native_command("graph-retry", &arg);
+                sheet.control_status = Some(format!("Retry requested for {}", nid));
+            }
+        }
+        _ => {}
+    }
     Next::Go
 }
 
@@ -7795,8 +9182,318 @@ mod tests {
         }
     }
 
+    #[test]
+    fn f01_native_denial_editor_requires_confirmation_and_keeps_draft() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        for cancel in [false, true] {
+            let request = approval("write", "ordinary.txt", false);
+            let choices = request.host_choices(true);
+            let mut m = model();
+            m.width = 40;
+            m.height = 12;
+            m.composer.set_text("original cafe\u{301}");
+            m.composer.editor_mut().move_left();
+            let draft = m.composer.to_string();
+            let cursor = m.composer.editor().get_cursor();
+            m.ask = permission_ask(&request, true);
+            open_ask_overlay(&mut m);
+            let abort = Arc::new(AtomicBool::new(false));
+            let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+            assert!(approval_answer_key(
+                &mut m,
+                press(KeyCode::Char('5')),
+                &choices,
+                &request,
+                &abort
+            )
+            .is_none());
+            assert!(m.approval_instructions.is_none());
+            assert!(
+                approval_answer_key(&mut m, press(KeyCode::Enter), &choices, &request, &abort)
+                    .is_none()
+            );
+            assert!(m.approval_instructions.is_some());
+            assert!(
+                approval_answer_key(&mut m, press(KeyCode::Enter), &choices, &request, &abort)
+                    .is_none()
+            );
+            for ch in "try cafe\u{301}".chars() {
+                assert!(approval_answer_key(
+                    &mut m,
+                    press(KeyCode::Char(ch)),
+                    &choices,
+                    &request,
+                    &abort
+                )
+                .is_none());
+            }
+            m.paste("must not enter either buffer");
+            assert!(!m.insert_dictation("late voice", m.composer_epoch).unwrap());
+            assert_eq!(
+                m.approval_instructions.as_ref().unwrap().to_string(),
+                "try cafe\u{301}"
+            );
+            let mut repeat = press(KeyCode::Enter);
+            repeat.kind = KeyEventKind::Repeat;
+            assert!(approval_answer_key(&mut m, repeat, &choices, &request, &abort).is_none());
+            m.width = 120;
+            m.height = 40;
+            let rendered = davinci_tui::davinci::views::ask::lines(&m);
+            assert!(rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("try cafe")));
+            let answer = approval_answer_key(
+                &mut m,
+                press(if cancel { KeyCode::Esc } else { KeyCode::Enter }),
+                &choices,
+                &request,
+                &abort,
+            )
+            .unwrap();
+            assert_eq!(answer.decision, ToolApprovalDecision::Deny);
+            assert_eq!(
+                answer.instructions.as_deref(),
+                if cancel {
+                    None
+                } else {
+                    Some("try cafe\u{301}")
+                }
+            );
+            assert!(m.approval_instructions.is_none());
+            assert!(m.overlay.is_none());
+            assert_eq!(m.composer.to_string(), draft);
+            assert_eq!(m.composer.editor().get_cursor(), cursor);
+        }
+    }
+
+    #[test]
+    fn f01_native_denial_editor_bounds_utf8_and_cancels() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let request = approval("write", "ordinary.txt", false);
+        let choices = request.host_choices(true);
+        let mut m = model();
+        m.ask = permission_ask(&request, true);
+        open_ask_overlay(&mut m);
+        m.approval_instructions = Some("x".repeat(4095).into());
+        let abort = Arc::new(AtomicBool::new(false));
+        assert!(approval_answer_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE),
+            &choices,
+            &request,
+            &abort
+        )
+        .is_none());
+        assert_eq!(m.approval_instructions.as_ref().unwrap().len(), 4095);
+        assert!(approval_answer_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &choices,
+            &request,
+            &abort
+        )
+        .is_none());
+        assert_eq!(m.approval_instructions.as_ref().unwrap().len(), 4096);
+        let answer = approval_answer_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &choices,
+            &request,
+            &abort,
+        )
+        .unwrap();
+        assert_eq!(answer, ToolApprovalDecision::Deny.into());
+        assert!(abort.load(Ordering::Relaxed));
+        assert!(m.approval_instructions.is_none());
+        assert!(m.overlay.is_none());
+    }
+
+    #[test]
+    fn f01_native_offers_policy_owned_denial_instructions() {
+        let mut request = approval("write", "ordinary.txt", false);
+        assert_eq!(
+            permission_ask(&request, true).items.last().unwrap().label,
+            "deny with instructions"
+        );
+        request.legal_choices.retain(|choice| {
+            choice.scope != davinci_agent::approval::GrantScope::DenyWithInstructions
+        });
+        assert_eq!(
+            permission_ask(&request, true).items.last().unwrap().label,
+            "deny"
+        );
+    }
+
+    #[test]
+    fn f01_modal_numeric_focus_preserves_draft_until_enter() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (width, height) in [(40, 12), (120, 40)] {
+            let mut m = model();
+            m.width = width;
+            m.height = height;
+            m.composer.set_text("keep cafe\u{301} draft");
+            m.composer.editor_mut().move_left();
+            let cursor = m.composer.editor().get_cursor();
+            let original = m.composer.to_string();
+            let permission = m.permission_mode.clone();
+            let request = approval("write", "ordinary.txt", false);
+            let choices = request.host_choices(true);
+            m.ask = permission_ask(&request, true);
+            open_ask_overlay(&mut m);
+            let abort = Arc::new(AtomicBool::new(false));
+            for key in [
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            ] {
+                assert_eq!(approval_key(&mut m, key, &choices, &abort), None);
+            }
+            assert_eq!(m.ask_index, 1);
+            m.keybindings = davinci_tui::Keybindings::from_json(r#"{"tui.select.confirm":"x"}"#);
+            assert_eq!(
+                approval_key(
+                    &mut m,
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                    &choices,
+                    &abort
+                ),
+                None
+            );
+            m.paste("\r\npasted instruction");
+            assert!(!m
+                .insert_dictation("voice instruction", m.composer_epoch)
+                .unwrap());
+            assert_eq!(m.composer.to_string(), original);
+            assert_eq!(m.composer.editor().get_cursor(), cursor);
+            assert_eq!(m.permission_mode, permission);
+            assert_eq!(
+                approval_key(
+                    &mut m,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &choices,
+                    &abort
+                ),
+                Some(ToolApprovalDecision::AllowForSession)
+            );
+            assert_eq!(m.composer.to_string(), original);
+            assert_eq!(m.composer.editor().get_cursor(), cursor);
+            open_ask_overlay(&mut m);
+            assert_eq!(
+                approval_key(
+                    &mut m,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    &choices,
+                    &abort
+                ),
+                Some(ToolApprovalDecision::Deny)
+            );
+            assert_eq!(m.composer.to_string(), original);
+            assert_eq!(m.composer.editor().get_cursor(), cursor);
+        }
+    }
+
+    #[test]
+    fn f01_native_approval_wait_releases_on_cancel_expiry_and_disconnect() {
+        for case in [
+            "allow",
+            "instructions",
+            "cancel",
+            "expired",
+            "disconnect",
+            "ui_error",
+            "expires_waiting",
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let abort = Arc::new(AtomicBool::new(case == "cancel"));
+            let expires = if case == "expired" {
+                0
+            } else if case == "expires_waiting" {
+                davinci_session::now_ms() + 250
+            } else {
+                davinci_session::now_ms() + 60_000
+            };
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    wait_native_approval(
+                        &approval("write", "ordinary.txt", false),
+                        expires,
+                        &tx,
+                        &abort,
+                    )
+                });
+                if matches!(
+                    case,
+                    "allow" | "instructions" | "ui_error" | "expires_waiting"
+                ) {
+                    let pending = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    if case == "allow" {
+                        pending
+                            .reply
+                            .send(ToolApprovalDecision::AllowOnce.into())
+                            .unwrap();
+                    } else if case == "instructions" {
+                        pending
+                            .reply
+                            .send(NativeApprovalAnswer {
+                                decision: ToolApprovalDecision::Deny,
+                                instructions: Some("read the docs first".into()),
+                            })
+                            .unwrap();
+                    } else if case == "ui_error" {
+                        let _exit = ApprovalUiExit::new(abort.clone());
+                    }
+                    let start = Instant::now();
+                    while !worker.is_finished() && start.elapsed() < Duration::from_secs(1) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(worker.is_finished());
+                    assert!(!pending.live.load(Ordering::Relaxed));
+                }
+                drop(rx);
+                let answer = worker.join().unwrap();
+                assert_eq!(
+                    answer.decision,
+                    if case == "allow" {
+                        ToolApprovalDecision::AllowOnce
+                    } else {
+                        ToolApprovalDecision::Deny
+                    }
+                );
+                let challenge: davinci_agent::approval::ApprovalChallenge = serde_json::from_value(json!({
+                    "schema_version": 1, "id": "00000000-0000-0000-0000-000000000001", "call_id": "fixture",
+                    "action_digest": "fixture", "policy_revision": 0, "contract_revision": null,
+                    "mode": "ask", "action_label": "write", "display_target": "ordinary.txt", "reason": "fixture",
+                    "legal_choices": [], "expires_at_ms": expires
+                })).unwrap();
+                let reply = answer.into_reply(&challenge);
+                assert_eq!(reply.challenge_id, challenge.id);
+                assert_eq!(
+                    reply.choice_id,
+                    if case == "instructions" {
+                        "deny_with_instructions"
+                    } else if case == "allow" {
+                        "once"
+                    } else {
+                        "deny"
+                    }
+                );
+                assert_eq!(
+                    reply.instructions.as_deref(),
+                    if case == "instructions" {
+                        Some("read the docs first")
+                    } else {
+                        None
+                    }
+                );
+            });
+        }
+    }
+
     fn approval(tool: &str, subject: &str, outside: bool) -> ToolApprovalRequest {
         ToolApprovalRequest {
+            legal_choices: davinci_agent::approval::offer_scopes(false, true, true),
             tool_call_id: "call_1".into(),
             tool: tool.into(),
             args: json!({}),
@@ -7822,7 +9519,8 @@ mod tests {
                 "allow once",
                 "allow for this session",
                 "always allow here",
-                "deny"
+                "deny",
+                "deny with instructions"
             ]
         );
         assert_eq!(ask.items[1].detail, "bash(git status *) until pi exits");
@@ -7833,8 +9531,485 @@ mod tests {
 
         let ask = permission_ask(&approval("write", "../out.txt", true), false);
         let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
-        assert_eq!(labels, ["allow once", "allow for this session", "deny"]);
+        assert_eq!(
+            labels,
+            [
+                "allow once",
+                "allow for this session",
+                "deny",
+                "deny with instructions"
+            ]
+        );
         assert_eq!(ask.note, "write · ../out.txt · outside the project");
+    }
+
+    #[test]
+    fn f05_scope_expansion_panel_has_only_host_authority_choices() {
+        let contract = davinci_agent::runtime::contracts::TaskContract::new(
+            "scope-panel",
+            7,
+            davinci_agent::TaskId::new(),
+            3,
+            vec!["src/".into()],
+            vec!["secrets/".into()],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let preview = contract
+            .preview_scope_expansion("migrations/001.sql", "write migration")
+            .unwrap();
+        let ask = scope_expansion_ask(&preview);
+        assert_eq!(ask.title, "Scope expansion required");
+        assert_eq!(ask.key, "/scope-expansion");
+        let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "approve expansion",
+                "request in-scope approach",
+                "deny with instructions"
+            ]
+        );
+        assert!(ask.note.contains("migrations/001.sql"));
+        assert!(ask.note.contains("revision 7 → 8"));
+        assert!(ask.note.contains(&preview.preview_digest));
+        assert_eq!(
+            scope_expansion_choice(0),
+            Some(davinci_agent::runtime::contracts::ScopeExpansionDecision::Approve)
+        );
+        assert_eq!(
+            scope_expansion_choice(1),
+            Some(davinci_agent::runtime::contracts::ScopeExpansionDecision::RequestInScopeApproach)
+        );
+        assert_eq!(
+            scope_expansion_choice(2),
+            Some(davinci_agent::runtime::contracts::ScopeExpansionDecision::Deny)
+        );
+        assert_eq!(scope_expansion_choice(3), None);
+    }
+
+    #[test]
+    fn f05_scope_expansion_deny_collects_bounded_host_instructions() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let contract = davinci_agent::runtime::contracts::TaskContract::new(
+            "scope-keys",
+            1,
+            davinci_agent::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let preview = contract
+            .preview_scope_expansion("outside.rs", "blocked write")
+            .unwrap();
+        let mut m = model();
+        m.ask = scope_expansion_ask(&preview);
+        open_ask_overlay(&mut m);
+        m.ask_index = 2;
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        assert!(scope_expansion_answer_key(&mut m, press(KeyCode::Enter)).is_none());
+        assert!(m.approval_instructions.is_some());
+        for ch in "stay in src".chars() {
+            assert!(scope_expansion_answer_key(&mut m, press(KeyCode::Char(ch))).is_none());
+        }
+        let answer = scope_expansion_answer_key(&mut m, press(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            answer.0,
+            davinci_agent::runtime::contracts::ScopeExpansionDecision::Deny
+        );
+        assert_eq!(answer.1.as_deref(), Some("stay in src"));
+        assert!(m.overlay.is_none());
+    }
+
+    #[test]
+    fn f05_scope_expansion_commit_is_durable_exact_and_invalidates_session_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        agent.session =
+            Some(davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap());
+        let current = davinci_agent::runtime::contracts::TaskContract::new(
+            "scope-commit",
+            4,
+            davinci_agent::TaskId::new(),
+            2,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let preview = current
+            .preview_scope_expansion("migrations/001.sql", "write migration")
+            .unwrap();
+        agent.set_active_contract(current.clone());
+        agent.permissions.lock().unwrap().remember("write:**");
+        assert!(!agent.permissions.lock().unwrap().session_allow.is_empty());
+
+        commit_scope_expansion(&mut agent, &preview, None).unwrap();
+
+        assert_eq!(agent.active_contract(), Some(preview.proposed.clone()));
+        assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
+        let session = agent.session.as_ref().unwrap();
+        let entry = session.entries.last().expect("durable audit entry");
+        assert_eq!(
+            entry.custom_type.as_deref(),
+            Some("task_contract_scope_expansion")
+        );
+        assert_eq!(
+            entry.extra["data"]["preview_digest"],
+            preview.preview_digest
+        );
+        assert_eq!(
+            entry.extra["data"]["proposed"]["digest"],
+            preview.proposed.digest
+        );
+    }
+
+    #[test]
+    fn f05_scope_expansion_commit_updates_bound_task_digest_before_live_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        agent
+            .load_from_session(
+                davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap(),
+            )
+            .unwrap();
+        let runtime = agent.runtime_for_session().unwrap().clone();
+        let task_id = davinci_agent::TaskId::new();
+        let current = davinci_agent::runtime::contracts::TaskContract::new(
+            "scope-bound",
+            5,
+            task_id,
+            2,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let preview = current
+            .preview_scope_expansion("migrations/001.sql", "write migration")
+            .unwrap();
+        let mut task = davinci_agent::TaskRecord::new(runtime.run_id, "bound scope task")
+            .with_assigned(runtime.agent_id)
+            .with_contract_digest(current.digest.clone());
+        task.id = task_id;
+        runtime.task_registry.create_task(task).unwrap();
+        agent.set_active_contract(current.clone());
+        let guard = capture_scope_expansion_task_guard(&agent, &preview).unwrap();
+
+        commit_scope_expansion(&mut agent, &preview, guard.as_ref()).unwrap();
+
+        let rebound = runtime.task_registry.get_task(&task_id).unwrap();
+        assert_eq!(
+            rebound.contract_digest.as_deref(),
+            Some(preview.proposed.digest.as_str())
+        );
+        assert_eq!(agent.active_contract(), Some(preview.proposed));
+    }
+
+    #[test]
+    fn f05_scope_expansion_rejects_task_revision_changed_after_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        agent
+            .load_from_session(
+                davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap(),
+            )
+            .unwrap();
+        let runtime = agent.runtime_for_session().unwrap().clone();
+        let task_id = davinci_agent::TaskId::new();
+        let current = davinci_agent::runtime::contracts::TaskContract::new(
+            "scope-bound-stale",
+            5,
+            task_id,
+            2,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let preview = current
+            .preview_scope_expansion("migrations/001.sql", "write migration")
+            .unwrap();
+        let mut task = davinci_agent::TaskRecord::new(runtime.run_id, "bound scope task")
+            .with_assigned(runtime.agent_id)
+            .with_contract_digest(current.digest.clone());
+        task.id = task_id;
+        runtime.task_registry.create_task(task).unwrap();
+        agent.set_active_contract(current.clone());
+        agent.permissions.lock().unwrap().remember("write:**");
+        let guard = capture_scope_expansion_task_guard(&agent, &preview).unwrap();
+        runtime
+            .task_registry
+            .assign_task(task_id, runtime.agent_id)
+            .unwrap();
+        let changed = runtime.task_registry.get_task(&task_id).unwrap();
+
+        let error = commit_scope_expansion(&mut agent, &preview, guard.as_ref()).unwrap_err();
+
+        assert!(error.contains("bound task contract digest"));
+        assert_eq!(agent.active_contract(), Some(current));
+        assert_eq!(
+            runtime
+                .task_registry
+                .get_task(&task_id)
+                .unwrap()
+                .contract_digest,
+            changed.contract_digest
+        );
+        assert!(!agent.permissions.lock().unwrap().session_allow.is_empty());
+    }
+
+    #[test]
+    fn f05_scope_expansion_bound_task_update_failure_keeps_live_contract_and_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        agent
+            .load_from_session(
+                davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap(),
+            )
+            .unwrap();
+        let runtime = agent.runtime_for_session().unwrap().clone();
+        let task_id = davinci_agent::TaskId::new();
+        let current = davinci_agent::runtime::contracts::TaskContract::new(
+            "scope-bound-fail",
+            5,
+            task_id,
+            2,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let preview = current
+            .preview_scope_expansion("migrations/001.sql", "write migration")
+            .unwrap();
+        let other_agent = davinci_agent::AgentId::new();
+        let mut task = davinci_agent::TaskRecord::new(runtime.run_id, "bound scope task")
+            .with_assigned(other_agent)
+            .with_contract_digest(current.digest.clone());
+        task.id = task_id;
+        runtime.task_registry.create_task(task).unwrap();
+        agent.set_active_contract(current.clone());
+        agent.permissions.lock().unwrap().remember("write:**");
+        let before = runtime.task_registry.get_task(&task_id).unwrap();
+        let guard = capture_scope_expansion_task_guard(&agent, &preview).unwrap();
+
+        let error = commit_scope_expansion(&mut agent, &preview, guard.as_ref()).unwrap_err();
+
+        assert!(error.contains("bound task contract digest"));
+        assert_eq!(agent.active_contract(), Some(current));
+        assert_eq!(runtime.task_registry.get_task(&task_id), Some(before));
+        assert!(!agent.permissions.lock().unwrap().session_allow.is_empty());
+        let audit = agent.session.as_ref().unwrap().entries.last().unwrap();
+        assert_eq!(
+            audit.custom_type.as_deref(),
+            Some("task_contract_scope_expansion")
+        );
+    }
+
+    #[test]
+    fn f05_scope_expansion_storage_failure_and_stale_preview_keep_current_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        let mut session =
+            davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        session.path = dir.path().join("missing-parent/session.jsonl");
+        agent.session = Some(session);
+        let current = davinci_agent::runtime::contracts::TaskContract::new(
+            "scope-fail",
+            9,
+            davinci_agent::TaskId::new(),
+            2,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let preview = current
+            .preview_scope_expansion("migrations/001.sql", "write migration")
+            .unwrap();
+        agent.set_active_contract(current.clone());
+        let prior_leaf = agent.session.as_ref().unwrap().leaf_id.clone();
+
+        assert!(commit_scope_expansion(&mut agent, &preview, None).is_err());
+        assert_eq!(agent.active_contract(), Some(current.clone()));
+        assert_eq!(agent.session.as_ref().unwrap().leaf_id, prior_leaf);
+
+        let newer = current.expand_scope(vec!["docs/".into()], vec![]).unwrap();
+        agent.set_active_contract(newer.clone());
+        assert!(commit_scope_expansion(&mut agent, &preview, None).is_err());
+        assert_eq!(agent.active_contract(), Some(newer));
+    }
+
+    #[test]
+    fn f05_scope_expansion_reject_and_in_scope_guidance_keep_contract_unchanged() {
+        let current = davinci_agent::runtime::contracts::TaskContract::new(
+            "scope-reject",
+            3,
+            davinci_agent::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let preview = current
+            .preview_scope_expansion("outside/file.rs", "requested write")
+            .unwrap();
+
+        let mut always_agent = Agent::new("fixture");
+        always_agent.set_active_contract(current.clone());
+        always_agent.set_permission_mode(PermissionMode::AlwaysApprove);
+        assert_eq!(always_agent.active_contract(), Some(current.clone()));
+
+        for (decision, instructions) in [
+            (
+                davinci_agent::runtime::contracts::ScopeExpansionDecision::RequestInScopeApproach,
+                None,
+            ),
+            (
+                davinci_agent::runtime::contracts::ScopeExpansionDecision::Deny,
+                Some("do not modify generated files".to_string()),
+            ),
+        ] {
+            let mut agent = Agent::new("fixture");
+            agent.set_active_contract(current.clone());
+            let guidance = apply_scope_expansion_decision(
+                &mut agent,
+                &preview,
+                None,
+                decision,
+                instructions.as_deref(),
+            )
+            .unwrap()
+            .expect("non-approval guidance");
+            assert_eq!(agent.active_contract(), Some(current.clone()));
+            assert!(guidance.contains("outside/file.rs"));
+            if let Some(instructions) = instructions.as_deref() {
+                assert!(guidance.contains(instructions));
+            }
+        }
+    }
+
+    #[test]
+    fn f09_watchdog_ask_and_choice_navigation() {
+        use davinci_agent::runtime::progress_watchdog::LoopSignal;
+        let signal = LoopSignal::RepeatedTestFailureWithoutNewDiagnosis {
+            signature: "test_foo failed: assertion failed".into(),
+            count: 3,
+        };
+        let ask = watchdog_ask(&signal);
+        assert_eq!(ask.title, "Progress watchdog");
+        assert_eq!(ask.name, "WATCHDOG");
+        assert_eq!(ask.key, "/watchdog");
+        assert_eq!(ask.items.len(), 3);
+        assert_eq!(watchdog_choice(0), Some("continue"));
+        assert_eq!(watchdog_choice(1), Some("plan"));
+        assert_eq!(watchdog_choice(2), Some("stop"));
+        assert_eq!(watchdog_choice(3), None);
+
+        let mut model = Model::new(
+            davinci_tui::davinci::theme::Theme::da_vinci(
+                davinci_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            80,
+            24,
+            false,
+        );
+        model.ask = ask;
+        model.ask_index = 0;
+        model.overlay = Some(Overlay::Ask);
+
+        // Press '1' -> continue
+        assert_eq!(
+            watchdog_answer_key(
+                &mut model,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('1'),
+                    crossterm::event::KeyModifiers::empty(),
+                ),
+            ),
+            Some("continue")
+        );
+
+        // Press '2' -> plan
+        assert_eq!(
+            watchdog_answer_key(
+                &mut model,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('2'),
+                    crossterm::event::KeyModifiers::empty(),
+                ),
+            ),
+            Some("plan")
+        );
+
+        // Press '3' -> stop
+        assert_eq!(
+            watchdog_answer_key(
+                &mut model,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('3'),
+                    crossterm::event::KeyModifiers::empty(),
+                ),
+            ),
+            Some("stop")
+        );
+
+        // Press Esc -> stop
+        assert_eq!(
+            watchdog_answer_key(
+                &mut model,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::empty(),
+                ),
+            ),
+            Some("stop")
+        );
+
+        // Test apply_watchdog_choice transitions
+        let mut agent = Agent::new("test_agent");
+        let res_continue = apply_watchdog_choice(&mut agent, "continue", &signal);
+        assert!(res_continue.is_ok());
+
+        let res_plan = apply_watchdog_choice(&mut agent, "plan", &signal);
+        assert!(res_plan.is_ok());
+        assert_eq!(
+            agent.permission_mode(),
+            davinci_agent::PermissionMode::ReadOnly
+        );
+
+        let res_stop = apply_watchdog_choice(&mut agent, "stop", &signal);
+        assert!(res_stop.is_ok());
     }
 
     #[test]
@@ -7853,15 +10028,172 @@ mod tests {
     }
 
     #[test]
+    fn permission_panel_uses_policy_choices_even_in_a_trusted_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = davinci_agent::PermissionPolicy::new(PermissionMode::Ask);
+        let davinci_agent::PermissionVerdict::Ask(request) = policy.decide(
+            "risky",
+            "write",
+            &json!({"path":".env", "content":"fixture"}),
+            dir.path(),
+        ) else {
+            panic!("expected Ask")
+        };
+        let mut m = model();
+        m.ask = permission_ask(&request, true);
+        assert_eq!(
+            m.ask
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["allow once", "deny", "deny with instructions"]
+        );
+        open_ask_overlay(&mut m);
+        m.ask_index = 1;
+        let abort = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            approval_key(
+                &mut m,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE
+                ),
+                &request.host_choices(true),
+                &abort
+            ),
+            Some(ToolApprovalDecision::Deny)
+        );
+        let mut trusted = true;
+        assert_eq!(
+            persist_permission_choice(
+                &mut m,
+                &request,
+                ToolApprovalDecision::AllowAlways,
+                dir.path(),
+                &mut trusted
+            ),
+            Some(ToolApprovalDecision::Deny)
+        );
+        assert!(!dir.path().join(".davinci/settings.json").exists());
+    }
+
+    #[test]
+    fn permission_save_failure_reopens_panel_without_granting() {
+        use ToolApprovalDecision::*;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".davinci"), "not a directory").unwrap();
+        let request = approval("write", "file.txt", false);
+        let mut m = model();
+        let mut project_allowed = true;
+        assert_eq!(
+            persist_permission_choice(
+                &mut m,
+                &request,
+                AllowAlways,
+                dir.path(),
+                &mut project_allowed
+            ),
+            None
+        );
+        assert!(!project_allowed);
+        assert!(m.ask.note.contains("could not be saved"));
+        assert_eq!(m.ask.items.len(), 4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let decision = approval_key(
+            &mut m,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &request.host_choices(project_allowed),
+            &abort,
+        );
+        assert_eq!(decision, Some(Deny));
+        assert_eq!(
+            persist_permission_choice(&mut m, &request, Deny, dir.path(), &mut project_allowed),
+            Some(Deny)
+        );
+        for (index, expected) in [(0, AllowOnce), (1, AllowForSession), (2, Deny)] {
+            project_allowed = true;
+            assert_eq!(
+                persist_permission_choice(
+                    &mut m,
+                    &request,
+                    AllowAlways,
+                    dir.path(),
+                    &mut project_allowed
+                ),
+                None
+            );
+            assert!(matches!(m.overlay, Some(Overlay::Ask)));
+            m.ask_index = index;
+            let choice = approval_key(
+                &mut m,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &request.host_choices(project_allowed),
+                &abort,
+            )
+            .unwrap();
+            assert_eq!(
+                persist_permission_choice(
+                    &mut m,
+                    &request,
+                    choice,
+                    dir.path(),
+                    &mut project_allowed
+                ),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            persist_permission_choice(
+                &mut m,
+                &request,
+                AllowAlways,
+                dir.path(),
+                &mut project_allowed
+            ),
+            Some(Deny)
+        );
+        let saved = tempfile::tempdir().unwrap();
+        project_allowed = true;
+        assert_eq!(
+            persist_permission_choice(
+                &mut m,
+                &request,
+                AllowAlways,
+                saved.path(),
+                &mut project_allowed
+            ),
+            Some(AllowAlways)
+        );
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(saved.path().join(".davinci/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["permissions"]["allow"],
+            json!([request.session_rule])
+        );
+    }
+
+    #[test]
     fn permission_rows_map_to_decisions_in_both_shapes() {
         use ToolApprovalDecision::*;
-        assert_eq!(permission_choice(0, true), Some(AllowOnce));
-        assert_eq!(permission_choice(1, true), Some(AllowForSession));
-        assert_eq!(permission_choice(2, true), Some(AllowAlways));
-        assert_eq!(permission_choice(3, true), Some(Deny));
-        assert_eq!(permission_choice(4, true), None);
-        assert_eq!(permission_choice(2, false), Some(Deny));
-        assert_eq!(permission_choice(3, false), None);
+        let request = approval("bash", "git status", false);
+        let trusted = request.host_choices(true);
+        let untrusted = request.host_choices(false);
+        assert_eq!(permission_choice(0, &trusted), Some(AllowOnce));
+        assert_eq!(permission_choice(1, &trusted), Some(AllowForSession));
+        assert_eq!(permission_choice(2, &trusted), Some(AllowAlways));
+        assert_eq!(permission_choice(3, &trusted), Some(Deny));
+        assert_eq!(permission_choice(4, &trusted), None);
+        assert_eq!(permission_choice(2, &untrusted), Some(Deny));
+        assert_eq!(permission_choice(3, &untrusted), None);
     }
 
     #[test]
@@ -7869,6 +10201,7 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
         let abort = Arc::new(AtomicBool::new(false));
+        let choices = approval("bash", "git status", false).host_choices(true);
         let open = || {
             let mut m = model();
             m.running = true;
@@ -7880,7 +10213,7 @@ mod tests {
 
         let mut m = open();
         assert_eq!(
-            approval_key(&mut m, key(KeyCode::Esc), true, &abort),
+            approval_key(&mut m, key(KeyCode::Esc), &choices, &abort),
             Some(ToolApprovalDecision::Deny)
         );
         assert_eq!(m.overlay, None);
@@ -7890,14 +10223,17 @@ mod tests {
         );
 
         let mut m = open();
-        assert_eq!(approval_key(&mut m, key(KeyCode::Down), true, &abort), None);
+        assert_eq!(
+            approval_key(&mut m, key(KeyCode::Down), &choices, &abort),
+            None
+        );
         assert_eq!(
             m.overlay,
             Some(Overlay::Ask),
             "moving keeps the question up"
         );
         assert_eq!(
-            approval_key(&mut m, key(KeyCode::Enter), true, &abort),
+            approval_key(&mut m, key(KeyCode::Enter), &choices, &abort),
             Some(ToolApprovalDecision::AllowForSession)
         );
         assert_eq!(m.overlay, None);
@@ -7907,7 +10243,7 @@ mod tests {
             approval_key(
                 &mut m,
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                true,
+                &choices,
                 &abort
             ),
             Some(ToolApprovalDecision::Deny)
@@ -9316,5 +11652,137 @@ mod tests {
         assert_eq!(m.screen, Screen::Workflows);
         assert!(m.workflows.is_some());
         assert_eq!(m.workflows.unwrap().workflows.len(), 0);
+    }
+
+    #[test]
+    fn f02_wait_native_decision_timeout() {
+        let (tx, rx) = mpsc::channel();
+        let abort = AtomicBool::new(false);
+        let q = davinci_agent::decisions::DecisionQuestion {
+            id: "q-timeout".into(),
+            kind: davinci_agent::decisions::DecisionKind::Architecture,
+            title: "Timeout Test".into(),
+            question: "Will it time out?".into(),
+            materiality: "High".into(),
+            evidence_refs: vec![],
+            evidence_fingerprints: std::collections::BTreeMap::new(),
+            options: vec![],
+            allow_custom: true,
+            custom_only: true,
+            plan_revision: 1,
+            state: davinci_agent::decisions::DecisionState::Open,
+            answer: None,
+        };
+        let req = davinci_agent::DecisionHostRequest { question: q };
+        // Expired deadline
+        let expired_ms = davinci_session::now_ms().saturating_sub(10);
+        let resp = wait_native_decision(req, expired_ms, &tx, &abort);
+        assert_eq!(resp, davinci_agent::DecisionHostResponse::Cancelled);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn f02_wait_native_decision_abort_cancelled() {
+        let (tx, _rx) = mpsc::channel();
+        let abort = AtomicBool::new(true);
+        let q = davinci_agent::decisions::DecisionQuestion {
+            id: "q-abort".into(),
+            kind: davinci_agent::decisions::DecisionKind::Architecture,
+            title: "Abort Test".into(),
+            question: "Will it cancel?".into(),
+            materiality: "High".into(),
+            evidence_refs: vec![],
+            evidence_fingerprints: std::collections::BTreeMap::new(),
+            options: vec![],
+            allow_custom: true,
+            custom_only: true,
+            plan_revision: 1,
+            state: davinci_agent::decisions::DecisionState::Open,
+            answer: None,
+        };
+        let req = davinci_agent::DecisionHostRequest { question: q };
+        let resp = wait_native_decision(req, davinci_session::now_ms() + 10_000, &tx, &abort);
+        assert_eq!(resp, davinci_agent::DecisionHostResponse::Cancelled);
+    }
+
+    #[test]
+    fn f02_open_decision_modal_mapping() {
+        let mut m = model();
+        let q = davinci_agent::decisions::DecisionQuestion {
+            id: "q-map".into(),
+            kind: davinci_agent::decisions::DecisionKind::Behavior,
+            title: "Map Test".into(),
+            question: "Map Question?".into(),
+            materiality: "Medium".into(),
+            evidence_refs: vec!["ref1".into()],
+            evidence_fingerprints: std::collections::BTreeMap::new(),
+            options: vec![davinci_agent::decisions::DecisionOptionInput {
+                id: "opt1".into(),
+                label: "Option 1".into(),
+                explanation: "Expl 1".into(),
+                recommended: true,
+            }],
+            allow_custom: true,
+            custom_only: false,
+            plan_revision: 3,
+            state: davinci_agent::decisions::DecisionState::Open,
+            answer: None,
+        };
+        open_decision_modal(&mut m, &q);
+        assert_eq!(m.overlay, Some(Overlay::Ask));
+        assert!(m.decision_modal.is_some());
+        let modal = m.decision_modal.as_ref().unwrap();
+        assert_eq!(modal.question_id, "q-map");
+        assert_eq!(modal.title, "Map Test");
+        assert_eq!(modal.options.len(), 1);
+        assert_eq!(modal.options[0].id, "opt1");
+        assert!(modal.options[0].recommended);
+        assert_eq!(modal.plan_revision, 3);
+    }
+
+    #[test]
+    fn f04_open_rewind_modal_mapping() {
+        let mut m = model();
+        let preview = davinci_agent::runtime::rewind::RewindPreview {
+            checkpoint_id: "cp-123".into(),
+            preview_digest: "digest-abc".into(),
+            files: vec![davinci_agent::runtime::rewind::FileRewindPlan {
+                path: "src/main.rs".into(),
+                classification: "inverse".into(),
+                resolved_content: Some(b"fn main() {}".to_vec()),
+                is_conflict: false,
+                conflict_reason: None,
+                pre_rewind_hash: None,
+            }],
+            conflict_count: 0,
+            irreversible_effects: vec![davinci_agent::runtime::effects::ExternalEffectReceipt {
+                receipt_id: "rcpt-1".into(),
+                task_id: davinci_agent::TaskId::new(),
+                operation_id: "op-1".into(),
+                kind: "deploy".into(),
+                details: serde_json::json!({
+                    "secret_token": "secret123",
+                    "target": "staging"
+                }),
+                timestamp_ms: 1000,
+                reversible: false,
+            }],
+        };
+        open_rewind_modal(&mut m, &preview, "Pre-Task 1", "12:00:00");
+        assert_eq!(m.overlay, Some(Overlay::Ask));
+        assert!(m.rewind_modal.is_some());
+        let modal = m.rewind_modal.as_ref().unwrap();
+        assert_eq!(modal.checkpoint_id, "cp-123");
+        assert_eq!(modal.checkpoint_name, "Pre-Task 1");
+        assert_eq!(modal.checkpoint_time, "12:00:00");
+        assert_eq!(modal.preview_digest, "digest-abc");
+        assert_eq!(modal.files.len(), 1);
+        assert_eq!(modal.files[0].path, "src/main.rs");
+        assert_eq!(modal.files[0].classification, "inverse");
+        assert_eq!(modal.conflict_count, 0);
+        assert_eq!(modal.irreversible_effects.len(), 1);
+        assert_eq!(modal.irreversible_effects[0].operation_id, "op-1");
+        assert!(modal.irreversible_effects[0].details.contains("[REDACTED]"));
+        assert!(!modal.irreversible_effects[0].details.contains("secret123"));
     }
 }

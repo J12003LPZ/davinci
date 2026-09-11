@@ -57,6 +57,37 @@ impl RequestBudget {
         Self::open_scoped(store, scan_id, max_turns, max_tokens, max_tokens * 3 / 4)
     }
 
+    #[allow(dead_code)]
+    pub fn open_scoped_with_root_lease(
+        store: Option<Store>,
+        scan_id: String,
+        max_turns: usize,
+        max_tokens: u64,
+        max_discovery_tokens: u64,
+        root_lease_tokens: Option<u64>,
+    ) -> Result<Self, String> {
+        if let Some(lease) = root_lease_tokens {
+            if max_tokens > lease {
+                return Err(format!(
+                    "subsystem security scan budget ({max_tokens}) exceeds root lease ({lease})"
+                ));
+            }
+        }
+        Self::open_scoped(store, scan_id, max_turns, max_tokens, max_discovery_tokens)
+    }
+
+    /// Enforce that this subsystem budget cannot exceed an authorized root lease.
+    #[allow(dead_code)]
+    pub fn enforce_root_lease(&self, root_lease_tokens: u64) -> Result<(), String> {
+        if self.max_tokens > root_lease_tokens {
+            return Err(format!(
+                "subsystem budget max_tokens ({}) cannot exceed root lease ({})",
+                self.max_tokens, root_lease_tokens
+            ));
+        }
+        Ok(())
+    }
+
     pub fn open_scoped(
         store: Option<Store>,
         scan_id: String,
@@ -338,5 +369,23 @@ mod tests {
         assert!(resumed.reserve(31).is_err());
         resumed.reserve(30).unwrap();
         assert!(resumed.reserve(1).is_err());
+    }
+
+    #[test]
+    fn test_subsystem_budget_never_exceeds_root_lease() {
+        // Tighter local cap than root lease succeeds
+        let b =
+            RequestBudget::open_scoped_with_root_lease(None, "scan1".into(), 5, 100, 50, Some(200));
+        assert!(b.is_ok());
+
+        // Local cap exceeding root lease fails
+        let b =
+            RequestBudget::open_scoped_with_root_lease(None, "scan2".into(), 5, 300, 50, Some(200));
+        assert!(b.is_err());
+
+        // enforce_root_lease validation
+        let budget = RequestBudget::open_scoped(None, "scan3".into(), 5, 150, 50).unwrap();
+        assert!(budget.enforce_root_lease(200).is_ok());
+        assert!(budget.enforce_root_lease(100).is_err());
     }
 }

@@ -96,6 +96,9 @@ pub struct Job {
     pub command: String,
     pub pid: u32,
     pub started: Instant,
+    pub task_id: Option<crate::runtime::ids::TaskId>,
+    pub agent_id: Option<crate::runtime::ids::AgentId>,
+    pub generation: Option<u64>,
     shared: Arc<Shared>,
     /// The model has been told this job finished.
     announced: bool,
@@ -204,9 +207,22 @@ impl Job {
     }
 }
 
+/// Canonical stop lifecycle progression: requested -> stopping -> stopped | failed_to_stop.
+pub fn stop_status(requested: bool, exited: bool, failed: bool) -> &'static str {
+    if exited {
+        "stopped"
+    } else if failed {
+        "failed_to_stop"
+    } else if requested {
+        "stopping"
+    } else {
+        "running"
+    }
+}
+
 /// `taskkill /T` on Windows, the process group elsewhere; `Child::kill`
 /// alone would leave a shell's children running.
-fn kill_tree(pid: u32) {
+pub fn kill_tree(pid: u32) {
     if cfg!(windows) {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
@@ -256,6 +272,43 @@ impl JobNotice {
         }
         out
     }
+
+    /// Convert a finished background job notice into an immutable execution receipt.
+    pub fn to_execution_receipt(
+        &self,
+        task_id: Option<crate::runtime::ids::TaskId>,
+    ) -> crate::runtime::evidence_store::ExecutionReceipt {
+        let (exit_code, killed) = match self.status {
+            JobStatus::Exited(code) => (Some(code), false),
+            JobStatus::Killed => (None, true),
+            JobStatus::Running => (None, false),
+        };
+        crate::runtime::evidence_store::ExecutionReceipt {
+            receipt_id: crate::runtime::ids::EvidenceId::new(),
+            operation_id: format!("job_{}", self.id),
+            task_id,
+            tool_name: "background_job".into(),
+            argv: vec![self.command.clone()],
+            cwd: ".".into(),
+            started: true,
+            exit_code,
+            timed_out: false,
+            cancelled: killed,
+            killed,
+            permission_denied: false,
+            simulated: false,
+            hook_vetoed: false,
+            stdout_hash: None,
+            stderr_hash: None,
+            stdout_artifact: None,
+            stderr_artifact: None,
+            assertion_counts: None,
+            runtime_versions: std::collections::HashMap::new(),
+            started_at_ms: 0,
+            finished_at_ms: self.elapsed.as_millis() as i64,
+            ..Default::default()
+        }
+    }
 }
 
 /// One row of `/jobs`.
@@ -300,12 +353,26 @@ pub fn kill_every_job() {
 pub struct JobBook {
     jobs: Vec<Job>,
     next_id: u32,
+    /// The host's active runtime; updated and checked under the book mutex.
+    pub(crate) cancellation_owner: Option<std::sync::Weak<std::sync::atomic::AtomicBool>>,
 }
 
 impl JobBook {
     /// Register a spawned child. Two threads drain its pipes into the
     /// buffer, a third notices when it exits.
-    pub fn register(&mut self, command: &str, mut child: Child) -> u32 {
+    pub fn register(&mut self, command: &str, child: Child) -> u32 {
+        self.register_with_provenance(command, child, None, None, None)
+    }
+
+    /// Register a spawned child with task, agent, and generation provenance.
+    pub fn register_with_provenance(
+        &mut self,
+        command: &str,
+        mut child: Child,
+        task_id: Option<crate::runtime::ids::TaskId>,
+        agent_id: Option<crate::runtime::ids::AgentId>,
+        generation: Option<u64>,
+    ) -> u32 {
         self.next_id += 1;
         let id = self.next_id;
         let pid = child.id();
@@ -394,11 +461,69 @@ impl JobBook {
             command: command.to_string(),
             pid,
             started: Instant::now(),
+            task_id,
+            agent_id,
+            generation,
             shared,
             announced: false,
             seen: false,
         });
+        // Cancellation may have drained the book between spawn and registration.
+        // Registration and the cancellation callback share the caller's book lock.
+        if self
+            .cancellation_owner
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|owner| owner.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            self.kill(id);
+        }
         id
+    }
+
+    pub fn kill_jobs_for_agent(&mut self, agent_id: &crate::runtime::ids::AgentId) -> Vec<u32> {
+        let matching: Vec<u32> = self
+            .jobs
+            .iter()
+            .filter(|j| j.agent_id.as_ref() == Some(agent_id) && j.status().is_running())
+            .map(|j| j.id)
+            .collect();
+        for id in &matching {
+            self.kill(*id);
+        }
+        matching
+    }
+
+    pub fn kill_jobs_for_task(&mut self, task_id: &crate::runtime::ids::TaskId) -> Vec<u32> {
+        let matching: Vec<u32> = self
+            .jobs
+            .iter()
+            .filter(|j| j.task_id.as_ref() == Some(task_id) && j.status().is_running())
+            .map(|j| j.id)
+            .collect();
+        for id in &matching {
+            self.kill(*id);
+        }
+        matching
+    }
+
+    pub fn get_process_lease(
+        &self,
+        agent_id: &crate::runtime::ids::AgentId,
+    ) -> Option<crate::runtime::control::ProcessLease> {
+        let job = self
+            .jobs
+            .iter()
+            .find(|j| j.agent_id.as_ref() == Some(agent_id) && j.status().is_running())?;
+        Some(crate::runtime::control::ProcessLease {
+            lease_id: uuid::Uuid::new_v4(),
+            task_id: job.task_id,
+            agent_id: *agent_id,
+            generation: job.generation.unwrap_or(1),
+            os_handle_identity: job.pid,
+            created_at: job.started.elapsed().as_millis() as i64,
+            child_tree: vec![job.pid],
+        })
     }
 
     pub fn get(&self, id: u32) -> Option<&Job> {
@@ -711,6 +836,84 @@ pub fn stdin_parameters() -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn f03_replaced_runtime_cannot_kill_current_jobs() {
+        let mut agent = crate::Agent::new("job binding fixture");
+        let old = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        agent.set_runtime(old.clone());
+        let current = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        agent.set_runtime(current.clone());
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::In.ReadLine()",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "read line"]);
+            command
+        };
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let jobs = agent.tool_context.jobs.clone();
+        let id = jobs
+            .lock()
+            .unwrap()
+            .register("fixture waiting for input", child);
+        old.cancellation_token.cancel();
+        assert_eq!(
+            jobs.lock().unwrap().get(id).unwrap().status(),
+            JobStatus::Running
+        );
+        current.cancellation_token.cancel();
+        assert_eq!(
+            jobs.lock().unwrap().get(id).unwrap().status(),
+            JobStatus::Killed
+        );
+        let late_child = command.spawn().unwrap();
+        let late_id = jobs
+            .lock()
+            .unwrap()
+            .register("late cancellation fixture", late_child);
+        assert_eq!(
+            jobs.lock().unwrap().get(late_id).unwrap().status(),
+            JobStatus::Killed
+        );
+        for job_id in [id, late_id] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let book = jobs.lock().unwrap();
+                let mut child = book.get(job_id).unwrap().shared.child.lock().unwrap();
+                if child.as_mut().unwrap().try_wait().unwrap().is_some() {
+                    break;
+                }
+                drop(child);
+                drop(book);
+                assert!(
+                    Instant::now() < deadline,
+                    "cancelled fixture child did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
     fn spawn(script: &str) -> Child {
         let mut command = if cfg!(windows) {
             let mut c = Command::new("cmd");
@@ -965,5 +1168,72 @@ mod tests {
         wait_for_exit(&book, id);
         let out = book.lock().unwrap().get(id).unwrap().output(None);
         assert!(out.contains("observed: hello_interactive"), "{out}");
+    }
+
+    #[test]
+    fn f07_stop_requires_exit() {
+        assert_eq!(stop_status(true, false, false), "stopping");
+        assert_eq!(stop_status(true, true, false), "stopped");
+        assert_eq!(stop_status(true, false, true), "failed_to_stop");
+    }
+
+    #[test]
+    fn test_process_tree_kill_provenance() {
+        let mut book = JobBook::default();
+        let agent_id = crate::runtime::ids::AgentId::new();
+        let task_id = crate::runtime::ids::TaskId::new();
+
+        let child = spawn("echo hello");
+        let pid = child.id();
+        let job_id = book.register_with_provenance(
+            "echo hello",
+            child,
+            Some(task_id),
+            Some(agent_id),
+            Some(1),
+        );
+
+        let lease = book.get_process_lease(&agent_id);
+        assert!(lease.is_some());
+        let lease = lease.unwrap();
+        assert_eq!(lease.agent_id, agent_id);
+        assert_eq!(lease.task_id, Some(task_id));
+        assert_eq!(lease.os_handle_identity, pid);
+
+        let killed = book.kill_jobs_for_agent(&agent_id);
+        assert_eq!(killed, vec![job_id]);
+    }
+
+    #[test]
+    fn test_stop_status_reducer_cases() {
+        // already exited
+        assert_eq!(stop_status(true, true, false), "stopped");
+        // requested and stopping
+        assert_eq!(stop_status(true, false, false), "stopping");
+        // access denied / failed
+        assert_eq!(stop_status(true, false, true), "failed_to_stop");
+        // not requested, still running
+        assert_eq!(stop_status(false, false, false), "running");
+    }
+
+    #[test]
+    fn test_unrelated_process_unaffected() {
+        let mut book = JobBook::default();
+        let agent1 = crate::runtime::ids::AgentId::new();
+        let agent2 = crate::runtime::ids::AgentId::new();
+
+        let child1 = spawn("echo worker1");
+        let child2 = spawn("echo worker2");
+
+        let id1 =
+            book.register_with_provenance("echo worker1", child1, None, Some(agent1), Some(1));
+        let id2 =
+            book.register_with_provenance("echo worker2", child2, None, Some(agent2), Some(1));
+
+        let killed = book.kill_jobs_for_agent(&agent1);
+        assert_eq!(killed, vec![id1]);
+
+        // id2 is not killed by agent1 kill call
+        assert_eq!(book.get(id2).unwrap().agent_id, Some(agent2));
     }
 }

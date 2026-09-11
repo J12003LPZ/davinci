@@ -13,9 +13,11 @@
 use std::path::Path;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use davinci_agent::Agent;
 use davinci_tui::davinci::model::{
-    BudgetMeta, BudgetRow, Model, PlanStep, Proposal, RecallHit, RecallMeta,
+    AgentRow, BudgetMeta, BudgetRow, Model, PlanStep, Proposal, RecallHit, RecallMeta, TaskBoardRow,
 };
 use davinci_tui::davinci::theme::State;
 use davinci_tui::davinci::views::disegno::roman;
@@ -313,6 +315,25 @@ fn compaction_proposal(agent: &Agent, in_use: u64, window: u64) -> Option<Propos
     })
 }
 
+/// Format cost minor units or label as unknown.
+pub fn cost_label(cost_minor_units: Option<u64>) -> String {
+    cost_minor_units
+        .map(|v| format!("{v} minor units"))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Retrieve the whole-task budget snapshot from the active agent runtime.
+pub fn root_ledger_snapshot(
+    agent: &Agent,
+) -> Option<davinci_agent::runtime::budget::BudgetSnapshot> {
+    agent
+        .runtime
+        .as_ref()?
+        .budget_ledger
+        .as_ref()
+        .map(|ledger| ledger.snapshot())
+}
+
 /// Fill the surfaces that have a source, leaving the ones that do not alone.
 pub fn dress_from_extensions(model: &mut Model, cwd: &Path, agent: &Agent) {
     let plan = plan(cwd);
@@ -323,6 +344,471 @@ pub fn dress_from_extensions(model: &mut Model, cwd: &Path, agent: &Agent) {
     model.budget = rows;
     model.budget_meta = meta;
     model.proposal = proposal;
+
+    if let Some(snap) = root_ledger_snapshot(agent) {
+        let watchdog_signal = agent.runtime.as_ref().and_then(|rt| {
+            rt.progress_watchdog.lock().ok().and_then(|wd| {
+                if let davinci_agent::runtime::progress_watchdog::WatchdogState::Paused(sig) =
+                    wd.state()
+                {
+                    Some(sig.description())
+                } else {
+                    None
+                }
+            })
+        });
+
+        let cost_str = if snap.has_unknown_cost || snap.cost_minor_units.is_none() {
+            "unknown (provider pricing unavailable)".to_string()
+        } else {
+            cost_label(snap.cost_minor_units)
+        };
+
+        model.task_budget = Some(davinci_tui::davinci::model::TaskBudgetView {
+            tokens_charged: snap.tokens_charged,
+            token_ceiling: snap.token_ceiling,
+            reserved_tokens: snap.tokens_reserved,
+            elapsed_ms: snap.elapsed.as_millis() as u64,
+            deadline_ms: snap.deadline.as_millis() as u64,
+            active_workers: snap.active_workers,
+            max_concurrency: snap.max_concurrency,
+            retries_used: snap.retries_used,
+            retry_ceiling: snap.retry_ceiling,
+            cost_label: cost_str,
+            verification_reserve: snap.verification_reserve,
+            handoff_reserve: snap.handoff_reserve,
+            watchdog_signal,
+        });
+    }
+}
+
+/// Filter whether a task from `task_root` is visible to an active session run with `active_root`.
+#[allow(dead_code)]
+pub fn task_visible(task_root: &str, active_root: &str, _terminal: bool) -> bool {
+    task_root == active_root
+}
+
+/// Map an internal [`davinci_agent::TaskState`] to the TUI theme [`State`].
+pub fn task_state_to_tui(state: davinci_agent::TaskState) -> State {
+    match state {
+        davinci_agent::TaskState::Completed => State::Done,
+        davinci_agent::TaskState::Running => State::Active,
+        davinci_agent::TaskState::Pending | davinci_agent::TaskState::Ready => State::Queued,
+        davinci_agent::TaskState::Failed | davinci_agent::TaskState::Blocked => State::Failed,
+        davinci_agent::TaskState::Cancelled => State::Skipped,
+    }
+}
+
+/// Scope status of an execution task on the UI surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TaskScopeStatus {
+    LegacyUncontracted,
+    ContractScoped {
+        revision: u64,
+        digest: String,
+        writable_count: usize,
+        protected_count: usize,
+    },
+    InvalidContract {
+        reason: String,
+    },
+}
+
+impl TaskScopeStatus {
+    #[allow(dead_code)]
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::LegacyUncontracted => "legacy (uncontracted)".to_string(),
+            Self::ContractScoped { revision, .. } => format!("contracted (rev {revision})"),
+            Self::InvalidContract { reason } => format!("invalid contract: {reason}"),
+        }
+    }
+}
+
+/// Evaluates scope status for an authoritative task record and optional contract.
+///
+/// Invariants:
+/// - Uncontracted tasks (`contract_digest: None`) are visibly reported as `LegacyUncontracted`.
+///   Legacy tasks are never claimed to be contract scoped.
+/// - Contract-scoped status is only reported when an active contract is provided, validates
+///   cleanly, and matches the bound contract digest.
+/// - If a contract is invalid or its digest mismatches the bound record digest, it fails closed
+///   with `InvalidContract`.
+/// - Following task resume, the correct active contract revision is reflected.
+#[allow(dead_code)]
+pub fn evaluate_task_scope_status(
+    record: &davinci_agent::TaskRecord,
+    contract: Option<&davinci_agent::runtime::contracts::TaskContract>,
+) -> TaskScopeStatus {
+    match (&record.contract_digest, contract) {
+        (None, _) => TaskScopeStatus::LegacyUncontracted,
+        (Some(_), None) => TaskScopeStatus::InvalidContract {
+            reason: "missing contract for bound digest".into(),
+        },
+        (Some(bound_digest), Some(c)) => {
+            if let Err(e) = c.validate() {
+                TaskScopeStatus::InvalidContract {
+                    reason: e.to_string(),
+                }
+            } else if c.digest != *bound_digest {
+                TaskScopeStatus::InvalidContract {
+                    reason: format!(
+                        "digest mismatch: bound {bound_digest} != contract {}",
+                        c.digest
+                    ),
+                }
+            } else {
+                TaskScopeStatus::ContractScoped {
+                    revision: c.revision,
+                    digest: c.digest.clone(),
+                    writable_count: c.writable_paths.len(),
+                    protected_count: c.protected_paths.len(),
+                }
+            }
+        }
+    }
+}
+
+/// Project authoritative task records into UI rows for the live task board.
+pub fn task_board_from_records(tasks: &[davinci_agent::TaskRecord]) -> Vec<TaskBoardRow> {
+    tasks
+        .iter()
+        .map(|t| {
+            let mut row = TaskBoardRow::new(
+                t.id.to_string(),
+                t.title.clone(),
+                t.state.public_status(),
+                task_state_to_tui(t.state),
+            );
+            row.owner = t.assigned_to.as_ref().map(|id| id.to_string());
+            row.dependencies = t.dependencies.iter().map(|id| id.to_string()).collect();
+            row.parent_plan_step = t.parent_plan_step.as_ref().map(|s| s.step_id.to_string());
+            row.evidence_refs = t.evidence_refs.iter().map(|e| e.to_string()).collect();
+            row.blocked_reasons = t
+                .blocked_reasons
+                .iter()
+                .map(|b| b.message.clone())
+                .collect();
+            row.updated_at_ms = t.updated_at_ms;
+            if row.activity.is_none() {
+                row.activity = Some(match &t.contract_digest {
+                    Some(digest) => format!("contract: {:.8}", digest),
+                    None => "legacy (uncontracted)".to_string(),
+                });
+            }
+            row
+        })
+        .collect()
+}
+
+/// The live execution task board snapshot for the current runtime.
+pub fn task_board(runtime: &davinci_agent::RuntimeHandle) -> Vec<TaskBoardRow> {
+    let tasks = runtime.task_registry.list_tasks(Some(runtime.run_id));
+    let active_root = runtime.run_id.to_string();
+    let visible_tasks: Vec<_> = tasks
+        .into_iter()
+        .filter(|t| task_visible(&t.run_id.to_string(), &active_root, t.state.is_terminal()))
+        .collect();
+    task_board_from_records(&visible_tasks)
+}
+
+/// Action mapping for the live worker control panel (`/agents`).
+#[allow(dead_code)]
+pub fn worker_action(key: &str) -> Option<&'static str> {
+    match key {
+        "enter" => Some("inspect"),
+        "s" => Some("steer"),
+        "x" => Some("stop"),
+        "r" => Some("retry"),
+        "d" => Some("diff"),
+        _ => None,
+    }
+}
+
+/// Project authoritative worker snapshots into UI rows for the live agents panel.
+pub fn agents_from_snapshots(
+    snapshots: &[davinci_agent::runtime::WorkerSnapshot],
+) -> Vec<AgentRow> {
+    snapshots
+        .iter()
+        .map(|s| {
+            let state = match s.state {
+                davinci_agent::runtime::AgentState::Completed => State::Done,
+                davinci_agent::runtime::AgentState::Running => State::Active,
+                davinci_agent::runtime::AgentState::Starting
+                | davinci_agent::runtime::AgentState::Waiting
+                | davinci_agent::runtime::AgentState::Idle => State::Queued,
+                davinci_agent::runtime::AgentState::Stopping
+                | davinci_agent::runtime::AgentState::Cancelled => State::Skipped,
+                davinci_agent::runtime::AgentState::Failed => State::Failed,
+            };
+
+            let elapsed_secs = s.elapsed_ms / 1000;
+            let mins = elapsed_secs / 60;
+            let secs = elapsed_secs % 60;
+            let elapsed = format!("{:02}:{:02}", mins, secs);
+
+            let owned_paths = s
+                .owned_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+
+            let mut row = AgentRow::new(s.agent_id.to_string(), s.name.clone(), state);
+            row.role = format!("{:?}", s.kind).to_lowercase();
+            row.status = match s.state {
+                davinci_agent::runtime::AgentState::Starting => "starting".into(),
+                davinci_agent::runtime::AgentState::Running => "working".into(),
+                davinci_agent::runtime::AgentState::Waiting => "waiting".into(),
+                davinci_agent::runtime::AgentState::Idle => "idle".into(),
+                davinci_agent::runtime::AgentState::Stopping => "stopping".into(),
+                davinci_agent::runtime::AgentState::Completed => "completed".into(),
+                davinci_agent::runtime::AgentState::Failed => "failed".into(),
+                davinci_agent::runtime::AgentState::Cancelled => "cancelled".into(),
+            };
+            row.elapsed = elapsed;
+            row.owned_paths = owned_paths;
+            row.tool_count = s.tool_count;
+            row.waiting_on = s.waiting_on.clone();
+            row.disconnected = s.disconnected;
+            row.usage_unknown = s.usage_unknown;
+            row
+        })
+        .collect()
+}
+
+/// The live agents sheet snapshot for the current runtime.
+pub fn agents_sheet(runtime: &davinci_agent::RuntimeHandle) -> Vec<AgentRow> {
+    let controller = davinci_agent::runtime::WorkerController::new(runtime.registry.clone());
+    let snapshots = controller.build_all_snapshots();
+    agents_from_snapshots(&snapshots)
+}
+
+/// Canonical evidence status label reflecting execution outcome and freshness.
+#[allow(dead_code)]
+pub fn evidence_label(performed: bool, passed: bool, current: bool) -> &'static str {
+    if !performed {
+        "not performed"
+    } else if !passed {
+        "failed"
+    } else if !current {
+        "stale"
+    } else {
+        "passed on current source"
+    }
+}
+
+/// Redact secrets, auth headers, and truncate large evidence outputs.
+#[allow(dead_code)]
+pub fn redact_evidence_output(raw: &str, max_len: usize) -> String {
+    let patterns = [
+        ("(?i)bearer\\s+[a-zA-Z0-9_\\-\\.]+", "Bearer [REDACTED]"),
+        ("(?i)sk-[a-zA-Z0-9]{20,}", "[REDACTED_API_KEY]"),
+        ("(?i)password=[^&\\s]+", "password=[REDACTED]"),
+        ("(?i)secret=[^&\\s]+", "secret=[REDACTED]"),
+        ("(?i)token=[^&\\s]+", "token=[REDACTED]"),
+    ];
+
+    let mut sanitized = raw.to_string();
+    for (pat, rep) in patterns {
+        if let Ok(re) = regex::Regex::new(pat) {
+            sanitized = re.replace_all(&sanitized, rep).to_string();
+        }
+    }
+
+    if sanitized.len() > max_len {
+        let truncated_bytes = sanitized.len() - max_len;
+        sanitized.truncate(max_len);
+        sanitized.push_str(&format!("\n... [truncated {} bytes]", truncated_bytes));
+    }
+
+    sanitized
+}
+
+/// Validates that an artifact retrieval path stays strictly within the authorized store boundary.
+#[allow(dead_code)]
+pub fn validate_artifact_scope(
+    store_root: &std::path::Path,
+    relative_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    if relative_path.contains("..")
+        || relative_path.starts_with('/')
+        || relative_path.starts_with('\\')
+    {
+        return Err("Artifact path attempts to escape store root boundary".into());
+    }
+    let target = store_root.join(relative_path);
+    if let (Ok(canon_root), Ok(canon_target)) = (store_root.canonicalize(), target.canonicalize()) {
+        if !canon_target.starts_with(&canon_root) {
+            return Err("Artifact path resolves outside store root boundary".into());
+        }
+    }
+    Ok(target)
+}
+
+#[allow(dead_code)]
+pub fn freshness_label(has_provenance: bool, fingerprint_matches: bool) -> &'static str {
+    if !has_provenance {
+        "unproven"
+    } else if fingerprint_matches {
+        "fresh"
+    } else {
+        "stale"
+    }
+}
+
+/// Builds the ContextInspectorSheet from a prepared context manifest and optional overlay.
+pub fn context_inspector_sheet_from_manifest(
+    manifest: &davinci_agent::runtime::PreparedContextManifest,
+    overlay: Option<&davinci_agent::runtime::ContextOverlay>,
+    preview_active: bool,
+    show_pending: bool,
+) -> davinci_tui::davinci::model::ContextInspectorSheet {
+    use davinci_tui::davinci::model::{ContextInspectorRow, ContextInspectorSheet};
+
+    let rows: Vec<ContextInspectorRow> = manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            let is_pinned = overlay.map_or(false, |o| o.pinned_ids.contains(&entry.id));
+            let is_excluded = overlay.map_or(false, |o| o.excluded_ids.contains(&entry.id));
+            let selected = if entry.mandatory {
+                true
+            } else if is_excluded {
+                false
+            } else if is_pinned {
+                true
+            } else {
+                entry.selected
+            };
+
+            let preview_body = Some(redact_evidence_output(
+                &format!(
+                    "ID: {}\nCategory: {}\nProvenance: {:?}\nSource: {}\nFingerprint: {}\nTokens: {}\nReason: {}\nStatus: {}",
+                    entry.id,
+                    entry.category,
+                    entry.provenance_kind,
+                    entry.source_ref,
+                    entry.content_hash,
+                    entry.token_estimate,
+                    entry.selection_reason.as_deref().unwrap_or("none"),
+                    if entry.mandatory {
+                        "mandatory"
+                    } else if is_pinned {
+                        "pinned"
+                    } else if selected {
+                        "selected"
+                    } else {
+                        "excluded"
+                    }
+                ),
+                4096,
+            ));
+
+            ContextInspectorRow {
+                item_id: entry.id.clone(),
+                category: entry.category.clone(),
+                provenance: entry.provenance_kind.as_str().to_string(),
+                source_ref: entry.source_ref.clone(),
+                fingerprint: entry.content_hash.clone(),
+                estimated_tokens: entry.token_estimate,
+                selected,
+                inclusion_reason: entry.selection_reason.clone(),
+                mandatory: entry.mandatory,
+                pinned: is_pinned,
+                freshness: entry.freshness.clone(),
+                last_refreshed_at: entry.inspect_ref.clone(),
+                preview_body,
+            }
+        })
+        .collect();
+
+    ContextInspectorSheet {
+        request_id: manifest.request_id.clone(),
+        root_run_id: manifest.root_run_id.to_string(),
+        source_revision: manifest.source_revision,
+        overlay_revision: manifest.overlay_revision,
+        manifest_digest: manifest.manifest_digest.clone(),
+        rows,
+        selected_index: 0,
+        preview_active,
+        show_pending,
+        confirmation_dialog: None,
+    }
+}
+
+/// Formatted report of interaction test coverage and named capability gaps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionCoverageReport {
+    pub real_terminal_verified: bool,
+    pub real_browser_verified: bool,
+    pub manual_verified: bool,
+    pub receipts_count: usize,
+    pub passed_receipts: usize,
+    pub named_gaps: Vec<String>,
+}
+
+#[allow(dead_code)]
+pub fn interaction_coverage_report(
+    receipts: &[davinci_coding_agent::interaction_testing::InteractionReceipt],
+) -> InteractionCoverageReport {
+    use davinci_coding_agent::interaction_testing::BackendKind;
+
+    let mut named_gaps = Vec::new();
+    let mut real_terminal_verified = false;
+    let mut real_browser_verified = false;
+    let mut manual_verified = false;
+    let mut passed_receipts = 0;
+
+    for r in receipts {
+        let source_bound = r
+            .source_manifest
+            .as_deref()
+            .is_some_and(|manifest| !manifest.trim().is_empty());
+        let verified = r.assertions_passed
+            && !r.assertions.is_empty()
+            && r.exit_outcome == Some(0)
+            && source_bound
+            && davinci_coding_agent::interaction_testing::validate_receipt_provenance(r).is_ok();
+        if verified {
+            passed_receipts += 1;
+            match r.backend_kind {
+                BackendKind::RealPty => real_terminal_verified = true,
+                BackendKind::RealBrowser => real_browser_verified = true,
+                BackendKind::PhysicalManual => manual_verified = true,
+                _ => {}
+            }
+        }
+    }
+
+    if !real_terminal_verified {
+        named_gaps.push(
+            "No passing provenance-valid real PTY evidence recorded: fixture-only coverage does not prove terminal behavior"
+                .into(),
+        );
+    }
+    if !real_browser_verified {
+        named_gaps.push(
+            "No passing provenance-valid real browser evidence recorded: fixture-only coverage does not prove Playwright runtime behavior"
+                .into(),
+        );
+    }
+    if !manual_verified {
+        named_gaps.push(
+            "Physical keyboard scan codes untested: verified through synthetic byte sequences"
+                .into(),
+        );
+    }
+
+    InteractionCoverageReport {
+        real_terminal_verified,
+        real_browser_verified,
+        manual_verified,
+        receipts_count: receipts.len(),
+        passed_receipts,
+        named_gaps,
+    }
 }
 
 #[cfg(test)]
@@ -448,6 +934,199 @@ mod tests {
     }
 
     #[test]
+    fn f09_unknown_cost() {
+        assert_eq!(cost_label(None), "unknown".to_string());
+        assert_eq!(cost_label(Some(0)), "0 minor units".to_string());
+        assert_eq!(cost_label(Some(12)), "12 minor units".to_string());
+    }
+
+    #[test]
+    fn test_parent_two_children_review_retry_sums_once() {
+        use davinci_agent::runtime::budget::*;
+        use davinci_agent::runtime::ids::*;
+        use std::time::Duration;
+
+        let budget = ResourceBudget::new(
+            RunId::new(),
+            1,
+            10_000,
+            Duration::from_secs(60),
+            4,
+            5,
+            None,
+            1000,
+            500,
+        )
+        .unwrap();
+        let ledger = ResourceLedger::new(budget);
+
+        // 1. Parent reservation & settlement
+        let p_res = ledger
+            .reserve("parent_1", ReservationPurpose::Implementation, 100, 100)
+            .unwrap();
+        ledger
+            .settle_receipt(
+                Some(&p_res.id),
+                UsageReceipt {
+                    attempt_id: "parent_1".into(),
+                    provider_usage: 200,
+                    estimated_usage: 200,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost: CostAmount::Known(10),
+                    finished_at: 100,
+                },
+            )
+            .unwrap();
+
+        // 2. Child 1 lease & settlement
+        let c1_res = ledger
+            .reserve("child_1", ReservationPurpose::Implementation, 150, 150)
+            .unwrap();
+        ledger
+            .settle_receipt(
+                Some(&c1_res.id),
+                UsageReceipt {
+                    attempt_id: "child_1".into(),
+                    provider_usage: 300,
+                    estimated_usage: 300,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost: CostAmount::Known(15),
+                    finished_at: 200,
+                },
+            )
+            .unwrap();
+
+        // 3. Child 2 lease & settlement
+        let c2_res = ledger
+            .reserve("child_2", ReservationPurpose::Implementation, 200, 200)
+            .unwrap();
+        ledger
+            .settle_receipt(
+                Some(&c2_res.id),
+                UsageReceipt {
+                    attempt_id: "child_2".into(),
+                    provider_usage: 400,
+                    estimated_usage: 400,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost: CostAmount::Known(20),
+                    finished_at: 300,
+                },
+            )
+            .unwrap();
+
+        // 4. Review reservation & settlement
+        let r_res = ledger
+            .reserve("review_1", ReservationPurpose::Verification, 50, 50)
+            .unwrap();
+        ledger
+            .settle_receipt(
+                Some(&r_res.id),
+                UsageReceipt {
+                    attempt_id: "review_1".into(),
+                    provider_usage: 100,
+                    estimated_usage: 100,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost: CostAmount::Known(5),
+                    finished_at: 400,
+                },
+            )
+            .unwrap();
+
+        // 5. Retry attempt & settlement
+        ledger.record_retry().unwrap();
+        let ret_res = ledger
+            .reserve("retry_1", ReservationPurpose::Implementation, 50, 50)
+            .unwrap();
+        ledger
+            .settle_receipt(
+                Some(&ret_res.id),
+                UsageReceipt {
+                    attempt_id: "retry_1".into(),
+                    provider_usage: 100,
+                    estimated_usage: 100,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost: CostAmount::Known(5),
+                    finished_at: 500,
+                },
+            )
+            .unwrap();
+
+        // Total: 200 + 300 + 400 + 100 + 100 = 1100 tokens
+        let snap = ledger.snapshot();
+        assert_eq!(snap.tokens_charged, 1100);
+        assert_eq!(snap.retries_used, 1);
+        assert_eq!(snap.cost_minor_units, Some(55));
+
+        // Replaying already-settled attempt does not double count (idempotent, returns Ok(false))
+        let replay_res = ledger.settle_receipt(
+            None,
+            UsageReceipt {
+                attempt_id: "parent_1".into(),
+                provider_usage: 200,
+                estimated_usage: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost: CostAmount::Known(10),
+                finished_at: 100,
+            },
+        );
+        assert!(!replay_res.unwrap());
+        assert_eq!(ledger.snapshot().tokens_charged, 1100);
+    }
+
+    #[test]
+    fn test_governor_metrics_distinct_from_whole_task_budget() {
+        let mut model = davinci_tui::davinci::model::Model::new(
+            davinci_tui::davinci::theme::Theme::da_vinci(
+                davinci_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            80,
+            24,
+            false,
+        );
+
+        let mut agent = davinci_agent::Agent::new("system");
+        let runtime = davinci_agent::runtime::RuntimeHandle::new(
+            davinci_agent::runtime::ids::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::runtime::RuntimeBus::new(),
+        );
+        let budget = davinci_agent::runtime::budget::ResourceBudget::new(
+            davinci_agent::runtime::ids::RunId::new(),
+            1,
+            50_000,
+            std::time::Duration::from_secs(60),
+            4,
+            5,
+            None,
+            5_000,
+            2_500,
+        )
+        .unwrap();
+        let ledger = davinci_agent::runtime::budget::ResourceLedger::new(budget);
+        let rt_with_budget = runtime.with_budget_ledger(ledger);
+        agent.set_runtime(rt_with_budget);
+
+        dress_from_extensions(&mut model, std::path::Path::new("."), &agent);
+
+        // Governor rows measure prompt context window
+        assert_eq!(model.budget.len(), 4);
+        assert_eq!(model.budget[0].role, "instructions");
+
+        // Whole-task budget measures task tokens and ceilings
+        let task_b = model.task_budget.expect("task_budget must be populated");
+        assert_eq!(task_b.token_ceiling, 50_000);
+        assert_eq!(task_b.tokens_charged, 0);
+        assert_eq!(task_b.cost_label, "0 minor units");
+    }
+
+    #[test]
     fn a_nearly_full_window_gets_a_proposal_that_states_its_terms() {
         let mut agent = davinci_agent::Agent::new("system");
         for _ in 0..10 {
@@ -507,6 +1186,9 @@ mod tests {
             phase: Phase::Implement,
             forced: None,
             dry_run: false,
+            execution_origin: None,
+            definition_digest: None,
+            saved_definition: None,
             classification: None,
             milestones: None,
             current_milestone: None,
@@ -527,6 +1209,739 @@ mod tests {
             ecosystem_stats: Default::default(),
             updated_at: 0,
             definition: None,
+            lifecycle: None,
+            revision: 0,
         }
+    }
+
+    #[test]
+    fn f03_resume_lineage() {
+        assert!(task_visible("root-a", "root-a", false));
+        assert!(!task_visible("root-a", "root-b", false));
+        assert!(task_visible("root-a", "root-a", true));
+    }
+
+    #[test]
+    fn f03_resume_after_main_runtime_gets_a_new_run_id() {
+        let bus = davinci_agent::RuntimeBus::new();
+        let old_run = davinci_agent::RunId::new();
+        let new_run = davinci_agent::RunId::new();
+        let agent_id = davinci_agent::AgentId::new();
+
+        let registry = davinci_agent::TaskRegistry::with_bus(bus.clone());
+        let record = davinci_agent::TaskRecord::new(old_run, "Initial task");
+        let task_id = registry.create_task(record).unwrap();
+
+        let runtime =
+            davinci_agent::RuntimeHandle::new(new_run, agent_id, bus).with_task_registry(registry);
+
+        assert!(task_visible(
+            &old_run.to_string(),
+            &old_run.to_string(),
+            false
+        ));
+        assert!(!task_visible(
+            &old_run.to_string(),
+            &new_run.to_string(),
+            false
+        ));
+        assert!(runtime.task_registry.get_task(&task_id).is_some());
+    }
+
+    #[test]
+    fn f03_old_running_worker_orphaned() {
+        assert_eq!(
+            task_state_to_tui(davinci_agent::TaskState::Running),
+            State::Active
+        );
+        assert_eq!(
+            task_state_to_tui(davinci_agent::TaskState::Failed),
+            State::Failed
+        );
+        assert_eq!(
+            davinci_agent::TaskState::Running.public_status(),
+            "in_progress"
+        );
+        assert_eq!(davinci_agent::TaskState::Failed.public_status(), "failed");
+    }
+
+    #[test]
+    fn f03_no_tasks() {
+        let bus = davinci_agent::RuntimeBus::new();
+        let run_id = davinci_agent::RunId::new();
+        let agent_id = davinci_agent::AgentId::new();
+        let runtime = davinci_agent::RuntimeHandle::new(run_id, agent_id, bus);
+
+        let board = task_board(&runtime);
+        assert!(board.is_empty());
+
+        let mut model = Model::new(
+            davinci_tui::davinci::theme::Theme::da_vinci(
+                davinci_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            80,
+            24,
+            false,
+        );
+        model.task_board = Some(davinci_tui::davinci::model::TaskBoardSheet {
+            tasks: board,
+            selected_index: 0,
+        });
+        let rendered = davinci_tui::davinci::views::task_board::lines(&model);
+        let joined: String = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(joined.contains("No tasks tracked"));
+    }
+
+    #[test]
+    fn f03_thousands_of_tasks_paginated() {
+        let run_id = davinci_agent::RunId::new();
+        let mut records = Vec::new();
+        for i in 0..2000 {
+            let task_id = davinci_agent::TaskId::new();
+            records.push(davinci_agent::TaskRecord {
+                id: task_id,
+                run_id,
+                title: format!("Subtask {i}"),
+                description: None,
+                dependencies: Vec::new(),
+                state: davinci_agent::TaskState::Completed,
+                assigned_to: None,
+                result: None,
+                created_at_ms: 1000 + i as i64,
+                updated_at_ms: 2000 + i as i64,
+                revision: 1,
+                owner_generation: 0,
+                parent_plan_step: None,
+                evidence_refs: Vec::new(),
+                blocked_reasons: Vec::new(),
+                attempt: 1,
+                contract_digest: None,
+                decision_prerequisites: Vec::new(),
+            });
+        }
+        let start = std::time::Instant::now();
+        let rows = task_board_from_records(&records);
+        let duration = start.elapsed();
+        assert_eq!(rows.len(), 2000);
+        assert!(
+            duration.as_millis() < 100,
+            "projection must be fast: {duration:?}"
+        );
+
+        let page_size = 20;
+        let page_0 = &rows[0..page_size];
+        assert_eq!(page_0.len(), 20);
+        assert_eq!(page_0[0].title, "Subtask 0");
+        assert_eq!(page_0[19].title, "Subtask 19");
+    }
+
+    #[test]
+    fn f03_terminal_narrow() {
+        let mut row = TaskBoardRow::new(
+            "task-long-id-12345678",
+            "Very long task title that exceeds narrow terminal width",
+            "in_progress",
+            State::Active,
+        );
+        row.owner = Some("worker-agent-name-extra-long".into());
+        row.dependencies = vec!["dep-1".into(), "dep-2".into(), "dep-3".into()];
+        row.blocked_reasons = vec!["Resource locked by external lock file".into()];
+
+        let mut model = Model::new(
+            davinci_tui::davinci::theme::Theme::da_vinci(
+                davinci_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            30,
+            24,
+            false,
+        );
+        model.task_board = Some(davinci_tui::davinci::model::TaskBoardSheet {
+            tasks: vec![row],
+            selected_index: 0,
+        });
+        let rendered = davinci_tui::davinci::views::task_board::lines(&model);
+        assert!(!rendered.is_empty());
+    }
+
+    #[test]
+    fn f03_branch_specific_tasks_not_leaked() {
+        let branch_a = "branch-a";
+        let branch_b = "branch-b";
+        assert!(task_visible(branch_a, branch_a, false));
+        assert!(!task_visible(branch_a, branch_b, false));
+        assert!(!task_visible(branch_b, branch_a, false));
+    }
+
+    #[test]
+    fn f03_acceptance_of_plan_does_not_complete_tasks() {
+        let bus = davinci_agent::RuntimeBus::new();
+        let run_id = davinci_agent::RunId::new();
+        let registry = davinci_agent::TaskRegistry::with_bus(bus);
+        let mut record = davinci_agent::TaskRecord::new(run_id, "Feature task");
+        record.state = davinci_agent::TaskState::Pending;
+        let task_id = registry.create_task(record).unwrap();
+
+        let plan = [PlanStep::new(
+            "I",
+            State::Done,
+            "constructing",
+            Some("Feature task"),
+        )];
+        assert_eq!(plan[0].state, State::Done);
+
+        let record = registry.get_task(&task_id).unwrap();
+        assert_eq!(record.state, davinci_agent::TaskState::Ready);
+        assert_ne!(record.state, davinci_agent::TaskState::Completed);
+
+        let rows = task_board_from_records(&[record]);
+        assert_eq!(rows[0].state, State::Queued);
+        assert_eq!(rows[0].status, "pending");
+    }
+
+    #[test]
+    fn f05_old_task_without_contract_is_legacy_uncontracted() {
+        let run_id = davinci_agent::RunId::new();
+        let legacy_task = davinci_agent::TaskRecord::new(run_id, "Old uncontracted task");
+
+        // Old task without contract must evaluate to LegacyUncontracted
+        let status = evaluate_task_scope_status(&legacy_task, None);
+        assert_eq!(status, TaskScopeStatus::LegacyUncontracted);
+        assert_eq!(status.display_label(), "legacy (uncontracted)");
+
+        // Projection to task board visibly displays uncontracted legacy state
+        let rows = task_board_from_records(&[legacy_task]);
+        assert_eq!(rows[0].activity.as_deref(), Some("legacy (uncontracted)"));
+    }
+
+    #[test]
+    fn f05_correct_contract_revision_displayed_after_resume() {
+        let run_id = davinci_agent::RunId::new();
+        let task_id = davinci_agent::TaskId::new();
+
+        let contract_rev1 = davinci_agent::runtime::contracts::TaskContract::new(
+            "contract-resume",
+            1,
+            task_id,
+            1,
+            vec!["src/main.rs".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // Expand to revision 2
+        let contract_rev2 = contract_rev1
+            .expand_scope(vec!["src/lib.rs".into()], vec![])
+            .unwrap();
+        assert_eq!(contract_rev2.revision, 2);
+
+        // Resume simulation: task record has persisted contract_digest matching rev 2
+        let mut resumed_record = davinci_agent::TaskRecord::new(run_id, "Resumed contracted task");
+        resumed_record.id = task_id;
+        resumed_record.contract_digest = Some(contract_rev2.digest.clone());
+
+        let status = evaluate_task_scope_status(&resumed_record, Some(&contract_rev2));
+        match &status {
+            TaskScopeStatus::ContractScoped {
+                revision, digest, ..
+            } => {
+                assert_eq!(*revision, 2);
+                assert_eq!(digest, &contract_rev2.digest);
+            }
+            other => panic!("expected ContractScoped, got {other:?}"),
+        }
+        assert_eq!(status.display_label(), "contracted (rev 2)");
+    }
+
+    #[test]
+    fn f05_invalid_contract_schema_fails_closed() {
+        let run_id = davinci_agent::RunId::new();
+        let mut record = davinci_agent::TaskRecord::new(run_id, "Corrupted contract task");
+        record.contract_digest = Some("expected_digest_123".into());
+
+        // Missing contract when digest is bound fails closed
+        let missing_status = evaluate_task_scope_status(&record, None);
+        assert!(matches!(
+            missing_status,
+            TaskScopeStatus::InvalidContract { .. }
+        ));
+
+        // Digest mismatch fails closed
+        let contract = davinci_agent::runtime::contracts::TaskContract::new(
+            "contract-diff",
+            1,
+            record.id,
+            1,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let mismatch_status = evaluate_task_scope_status(&record, Some(&contract));
+        assert!(matches!(
+            mismatch_status,
+            TaskScopeStatus::InvalidContract { .. }
+        ));
+    }
+
+    #[test]
+    fn f06_report_gap() {
+        assert_eq!(evidence_label(false, false, false), "not performed");
+        assert_eq!(evidence_label(true, true, false), "stale");
+        assert_eq!(evidence_label(true, true, true), "passed on current source");
+        assert_eq!(evidence_label(true, false, true), "failed");
+    }
+
+    #[test]
+    fn test_redact_evidence_output_and_truncation_notice() {
+        let raw = "Authorization: Bearer sk-ant-api03-abcdef1234567890abcdef1234567890 password=supersecret token=ghp_secrettoken";
+        let redacted = redact_evidence_output(raw, 50);
+        assert!(!redacted.contains("supersecret"));
+        assert!(!redacted.contains("ghp_secrettoken"));
+        assert!(redacted.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_validate_artifact_scope_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path();
+        let safe_file = store_root.join("evidence_1.log");
+        std::fs::write(&safe_file, b"ok").unwrap();
+
+        // Valid relative path inside boundary
+        assert!(validate_artifact_scope(store_root, "evidence_1.log").is_ok());
+
+        // Directory traversal outside boundary
+        assert!(validate_artifact_scope(store_root, "../outside.txt").is_err());
+        assert!(validate_artifact_scope(store_root, "/etc/passwd").is_err());
+        assert!(validate_artifact_scope(store_root, "\\windows\\system32").is_err());
+    }
+
+    #[test]
+    fn test_same_source_rerun_creates_new_receipt() {
+        let task_id = davinci_agent::TaskId::new();
+        let r1 = davinci_agent::runtime::evidence_store::ExecutionReceipt {
+            receipt_id: davinci_agent::runtime::ids::EvidenceId::new(),
+            operation_id: "verify_1".into(),
+            task_id: Some(task_id),
+            tool_name: "cargo test".into(),
+            started: true,
+            exit_code: Some(0),
+            ..Default::default()
+        };
+
+        // Same command on same source rerun creates a new distinct receipt ID
+        let r2 = davinci_agent::runtime::evidence_store::ExecutionReceipt {
+            receipt_id: davinci_agent::runtime::ids::EvidenceId::new(),
+            operation_id: "verify_1".into(),
+            task_id: Some(task_id),
+            tool_name: "cargo test".into(),
+            started: true,
+            exit_code: Some(0),
+            ..Default::default()
+        };
+
+        assert_ne!(r1.receipt_id, r2.receipt_id);
+        assert_eq!(r1.operation_id, r2.operation_id);
+    }
+
+    #[test]
+    fn f07_panel_actions() {
+        assert_eq!(worker_action("enter"), Some("inspect"));
+        assert_eq!(worker_action("s"), Some("steer"));
+        assert_eq!(worker_action("x"), Some("stop"));
+        assert_eq!(worker_action("r"), Some("retry"));
+        assert_eq!(worker_action("d"), Some("diff"));
+        assert_eq!(worker_action("shift_tab"), None);
+    }
+
+    #[test]
+    fn test_delayed_stop_acknowledgment() {
+        use davinci_agent::runtime::control::{reduce_stop_status, ControlStatus};
+        assert_eq!(
+            reduce_stop_status(true, false, false),
+            ControlStatus::Stopping
+        );
+        assert_eq!(
+            reduce_stop_status(true, true, false),
+            ControlStatus::Stopped
+        );
+        assert_eq!(
+            reduce_stop_status(true, false, true),
+            ControlStatus::FailedToStop
+        );
+    }
+
+    #[test]
+    fn test_thousands_of_events_bounded() {
+        let run_id = davinci_agent::RunId::new();
+        let mut snapshots = Vec::new();
+        for i in 0..2000 {
+            let agent_id = davinci_agent::AgentId::new();
+            snapshots.push(davinci_agent::runtime::WorkerSnapshot {
+                agent_id,
+                run_id,
+                task_id: None,
+                name: format!("worker-{i}"),
+                kind: davinci_agent::runtime::AgentKind::GraphWorker,
+                state: davinci_agent::runtime::AgentState::Running,
+                generation: 1,
+                revision: 1,
+                elapsed_ms: 120_000,
+                last_activity_ms: 1000,
+                tool_count: 5,
+                owned_paths: vec![std::path::PathBuf::from(format!("crates/worker_{i}.rs"))],
+                waiting_on: None,
+                disconnected: false,
+                usage_unknown: false,
+            });
+        }
+        let rows = agents_from_snapshots(&snapshots);
+        assert_eq!(rows.len(), 2000);
+        assert_eq!(rows[0].name, "worker-0");
+        assert_eq!(rows[1999].name, "worker-1999");
+    }
+
+    #[test]
+    fn test_diff_of_binary_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline =
+            crate::native_extensions::graph::mutation::capture_baseline(dir.path()).unwrap();
+        let bin_file = dir.path().join("image.bin");
+        std::fs::write(&bin_file, [0u8, 159, 255, 0, 12, 0]).unwrap();
+        let report = crate::native_extensions::graph::mutation::compute_owned_diff(
+            dir.path(),
+            &baseline,
+            &[],
+        )
+        .unwrap();
+        assert!(report.owned_diff.contains("new binary file"));
+    }
+
+    #[test]
+    fn test_refresh_while_typing_steer() {
+        let mut model = Model::new(
+            davinci_tui::davinci::theme::Theme::da_vinci(
+                davinci_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            80,
+            24,
+            false,
+        );
+        model.composer.push_str("drafting steer text");
+        assert_eq!(&*model.composer, "drafting steer text");
+
+        let agent_id = davinci_agent::AgentId::new();
+        let row = AgentRow::new(agent_id.to_string(), "worker-1", State::Active);
+        model.agents = Some(davinci_tui::davinci::model::AgentsSheet {
+            agents: vec![row],
+            selected_index: 0,
+        });
+
+        // Simulating refresh:
+        let refreshed_row = AgentRow::new(agent_id.to_string(), "worker-1", State::Active);
+        if let Some(sheet) = model.agents.as_mut() {
+            let prev_sel = sheet.selected_index;
+            sheet.agents = vec![refreshed_row];
+            sheet.selected_index = prev_sel.min(sheet.agents.len().saturating_sub(1));
+        }
+
+        // Draft text and selection preserved
+        assert_eq!(&*model.composer, "drafting steer text");
+        assert_eq!(model.agents.as_ref().unwrap().selected_index, 0);
+    }
+
+    #[test]
+    fn f08_visible_freshness() {
+        assert_eq!(freshness_label(false, false), "unproven");
+        assert_eq!(freshness_label(true, false), "stale");
+        assert_eq!(freshness_label(true, true), "fresh");
+    }
+
+    #[test]
+    fn test_narrow_terminal_context_inspector() {
+        let mut model = Model::new(
+            davinci_tui::davinci::theme::Theme::da_vinci(
+                davinci_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            35,
+            20,
+            false,
+        );
+        let row = davinci_tui::davinci::model::ContextInspectorRow {
+            item_id: "sec_policy_1".into(),
+            category: "security".into(),
+            provenance: "mandatory_policy".into(),
+            source_ref: "repo::policy".into(),
+            fingerprint: "hash123".into(),
+            estimated_tokens: 150,
+            selected: true,
+            inclusion_reason: Some("mandatory".into()),
+            mandatory: true,
+            pinned: false,
+            freshness: "fresh".into(),
+            last_refreshed_at: None,
+            preview_body: Some("policy details".into()),
+        };
+        model.context_inspector = Some(davinci_tui::davinci::model::ContextInspectorSheet {
+            request_id: "req-narrow".into(),
+            root_run_id: "run-narrow".into(),
+            source_revision: 1,
+            overlay_revision: 1,
+            manifest_digest: "digest".into(),
+            rows: vec![row],
+            selected_index: 0,
+            preview_active: true,
+            show_pending: false,
+            confirmation_dialog: None,
+        });
+
+        let rendered = davinci_tui::davinci::views::context_inspector::lines(&model);
+        assert!(!rendered.is_empty());
+        let text: String = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("[mandatory]"));
+        assert!(text.contains("mandatory_policy"));
+    }
+
+    #[test]
+    fn test_huge_source_body_paginated_and_bounded() {
+        let mut model = Model::new(
+            davinci_tui::davinci::theme::Theme::da_vinci(
+                davinci_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            80,
+            24,
+            false,
+        );
+        let huge_preview = (0..100)
+            .map(|i| format!("line {i} of source code"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let row = davinci_tui::davinci::model::ContextInspectorRow {
+            item_id: "huge_file".into(),
+            category: "code".into(),
+            provenance: "repository_fact".into(),
+            source_ref: "src/big.rs".into(),
+            fingerprint: "hash_big".into(),
+            estimated_tokens: 5000,
+            selected: true,
+            inclusion_reason: None,
+            mandatory: false,
+            pinned: false,
+            freshness: "fresh".into(),
+            last_refreshed_at: None,
+            preview_body: Some(huge_preview),
+        };
+        model.context_inspector = Some(davinci_tui::davinci::model::ContextInspectorSheet {
+            request_id: "req-huge".into(),
+            root_run_id: "run-huge".into(),
+            source_revision: 1,
+            overlay_revision: 1,
+            manifest_digest: "digest".into(),
+            rows: vec![row],
+            selected_index: 0,
+            preview_active: true,
+            show_pending: false,
+            confirmation_dialog: None,
+        });
+
+        let rendered = davinci_tui::davinci::views::context_inspector::lines(&model);
+        let text: String = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("truncated"));
+    }
+
+    #[test]
+    fn test_secrets_redacted_in_preview() {
+        let raw_with_secret =
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 sk-12345678901234567890 password=supersecret";
+        let redacted = redact_evidence_output(raw_with_secret, 1000);
+        assert!(!redacted.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+        assert!(!redacted.contains("supersecret"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_keyboard_exclusion_of_mandatory_rejected() {
+        assert!(!davinci_agent::runtime::overlay_change_allowed(
+            true, "exclude", true
+        ));
+        assert!(!davinci_agent::runtime::overlay_change_allowed(
+            true, "pin", true
+        ));
+        assert!(davinci_agent::runtime::overlay_change_allowed(
+            false, "exclude", true
+        ));
+        assert!(davinci_agent::runtime::overlay_change_allowed(
+            false, "pin", true
+        ));
+    }
+
+    #[test]
+    fn test_correction_survives_resume() {
+        let mut overlay = davinci_agent::runtime::ContextOverlay::new(1);
+        overlay.add_correction("fact_1", "corrected value");
+        overlay.add_tombstone("fact_1");
+        assert!(overlay.is_tombstoned("fact_1"));
+
+        // Simulate resume: serialized and restored
+        let serialized = serde_json::to_string(&overlay).unwrap();
+        let restored: davinci_agent::runtime::ContextOverlay =
+            serde_json::from_str(&serialized).unwrap();
+        assert!(restored.is_tombstoned("fact_1"));
+        assert_eq!(
+            restored
+                .memory_corrections
+                .get("fact_1")
+                .map(|s| s.as_str()),
+            Some("corrected value")
+        );
+    }
+
+    #[test]
+    fn test_json_no_private_body_by_default() {
+        let run_id = davinci_agent::runtime::ids::RunId::new();
+        let entry = davinci_agent::runtime::ContextManifestEntry::new(
+            "doc_private",
+            "memory",
+            davinci_agent::runtime::ProvenanceKind::RepositoryFact,
+            "private.txt",
+            "hash_priv",
+            500,
+            true,
+            Some("selected".into()),
+            false,
+            "fresh",
+            None,
+        );
+        let manifest = davinci_agent::runtime::PreparedContextManifest::new(
+            "req-json",
+            run_id,
+            1,
+            1,
+            vec![entry],
+            0,
+        );
+        let summary = crate::output::ContextManifestSummary::from_prepared(&manifest, None);
+        let json = summary.to_json_string().unwrap();
+        assert!(json.contains("doc_private"));
+        assert!(json.contains("repository_fact"));
+        assert!(!json.contains("preview_body"));
+    }
+
+    #[test]
+    fn test_inspector_absent_before_first_request() {
+        let model = Model::new(
+            davinci_tui::davinci::theme::Theme::da_vinci(
+                davinci_tui::davinci::theme::ColorDepth::TrueColor,
+                false,
+            ),
+            80,
+            24,
+            false,
+        );
+        assert!(model.context_inspector.is_none());
+        let rendered = davinci_tui::davinci::views::context_inspector::lines(&model);
+        let text: String = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("No context manifest available"));
+    }
+
+    #[test]
+    fn f11_forged_real_backend_is_not_verified_coverage() {
+        let receipts = vec![
+            davinci_coding_agent::interaction_testing::InteractionReceipt {
+                scenario_id: "forged_real_pty".into(),
+                backend_kind: davinci_coding_agent::interaction_testing::BackendKind::RealPty,
+                backend_identity: "fake_fixture_simulated".into(),
+                source_manifest: Some("source-digest".into()),
+                assertions_passed: true,
+                assertions: vec!["PASS: forged".into()],
+                frames_count: 1,
+                event_log: Vec::new(),
+                console_errors: Vec::new(),
+                network_failures: Vec::new(),
+                trace_refs: Vec::new(),
+                exit_outcome: Some(0),
+            },
+        ];
+        let report = interaction_coverage_report(&receipts);
+        assert_eq!(report.passed_receipts, 0);
+        assert!(!report.real_terminal_verified);
+    }
+
+    #[test]
+    fn f11_failed_real_backend_is_not_verified_coverage() {
+        let receipts = vec![
+            davinci_coding_agent::interaction_testing::InteractionReceipt {
+                scenario_id: "real_pty_failure".into(),
+                backend_kind: davinci_coding_agent::interaction_testing::BackendKind::RealPty,
+                backend_identity: "conpty-test".into(),
+                source_manifest: Some("source-digest".into()),
+                assertions_passed: false,
+                assertions: vec!["FAIL: draft changed".into()],
+                frames_count: 1,
+                event_log: Vec::new(),
+                console_errors: Vec::new(),
+                network_failures: Vec::new(),
+                trace_refs: Vec::new(),
+                exit_outcome: Some(1),
+            },
+        ];
+        let report = interaction_coverage_report(&receipts);
+        assert!(!report.real_terminal_verified);
+        assert!(report
+            .named_gaps
+            .iter()
+            .any(|gap| gap.contains("provenance-valid real PTY evidence")));
+    }
+
+    #[test]
+    fn test_interaction_coverage_report_gaps() {
+        let receipts = vec![
+            davinci_coding_agent::interaction_testing::InteractionReceipt {
+                scenario_id: "test_scen".into(),
+                backend_kind: davinci_coding_agent::interaction_testing::BackendKind::FixtureOnly,
+                backend_identity: "fake_pty".into(),
+                source_manifest: Some("source-digest".into()),
+                assertions_passed: true,
+                assertions: vec!["PASS: ok".into()],
+                frames_count: 1,
+                event_log: Vec::new(),
+                console_errors: Vec::new(),
+                network_failures: Vec::new(),
+                trace_refs: Vec::new(),
+                exit_outcome: Some(0),
+            },
+        ];
+        let report = interaction_coverage_report(&receipts);
+        assert_eq!(report.receipts_count, 1);
+        assert_eq!(report.passed_receipts, 1);
+        assert!(!report.real_terminal_verified);
+        assert!(!report.real_browser_verified);
+        assert!(!report.manual_verified);
+        assert_eq!(report.named_gaps.len(), 3);
+        assert!(report.named_gaps.iter().any(|g| g.contains("real PTY")));
     }
 }

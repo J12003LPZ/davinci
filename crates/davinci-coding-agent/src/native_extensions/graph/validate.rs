@@ -13,6 +13,22 @@ use serde_json::Value;
 
 pub type ValidationResult = Result<Artifact, Vec<String>>;
 
+pub fn known_artifact_contract_versions() -> &'static [(&'static str, u32)] {
+    &[
+        ("classification", 1),
+        ("evidence", 1),
+        ("plan", 1),
+        ("patch-report", 1),
+        ("review", 1),
+    ]
+}
+
+pub fn is_known_artifact_contract(name: &str, version: u32) -> bool {
+    known_artifact_contract_versions()
+        .iter()
+        .any(|&(k, v)| k == name && v == version)
+}
+
 static RESEARCH_TASK_FIELDS: &[FieldRule] = &[
     FieldRule {
         name: "kind",

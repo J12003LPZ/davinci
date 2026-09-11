@@ -14,12 +14,13 @@
 //! own loop — no respawn, no prose parsing.
 
 use super::roles::{
-    ensure_governor_recovery_tool, is_bash_command_allowed, role_bash_policy, role_tools,
-    GRAPH_SUBMIT_TOOL,
+    ensure_governor_recovery_tool, is_bash_command_allowed, requires_task_coordinator,
+    role_bash_policy, role_tools, GRAPH_SUBMIT_TOOL,
 };
 use super::store::write_artifact;
 use super::types::{ArtifactKind, BashPolicy, Role};
 use super::validate::{artifact_contract, artifact_schema, validate_artifact};
+use davinci_agent::runtime::TaskContract;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -52,6 +53,8 @@ pub struct GraphWorkerContext {
     pub artifact_path: PathBuf,
     pub bash_policy: BashPolicy,
     pub allowed_tools: BTreeSet<String>,
+    pub has_coordinator: bool,
+    pub task_contract: Option<TaskContract>,
 }
 
 impl GraphWorkerContext {
@@ -59,19 +62,67 @@ impl GraphWorkerContext {
     /// is registered, and the parent treats a missing artifact as failure, so a
     /// broken worker cannot silently succeed.
     pub fn from_env() -> Option<Self> {
-        Self::from_parts(
+        let has_coordinator = std::env::var_os("DAVINCI_TASK_COORDINATOR_ADDR").is_some();
+        let raw_contract = std::env::var("DAVINCI_TASK_CONTRACT_JSON").ok();
+        let expected_digest = std::env::var("PI_CONTRACT_DIGEST").ok();
+        let task_contract = match (raw_contract, expected_digest) {
+            (None, None) => None,
+            (Some(raw), Some(expected)) => {
+                let contract: TaskContract = serde_json::from_str(&raw).ok()?;
+                contract.validate().ok()?;
+                if contract.digest != expected {
+                    return None;
+                }
+                Some(contract)
+            }
+            // A partially lost/tampered contract transport is a misconfigured worker, not a
+            // legacy uncontracted worker. Returning None prevents graph hooks from admitting it.
+            _ => return None,
+        };
+        Self::from_parts_full(
             std::env::var("PI_GRAPH_ROLE").ok().as_deref(),
             std::env::var("PI_GRAPH_EXPECT").ok().as_deref(),
             std::env::var("PI_GRAPH_ARTIFACT_PATH").ok().as_deref(),
             std::env::var("PI_GRAPH_EXTRA_TOOLS").ok().as_deref(),
+            has_coordinator,
+            task_contract,
         )
     }
 
+    #[allow(dead_code)]
     pub fn from_parts(
         role: Option<&str>,
         expect: Option<&str>,
         artifact_path: Option<&str>,
         extra_tools: Option<&str>,
+    ) -> Option<Self> {
+        Self::from_parts_with_coordinator(role, expect, artifact_path, extra_tools, false)
+    }
+
+    pub fn from_parts_with_coordinator(
+        role: Option<&str>,
+        expect: Option<&str>,
+        artifact_path: Option<&str>,
+        extra_tools: Option<&str>,
+        has_coordinator: bool,
+    ) -> Option<Self> {
+        Self::from_parts_full(
+            role,
+            expect,
+            artifact_path,
+            extra_tools,
+            has_coordinator,
+            None,
+        )
+    }
+
+    pub fn from_parts_full(
+        role: Option<&str>,
+        expect: Option<&str>,
+        artifact_path: Option<&str>,
+        extra_tools: Option<&str>,
+        has_coordinator: bool,
+        task_contract: Option<TaskContract>,
     ) -> Option<Self> {
         let role = Role::parse(role?)?;
         let expect = ArtifactKind::parse(expect?)?;
@@ -81,7 +132,10 @@ impl GraphWorkerContext {
             let tool = tool.trim();
             // Global extras are not authority grants to read-only roles.
             // Unknown extensions have no trustworthy effect classification.
-            if role == Role::Writer && !tool.is_empty() {
+            if role == Role::Writer
+                && !tool.is_empty()
+                && (has_coordinator || !requires_task_coordinator(tool))
+            {
                 tools.push(tool.to_string());
             }
         }
@@ -93,6 +147,8 @@ impl GraphWorkerContext {
             artifact_path: PathBuf::from(artifact_path),
             bash_policy: role_bash_policy(role),
             allowed_tools,
+            has_coordinator,
+            task_contract,
         })
     }
 
@@ -150,6 +206,9 @@ impl GraphWorkerContext {
     /// roles even if the allowlist was mangled, and judge bash by its command
     /// text rather than by its name.
     pub fn block_reason(&self, tool_name: &str, args: &Value) -> Option<String> {
+        if requires_task_coordinator(tool_name) && !self.has_coordinator {
+            return Some("graph worker task tools require parent coordinator transport".into());
+        }
         if SUBMITTED.load(Ordering::Relaxed) {
             return Some(format!(
                 "this {} node already submitted its artifact; stop now rather than doing more work",
@@ -164,6 +223,25 @@ impl GraphWorkerContext {
                 "tool \"{tool_name}\" is not available to the {} role",
                 self.role
             ));
+        }
+        if let Some(contract) = &self.task_contract {
+            if self.role == Role::Writer
+                && matches!(
+                    tool_name,
+                    "write" | "edit" | "notebook_edit" | "apply_patch"
+                )
+            {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                if let Err(violation) = contract.check_call(&cwd, tool_name, args) {
+                    return Some(violation.to_string());
+                }
+            }
+            if matches!(tool_name, "bash" | "powershell" | "exec_command") {
+                return Some(
+                    "execution_contract_unenforceable: graph worker shell execution has no contracted process sandbox"
+                        .into(),
+                );
+            }
         }
         if !matches!(tool_name, "bash" | "powershell" | "exec_command") {
             return None;
@@ -187,6 +265,66 @@ mod tests {
 
     fn submit_guard() -> std::sync::MutexGuard<'static, ()> {
         super::submit_test_guard()
+    }
+
+    #[test]
+    fn f03_graph_worker_requires_task_coordinator_transport() {
+        let _guard = submit_guard();
+        let mut ctx = GraphWorkerContext::from_parts(
+            Some("writer"),
+            Some("patch-report"),
+            Some("artifact.json"),
+            Some("task_create,task_update,task_list,task_get,custom_mutator"),
+        )
+        .unwrap();
+        for tool in ["task_create", "task_update", "task_list", "task_get"] {
+            assert!(!ctx.allowed_tools.contains(tool), "advertised {tool}");
+            // A widened CLI allowlist still cannot create an isolated task truth.
+            ctx.allowed_tools.insert(tool.into());
+            assert!(ctx
+                .block_reason(tool, &json!({}))
+                .unwrap()
+                .contains("coordinator"));
+        }
+        assert!(ctx.block_reason("custom_mutator", &json!({})).is_none());
+        assert!(ctx.block_reason("write", &json!({})).is_none());
+    }
+
+    #[test]
+    fn f03_graph_worker_with_coordinator_allows_writer_task_tools() {
+        let _guard = submit_guard();
+        let ctx = GraphWorkerContext::from_parts_with_coordinator(
+            Some("writer"),
+            Some("patch-report"),
+            Some("artifact.json"),
+            Some("task_create,task_update,task_list,task_get,custom_mutator"),
+            true,
+        )
+        .unwrap();
+        for tool in ["task_create", "task_update", "task_list", "task_get"] {
+            assert!(ctx.allowed_tools.contains(tool), "should advertise {tool}");
+            assert!(
+                ctx.block_reason(tool, &json!({})).is_none(),
+                "should allow {tool}"
+            );
+        }
+
+        // Non-writer role with coordinator still cannot use task tools
+        let ro_ctx = GraphWorkerContext::from_parts_with_coordinator(
+            Some("researcher"),
+            Some("evidence"),
+            Some("artifact.json"),
+            Some("task_create,task_update,task_list,task_get"),
+            true,
+        )
+        .unwrap();
+        for tool in ["task_create", "task_update", "task_list", "task_get"] {
+            assert!(!ro_ctx.allowed_tools.contains(tool));
+            assert!(ro_ctx
+                .block_reason(tool, &json!({}))
+                .unwrap()
+                .contains("not available"));
+        }
     }
 
     #[test]
@@ -385,5 +523,87 @@ mod tests {
         let (description, parameters) = context.tool_spec();
         assert!(description.contains("final plan artifact"));
         assert_eq!(parameters["required"][0], "artifact");
+    }
+
+    #[test]
+    fn f05_worker_enforces_inherited_contract() {
+        let _guard = submit_guard();
+        let contract = TaskContract::new(
+            "graph-worker-contract",
+            1,
+            davinci_agent::TaskId::new(),
+            1,
+            vec!["crates/".into()],
+            vec![".git/".into()],
+            false,
+            vec![],
+            vec![],
+            vec!["target/".into()],
+        )
+        .unwrap();
+
+        let ctx = GraphWorkerContext::from_parts_full(
+            Some("writer"),
+            Some("patch-report"),
+            Some("artifact.json"),
+            Some("write,edit,bash"),
+            false,
+            Some(contract),
+        )
+        .unwrap();
+
+        assert!(ctx
+            .block_reason("write", &json!({"path": "crates/davinci-agent/src/lib.rs"}))
+            .is_none());
+        assert!(ctx
+            .block_reason("write", &json!({"path": "README.md"}))
+            .is_some());
+        let shell = ctx
+            .block_reason("bash", &json!({"command": "cargo test"}))
+            .expect("contracted graph shell must fail closed without a sandbox");
+        assert!(shell.contains("execution_contract_unenforceable"));
+    }
+
+    #[test]
+    fn f05_worker_contract_transport_rejects_partial_or_mismatched_environment() {
+        let _guard = submit_guard();
+        let contract = TaskContract::new(
+            "graph-worker-env-contract",
+            1,
+            davinci_agent::TaskId::new(),
+            1,
+            vec!["crates/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        std::env::set_var("PI_GRAPH_ROLE", "writer");
+        std::env::set_var("PI_GRAPH_EXPECT", "patch-report");
+        std::env::set_var("PI_GRAPH_ARTIFACT_PATH", "artifact.json");
+        std::env::set_var("PI_GRAPH_EXTRA_TOOLS", "write");
+        std::env::set_var("PI_CONTRACT_DIGEST", &contract.digest);
+        std::env::remove_var("DAVINCI_TASK_CONTRACT_JSON");
+        assert!(GraphWorkerContext::from_env().is_none());
+
+        std::env::set_var(
+            "DAVINCI_TASK_CONTRACT_JSON",
+            serde_json::to_string(&contract).unwrap(),
+        );
+        std::env::set_var("PI_CONTRACT_DIGEST", "mismatched");
+        assert!(GraphWorkerContext::from_env().is_none());
+
+        for key in [
+            "PI_GRAPH_ROLE",
+            "PI_GRAPH_EXPECT",
+            "PI_GRAPH_ARTIFACT_PATH",
+            "PI_GRAPH_EXTRA_TOOLS",
+            "PI_CONTRACT_DIGEST",
+            "DAVINCI_TASK_CONTRACT_JSON",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 }

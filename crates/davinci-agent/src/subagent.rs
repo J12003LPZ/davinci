@@ -152,10 +152,16 @@ pub struct SubagentRequest {
     pub instance_name: Option<String>,
     /// Registered runtime agent identity.
     pub runtime_agent_id: Option<AgentId>,
+    /// Host-only in-process coordinator binding, never accepted from tool JSON.
+    pub runtime: Option<RuntimeHandle>,
     /// Parent permission mode to enforce permission containment.
     pub parent_permission_mode: Option<PermissionMode>,
     /// Path to isolated worktree if isolation: worktree was requested.
     pub worktree_path: Option<PathBuf>,
+    /// Active contract digest propagated to child worker.
+    pub contract_digest: Option<String>,
+    /// Task-scoped contract for execution gate enforcement.
+    pub active_contract: Option<crate::runtime::contracts::TaskContract>,
 }
 
 type SubagentFn = dyn Fn(&SubagentRequest) -> Result<String, String> + Send + Sync;
@@ -240,6 +246,8 @@ pub struct SubagentParent {
     pub permission_mode: Option<PermissionMode>,
     pub agent_id: Option<AgentId>,
     pub worktree_manager: Option<WorktreeManager>,
+    pub contract_digest: Option<String>,
+    pub active_contract: Option<crate::runtime::contracts::TaskContract>,
 }
 
 /// One worker's request as the model wrote it.
@@ -487,6 +495,12 @@ pub fn run_tool(
             let _ = rt.registry.transition(child_agent_id, AgentState::Running);
         }
 
+        let runtime = parent
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.for_worker(child_agent_id, child_token.clone()))
+            .transpose()
+            .map_err(ToolError::Failed)?;
         requests.push(SubagentRequest {
             prompt: spec.prompt.clone(),
             tools: scoped,
@@ -501,8 +515,11 @@ pub fn run_tool(
             isolation: spec.isolation.clone(),
             instance_name: spec.name.clone(),
             runtime_agent_id: Some(child_agent_id),
+            runtime,
             parent_permission_mode: parent.permission_mode,
             worktree_path: wt_path,
+            contract_digest: parent.contract_digest.clone(),
+            active_contract: parent.active_contract.clone(),
         });
         leases.push(lease_opt);
     }
@@ -695,6 +712,227 @@ pub fn run_tool(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn f03_background_worker_task_authority_follows_lifetime() {
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::{Duration, Instant};
+        for mode in ["background", "teammate"] {
+            let parent = RuntimeHandle::new(
+                crate::RunId::new(),
+                AgentId::new(),
+                crate::RuntimeBus::new(),
+            );
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let finish_rx = Arc::new(Mutex::new(finish_rx));
+            let runner = SubagentRunner::new(move |request| {
+                ready_tx
+                    .send(crate::tools::ToolContext {
+                        runtime: request.runtime.clone(),
+                        ..Default::default()
+                    })
+                    .map_err(|error| error.to_string())?;
+                finish_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok("finished".into())
+            });
+            run_tool(
+                &json!({"prompt":"fixture", "mode":mode}),
+                &["read".into()],
+                Some(&runner),
+                &SubagentParent {
+                    runtime: Some(parent.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let context = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            crate::runtime::task_create_tool(
+                &json!({"title":mode,"operation_id":uuid::Uuid::new_v4()}),
+                &context,
+            )
+            .unwrap();
+            assert_eq!(
+                parent.task_registry.list_tasks(Some(parent.run_id)).len(),
+                1
+            );
+            let child_id = context.runtime.as_ref().unwrap().agent_id;
+            finish_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while parent.registry.get(&child_id).unwrap().state == AgentState::Running {
+                assert!(
+                    Instant::now() < deadline,
+                    "background worker did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(crate::runtime::task_list_tool(&json!({}), &context)
+                .unwrap_err()
+                .to_string()
+                .contains("worker task authority"));
+        }
+    }
+
+    #[test]
+    fn f03_finished_worker_cannot_use_retained_task_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = session.path.clone();
+        let mut agent = crate::Agent::new("fixture");
+        agent.load_from_session(session).unwrap();
+        let parent = agent.runtime_for_session().unwrap().clone();
+        let retained = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = retained.clone();
+        let runner = SubagentRunner::new(move |req| {
+            let context = crate::tools::ToolContext {
+                runtime: req.runtime.clone(),
+                ..Default::default()
+            };
+            let created = crate::runtime::task_create_tool(
+                &json!({"title":"owned", "operation_id":uuid::Uuid::new_v4()}),
+                &context,
+            )
+            .unwrap();
+            *captured.lock().unwrap() =
+                Some((context, created.details.unwrap()["task_id"].clone()));
+            Ok("finished".into())
+        });
+        run_tool(
+            &json!({"prompt":"fixture"}),
+            &["read".into()],
+            Some(&runner),
+            &SubagentParent {
+                runtime: Some(parent.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (context, id) = retained.lock().unwrap().take().unwrap();
+        let before = parent.task_registry.list_tasks(Some(parent.run_id));
+        for result in [
+            crate::runtime::task_create_tool(
+                &json!({"title":"late", "operation_id":uuid::Uuid::new_v4()}),
+                &context,
+            ),
+            crate::runtime::task_update_tool(
+                &json!({"task_id":id,"expected_revision":0,"operation_id":uuid::Uuid::new_v4(),"assigned_to":context.runtime.as_ref().unwrap().agent_id}),
+                &context,
+            ),
+            crate::runtime::task_get_tool(&json!({"task_id":id}), &context),
+            crate::runtime::task_list_tool(&json!({}), &context),
+        ] {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("worker task authority"));
+        }
+        assert_eq!(parent.task_registry.list_tasks(Some(parent.run_id)), before);
+        drop(context);
+        drop(runner);
+        drop(parent);
+        drop(agent);
+        let mut resumed = crate::Agent::new("fixture");
+        resumed
+            .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            resumed
+                .runtime_for_session()
+                .unwrap()
+                .task_registry
+                .list_tasks(None),
+            before
+        );
+    }
+
+    #[test]
+    fn f03_subagent_commands_share_parent_task_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = session.path.clone();
+        let mut agent = crate::Agent::new("fixture");
+        agent.load_from_session(session).unwrap();
+        let parent = agent.runtime_for_session().unwrap().clone();
+        let tasks = parent.task_registry.clone();
+        let run = parent.run_id;
+        let parent_id = parent.agent_id;
+        let parent_token = parent.cancellation_token.clone();
+        let coordinator = parent.clone();
+        let runner = SubagentRunner::new(move |req| {
+            let child = req
+                .runtime
+                .as_ref()
+                .expect("host must supply worker runtime");
+            assert_eq!(child.run_id, run);
+            assert_eq!(child.agent_id, req.runtime_agent_id.unwrap());
+            assert_ne!(child.agent_id, parent_id);
+            assert_eq!(child.parent_agent_id, Some(parent_id));
+            assert!(coordinator.for_worker(AgentId::new(), None).is_err());
+            let mut foreign = coordinator.clone();
+            foreign.run_id = crate::RunId::new();
+            assert!(foreign.for_worker(child.agent_id, None).is_err());
+            foreign.run_id = run;
+            foreign.agent_id = AgentId::new();
+            assert!(foreign.for_worker(child.agent_id, None).is_err());
+            let context = crate::tools::ToolContext {
+                runtime: Some(child.clone()),
+                ..Default::default()
+            };
+            crate::runtime::task_create_tool(
+                &json!({"title":"worker task","operation_id":uuid::Uuid::new_v4()}),
+                &context,
+            )
+            .unwrap();
+            assert!(crate::runtime::task_list_tool(&json!({}), &context).is_ok());
+            let mut rebound = context.clone();
+            rebound.runtime.as_mut().unwrap().run_id = crate::RunId::new();
+            assert!(crate::runtime::task_list_tool(&json!({}), &rebound).is_err());
+            rebound.runtime.as_mut().unwrap().run_id = run;
+            rebound.runtime.as_mut().unwrap().parent_agent_id = Some(AgentId::new());
+            assert!(crate::runtime::task_list_tool(&json!({}), &rebound).is_err());
+            child.cancellation_token.cancel();
+            assert!(crate::runtime::task_list_tool(&json!({}), &context)
+                .unwrap_err()
+                .to_string()
+                .contains("worker task authority"));
+            Ok("created".into())
+        });
+        run_tool(
+            &json!({"prompt":"create task"}),
+            &["read".into()],
+            Some(&runner),
+            &SubagentParent {
+                runtime: Some(parent),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !parent_token.is_cancelled(),
+            "child cancellation cannot cancel the coordinator"
+        );
+        assert_eq!(tasks.list_tasks(Some(run)).len(), 1);
+        let expected = tasks.list_tasks(Some(run));
+        drop(runner);
+        drop(tasks);
+        drop(agent);
+        let mut resumed = crate::Agent::new("fixture");
+        resumed
+            .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            resumed
+                .runtime_for_session()
+                .unwrap()
+                .task_registry
+                .list_tasks(Some(run)),
+            expected
+        );
+    }
 
     #[test]
     fn verified_read_only_extension_tool_can_be_scoped_to_a_child() {

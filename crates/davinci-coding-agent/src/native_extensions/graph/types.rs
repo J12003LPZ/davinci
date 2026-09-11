@@ -581,6 +581,62 @@ pub struct GraphCounters {
     pub started_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionOrigin {
+    GeneratedGoal,
+    SavedDefinition { name: String, digest: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphLifecycle {
+    Running,
+    PauseRequested,
+    Paused,
+    StopRequested,
+    Stopped,
+    RecoveryRequired,
+}
+
+#[allow(dead_code)]
+impl GraphLifecycle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::PauseRequested => "pause_requested",
+            Self::Paused => "paused",
+            Self::StopRequested => "stop_requested",
+            Self::Stopped => "stopped",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "running" => Some(Self::Running),
+            "pause_requested" => Some(Self::PauseRequested),
+            "paused" => Some(Self::Paused),
+            "stop_requested" => Some(Self::StopRequested),
+            "stopped" => Some(Self::Stopped),
+            "recovery_required" => Some(Self::RecoveryRequired),
+            _ => None,
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        matches!(self, Self::Paused)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Stopped | Self::RecoveryRequired)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphRun {
@@ -592,6 +648,13 @@ pub struct GraphRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced: Option<Complexity>,
     pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_origin: Option<ExecutionOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_definition:
+        Option<crate::native_extensions::graph::definitions::SavedGraphDefinitionV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<super::topology::GraphDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -620,9 +683,23 @@ pub struct GraphRun {
     #[serde(default)]
     pub ecosystem_stats: crate::native_extensions::ecosystem::telemetry::EcosystemStats,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<GraphLifecycle>,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl GraphRun {
+    pub fn current_lifecycle(&self) -> GraphLifecycle {
+        if let Some(lifecycle) = self.lifecycle {
+            lifecycle
+        } else if matches!(self.phase, Phase::Done | Phase::Cancelled) {
+            GraphLifecycle::Stopped
+        } else {
+            GraphLifecycle::Running
+        }
+    }
+
     pub fn task(&self, id: &str) -> Option<&GraphTaskState> {
         self.tasks.iter().find(|task| task.id == id)
     }
@@ -907,6 +984,10 @@ pub struct WorkerSpec {
     pub transcript_path: Option<std::path::PathBuf>,
     pub project_trusted: bool,
     pub runtime_agent_id: Option<davinci_agent::AgentId>,
+    /// Host-owned immutable task contract snapshot for this worker attempt.
+    pub task_contract: Option<davinci_agent::runtime::TaskContract>,
+    pub coordinator_client: Option<davinci_agent::runtime::task_transport::TaskCoordinatorClient>,
+    pub node_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -984,6 +1065,9 @@ mod tests {
             phase: Phase::Investigate,
             forced: None,
             dry_run: false,
+            execution_origin: None,
+            definition_digest: None,
+            saved_definition: None,
             definition: None,
             classification: None,
             milestones: None,
@@ -1014,6 +1098,8 @@ mod tests {
             resource_snapshot: None,
             ecosystem_stats: Default::default(),
             updated_at: 0,
+            lifecycle: None,
+            revision: 0,
         };
         let planner = run.tasks[2].clone();
         assert_eq!(run.unmet_dependencies(&planner), vec!["a", "b"]);

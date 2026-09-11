@@ -9,7 +9,7 @@ use thiserror::Error;
 use super::cancellation::CancellationToken;
 use super::events::{AgentKind, AgentRecord, AgentState};
 use super::ids::{AgentId, RunId, TaskId};
-use super::tasks::TaskState;
+use super::tasks::{TaskError, TaskOwner};
 use super::RuntimeHandle;
 
 fn now_ms() -> i64 {
@@ -165,21 +165,22 @@ impl TeamManager {
             }
         }
 
-        // Verify task state
+        // Capture a revision; the registry checks readiness and ownership atomically.
         let task = self
             .runtime
             .task_registry
             .get_task(&task_id)
             .ok_or_else(|| TeamError::TaskError(format!("Task '{task_id}' not found")))?;
 
-        if task.state != TaskState::Ready || task.assigned_to.is_some() {
-            return Err(TeamError::TaskAlreadyClaimed(task_id));
-        }
-
         self.runtime
             .task_registry
-            .assign_task(task_id, teammate_id)
-            .map_err(|e| TeamError::TaskError(e.to_string()))?;
+            .claim_task(task_id, self.runtime.run_id, teammate_id, task.revision)
+            .map_err(|e| match e {
+                TaskError::RevisionConflict(_) | TaskError::InvalidTransition { .. } => {
+                    TeamError::TaskAlreadyClaimed(task_id)
+                }
+                other => TeamError::TaskError(other.to_string()),
+            })?;
 
         Ok(())
     }
@@ -202,9 +203,23 @@ impl TeamManager {
             }
         }
 
+        let task = self
+            .runtime
+            .task_registry
+            .get_task(&task_id)
+            .ok_or_else(|| TeamError::TaskError(format!("Task '{task_id}' not found")))?;
         self.runtime
             .task_registry
-            .complete_task(task_id, result.clone())
+            .complete_owned_task(
+                task_id,
+                result.clone(),
+                TaskOwner {
+                    run_id: self.runtime.run_id,
+                    agent_id: teammate_id,
+                    revision: task.revision,
+                    generation: task.owner_generation,
+                },
+            )
             .map_err(|e| TeamError::TaskError(e.to_string()))?;
 
         // Send completion notice to team lead
@@ -235,6 +250,18 @@ impl TeamManager {
 
         handle.token.cancel();
 
+        // 1. Transition to Stopping (cooperative cancellation requested)
+        let _ = self
+            .runtime
+            .registry
+            .transition(teammate_id, AgentState::Stopping);
+
+        // 2. Reject undelivered messages
+        self.runtime
+            .mailbox
+            .reject_undelivered_for_cancelled(&teammate_id, "interrupted");
+
+        // 3. Observed exit -> transition to Cancelled
         let _ = self
             .runtime
             .registry
@@ -262,6 +289,62 @@ impl TeamManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f03_teammate_cannot_complete_another_owners_task() {
+        let (team, lead, run) = setup_team_test(2);
+        let (owner, _) = team.register_teammate("owner").unwrap();
+        let (other, _) = team.register_teammate("other").unwrap();
+        let id = team
+            .runtime
+            .task_registry
+            .create_task(TaskRecord::new(run, "owned"))
+            .unwrap();
+        team.claim_task(owner, id).unwrap();
+        let before = team.runtime.task_registry.get_task(&id).unwrap();
+        assert!(team
+            .complete_task(other, id, Some("forged".into()))
+            .is_err());
+        assert_eq!(team.runtime.task_registry.get_task(&id), Some(before));
+        assert!(team.runtime.mailbox.drain(lead, 10).is_empty());
+        team.complete_task(owner, id, Some("valid".into())).unwrap();
+        assert_eq!(team.runtime.mailbox.drain(lead, 10).len(), 1);
+    }
+
+    #[test]
+    fn f03_team_concurrent_claim_has_one_owner() {
+        let (team, _, run) = setup_team_test(2);
+        let (first, _) = team.register_teammate("first").unwrap();
+        let (second, _) = team.register_teammate("second").unwrap();
+        let id = team
+            .runtime
+            .task_registry
+            .create_task(super::super::tasks::TaskRecord::new(run, "contested"))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [first, second]
+            .into_iter()
+            .map(|actor| {
+                let team = team.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (actor, team.claim_task(actor, id))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(_, r)| r.is_ok()).count(), 1);
+        let task = team.runtime.task_registry.get_task(&id).unwrap();
+        assert_eq!(task.owner_generation, 1);
+        assert_eq!(
+            task.assigned_to,
+            results
+                .iter()
+                .find(|(_, r)| r.is_ok())
+                .map(|(actor, _)| *actor)
+        );
+    }
+
     use super::*;
     use crate::runtime::bus::RuntimeBus;
     use crate::runtime::tasks::TaskRecord;

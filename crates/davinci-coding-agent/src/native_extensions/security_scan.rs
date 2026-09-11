@@ -1733,6 +1733,7 @@ mod tests {
             security: result.clone(),
             changed_files: vec!["src/auth.rs".into()],
             graph_run_id: Some("run-gate".into()),
+            source_manifest_digest: None,
         };
         assert!(!bundle.approval_eligible(SecurityPolicyMode::Risk));
         assert!(!bundle.approval_eligible(SecurityPolicyMode::Always));

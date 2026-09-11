@@ -73,6 +73,28 @@ pub struct RpcCommand {
     pub value: Option<String>,
     #[serde(rename = "notifyType", default)]
     pub notify_type: Option<String>,
+    #[serde(rename = "agentId", default)]
+    pub agent_id: Option<String>,
+    #[serde(rename = "action", default)]
+    pub action: Option<String>,
+    #[serde(rename = "operationId", default)]
+    pub operation_id: Option<String>,
+    #[serde(rename = "expectedRevision", default)]
+    pub expected_revision: Option<u64>,
+    #[serde(rename = "expectedGeneration", default)]
+    pub expected_generation: Option<u64>,
+    #[serde(rename = "decisionId", default)]
+    pub decision_id: Option<String>,
+    #[serde(rename = "choiceId", default)]
+    pub choice_id: Option<String>,
+    #[serde(rename = "runId", default)]
+    pub run_id: Option<String>,
+    #[serde(rename = "nodeId", default)]
+    pub node_id: Option<String>,
+    #[serde(rename = "expectedAttempt", default)]
+    pub expected_attempt: Option<u32>,
+    #[serde(rename = "control", default)]
+    pub control: Option<crate::native_extensions::graph::control::GraphControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +157,7 @@ pub struct RpcRuntime {
     pub pending_ui: std::collections::HashMap<String, RpcCommand>,
     pub pending_events: Vec<RpcSessionEvent>,
     pub prompt_needs_turn: bool,
+    pub control_operations: std::collections::HashMap<String, Value>,
 }
 
 impl RpcRuntime {
@@ -163,6 +186,7 @@ impl RpcRuntime {
             pending_ui: std::collections::HashMap::new(),
             pending_events: Vec::new(),
             prompt_needs_turn: false,
+            control_operations: std::collections::HashMap::new(),
         }
     }
 
@@ -642,6 +666,203 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             }
             ok(id, &kind, None)
         }
+        "decision_response" => {
+            if let Some(response_id) = id.clone() {
+                runtime.pending_ui.insert(response_id, command);
+            }
+            ok(id, &kind, None)
+        }
+        "agent_control" => {
+            let Some(agent_id_str) = command.agent_id.as_deref() else {
+                return fail(id, &kind, "Missing agentId parameter".into());
+            };
+            let Ok(agent_id) = agent_id_str.parse::<davinci_agent::runtime::AgentId>() else {
+                return fail(id, &kind, format!("Invalid agentId: {agent_id_str}"));
+            };
+            let action_name = command.action.as_deref().unwrap_or("inspect");
+            let Some(runtime_handle) = &runtime.agent.runtime else {
+                return fail(id, &kind, "No active runtime handle available".into());
+            };
+            let controller =
+                davinci_agent::runtime::WorkerController::new(runtime_handle.registry.clone());
+
+            let op_id = command
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+            match action_name {
+                "inspect" => {
+                    let snapshot = controller.build_snapshot(&agent_id);
+                    ok(
+                        id,
+                        &kind,
+                        Some(serde_json::json!({
+                            "operationId": op_id,
+                            "snapshot": snapshot,
+                            "completed": true,
+                        })),
+                    )
+                }
+                "diff" => {
+                    let baseline_res =
+                        crate::native_extensions::graph::mutation::capture_baseline(&runtime.cwd);
+                    match baseline_res {
+                        Ok(baseline) => {
+                            match crate::native_extensions::graph::mutation::compute_owned_diff(
+                                &runtime.cwd,
+                                &baseline,
+                                &[],
+                            ) {
+                                Ok(report) => ok(
+                                    id,
+                                    &kind,
+                                    Some(serde_json::json!({
+                                        "operationId": op_id,
+                                        "diff": report,
+                                        "completed": true,
+                                    })),
+                                ),
+                                Err(err) => {
+                                    fail(id, &kind, format!("Failed to compute diff: {err}"))
+                                }
+                            }
+                        }
+                        Err(err) => fail(id, &kind, format!("Failed to capture baseline: {err}")),
+                    }
+                }
+                "stop" | "retry" | "steer" => {
+                    let action = match action_name {
+                        "stop" => davinci_agent::runtime::WorkerControlAction::Stop {
+                            reason: command.message.clone(),
+                        },
+                        "retry" => davinci_agent::runtime::WorkerControlAction::Retry {
+                            reason: command.message.clone(),
+                        },
+                        _ => davinci_agent::runtime::WorkerControlAction::Steer {
+                            message: command.message.clone().unwrap_or_default(),
+                            redirect: true,
+                        },
+                    };
+                    let generation = command
+                        .expected_generation
+                        .unwrap_or_else(|| runtime_handle.registry.get_generation(&agent_id));
+                    let expected_revision = command
+                        .expected_revision
+                        .unwrap_or_else(|| runtime_handle.registry.get_revision(&agent_id));
+                    let cmd = davinci_agent::runtime::WorkerControlCommand {
+                        id: uuid::Uuid::new_v4(),
+                        root_run_id: runtime_handle.run_id,
+                        agent_id,
+                        generation,
+                        task_id: None,
+                        expected_revision,
+                        action,
+                    };
+                    let receipt = controller.execute_command(cmd, true);
+                    let is_completed = receipt.status
+                        == davinci_agent::runtime::ControlStatus::Stopped
+                        || receipt.status == davinci_agent::runtime::ControlStatus::Rejected;
+                    let result_val = serde_json::json!({
+                        "operationId": op_id,
+                        "agentId": agent_id.to_string(),
+                        "status": receipt.status.as_str(),
+                        "action": receipt.action,
+                        "completed": is_completed,
+                        "reason": receipt.reason,
+                    });
+                    runtime.control_operations.insert(op_id, result_val.clone());
+                    ok(id, &kind, Some(result_val))
+                }
+                other => fail(id, &kind, format!("Unknown control action: {other}")),
+            }
+        }
+        "get_worker_snapshots" | "agent_snapshots" => {
+            let snapshots = if let Some(runtime_handle) = &runtime.agent.runtime {
+                let controller =
+                    davinci_agent::runtime::WorkerController::new(runtime_handle.registry.clone());
+                controller.build_all_snapshots()
+            } else {
+                Vec::new()
+            };
+            ok(
+                id,
+                &kind,
+                Some(serde_json::json!({ "snapshots": snapshots })),
+            )
+        }
+        "poll_control_operation" => {
+            let Some(op_id) = command.operation_id.as_deref() else {
+                return fail(id, &kind, "Missing operationId parameter".into());
+            };
+            if let Some(data) = runtime.control_operations.get(op_id) {
+                ok(id, &kind, Some(data.clone()))
+            } else {
+                fail(id, &kind, format!("Operation not found: {op_id}"))
+            }
+        }
+        "graph_control" => {
+            let ctrl = if let Some(ctrl) = command.control {
+                ctrl
+            } else {
+                let Some(run_id) = command.run_id.clone() else {
+                    return fail(
+                        id,
+                        &kind,
+                        "Missing runId parameter for graph_control".into(),
+                    );
+                };
+                let action = match command.action.as_deref().unwrap_or("pause") {
+                    "pause" => crate::native_extensions::graph::control::GraphControlAction::Pause,
+                    "resume" => {
+                        crate::native_extensions::graph::control::GraphControlAction::Resume
+                    }
+                    "stop_node" => {
+                        crate::native_extensions::graph::control::GraphControlAction::StopNode
+                    }
+                    "stop_graph" | "stop" => {
+                        crate::native_extensions::graph::control::GraphControlAction::StopGraph
+                    }
+                    "retry_node" | "retry" => {
+                        crate::native_extensions::graph::control::GraphControlAction::RetryNode
+                    }
+                    other => {
+                        return fail(id, &kind, format!("Unknown graph control action: {other}"))
+                    }
+                };
+                crate::native_extensions::graph::control::GraphControl {
+                    operation_id: command
+                        .operation_id
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    run_id,
+                    expected_run_revision: command.expected_revision.unwrap_or(0),
+                    node_id: command.node_id.clone(),
+                    expected_attempt: command.expected_attempt,
+                    action,
+                }
+            };
+
+            let ctrl_json = match serde_json::to_string(&ctrl) {
+                Ok(j) => j,
+                Err(e) => {
+                    return fail(
+                        id,
+                        &kind,
+                        format!("Failed to serialize control command: {e}"),
+                    )
+                }
+            };
+
+            let controller =
+                crate::native_extensions::graph::GraphController::new(PathBuf::from(&runtime.cwd));
+            match controller.command("graph-control", &ctrl_json) {
+                Ok(Some(receipt_val)) => ok(id, &kind, Some(receipt_val)),
+                Ok(None) => fail(id, &kind, "No receipt returned for graph control".into()),
+                Err(err) => fail(id, &kind, err),
+            }
+        }
+
         other => fail(id, other, format!("Unknown RPC command: {other}")),
     }
 }
@@ -765,7 +986,11 @@ fn create_session(runtime: &mut RpcRuntime, parent: Option<&str>) -> Result<bool
     next.provider = runtime.agent.provider.clone();
     next.model_id = runtime.agent.model_id.clone();
     next.tools = runtime.agent.tools.clone();
-    next.session = Some(session);
+    next.permissions = runtime.agent.permissions.clone();
+    next.approver = runtime.agent.approver.clone();
+    next.approval_responder = runtime.agent.approval_responder.clone();
+    next.load_from_session(session)?;
+    runtime.agent.reset_session_approvals();
     runtime.agent = next;
     Ok(false)
 }
@@ -777,7 +1002,7 @@ fn clone_session(runtime: &mut RpcRuntime) -> Result<bool, String> {
     let cloned = session
         .clone_session(&runtime.session_dir)
         .map_err(|err| err.to_string())?;
-    runtime.agent.load_from_session(cloned);
+    runtime.agent.load_from_session(cloned)?;
     Ok(false)
 }
 
@@ -792,7 +1017,7 @@ fn fork_session(runtime: &mut RpcRuntime, entry_id: Option<&str>) -> Result<Valu
     let forked = session
         .fork(&entry_id, &runtime.session_dir)
         .map_err(|err| err.to_string())?;
-    runtime.agent.load_from_session(forked);
+    runtime.agent.load_from_session(forked)?;
     Ok(serde_json::json!({
         "text": runtime.agent.last_assistant_text().unwrap_or_default(),
         "cancelled": false,
@@ -805,7 +1030,7 @@ fn switch_session(runtime: &mut RpcRuntime, session_path: Option<&str>) -> Resul
     };
     let path = Path::new(session_path);
     let session = JsonlSession::open(path).map_err(|err| err.to_string())?;
-    runtime.agent.load_from_session(session);
+    runtime.agent.load_from_session(session)?;
     Ok(false)
 }
 
@@ -931,11 +1156,272 @@ fn fail(id: Option<String>, command: &str, error: String) -> RpcResponse {
     }
 }
 
+#[allow(dead_code)]
+pub fn approval_host_result(
+    interactive: bool,
+    valid_reply: bool,
+    disconnected: bool,
+) -> &'static str {
+    if disconnected {
+        "denied"
+    } else if valid_reply {
+        "resolved"
+    } else if interactive {
+        "pending"
+    } else {
+        "approval_required"
+    }
+}
+
+pub fn rpc_resolve_decision(
+    request: &davinci_agent::DecisionHostRequest,
+    mut ask: impl FnMut(&serde_json::Value) -> serde_json::Value,
+) -> davinci_agent::DecisionHostResponse {
+    let issued_request_id = format!("dec-req-{}", davinci_session::now_ms());
+    let question = &request.question;
+
+    let payload = serde_json::json!({
+        "op": "decision",
+        "id": issued_request_id,
+        "question": {
+            "id": question.id,
+            "kind": question.kind,
+            "title": question.title,
+            "question": question.question,
+            "materiality": question.materiality,
+            "evidence_refs": question.evidence_refs,
+            "options": question.options,
+            "allow_custom": question.allow_custom,
+            "custom_only": question.custom_only,
+            "plan_revision": question.plan_revision,
+        }
+    });
+
+    let answer = ask(&payload);
+    if answer.is_null() {
+        // Older clients may use sequential select/input but must preserve question/revision/request identity
+        let mut options: Vec<String> = question.options.iter().map(|o| o.label.clone()).collect();
+        if question.allow_custom {
+            options.push("Custom response".into());
+        }
+        options.push("Defer decision".into());
+        options.push("Cancel".into());
+
+        let select_call = serde_json::json!({
+            "op": "select",
+            "id": issued_request_id,
+            "title": format!("{}: {}", question.title, question.question),
+            "options": options,
+            "decision_id": question.id,
+            "plan_revision": question.plan_revision,
+        });
+        let sel_ans = ask(&select_call);
+        if let Some(choice_str) = sel_ans.as_str() {
+            if choice_str == "Cancel" {
+                return davinci_agent::DecisionHostResponse::Cancelled;
+            }
+            if choice_str == "Defer decision" {
+                return davinci_agent::DecisionHostResponse::Reply(
+                    davinci_agent::DecisionHostReply {
+                        action: davinci_agent::decisions::HostDecisionAction::Defer,
+                        host_event_id: format!("rpc-evt-{}", davinci_session::now_ms()),
+                        answered_at_ms: davinci_session::now_ms(),
+                    },
+                );
+            }
+            if choice_str == "Custom response" && question.allow_custom {
+                let input_call = serde_json::json!({
+                    "op": "input",
+                    "id": issued_request_id,
+                    "title": "Enter custom response",
+                    "placeholder": "Custom answer...",
+                    "decision_id": question.id,
+                    "plan_revision": question.plan_revision,
+                });
+                let input_ans = ask(&input_call);
+                if let Some(custom_text) = input_ans.as_str() {
+                    let trimmed = custom_text.trim();
+                    if !trimmed.is_empty() {
+                        return davinci_agent::DecisionHostResponse::Reply(
+                            davinci_agent::DecisionHostReply {
+                                action: davinci_agent::decisions::HostDecisionAction::AnswerCustom(
+                                    trimmed.to_string(),
+                                ),
+                                host_event_id: format!("rpc-evt-{}", davinci_session::now_ms()),
+                                answered_at_ms: davinci_session::now_ms(),
+                            },
+                        );
+                    }
+                }
+                return davinci_agent::DecisionHostResponse::Cancelled;
+            }
+            if let Some(opt) = question
+                .options
+                .iter()
+                .find(|o| o.label == choice_str || o.id == choice_str)
+            {
+                return davinci_agent::DecisionHostResponse::Reply(
+                    davinci_agent::DecisionHostReply {
+                        action: davinci_agent::decisions::HostDecisionAction::AnswerChoice(
+                            opt.id.clone(),
+                        ),
+                        host_event_id: format!("rpc-evt-{}", davinci_session::now_ms()),
+                        answered_at_ms: davinci_session::now_ms(),
+                    },
+                );
+            }
+        }
+        return davinci_agent::DecisionHostResponse::Unavailable;
+    }
+
+    if let Some(action_str) = answer.get("action").and_then(|a| a.as_str()) {
+        let host_event_id = answer
+            .get("host_event_id")
+            .and_then(|h| h.as_str())
+            .unwrap_or(&issued_request_id)
+            .to_string();
+        let answered_at_ms = answer
+            .get("answered_at_ms")
+            .and_then(|t| t.as_u64())
+            .unwrap_or_else(davinci_session::now_ms);
+        match action_str {
+            "answer_choice" => {
+                if let Some(choice) = answer.get("choice_id").and_then(|c| c.as_str()) {
+                    return davinci_agent::DecisionHostResponse::Reply(
+                        davinci_agent::DecisionHostReply {
+                            action: davinci_agent::decisions::HostDecisionAction::AnswerChoice(
+                                choice.to_string(),
+                            ),
+                            host_event_id,
+                            answered_at_ms,
+                        },
+                    );
+                }
+            }
+            "answer_custom" => {
+                if let Some(custom) = answer.get("custom_text").and_then(|c| c.as_str()) {
+                    return davinci_agent::DecisionHostResponse::Reply(
+                        davinci_agent::DecisionHostReply {
+                            action: davinci_agent::decisions::HostDecisionAction::AnswerCustom(
+                                custom.to_string(),
+                            ),
+                            host_event_id,
+                            answered_at_ms,
+                        },
+                    );
+                }
+            }
+            "defer" => {
+                return davinci_agent::DecisionHostResponse::Reply(
+                    davinci_agent::DecisionHostReply {
+                        action: davinci_agent::decisions::HostDecisionAction::Defer,
+                        host_event_id,
+                        answered_at_ms,
+                    },
+                );
+            }
+            "cancel" => {
+                return davinci_agent::DecisionHostResponse::Cancelled;
+            }
+            _ => {}
+        }
+    }
+    davinci_agent::DecisionHostResponse::Unavailable
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use davinci_agent::default_system_prompt;
     use davinci_session::JsonlSession;
+
+    #[test]
+    fn f01_noninteractive_fail_closed_contract() {
+        assert_eq!(
+            approval_host_result(false, false, false),
+            "approval_required"
+        );
+        assert_eq!(approval_host_result(true, false, true), "denied");
+        assert_eq!(approval_host_result(true, true, false), "resolved");
+    }
+
+    #[test]
+    fn f03_rpc_session_switch_reports_recovery_without_switching() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        let first = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let first_path = first.path.clone();
+        agent.load_from_session(first).unwrap();
+        let next = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        std::fs::write(
+            davinci_session::runtime_log_path(&next.path),
+            b"{bad}\n{bad}\n",
+        )
+        .unwrap();
+        let mut runtime = RpcRuntime::new(agent, dir.path().into(), dir.path().into());
+        let response = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "switch_session".into(),
+                session_path: Some(next.path.to_string_lossy().into_owned()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(!response.success);
+        assert!(response
+            .error
+            .unwrap()
+            .starts_with("Runtime recovery required:"));
+        assert_eq!(runtime.agent.session.as_ref().unwrap().path, first_path);
+    }
+
+    #[test]
+    fn f01_rpc_new_session_preserves_policy_and_host_but_clears_consent() {
+        use davinci_agent::{PermissionMode, PermissionRule, ToolApprovalDecision, ToolApprover};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(default_system_prompt());
+        agent.set_permission_mode(PermissionMode::Ask);
+        {
+            let mut policy = agent.permissions.lock().unwrap();
+            policy.project_trusted = true;
+            policy
+                .deny
+                .push(PermissionRule::subject("write", "protected.txt"));
+            policy
+                .session_allow
+                .push(PermissionRule::subject("write", "ordinary.txt"));
+        }
+        agent.approver = Some(ToolApprover(Arc::new(|_| ToolApprovalDecision::Deny)));
+        agent.approval_responder = Some(davinci_agent::approval::ApprovalResponder(Arc::new(
+            |_, challenge| {
+                davinci_agent::approval::ApprovalReply::from_legacy(
+                    challenge,
+                    ToolApprovalDecision::Deny,
+                )
+            },
+        )));
+        let permissions = agent.permissions.clone();
+        let mut runtime = RpcRuntime::new(agent, dir.path().into(), dir.path().into());
+        assert!(!create_session(&mut runtime, None).unwrap());
+        assert!(runtime.agent.runtime_for_session().is_some());
+        assert!(runtime
+            .agent
+            .session
+            .as_ref()
+            .unwrap()
+            .path
+            .with_extension("tasks.jsonl")
+            .is_file());
+        assert!(Arc::ptr_eq(&permissions, &runtime.agent.permissions));
+        let policy = runtime.agent.permissions.lock().unwrap();
+        assert_eq!(policy.mode, PermissionMode::Ask);
+        assert!(policy.project_trusted);
+        assert_eq!(policy.deny.len(), 1);
+        assert!(policy.session_allow.is_empty());
+        assert!(runtime.agent.approver.is_some());
+        assert!(runtime.agent.approval_responder.is_some());
+    }
 
     #[test]
     fn extension_ui_protocol_matches_ts_shapes() {
@@ -1371,5 +1857,352 @@ mod tests {
         assert!(queued.success);
         assert!(!runtime.prompt_needs_turn);
         assert_eq!(runtime.agent.queues.follow_up.len(), 1);
+    }
+
+    #[test]
+    fn test_rpc_agent_control_and_poll() {
+        let bus = davinci_agent::RuntimeBus::new();
+        let run_id = davinci_agent::RunId::new();
+        let agent_id = davinci_agent::AgentId::new();
+        let handle = davinci_agent::RuntimeHandle::new(run_id, agent_id, bus);
+        let mut agent = davinci_agent::Agent::new(default_system_prompt());
+        agent.runtime = Some(handle);
+
+        let mut runtime = RpcRuntime::new(agent, PathBuf::from("/tmp"), PathBuf::from("/tmp"));
+
+        let worker_id = davinci_agent::AgentId::new();
+        let record = davinci_agent::runtime::AgentRecord {
+            id: worker_id,
+            run_id,
+            parent: Some(agent_id),
+            kind: davinci_agent::runtime::AgentKind::GraphWorker,
+            name: "test-worker".into(),
+            provider: "mock".into(),
+            model_id: "mock".into(),
+            cwd: PathBuf::from("/tmp"),
+            state: davinci_agent::runtime::AgentState::Running,
+            task_id: None,
+            worktree: None,
+            started_ms: 1000,
+            updated_ms: 1000,
+            failure_reason: None,
+        };
+        runtime
+            .agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .registry
+            .register_agent(record)
+            .unwrap();
+
+        // 1. Get snapshots
+        let snap_res = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_worker_snapshots".into(),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(snap_res.success);
+        let sn = snap_res.data.as_ref().unwrap()["snapshots"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sn.len(), 1);
+        assert_eq!(sn[0]["name"], "test-worker");
+
+        // 2. Control inspect
+        let inspect_res = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "agent_control".into(),
+                agent_id: Some(worker_id.to_string()),
+                action: Some("inspect".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(inspect_res.success);
+        assert!(inspect_res.data.as_ref().unwrap()["completed"]
+            .as_bool()
+            .unwrap());
+
+        // 3. Control stop (completed action)
+        let stop_res = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "agent_control".into(),
+                agent_id: Some(worker_id.to_string()),
+                action: Some("stop".into()),
+                operation_id: Some("op-123".into()),
+                message: Some("graceful stop".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(stop_res.success);
+        let stop_data = stop_res.data.as_ref().unwrap();
+        assert_eq!(stop_data["operationId"], "op-123");
+        assert_eq!(stop_data["status"], "stopped");
+        assert!(stop_data["completed"].as_bool().unwrap());
+
+        // 4. Poll operation by ID
+        let poll_res = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "poll_control_operation".into(),
+                operation_id: Some("op-123".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(poll_res.success);
+        let polled_data = poll_res.data.as_ref().unwrap();
+        assert_eq!(polled_data["operationId"], "op-123");
+        assert_eq!(polled_data["status"], "stopped");
+
+        // 5. Control retry on active worker (accepted command, not yet terminal/completed)
+        let worker_id2 = davinci_agent::AgentId::new();
+        let record2 = davinci_agent::runtime::AgentRecord {
+            id: worker_id2,
+            run_id,
+            parent: Some(agent_id),
+            kind: davinci_agent::runtime::AgentKind::GraphWorker,
+            name: "test-worker-2".into(),
+            provider: "mock".into(),
+            model_id: "mock".into(),
+            cwd: PathBuf::from("/tmp"),
+            state: davinci_agent::runtime::AgentState::Running,
+            task_id: None,
+            worktree: None,
+            started_ms: 1000,
+            updated_ms: 1000,
+            failure_reason: None,
+        };
+        runtime
+            .agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .registry
+            .register_agent(record2)
+            .unwrap();
+
+        let retry_res = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "agent_control".into(),
+                agent_id: Some(worker_id2.to_string()),
+                action: Some("retry".into()),
+                operation_id: Some("op-retry".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(retry_res.success);
+        let retry_data = retry_res.data.as_ref().unwrap();
+        assert_eq!(retry_data["status"], "accepted");
+        assert!(!retry_data["completed"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn f02_rpc_decision_typed_reply() {
+        let question = davinci_agent::decisions::DecisionQuestion {
+            id: "db-choice".into(),
+            kind: davinci_agent::decisions::DecisionKind::Persistence,
+            title: "Database".into(),
+            question: "Choose db".into(),
+            materiality: "Changes storage".into(),
+            evidence_refs: vec![],
+            evidence_fingerprints: std::collections::BTreeMap::new(),
+            options: vec![davinci_agent::decisions::DecisionOptionInput {
+                id: "sqlite".into(),
+                label: "SQLite".into(),
+                explanation: "Local file".into(),
+                recommended: true,
+            }],
+            allow_custom: false,
+            custom_only: false,
+            state: davinci_agent::decisions::DecisionState::Open,
+            answer: None,
+            plan_revision: 1,
+        };
+        let request = davinci_agent::DecisionHostRequest { question };
+        let response = rpc_resolve_decision(&request, |call| {
+            assert_eq!(call["op"], "decision");
+            assert_eq!(call["question"]["id"], "db-choice");
+            serde_json::json!({
+                "action": "answer_choice",
+                "choice_id": "sqlite",
+                "host_event_id": "evt-123",
+                "answered_at_ms": 1000
+            })
+        });
+        match response {
+            davinci_agent::DecisionHostResponse::Reply(reply) => {
+                assert_eq!(
+                    reply.action,
+                    davinci_agent::decisions::HostDecisionAction::AnswerChoice("sqlite".into())
+                );
+                assert_eq!(reply.host_event_id, "evt-123");
+            }
+            other => panic!("expected Reply, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn f02_rpc_decision_sequential_select_and_custom() {
+        let question = davinci_agent::decisions::DecisionQuestion {
+            id: "db-choice".into(),
+            kind: davinci_agent::decisions::DecisionKind::Persistence,
+            title: "Database".into(),
+            question: "Choose db".into(),
+            materiality: "Changes storage".into(),
+            evidence_refs: vec![],
+            evidence_fingerprints: std::collections::BTreeMap::new(),
+            options: vec![davinci_agent::decisions::DecisionOptionInput {
+                id: "sqlite".into(),
+                label: "SQLite".into(),
+                explanation: "Local file".into(),
+                recommended: false,
+            }],
+            allow_custom: true,
+            custom_only: false,
+            state: davinci_agent::decisions::DecisionState::Open,
+            answer: None,
+            plan_revision: 2,
+        };
+        let request = davinci_agent::DecisionHostRequest { question };
+        let mut call_count = 0;
+        let response = rpc_resolve_decision(&request, |call| {
+            call_count += 1;
+            if call["op"] == "decision" {
+                // Older client returns null (unknown op)
+                serde_json::Value::Null
+            } else if call["op"] == "select" {
+                // Preserves question and revision identity
+                assert_eq!(call["decision_id"], "db-choice");
+                assert_eq!(call["plan_revision"], 2);
+                serde_json::json!("Custom response")
+            } else if call["op"] == "input" {
+                assert_eq!(call["decision_id"], "db-choice");
+                assert_eq!(call["plan_revision"], 2);
+                serde_json::json!("postgres://localhost:5432")
+            } else {
+                panic!("unexpected op {}", call["op"]);
+            }
+        });
+        assert_eq!(call_count, 3);
+        match response {
+            davinci_agent::DecisionHostResponse::Reply(reply) => {
+                assert_eq!(
+                    reply.action,
+                    davinci_agent::decisions::HostDecisionAction::AnswerCustom(
+                        "postgres://localhost:5432".into()
+                    )
+                );
+            }
+            other => panic!("expected Reply with custom answer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn f02_rpc_decision_timeout_and_disconnect_cannot_synthesize_answer() {
+        let question = davinci_agent::decisions::DecisionQuestion {
+            id: "db-choice".into(),
+            kind: davinci_agent::decisions::DecisionKind::Persistence,
+            title: "Database".into(),
+            question: "Choose db".into(),
+            materiality: "Changes storage".into(),
+            evidence_refs: vec![],
+            evidence_fingerprints: std::collections::BTreeMap::new(),
+            options: vec![],
+            allow_custom: false,
+            custom_only: false,
+            state: davinci_agent::decisions::DecisionState::Open,
+            answer: None,
+            plan_revision: 1,
+        };
+        let request = davinci_agent::DecisionHostRequest { question };
+        let response = rpc_resolve_decision(&request, |_| serde_json::Value::Null);
+        assert_eq!(response, davinci_agent::DecisionHostResponse::Unavailable);
+    }
+
+    #[test]
+    fn f13_rpc_graph_control_and_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Agent::new("fixture");
+        let mut runtime = RpcRuntime::new(agent, dir.path().into(), dir.path().into());
+        let run_id = crate::native_extensions::graph::store::new_run_id();
+        crate::native_extensions::graph::store::create_run_dir(dir.path(), &run_id).unwrap();
+
+        let mut run = crate::native_extensions::graph::types::GraphRun {
+            version: 1,
+            run_id: run_id.clone(),
+            goal: "rpc test goal".into(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            phase: crate::native_extensions::graph::types::Phase::Implement,
+            forced: None,
+            dry_run: true,
+            execution_origin: None,
+            definition_digest: None,
+            saved_definition: None,
+            definition: None,
+            classification: None,
+            milestones: None,
+            current_milestone: None,
+            tasks: vec![],
+            verification: None,
+            verification_bundle: None,
+            review_coverage: None,
+            budgets: crate::native_extensions::graph::types::GraphBudgets::default(),
+            counters: crate::native_extensions::graph::types::GraphCounters {
+                workers_spawned: 1,
+                revision_cycles: 0,
+                replans: 0,
+                cost_usd: 0.0,
+                started_at: crate::native_extensions::graph::store::now_ms(),
+            },
+            blocked_reason: None,
+            resource_snapshot: None,
+            ecosystem_stats: Default::default(),
+            updated_at: 0,
+            lifecycle: Some(crate::native_extensions::graph::types::GraphLifecycle::Running),
+            revision: 1,
+        };
+        crate::native_extensions::graph::store::save_run(&mut run).unwrap();
+
+        // 1. Send graph_control command to pause
+        let res = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "graph_control".into(),
+                run_id: Some(run_id.clone()),
+                action: Some("pause".into()),
+                operation_id: Some("op-pause-1".into()),
+                expected_revision: Some(1),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(res.success);
+        let receipt = res.data.unwrap();
+        assert_eq!(receipt["operationId"], "op-pause-1");
+        assert_eq!(receipt["state"], "applied");
+
+        // Verify state is paused on disk
+        let loaded = crate::native_extensions::graph::store::load_run(dir.path(), &run_id).unwrap();
+        assert_eq!(
+            loaded.current_lifecycle(),
+            crate::native_extensions::graph::types::GraphLifecycle::Paused
+        );
+
+        // 2. Send graph_control to missing run (simulates disconnect / missing target)
+        let res_missing = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "graph_control".into(),
+                run_id: Some("non-existent-run".into()),
+                action: Some("pause".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(!res_missing.success);
+        assert!(res_missing.error.unwrap().contains("not found"));
     }
 }

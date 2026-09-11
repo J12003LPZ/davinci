@@ -133,7 +133,12 @@ pub fn hook_kind_for(event: &davinci_agent::RuntimeEvent) -> Option<&'static str
             ..
         } => Some("subagentStop"),
         davinci_agent::RuntimeEvent::TaskCreated { .. } => Some("taskCreated"),
-        davinci_agent::RuntimeEvent::TaskCompleted { .. } => Some("taskCompleted"),
+        // Keep the existing hook as the pre-completion gate; do not execute it
+        // twice when the successful commit observation follows the proposal.
+        davinci_agent::RuntimeEvent::TaskCompletionRequested { .. }
+        | davinci_agent::RuntimeEvent::TaskCompleted { success: false, .. } => {
+            Some("taskCompleted")
+        }
         davinci_agent::RuntimeEvent::PreCompact { .. } => Some("preCompact"),
         davinci_agent::RuntimeEvent::PostCompact { .. } => Some("postCompact"),
         davinci_agent::RuntimeEvent::PreModelSwitch { .. } => Some("preModelSwitch"),
@@ -233,6 +238,17 @@ pub fn run_one_envelope(
             payload["sessionId"] = serde_json::json!(session_id);
         }
         payload["event"] = serde_json::to_value(&env.payload).unwrap_or(Value::Null);
+        // Shell hooks retain their existing pre-completion input contract.
+        // Only this compatibility adapter uses the old name: runtime observers
+        // and persistence receive TaskCompletionRequested, never a false fact.
+        if matches!(
+            env.payload,
+            davinci_agent::RuntimeEvent::TaskCompletionRequested { .. }
+        ) {
+            payload["event"]["kind"] = serde_json::json!("task_completed");
+            payload["event"]["success"] = serde_json::json!(true);
+            payload["event"]["phase"] = serde_json::json!("proposal");
+        }
     }
     let payload_str = payload.to_string();
     let mut cmd = Command::new(program);
@@ -297,6 +313,33 @@ pub fn run_one_envelope(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f03_completion_hook_runs_for_proposal_not_success_observation() {
+        use davinci_agent::{RuntimeEvent, TaskId};
+        let task_id = TaskId::new();
+        assert_eq!(
+            super::hook_kind_for(&RuntimeEvent::TaskCompletionRequested {
+                task_id,
+                expected_revision: 3,
+            }),
+            Some("taskCompleted")
+        );
+        assert_eq!(
+            super::hook_kind_for(&RuntimeEvent::TaskCompleted {
+                task_id,
+                success: true
+            }),
+            None
+        );
+        // Preserve the historical failure notification hook.
+        assert_eq!(
+            super::hook_kind_for(&RuntimeEvent::TaskCompleted {
+                task_id,
+                success: false
+            }),
+            Some("taskCompleted")
+        );
+    }
     use super::*;
     use std::sync::Mutex;
 
@@ -474,6 +517,93 @@ mod tests {
         let trusted = load(&agent, &project, true);
         assert_eq!(trusted.pre_compact.len(), 2);
         assert_eq!(trusted.pre_compact[1][1], "project_compact");
+    }
+
+    #[test]
+    fn f03_legacy_completion_hook_can_still_deny_by_payload() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_dry_run = std::env::var_os("PI_HOOKS_DRY_RUN");
+        let previous_v2 = std::env::var_os("DAVINCI_RUNTIME_HOOKS_V2");
+        std::env::remove_var("PI_HOOKS_DRY_RUN");
+        std::env::set_var("DAVINCI_RUNTIME_HOOKS_V2", "1");
+        let command = if cfg!(windows) {
+            vec!["powershell".into(), "-NoProfile".into(), "-Command".into(),
+                "$p = $input | ConvertFrom-Json; if ($p.event.kind -eq 'task_completed' -and $p.event.success -eq $true) { Write-Output 'legacy completion denied'; exit 1 }; exit 0".into()]
+        } else {
+            vec!["sh".into(), "-c".into(),
+                r#"payload=$(cat); case "$payload" in *'"kind":"task_completed"'*) case "$payload" in *'"success":true'*) echo 'legacy completion denied'; exit 1;; esac;; esac; exit 0"#.into()]
+        };
+        let bus = davinci_agent::RuntimeBus::new();
+        bus.subscribe(std::sync::Arc::new(
+            crate::runtime_host::HooksRuntimeSubscriber::new(HooksFile {
+                task_completed: vec![command],
+                ..Default::default()
+            }),
+        ));
+        let registry = davinci_agent::TaskRegistry::with_bus(bus);
+        let id = registry
+            .create_task(davinci_agent::TaskRecord::new(
+                davinci_agent::RunId::new(),
+                "legacy gate",
+            ))
+            .unwrap();
+        let result = registry.complete_task(id, None);
+        if let Some(value) = previous_dry_run {
+            std::env::set_var("PI_HOOKS_DRY_RUN", value);
+        }
+        match previous_v2 {
+            Some(value) => std::env::set_var("DAVINCI_RUNTIME_HOOKS_V2", value),
+            None => std::env::remove_var("DAVINCI_RUNTIME_HOOKS_V2"),
+        }
+        assert!(
+            matches!(result, Err(davinci_agent::TaskError::CompletionRefused(reason)) if reason.contains("legacy completion denied"))
+        );
+        assert_eq!(
+            registry.get_task(&id).unwrap().state,
+            davinci_agent::TaskState::Ready
+        );
+    }
+
+    #[test]
+    fn f03_completion_proposal_preserves_legacy_hook_payload() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_dry_run = std::env::var_os("PI_HOOKS_DRY_RUN");
+        std::env::remove_var("PI_HOOKS_DRY_RUN");
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("completion.json");
+        let task_id = davinci_agent::TaskId::new();
+        let envelope = davinci_agent::RuntimeEventEnvelope::new(
+            1,
+            davinci_agent::RunId::new(),
+            None,
+            None,
+            None,
+            davinci_agent::RuntimeEvent::TaskCompletionRequested {
+                task_id,
+                expected_revision: 7,
+            },
+        );
+        let reason = run_one_envelope(
+            &shell_hook(0, &capture),
+            "taskCompleted",
+            "",
+            &Value::Null,
+            None,
+            Some(&envelope),
+        );
+        if let Some(value) = previous_dry_run {
+            std::env::set_var("PI_HOOKS_DRY_RUN", value);
+        }
+        assert!(reason.is_none());
+        let text = std::fs::read_to_string(capture).unwrap();
+        let payload: Value =
+            serde_json::from_str(text.trim_start_matches('\u{feff}').trim()).unwrap();
+        assert_eq!(payload["kind"], "taskCompleted");
+        assert_eq!(payload["event"]["kind"], "task_completed");
+        assert_eq!(payload["event"]["success"], true);
+        assert_eq!(payload["event"]["task_id"], task_id.to_string());
+        assert_eq!(payload["event"]["expected_revision"], 7);
+        assert_eq!(payload["event"]["phase"], "proposal");
     }
 
     #[test]

@@ -11,6 +11,62 @@ use thiserror::Error;
 use crate::jobs::JobBook;
 use crate::todo::TodoList;
 
+#[allow(dead_code)]
+pub fn decision_wait(interactive: bool, deferred: bool, cancelled: bool) -> &'static str {
+    if cancelled {
+        "cancelled"
+    } else if deferred {
+        "deferred"
+    } else if interactive {
+        "wait_for_user"
+    } else {
+        "decision_required"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionHostReply {
+    pub action: crate::decisions::HostDecisionAction,
+    pub host_event_id: String,
+    pub answered_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionHostResponse {
+    Reply(DecisionHostReply),
+    Cancelled,
+    Timeout,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecisionHostRequest {
+    pub question: crate::decisions::DecisionQuestion,
+}
+
+#[derive(Clone)]
+pub struct DecisionResponder(
+    Arc<dyn Fn(DecisionHostRequest) -> DecisionHostResponse + Send + Sync + 'static>,
+);
+
+impl std::fmt::Debug for DecisionResponder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DecisionResponder(..)")
+    }
+}
+
+impl DecisionResponder {
+    pub fn new(
+        responder: impl Fn(DecisionHostRequest) -> DecisionHostResponse + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(responder))
+    }
+
+    pub fn respond(&self, request: DecisionHostRequest) -> DecisionHostResponse {
+        (self.0)(request)
+    }
+}
+
 pub const BUILTIN_TOOLS: &[&str] = &[
     "read",
     "write",
@@ -34,7 +90,14 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "write_stdin",
     "update_plan",
     "propose_plan",
+    "ask_user_question",
     "tool_search",
+    "code_definition",
+    "code_references",
+    "code_outline",
+    "code_diagnostics",
+    "code_call_hierarchy",
+    "code_rename_preview",
 ];
 
 pub const CODEX_HOT_TOOLS: &[&str] = &[
@@ -65,6 +128,18 @@ pub struct ToolContext {
     /// of holding the tool thread until the process ends on its own.
     pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub runtime: Option<crate::runtime::RuntimeHandle>,
+    pub task_coordinator: Option<crate::runtime::task_transport::TaskCoordinatorClient>,
+    pub active_contract: Arc<Mutex<Option<crate::runtime::contracts::TaskContract>>>,
+    pub semantic: Option<Arc<dyn crate::semantic::SemanticService>>,
+    /// Trusted host bridge for synchronous user decisions. This is kept
+    /// distinct from permission approval so a recommendation or answer can
+    /// never issue tool authority.
+    pub decision_responder: Option<DecisionResponder>,
+    /// Process-local guard for the one-outstanding-question invariant.
+    pub decision_slot: Arc<Mutex<Option<String>>>,
+    /// Host-question deadline. `None` uses the production default; tests and
+    /// embedders may choose a shorter explicit bound.
+    pub decision_timeout: Option<std::time::Duration>,
 }
 
 pub fn team_tools_enabled() -> bool {
@@ -282,6 +357,28 @@ pub fn tool_specs() -> Vec<AgentTool> {
             parameters: update_plan_parameters(),
         },
         AgentTool {
+            name: "ask_user_question".into(),
+            description: "Ask one material, evidence-backed structured question of the controlling user. The tool carries question content only; answers and host authority are never accepted from model JSON.".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "additionalProperties": false,
+                "properties":{
+                    "id":{"type":"string"},
+                    "kind":{"type":"string","enum":["scope","approach","tradeoff","compatibility","persistence","behavior","verification","other"]},
+                    "title":{"type":"string"},
+                    "question":{"type":"string"},
+                    "materiality":{"type":"string"},
+                    "evidence_refs":{"type":"array","items":{"type":"string"}},
+                    "options":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
+                        "id":{"type":"string"},"label":{"type":"string"},"explanation":{"type":"string"},"recommended":{"type":"boolean"}
+                    },"required":["id","label","explanation"]}},
+                    "allow_custom":{"type":"boolean"},
+                    "custom_only":{"type":"boolean"}
+                },
+                "required":["id","kind","title","question","materiality","evidence_refs","options"]
+            }),
+        },
+        AgentTool {
             name: "tool_search".into(),
             description: "Discover deferred tools and namespaces by keyword query.".into(),
             parameters: serde_json::json!({
@@ -290,6 +387,85 @@ pub fn tool_specs() -> Vec<AgentTool> {
                     "query": { "type": "string", "description": "Keyword query for tool discovery" }
                 },
                 "required": ["query"]
+            }),
+        },
+        AgentTool {
+            name: "code_definition".into(),
+            description: "Find symbol definition via language server or text search fallback.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" },
+                    "line": { "type": "number", "description": "1-indexed line number" },
+                    "character": { "type": "number", "description": "1-indexed character offset" },
+                    "symbol": { "type": "string", "description": "Symbol name for fallback" }
+                },
+                "required": ["path"]
+            }),
+        },
+        AgentTool {
+            name: "code_references".into(),
+            description: "Find symbol references across the workspace via language server or text search fallback.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path containing symbol" },
+                    "line": { "type": "number", "description": "1-indexed line number" },
+                    "character": { "type": "number", "description": "1-indexed character offset" },
+                    "symbol": { "type": "string", "description": "Symbol name to find references for" },
+                    "includeDeclaration": { "type": "boolean", "description": "Include declaration in results" }
+                },
+                "required": ["path"]
+            }),
+        },
+        AgentTool {
+            name: "code_outline".into(),
+            description: "Extract symbol outline (functions, classes, types) for a file.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" }
+                },
+                "required": ["path"]
+            }),
+        },
+        AgentTool {
+            name: "code_diagnostics".into(),
+            description: "Retrieve compiler and linter diagnostics for a file from the language server.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" }
+                },
+                "required": ["path"]
+            }),
+        },
+        AgentTool {
+            name: "code_call_hierarchy".into(),
+            description: "Trace incoming or outgoing call hierarchy for a function or method.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" },
+                    "line": { "type": "number", "description": "1-indexed line number" },
+                    "character": { "type": "number", "description": "1-indexed character offset" },
+                    "direction": { "type": "string", "enum": ["incoming", "outgoing"], "description": "Call direction (incoming or outgoing)" }
+                },
+                "required": ["path", "line", "character"]
+            }),
+        },
+        AgentTool {
+            name: "code_rename_preview".into(),
+            description: "Generate a preview of a workspace-wide symbol rename operation.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Target file path" },
+                    "line": { "type": "number", "description": "1-indexed line number" },
+                    "character": { "type": "number", "description": "1-indexed character offset" },
+                    "newName": { "type": "string", "description": "Proposed new symbol name" }
+                },
+                "required": ["path", "line", "character", "newName"]
             }),
         },
     ];
@@ -379,15 +555,22 @@ pub fn execute_tool_with(
                 details: Some(serde_json::json!({"revision": plan.revision, "changes": plan.changes})),
             })
         },
+        "ask_user_question" => ask_user_question_tool(cwd, input, context),
         "tool_search" => tool_search_tool(input, context),
         "job_output" => crate::jobs::output_tool(&context.jobs, input, context.abort.as_deref())
             .map_err(ToolError::Failed),
         "job_kill" => crate::jobs::kill_tool(&context.jobs, input).map_err(ToolError::Failed),
         "notebook_edit" => notebook_edit_tool(cwd, input),
         "mcp_read" => mcp_read_tool(input, context),
-        "agent_status" | "agent_message" | "agent_stop" | "task_create" | "task_update"
-        | "task_list"
+        "agent_status" | "agent_message" | "agent_stop"
             if !team_tools_enabled() =>
+        {
+            Err(ToolError::Failed(
+                "Team coordination tools are disabled; set DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1 to enable".into(),
+            ))
+        }
+        "task_create" | "task_update" | "task_list" | "task_get"
+            if !team_tools_enabled() && context.task_coordinator.is_none() =>
         {
             Err(ToolError::Failed(
                 "Team coordination tools are disabled; set DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1 to enable".into(),
@@ -399,6 +582,7 @@ pub fn execute_tool_with(
         "task_create" => crate::runtime::task_create_tool(input, context),
         "task_update" => crate::runtime::task_update_tool(input, context),
         "task_list" => crate::runtime::task_list_tool(input, context),
+        "task_get" => crate::runtime::task_get_tool(input, context),
         "workflow_run" | "workflow_status"
             if !workflow_tools_enabled() =>
         {
@@ -408,6 +592,12 @@ pub fn execute_tool_with(
         }
         "workflow_run" => crate::runtime::workflow_run_tool(cwd, input, context),
         "workflow_status" => crate::runtime::workflow_status_tool(input, context),
+        "code_definition" => code_definition_tool(cwd, input, context),
+        "code_references" => code_references_tool(cwd, input, context),
+        "code_outline" => code_outline_tool(cwd, input, context),
+        "code_diagnostics" => code_diagnostics_tool(cwd, input, context),
+        "code_call_hierarchy" => code_call_hierarchy_tool(cwd, input, context),
+        "code_rename_preview" => code_rename_preview_tool(cwd, input, context),
         other if other.starts_with("mcp__") => mcp_call_tool(other, input, context),
         other => Err(ToolError::Unknown(other.to_string())),
     }
@@ -455,6 +645,180 @@ fn write_stdin_tool(
             is_error: true,
             details: None,
         }),
+    }
+}
+
+fn wait_for_decision_host(
+    responder: DecisionResponder,
+    request: DecisionHostRequest,
+    context: &ToolContext,
+) -> DecisionHostResponse {
+    use std::sync::mpsc::RecvTimeoutError;
+    const DEFAULT_DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+    let deadline = context.decision_timeout.unwrap_or(DEFAULT_DECISION_TIMEOUT);
+    let started = std::time::Instant::now();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(responder.respond(request));
+    });
+    loop {
+        if context.is_aborted() {
+            return DecisionHostResponse::Cancelled;
+        }
+        if started.elapsed() >= deadline {
+            return DecisionHostResponse::Timeout;
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        match receiver.recv_timeout(POLL.min(remaining)) {
+            Ok(response) => return response,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return DecisionHostResponse::Unavailable,
+        }
+    }
+}
+
+fn ask_user_question_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let raw: crate::decisions::DecisionQuestionInput = serde_json::from_value(input.clone())
+        .map_err(|error| ToolError::Failed(format!("Invalid structured question: {error}")))?;
+    let snapshot = context
+        .living_plan
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let question = crate::decisions::validate_question_for_plan(raw, &snapshot, cwd)
+        .map_err(ToolError::Failed)?;
+
+    let Some(responder) = &context.decision_responder else {
+        return Ok(ToolResult {
+            content: decision_wait(false, false, false).into(),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "status": decision_wait(false, false, false),
+                "question": question,
+                "interactive": false
+            })),
+        });
+    };
+    if context.is_aborted() {
+        return Ok(ToolResult {
+            content: decision_wait(true, false, true).into(),
+            is_error: true,
+            details: Some(serde_json::json!({"status": decision_wait(true, false, true)})),
+        });
+    }
+
+    {
+        let mut slot = context
+            .decision_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = slot.as_ref() {
+            return Ok(ToolResult {
+                content: format!(
+                    "{}: another question is already pending ({active})",
+                    decision_wait(false, false, false)
+                ),
+                is_error: true,
+                details: Some(serde_json::json!({
+                    "status": decision_wait(false, false, false),
+                    "pending_decision_id":active,
+                    "question":question
+                })),
+            });
+        }
+        *slot = Some(question.id.clone());
+    }
+
+    struct SlotGuard<'a>(&'a Arc<Mutex<Option<String>>>);
+    impl Drop for SlotGuard<'_> {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+    let _slot_guard = SlotGuard(&context.decision_slot);
+    let wait_started = std::time::Instant::now();
+    let response = wait_for_decision_host(
+        responder.clone(),
+        DecisionHostRequest {
+            question: question.clone(),
+        },
+        context,
+    );
+    let elapsed_ms = wait_started.elapsed().as_millis() as u64;
+
+    match response {
+        DecisionHostResponse::Cancelled => Ok(ToolResult {
+            content: decision_wait(true, false, true).into(),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "status": decision_wait(true, false, true),
+                "question":question,
+                "elapsed_ms":elapsed_ms
+            })),
+        }),
+        DecisionHostResponse::Unavailable => Ok(ToolResult {
+            content: decision_wait(false, false, false).into(),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "status": decision_wait(false, false, false),
+                "question":question,
+                "interactive":false,
+                "elapsed_ms":elapsed_ms
+            })),
+        }),
+        DecisionHostResponse::Timeout => Ok(ToolResult {
+            content: format!(
+                "{}: timed out waiting for user",
+                decision_wait(false, false, false)
+            ),
+            is_error: true,
+            details: Some(serde_json::json!({
+                "status": decision_wait(false, false, false),
+                "reason":"timeout",
+                "question":question,
+                "elapsed_ms":elapsed_ms
+            })),
+        }),
+        DecisionHostResponse::Reply(reply) => {
+            let mut pending = snapshot.clone();
+            pending
+                .structured_decisions
+                .insert(question.id.clone(), question.clone());
+            let host_reply = crate::decisions::HostDecisionReply {
+                decision_id: question.id.clone(),
+                expected_plan_revision: snapshot.revision,
+                expected_question_revision: question.plan_revision,
+                host_event_id: reply.host_event_id,
+                answered_at_ms: reply.answered_at_ms,
+                action: reply.action,
+            };
+            let (next, _) = crate::decisions::apply_host_decision(&pending, &host_reply, cwd)
+                .map_err(ToolError::Failed)?;
+            let state = next
+                .structured_decisions
+                .get(&question.id)
+                .map(|decision| format!("{:?}", decision.state).to_ascii_lowercase())
+                .unwrap_or_else(|| "unknown".into());
+            *context
+                .living_plan
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = next.clone();
+            Ok(ToolResult {
+                content: state.clone(),
+                is_error: false,
+                details: Some(serde_json::json!({
+                    "status":state,
+                    "decision_id":question.id,
+                    "revision":next.revision,
+                    "elapsed_ms":elapsed_ms
+                })),
+            })
+        }
     }
 }
 
@@ -2246,10 +2610,533 @@ fn match_glob_chars(pattern: &str, name: &str) -> bool {
     rec(&p, &n)
 }
 
+fn code_definition_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let symbol = input.get("symbol").and_then(Value::as_str);
+
+    if let Some(semantic) = &context.semantic {
+        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if semantic.is_server_available(lang, &path)
+            && semantic.capabilities(lang, &path).definition
+        {
+            match semantic.definition(
+                cwd,
+                raw_path,
+                line.saturating_sub(1),
+                character.saturating_sub(1),
+            ) {
+                Ok(res) => {
+                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                    return Ok(ToolResult {
+                        content,
+                        is_error: false,
+                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                    });
+                }
+                Err(err) => return Err(ToolError::Failed(err)),
+            }
+        }
+    }
+
+    let sym = symbol.ok_or_else(|| {
+        ToolError::Failed(
+            "No language server available and no `symbol` argument provided for text fallback"
+                .into(),
+        )
+    })?;
+    let res =
+        crate::semantic::text_fallback_definition(cwd, sym, Some(&path), context.abort.as_deref())
+            .map_err(ToolError::Failed)?;
+    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+    })
+}
+
+fn code_references_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let symbol = input.get("symbol").and_then(Value::as_str);
+    let include_decl = input
+        .get("includeDeclaration")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    if let Some(semantic) = &context.semantic {
+        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if semantic.is_server_available(lang, &path)
+            && semantic.capabilities(lang, &path).references
+        {
+            match semantic.references(
+                cwd,
+                raw_path,
+                line.saturating_sub(1),
+                character.saturating_sub(1),
+                include_decl,
+            ) {
+                Ok(res) => {
+                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                    return Ok(ToolResult {
+                        content,
+                        is_error: false,
+                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                    });
+                }
+                Err(err) => return Err(ToolError::Failed(err)),
+            }
+        }
+    }
+
+    let sym = symbol.ok_or_else(|| {
+        ToolError::Failed(
+            "No language server available and no `symbol` argument provided for text fallback"
+                .into(),
+        )
+    })?;
+    let res =
+        crate::semantic::text_fallback_references(cwd, sym, Some(&path), context.abort.as_deref())
+            .map_err(ToolError::Failed)?;
+    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+    })
+}
+
+fn code_outline_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+
+    if let Some(semantic) = &context.semantic {
+        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if semantic.is_server_available(lang, &path) && semantic.capabilities(lang, &path).outline {
+            match semantic.outline(cwd, raw_path) {
+                Ok(res) => {
+                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                    return Ok(ToolResult {
+                        content,
+                        is_error: false,
+                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                    });
+                }
+                Err(err) => return Err(ToolError::Failed(err)),
+            }
+        }
+    }
+
+    let res = crate::semantic::text_fallback_outline(cwd, raw_path).map_err(ToolError::Failed)?;
+    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+    })
+}
+
+fn code_diagnostics_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+
+    if let Some(semantic) = &context.semantic {
+        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if semantic.is_server_available(lang, &path)
+            && semantic.capabilities(lang, &path).diagnostics
+        {
+            match semantic.diagnostics(cwd, raw_path) {
+                Ok(res) => {
+                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                    return Ok(ToolResult {
+                        content,
+                        is_error: false,
+                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                    });
+                }
+                Err(err) => return Err(ToolError::Failed(err)),
+            }
+        }
+    }
+
+    Err(ToolError::Failed(
+        "Diagnostics unavailable: language server not available for this file type".into(),
+    ))
+}
+
+fn code_call_hierarchy_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let direction = input
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("incoming");
+    let incoming = direction != "outgoing";
+
+    if let Some(semantic) = &context.semantic {
+        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if semantic.is_server_available(lang, &path)
+            && semantic.capabilities(lang, &path).call_hierarchy
+        {
+            match semantic.call_hierarchy(
+                cwd,
+                raw_path,
+                line.saturating_sub(1),
+                character.saturating_sub(1),
+                incoming,
+            ) {
+                Ok(res) => {
+                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                    return Ok(ToolResult {
+                        content,
+                        is_error: false,
+                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                    });
+                }
+                Err(err) => return Err(ToolError::Failed(err)),
+            }
+        }
+    }
+
+    Err(ToolError::Failed(
+        "Call hierarchy is unsupported without an active language server".into(),
+    ))
+}
+
+fn code_rename_preview_tool(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    if context.is_aborted() {
+        return Err(ToolError::Failed("Operation aborted".into()));
+    }
+    let raw_path = required_str(input, "path")?;
+    let path = resolve(cwd, raw_path)?;
+    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let new_name = required_str(input, "newName")?;
+
+    if let Some(semantic) = &context.semantic {
+        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if semantic.is_server_available(lang, &path)
+            && semantic.capabilities(lang, &path).rename_preview
+        {
+            match semantic.rename_preview(
+                cwd,
+                raw_path,
+                line.saturating_sub(1),
+                character.saturating_sub(1),
+                new_name,
+            ) {
+                Ok(preview) => {
+                    let content = serde_json::to_string_pretty(&preview).unwrap_or_default();
+                    return Ok(ToolResult {
+                        content,
+                        is_error: false,
+                        details: Some(serde_json::to_value(&preview).unwrap_or_default()),
+                    });
+                }
+                Err(err) => return Err(ToolError::Failed(err)),
+            }
+        }
+    }
+
+    Err(ToolError::Failed("Rename preview is unavailable without an active language server; plain text search cannot safely guarantee semantic rename".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn f02_waiting_mode() {
+        assert_eq!(decision_wait(false, false, false), "decision_required");
+        assert_eq!(decision_wait(true, false, false), "wait_for_user");
+        assert_eq!(decision_wait(true, true, false), "deferred");
+        assert_eq!(decision_wait(true, false, true), "cancelled");
+    }
+
+    fn f02_question_fixture() -> (tempfile::TempDir, ToolContext, serde_json::Value) {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("src.rs"), "fn existing() {}\n").unwrap();
+        let mut plan = crate::LivingPlan::default();
+        plan.update(
+            &serde_json::json!({
+                "expected_revision":0,
+                "goal":"Choose cache persistence",
+                "evidence":[{"path":"src.rs","finding":"Current cache entry point"}]
+            }),
+            dir.path(),
+        )
+        .unwrap();
+        let context = ToolContext {
+            living_plan: Arc::new(Mutex::new(plan)),
+            ..ToolContext::default()
+        };
+        let question = serde_json::json!({
+            "id":"cache-scope",
+            "kind":"persistence",
+            "title":"Cache scope",
+            "question":"Which cache should be used?",
+            "materiality":"Changes persistence semantics",
+            "evidence_refs":["src.rs"],
+            "options":[
+                {"id":"memory","label":"Memory","explanation":"Process local","recommended":true},
+                {"id":"sqlite","label":"SQLite","explanation":"Persistent","recommended":false}
+            ],
+            "allow_custom":true,
+            "custom_only":false
+        });
+        (dir, context, question)
+    }
+
+    #[test]
+    fn f02_question_schema_has_content_but_no_authority_fields() {
+        let spec = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "ask_user_question")
+            .unwrap();
+        let properties = spec.parameters["properties"].as_object().unwrap();
+        for forbidden in [
+            "answer",
+            "state",
+            "actor",
+            "approved_revision",
+            "permission_mode",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "schema exposed {forbidden}"
+            );
+        }
+        assert_eq!(spec.parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn f02_no_ui_and_timeout_return_pending_without_plan_mutation() {
+        let (dir, context, question) = f02_question_fixture();
+        let before = context.living_plan.lock().unwrap().clone();
+        let unavailable =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &context).unwrap();
+        assert!(unavailable.is_error);
+        assert_eq!(
+            unavailable.details.as_ref().unwrap()["status"],
+            "decision_required"
+        );
+        assert_eq!(*context.living_plan.lock().unwrap(), before);
+
+        let timeout_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                DecisionHostResponse::Unavailable
+            })),
+            decision_timeout: Some(std::time::Duration::from_millis(25)),
+            ..ToolContext::default()
+        };
+        let started = std::time::Instant::now();
+        let timed_out =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &timeout_context)
+                .unwrap();
+        assert!(timed_out.is_error);
+        assert_eq!(timed_out.details.as_ref().unwrap()["reason"], "timeout");
+        assert!(
+            timed_out.details.as_ref().unwrap()["elapsed_ms"]
+                .as_u64()
+                .unwrap()
+                >= 20
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+        assert_eq!(*timeout_context.living_plan.lock().unwrap(), before);
+    }
+
+    #[test]
+    fn f02_host_answer_uses_authenticated_reply_and_never_changes_files() {
+        let (dir, context, question) = f02_question_fixture();
+        let source_before = fs::read(dir.path().join("src.rs")).unwrap();
+        let answer_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                DecisionHostResponse::Reply(DecisionHostReply {
+                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    host_event_id: "ui-event-1".into(),
+                    answered_at_ms: 42,
+                })
+            })),
+            ..ToolContext::default()
+        };
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &answer_context).unwrap();
+        assert!(!result.is_error);
+        let plan = answer_context.living_plan.lock().unwrap().clone();
+        let decision = &plan.structured_decisions["cache-scope"];
+        assert_eq!(
+            decision.state,
+            crate::decisions::DecisionState::AnsweredByUser
+        );
+        assert_eq!(
+            decision.answer.as_ref().unwrap().host_event_id,
+            "ui-event-1"
+        );
+        assert_eq!(fs::read(dir.path().join("src.rs")).unwrap(), source_before);
+    }
+
+    #[test]
+    fn f02_one_question_capacity_and_parent_stop_are_fail_closed() {
+        let (dir, context, question) = f02_question_fixture();
+        *context.decision_slot.lock().unwrap() = Some("already-pending".into());
+        let occupied = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_slot: context.decision_slot.clone(),
+            decision_responder: Some(DecisionResponder::new(|_| panic!("must not dispatch"))),
+            ..ToolContext::default()
+        };
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &occupied).unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            result.details.as_ref().unwrap()["pending_decision_id"],
+            "already-pending"
+        );
+
+        let stopped = ToolContext {
+            living_plan: context.living_plan.clone(),
+            abort: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+            decision_responder: Some(DecisionResponder::new(|_| panic!("must not dispatch"))),
+            ..ToolContext::default()
+        };
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &stopped).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.details.as_ref().unwrap()["status"], "cancelled");
+
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let during_wait = ToolContext {
+            living_plan: context.living_plan.clone(),
+            abort: Some(abort.clone()),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                DecisionHostResponse::Unavailable
+            })),
+            decision_timeout: Some(std::time::Duration::from_secs(1)),
+            ..ToolContext::default()
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &during_wait).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.details.as_ref().unwrap()["status"], "cancelled");
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
+    }
+
+    #[test]
+    fn f02_hanging_responder_times_out_promptly_without_plan_mutation() {
+        let (dir, context, question) = f02_question_fixture();
+        let before = context.living_plan.lock().unwrap().clone();
+        let timeout_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                DecisionHostResponse::Reply(DecisionHostReply {
+                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    host_event_id: "late-event".into(),
+                    answered_at_ms: 100,
+                })
+            })),
+            decision_timeout: Some(std::time::Duration::from_millis(25)),
+            ..ToolContext::default()
+        };
+        let started = std::time::Instant::now();
+        let timed_out =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &timeout_context)
+                .unwrap();
+        assert!(timed_out.is_error);
+        assert_eq!(timed_out.details.as_ref().unwrap()["reason"], "timeout");
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(*timeout_context.living_plan.lock().unwrap(), before);
+        assert!(timeout_context.decision_slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn f02_abort_while_responder_blocked_cancels_promptly() {
+        let (dir, context, question) = f02_question_fixture();
+        let before = context.living_plan.lock().unwrap().clone();
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let abort_context = ToolContext {
+            living_plan: context.living_plan.clone(),
+            abort: Some(abort.clone()),
+            decision_responder: Some(DecisionResponder::new(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                DecisionHostResponse::Reply(DecisionHostReply {
+                    action: crate::decisions::HostDecisionAction::AnswerChoice("sqlite".into()),
+                    host_event_id: "late-event".into(),
+                    answered_at_ms: 100,
+                })
+            })),
+            decision_timeout: Some(std::time::Duration::from_secs(10)),
+            ..ToolContext::default()
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let result =
+            execute_tool_with(dir.path(), "ask_user_question", &question, &abort_context).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.details.as_ref().unwrap()["status"], "cancelled");
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(*abort_context.living_plan.lock().unwrap(), before);
+        assert!(abort_context.decision_slot.lock().unwrap().is_none());
+    }
 
     #[test]
     fn parallel_edits_on_the_same_file_are_serialized() {
@@ -2694,6 +3581,7 @@ mod tests {
         let specs = tool_specs();
         assert!(!specs.iter().any(|s| s.name == "agent_status"));
         assert!(!specs.iter().any(|s| s.name == "task_create"));
+        assert!(!specs.iter().any(|s| s.name == "task_get"));
 
         let err = execute_tool_with(dir.path(), "agent_status", &serde_json::json!({}), &context)
             .unwrap_err();
@@ -2704,10 +3592,24 @@ mod tests {
         // When enabled
         std::env::set_var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS", "1");
         let specs_enabled = tool_specs();
+        let capabilities = crate::runtime::capabilities::builtin_capabilities();
+        let get_dispatch = execute_tool_with(
+            dir.path(),
+            "task_get",
+            &serde_json::json!({"task_id": uuid::Uuid::new_v4().to_string()}),
+            &context,
+        );
         std::env::remove_var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS");
+        assert!(
+            matches!(get_dispatch, Err(ToolError::Failed(message)) if message == "Runtime subsystem not initialized")
+        );
+        assert!(capabilities
+            .iter()
+            .any(|cap| cap.name == "task_get" && cap.read_only));
         assert!(specs_enabled.iter().any(|s| s.name == "agent_status"));
         assert!(specs_enabled.iter().any(|s| s.name == "task_create"));
         assert!(specs_enabled.iter().any(|s| s.name == "task_update"));
+        assert!(specs_enabled.iter().any(|s| s.name == "task_get"));
     }
 
     #[test]
@@ -2739,5 +3641,108 @@ mod tests {
         std::env::remove_var("DAVINCI_EXPERIMENTAL_WORKFLOWS");
         assert!(specs_enabled.iter().any(|s| s.name == "workflow_run"));
         assert!(specs_enabled.iter().any(|s| s.name == "workflow_status"));
+    }
+
+    #[test]
+    fn semantic_tools_registration_and_fallback_execution() {
+        let dir = tempdir().unwrap();
+        let context = ToolContext::default();
+
+        // 1. Tool specs exist
+        let specs = tool_specs();
+        assert!(specs.iter().any(|s| s.name == "code_definition"));
+        assert!(specs.iter().any(|s| s.name == "code_references"));
+        assert!(specs.iter().any(|s| s.name == "code_outline"));
+        assert!(specs.iter().any(|s| s.name == "code_diagnostics"));
+        assert!(specs.iter().any(|s| s.name == "code_call_hierarchy"));
+        assert!(specs.iter().any(|s| s.name == "code_rename_preview"));
+
+        // 2. Prepare sample source file
+        let src = r#"
+pub struct User {
+    pub name: String,
+}
+
+impl User {
+    pub fn greet(&self) -> String {
+        format!("Hello, {}", self.name)
+    }
+}
+"#;
+        std::fs::write(dir.path().join("user.rs"), src).unwrap();
+
+        // 3. Fallback definition
+        let def_res = execute_tool_with(
+            dir.path(),
+            "code_definition",
+            &serde_json::json!({"path": "user.rs", "symbol": "greet"}),
+            &context,
+        )
+        .unwrap();
+        assert!(!def_res.is_error);
+        assert!(def_res.content.contains("greet"));
+        assert!(def_res.content.contains("fallback"));
+
+        // 4. Fallback references
+        let ref_res = execute_tool_with(
+            dir.path(),
+            "code_references",
+            &serde_json::json!({"path": "user.rs", "symbol": "User"}),
+            &context,
+        )
+        .unwrap();
+        assert!(!ref_res.is_error);
+        assert!(ref_res.content.contains("user.rs"));
+
+        // 5. Fallback outline
+        let outline_res = execute_tool_with(
+            dir.path(),
+            "code_outline",
+            &serde_json::json!({"path": "user.rs"}),
+            &context,
+        )
+        .unwrap();
+        assert!(!outline_res.is_error);
+        assert!(outline_res.content.contains("User"));
+        assert!(outline_res.content.contains("greet"));
+
+        // 6. Diagnostics without server returns error (not 0 errors)
+        let diag_res = execute_tool_with(
+            dir.path(),
+            "code_diagnostics",
+            &serde_json::json!({"path": "user.rs"}),
+            &context,
+        );
+        assert!(diag_res.is_err());
+        assert!(diag_res
+            .unwrap_err()
+            .to_string()
+            .contains("Diagnostics unavailable"));
+
+        // 7. Call hierarchy without server returns unsupported error
+        let hier_res = execute_tool_with(
+            dir.path(),
+            "code_call_hierarchy",
+            &serde_json::json!({"path": "user.rs", "line": 7, "character": 12}),
+            &context,
+        );
+        assert!(hier_res.is_err());
+        assert!(hier_res
+            .unwrap_err()
+            .to_string()
+            .contains("Call hierarchy is unsupported"));
+
+        // 8. Rename preview without server returns error
+        let rename_res = execute_tool_with(
+            dir.path(),
+            "code_rename_preview",
+            &serde_json::json!({"path": "user.rs", "line": 7, "character": 12, "newName": "say_hello"}),
+            &context,
+        );
+        assert!(rename_res.is_err());
+        assert!(rename_res
+            .unwrap_err()
+            .to_string()
+            .contains("Rename preview is unavailable"));
     }
 }

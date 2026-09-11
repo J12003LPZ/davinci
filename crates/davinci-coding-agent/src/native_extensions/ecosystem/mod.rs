@@ -253,6 +253,9 @@ mod tests {
             expect: ArtifactKind::Evidence,
             extra_extensions: vec![],
             runtime_agent_id: None,
+            task_contract: None,
+            coordinator_client: None,
+            node_abort: None,
         };
         let args = build_worker_args(&spec, Path::new("briefing.md"), Path::new("system.md"));
         assert!(
@@ -485,6 +488,8 @@ mod tests {
             learning: Some(learning),
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -602,6 +607,8 @@ mod tests {
             learning: Some(learning),
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -775,6 +782,8 @@ mod tests {
             learning: Some(learning),
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -919,6 +928,8 @@ mod tests {
             )),
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
 
         let options = RunOptions {
@@ -1042,6 +1053,8 @@ mod tests {
             learning: None,
             governor: None,
             runtime: None,
+            permissions: None,
+            task_contract: None,
         };
         let sec_run = run_graph(
             RunOptions {

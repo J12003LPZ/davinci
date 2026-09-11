@@ -1,6 +1,10 @@
 //! Agent runtime matching `@earendil-works/pi-agent-core`.
 
 pub mod apply_patch;
+pub mod approval;
+pub mod decisions;
+mod permission_state;
+pub use permission_state::PermissionState;
 mod batch;
 mod branch;
 mod compaction;
@@ -19,6 +23,7 @@ pub mod prompt;
 mod pruning;
 mod queues;
 mod scheduler;
+pub mod semantic;
 pub mod shell_policy;
 mod skills;
 mod stats;
@@ -91,7 +96,8 @@ pub use tool_ledger::{
     classify_side_effect, ToolCallLedger, ToolCallRecord, ToolExecutionStatus, ToolSideEffect,
 };
 pub use tools::{
-    execute_tool, execute_tool_with, tool_specs, validate_builtin_tool_descriptions, AgentTool,
+    decision_wait, execute_tool, execute_tool_with, tool_specs, validate_builtin_tool_descriptions,
+    AgentTool, DecisionHostReply, DecisionHostRequest, DecisionHostResponse, DecisionResponder,
     ToolContext, ToolError, ToolResult, BUILTIN_TOOLS, CODEX_HOT_TOOLS,
 };
 pub use turn::retry_delay_ms;
@@ -103,14 +109,17 @@ pub use prompt::{
     PromptModule, PromptModuleIdentity, RuntimePromptState,
 };
 pub use runtime::{
-    find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
+    contract_gate, effect_profile_allows, find_saved_workflow, hash_system_prompt,
+    hash_system_prompt_with_manifest, hash_tool_names, normalize_relative_path, path_scope_allows,
     save_workflow_to_project, wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState,
     CacheIdentity, CacheMissReason, CancellationToken, CapabilitySource, ContextBroker,
-    ContextItem, ContextPacket, ContextRequest, ContextSource, PhaseStatus, RegistryError, RunId,
-    RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent,
-    RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, TaskError, TaskId,
-    TaskRecord, TaskRegistry, TaskState, WorkflowExecutor, WorkflowId, WorkflowSpec,
-    WorkflowStateStore, WorkflowStatus, WorktreeError, WorktreeLease, WorktreeManager,
+    ContextItem, ContextPacket, ContextRequest, ContextSource, ContractError, ContractExecutor,
+    DeclaredEffect, ExecutionError, ExecutorCapabilities, PhaseStatus, PreparedAction,
+    RegistryError, RunId, RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry,
+    RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry,
+    RuntimeSubscriber, ScopeViolation, TaskContract, TaskError, TaskId, TaskRecord, TaskRegistry,
+    TaskState, WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore, WorkflowStatus,
+    WorktreeError, WorktreeLease, WorktreeManager,
 };
 
 use davinci_ai::{
@@ -228,10 +237,15 @@ pub struct Agent {
     /// Which tools may run without asking (`permission.rs`). Shared, because
     /// the gate reads it from `&self` on the tool thread while the host reads
     /// the mode for its chrome, and a granted rule is written back mid-turn.
-    pub permissions: Arc<std::sync::Mutex<PermissionPolicy>>,
+    /// Construct with `Arc::new(PermissionState::new(policy))`; update through
+    /// `lock()` so mutable access invalidates outstanding approval revisions.
+    pub permissions: Arc<PermissionState>,
     /// Who answers when the policy says ask. `None` means the run cannot
     /// ask, and the call is refused with a message that says so.
     pub approver: Option<ToolApprover>,
+    /// Typed trusted-host responder; takes precedence over the legacy approver.
+    pub approval_responder: Option<approval::ApprovalResponder>,
+    approval_registry: Arc<approval::ApprovalRegistry>,
     /// Background shell jobs (`jobs.rs`) and the model's todo ledger
     /// (`todo.rs`), shared with the tool thread and the shell.
     pub tool_context: ToolContext,
@@ -275,10 +289,15 @@ pub struct Agent {
     ephemeral_context: Vec<ChatMessage>,
     /// Host-supplied schema/identity estimate, excluding `system_prompt` and messages.
     provider_context_overhead_tokens: Option<u64>,
+    /// Last prepared context manifest before provider dispatch.
+    pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
     pub runtime: Option<RuntimeHandle>,
     /// Active prompt manifest identifying modules, hashes, and token budgets.
     pub prompt_manifest: Option<PromptManifest>,
+    /// Exact host session source and lineage captured at runtime installation.
+    /// Separate from mutable public session/runtime fields to reject stale reuse.
+    runtime_session: Option<(PathBuf, String, RunId)>,
 }
 
 impl Agent {
@@ -323,8 +342,10 @@ impl Agent {
             custom_tool_executor: None,
             pre_tool: None,
             post_tool: None,
-            permissions: Arc::new(std::sync::Mutex::new(PermissionPolicy::default())),
+            permissions: Arc::new(PermissionState::new(PermissionPolicy::default())),
             approver: None,
+            approval_responder: None,
+            approval_registry: Arc::new(approval::ApprovalRegistry::default()),
             tool_context: ToolContext::default(),
             summarizer: None,
             subagent_runner: None,
@@ -351,7 +372,9 @@ impl Agent {
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
             provider_context_overhead_tokens: None,
+            last_prepared_manifest: None,
             runtime: None,
+            runtime_session: None,
         }
     }
 
@@ -361,17 +384,40 @@ impl Agent {
             .register_with(&runtime.capability_registry);
         runtime
             .cancellation_token
-            .attach_job_book(self.tool_context.jobs.clone());
-        if self.abort_signal.is_none() {
+            .bind_job_book(&self.tool_context.jobs);
+        let owns_abort_signal = self.abort_signal.as_ref().is_some_and(|signal| {
+            self.runtime.as_ref().is_some_and(|previous| {
+                Arc::ptr_eq(signal, &previous.cancellation_token.as_atomic_bool())
+            })
+        });
+        if self.abort_signal.is_none() || owns_abort_signal {
             self.abort_signal = Some(runtime.cancellation_token.as_atomic_bool());
         }
         self.tool_context.runtime = Some(runtime.clone());
+        self.runtime_session = self.session.as_ref().and_then(|session| {
+            let source = std::fs::canonicalize(&session.path).ok()?;
+            (runtime.session_id.as_deref() == Some(session.header.id.as_str()))
+                .then(|| (source, session.header.id.clone(), runtime.run_id))
+        });
         self.runtime = Some(runtime);
     }
 
     pub fn with_runtime(mut self, runtime: RuntimeHandle) -> Self {
         self.set_runtime(runtime);
         self
+    }
+
+    /// Return the runtime bound to the current session, when reusable by the host.
+    pub fn runtime_for_session(&self) -> Option<&RuntimeHandle> {
+        let session = self.session.as_ref()?;
+        let (path, id, run_id) = self.runtime_session.as_ref()?;
+        let source = std::fs::canonicalize(&session.path).ok()?;
+        self.runtime.as_ref().filter(|runtime| {
+            source == *path
+                && session.header.id == *id
+                && runtime.session_id.as_deref() == Some(id.as_str())
+                && runtime.run_id == *run_id
+        })
     }
 
     pub fn register_context_source(&mut self, source: Arc<dyn crate::runtime::ContextSource>) {
@@ -613,6 +659,127 @@ impl Agent {
     /// any host-added system suffix. `None` restores the builtin/MCP estimate.
     pub fn set_provider_context_overhead_tokens(&mut self, tokens: Option<u64>) {
         self.provider_context_overhead_tokens = tokens;
+    }
+
+    /// Captures the complete prepared provider context manifest.
+    pub fn prepare_context_manifest(
+        &mut self,
+        request_id: &str,
+        root_run_id: runtime::ids::RunId,
+        source_revision: u64,
+        overlay_revision: u64,
+    ) -> runtime::context_manifest::PreparedContextManifest {
+        use runtime::context_manifest::{
+            ContextManifestEntry, PreparedContextManifest, ProvenanceKind,
+        };
+        let mut entries = Vec::new();
+
+        // 1. Mandatory system prompt
+        let sys_tokens = (self.system_prompt.len() as u64).div_ceil(4);
+        let sys_hash = ContextManifestEntry::hash_content(&self.system_prompt);
+        entries.push(ContextManifestEntry::new(
+            "system_prompt",
+            "system",
+            ProvenanceKind::MandatoryPolicy,
+            "agent::system_prompt",
+            sys_hash,
+            sys_tokens,
+            true,
+            Some("mandatory_system_prompt".into()),
+            true,
+            "fresh",
+            None,
+        ));
+
+        // 2. Mandatory tool schemas
+        let tool_tokens = self.provider_context_overhead_tokens.unwrap_or_else(|| {
+            let specs = self.builtin_and_mcp_specs();
+            (serde_json::to_vec(&specs)
+                .expect("tool schemas are JSON")
+                .len() as u64)
+                .div_ceil(4)
+        });
+        entries.push(ContextManifestEntry::new(
+            "tool_schemas",
+            "tools",
+            ProvenanceKind::MandatoryPolicy,
+            "agent::tool_catalog",
+            ContextManifestEntry::hash_content(&self.tools.join(",")),
+            tool_tokens,
+            true,
+            Some("mandatory_tool_schemas".into()),
+            true,
+            "fresh",
+            None,
+        ));
+
+        // 3. Living plan if present
+        if let Some(plan_text) = self.plan_provider_context() {
+            let plan_tokens = (plan_text.len() as u64).div_ceil(4);
+            entries.push(ContextManifestEntry::new(
+                "living_plan",
+                "plan",
+                ProvenanceKind::UserDecision,
+                "agent::living_plan",
+                ContextManifestEntry::hash_content(&plan_text),
+                plan_tokens,
+                true,
+                Some("active_plan".into()),
+                false,
+                "fresh",
+                None,
+            ));
+        }
+
+        // 4. Ephemeral context
+        for (i, msg) in self.ephemeral_context.iter().enumerate() {
+            let tokens = compaction::estimate_tokens(msg);
+            let content_str = serde_json::to_string(&msg.content).unwrap_or_default();
+            entries.push(ContextManifestEntry::new(
+                format!("ephemeral_{i}"),
+                "ephemeral",
+                ProvenanceKind::ToolEvidence,
+                "agent::ephemeral_context",
+                ContextManifestEntry::hash_content(&content_str),
+                tokens,
+                true,
+                Some("ephemeral_injection".into()),
+                false,
+                "fresh",
+                None,
+            ));
+        }
+
+        // 5. Conversation messages
+        for (i, msg) in self.messages_for_provider().iter().enumerate() {
+            let tokens = compaction::estimate_tokens(msg);
+            let content_str = serde_json::to_string(&msg.content).unwrap_or_default();
+            entries.push(ContextManifestEntry::new(
+                format!("message_{i}"),
+                "history",
+                ProvenanceKind::ToolEvidence,
+                format!("message::{}", msg.role),
+                ContextManifestEntry::hash_content(&content_str),
+                tokens,
+                true,
+                Some("conversation_history".into()),
+                false,
+                "fresh",
+                None,
+            ));
+        }
+
+        let manifest = PreparedContextManifest::new(
+            request_id,
+            root_run_id,
+            source_revision,
+            overlay_revision,
+            entries,
+            0,
+        );
+
+        self.last_prepared_manifest = Some(manifest.clone());
+        manifest
     }
 
     /// Prune old tool output from the provider view when the context has
@@ -1139,31 +1306,58 @@ impl Agent {
         self.aborted = true;
     }
 
-    /// True when either the local flag or the cross-thread signal fired.
+    /// True when the local flag, host signal, or active runtime is cancelled.
     pub fn abort_requested(&self) -> bool {
         self.aborted
             || self
                 .abort_signal
                 .as_ref()
                 .is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Relaxed))
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.cancellation_token.is_cancelled())
     }
 
-    pub fn load_from_session(&mut self, session: JsonlSession) {
-        self.messages = messages_from_session(&session);
+    /// Revoke ephemeral consent when an idle host replaces or reloads a session.
+    /// Keep the configured policy and transport callbacks for the next request.
+    pub fn reset_session_approvals(&mut self) {
+        let mut policy = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        policy.session_allow.clear();
+        self.approval_registry.revoke_all();
+    }
+
+    /// Activate durable task state before replacing the active session.
+    /// Reloading the live source preserves its writer lease and worker handles.
+    pub fn load_from_session(&mut self, session: JsonlSession) -> Result<(), String> {
+        let source = std::fs::canonicalize(&session.path).map_err(|error| {
+            format!("Runtime recovery required: session source could not be resolved: {error}")
+        })?;
+        let current = self.runtime_for_session().filter(|runtime| {
+            self.runtime_session
+                .as_ref()
+                .is_some_and(|(path, id, _)| *path == source && *id == session.header.id)
+                && runtime.task_registry.is_durable()
+        });
+        let candidate = match current {
+            Some(runtime) => runtime.clone(),
+            None => runtime::session::restore_session_runtime(
+                RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new()),
+                &session,
+            )
+            .map_err(|error| format!("Runtime recovery required: {error}"))?,
+        };
+        let messages = messages_from_session(&session);
+        self.reset_session_approvals();
+        self.messages = messages;
         self.pending_prompt_messages.clear();
-        if let Some(ref mut rt) = self.runtime {
-            rt.session_id = Some(session.header.id.clone());
-            let log_path = davinci_session::runtime_log_path(&session.path);
-            if log_path.is_file() {
-                if let Ok(events) =
-                    davinci_session::read_runtime_log::<crate::RuntimeEventEnvelope>(&log_path)
-                {
-                    let _ = rt.rehydrate_from_log(&events);
-                }
-            }
-        }
         self.session = Some(session);
+        self.set_runtime(candidate);
         self.restore_living_plan();
+        Ok(())
     }
 
     /// Navigate the session tree. When `summarize` is true, generates a branch
@@ -1437,6 +1631,280 @@ pub fn chat_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f03_equivalent_session_path_reuses_live_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let intermediate = session.path.parent().unwrap().join("alias");
+        std::fs::create_dir(&intermediate).unwrap();
+        let alias = intermediate
+            .join("..")
+            .join(session.path.file_name().unwrap());
+        let mut agent = Agent::new("fixture");
+        agent.load_from_session(session).unwrap();
+        let run = agent.runtime_for_session().unwrap().run_id;
+        agent
+            .load_from_session(JsonlSession::open(&alias).unwrap())
+            .unwrap();
+        assert_eq!(agent.runtime_for_session().unwrap().run_id, run);
+    }
+
+    #[test]
+    fn f03_session_reload_preserves_live_claim_and_writer_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = session.path.clone();
+        let mut agent = Agent::new("fixture");
+        agent.load_from_session(session).unwrap();
+        let worker = agent.runtime_for_session().unwrap().clone();
+        let id = worker
+            .task_registry
+            .create_task(TaskRecord::new(worker.run_id, "live"))
+            .unwrap();
+        let before = worker.task_registry.get_task(&id).unwrap();
+        worker
+            .task_registry
+            .claim_task(id, worker.run_id, worker.agent_id, before.revision)
+            .unwrap();
+        let claimed = worker.task_registry.get_task(&id).unwrap();
+        agent
+            .load_from_session(JsonlSession::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            agent
+                .runtime_for_session()
+                .unwrap()
+                .task_registry
+                .get_task(&id),
+            Some(claimed)
+        );
+        assert!(!worker.cancellation_token.is_cancelled());
+        let mut competing = Agent::new("fixture");
+        assert!(competing
+            .load_from_session(JsonlSession::open(&path).unwrap())
+            .is_err());
+        assert!(competing.session.is_none());
+        drop(worker);
+        drop(agent);
+        competing
+            .load_from_session(JsonlSession::open(&path).unwrap())
+            .unwrap();
+        let recovered = competing
+            .runtime_for_session()
+            .unwrap()
+            .task_registry
+            .get_task(&id)
+            .unwrap();
+        assert_eq!(recovered.state, TaskState::Failed);
+    }
+
+    #[test]
+    fn f03_corrupt_task_journal_prevents_session_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let mut agent = Agent::new("fixture");
+        agent.load_from_session(first).unwrap();
+        let first_path = agent.session.as_ref().unwrap().path.clone();
+        let run = agent.runtime_for_session().unwrap().run_id;
+        let next = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let journal = next.path.with_extension("tasks.jsonl");
+        let corrupt = b"invalid task journal\n";
+        std::fs::write(&journal, corrupt).unwrap();
+        let error = agent.load_from_session(next).unwrap_err();
+        assert!(
+            error.contains("task journal could not be opened"),
+            "{error}"
+        );
+        assert_eq!(agent.session.as_ref().unwrap().path, first_path);
+        assert_eq!(agent.runtime_for_session().unwrap().run_id, run);
+        assert_eq!(std::fs::read(journal).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn f03_session_load_activates_durable_tasks_before_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = session.path.clone();
+        let mut agent = Agent::new("fixture");
+        agent.load_from_session(session).unwrap();
+        assert!(path.with_extension("tasks.jsonl").is_file());
+        let runtime = agent.runtime_for_session().unwrap();
+        let run = runtime.run_id;
+        let id = runtime
+            .task_registry
+            .create_task(TaskRecord::new(run, "before prompt"))
+            .unwrap();
+        let expected = runtime.task_registry.get_task(&id).unwrap();
+        agent
+            .load_from_session(JsonlSession::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(agent.runtime_for_session().unwrap().run_id, run);
+        assert_eq!(
+            agent.runtime.as_ref().unwrap().task_registry.get_task(&id),
+            Some(expected.clone())
+        );
+        drop(agent);
+        let mut resumed = Agent::new("fixture");
+        resumed
+            .load_from_session(JsonlSession::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(resumed.runtime_for_session().unwrap().run_id, run);
+        assert_eq!(
+            resumed
+                .runtime
+                .as_ref()
+                .unwrap()
+                .task_registry
+                .get_task(&id),
+            Some(expected)
+        );
+        let events = davinci_session::read_runtime_log::<RuntimeEventEnvelope>(
+            &davinci_session::runtime_log_path(&path),
+        )
+        .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.payload, RuntimeEvent::TaskCreated { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn f03_failed_session_load_preserves_active_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        let first = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let first_path = first.path.clone();
+        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+            .with_session(&first.header.id);
+        agent.session = Some(first);
+        agent.set_runtime(runtime.clone());
+        agent.prompt("keep this prompt");
+        let before = serde_json::to_value(&agent.messages).unwrap();
+        let next = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let path = davinci_session::runtime_log_path(&next.path);
+        let corrupt = b"{broken record}\n{broken record}\n";
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(agent.load_from_session(next).is_err());
+        assert_eq!(agent.session.as_ref().unwrap().path, first_path);
+        assert_eq!(serde_json::to_value(&agent.messages).unwrap(), before);
+        assert_eq!(agent.runtime.as_ref().unwrap().run_id, runtime.run_id);
+        assert!(agent.runtime_for_session().is_some());
+        assert_eq!(std::fs::read(path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn f03_session_load_isolates_previous_worker_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        let first = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let old = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+            .with_session(&first.header.id);
+        let old_task = old
+            .task_registry
+            .create_task(TaskRecord::new(old.run_id, "old task"))
+            .unwrap();
+        agent.session = Some(first);
+        agent.set_runtime(old.clone());
+        let next = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let next_id = next.header.id.clone();
+        agent.load_from_session(next).unwrap();
+        let current = agent.runtime.as_ref().unwrap();
+        assert_eq!(current.session_id.as_deref(), Some(next_id.as_str()));
+        assert!(current.task_registry.get_task(&old_task).is_none());
+        assert!(old.task_registry.get_task(&old_task).is_some());
+        assert_ne!(old.session_id, current.session_id);
+        old.cancellation_token.cancel();
+        assert!(!agent.abort_requested());
+        assert_eq!(
+            agent.tool_context.runtime.as_ref().unwrap().session_id,
+            current.session_id
+        );
+    }
+
+    #[test]
+    fn f03_session_runtime_reuse_checks_file_and_binding_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("fixture");
+        let first = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        let first_path = first.path.clone();
+        let id = first.header.id.clone();
+        agent.session = Some(first);
+        let runtime =
+            RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new()).with_session(&id);
+        agent.set_runtime(runtime.clone());
+        assert!(agent.runtime_for_session().is_some());
+        let mut other = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+        other.header.id = id.clone();
+        agent.session = Some(other);
+        assert!(
+            agent.runtime_for_session().is_none(),
+            "same ID in a different file is not the same binding"
+        );
+        agent.session.as_mut().unwrap().path = first_path;
+        assert!(agent.runtime_for_session().is_some());
+        agent.runtime.as_mut().unwrap().run_id = RunId::new();
+        assert!(
+            agent.runtime_for_session().is_none(),
+            "unbound runtime replacement cannot inherit ownership"
+        );
+        agent.set_runtime(runtime);
+        let session = agent.session.take().unwrap();
+        agent.load_from_session(session).unwrap();
+        assert!(
+            agent.runtime_for_session().is_some(),
+            "explicit reload completes reconciliation before returning"
+        );
+    }
+
+    #[test]
+    fn f03_runtime_rebind_refreshes_only_owned_abort_signal() {
+        for external in [false, true] {
+            let mut agent = Agent::new("runtime binding fixture");
+            let old = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+            agent.set_runtime(old.clone());
+            let ui_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if external {
+                agent.abort_signal = Some(ui_signal.clone());
+            }
+            old.cancellation_token.cancel();
+            let next = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+            agent.set_runtime(next.clone());
+            assert!(
+                !agent.abort_requested(),
+                "old runtime must not cancel the new binding"
+            );
+            let expected = if external {
+                ui_signal.clone()
+            } else {
+                next.cancellation_token.as_atomic_bool()
+            };
+            assert!(Arc::ptr_eq(agent.abort_signal.as_ref().unwrap(), &expected));
+            assert_eq!(agent.runtime.as_ref().unwrap().run_id, next.run_id);
+            assert_eq!(
+                agent.tool_context.runtime.as_ref().unwrap().run_id,
+                next.run_id
+            );
+            if external {
+                ui_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(agent.abort_requested(), "UI cancellation remains effective");
+                ui_signal.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            next.cancellation_token.cancel();
+            assert!(
+                agent.abort_requested(),
+                "new runtime cancellation remains effective"
+            );
+            agent.set_runtime(next);
+            assert!(
+                agent.abort_requested(),
+                "rebinding the same runtime cannot clear cancellation"
+            );
+        }
+    }
 
     #[test]
     fn a_chat_entry_keeps_the_message_extras() {
@@ -2212,7 +2680,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut agent = Agent::new(default_system_prompt());
         agent.cwd = dir.path().to_path_buf();
-        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+        agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
             PermissionMode::ReadOnly,
         )));
         agent.prompt("go");
@@ -2339,7 +2807,7 @@ mod tests {
         let seen = asked.clone();
         let mut agent = Agent::new(default_system_prompt());
         agent.cwd = dir.path().to_path_buf();
-        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+        agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
             PermissionMode::Ask,
         )));
         agent.approver = Some(ToolApprover(Arc::new(move |request| {
@@ -2384,7 +2852,7 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["write"]
+            ["write(out.txt)"]
         );
     }
 
@@ -2395,7 +2863,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut agent = Agent::new(default_system_prompt());
         agent.cwd = dir.path().to_path_buf();
-        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+        agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
             PermissionMode::ReadOnly,
         )));
         agent.approver = Some(ToolApprover(Arc::new(|_request| {
@@ -2427,7 +2895,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut agent = Agent::new(default_system_prompt());
         agent.cwd = dir.path().to_path_buf();
-        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+        agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
             PermissionMode::Ask,
         )));
         agent.approver = Some(ToolApprover(Arc::new(|_request| {
@@ -2455,7 +2923,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut agent = Agent::new(default_system_prompt());
         agent.cwd = dir.path().to_path_buf();
-        agent.permissions = Arc::new(std::sync::Mutex::new(PermissionPolicy::new(
+        agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
             PermissionMode::Ask,
         )));
         agent.prompt("go");
@@ -2475,7 +2943,7 @@ mod tests {
             outcomes[0].2
         );
         assert!(
-            outcomes[0].2.contains("`bash(git status *)`"),
+            outcomes[0].2.contains("`bash(git status)`"),
             "{}",
             outcomes[0].2
         );
@@ -2706,7 +3174,7 @@ mod tests {
                 has_tool_call: false,
             })
         }));
-        agent.load_from_session(session);
+        agent.load_from_session(session).unwrap();
         let result = agent
             .navigate_tree_entry(&abandoned, true, None, false, 16_384)
             .unwrap();

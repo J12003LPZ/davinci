@@ -76,18 +76,23 @@ impl GraphDefinition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphTopologyError {
     EmptyGraph,
+    DuplicateNodeId(String),
     UnknownNodeInEdge(String),
     CycleDetected,
     UnreachableRequiredNode(String),
     ReviewBypassed,
     MissingVerificationNode,
     ConcurrentWritersPossible,
+    ReviewerWriterPrivilege(String),
+    IncoherentRoleArtifact(String),
+    ImpossibleConditionConjunction(String),
 }
 
 impl std::fmt::Display for GraphTopologyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyGraph => write!(f, "graph definition has no nodes"),
+            Self::DuplicateNodeId(id) => write!(f, "duplicate node id in graph: {id}"),
             Self::UnknownNodeInEdge(id) => write!(f, "edge references unknown node: {id}"),
             Self::CycleDetected => write!(f, "cycle detected in graph topology"),
             Self::UnreachableRequiredNode(id) => write!(f, "required node is unreachable: {id}"),
@@ -97,6 +102,15 @@ impl std::fmt::Display for GraphTopologyError {
             }
             Self::ConcurrentWritersPossible => {
                 write!(f, "two mutation-capable writers can be ready concurrently")
+            }
+            Self::ReviewerWriterPrivilege(id) => {
+                write!(f, "reviewer node cannot have mutation privileges: {id}")
+            }
+            Self::IncoherentRoleArtifact(id) => {
+                write!(f, "incoherent role and artifact contract for node: {id}")
+            }
+            Self::ImpossibleConditionConjunction(id) => {
+                write!(f, "impossible condition conjunction on node: {id}")
             }
         }
     }
@@ -110,9 +124,31 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
         return Err(GraphTopologyError::EmptyGraph);
     }
 
+    // 1. Unique safe node IDs
+    let mut seen_node_ids = HashSet::new();
+    for node in &definition.nodes {
+        if !seen_node_ids.insert(node.id.as_str()) {
+            return Err(GraphTopologyError::DuplicateNodeId(node.id.clone()));
+        }
+    }
+
+    // 2. Role and artifact contract coherence, and reviewer privileges
+    for node in &definition.nodes {
+        if node.role == Role::Reviewer && node.allows_mutation {
+            return Err(GraphTopologyError::ReviewerWriterPrivilege(node.id.clone()));
+        }
+        if !super::definitions::role_contract_valid(
+            node.role.as_str(),
+            node.expect.as_str(),
+            node.allows_mutation,
+        ) {
+            return Err(GraphTopologyError::IncoherentRoleArtifact(node.id.clone()));
+        }
+    }
+
     let node_ids: HashSet<&str> = definition.nodes.iter().map(|n| n.id.as_str()).collect();
 
-    // 1. Edge references to unknown nodes
+    // 3. Edge references to unknown nodes
     for edge in &definition.edges {
         if !node_ids.contains(edge.from.as_str()) {
             return Err(GraphTopologyError::UnknownNodeInEdge(edge.from.clone()));
@@ -122,7 +158,7 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
         }
     }
 
-    // 2. Unbounded cycle detection (Kahn's algorithm for DAG validation)
+    // 4. Unbounded cycle detection (Kahn's algorithm for DAG validation) + topological ordering
     let mut in_degrees: HashMap<&str, usize> = HashMap::new();
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
     for id in &node_ids {
@@ -143,9 +179,9 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
         .map(|(&id, _)| id)
         .collect();
 
-    let mut visited_count = 0;
+    let mut topo_order = Vec::new();
     while let Some(node) = queue.pop_front() {
-        visited_count += 1;
+        topo_order.push(node);
         if let Some(neighbors) = adjacency.get(node) {
             for neighbor in neighbors {
                 let deg = in_degrees.get_mut(neighbor).unwrap();
@@ -157,11 +193,56 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
         }
     }
 
-    if visited_count < definition.nodes.len() {
+    if topo_order.len() < definition.nodes.len() {
         return Err(GraphTopologyError::CycleDetected);
     }
 
-    // 3. Reachability of required nodes from entry node
+    // 5. Condition conjunction impossible
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OutcomeReq {
+        Success,
+        Failure,
+    }
+
+    let mut node_requirements: HashMap<&str, HashMap<&str, OutcomeReq>> = HashMap::new();
+    for &node_id in &topo_order {
+        let mut reqs: HashMap<&str, OutcomeReq> = HashMap::new();
+        for edge in definition.incoming_edges(node_id) {
+            let from_id = edge.from.as_str();
+            let edge_req = match edge.condition {
+                EdgeCondition::OnSuccess => Some(OutcomeReq::Success),
+                EdgeCondition::OnFailure => Some(OutcomeReq::Failure),
+                EdgeCondition::Always => None,
+            };
+            if let Some(r) = edge_req {
+                if let Some(&existing) = reqs.get(from_id) {
+                    if existing != r {
+                        return Err(GraphTopologyError::ImpossibleConditionConjunction(
+                            node_id.to_string(),
+                        ));
+                    }
+                } else {
+                    reqs.insert(from_id, r);
+                }
+            }
+            if let Some(parent_reqs) = node_requirements.get(from_id) {
+                for (&ancestor, &req) in parent_reqs {
+                    if let Some(&existing) = reqs.get(ancestor) {
+                        if existing != req {
+                            return Err(GraphTopologyError::ImpossibleConditionConjunction(
+                                node_id.to_string(),
+                            ));
+                        }
+                    } else {
+                        reqs.insert(ancestor, req);
+                    }
+                }
+            }
+        }
+        node_requirements.insert(node_id, reqs);
+    }
+
+    // 6. Reachability of required nodes from entry node
     let entry_node = definition.nodes.first().map(|n| n.id.as_str());
 
     let mut reachable = HashSet::new();
@@ -184,9 +265,9 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
         }
     }
 
-    // 4. Review bypass invariant:
+    // 7. Review bypass invariant:
     // In Standard or Complex mode, any mutation-capable writer must reach a reviewer node
-    // before the end of the run.
+    // before the end of the run on successful delivery paths, and failure branches cannot bypass review.
     if matches!(definition.mode, GraphMode::Standard | GraphMode::Complex) {
         let writers: Vec<&NodeDefinition> = definition
             .nodes
@@ -195,7 +276,8 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
             .collect();
 
         for writer in writers {
-            let mut writer_reaches_review = false;
+            // (a) Writer must reach a reviewer along non-failure edges (OnSuccess or Always).
+            let mut writer_reaches_review_on_success = false;
             let mut search_queue = VecDeque::from([writer.id.as_str()]);
             let mut seen = HashSet::new();
             while let Some(curr) = search_queue.pop_front() {
@@ -204,28 +286,78 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
                 }
                 if let Some(node) = definition.node(curr) {
                     if node.role == Role::Reviewer {
-                        writer_reaches_review = true;
+                        writer_reaches_review_on_success = true;
                         break;
                     }
                 }
                 for edge in definition.outgoing_edges(curr) {
-                    search_queue.push_back(edge.to.as_str());
+                    if matches!(
+                        edge.condition,
+                        EdgeCondition::Always | EdgeCondition::OnSuccess
+                    ) {
+                        search_queue.push_back(edge.to.as_str());
+                    }
                 }
             }
-            if !writer_reaches_review {
+            if !writer_reaches_review_on_success {
                 return Err(GraphTopologyError::ReviewBypassed);
+            }
+
+            // (b) Any failure branch (OnFailure) originating from the writer or from intermediate
+            // nodes on the path to the reviewer must also reach a reviewer, not bypass review.
+            let mut path_nodes = HashSet::new();
+            let mut path_queue = VecDeque::from([writer.id.as_str()]);
+            while let Some(curr) = path_queue.pop_front() {
+                if !path_nodes.insert(curr) {
+                    continue;
+                }
+                if let Some(node) = definition.node(curr) {
+                    if node.role == Role::Reviewer {
+                        continue;
+                    }
+                }
+                for edge in definition.outgoing_edges(curr) {
+                    path_queue.push_back(edge.to.as_str());
+                }
+            }
+
+            for &p_id in &path_nodes {
+                for edge in definition.outgoing_edges(p_id) {
+                    if edge.condition == EdgeCondition::OnFailure {
+                        let mut failure_reaches_review = false;
+                        let mut f_queue = VecDeque::from([edge.to.as_str()]);
+                        let mut f_seen = HashSet::new();
+                        while let Some(curr) = f_queue.pop_front() {
+                            if !f_seen.insert(curr) {
+                                continue;
+                            }
+                            if let Some(node) = definition.node(curr) {
+                                if node.role == Role::Reviewer {
+                                    failure_reaches_review = true;
+                                    break;
+                                }
+                            }
+                            for f_edge in definition.outgoing_edges(curr) {
+                                f_queue.push_back(f_edge.to.as_str());
+                            }
+                        }
+                        if !failure_reaches_review {
+                            return Err(GraphTopologyError::ReviewBypassed);
+                        }
+                    }
+                }
             }
         }
     }
 
-    // 5. Verify-success edge without verification node:
+    // 8. Verify-success edge without verification node:
     for edge in &definition.edges {
         if edge.from.starts_with("verify") && !definition.nodes.iter().any(|n| n.id == edge.from) {
             return Err(GraphTopologyError::MissingVerificationNode);
         }
     }
 
-    // 6. Two mutation-capable writers that can be ready concurrently:
+    // 9. Two mutation-capable writers that can be ready concurrently:
     let mutation_nodes: Vec<&NodeDefinition> = definition
         .nodes
         .iter()
@@ -732,5 +864,103 @@ mod tests {
         // When implement-1 is running, no other writer can be ready
         state.running_tasks.insert("implement-1".into());
         assert!(ready_nodes(&def, &state).is_empty());
+    }
+
+    #[test]
+    fn graph_topology_rejection_of_duplicate_node_ids() {
+        let mut def = build_definition(GraphMode::Simple, &test_classification());
+        def.nodes.push(NodeDefinition {
+            id: "implement-1".into(),
+            role: Role::Writer,
+            expect: ArtifactKind::PatchReport,
+            required: false,
+            allows_mutation: true,
+        });
+        let err = validate_definition(&def).unwrap_err();
+        assert_eq!(
+            err,
+            GraphTopologyError::DuplicateNodeId("implement-1".into())
+        );
+    }
+
+    #[test]
+    fn graph_topology_rejection_of_reviewer_writer_privilege() {
+        let mut def = build_definition(GraphMode::Standard, &test_classification());
+        if let Some(rev) = def.nodes.iter_mut().find(|n| n.role == Role::Reviewer) {
+            rev.allows_mutation = true;
+        }
+        let err = validate_definition(&def).unwrap_err();
+        assert!(matches!(
+            err,
+            GraphTopologyError::ReviewerWriterPrivilege(_)
+        ));
+    }
+
+    #[test]
+    fn graph_topology_rejection_of_incoherent_role_artifact() {
+        let mut def = build_definition(GraphMode::Standard, &test_classification());
+        if let Some(planner) = def.nodes.iter_mut().find(|n| n.role == Role::Planner) {
+            planner.expect = ArtifactKind::PatchReport;
+        }
+        let err = validate_definition(&def).unwrap_err();
+        assert_eq!(
+            err,
+            GraphTopologyError::IncoherentRoleArtifact("plan-1".into())
+        );
+    }
+
+    #[test]
+    fn graph_topology_rejection_of_failure_branch_review_bypass() {
+        let mut def = build_definition(GraphMode::Standard, &test_classification());
+        def.nodes.push(NodeDefinition {
+            id: "fallback-exit".into(),
+            role: Role::Researcher,
+            expect: ArtifactKind::Evidence,
+            required: false,
+            allows_mutation: false,
+        });
+        def.edges.push(EdgeDefinition {
+            from: "implement-1".into(),
+            to: "fallback-exit".into(),
+            condition: EdgeCondition::OnFailure,
+        });
+        let err = validate_definition(&def).unwrap_err();
+        assert_eq!(err, GraphTopologyError::ReviewBypassed);
+    }
+
+    #[test]
+    fn graph_topology_rejection_of_impossible_condition_conjunction() {
+        let mut def = build_definition(GraphMode::Simple, &test_classification());
+        def.nodes.push(NodeDefinition {
+            id: "impossible-node".into(),
+            role: Role::Researcher,
+            expect: ArtifactKind::Evidence,
+            required: false,
+            allows_mutation: false,
+        });
+        def.edges.push(EdgeDefinition {
+            from: "classify".into(),
+            to: "impossible-node".into(),
+            condition: EdgeCondition::OnSuccess,
+        });
+        def.edges.push(EdgeDefinition {
+            from: "classify".into(),
+            to: "impossible-node".into(),
+            condition: EdgeCondition::OnFailure,
+        });
+        let err = validate_definition(&def).unwrap_err();
+        assert_eq!(
+            err,
+            GraphTopologyError::ImpossibleConditionConjunction("impossible-node".into())
+        );
+    }
+
+    #[test]
+    fn graph_topology_simple_retains_verify_and_mode_semantics() {
+        let def = build_definition(GraphMode::Simple, &test_classification());
+        assert_eq!(def.mode, GraphMode::Simple);
+        assert!(validate_definition(&def).is_ok());
+        assert!(def.nodes.iter().any(|n| n.allows_mutation));
+        assert!(!def.nodes.iter().any(|n| n.role == Role::Reviewer));
     }
 }

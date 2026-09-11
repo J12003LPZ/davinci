@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -142,11 +143,31 @@ pub struct Settings {
     pub permissions: Option<PermissionSettings>,
     #[serde(default)]
     pub learning: Option<crate::native_extensions::learning::LearningConfig>,
+    #[serde(default, rename = "languageServers")]
+    pub language_servers: Option<HashMap<String, LspServerConfigSetting>>,
     /// Settings keys this struct does not model (for example `subagents`,
     /// written by extensions). They are carried through untouched so a rewrite
     /// by `pi install`/`pi remove` cannot silently drop another tool's config.
     #[serde(flatten, default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Language server configuration from settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LspServerConfigSetting {
+    pub executable: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default, rename = "envAllowlist")]
+    pub env_allowlist: Vec<String>,
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default)]
+    pub trusted: Option<bool>,
+    #[serde(default, rename = "executableHash")]
+    pub executable_hash: Option<String>,
 }
 
 /// `webSearch` in settings: provider keys for the `web_search` tool.

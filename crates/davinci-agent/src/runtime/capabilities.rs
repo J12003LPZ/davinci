@@ -33,6 +33,107 @@ impl std::fmt::Display for CapabilitySource {
     }
 }
 
+/// Declared execution effect of a tool capability.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredEffect {
+    FileSystemRead,
+    FileSystemWrite,
+    ProcessExecution,
+    NetworkAccess,
+    ExternalServicePublish,
+    McpRead,
+    McpMutation,
+    HostInteraction,
+    Other(String),
+}
+
+impl std::fmt::Display for DeclaredEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileSystemRead => write!(f, "filesystem_read"),
+            Self::FileSystemWrite => write!(f, "filesystem_write"),
+            Self::ProcessExecution => write!(f, "process_execution"),
+            Self::NetworkAccess => write!(f, "network_access"),
+            Self::ExternalServicePublish => write!(f, "external_service_publish"),
+            Self::McpRead => write!(f, "mcp_read"),
+            Self::McpMutation => write!(f, "mcp_mutation"),
+            Self::HostInteraction => write!(f, "host_interaction"),
+            Self::Other(s) => write!(f, "other({s})"),
+        }
+    }
+}
+
+/// Computes the default declared effects for a builtin or registered tool.
+pub fn default_declared_effects(name: &str, class: ToolClass) -> Vec<DeclaredEffect> {
+    match name {
+        "read" | "grep" | "find" | "ls" => vec![DeclaredEffect::FileSystemRead],
+        "write" | "edit" | "notebook_edit" | "apply_patch" => {
+            vec![DeclaredEffect::FileSystemWrite]
+        }
+        "bash" | "powershell" | "exec_command" | "write_stdin" => {
+            vec![DeclaredEffect::ProcessExecution]
+        }
+        "web_fetch" | "web_search" => vec![DeclaredEffect::NetworkAccess],
+        "mcp_read" => vec![DeclaredEffect::McpRead],
+        "ask_user_question" => vec![DeclaredEffect::HostInteraction],
+        _ => match class {
+            ToolClass::Read => vec![DeclaredEffect::FileSystemRead],
+            ToolClass::Edit => vec![DeclaredEffect::FileSystemWrite],
+            ToolClass::Shell => vec![DeclaredEffect::ProcessExecution],
+            ToolClass::Network => vec![DeclaredEffect::NetworkAccess],
+            ToolClass::Other => vec![DeclaredEffect::Other("other".into())],
+        },
+    }
+}
+
+/// A canonical representation of an action prepared for execution,
+/// validated against contracts and runtime capability ledgers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedAction {
+    pub tool: String,
+    pub targets: Vec<String>,
+    pub declared_effects: Vec<DeclaredEffect>,
+    #[serde(default)]
+    pub contract_digest: Option<String>,
+    #[serde(default)]
+    pub owner_generation: Option<u64>,
+    #[serde(default)]
+    pub source_manifest: Option<String>,
+}
+
+impl PreparedAction {
+    pub fn new(
+        tool: impl Into<String>,
+        targets: Vec<String>,
+        declared_effects: Vec<DeclaredEffect>,
+    ) -> Self {
+        Self {
+            tool: tool.into(),
+            targets,
+            declared_effects,
+            contract_digest: None,
+            owner_generation: None,
+            source_manifest: None,
+        }
+    }
+
+    pub fn with_contract(
+        mut self,
+        digest: impl Into<String>,
+        owner_generation: Option<u64>,
+    ) -> Self {
+        self.contract_digest = Some(digest.into());
+        self.owner_generation = owner_generation;
+        self
+    }
+
+    pub fn with_source_manifest(mut self, manifest: impl Into<String>) -> Self {
+        self.source_manifest = Some(manifest.into());
+        self
+    }
+}
+
 /// A unified capability record representing an executable tool in the runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapability {
@@ -42,6 +143,8 @@ pub struct RuntimeCapability {
     pub read_only: bool,
     pub schema_hash: String,
     pub version: Option<String>,
+    #[serde(default)]
+    pub declared_effects: Vec<DeclaredEffect>,
 }
 
 impl RuntimeCapability {
@@ -53,13 +156,16 @@ impl RuntimeCapability {
         schema: &serde_json::Value,
         version: Option<String>,
     ) -> Self {
+        let name_str = name.into();
+        let declared_effects = default_declared_effects(&name_str, tool_class);
         Self {
-            name: name.into(),
+            name: name_str,
             source,
             tool_class,
             read_only,
             schema_hash: compute_schema_hash(schema),
             version,
+            declared_effects,
         }
     }
 
@@ -71,14 +177,22 @@ impl RuntimeCapability {
         schema_hash: impl Into<String>,
         version: Option<String>,
     ) -> Self {
+        let name_str = name.into();
+        let declared_effects = default_declared_effects(&name_str, tool_class);
         Self {
-            name: name.into(),
+            name: name_str,
             source,
             tool_class,
             read_only,
             schema_hash: schema_hash.into(),
             version,
+            declared_effects,
         }
+    }
+
+    pub fn with_declared_effects(mut self, effects: Vec<DeclaredEffect>) -> Self {
+        self.declared_effects = effects;
+        self
     }
 }
 
@@ -99,6 +213,7 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
             let class = tool_class(&tool.name);
             let read_only = matches!(class, ToolClass::Read | ToolClass::Network);
             let schema_hash = compute_schema_hash(&tool.parameters);
+            let declared_effects = default_declared_effects(&tool.name, class);
             RuntimeCapability {
                 name: tool.name,
                 source: CapabilitySource::Builtin,
@@ -106,6 +221,7 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
                 read_only,
                 schema_hash,
                 version: Some(format!("builtin-{}", env!("CARGO_PKG_VERSION"))),
+                declared_effects,
             }
         })
         .collect()
@@ -265,6 +381,8 @@ mod tests {
         // Unknown capability defaults to mutating
         assert!(!registry.is_read_only("unregistered_custom_tool"));
         assert!(registry.is_mutating("unregistered_custom_tool"));
+        let ask = registry.get("ask_user_question").unwrap();
+        assert_eq!(ask.declared_effects, vec![DeclaredEffect::HostInteraction]);
     }
 
     #[test]

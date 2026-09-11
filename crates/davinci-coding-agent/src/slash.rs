@@ -85,6 +85,12 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             None,
         ),
         ("agents", "List custom agent profiles and status", None),
+        ("tasks", "Execution checklist and live task board", None),
+        (
+            "graph",
+            "Inspect and control native graph runs",
+            Some("[diff|fork|rewind|explain|dry-run|verify|budget|export]"),
+        ),
         ("help", "Show all commands and shortcuts", None),
         ("quit", "Quit pi", None),
     ]
@@ -132,6 +138,7 @@ pub enum SlashAction {
     ShowCost,
     ShowStatus,
     Agents,
+    Tasks,
 }
 
 /// Repository initialization uses the normal agent turn and its permission gates.
@@ -212,6 +219,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "cost" => SlashAction::ShowCost,
         "status" => SlashAction::ShowStatus,
         "agents" => SlashAction::Agents,
+        "tasks" => SlashAction::Tasks,
         "help" => SlashAction::Status(
             builtin_slash_commands()
                 .into_iter()
@@ -358,5 +366,43 @@ mod tests {
                 SlashAction::SetThinking(level.into())
             );
         }
+    }
+
+    #[test]
+    fn tasks_command_is_advertised_and_parsed() {
+        let commands = builtin_slash_commands();
+        assert!(commands.iter().any(|c| c.name == "tasks"));
+        assert_eq!(parse_line("/tasks"), SlashAction::Tasks);
+    }
+
+    #[test]
+    fn graph_commands_delegate_to_extension_host_without_internal_lifecycle_leaks() {
+        let builtins = builtin_slash_commands();
+        let graph = builtins
+            .iter()
+            .find(|command| command.name == "graph")
+            .expect("graph family should be discoverable");
+        assert!(graph.description.contains("native graph"));
+        assert!(graph
+            .argument_hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("budget") && hint.contains("export")));
+        for internal in ["graph-resume", "graph-status", "graph-view", "graph-abort"] {
+            assert!(
+                !builtins.iter().any(|c| c.name == internal),
+                "internal lifecycle command '{internal}' must not be in builtin_slash_commands"
+            );
+        }
+
+        // /graph and subcommands route as extension/prompt commands for host dispatch
+        assert_eq!(
+            parse_line("/graph save security-audit"),
+            SlashAction::Prompt("/graph save security-audit".into())
+        );
+        assert_eq!(
+            parse_line("/graph run security-audit"),
+            SlashAction::Prompt("/graph run security-audit".into())
+        );
+        assert_eq!(parse_line("/graph"), SlashAction::Prompt("/graph".into()));
     }
 }

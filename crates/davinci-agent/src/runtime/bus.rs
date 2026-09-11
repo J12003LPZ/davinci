@@ -17,7 +17,13 @@ pub trait RuntimeSubscriber: Send + Sync {
 
 #[derive(Default)]
 struct RuntimeBusInner {
-    subscribers: Mutex<Vec<Arc<dyn RuntimeSubscriber>>>,
+    subscribers: Mutex<Vec<Subscription>>,
+}
+
+#[derive(Clone)]
+struct Subscription {
+    observer: Arc<dyn RuntimeSubscriber>,
+    session: bool,
 }
 
 #[derive(Clone, Default)]
@@ -36,8 +42,51 @@ impl RuntimeBus {
 
     pub fn subscribe(&self, subscriber: Arc<dyn RuntimeSubscriber>) {
         if let Ok(mut subs) = self.inner.subscribers.lock() {
-            subs.push(subscriber);
+            subs.push(Subscription {
+                observer: subscriber,
+                session: false,
+            });
         }
+    }
+
+    /// Install a session-owned observer once, retaining it across prompt turns.
+    pub fn subscribe_session(&self, subscriber: Arc<dyn RuntimeSubscriber>) {
+        self.inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Subscription {
+                observer: subscriber,
+                session: true,
+            });
+    }
+
+    /// Atomically refresh turn observers on the bus shared with live workers.
+    /// Session observers (including the single log writer) retain their identity.
+    pub fn replace_turn_subscribers_from(&self, source: &Self) {
+        if Arc::ptr_eq(&self.inner, &source.inner) {
+            return;
+        }
+        let mut next = source
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|entry| !entry.session)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut current = self
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::take(&mut *current);
+        next.extend(previous.iter().filter(|entry| entry.session).cloned());
+        *current = next;
+        // Subscriber destructors may reenter the bus; release them outside its lock.
+        drop(current);
+        drop(previous);
     }
 
     /// Emits an event to observers in registration order. Observer panics are
@@ -50,7 +99,7 @@ impl RuntimeBus {
 
         for subscriber in subscribers {
             let res = catch_unwind(AssertUnwindSafe(|| {
-                subscriber.on_event(&event);
+                subscriber.observer.on_event(&event);
             }));
             if let Err(_panic_err) = res {
                 eprintln!(
@@ -73,13 +122,14 @@ impl RuntimeBus {
         };
 
         for subscriber in subscribers {
-            let decision = match catch_unwind(AssertUnwindSafe(|| subscriber.on_event(&event))) {
-                Ok(dec) => dec,
-                Err(_panic_err) => {
-                    // Decision subscribers fail closed on panic for safety
-                    return Err("RuntimeSubscriber panicked during decision evaluation".into());
-                }
-            };
+            let decision =
+                match catch_unwind(AssertUnwindSafe(|| subscriber.observer.on_event(&event))) {
+                    Ok(dec) => dec,
+                    Err(_panic_err) => {
+                        // Decision subscribers fail closed on panic for safety
+                        return Err("RuntimeSubscriber panicked during decision evaluation".into());
+                    }
+                };
 
             if let RuntimeDecision::Deny { reason } = decision {
                 if is_decision {
@@ -105,7 +155,7 @@ pub fn is_decision_event(event: &RuntimeEvent) -> bool {
             | RuntimeEvent::PreToolUse { .. }
             | RuntimeEvent::PermissionRequested { .. }
             | RuntimeEvent::PreModelSwitch { .. }
-            | RuntimeEvent::TaskCompleted { .. }
+            | RuntimeEvent::TaskCompletionRequested { .. }
     )
 }
 
@@ -115,6 +165,21 @@ mod tests {
     use crate::runtime::ids::{AgentId, RunId};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn f03_only_completion_proposal_is_a_decision() {
+        let task_id = crate::runtime::TaskId::new();
+        assert!(is_decision_event(&RuntimeEvent::TaskCompletionRequested {
+            task_id,
+            expected_revision: 7,
+        }));
+        for success in [true, false] {
+            assert!(!is_decision_event(&RuntimeEvent::TaskCompleted {
+                task_id,
+                success
+            }));
+        }
+    }
 
     struct OrderRecorder {
         id: usize,
@@ -219,6 +284,56 @@ mod tests {
         // Subscriber 3 was never called
         let recorded = order.lock().unwrap().clone();
         assert_eq!(recorded, vec![1, 2]);
+    }
+
+    #[test]
+    fn f03_turn_refresh_updates_old_handles_without_duplicating_session_observers() {
+        let bus = RuntimeBus::new();
+        let old_worker = bus.clone();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        bus.subscribe(Arc::new(OrderRecorder {
+            id: 1,
+            order: order.clone(),
+            deny_on_pre_tool: false,
+        }));
+        bus.subscribe_session(Arc::new(OrderRecorder {
+            id: 2,
+            order: order.clone(),
+            deny_on_pre_tool: false,
+        }));
+        let next = RuntimeBus::new();
+        next.subscribe(Arc::new(OrderRecorder {
+            id: 3,
+            order: order.clone(),
+            deny_on_pre_tool: true,
+        }));
+        bus.replace_turn_subscribers_from(&next);
+        bus.replace_turn_subscribers_from(&next);
+        old_worker.emit_observe(RuntimeEventEnvelope::new(
+            1,
+            RunId::new(),
+            None,
+            None,
+            None,
+            RuntimeEvent::TurnStarted,
+        ));
+        assert_eq!(*order.lock().unwrap(), vec![3, 2]);
+        order.lock().unwrap().clear();
+        assert!(old_worker
+            .emit_decision(RuntimeEventEnvelope::new(
+                2,
+                RunId::new(),
+                None,
+                None,
+                None,
+                RuntimeEvent::PreToolUse {
+                    call_id: "fixture".into(),
+                    tool: "read".into(),
+                    args: json!({})
+                }
+            ))
+            .is_err());
+        assert_eq!(*order.lock().unwrap(), vec![3]);
     }
 
     #[test]

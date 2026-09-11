@@ -147,6 +147,18 @@ pub fn agent_message_tool(input: &Value, context: &ToolContext) -> Result<ToolRe
         ));
     }
 
+    if let Some(record) = runtime.registry.get(&to) {
+        if matches!(
+            record.state,
+            AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+        ) {
+            return Err(ToolError::Failed(format!(
+                "Recipient agent '{to}' is in terminal state {:?}",
+                record.state
+            )));
+        }
+    }
+
     let msg_id = runtime
         .send_message(to, message)
         .map_err(|e| ToolError::Failed(format!("Failed to deliver message: {e}")))?;
@@ -154,11 +166,11 @@ pub fn agent_message_tool(input: &Value, context: &ToolContext) -> Result<ToolRe
     let details = json!({
         "message_id": msg_id.to_string(),
         "to": to.to_string(),
-        "status": "delivered_to_queue",
+        "status": "queued",
     });
 
     Ok(ToolResult {
-        content: format!("Message delivered to agent '{to}' mailbox (id: {msg_id})"),
+        content: format!("Message delivered to queue for agent '{to}' (id: {msg_id})"),
         is_error: false,
         details: Some(details),
     })
@@ -180,15 +192,31 @@ pub fn agent_stop_tool(input: &Value, context: &ToolContext) -> Result<ToolResul
 
     let reason = input.get("reason").and_then(Value::as_str);
 
+    // 1. Transition to Stopping (cooperative stop requested)
     runtime
         .registry
         .transition(aid, AgentState::Stopping)
         .map_err(|e| ToolError::Failed(format!("Failed to stop agent '{aid}': {e}")))?;
 
+    // 2. Kill associated process tree if background jobs exist
+    let killed_jobs = if let Ok(mut jobs) = context.jobs.lock() {
+        jobs.kill_jobs_for_agent(&aid)
+    } else {
+        Vec::new()
+    };
+
+    // 3. Reject undelivered mailbox messages
+    runtime
+        .mailbox
+        .reject_undelivered_for_cancelled(&aid, reason.unwrap_or("agent_stop_requested"));
+
+    let status = crate::jobs::stop_status(true, false, false);
+
     let details = json!({
         "agent_id": aid.to_string(),
-        "status": "stopping",
+        "status": status,
         "reason": reason,
+        "killed_jobs": killed_jobs,
     });
 
     Ok(ToolResult {

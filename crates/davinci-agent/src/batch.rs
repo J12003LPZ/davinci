@@ -152,6 +152,7 @@ impl Agent {
         };
         let sequential = self.tool_execution_mode == crate::ToolExecutionMode::Sequential;
         let mut scheduled = Vec::with_capacity(operations.len());
+        let mut owned_reservations = Vec::with_capacity(operations.len());
         for (index, operation) in operations.iter().enumerate() {
             // An interrupted batch stops asking: the operations left are
             // reported as not run, the way the top-level loop reports them.
@@ -161,6 +162,10 @@ impl Agent {
             let op_id = format!("{id}#{}", index + 1);
             let preparation =
                 self.prepare_tool_call(cwd, &op_id, &operation.tool, &operation.args, 1);
+            owned_reservations.push(matches!(
+                &preparation,
+                crate::turn::Preparation::Ready { .. }
+            ));
             let lane = match &preparation {
                 crate::turn::Preparation::Ready { lane } => *lane,
                 crate::turn::Preparation::Wait { lane, .. } => *lane,
@@ -171,7 +176,7 @@ impl Agent {
             scheduled.push(crate::scheduler::ScheduledCall {
                 lane,
                 run: Box::new(move || {
-                    let mut result = match preparation {
+                    let pre_hook_result = match preparation {
                         crate::turn::Preparation::Immediate(result) => result,
                         crate::turn::Preparation::Wait { call_id, .. } => {
                             agent.wait_for_tool_call(&call_id)
@@ -180,21 +185,40 @@ impl Agent {
                             agent.run_prepared_call(cwd, &op_id, &tool, &args, 1)
                         }
                     };
+                    let pre_hook_error = pre_hook_result.is_error;
+                    let mut result = pre_hook_result.clone();
                     if let Some(hook) = &agent.post_tool {
                         result = (hook.0)(&op_id, cwd, &tool, &args, result);
                     }
+                    let hook_vetoed = !pre_hook_error && result.is_error;
+                    agent.record_receipt(
+                        cwd,
+                        &op_id,
+                        &tool,
+                        &args,
+                        &pre_hook_result,
+                        &result,
+                        hook_vetoed,
+                    );
                     result
                 }),
             });
         }
-        let abort = self.abort_signal.clone();
-        let (results, report) = crate::scheduler::run_lanes(
+        let (results, report) = crate::scheduler::run_lanes_with_cancel(
             scheduled,
             sequential,
             crate::scheduler::MAX_TOOL_PARALLELISM,
-            abort.as_deref(),
+            || self.abort_requested(),
             |_| {},
         );
+        for (index, owned) in owned_reservations.iter().enumerate().skip(results.len()) {
+            if *owned {
+                self.tool_ledger
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .cancel_reservation(&format!("{id}#{}", index + 1));
+            }
+        }
         crate::stats::SharedCounters::add(&self.counters.batch_operations, results.len() as u64);
         let rendered = self.render_batch(id, &operations, results, report);
         if let Some(files) = rendered
@@ -316,6 +340,57 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f03_batch_observes_runtime_and_ui_cancellation() {
+        for cancel_runtime in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut agent = Agent::new("batch cancellation");
+            agent.tools = vec!["write".into()];
+            agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+                crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+            ));
+            let runtime = crate::RuntimeHandle::new(
+                crate::RunId::new(),
+                crate::AgentId::new(),
+                crate::RuntimeBus::new(),
+            );
+            let token = runtime.cancellation_token.clone();
+            let ui = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            agent.abort_signal = Some(ui.clone());
+            agent.set_runtime(runtime);
+            agent.post_tool = Some(crate::PostToolHook(std::sync::Arc::new(
+                move |_, _, _, _, result| {
+                    if cancel_runtime {
+                        token.cancel();
+                    } else {
+                        ui.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    result
+                },
+            )));
+            let result = agent.run_batch(
+                dir.path(),
+                "cancel",
+                &serde_json::json!({"operations":[
+                    {"tool":"write","args":{"path":"first.txt","content":"first"}},
+                    {"tool":"write","args":{"path":"second.txt","content":"second"}}
+                ]}),
+            );
+            assert_eq!(
+                result.details.as_ref().unwrap()["operations"][1]["status"],
+                "skipped"
+            );
+            assert!(dir.path().join("first.txt").exists());
+            assert!(!dir.path().join("second.txt").exists());
+            let ledger = serde_json::to_value(&*agent.tool_ledger.lock().unwrap()).unwrap();
+            assert!(ledger["records"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|record| record["status"] != "pending" && record["status"] != "executing"));
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -352,5 +427,58 @@ mod tests {
         assert!(summary.contains("content=\"xxxx"), "{summary}");
         assert!(!summary.contains(&"x".repeat(100)), "{summary}");
         assert!(summary.len() < 200, "{summary}");
+    }
+
+    #[test]
+    fn f05_batch_member_contract_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let mut agent = Agent::new("batch contract test");
+        agent.tools = vec!["write".into()];
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+        ));
+
+        let contract = crate::runtime::TaskContract::new(
+            "contract-batch-test",
+            1,
+            crate::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec!["secret.env".into()],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        agent.set_active_contract(contract);
+
+        let result = agent.run_batch(
+            dir.path(),
+            "batch_call_1",
+            &serde_json::json!({
+                "operations": [
+                    {"tool": "write", "args": {"path": "src/allowed.rs", "content": "pub fn ok() {}"}},
+                    {"tool": "write", "args": {"path": "secret.env", "content": "SECRET=leak"}}
+                ]
+            }),
+        );
+
+        // Hard-contracted native writes have no race-safe filesystem backend yet, so even the
+        // in-scope member must fail closed before mutation; the forbidden member remains denied.
+        let details = result.details.as_ref().unwrap();
+        let ops = details["operations"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0]["status"], "error");
+        assert_eq!(ops[1]["status"], "error");
+
+        assert!(!dir.path().join("src/allowed.rs").exists());
+        assert!(!dir.path().join("secret.env").exists());
+        assert!(result.content.contains("Scope violation"));
+        assert!(result.content.contains("execution_contract_unenforceable"));
     }
 }

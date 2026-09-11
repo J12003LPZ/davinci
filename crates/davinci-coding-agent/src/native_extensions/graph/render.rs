@@ -1,14 +1,377 @@
 //! `/graph` argument parsing and text rendering. Pure — the controller stays
 //! free of presentation and the command layer stays thin glue.
 
+use std::collections::HashMap;
+
 use super::store::now_ms;
 use super::types::{Complexity, GraphRun, GraphTaskState, TaskStatus, WorkerUsage};
+
+use super::operations;
+#[allow(unused_imports)]
+pub use operations::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParsedGraphArgs {
     pub goal: String,
     pub forced: Option<Complexity>,
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphCommand {
+    Current,
+    Save {
+        name: String,
+        overwrite: bool,
+    },
+    RunSaved {
+        name: String,
+        params: HashMap<String, String>,
+        dry_run: bool,
+    },
+    Goal(ParsedGraphArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum GraphAdvancedCommand {
+    Diff {
+        revision: Option<u64>,
+    },
+    Explain {
+        node_id: Option<String>,
+    },
+    DryRun {
+        name: Option<String>,
+    },
+    Fork {
+        node_id: String,
+        strategy: Option<String>,
+        authorized: bool,
+    },
+    Rewind {
+        node_id: String,
+        authorized: bool,
+    },
+    Verify,
+    Budget {
+        resource: Option<String>,
+        value: Option<String>,
+        expected_revision: Option<u64>,
+        authorized: bool,
+    },
+    Export {
+        name: Option<String>,
+        overwrite: bool,
+    },
+}
+
+#[allow(dead_code)]
+pub fn parse_diff_args(args: &str) -> Result<Option<u64>, String> {
+    let tokens = tokenize_args(args)?;
+    let mut revision = None;
+    for token in tokens {
+        if token == "diff" {
+            continue;
+        }
+        if let Ok(rev) = token.parse::<u64>() {
+            revision = Some(rev);
+        } else {
+            return Err(format!("invalid revision '{token}' for /graph diff"));
+        }
+    }
+    Ok(revision)
+}
+
+#[allow(dead_code)]
+pub fn parse_explain_args(args: &str) -> Result<Option<String>, String> {
+    let tokens = tokenize_args(args)?;
+    let mut node_id = None;
+    for token in tokens {
+        if token == "explain" {
+            continue;
+        }
+        if node_id.is_none() {
+            node_id = Some(token);
+        } else {
+            return Err(format!("unexpected argument for /graph explain: '{token}'"));
+        }
+    }
+    Ok(node_id)
+}
+
+#[allow(dead_code)]
+pub fn parse_advanced_graph_command(args: &str) -> Result<Option<GraphAdvancedCommand>, String> {
+    let trimmed = args.trim();
+    let command = tokenize_args(trimmed)?;
+    let Some(first) = command.first().cloned() else {
+        return Ok(None);
+    };
+    if first == "diff" {
+        Ok(Some(GraphAdvancedCommand::Diff {
+            revision: parse_diff_args(trimmed)?,
+        }))
+    } else if first == "explain" {
+        Ok(Some(GraphAdvancedCommand::Explain {
+            node_id: parse_explain_args(trimmed)?,
+        }))
+    } else if first == "dry-run" {
+        let tokens = command;
+        let mut name = None;
+        for token in tokens.into_iter().skip(1) {
+            if name.is_none() {
+                name = Some(token);
+            } else {
+                return Err(format!("unexpected argument for /graph dry-run: '{token}'"));
+            }
+        }
+        Ok(Some(GraphAdvancedCommand::DryRun { name }))
+    } else if first == "fork" {
+        let tokens = command;
+        if tokens.len() < 2 {
+            return Err(
+                "missing node argument for /graph fork: usage: /graph fork <node> [strategy]"
+                    .into(),
+            );
+        }
+        let node_id = tokens[1].clone();
+        let mut strategy = None;
+        let mut authorized = false;
+        for token in tokens.into_iter().skip(2) {
+            if token == "--authorize" {
+                authorized = true;
+            } else if token.starts_with("--") {
+                return Err(format!("unknown option for /graph fork: '{token}'"));
+            } else if strategy.is_none() {
+                strategy = Some(token);
+            } else {
+                return Err(format!("unexpected argument for /graph fork: '{token}'"));
+            }
+        }
+        Ok(Some(GraphAdvancedCommand::Fork {
+            node_id,
+            strategy,
+            authorized,
+        }))
+    } else if first == "rewind" {
+        let tokens = command;
+        if tokens.len() < 2 {
+            return Err(
+                "missing node argument for /graph rewind: usage: /graph rewind <node>".into(),
+            );
+        }
+        let node_id = tokens[1].clone();
+        let mut authorized = false;
+        for token in tokens.into_iter().skip(2) {
+            if token == "--authorize" {
+                authorized = true;
+            } else {
+                return Err(format!("unexpected argument for /graph rewind: '{token}'"));
+            }
+        }
+        Ok(Some(GraphAdvancedCommand::Rewind {
+            node_id,
+            authorized,
+        }))
+    } else if first == "verify" {
+        if command.len() > 1 {
+            return Err("unexpected argument for /graph verify".into());
+        }
+        Ok(Some(GraphAdvancedCommand::Verify))
+    } else if first == "budget" {
+        let mut resource = None;
+        let mut value = None;
+        let mut expected_revision = None;
+        let mut authorized = false;
+        let mut positional = Vec::new();
+        let mut saw_set = false;
+        let mut tokens = command.into_iter().skip(1);
+        while let Some(token) = tokens.next() {
+            match token.as_str() {
+                "set" if positional.is_empty() => saw_set = true,
+                "--authorize" => authorized = true,
+                "--revision" => {
+                    let revision = tokens
+                        .next()
+                        .ok_or_else(|| "missing revision after --revision".to_string())?;
+                    expected_revision =
+                        Some(revision.parse::<u64>().map_err(|_| {
+                            format!("invalid revision '{revision}' for /graph budget")
+                        })?);
+                }
+                _ if token.starts_with("--") => {
+                    return Err(format!("unknown option for /graph budget: '{token}'"));
+                }
+                _ => positional.push(token),
+            }
+        }
+        if positional.len() > 2 {
+            return Err(
+                "Usage: /graph budget [set] <resource> <value> [--revision N] [--authorize]".into(),
+            );
+        }
+        if positional.is_empty() && (saw_set || expected_revision.is_some() || authorized) {
+            return Err(
+                "Usage: /graph budget [set] <resource> <value> [--revision N] [--authorize]".into(),
+            );
+        }
+        if let Some(item) = positional.first() {
+            resource = Some(item.clone());
+        }
+        if let Some(item) = positional.get(1) {
+            value = Some(item.clone());
+        }
+        if value.is_none() && resource.is_some() {
+            return Err(
+                "budget inspection takes no resource; updates require <resource> <value>".into(),
+            );
+        }
+        Ok(Some(GraphAdvancedCommand::Budget {
+            resource,
+            value,
+            expected_revision,
+            authorized,
+        }))
+    } else if first == "export" {
+        let mut name = None;
+        let mut overwrite = false;
+        for token in command.into_iter().skip(1) {
+            if token == "--overwrite" {
+                overwrite = true;
+            } else if name.is_none() {
+                if !super::definitions::safe_graph_name(&token) {
+                    return Err(format!("invalid export name '{token}'"));
+                }
+                name = Some(token);
+            } else {
+                return Err(format!("unexpected argument for /graph export: '{token}'"));
+            }
+        }
+        if name.is_none() && overwrite {
+            return Err("/graph export --overwrite requires an export name".into());
+        }
+        Ok(Some(GraphAdvancedCommand::Export { name, overwrite }))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn graph_command_kind(args: &str) -> &'static str {
+    let args = args.trim();
+    if args.is_empty() {
+        return "current";
+    }
+    if args.starts_with("-- ") {
+        return "goal";
+    }
+    match args.split_whitespace().next() {
+        Some("save") => "save",
+        Some("run") => "run",
+        _ => "goal",
+    }
+}
+
+pub fn tokenize_args(input: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+    for c in input.chars() {
+        match c {
+            '"' | '\'' if in_quote == Some(c) => {
+                in_quote = None;
+            }
+            '"' | '\'' if in_quote.is_none() => {
+                in_quote = Some(c);
+            }
+            c if c.is_whitespace() && in_quote.is_none() => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+    if let Some(q) = in_quote {
+        return Err(format!("unclosed quote `{q}` in arguments"));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+pub fn parse_graph_command(args: &str) -> Result<GraphCommand, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Ok(GraphCommand::Current);
+    }
+    if trimmed.starts_with("-- ") {
+        let goal_text = trimmed.strip_prefix("-- ").unwrap().trim();
+        return Ok(GraphCommand::Goal(parse_graph_args(goal_text)));
+    }
+    let kind = graph_command_kind(trimmed);
+    match kind {
+        "save" => {
+            let tokens = tokenize_args(trimmed)?;
+            let mut name: Option<String> = None;
+            let mut overwrite = false;
+            for token in tokens.into_iter().skip(1) {
+                if token == "--overwrite" {
+                    overwrite = true;
+                } else if name.is_none() {
+                    if !super::definitions::safe_graph_name(&token) {
+                        return Err(format!("invalid graph name '{token}'"));
+                    }
+                    name = Some(token);
+                } else {
+                    return Err(format!("unexpected argument for /graph save: '{token}'"));
+                }
+            }
+            let Some(name) = name else {
+                return Err("Usage: /graph save <name> [--overwrite]".into());
+            };
+            Ok(GraphCommand::Save { name, overwrite })
+        }
+        "run" => {
+            let tokens = tokenize_args(trimmed)?;
+            let mut name: Option<String> = None;
+            let mut dry_run = false;
+            let mut params = HashMap::new();
+            for token in tokens.into_iter().skip(1) {
+                if token == "--dry-run" {
+                    dry_run = true;
+                } else if name.is_none() && !token.contains('=') {
+                    if !super::definitions::safe_graph_name(&token) {
+                        return Err(format!("invalid graph name '{token}'"));
+                    }
+                    name = Some(token);
+                } else if let Some((k, v)) = token.split_once('=') {
+                    if !super::definitions::is_safe_param_name(k) {
+                        return Err(format!("invalid parameter name '{k}'"));
+                    }
+                    if !super::definitions::is_safe_param_value(v) {
+                        return Err(format!("unsafe parameter value for '{k}'"));
+                    }
+                    params.insert(k.to_string(), v.to_string());
+                } else {
+                    return Err(format!("unexpected argument for /graph run: '{token}'"));
+                }
+            }
+            let Some(name) = name else {
+                return Err("Usage: /graph run <name> [param=value ...] [--dry-run]".into());
+            };
+            Ok(GraphCommand::RunSaved {
+                name,
+                params,
+                dry_run,
+            })
+        }
+        "goal" => Ok(GraphCommand::Goal(parse_graph_args(trimmed))),
+        _ => Ok(GraphCommand::Current),
+    }
 }
 
 /// Strip flags as whole tokens but keep the goal text verbatim otherwise:
@@ -255,6 +618,9 @@ mod tests {
             phase: Phase::Implement,
             forced: None,
             dry_run: false,
+            execution_origin: None,
+            definition_digest: None,
+            saved_definition: None,
             definition: None,
             classification: None,
             milestones: None,
@@ -281,6 +647,8 @@ mod tests {
             resource_snapshot: None,
             ecosystem_stats: Default::default(),
             updated_at: 120_000,
+            lifecycle: None,
+            revision: 0,
         }
     }
 
@@ -368,5 +736,261 @@ mod tests {
         assert!(summary.contains("- milestones (1/2 delivered)"));
         assert!(summary.contains("  - [x] one"));
         assert!(summary.contains("  - [ ] two"));
+    }
+
+    #[test]
+    fn f12_reserved_word_escape() {
+        assert_eq!(graph_command_kind(""), "current");
+        assert_eq!(graph_command_kind("save security-audit"), "save");
+        assert_eq!(graph_command_kind("run security-audit"), "run");
+        assert_eq!(graph_command_kind("-- save the broken file"), "goal");
+        assert_eq!(graph_command_kind("repair OAuth"), "goal");
+    }
+
+    #[test]
+    fn test_parse_graph_command_bare_current() {
+        assert_eq!(parse_graph_command("").unwrap(), GraphCommand::Current);
+        assert_eq!(parse_graph_command("   ").unwrap(), GraphCommand::Current);
+    }
+
+    #[test]
+    fn test_parse_graph_command_save() {
+        let cmd = parse_graph_command("save security-audit").unwrap();
+        assert_eq!(
+            cmd,
+            GraphCommand::Save {
+                name: "security-audit".into(),
+                overwrite: false,
+            }
+        );
+
+        let cmd = parse_graph_command("save security-audit --overwrite").unwrap();
+        assert_eq!(
+            cmd,
+            GraphCommand::Save {
+                name: "security-audit".into(),
+                overwrite: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_graph_command_save_validation() {
+        // Missing name
+        let err = parse_graph_command("save").unwrap_err();
+        assert!(err.contains("Usage: /graph save <name>"));
+
+        // Invalid name
+        let err = parse_graph_command("save ../escaping").unwrap_err();
+        assert!(err.contains("invalid graph name"));
+    }
+
+    #[test]
+    fn test_parse_graph_command_run() {
+        let cmd = parse_graph_command("run security-audit").unwrap();
+        match cmd {
+            GraphCommand::RunSaved {
+                name,
+                params,
+                dry_run,
+            } => {
+                assert_eq!(name, "security-audit");
+                assert!(params.is_empty());
+                assert!(!dry_run);
+            }
+            _ => panic!("expected RunSaved"),
+        }
+
+        let cmd = parse_graph_command("run security-audit scope=crates/agent --dry-run").unwrap();
+        match cmd {
+            GraphCommand::RunSaved {
+                name,
+                params,
+                dry_run,
+            } => {
+                assert_eq!(name, "security-audit");
+                assert_eq!(params.get("scope").unwrap(), "crates/agent");
+                assert!(dry_run);
+            }
+            _ => panic!("expected RunSaved"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_command_run_paths_with_spaces_and_quotes() {
+        let cmd =
+            parse_graph_command("run my-pipeline path=\"src/my dir/file.rs\" workers=2").unwrap();
+        match cmd {
+            GraphCommand::RunSaved {
+                name,
+                params,
+                dry_run,
+            } => {
+                assert_eq!(name, "my-pipeline");
+                assert_eq!(params.get("path").unwrap(), "src/my dir/file.rs");
+                assert_eq!(params.get("workers").unwrap(), "2");
+                assert!(!dry_run);
+            }
+            _ => panic!("expected RunSaved"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_command_run_validation() {
+        // Missing name
+        let err = parse_graph_command("run").unwrap_err();
+        assert!(err.contains("Usage: /graph run <name>"));
+
+        // Unsafe parameter value (shell expansion)
+        let err = parse_graph_command("run pipe target=$(whoami)").unwrap_err();
+        assert!(err.contains("unsafe parameter value"));
+
+        // Invalid parameter name
+        let err = parse_graph_command("run pipe bad:param=1").unwrap_err();
+        assert!(err.contains("invalid parameter name"));
+    }
+
+    #[test]
+    fn test_parse_graph_command_goals_and_escapes() {
+        // Normal goal
+        let cmd = parse_graph_command("repair OAuth login flow --dry-run").unwrap();
+        assert_eq!(
+            cmd,
+            GraphCommand::Goal(ParsedGraphArgs {
+                goal: "repair OAuth login flow".into(),
+                forced: None,
+                dry_run: true,
+            })
+        );
+
+        // Escaped reserved word goal
+        let cmd = parse_graph_command("-- save the broken file").unwrap();
+        assert_eq!(
+            cmd,
+            GraphCommand::Goal(ParsedGraphArgs {
+                goal: "save the broken file".into(),
+                forced: None,
+                dry_run: false,
+            })
+        );
+
+        // Multiline goal preserved
+        let brief = "first line\nsecond line\nthird line";
+        let cmd = parse_graph_command(brief).unwrap();
+        match cmd {
+            GraphCommand::Goal(parsed) => {
+                assert_eq!(parsed.goal, brief);
+            }
+            _ => panic!("expected Goal"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_command_diff_and_explain() {
+        assert_eq!(
+            parse_advanced_graph_command("diff").unwrap(),
+            Some(GraphAdvancedCommand::Diff { revision: None })
+        );
+        assert_eq!(
+            parse_advanced_graph_command("diff 3").unwrap(),
+            Some(GraphAdvancedCommand::Diff { revision: Some(3) })
+        );
+        assert!(parse_advanced_graph_command("diff abc").is_err());
+
+        assert_eq!(
+            parse_advanced_graph_command("explain").unwrap(),
+            Some(GraphAdvancedCommand::Explain { node_id: None })
+        );
+        assert_eq!(
+            parse_advanced_graph_command("explain writer-1").unwrap(),
+            Some(GraphAdvancedCommand::Explain {
+                node_id: Some("writer-1".into())
+            })
+        );
+        assert!(parse_advanced_graph_command("explain writer-1 extra").is_err());
+    }
+
+    #[test]
+    fn f14_parse_budget_and_export_commands() {
+        assert_eq!(
+            parse_advanced_graph_command("budget").unwrap(),
+            Some(GraphAdvancedCommand::Budget {
+                resource: None,
+                value: None,
+                expected_revision: None,
+                authorized: false,
+            })
+        );
+        assert_eq!(
+            parse_advanced_graph_command("budget set max-cost-usd 4.5 --revision 7 --authorize")
+                .unwrap(),
+            Some(GraphAdvancedCommand::Budget {
+                resource: Some("max-cost-usd".into()),
+                value: Some("4.5".into()),
+                expected_revision: Some(7),
+                authorized: true,
+            })
+        );
+        assert_eq!(
+            parse_advanced_graph_command("export").unwrap(),
+            Some(GraphAdvancedCommand::Export {
+                name: None,
+                overwrite: false,
+            })
+        );
+        assert_eq!(
+            parse_advanced_graph_command("export release --overwrite").unwrap(),
+            Some(GraphAdvancedCommand::Export {
+                name: Some("release".into()),
+                overwrite: true,
+            })
+        );
+        assert!(parse_advanced_graph_command("budget set").is_err());
+        assert!(parse_advanced_graph_command("export ../secret").is_err());
+        assert!(parse_advanced_graph_command("export --overwrite").is_err());
+    }
+
+    #[test]
+    fn f14_all_advanced_commands_have_exact_argument_boundaries() {
+        assert!(matches!(
+            parse_advanced_graph_command("dry-run").unwrap(),
+            Some(GraphAdvancedCommand::DryRun { name: None })
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("fork writer-1 repair-minimal").unwrap(),
+            Some(GraphAdvancedCommand::Fork {
+                authorized: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("rewind writer-1").unwrap(),
+            Some(GraphAdvancedCommand::Rewind {
+                authorized: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("fork writer-1 --authorize").unwrap(),
+            Some(GraphAdvancedCommand::Fork {
+                authorized: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("rewind writer-1 --authorize").unwrap(),
+            Some(GraphAdvancedCommand::Rewind {
+                authorized: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("verify").unwrap(),
+            Some(GraphAdvancedCommand::Verify)
+        ));
+        assert!(parse_advanced_graph_command("fork writer-1 extra trailing").is_err());
+        assert!(parse_advanced_graph_command("rewind writer-1 extra").is_err());
+        assert!(parse_advanced_graph_command("fork writer-1 --unknown").is_err());
+        assert!(parse_advanced_graph_command("diffuse").unwrap().is_none());
     }
 }

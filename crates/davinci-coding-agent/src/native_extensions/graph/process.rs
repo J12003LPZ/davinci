@@ -69,21 +69,33 @@ fn pump<R: Read + Send + 'static>(reader: R, sender: mpsc::Sender<Line>, wrap: f
 }
 
 pub fn terminate(child: &mut Child) {
-    // A worker or verify command is usually a shell/`pi` process with its own
-    // children (cargo, node, rustc). Killing only the immediate child leaves
-    // that tree running, still holding e.g. the `target/` lock, so on Windows
-    // the whole tree is taken down via `taskkill /T` before the direct kill.
+    let pid = child.id();
+    terminate_process_tree(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub fn terminate_process_tree(pid: u32) {
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    #[cfg(not(windows))]
+    {
+        let ipid = pid as i32;
+        unsafe {
+            let _ = libc::kill(-ipid, libc::SIGTERM);
+            let _ = libc::kill(ipid, libc::SIGTERM);
+            thread::sleep(Duration::from_millis(50));
+            let _ = libc::kill(-ipid, libc::SIGKILL);
+            let _ = libc::kill(ipid, libc::SIGKILL);
+        }
+    }
 }
 
 #[allow(dead_code)]
