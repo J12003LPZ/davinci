@@ -47,6 +47,14 @@ impl PromptProfile {
             Self::Preview => PREVIEW_PROMPT_VERSION,
         }
     }
+
+    pub fn bundle(self) -> crate::prompt::bundle::PromptBundle {
+        match self {
+            Self::LegacyV1 => crate::prompt::bundle::legacy_bundle(),
+            Self::Stable => crate::prompt::bundle::stable_bundle(),
+            Self::Preview => crate::prompt::bundle::preview_bundle(),
+        }
+    }
 }
 
 impl std::str::FromStr for PromptProfile {

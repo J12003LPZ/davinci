@@ -121,31 +121,9 @@ pub fn compose_profile_prompt(
     ctx: &PromptContext<'_>,
 ) -> ComposedPrompt {
     match profile {
-        version::PromptProfile::LegacyV1 => {
-            let mut composed = compose_legacy_default();
-            composed.manifest.profile = profile.id().to_string();
-            composed.manifest.profile_version = profile.version();
-            composed
-        }
-        version::PromptProfile::Stable | version::PromptProfile::Preview => {
-            let mut modules = stable_v2_modules();
-            let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
-            if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
-                modules.push(adapter);
-            }
-            modules.push(crate::prompt::runtime_state::runtime_state_module(
-                &crate::prompt::runtime_state::RuntimePromptState {
-                    permission_mode: ctx.permission_mode,
-                    plan_revision: None,
-                    plan_approved: false,
-                    active_contract: false,
-                },
-            ));
-            let mut composed = compose_modules(&modules);
-            composed.manifest.profile = profile.id().to_string();
-            composed.manifest.profile_version = profile.version();
-            composed
-        }
+        version::PromptProfile::LegacyV1 => compose_legacy_default(),
+        version::PromptProfile::Stable => crate::prompt::bundle::stable_bundle().compose(ctx),
+        version::PromptProfile::Preview => crate::prompt::bundle::preview_bundle().compose(ctx),
     }
 }
 
@@ -253,5 +231,24 @@ mod tests {
         assert_eq!(a.text, b.text);
         assert_eq!(a.stable_text, b.stable_text);
         assert_eq!(a.dynamic_text, b.dynamic_text);
+    }
+
+    #[test]
+    fn preview_profile_produces_distinct_hash_and_manifest_from_stable() {
+        let ctx = fixture_context();
+        let stable = compose_profile_prompt(version::PromptProfile::Stable, &ctx);
+        let preview = compose_profile_prompt(version::PromptProfile::Preview, &ctx);
+
+        assert_eq!(stable.manifest.profile, "stable");
+        assert_eq!(stable.manifest.profile_version, 2);
+
+        assert_eq!(preview.manifest.profile, "preview");
+        assert_eq!(preview.manifest.profile_version, 3);
+
+        assert_ne!(
+            preview.manifest.stable_sha256, stable.manifest.stable_sha256,
+            "preview prompt hash must be distinct from stable"
+        );
+        assert_ne!(preview.stable_text, stable.stable_text);
     }
 }

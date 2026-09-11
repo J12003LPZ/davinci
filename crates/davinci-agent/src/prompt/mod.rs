@@ -1,5 +1,6 @@
 //! Versioned prompt engineering subsystem.
 
+pub mod bundle;
 pub mod capabilities;
 pub mod coding;
 pub mod collaboration;
@@ -13,6 +14,10 @@ pub mod tool_strategy;
 pub mod verification;
 pub mod version;
 
+pub use bundle::{
+    legacy_bundle, preview_bundle, stable_bundle, validate_ab_comparison, PromptBundle,
+    PromptCandidateDescriptor,
+};
 pub use capabilities::{
     capability_module, detect_native_capabilities, CapabilityDecision, NativeBehaviorCapability,
     CAPABILITY_POLICY_MAX_TOKENS,

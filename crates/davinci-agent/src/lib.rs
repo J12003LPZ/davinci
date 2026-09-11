@@ -105,8 +105,9 @@ pub use turn::retry_delay_ms;
 pub mod runtime;
 pub use prompt::{
     compose_default_prompt, compose_legacy_default, compose_modules, runtime_state_module,
-    runtime_state_text, ComposedPrompt, PromptCacheClass, PromptContext, PromptManifest,
-    PromptModule, PromptModuleIdentity, PromptSessionState, PromptSource, RuntimePromptState,
+    runtime_state_text, ComposedPrompt, PromptBundle, PromptCacheClass, PromptCandidateDescriptor,
+    PromptContext, PromptManifest, PromptModule, PromptModuleIdentity, PromptSessionState,
+    PromptSource, RuntimePromptState,
 };
 pub use runtime::{
     contract_gate, effect_profile_allows, find_saved_workflow, hash_system_prompt,
