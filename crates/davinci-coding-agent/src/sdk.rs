@@ -21,6 +21,9 @@ type AgentEventListener = Box<dyn Fn(&davinci_agent::AgentEvent)>;
 pub struct CreateAgentSessionOptions {
     pub cwd: Option<PathBuf>,
     pub agent_dir: Option<PathBuf>,
+    pub prompt_profile: Option<davinci_agent::PromptProfile>,
+    pub system_prompt: Option<String>,
+    pub append_system_prompt: Vec<String>,
     pub thinking_level: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -366,6 +369,26 @@ fn parse_thinking(value: &str) -> davinci_protocol::ThinkingLevel {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn create_agent_session_options_carry_prompt_configuration() {
+        let options = CreateAgentSessionOptions {
+            prompt_profile: Some(davinci_agent::PromptProfile::Preview),
+            system_prompt: Some("custom replacement".into()),
+            append_system_prompt: vec!["first append".into(), "second append".into()],
+            ..CreateAgentSessionOptions::default()
+        };
+
+        assert_eq!(
+            options.prompt_profile,
+            Some(davinci_agent::PromptProfile::Preview)
+        );
+        assert_eq!(options.system_prompt.as_deref(), Some("custom replacement"));
+        assert_eq!(
+            options.append_system_prompt,
+            vec!["first append".to_string(), "second append".to_string()]
+        );
+    }
 
     #[test]
     fn create_agent_session_applies_tools_and_prompt() {
