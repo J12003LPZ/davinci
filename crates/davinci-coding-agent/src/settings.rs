@@ -321,23 +321,9 @@ pub fn format_compaction_threshold(
 pub fn resolve_prompt_profile(
     cli_flag: Option<davinci_agent::PromptProfile>,
     settings_profile: Option<&str>,
-) -> davinci_agent::PromptProfile {
-    if let Some(profile) = cli_flag {
-        return profile;
-    }
-    if let Some(setting_str) = settings_profile {
-        if let Some(profile) = davinci_agent::PromptProfile::parse(setting_str) {
-            return profile;
-        }
-    }
-    if let Ok(env_val) =
-        std::env::var("DAVINCI_PROMPT_PROFILE").or_else(|_| std::env::var("PI_PROMPT_PROFILE"))
-    {
-        if let Some(profile) = davinci_agent::PromptProfile::parse(&env_val) {
-            return profile;
-        }
-    }
-    davinci_agent::PromptProfile::Stable
+    env_value: Option<&str>,
+) -> Result<crate::prompt_host::ResolvedPromptProfile, String> {
+    crate::prompt_host::resolve_prompt_profile(cli_flag, settings_profile, env_value)
 }
 
 fn format_token_count(tokens: u64) -> String {
@@ -1695,8 +1681,11 @@ mod tests {
     #[test]
     fn stable_is_default_prompt_profile() {
         assert_eq!(
-            resolve_prompt_profile(None, None),
-            davinci_agent::PromptProfile::Stable
+            resolve_prompt_profile(None, None, None),
+            Ok(crate::prompt_host::ResolvedPromptProfile {
+                profile: davinci_agent::PromptProfile::Stable,
+                source: crate::prompt_host::PromptSelectionSource::Default,
+            })
         );
     }
 
@@ -1705,14 +1694,29 @@ mod tests {
         assert_eq!(
             resolve_prompt_profile(
                 Some(davinci_agent::PromptProfile::Preview),
-                Some("legacy-v1")
+                Some("invalid-setting"),
+                Some("invalid-environment"),
             ),
-            davinci_agent::PromptProfile::Preview
+            Ok(crate::prompt_host::ResolvedPromptProfile {
+                profile: davinci_agent::PromptProfile::Preview,
+                source: crate::prompt_host::PromptSelectionSource::Cli,
+            })
         );
 
         assert_eq!(
-            resolve_prompt_profile(None, Some("legacy-v1")),
-            davinci_agent::PromptProfile::LegacyV1
+            resolve_prompt_profile(None, Some("legacy-v1"), Some("invalid-environment")),
+            Ok(crate::prompt_host::ResolvedPromptProfile {
+                profile: davinci_agent::PromptProfile::LegacyV1,
+                source: crate::prompt_host::PromptSelectionSource::ProjectSetting,
+            })
         );
+    }
+
+    #[test]
+    fn invalid_selected_setting_does_not_fall_through_to_environment() {
+        let error = resolve_prompt_profile(None, Some("experimental"), Some("preview"))
+            .expect_err("an invalid selected setting must be reported");
+        assert!(error.contains("experimental"));
+        assert!(error.contains("stable, preview, legacy-v1"));
     }
 }

@@ -159,25 +159,19 @@ pub fn parse_args(args: &[String]) -> Args {
             result.append_system_prompt.push(args[i].clone());
         } else if arg == "--prompt-profile" && i + 1 < args.len() {
             i += 1;
-            match davinci_agent::PromptProfile::parse(&args[i]) {
-                Some(profile) => result.prompt_profile = Some(profile),
-                None => result.diagnostics.push(Diagnostic {
+            match crate::prompt_host::parse_prompt_profile(&args[i]) {
+                Ok(profile) => result.prompt_profile = Some(profile),
+                Err(message) => result.diagnostics.push(Diagnostic {
                     kind: "error",
-                    message: format!(
-                        "Invalid prompt profile '{}'. Valid profiles: stable, preview, legacy-v1",
-                        args[i]
-                    ),
+                    message,
                 }),
             }
         } else if let Some(val) = arg.strip_prefix("--prompt-profile=") {
-            match davinci_agent::PromptProfile::parse(val) {
-                Some(profile) => result.prompt_profile = Some(profile),
-                None => result.diagnostics.push(Diagnostic {
+            match crate::prompt_host::parse_prompt_profile(val) {
+                Ok(profile) => result.prompt_profile = Some(profile),
+                Err(message) => result.diagnostics.push(Diagnostic {
                     kind: "error",
-                    message: format!(
-                        "Invalid prompt profile '{}'. Valid profiles: stable, preview, legacy-v1",
-                        val
-                    ),
+                    message,
                 }),
             }
         } else if arg == "--name" || arg == "-n" {
@@ -518,9 +512,8 @@ mod tests {
 
         let bad = args(&["--prompt-profile", "unknown"]);
         assert_eq!(bad.prompt_profile, None);
-        assert!(bad
-            .diagnostics
-            .iter()
-            .any(|d| d.kind == "error" && d.message.contains("Invalid prompt profile")));
+        assert!(bad.diagnostics.iter().any(|d| d.kind == "error"
+            && d.message
+                == "Invalid prompt profile 'unknown'. Valid profiles: stable, preview, legacy-v1"));
     }
 }

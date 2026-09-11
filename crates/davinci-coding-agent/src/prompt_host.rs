@@ -50,7 +50,7 @@ pub fn resolve_prompt_profile(
     })
 }
 
-fn parse_prompt_profile(value: &str) -> Result<PromptProfile, String> {
+pub fn parse_prompt_profile(value: &str) -> Result<PromptProfile, String> {
     PromptProfile::parse(value).ok_or_else(|| {
         format!("Invalid prompt profile '{value}'. Valid profiles: stable, preview, legacy-v1")
     })

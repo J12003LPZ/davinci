@@ -107,6 +107,8 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use davinci_coding_agent::prompt_host;
+
 /// True while the raw-mode TUI owns the screen. Any raw `println!` in that
 /// state moves the hardware cursor behind the renderer's back and corrupts
 /// the diff-based repaint, so the shadowed macros below reroute output into
@@ -544,10 +546,15 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         cwd,
         parsed.project_trust_override,
     );
+    let env_profile = std::env::var("DAVINCI_PROMPT_PROFILE")
+        .ok()
+        .or_else(|| std::env::var("PI_PROMPT_PROFILE").ok());
     let profile = crate::settings::resolve_prompt_profile(
         parsed.prompt_profile,
         settings.prompt_profile.as_deref(),
-    );
+        env_profile.as_deref(),
+    )?
+    .profile;
 
     let (base_prompt, manifest) = if let Some(custom) = &parsed.system_prompt {
         (custom.clone(), None)
@@ -12366,5 +12373,31 @@ mod tests {
 
         let status_rollback = format_session_status(&rollback_args, &rollback_agent);
         assert!(status_rollback.contains("prompt: legacy-v1 v1"));
+    }
+
+    #[test]
+    fn build_agent_rejects_invalid_selected_prompt_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(cwd.join(".davinci")).unwrap();
+        std::fs::write(
+            cwd.join(".davinci").join("settings.json"),
+            r#"{"promptProfile":"experimental"}"#,
+        )
+        .unwrap();
+        let parsed = Args {
+            project_trust_override: Some(true),
+            ..Args::default()
+        };
+
+        let error = match build_agent(&parsed, &session_dir, &cwd) {
+            Ok(_) => panic!("an invalid selected project profile must reach the host boundary"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "Invalid prompt profile 'experimental'. Valid profiles: stable, preview, legacy-v1"
+        );
     }
 }
