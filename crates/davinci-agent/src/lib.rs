@@ -643,6 +643,72 @@ impl Agent {
         })
     }
 
+    pub(crate) fn prepare_builtin_prompt_for_user_turn_batch(
+        &mut self,
+        user_texts: &[&str],
+    ) -> Result<prompt::PreparedTurnPrompt, String> {
+        if user_texts.is_empty() {
+            return Err("Cannot prepare empty user-turn batch".to_string());
+        }
+
+        let original_previous = self.last_real_user_request.clone();
+        let mut union = prompt::CapabilityDecision {
+            capabilities: Vec::new(),
+            reasons: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let mut last_runtime_state = None;
+
+        for user_text in user_texts {
+            let prepared = match self.prepare_builtin_prompt_for_user_turn(user_text) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.last_real_user_request = original_previous;
+                    return Err(error);
+                }
+            };
+            for capability in prepared.capabilities.capabilities {
+                if !union.capabilities.contains(&capability) {
+                    union.capabilities.push(capability);
+                }
+            }
+            union.reasons.extend(prepared.capabilities.reasons);
+            union.evidence.extend(prepared.capabilities.evidence);
+            last_runtime_state = Some(prepared.runtime_state);
+            self.last_real_user_request = Some((*user_text).to_string());
+        }
+        self.last_real_user_request = original_previous;
+        union
+            .capabilities
+            .sort_by_key(|capability| match capability {
+                prompt::NativeBehaviorCapability::FrontendDesign => 0,
+                prompt::NativeBehaviorCapability::Debugging => 1,
+                prompt::NativeBehaviorCapability::CodeReview => 2,
+            });
+
+        let runtime_state = last_runtime_state.expect("non-empty batch has runtime state");
+        let permission_mode = self.permissions.lock().map(|p| p.mode).unwrap_or_default();
+        let ctx = prompt::composer::PromptContext {
+            provider: &self.provider,
+            model_id: &self.model_id,
+            permission_mode,
+            plan_active: permission_mode == PermissionMode::ReadOnly,
+        };
+        let composed =
+            prompt::turn::compose_turn_prompt(&self.prompt_session, &ctx, &union, &runtime_state)?;
+        self.system_prompt = composed.text.clone();
+        self.base_system_prompt = composed.text.clone();
+        self.prompt_manifest = Some(composed.manifest.clone());
+        self.prompt_session.last_manifest = Some(composed.manifest.clone());
+        self.prompt_session.stable_bundle_hash = Some(composed.manifest.stable_sha256.clone());
+
+        Ok(prompt::PreparedTurnPrompt {
+            composed,
+            capabilities: union,
+            runtime_state,
+        })
+    }
+
     pub fn prompt(&mut self, text: &str) -> ChatMessage {
         self.prompt_user_with(text, &[])
     }
@@ -653,7 +719,15 @@ impl Agent {
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
         let _ = self.prepare_builtin_prompt_for_user_turn(text);
-        let message = self.prompt_with(text, images);
+        self.prompt_user_with_prepared(text, images)
+    }
+
+    pub(crate) fn prompt_user_with_prepared(
+        &mut self,
+        text: &str,
+        images: &[davinci_ai::MessageContent],
+    ) -> ChatMessage {
+        let message = self.prompt_with_origin(text, images, true);
         self.last_real_user_request = Some(text.to_string());
         message
     }
@@ -662,6 +736,15 @@ impl Agent {
         &mut self,
         text: &str,
         images: &[davinci_ai::MessageContent],
+    ) -> ChatMessage {
+        self.prompt_with_origin(text, images, false)
+    }
+
+    fn prompt_with_origin(
+        &mut self,
+        text: &str,
+        images: &[davinci_ai::MessageContent],
+        real_user_origin: bool,
     ) -> ChatMessage {
         self.flush_pending_bash_messages();
         // A job that finished while the user was typing is in context
@@ -684,16 +767,22 @@ impl Agent {
         if self.auto_resize_images {
             content = crate::normalize_tool_result_images(&content, true);
         }
-        let message = ChatMessage {
+        let mut message = ChatMessage {
             role: "user".into(),
             content,
             ..ChatMessage::default()
         };
+        if real_user_origin {
+            message
+                .extra
+                .insert(REAL_USER_ORIGIN_FIELD.into(), Value::Bool(true));
+        }
         self.messages.push(message.clone());
         if let Some(session) = &mut self.session {
-            let _ = session.append_entry(SessionEntry::message(
+            let _ = session.append_entry(chat_entry(
                 "user",
                 serde_json::to_value(&message.content).unwrap_or(Value::Null),
+                &message.extra,
             ));
         }
         self.pending_prompt_messages.push(message.clone());
@@ -1458,6 +1547,7 @@ impl Agent {
             .map_err(|error| format!("Runtime recovery required: {error}"))?,
         };
         let messages = messages_from_session(&session);
+        self.last_real_user_request = last_real_user_request_from_messages(&messages);
         self.reset_session_approvals();
         self.messages = messages;
         self.pending_prompt_messages.clear();
@@ -1727,6 +1817,20 @@ fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {
         .collect()
 }
 
+fn last_real_user_request_from_messages(messages: &[ChatMessage]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != "user"
+            || message.extra.get(REAL_USER_ORIGIN_FIELD) != Some(&Value::Bool(true))
+        {
+            return None;
+        }
+        message.content.iter().find_map(|content| match content {
+            davinci_ai::MessageContent::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+    })
+}
+
 fn first_kept_entry_id(
     session: &JsonlSession,
     before: &[ChatMessage],
@@ -1778,6 +1882,7 @@ impl From<AssistantMessage> for CompleteOutput {
 /// The `customType` of the user message that tells the model a background
 /// job finished.
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
+const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
 
 pub fn default_system_prompt() -> String {
     prompt::compose_legacy_default().text
@@ -2273,6 +2378,51 @@ mod tests {
         let manifest = resumed.prompt_manifest.as_ref().expect("manifest");
         assert_eq!(manifest.profile, "stable");
         assert_eq!(manifest.profile_version, 2);
+    }
+
+    #[test]
+    fn real_user_routing_history_survives_resume_without_mailbox_contamination() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let session = JsonlSession::create(dir.path(), "routing-history", None).unwrap();
+        let path = session.path.clone();
+        let mut agent = Agent::new_builtin(prompt::PromptProfile::Stable);
+        agent.session = Some(session);
+        agent.prompt_user_with(
+            "Redesign the UI dashboard layout with visual hierarchy.",
+            &[],
+        );
+        agent.prompt_with("Internal mailbox note: routine status only.", &[]);
+
+        let mut resumed = Agent::new_builtin(prompt::PromptProfile::Stable);
+        resumed
+            .load_from_session(JsonlSession::open(&path).unwrap())
+            .unwrap();
+        resumed.prompt_user_with("cards", &[]);
+        assert!(
+            resumed.system_prompt.contains("frontend_design_policy"),
+            "the last persisted real user request must remain eligible history after resume"
+        );
+
+        let isolated = JsonlSession::create(dir.path(), "mailbox-isolation", None).unwrap();
+        let isolated_path = isolated.path.clone();
+        let mut agent = Agent::new_builtin(prompt::PromptProfile::Stable);
+        agent.session = Some(isolated);
+        agent.prompt_user_with("Say hello.", &[]);
+        agent.prompt_with(
+            "Redesign the UI dashboard layout with visual hierarchy and cards.",
+            &[],
+        );
+
+        let mut resumed = Agent::new_builtin(prompt::PromptProfile::Stable);
+        resumed
+            .load_from_session(JsonlSession::open(&isolated_path).unwrap())
+            .unwrap();
+        resumed.prompt_user_with("cards", &[]);
+        assert!(
+            !resumed.system_prompt.contains("frontend_design_policy"),
+            "unmarked internal mailbox text must remain ineligible routing history after resume"
+        );
     }
 
     #[test]

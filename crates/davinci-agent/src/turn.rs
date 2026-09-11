@@ -410,8 +410,19 @@ impl Agent {
         if steer {
             self.stats.user_steers += drained.len() as u64;
         }
+        let batch_prepared = if drained.len() > 1 {
+            let texts: Vec<&str> = drained.iter().map(|queued| queued.text.as_str()).collect();
+            self.prepare_builtin_prompt_for_user_turn_batch(&texts)
+                .is_ok()
+        } else {
+            false
+        };
         for queued in drained {
-            let message = self.prompt_user_with(&queued.text, &queued.images);
+            let message = if batch_prepared {
+                self.prompt_user_with_prepared(&queued.text, &queued.images)
+            } else {
+                self.prompt_user_with(&queued.text, &queued.images)
+            };
             let _ = self.pending_prompt_messages.pop();
             new_messages.push(message.clone());
             self.push_event(

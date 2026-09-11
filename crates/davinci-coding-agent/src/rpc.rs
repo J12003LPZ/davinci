@@ -2314,6 +2314,59 @@ mod tests {
     }
 
     #[test]
+    fn rpc_default_all_queued_turns_union_capabilities_for_one_provider_request() {
+        fn assistant(id: &str) -> davinci_ai::AssistantMessage {
+            davinci_ai::AssistantMessage {
+                id: id.into(),
+                role: "assistant".into(),
+                content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let mut agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+        agent.prompt_session.append("RPC ALL APPEND");
+        assert_eq!(agent.queues.steer_mode, davinci_agent::QueueMode::All);
+        let mut runtime = RpcRuntime::new(
+            agent,
+            dir.path().join("sessions-all"),
+            dir.path().to_path_buf(),
+        );
+        for message in [
+            "Redesign this dashboard so it feels premium and intentional.",
+            "What is 2 + 2?",
+        ] {
+            let response = handle_rpc(
+                &mut runtime,
+                RpcCommand {
+                    kind: "steer".into(),
+                    message: Some(message.into()),
+                    ..RpcCommand::default()
+                },
+            );
+            assert!(response.success);
+        }
+        let mut provider_prompts = Vec::new();
+        runtime
+            .agent
+            .run_loop(|agent| {
+                provider_prompts.push(agent.system_prompt.clone());
+                Ok(assistant("rpc-all"))
+            })
+            .unwrap();
+        assert_eq!(provider_prompts.len(), 1);
+        assert!(provider_prompts[0].contains("frontend_design_policy"));
+        assert!(
+            provider_prompts[0].find("frontend_design_policy").unwrap()
+                < provider_prompts[0].find("RPC ALL APPEND").unwrap()
+        );
+    }
+
+    #[test]
     fn rpc_prompt_activates_capabilities_on_user_turn() {
         let dir = tempdir().unwrap();
         let agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);

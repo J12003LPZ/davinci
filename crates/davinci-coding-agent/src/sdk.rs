@@ -757,6 +757,53 @@ mod tests {
     }
 
     #[test]
+    fn sdk_default_all_queued_turns_union_capabilities_for_one_provider_request() {
+        fn assistant(id: &str) -> davinci_ai::AssistantMessage {
+            davinci_ai::AssistantMessage {
+                id: id.into(),
+                role: "assistant".into(),
+                content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+            }
+        }
+        let dir = tempdir().unwrap();
+        let mut session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent-all")),
+            session_dir: Some(dir.path().join("sessions-all")),
+            append_system_prompt: vec!["SDK ALL APPEND".into()],
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        assert_eq!(
+            session.agent.queues.steer_mode,
+            davinci_agent::QueueMode::All
+        );
+        session.steer(
+            "Redesign this dashboard so it feels premium and intentional.",
+            Vec::new(),
+        );
+        session.steer("What is 2 + 2?", Vec::new());
+        let mut prompts = Vec::new();
+        session
+            .run(|agent| {
+                prompts.push(agent.system_prompt.clone());
+                Ok(assistant("sdk-all"))
+            })
+            .unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("frontend_design_policy"));
+        assert!(
+            prompts[0].find("frontend_design_policy").unwrap()
+                < prompts[0].find("SDK ALL APPEND").unwrap()
+        );
+    }
+
+    #[test]
     fn sdk_session_prompt_activates_capabilities_on_user_turn() {
         let dir = tempdir().unwrap();
         let mut session = create_agent_session(CreateAgentSessionOptions {
