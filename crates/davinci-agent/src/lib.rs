@@ -600,10 +600,11 @@ impl Agent {
             .map(|ledger| ledger.recent_tool_names(10))
             .unwrap_or_default();
 
+        let has_uncommitted_changes = runtime::has_uncommitted_changes(&self.cwd);
         let router_input = prompt::CapabilityRouterInput::new(user_text)
             .with_previous_request(previous_user_request)
             .with_recent_tools(&recent_tools)
-            .with_uncommitted_changes(false);
+            .with_uncommitted_changes(has_uncommitted_changes);
 
         let capabilities = prompt::route_capabilities(&router_input);
 
@@ -4213,6 +4214,28 @@ mod tests {
             agent.prompt_manifest.as_ref().unwrap().stable_sha256,
             PromptProfile::Stable.bundle().stable_sha256()
         );
+    }
+
+    #[test]
+    fn prepare_builtin_prompt_routes_contextual_review_for_dirty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(dir.path().join("dirty.rs"), "fn dirty() {}\n").unwrap();
+
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+        agent.cwd = dir.path().to_path_buf();
+        let prepared = agent
+            .prepare_builtin_prompt_for_user_turn("sanity check what i just wrote")
+            .unwrap();
+
+        assert!(prepared
+            .capabilities
+            .is_active(prompt::capabilities::NativeBehaviorCapability::CodeReview));
     }
 
     #[test]

@@ -70,6 +70,14 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Return whether `cwd` currently has tracked or untracked Git changes.
+/// Non-repositories and unavailable Git are treated as clean routing context.
+pub fn has_uncommitted_changes(cwd: &Path) -> bool {
+    run_git(cwd, &["status", "--porcelain"])
+        .map(|status| !status.is_empty())
+        .unwrap_or(false)
+}
+
 /// Thread-safe manager for ephemeral git worktrees.
 #[derive(Clone)]
 pub struct WorktreeManager {

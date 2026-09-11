@@ -106,7 +106,7 @@ pub use workflow::{
     WorkflowPhaseSpec, WorkflowSpec, WorkflowStateError, WorkflowStateStore, WorkflowStatus,
     WorkflowValidationError, WorkflowWorkerSpec,
 };
-pub use worktree::{WorktreeError, WorktreeLease, WorktreeManager};
+pub use worktree::{has_uncommitted_changes, WorktreeError, WorktreeLease, WorktreeManager};
 
 /// Handle held by an executing Agent or worker to participate in the shared runtime.
 #[derive(Clone)]
