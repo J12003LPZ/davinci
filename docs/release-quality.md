@@ -21,6 +21,10 @@ Every pull request that modifies `crates/davinci-agent/src/prompt/` or `crates/d
 
 PR CI runs completely offline (`PI_OFFLINE=1`) without external network access.
 
+Main CI must be green before any prompt, native capability, or evaluation feature is
+graduated. Workflow syntax and lint validity are therefore release prerequisites,
+not advisory checks.
+
 ---
 
 ## 2. Live Candidate Graduation Gates (Preview -> Stable)

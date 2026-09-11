@@ -31,7 +31,8 @@ jobs:
       - name: Use repository-pinned Rust
         run: rustup show
       - name: Run offline behavioral suite verification
-        run: cargo test -p davinci-evals behavior:: -- --nocapture
+        run: |
+          cargo test -p davinci-evals behavior:: -- --nocapture
       - name: Run gate verification
         run: cargo test -p davinci-evals behavior::gate -- --nocapture
       - name: Upload eval test artifacts
