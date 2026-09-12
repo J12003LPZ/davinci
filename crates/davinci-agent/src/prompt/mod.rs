@@ -21,7 +21,8 @@ pub use bundle::{
 };
 pub use capabilities::{
     capability_module, detect_native_capabilities, route_capabilities, CapabilityDecision,
-    CapabilityEvidence, CapabilityEvidenceKind, CapabilityRouterInput, NativeBehaviorCapability,
+    CapabilityEvidence, CapabilityEvidenceKind, CapabilityRouterInput, CapabilityRunState,
+    DebuggingState, FrontendDesignState, NativeBehaviorCapability, ReviewState,
     CAPABILITY_POLICY_MAX_TOKENS,
 };
 pub use coding::{

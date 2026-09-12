@@ -71,6 +71,7 @@ pub use permission::{
     ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
     ToolApprovalRequest, ToolApprover, ToolClass,
 };
+pub use prompt::{CapabilityRunState, DebuggingState, FrontendDesignState, ReviewState};
 pub use prompt::{PreparedTurnPrompt, PromptProfile};
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
@@ -134,7 +135,7 @@ use davinci_session::{JsonlSession, SessionEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 type CustomToolFn = dyn Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync;
@@ -286,6 +287,8 @@ pub struct Agent {
     previous_plan_revision: Option<LivingPlan>,
     /// Whether the host has registered a backend capable of visual verification.
     visual_verification_available: bool,
+    /// Typed lifecycle evidence for the currently prepared real user turn.
+    capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -384,6 +387,7 @@ impl Agent {
             previous_execution_mode: None,
             previous_plan_revision: None,
             visual_verification_available: false,
+            capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -510,6 +514,32 @@ impl Agent {
         self.visual_verification_available = available;
     }
 
+    /// Return a read-only snapshot of lifecycle evidence for the prepared turn.
+    pub fn capability_run_state(&self) -> prompt::CapabilityRunState {
+        self.capability_run_state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    fn reset_capability_run_state(
+        &self,
+        capabilities: &prompt::CapabilityDecision,
+        visual_backend_available: bool,
+    ) {
+        self.capability_run_state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .reset_for_user_turn(capabilities, visual_backend_available);
+    }
+
+    fn observe_capability_event(&self, event: &AgentEvent) {
+        self.capability_run_state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .observe_event(event);
+    }
+
     pub fn is_plan_mode(&self) -> bool {
         self.permission_mode() == PermissionMode::ReadOnly
     }
@@ -581,6 +611,7 @@ impl Agent {
     }
 
     pub fn push_event(&self, events: &mut Vec<AgentEvent>, event: AgentEvent) {
+        self.observe_capability_event(&event);
         if let Some(sink) = &self.event_sink {
             (sink.0)(&event);
         }
@@ -593,6 +624,7 @@ impl Agent {
     /// so the loop records them into the event list without sending them a
     /// second time.
     pub fn emit_live(&self, event: AgentEvent) {
+        self.observe_capability_event(&event);
         if let Some(sink) = &self.event_sink {
             (sink.0)(&event);
         }
@@ -646,6 +678,7 @@ impl Agent {
             &capabilities,
             &runtime_state,
         )?;
+        self.reset_capability_run_state(&capabilities, runtime_state.visual_verification_available);
 
         self.system_prompt = composed.text.clone();
         self.base_system_prompt = composed.text.clone();
@@ -713,6 +746,7 @@ impl Agent {
         };
         let composed =
             prompt::turn::compose_turn_prompt(&self.prompt_session, &ctx, &union, &runtime_state)?;
+        self.reset_capability_run_state(&union, runtime_state.visual_verification_available);
         self.system_prompt = composed.text.clone();
         self.base_system_prompt = composed.text.clone();
         self.prompt_manifest = Some(composed.manifest.clone());
@@ -4437,6 +4471,48 @@ mod tests {
             .prepare_builtin_prompt_for_user_turn("Continue the approved task.")
             .unwrap();
         assert!(prepared.runtime_state.active_contract);
+    }
+
+    #[test]
+    fn capability_run_state_resets_on_each_real_user_turn_and_observes_events() {
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+        agent.set_visual_verification_available(true);
+        agent
+            .prepare_builtin_prompt_for_user_turn(
+                "Redesign this dashboard so it feels premium and intentional.",
+            )
+            .unwrap();
+
+        let mut events = Vec::new();
+        agent.push_event(
+            &mut events,
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: "edit-1".into(),
+                tool_name: "edit".into(),
+                args: serde_json::json!({"path": "src/App.tsx"}),
+            },
+        );
+        agent.emit_live(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "edit-1".into(),
+            tool_name: "edit".into(),
+            result: serde_json::json!({}),
+            is_error: false,
+            details: None,
+        });
+
+        let state = agent.capability_run_state();
+        assert!(state
+            .frontend
+            .as_ref()
+            .is_some_and(|frontend| frontend.frontend_edit_seen));
+
+        agent
+            .prepare_builtin_prompt_for_user_turn("Diagnose the root cause of this failure.")
+            .unwrap();
+        let state = agent.capability_run_state();
+        assert!(state.frontend.is_none());
+        assert!(state.debugging.is_some());
+        assert!(!state.debugging.as_ref().unwrap().failure_signal_seen);
     }
 
     #[test]
