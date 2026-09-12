@@ -15,6 +15,8 @@ pub struct CapabilityRunState {
     pub review: Option<ReviewState>,
     #[serde(skip)]
     in_flight_commands: HashMap<String, String>,
+    #[serde(skip)]
+    in_flight_edits: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +63,7 @@ impl CapabilityRunState {
                 review_started: true,
             });
         self.in_flight_commands.clear();
+        self.in_flight_edits.clear();
     }
 
     pub fn observe_event(&mut self, event: &AgentEvent) {
@@ -82,15 +85,12 @@ impl CapabilityRunState {
 
     fn observe_tool_start(&mut self, tool_call_id: &str, tool_name: &str, args: &Value) {
         if is_edit_tool(tool_name) {
-            if let Some(frontend) = self.frontend.as_mut() {
-                frontend.frontend_edit_seen = true;
-                frontend.visual_snapshot_after_last_edit = false;
-            }
-            if let Some(debugging) = self.debugging.as_mut() {
-                if debugging.failure_signal_seen {
-                    debugging.causal_edit_seen = true;
-                }
-            }
+            let after_failure = self
+                .debugging
+                .as_ref()
+                .is_some_and(|debugging| debugging.failure_signal_seen);
+            self.in_flight_edits
+                .insert(tool_call_id.to_owned(), after_failure);
         }
 
         if let Some(digest) = command_digest(tool_name, args) {
@@ -101,6 +101,19 @@ impl CapabilityRunState {
 
     fn observe_tool_end(&mut self, tool_call_id: &str, tool_name: &str, is_error: bool) {
         let command_digest = self.in_flight_commands.remove(tool_call_id);
+        let edit_after_failure = self.in_flight_edits.remove(tool_call_id);
+
+        if is_edit_tool(tool_name) && !is_error {
+            if let Some(frontend) = self.frontend.as_mut() {
+                frontend.frontend_edit_seen = true;
+                frontend.visual_snapshot_after_last_edit = false;
+            }
+            if edit_after_failure == Some(true) {
+                if let Some(debugging) = self.debugging.as_mut() {
+                    debugging.causal_edit_seen = true;
+                }
+            }
+        }
 
         if tool_name == "visual_snapshot" && !is_error {
             if let Some(frontend) = self.frontend.as_mut() {
@@ -139,7 +152,7 @@ fn is_edit_tool(tool_name: &str) -> bool {
 }
 
 fn command_digest(tool_name: &str, args: &Value) -> Option<String> {
-    if !matches!(tool_name, "bash" | "powershell") {
+    if !matches!(tool_name, "bash" | "powershell" | "exec_command") {
         return None;
     }
     args.get("command")
@@ -187,7 +200,7 @@ mod tests {
         state.reset_for_user_turn(&decision(NativeBehaviorCapability::FrontendDesign), true);
 
         state.observe_event(&start("edit-1", "edit", json!({"path": "src/App.tsx"})));
-        assert!(state.frontend.as_ref().unwrap().frontend_edit_seen);
+        assert!(!state.frontend.as_ref().unwrap().frontend_edit_seen);
         assert!(
             !state
                 .frontend
@@ -206,6 +219,7 @@ mod tests {
         assert_eq!(frontend.visual_revision_count, 1);
 
         state.observe_event(&start("edit-2", "apply_patch", json!({"patch": "..."})));
+        state.observe_event(&end("edit-2", "apply_patch", false));
         let frontend = state.frontend.as_ref().unwrap();
         assert!(!frontend.visual_snapshot_after_last_edit);
         assert_eq!(frontend.visual_revision_count, 1);
@@ -230,6 +244,7 @@ mod tests {
         assert!(!debugging.causal_edit_seen);
 
         state.observe_event(&start("edit-1", "edit", json!({"path": "src/lib.rs"})));
+        assert!(!state.debugging.as_ref().unwrap().causal_edit_seen);
         state.observe_event(&end("edit-1", "edit", false));
         assert!(state.debugging.as_ref().unwrap().causal_edit_seen);
 
@@ -255,5 +270,52 @@ mod tests {
         assert!(!debugging.reproducer_failed_before_edit);
         assert!(!debugging.causal_edit_seen);
         assert!(!debugging.reproducer_passed_after_edit);
+    }
+
+    #[test]
+    fn failed_edits_do_not_create_frontend_or_debug_evidence() {
+        let mut state = CapabilityRunState::default();
+        state.reset_for_user_turn(&decision(NativeBehaviorCapability::FrontendDesign), true);
+        state.observe_event(&start("edit-1", "edit", json!({"path": "src/App.tsx"})));
+        state.observe_event(&end("edit-1", "edit", true));
+        assert!(!state.frontend.as_ref().unwrap().frontend_edit_seen);
+
+        state.reset_for_user_turn(&decision(NativeBehaviorCapability::Debugging), false);
+        state.observe_event(&start(
+            "run-1",
+            "bash",
+            json!({"command": "cargo test -p davinci-agent"}),
+        ));
+        state.observe_event(&end("run-1", "bash", true));
+        state.observe_event(&start("edit-1", "edit", json!({"path": "src/lib.rs"})));
+        state.observe_event(&end("edit-1", "edit", true));
+        state.observe_event(&start(
+            "run-2",
+            "bash",
+            json!({"command": "cargo test -p davinci-agent"}),
+        ));
+        state.observe_event(&end("run-2", "bash", false));
+
+        let debugging = state.debugging.as_ref().unwrap();
+        assert!(!debugging.causal_edit_seen);
+        assert!(!debugging.reproducer_passed_after_edit);
+    }
+
+    #[test]
+    fn exec_command_is_tracked_as_a_reproducer() {
+        let mut state = CapabilityRunState::default();
+        state.reset_for_user_turn(&decision(NativeBehaviorCapability::Debugging), false);
+        let command = "cargo test -p davinci-agent";
+        state.observe_event(&start("run-1", "exec_command", json!({"command": command})));
+        state.observe_event(&end("run-1", "exec_command", true));
+        state.observe_event(&start("edit-1", "edit", json!({"path": "src/lib.rs"})));
+        state.observe_event(&end("edit-1", "edit", false));
+        state.observe_event(&start("run-2", "exec_command", json!({"command": command})));
+        state.observe_event(&end("run-2", "exec_command", false));
+
+        let debugging = state.debugging.as_ref().unwrap();
+        assert!(debugging.reproducer_command_digest.is_some());
+        assert!(debugging.reproducer_failed_before_edit);
+        assert!(debugging.reproducer_passed_after_edit);
     }
 }
