@@ -11766,17 +11766,10 @@ mod tests {
         let mut agent = Agent::new("x");
 
         sync_visual_verification_availability(&mut agent, &[]);
-        assert!(!agent
-            .runtime_prompt_state()
-            .visual_verification_available);
+        assert!(!agent.runtime_prompt_state().visual_verification_available);
 
-        sync_visual_verification_availability(
-            &mut agent,
-            &[String::from("visual_snapshot")],
-        );
-        assert!(agent
-            .runtime_prompt_state()
-            .visual_verification_available);
+        sync_visual_verification_availability(&mut agent, &[String::from("visual_snapshot")]);
+        assert!(agent.runtime_prompt_state().visual_verification_available);
     }
 
     #[test]
