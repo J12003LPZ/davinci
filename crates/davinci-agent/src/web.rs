@@ -63,6 +63,7 @@ fn ip_refusal(ip: IpAddr) -> Option<&'static str> {
 }
 
 fn ipv4_refusal(ip: Ipv4Addr) -> Option<&'static str> {
+    let octets = ip.octets();
     if ip.is_unspecified() {
         Some("unspecified address")
     } else if ip.is_loopback() {
@@ -72,6 +73,9 @@ fn ipv4_refusal(ip: Ipv4Addr) -> Option<&'static str> {
         Some("link-local address")
     } else if ip.is_private() {
         Some("private address")
+    } else if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+        // RFC 6598 shared address space can route to provider-internal services.
+        Some("shared address")
     } else if ip.is_broadcast() {
         Some("broadcast address")
     } else if ip.is_multicast() {
@@ -1462,6 +1466,11 @@ and <a href="https://example.com/x">https://example.com/x</a>.</p>
         assert_eq!(refused("172.16.0.1"), Some("private address"));
         assert_eq!(refused("172.31.255.255"), Some("private address"));
         assert_eq!(refused("192.168.1.1"), Some("private address"));
+        assert_eq!(refused("100.64.0.0"), Some("shared address"));
+        assert_eq!(refused("100.100.100.200"), Some("shared address"));
+        assert_eq!(refused("100.127.255.255"), Some("shared address"));
+        assert_eq!(refused("100.63.255.255"), None);
+        assert_eq!(refused("100.128.0.0"), None);
         assert_eq!(refused("fc00::1"), Some("private address"));
         assert_eq!(refused("fdab::1"), Some("private address"));
         assert_eq!(refused("169.254.169.254"), Some("link-local address"));
