@@ -8,6 +8,7 @@ pub mod harness_table;
 pub mod reporter;
 pub mod security_eval;
 pub mod summary;
+pub mod visual;
 
 pub use artifacts::{
     persist_behavior_trace_artifacts, persist_eval_artifact_references,
