@@ -142,7 +142,12 @@ pub fn compose_with_mutations(
     ctx: &PromptContext<'_>,
     mutations: &[PromptMutation],
 ) -> ComposedPrompt {
-    let mut modules = stable_v2_modules();
+    let policy = crate::prompt::model_policy::prompt_model_policy(ctx.provider, ctx.model_id);
+    let mut modules = crate::prompt::model_policy::apply_model_policy(
+        policy,
+        version::PromptProfile::Stable,
+        stable_v2_modules(),
+    );
     let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
     if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
         modules.push(adapter);
@@ -179,7 +184,12 @@ pub fn compose_with_mutations(
         }
     }
 
-    compose_modules(&modules)
+    let mut composed = compose_modules(&modules);
+    composed.manifest.profile = version::PromptProfile::Stable.id().to_string();
+    composed.manifest.profile_version = version::PromptProfile::Stable.version();
+    composed.manifest.model_policy = policy.id().to_string();
+    composed.manifest.model_policy_version = policy.version();
+    composed
 }
 
 #[cfg(test)]

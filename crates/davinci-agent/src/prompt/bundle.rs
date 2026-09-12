@@ -39,7 +39,10 @@ impl PromptBundle {
 
     /// Composes this bundle into a full prompt with provider adapter and runtime state.
     pub fn compose(&self, ctx: &PromptContext<'_>) -> ComposedPrompt {
-        let mut modules = self.modules.clone();
+        let profile = PromptProfile::parse(self.id).unwrap_or(PromptProfile::Stable);
+        let policy = crate::prompt::model_policy::prompt_model_policy(ctx.provider, ctx.model_id);
+        let mut modules =
+            crate::prompt::model_policy::apply_model_policy(policy, profile, self.modules.clone());
         let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
         if let Some(adapter) = crate::prompt::provider::provider_adapter(family) {
             modules.push(adapter);
@@ -56,6 +59,8 @@ impl PromptBundle {
         let mut composed = compose_modules(&modules);
         composed.manifest.profile = self.id.to_string();
         composed.manifest.profile_version = self.version;
+        composed.manifest.model_policy = policy.id().to_string();
+        composed.manifest.model_policy_version = policy.version();
         composed
     }
 

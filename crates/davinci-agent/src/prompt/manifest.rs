@@ -17,11 +17,19 @@ pub struct PromptModuleIdentity {
 pub struct PromptManifest {
     pub profile: String,
     pub profile_version: u32,
+    #[serde(default = "default_model_policy_id")]
+    pub model_policy: String,
+    #[serde(default)]
+    pub model_policy_version: u32,
     pub stable_sha256: String,
     pub full_sha256: String,
     pub stable_estimated_tokens: usize,
     pub dynamic_estimated_tokens: usize,
     pub modules: Vec<PromptModuleIdentity>,
+}
+
+pub(crate) fn default_model_policy_id() -> String {
+    "default".to_string()
 }
 
 pub fn estimate_tokens_from_str(s: &str) -> usize {
@@ -59,6 +67,8 @@ impl PromptManifest {
         Self {
             profile: profile.to_string(),
             profile_version,
+            model_policy: default_model_policy_id(),
+            model_policy_version: 0,
             stable_sha256: hash_text(stable_text),
             full_sha256: hash_text(full_text),
             stable_estimated_tokens: estimate_tokens_from_str(stable_text),
@@ -116,6 +126,44 @@ mod tests {
         assert_ne!(a.manifest.full_sha256, b.manifest.full_sha256);
     }
 
+    #[test]
+    fn old_manifest_deserializes_with_default_model_policy() {
+        let serialized = r#"{
+            "profile":"stable",
+            "profile_version":2,
+            "stable_sha256":"stable",
+            "full_sha256":"full",
+            "stable_estimated_tokens":10,
+            "dynamic_estimated_tokens":2,
+            "modules":[]
+        }"#;
+
+        let manifest: PromptManifest = serde_json::from_str(serialized).unwrap();
+        assert_eq!(manifest.model_policy, "default");
+        assert_eq!(manifest.model_policy_version, 0);
+    }
+    #[test]
+    fn astra_manifest_records_model_policy_without_changing_profile_identity() {
+        let ctx = PromptContext {
+            provider: "openai-codex",
+            model_id: "gpt-6-astra",
+            permission_mode: PermissionMode::Ask,
+            plan_active: false,
+        };
+
+        let prompt =
+            crate::prompt::compose_profile_prompt(crate::prompt::PromptProfile::Stable, &ctx);
+        assert_eq!(prompt.manifest.profile, "stable");
+        assert_eq!(
+            prompt.manifest.profile_version,
+            crate::prompt::STABLE_PROMPT_VERSION
+        );
+        assert_eq!(prompt.manifest.model_policy, "gpt6-astra");
+        assert_eq!(
+            prompt.manifest.model_policy_version,
+            crate::prompt::GPT6_ASTRA_POLICY_VERSION
+        );
+    }
     #[test]
     fn stable_prompt_stays_within_budget() {
         let prompt = compose_default_prompt(&fixture_context());

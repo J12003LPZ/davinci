@@ -7,6 +7,7 @@ pub mod collaboration;
 pub mod composer;
 pub mod core;
 pub mod manifest;
+pub mod model_policy;
 pub mod provider;
 pub mod runtime_state;
 pub mod session;
@@ -38,6 +39,9 @@ pub use composer::{
 };
 pub use core::{core_autonomy_module, core_identity_module};
 pub use manifest::{PromptManifest, PromptModuleIdentity};
+pub use model_policy::{
+    apply_model_policy, prompt_model_policy, PromptModelPolicy, GPT6_ASTRA_POLICY_VERSION,
+};
 pub use provider::{
     prompt_model_family, provider_adapter, PromptModelFamily, PROVIDER_ADAPTER_MAX_TOKENS,
 };

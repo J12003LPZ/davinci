@@ -274,6 +274,8 @@ pub fn compose_session_prompt(
             let manifest = PromptManifest {
                 profile: "custom".to_string(),
                 profile_version: 0,
+                model_policy: "default".to_string(),
+                model_policy_version: 0,
                 stable_sha256: hash_text(&stable_text),
                 full_sha256: hash_text(&full_text),
                 stable_estimated_tokens: estimate_tokens_from_str(&stable_text),

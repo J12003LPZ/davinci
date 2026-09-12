@@ -27,7 +27,9 @@ pub fn compose_turn_prompt(
     })?;
 
     let bundle = profile.bundle();
-    let mut modules = bundle.modules.clone();
+    let policy = crate::prompt::model_policy::prompt_model_policy(ctx.provider, ctx.model_id);
+    let mut modules =
+        crate::prompt::model_policy::apply_model_policy(policy, profile, bundle.modules.clone());
 
     // 1. Dynamic provider adapter
     let family = crate::prompt::provider::prompt_model_family(ctx.provider, ctx.model_id);
@@ -46,6 +48,8 @@ pub fn compose_turn_prompt(
     let mut composed = compose_modules(&modules);
     composed.manifest.profile = bundle.id.to_string();
     composed.manifest.profile_version = bundle.version;
+    composed.manifest.model_policy = policy.id().to_string();
+    composed.manifest.model_policy_version = policy.version();
 
     // 4. Dynamic user appends
     let appends = session
