@@ -181,6 +181,8 @@ pub struct NativeExtensionHost {
     pub graph: GraphController,
     pub security: SecurityScanController,
     pub learning: LearningController,
+    /// Set by the native visual backend registration path when one exists.
+    pub visual_verification_available: bool,
 }
 
 impl NativeExtensionHost {
@@ -214,7 +216,12 @@ impl NativeExtensionHost {
             graph,
             security: SecurityScanController::new(cwd.to_path_buf()),
             learning,
+            visual_verification_available: false,
         }
+    }
+
+    pub fn visual_verification_available(&self) -> bool {
+        self.visual_verification_available
     }
 
     pub fn tool_names(&self) -> Vec<String> {

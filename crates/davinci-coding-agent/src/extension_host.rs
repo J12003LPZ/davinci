@@ -370,6 +370,13 @@ impl ExtensionHost {
             .unwrap_or_default()
     }
 
+    pub fn visual_verification_available(&self) -> bool {
+        self.native
+            .lock()
+            .map(|native| native.visual_verification_available())
+            .unwrap_or(false)
+    }
+
     pub fn native_tool_specs(&self) -> Vec<davinci_ai::ToolSpec> {
         NativeExtensionHost::tool_specs()
     }

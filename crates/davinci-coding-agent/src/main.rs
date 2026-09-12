@@ -730,7 +730,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         let _ = ext.handlers.as_slice();
     }
     agent.apply_extension_tools(&names);
-    sync_visual_verification_availability(&mut agent, &names);
+    sync_visual_verification_availability(&mut agent, &host);
     // A graph worker's `--tools` is its whole allowlist: the native tools it
     // was not handed (graph_run, sec_*, memory_search…) are not offered to
     // its model either, rather than merely refused when called.
@@ -7153,13 +7153,8 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
     agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
 }
 
-const VISUAL_SNAPSHOT_TOOL_NAME: &str = "visual_snapshot";
-
-fn sync_visual_verification_availability(agent: &mut Agent, native_tool_names: &[String]) {
-    let available = native_tool_names
-        .iter()
-        .any(|name| name == VISUAL_SNAPSHOT_TOOL_NAME);
-    agent.set_visual_verification_available(available);
+fn sync_visual_verification_availability(agent: &mut Agent, host: &ExtensionHost) {
+    agent.set_visual_verification_available(host.visual_verification_available());
 }
 
 fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut ExtensionHost) {
@@ -7173,7 +7168,7 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
         names.extend(ext.commands.iter().cloned());
     }
     agent.apply_extension_tools(&names);
-    sync_visual_verification_availability(agent, &names);
+    sync_visual_verification_availability(agent, host);
     attach_tool_executor(agent, host);
     host.emit(ExtensionEvent::SessionStart);
 }
@@ -11764,11 +11759,20 @@ mod tests {
     #[test]
     fn visual_verification_prompt_state_follows_registered_native_backend() {
         let mut agent = Agent::new("x");
+        let host = ExtensionHost::default();
 
-        sync_visual_verification_availability(&mut agent, &[]);
+        sync_visual_verification_availability(&mut agent, &host);
         assert!(!agent.runtime_prompt_state().visual_verification_available);
 
-        sync_visual_verification_availability(&mut agent, &[String::from("visual_snapshot")]);
+        agent.apply_extension_tools(&[String::from("visual_snapshot")]);
+        sync_visual_verification_availability(&mut agent, &host);
+        assert!(!agent.runtime_prompt_state().visual_verification_available);
+
+        {
+            let mut native = host.native.lock().unwrap_or_else(|err| err.into_inner());
+            native.visual_verification_available = true;
+        }
+        sync_visual_verification_availability(&mut agent, &host);
         assert!(agent.runtime_prompt_state().visual_verification_available);
     }
 
