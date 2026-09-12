@@ -127,9 +127,9 @@ impl CapabilityRunState {
 
         if let Some(debugging) = self.debugging.as_mut() {
             if is_error {
-                debugging.failure_signal_seen = true;
-                if !debugging.causal_edit_seen {
-                    if let Some(digest) = command_digest {
+                if let Some(digest) = command_digest {
+                    debugging.failure_signal_seen = true;
+                    if !debugging.causal_edit_seen {
                         debugging.reproducer_command_digest.get_or_insert(digest);
                         debugging.reproducer_failed_before_edit = true;
                     }
@@ -317,5 +317,38 @@ mod tests {
         assert!(debugging.reproducer_command_digest.is_some());
         assert!(debugging.reproducer_failed_before_edit);
         assert!(debugging.reproducer_passed_after_edit);
+    }
+
+    #[test]
+    fn powershell_is_tracked_as_a_reproducer() {
+        let mut state = CapabilityRunState::default();
+        state.reset_for_user_turn(&decision(NativeBehaviorCapability::Debugging), false);
+        let command = "cargo test -p davinci-agent";
+        state.observe_event(&start("run-1", "powershell", json!({"command": command})));
+        state.observe_event(&end("run-1", "powershell", true));
+        state.observe_event(&start("edit-1", "edit", json!({"path": "src/lib.rs"})));
+        state.observe_event(&end("edit-1", "edit", false));
+        state.observe_event(&start("run-2", "powershell", json!({"command": command})));
+        state.observe_event(&end("run-2", "powershell", false));
+
+        let debugging = state.debugging.as_ref().unwrap();
+        assert!(debugging.reproducer_command_digest.is_some());
+        assert!(debugging.reproducer_failed_before_edit);
+        assert!(debugging.reproducer_passed_after_edit);
+    }
+
+    #[test]
+    fn failed_edit_is_not_a_debug_failure_signal() {
+        let mut state = CapabilityRunState::default();
+        state.reset_for_user_turn(&decision(NativeBehaviorCapability::Debugging), false);
+        state.observe_event(&start("edit-1", "edit", json!({"path": "src/lib.rs"})));
+        state.observe_event(&end("edit-1", "edit", true));
+        state.observe_event(&start("edit-2", "edit", json!({"path": "src/lib.rs"})));
+        state.observe_event(&end("edit-2", "edit", false));
+
+        let debugging = state.debugging.as_ref().unwrap();
+        assert!(!debugging.failure_signal_seen);
+        assert!(!debugging.causal_edit_seen);
+        assert!(debugging.reproducer_command_digest.is_none());
     }
 }
