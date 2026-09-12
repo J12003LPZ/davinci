@@ -72,8 +72,8 @@ pub use permission::{
     ToolApprovalRequest, ToolApprover, ToolClass,
 };
 pub use prompt::{
-    CapabilityGateOutcome, CapabilityRunState, DebuggingState, FrontendDesignState, ReviewState,
-    MAX_CAPABILITY_COMPLETION_REMINDERS,
+    CapabilityGateOutcome, CapabilityRunState, DebuggingState, FrontendDesignState,
+    ReproducerEvidence, ReviewState, MAX_CAPABILITY_COMPLETION_REMINDERS,
 };
 pub use prompt::{PreparedTurnPrompt, PromptProfile};
 pub use pruning::PruneSettings;

@@ -2799,7 +2799,10 @@ mod tests {
         {
             let mut state = agent.capability_run_state.lock().unwrap();
             state.debugging = Some(crate::DebuggingState {
-                reproducer_failed_before_edit: true,
+                reproducer: Some(crate::ReproducerEvidence {
+                    failed_before_edit: true,
+                    ..crate::ReproducerEvidence::default()
+                }),
                 causal_edit_seen: true,
                 ..crate::DebuggingState::default()
             });

@@ -23,8 +23,8 @@ pub use capabilities::{
     capability_module, detect_native_capabilities, evaluate_completion, incomplete_evidence_reason,
     route_capabilities, CapabilityDecision, CapabilityEvidence, CapabilityEvidenceKind,
     CapabilityGateOutcome, CapabilityRouterInput, CapabilityRunState, DebuggingState,
-    FrontendDesignState, NativeBehaviorCapability, ReviewState, CAPABILITY_POLICY_MAX_TOKENS,
-    DEBUGGING_REPRODUCER_REASON_CODE, FRONTEND_SNAPSHOT_REASON_CODE,
+    FrontendDesignState, NativeBehaviorCapability, ReproducerEvidence, ReviewState,
+    CAPABILITY_POLICY_MAX_TOKENS, DEBUGGING_REPRODUCER_REASON_CODE, FRONTEND_SNAPSHOT_REASON_CODE,
     MAX_CAPABILITY_COMPLETION_REMINDERS,
 };
 pub use coding::{

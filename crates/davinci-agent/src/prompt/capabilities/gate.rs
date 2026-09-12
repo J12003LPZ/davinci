@@ -35,9 +35,9 @@ pub fn evaluate_completion(
 pub fn incomplete_evidence_reason(state: &CapabilityRunState) -> Option<&'static str> {
     if state.active.contains(&NativeBehaviorCapability::Debugging)
         && state.debugging.as_ref().is_some_and(|debugging| {
-            debugging.reproducer_failed_before_edit
-                && debugging.causal_edit_seen
-                && !debugging.reproducer_passed_after_edit
+            debugging.reproducer.as_ref().is_some_and(|reproducer| {
+                reproducer.failed_before_edit && !reproducer.passed_after_edit
+            }) && debugging.causal_edit_seen
         })
     {
         return Some(DEBUGGING_REPRODUCER_REASON_CODE);
@@ -73,7 +73,9 @@ fn reminder_message(reason_code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prompt::capabilities::{CapabilityDecision, DebuggingState, FrontendDesignState};
+    use crate::prompt::capabilities::{
+        CapabilityDecision, DebuggingState, FrontendDesignState, ReproducerEvidence,
+    };
 
     fn state(capability: NativeBehaviorCapability) -> CapabilityRunState {
         let decision = CapabilityDecision {
@@ -90,7 +92,10 @@ mod tests {
     fn debugging_requires_original_reproducer_after_edit() {
         let mut state = state(NativeBehaviorCapability::Debugging);
         state.debugging = Some(DebuggingState {
-            reproducer_failed_before_edit: true,
+            reproducer: Some(ReproducerEvidence {
+                failed_before_edit: true,
+                ..ReproducerEvidence::default()
+            }),
             causal_edit_seen: true,
             ..DebuggingState::default()
         });
@@ -109,7 +114,10 @@ mod tests {
             .debugging
             .as_mut()
             .unwrap()
-            .reproducer_passed_after_edit = true;
+            .reproducer
+            .as_mut()
+            .unwrap()
+            .passed_after_edit = true;
         assert_eq!(
             evaluate_completion(&state, 0),
             CapabilityGateOutcome::AllowCompletion
@@ -149,7 +157,10 @@ mod tests {
     fn debugging_without_a_causal_edit_does_not_claim_unresolved_change() {
         let mut state = state(NativeBehaviorCapability::Debugging);
         state.debugging = Some(DebuggingState {
-            reproducer_failed_before_edit: true,
+            reproducer: Some(ReproducerEvidence {
+                failed_before_edit: true,
+                ..ReproducerEvidence::default()
+            }),
             ..DebuggingState::default()
         });
         assert_eq!(
@@ -162,7 +173,10 @@ mod tests {
     fn max_reminders_allow_completion_but_keep_incomplete_evidence_visible() {
         let mut state = state(NativeBehaviorCapability::Debugging);
         state.debugging = Some(DebuggingState {
-            reproducer_failed_before_edit: true,
+            reproducer: Some(ReproducerEvidence {
+                failed_before_edit: true,
+                ..ReproducerEvidence::default()
+            }),
             causal_edit_seen: true,
             ..DebuggingState::default()
         });

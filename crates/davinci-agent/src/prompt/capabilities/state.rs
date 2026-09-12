@@ -2,7 +2,7 @@
 
 use crate::events::AgentEvent;
 use crate::prompt::capabilities::{CapabilityDecision, NativeBehaviorCapability};
-use crate::prompt::manifest::hash_text;
+use crate::tool_ledger::canonical_arguments_digest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ pub struct CapabilityRunState {
     pub debugging: Option<DebuggingState>,
     pub review: Option<ReviewState>,
     #[serde(skip)]
-    in_flight_commands: HashMap<String, String>,
+    in_flight_commands: HashMap<String, PendingCommandEvidence>,
     #[serde(skip)]
     in_flight_edits: HashMap<String, bool>,
 }
@@ -28,12 +28,26 @@ pub struct FrontendDesignState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReproducerEvidence {
+    pub tool: String,
+    pub argument_digest: String,
+    pub executable_summary: String,
+    pub failed_before_edit: bool,
+    pub passed_after_edit: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebuggingState {
     pub failure_signal_seen: bool,
-    pub reproducer_command_digest: Option<String>,
-    pub reproducer_failed_before_edit: bool,
+    pub reproducer: Option<ReproducerEvidence>,
     pub causal_edit_seen: bool,
-    pub reproducer_passed_after_edit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCommandEvidence {
+    tool: String,
+    argument_digest: String,
+    executable_summary: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,14 +107,14 @@ impl CapabilityRunState {
                 .insert(tool_call_id.to_owned(), after_failure);
         }
 
-        if let Some(digest) = command_digest(tool_name, args) {
+        if let Some(command) = command_evidence(tool_name, args) {
             self.in_flight_commands
-                .insert(tool_call_id.to_owned(), digest);
+                .insert(tool_call_id.to_owned(), command);
         }
     }
 
     fn observe_tool_end(&mut self, tool_call_id: &str, tool_name: &str, is_error: bool) {
-        let command_digest = self.in_flight_commands.remove(tool_call_id);
+        let command = self.in_flight_commands.remove(tool_call_id);
         let edit_after_failure = self.in_flight_edits.remove(tool_call_id);
 
         if is_edit_tool(tool_name) && !is_error {
@@ -125,20 +139,35 @@ impl CapabilityRunState {
             }
         }
 
-        if let Some(debugging) = self.debugging.as_mut() {
-            if is_error {
-                if let Some(digest) = command_digest {
-                    debugging.failure_signal_seen = true;
-                    if !debugging.causal_edit_seen {
-                        debugging.reproducer_command_digest.get_or_insert(digest);
-                        debugging.reproducer_failed_before_edit = true;
-                    }
-                }
-            } else if debugging.causal_edit_seen
-                && debugging.reproducer_failed_before_edit
-                && command_digest.as_deref() == debugging.reproducer_command_digest.as_deref()
-            {
-                debugging.reproducer_passed_after_edit = true;
+        if let Some(command) = command {
+            self.observe_command_end(command, is_error);
+        }
+    }
+
+    fn observe_command_end(&mut self, command: PendingCommandEvidence, is_error: bool) {
+        let Some(debugging) = self.debugging.as_mut() else {
+            return;
+        };
+        if is_error {
+            debugging.failure_signal_seen = true;
+            if !debugging.causal_edit_seen && debugging.reproducer.is_none() {
+                debugging.reproducer = Some(ReproducerEvidence {
+                    tool: command.tool,
+                    argument_digest: command.argument_digest,
+                    executable_summary: command.executable_summary,
+                    failed_before_edit: true,
+                    passed_after_edit: false,
+                });
+            }
+        } else if debugging.causal_edit_seen
+            && debugging.reproducer.as_ref().is_some_and(|reproducer| {
+                reproducer.failed_before_edit
+                    && reproducer.tool == command.tool
+                    && reproducer.argument_digest == command.argument_digest
+            })
+        {
+            if let Some(reproducer) = debugging.reproducer.as_mut() {
+                reproducer.passed_after_edit = true;
             }
         }
     }
@@ -151,14 +180,33 @@ fn is_edit_tool(tool_name: &str) -> bool {
     )
 }
 
-fn command_digest(tool_name: &str, args: &Value) -> Option<String> {
+fn command_evidence(tool_name: &str, args: &Value) -> Option<PendingCommandEvidence> {
     if !matches!(tool_name, "bash" | "powershell" | "exec_command") {
         return None;
     }
-    args.get("command")
+    let command = args
+        .get("command")
         .and_then(Value::as_str)
-        .filter(|command| !command.trim().is_empty())
-        .map(hash_text)
+        .filter(|command| !command.trim().is_empty())?;
+    Some(PendingCommandEvidence {
+        tool: tool_name.to_owned(),
+        argument_digest: canonical_arguments_digest(args),
+        executable_summary: executable_summary(command),
+    })
+}
+
+fn executable_summary(command: &str) -> String {
+    let executable = command.split_whitespace().next().unwrap_or_default();
+    if !executable.is_empty()
+        && executable.len() <= 64
+        && executable
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+    {
+        executable.to_owned()
+    } else {
+        "<redacted>".to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -239,8 +287,11 @@ mod tests {
 
         let debugging = state.debugging.as_ref().unwrap();
         assert!(debugging.failure_signal_seen);
-        assert!(debugging.reproducer_command_digest.is_some());
-        assert!(debugging.reproducer_failed_before_edit);
+        assert!(debugging.reproducer.is_some());
+        assert!(debugging
+            .reproducer
+            .as_ref()
+            .is_some_and(|reproducer| reproducer.failed_before_edit));
         assert!(!debugging.causal_edit_seen);
 
         state.observe_event(&start("edit-1", "edit", json!({"path": "src/lib.rs"})));
@@ -255,21 +306,23 @@ mod tests {
         ));
         state.observe_event(&end("run-2", "bash", false));
 
-        assert!(
-            state
-                .debugging
-                .as_ref()
-                .unwrap()
-                .reproducer_passed_after_edit
-        );
+        assert!(state
+            .debugging
+            .as_ref()
+            .unwrap()
+            .reproducer
+            .as_ref()
+            .is_some_and(|reproducer| reproducer.passed_after_edit));
 
         state.reset_for_user_turn(&decision(NativeBehaviorCapability::Debugging), false);
         let debugging = state.debugging.as_ref().unwrap();
         assert!(!debugging.failure_signal_seen);
-        assert!(debugging.reproducer_command_digest.is_none());
-        assert!(!debugging.reproducer_failed_before_edit);
+        assert!(debugging.reproducer.is_none());
         assert!(!debugging.causal_edit_seen);
-        assert!(!debugging.reproducer_passed_after_edit);
+        assert!(!debugging
+            .reproducer
+            .as_ref()
+            .is_some_and(|reproducer| reproducer.passed_after_edit));
     }
 
     #[test]
@@ -298,7 +351,10 @@ mod tests {
 
         let debugging = state.debugging.as_ref().unwrap();
         assert!(!debugging.causal_edit_seen);
-        assert!(!debugging.reproducer_passed_after_edit);
+        assert!(!debugging
+            .reproducer
+            .as_ref()
+            .is_some_and(|reproducer| reproducer.passed_after_edit));
     }
 
     #[test]
@@ -314,9 +370,15 @@ mod tests {
         state.observe_event(&end("run-2", "exec_command", false));
 
         let debugging = state.debugging.as_ref().unwrap();
-        assert!(debugging.reproducer_command_digest.is_some());
-        assert!(debugging.reproducer_failed_before_edit);
-        assert!(debugging.reproducer_passed_after_edit);
+        assert!(debugging.reproducer.is_some());
+        assert!(debugging
+            .reproducer
+            .as_ref()
+            .is_some_and(|reproducer| reproducer.failed_before_edit));
+        assert!(debugging
+            .reproducer
+            .as_ref()
+            .is_some_and(|reproducer| reproducer.passed_after_edit));
     }
 
     #[test]
@@ -332,9 +394,15 @@ mod tests {
         state.observe_event(&end("run-2", "powershell", false));
 
         let debugging = state.debugging.as_ref().unwrap();
-        assert!(debugging.reproducer_command_digest.is_some());
-        assert!(debugging.reproducer_failed_before_edit);
-        assert!(debugging.reproducer_passed_after_edit);
+        assert!(debugging.reproducer.is_some());
+        assert!(debugging
+            .reproducer
+            .as_ref()
+            .is_some_and(|reproducer| reproducer.failed_before_edit));
+        assert!(debugging
+            .reproducer
+            .as_ref()
+            .is_some_and(|reproducer| reproducer.passed_after_edit));
     }
 
     #[test]
@@ -349,6 +417,105 @@ mod tests {
         let debugging = state.debugging.as_ref().unwrap();
         assert!(!debugging.failure_signal_seen);
         assert!(!debugging.causal_edit_seen);
-        assert!(debugging.reproducer_command_digest.is_none());
+        assert!(debugging.reproducer.is_none());
+    }
+
+    #[test]
+    fn debugging_reproducer_requires_the_same_tool_and_canonical_arguments() {
+        let mut state = CapabilityRunState::default();
+        state.reset_for_user_turn(&decision(NativeBehaviorCapability::Debugging), false);
+        let failing_args = json!({
+            "command": "cargo test -p davinci-agent debugging_reproducer",
+            "cwd": "workspace"
+        });
+        state.observe_event(&start("run-1", "bash", failing_args.clone()));
+        state.observe_event(&end("run-1", "bash", true));
+        state.observe_event(&start("edit-1", "edit", json!({"path": "src/lib.rs"})));
+        state.observe_event(&end("edit-1", "edit", false));
+
+        state.observe_event(&start(
+            "lint-1",
+            "powershell",
+            json!({"command": "cargo test -p davinci-agent debugging_reproducer", "cwd": "workspace"}),
+        ));
+        state.observe_event(&end("lint-1", "powershell", false));
+        assert!(
+            !state
+                .debugging
+                .as_ref()
+                .unwrap()
+                .reproducer
+                .as_ref()
+                .unwrap()
+                .passed_after_edit
+        );
+
+        state.observe_event(&start(
+            "run-2",
+            "bash",
+            json!({"cwd": "workspace", "command": "cargo test -p davinci-agent debugging_reproducer"}),
+        ));
+        state.observe_event(&end("run-2", "bash", false));
+        assert!(
+            state
+                .debugging
+                .as_ref()
+                .unwrap()
+                .reproducer
+                .as_ref()
+                .unwrap()
+                .passed_after_edit
+        );
+    }
+
+    #[test]
+    fn debugging_reproducer_does_not_accept_a_different_passing_lint_command() {
+        let mut state = CapabilityRunState::default();
+        state.reset_for_user_turn(&decision(NativeBehaviorCapability::Debugging), false);
+        state.observe_event(&start(
+            "run-1",
+            "bash",
+            json!({"command": "cargo test -p davinci-agent"}),
+        ));
+        state.observe_event(&end("run-1", "bash", true));
+        state.observe_event(&start("edit-1", "edit", json!({"path": "src/lib.rs"})));
+        state.observe_event(&end("edit-1", "edit", false));
+        state.observe_event(&start(
+            "lint-1",
+            "bash",
+            json!({"command": "cargo clippy -p davinci-agent"}),
+        ));
+        state.observe_event(&end("lint-1", "bash", false));
+
+        assert!(
+            !state
+                .debugging
+                .as_ref()
+                .unwrap()
+                .reproducer
+                .as_ref()
+                .unwrap()
+                .passed_after_edit
+        );
+    }
+
+    #[test]
+    fn debugging_reproducer_durable_state_redacts_raw_arguments() {
+        let mut state = CapabilityRunState::default();
+        state.reset_for_user_turn(&decision(NativeBehaviorCapability::Debugging), false);
+        let command =
+            "cargo test --token=do-not-persist --manifest-path C:\\private\\repo\\Cargo.toml";
+        state.observe_event(&start("run-1", "bash", json!({"command": command})));
+        state.observe_event(&end("run-1", "bash", true));
+
+        let debugging = state.debugging.as_ref().unwrap();
+        let reproducer = debugging.reproducer.as_ref().unwrap();
+        assert_eq!(reproducer.tool, "bash");
+        assert_eq!(reproducer.executable_summary, "cargo");
+        assert_ne!(reproducer.argument_digest, command);
+        let serialized = serde_json::to_string(debugging).unwrap();
+        assert!(!serialized.contains(command));
+        assert!(!serialized.contains("do-not-persist"));
+        assert!(!serialized.contains("private"));
     }
 }
