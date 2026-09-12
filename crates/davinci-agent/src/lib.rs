@@ -641,6 +641,12 @@ impl Agent {
         user_text: &str,
     ) -> Result<prompt::PreparedTurnPrompt, String> {
         if !self.prompt_session.is_builtin() {
+            let no_capabilities = prompt::CapabilityDecision {
+                capabilities: Vec::new(),
+                reasons: Vec::new(),
+                evidence: Vec::new(),
+            };
+            self.reset_capability_run_state(&no_capabilities, self.visual_verification_available);
             return Err(
                 "Cannot prepare builtin prompt: session uses custom replacement prompt".to_string(),
             );
@@ -4635,6 +4641,34 @@ mod tests {
             &[],
         );
         assert_eq!(agent.system_prompt, "CUSTOM SYSTEM PROMPT");
+    }
+
+    #[test]
+    fn custom_replacement_real_user_turn_clears_capability_run_state() {
+        let mut agent = Agent::new_builtin(PromptProfile::Stable);
+        agent
+            .prepare_builtin_prompt_for_user_turn(
+                "Redesign this dashboard so it feels premium and intentional.",
+            )
+            .unwrap();
+        agent.push_event(
+            &mut Vec::new(),
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: "edit-1".into(),
+                tool_name: "edit".into(),
+                args: serde_json::json!({"path": "src/App.tsx"}),
+            },
+        );
+        assert!(agent.capability_run_state().frontend.is_some());
+
+        agent.prompt_session = PromptSessionState::custom("CUSTOM SYSTEM PROMPT");
+        agent.prompt_user_with("Keep the custom prompt.", &[]);
+
+        let state = agent.capability_run_state();
+        assert!(state.active.is_empty());
+        assert!(state.frontend.is_none());
+        assert!(state.debugging.is_none());
+        assert!(state.review.is_none());
     }
 
     #[test]
