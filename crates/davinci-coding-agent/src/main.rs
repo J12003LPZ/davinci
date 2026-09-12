@@ -730,6 +730,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         let _ = ext.handlers.as_slice();
     }
     agent.apply_extension_tools(&names);
+    sync_visual_verification_availability(&mut agent, &names);
     // A graph worker's `--tools` is its whole allowlist: the native tools it
     // was not handed (graph_run, sec_*, memory_search…) are not offered to
     // its model either, rather than merely refused when called.
@@ -7152,6 +7153,15 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
     agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
 }
 
+const VISUAL_SNAPSHOT_TOOL_NAME: &str = "visual_snapshot";
+
+fn sync_visual_verification_availability(agent: &mut Agent, native_tool_names: &[String]) {
+    let available = native_tool_names
+        .iter()
+        .any(|name| name == VISUAL_SNAPSHOT_TOOL_NAME);
+    agent.set_visual_verification_available(available);
+}
+
 fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut ExtensionHost) {
     apply_discovered_resources(parsed, agent);
     *host = loaded_extension_host(parsed);
@@ -7163,6 +7173,7 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
         names.extend(ext.commands.iter().cloned());
     }
     agent.apply_extension_tools(&names);
+    sync_visual_verification_availability(agent, &names);
     attach_tool_executor(agent, host);
     host.emit(ExtensionEvent::SessionStart);
 }
@@ -11748,6 +11759,24 @@ mod tests {
             .iter()
             .any(|line| line.role == "exec" && line.text == "ok"));
         assert!(chrome.status.contains("newSession") || chrome.status.contains("model="));
+    }
+
+    #[test]
+    fn visual_verification_prompt_state_follows_registered_native_backend() {
+        let mut agent = Agent::new("x");
+
+        sync_visual_verification_availability(&mut agent, &[]);
+        assert!(!agent
+            .runtime_prompt_state()
+            .visual_verification_available);
+
+        sync_visual_verification_availability(
+            &mut agent,
+            &[String::from("visual_snapshot")],
+        );
+        assert!(agent
+            .runtime_prompt_state()
+            .visual_verification_available);
     }
 
     #[test]
