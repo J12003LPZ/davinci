@@ -234,6 +234,10 @@ pub struct BehaviorTelemetry {
     pub files_changed_count: u64,
     pub verification_commands_run: u64,
     pub verification_failures: u64,
+    /// Capability turns that completed after the bounded reminder ceiling
+    /// without all capability-specific evidence.
+    #[serde(default)]
+    pub capability_incomplete_evidence: u64,
     pub aborted: bool,
     pub user_steers: u64,
 }
@@ -368,6 +372,7 @@ mod behavior_telemetry_tests {
             files_changed_count: 2,
             verification_commands_run: 3,
             verification_failures: 1,
+            capability_incomplete_evidence: 0,
             aborted: false,
             user_steers: 1,
         };
@@ -386,6 +391,7 @@ mod behavior_telemetry_tests {
         assert!(json.contains("\"files_changed_count\": 2"));
         assert!(json.contains("\"verification_commands_run\": 3"));
         assert!(json.contains("\"verification_failures\": 1"));
+        assert!(json.contains("\"capability_incomplete_evidence\": 0"));
         assert!(json.contains("\"aborted\": false"));
         assert!(json.contains("\"user_steers\": 1"));
 
@@ -433,6 +439,7 @@ mod behavior_telemetry_tests {
             files_changed_count: 1,
             verification_commands_run: 1,
             verification_failures: 0,
+            capability_incomplete_evidence: 0,
             aborted: false,
             user_steers: 0,
         };
@@ -468,6 +475,7 @@ mod behavior_telemetry_tests {
                 files_changed_count: 2,
                 verification_commands_run: 2,
                 verification_failures: if i < 8 { 1 } else { 0 }, // 8 failures recovered
+                capability_incomplete_evidence: 0,
                 aborted: false,
                 user_steers: if i < 17 { 1 } else { 0 }, // 17 / 42 ~ 0.4
             });

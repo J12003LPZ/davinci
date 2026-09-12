@@ -77,6 +77,7 @@ impl Agent {
             Vec::new()
         };
         let mut new_messages = prompt_messages.clone();
+        let mut capability_completion_reminders = 0_u32;
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
         if let Some(runtime) = &self.runtime {
@@ -227,6 +228,39 @@ impl Agent {
                 })
                 .collect::<Vec<_>>();
 
+            if tool_calls.is_empty() {
+                let capability_state = self.capability_run_state();
+                match crate::prompt::evaluate_completion(
+                    &capability_state,
+                    capability_completion_reminders,
+                ) {
+                    crate::prompt::CapabilityGateOutcome::AllowCompletion => {
+                        if capability_completion_reminders
+                            >= crate::prompt::MAX_CAPABILITY_COMPLETION_REMINDERS
+                            && crate::prompt::incomplete_evidence_reason(&capability_state)
+                                .is_some()
+                        {
+                            self.stats.capability_incomplete_evidence =
+                                self.stats.capability_incomplete_evidence.saturating_add(1);
+                        }
+                    }
+                    crate::prompt::CapabilityGateOutcome::ContinueWithReminder {
+                        message,
+                        reason_code,
+                    } => {
+                        capability_completion_reminders =
+                            capability_completion_reminders.saturating_add(1);
+                        self.queue_capability_reminder(
+                            &message,
+                            &reason_code,
+                            &mut events,
+                            &mut new_messages,
+                        );
+                        continue;
+                    }
+                }
+            }
+
             let had_tools = !tool_calls.is_empty();
             let mut tool_results = Vec::new();
             if had_tools {
@@ -360,6 +394,30 @@ impl Agent {
         self.flush_pending_bash_messages();
         self.emit_behavior_telemetry();
         Ok(events)
+    }
+
+    fn queue_capability_reminder(
+        &mut self,
+        message_text: &str,
+        reason_code: &str,
+        events: &mut Vec<AgentEvent>,
+        new_messages: &mut Vec<ChatMessage>,
+    ) {
+        let mut message = ChatMessage::text("user", message_text);
+        message.extra.insert(
+            "davinciCapabilityReminder".into(),
+            Value::String(reason_code.to_string()),
+        );
+        self.messages.push(message.clone());
+        self.persist_full_message(&message);
+        new_messages.push(message.clone());
+        self.push_event(
+            events,
+            AgentEvent::MessageStart {
+                message: message.clone(),
+            },
+        );
+        self.push_event(events, AgentEvent::MessageEnd { message });
     }
 
     /// Background jobs that finished since the last step are told to the
@@ -2019,6 +2077,7 @@ impl Agent {
             files_changed_count: final_stats.files_changed_count,
             verification_commands_run: final_stats.verification_commands_run,
             verification_failures: final_stats.verification_failures,
+            capability_incomplete_evidence: final_stats.capability_incomplete_evidence,
             aborted: self.abort_requested(),
             user_steers: final_stats.user_steers,
         });
@@ -2537,7 +2596,7 @@ mod tests {
         AgentId, RunId, RuntimeBus, RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope,
         RuntimeHandle, RuntimeSubscriber,
     };
-    use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
+    use davinci_ai::{content_text, AssistantMessage, ContentBlock, StopReason};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2730,6 +2789,75 @@ mod tests {
         assert_eq!(entry.model_turns, 1);
         assert!(!entry.aborted);
         assert_eq!(entry.prompt_version, 2);
+    }
+
+    #[test]
+    fn capability_gate_continues_before_turn_finalization() {
+        davinci_telemetry::clear_behavior_telemetry();
+        let mut agent = Agent::new_builtin(crate::PromptProfile::Stable);
+        agent.prompt_user_with("Diagnose the failing command and find the root cause", &[]);
+        {
+            let mut state = agent.capability_run_state.lock().unwrap();
+            state.debugging = Some(crate::DebuggingState {
+                reproducer_failed_before_edit: true,
+                causal_edit_seen: true,
+                ..crate::DebuggingState::default()
+            });
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider_views = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let calls_for_provider = Arc::clone(&calls);
+        let views_for_provider = Arc::clone(&provider_views);
+        let events = agent
+            .run_loop(move |current| {
+                views_for_provider.lock().unwrap().push(
+                    current
+                        .messages_for_provider()
+                        .iter()
+                        .map(|message| content_text(&message.content))
+                        .collect(),
+                );
+                let call = calls_for_provider.fetch_add(1, Ordering::SeqCst);
+                Ok(AssistantMessage {
+                    id: format!("msg_{call}"),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "I am ready to finish".into(),
+                    }],
+                    model: "test-model".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let views = provider_views.lock().unwrap();
+        assert!(views[1]
+            .iter()
+            .any(|text| text
+                .contains("Before completing, rerun the original failing command unchanged")));
+        assert!(views[2]
+            .iter()
+            .any(|text| text
+                .contains("Before completing, rerun the original failing command unchanged")));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(agent.run_stats().capability_incomplete_evidence, 1);
+        assert_eq!(
+            davinci_telemetry::get_behavior_telemetry()
+                .last()
+                .unwrap()
+                .capability_incomplete_evidence,
+            1
+        );
     }
 
     #[test]

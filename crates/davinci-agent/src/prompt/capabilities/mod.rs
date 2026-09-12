@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 
 pub use debugging::{debugging_module, DEBUGGING_POLICY};
 pub use frontend::{frontend_design_module, FRONTEND_DESIGN_POLICY};
+pub use gate::{
+    evaluate_completion, incomplete_evidence_reason, CapabilityGateOutcome,
+    DEBUGGING_REPRODUCER_REASON_CODE, FRONTEND_SNAPSHOT_REASON_CODE,
+    MAX_CAPABILITY_COMPLETION_REMINDERS,
+};
 pub use review::{code_review_module, CODE_REVIEW_POLICY};
 pub use router::{
     detect_native_capabilities, route_capabilities, CapabilityEvidence, CapabilityEvidenceKind,

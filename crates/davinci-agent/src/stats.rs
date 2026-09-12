@@ -99,6 +99,10 @@ pub struct RunStats {
     /// Verification commands that resulted in test/build failures.
     #[serde(default)]
     pub verification_failures: u64,
+    /// Capability completion attempts that reached the reminder ceiling with
+    /// evidence still incomplete.
+    #[serde(default)]
+    pub capability_incomplete_evidence: u64,
     /// Mid-run steering inputs injected by the user.
     #[serde(default)]
     pub user_steers: u64,
@@ -217,6 +221,7 @@ mod tests {
         obj.remove("filesChangedCount");
         obj.remove("verificationCommandsRun");
         obj.remove("verificationFailures");
+        obj.remove("capabilityIncompleteEvidence");
         obj.remove("userSteers");
         let restored: RunStats = serde_json::from_value(json).unwrap();
         assert_eq!(restored.permission_prompts, 0);
@@ -224,6 +229,7 @@ mod tests {
         assert_eq!(restored.files_changed_count, 0);
         assert_eq!(restored.verification_commands_run, 0);
         assert_eq!(restored.verification_failures, 0);
+        assert_eq!(restored.capability_incomplete_evidence, 0);
         assert_eq!(restored.user_steers, 0);
     }
 }

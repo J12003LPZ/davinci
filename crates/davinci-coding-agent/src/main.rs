@@ -11558,6 +11558,7 @@ mod tests {
                 files_changed_count: 2,
                 verification_commands_run: 2,
                 verification_failures: 1,
+                capability_incomplete_evidence: 0,
                 aborted: false,
                 user_steers: 1,
             });

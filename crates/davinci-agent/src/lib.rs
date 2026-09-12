@@ -71,7 +71,10 @@ pub use permission::{
     ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
     ToolApprovalRequest, ToolApprover, ToolClass,
 };
-pub use prompt::{CapabilityRunState, DebuggingState, FrontendDesignState, ReviewState};
+pub use prompt::{
+    CapabilityGateOutcome, CapabilityRunState, DebuggingState, FrontendDesignState, ReviewState,
+    MAX_CAPABILITY_COMPLETION_REMINDERS,
+};
 pub use prompt::{PreparedTurnPrompt, PromptProfile};
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
