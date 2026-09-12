@@ -1071,6 +1071,12 @@ impl Agent {
                 })),
             });
         }
+        if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &reason);
+            }
+            return immediate(reason, true);
+        }
         if let Some(reason) = self.permission_denial(cwd, id, name, args) {
             // `denied` marks a call that never ran, for the hosts' rows
             // and the post-tool hooks, without sniffing the text.
@@ -1119,6 +1125,16 @@ impl Agent {
                     "denied": true,
                     "scope_violation": violation,
                 })),
+            };
+        }
+        if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &reason);
+            }
+            return crate::ToolResult {
+                content: reason,
+                is_error: true,
+                details: Some(serde_json::json!({ "denied": true })),
             };
         }
         if let Err(violation) = self.check_contract_dispatch_boundary(cwd, name) {
@@ -1792,6 +1808,35 @@ impl Agent {
             Some(reason) => denied(reason),
             None => None,
         }
+    }
+
+    fn capability_effect_denial(&self, cwd: &Path, name: &str, args: &Value) -> Option<String> {
+        let state = self.capability_run_state();
+        let decision = crate::prompt::capabilities::CapabilityDecision {
+            capabilities: state.active,
+            reasons: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let request = self.last_real_user_request.as_deref().unwrap_or_default();
+        let ceiling = crate::prompt::capabilities::capability_effect_ceiling(&decision, request);
+        if ceiling != crate::prompt::capabilities::CapabilityEffectCeiling::ReadOnly {
+            return None;
+        }
+
+        let command = args
+            .get("command")
+            .or_else(|| args.get("cmd"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if name == "ask_user_question"
+            || crate::read_only_capability_allows(name, args, command, cwd)
+        {
+            return None;
+        }
+
+        Some(format!(
+            "review-only capability effect ceiling denied `{name}`; only reads and recognized local checks are allowed."
+        ))
     }
 
     /// Checks whether an action conforms to the active task contract and execution gate invariants.
@@ -3221,5 +3266,65 @@ mod tests {
         );
         assert_eq!(effects2[1].before_blob, first_blob);
         assert_ne!(effects2[1].after_blob, first_blob);
+    }
+
+    #[test]
+    fn review_only_ceiling_denies_mutations_and_nonlocal_shells() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new_builtin(crate::PromptProfile::Stable);
+        agent.cwd = dir.path().to_path_buf();
+        agent.tools = vec!["read".into(), "write".into(), "bash".into()];
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        agent.prompt_user_with("Review this PR", &[]);
+
+        let write = agent.prepare_tool_call(
+            dir.path(),
+            "review-write",
+            "write",
+            &serde_json::json!({"path":"reviewed.rs","content":"should not land"}),
+            0,
+        );
+        match write {
+            Preparation::Immediate(result) => {
+                assert!(result.is_error);
+                assert!(result.content.contains("review-only"));
+            }
+            _ => panic!("review-only capability must deny writes before permission approval"),
+        }
+
+        let local_check = agent.prepare_tool_call(
+            dir.path(),
+            "review-test",
+            "bash",
+            &serde_json::json!({"command":"cargo test --offline"}),
+            0,
+        );
+        assert!(matches!(local_check, Preparation::Ready { .. }));
+
+        let network_shell = agent.prepare_tool_call(
+            dir.path(),
+            "review-network",
+            "bash",
+            &serde_json::json!({"command":"curl https://example.com"}),
+            0,
+        );
+        match network_shell {
+            Preparation::Immediate(result) => {
+                assert!(result.is_error);
+                assert!(result.content.contains("review-only"));
+            }
+            _ => panic!("review-only capability must deny nonlocal shell commands"),
+        }
+
+        let dispatch = agent.run_prepared_call(
+            dir.path(),
+            "review-dispatch-write",
+            "write",
+            &serde_json::json!({"path":"dispatch.rs","content":"should not land"}),
+            0,
+        );
+        assert!(dispatch.is_error);
+        assert!(dispatch.content.contains("review-only"));
+        assert!(!dir.path().join("dispatch.rs").exists());
     }
 }

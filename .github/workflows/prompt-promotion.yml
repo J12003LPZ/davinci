@@ -1,0 +1,130 @@
+name: Prompt promotion certification
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_commit:
+        description: Exact candidate commit to certify
+        required: true
+        type: string
+      evidence:
+        description: Repository-relative PromptPromotionEvidence JSON path
+        required: true
+        type: string
+      artifacts_root:
+        description: Repository-relative content-addressed artifact root
+        required: true
+        type: string
+      candidate_prompt_hash:
+        description: Expected Preview candidate prompt hash
+        required: true
+        type: string
+      stable_prompt_hash:
+        description: Expected Stable baseline prompt hash
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PI_OFFLINE: '1'
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_commit }}
+
+      - name: Use repository-pinned Rust
+        run: rustup show
+
+      - name: Run complete offline suite
+        run: cargo test --workspace --offline --locked
+
+      - name: Verify Preview hash binding
+        shell: python
+        env:
+          EVIDENCE_PATH: ${{ inputs.evidence }}
+          EXPECTED_CANDIDATE_HASH: ${{ inputs.candidate_prompt_hash }}
+          EXPECTED_STABLE_HASH: ${{ inputs.stable_prompt_hash }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = json.loads(Path(os.environ["EVIDENCE_PATH"]).read_text(encoding="utf-8"))
+          if evidence["candidate_prompt_hash"] != os.environ["EXPECTED_CANDIDATE_HASH"]:
+              raise SystemExit("candidate evidence hash does not equal Preview hash")
+          if evidence["base_stable_hash"] != os.environ["EXPECTED_STABLE_HASH"]:
+              raise SystemExit("candidate evidence base does not equal Stable hash")
+
+      - name: Validate promotion evidence and artifact hashes
+        id: gate
+        shell: bash
+        env:
+          EVIDENCE_PATH: ${{ inputs.evidence }}
+          ARTIFACTS_ROOT: ${{ inputs.artifacts_root }}
+          CANDIDATE_HASH: ${{ inputs.candidate_prompt_hash }}
+          STABLE_HASH: ${{ inputs.stable_prompt_hash }}
+        run: |
+          set +e
+          cargo run --offline --locked -p davinci-evals -- \
+            behavior promote-check \
+            --evidence "${EVIDENCE_PATH}" \
+            --artifacts-root "${ARTIFACTS_ROOT}" \
+            --candidate-prompt-hash "${CANDIDATE_HASH}" \
+            --stable-prompt-hash "${STABLE_HASH}" \
+            > target/promotion-check.txt 2>&1
+          status=$?
+          set -e
+          if [[ "${status}" -eq 0 ]]; then
+            echo 'eligible=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'eligible=false' >> "$GITHUB_OUTPUT"
+          fi
+          cat target/promotion-check.txt
+          exit "${status}"
+
+      - name: Write certification artifact
+        if: always()
+        shell: python
+        env:
+          EVIDENCE_PATH: ${{ inputs.evidence }}
+          CANDIDATE_HASH: ${{ inputs.candidate_prompt_hash }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          ELIGIBLE: ${{ steps.gate.outputs.eligible || 'false' }}
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          evidence_path = Path(os.environ["EVIDENCE_PATH"])
+          evidence_hash = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+          output = {
+              "eligible": os.environ["ELIGIBLE"] == "true",
+              "candidate_hash": os.environ["CANDIDATE_HASH"],
+              "commit": os.environ["CANDIDATE_COMMIT"],
+              "evidence_hash": evidence_hash,
+          }
+          target = Path("target/promotion")
+          target.mkdir(parents=True, exist_ok=True)
+          (target / "certification.json").write_text(
+              json.dumps(output, indent=2) + "\n", encoding="utf-8"
+          )
+
+      - name: Upload promotion certification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-promotion-certification-${{ github.run_id }}
+          path: |
+            target/promotion
+            target/promotion-check.txt
+          retention-days: 30
+          if-no-files-found: error

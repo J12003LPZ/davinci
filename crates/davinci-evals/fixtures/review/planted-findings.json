@@ -1,0 +1,36 @@
+{
+  "findings": [
+    {
+      "lens": "Correctness",
+      "severity": "Major",
+      "confidence": 92,
+      "path": "src/service.rs",
+      "line": 41,
+      "title": "Unchecked result",
+      "evidence": "The error is discarded before the response is returned.",
+      "recommendation": "Propagate or handle the error."
+    },
+    {
+      "lens": "Security",
+      "severity": "Blocker",
+      "confidence": 89,
+      "path": "src/service.rs",
+      "line": 41,
+      "title": "unchecked-result",
+      "evidence": "The same discarded result is security-relevant.",
+      "recommendation": "Handle the error before returning."
+    },
+    {
+      "lens": "CommentsAndDocs",
+      "severity": "Minor",
+      "confidence": 96,
+      "path": "README.md",
+      "line": null,
+      "title": "Style preference",
+      "evidence": "The reviewer dislikes the heading style.",
+      "recommendation": "Optional: adjust the heading."
+    }
+  ],
+  "planted_critical_titles": ["Unchecked result"],
+  "harmless_decoy_titles": ["Style preference"]
+}

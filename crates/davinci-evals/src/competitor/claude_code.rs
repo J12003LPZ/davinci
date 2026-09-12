@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::command::{CommandHarness, ExternalHarness, ExternalRun, ExternalTask};
+use super::probe::{probe_harness, HarnessCapabilities};
+use super::report::{classify_comparison, ComparisonClass};
+use crate::behavior::{VerificationCommand, VerificationResult};
 
 pub const CLAUDE_CODE_BIN_ENV: &str = "DAVINCI_CLAUDE_CODE_BIN";
 pub const PI_CLAUDE_CODE_BIN_ENV: &str = "PI_CLAUDE_CODE_BIN";
@@ -11,6 +14,8 @@ pub const PI_CLAUDE_CODE_BIN_ENV: &str = "PI_CLAUDE_CODE_BIN";
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeHarness {
     inner: CommandHarness,
+    requested_model: Option<String>,
+    requested_permission_mode: Option<String>,
 }
 
 impl ClaudeCodeHarness {
@@ -21,13 +26,64 @@ impl ClaudeCodeHarness {
 
         Self {
             inner: CommandHarness::new("claude-code", PathBuf::from(bin), vec!["-p".into()]),
+            requested_model: None,
+            requested_permission_mode: None,
         }
     }
 
     pub fn with_binary(binary: impl Into<PathBuf>) -> Self {
         Self {
             inner: CommandHarness::new("claude-code", binary, vec!["-p".into()]),
+            requested_model: None,
+            requested_permission_mode: None,
         }
+    }
+
+    pub fn with_binary_and_options(
+        binary: impl Into<PathBuf>,
+        model: Option<String>,
+        permission_mode: Option<String>,
+    ) -> Self {
+        Self {
+            inner: CommandHarness::new("claude-code", binary, Vec::new()),
+            requested_model: model,
+            requested_permission_mode: permission_mode,
+        }
+    }
+
+    pub fn capabilities(&self) -> Result<HarnessCapabilities, String> {
+        probe_harness(&self.inner.binary)
+    }
+
+    fn confirmed_runner(&self, capabilities: &HarnessCapabilities) -> CommandHarness {
+        let mut args = Vec::new();
+        if capabilities.supports_structured_output {
+            args.extend(["--output-format".into(), "json".into()]);
+        }
+        if capabilities.supports_model_flag {
+            if let Some(model) = self
+                .requested_model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+            {
+                args.extend(["--model".into(), model.to_string()]);
+            }
+        }
+        if capabilities.supports_permission_mode {
+            if let Some(permission_mode) = self
+                .requested_permission_mode
+                .as_deref()
+                .filter(|permission_mode| !permission_mode.trim().is_empty())
+            {
+                args.extend(["--permission-mode".into(), permission_mode.to_string()]);
+            }
+        }
+        args.push("-p".into());
+        CommandHarness::new(
+            self.inner.harness_name.clone(),
+            self.inner.binary.clone(),
+            args,
+        )
     }
 }
 
@@ -43,11 +99,22 @@ impl ExternalHarness for ClaudeCodeHarness {
     }
 
     fn available(&self) -> Result<bool, String> {
-        self.inner.available()
+        Ok(self.capabilities().is_ok())
     }
 
     fn run(&self, task: &ExternalTask) -> Result<ExternalRun, String> {
-        self.inner.run(task)
+        let capabilities = self.capabilities()?;
+        self.confirmed_runner(&capabilities).run(task)
+    }
+
+    fn run_with_verification(
+        &self,
+        task: &ExternalTask,
+        verification_commands: &[VerificationCommand],
+    ) -> Result<(ExternalRun, Vec<VerificationResult>), String> {
+        let capabilities = self.capabilities()?;
+        self.confirmed_runner(&capabilities)
+            .run_with_verification(task, verification_commands)
     }
 }
 
@@ -62,6 +129,16 @@ pub struct FairComparisonMetadata {
     pub permission_mode: String,
     pub timeout_seconds: u64,
     pub repo_snapshot_hash: String,
+}
+
+pub fn comparison_class_for_metadata(
+    metadata: &FairComparisonMetadata,
+    matched_run_executed: bool,
+) -> ComparisonClass {
+    let controls_known = metadata.models_controlled
+        && !metadata.permission_mode.trim().is_empty()
+        && metadata.permission_mode != "unknown";
+    classify_comparison(controls_known, matched_run_executed)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -112,6 +189,10 @@ pub fn format_competitor_report_markdown(report: &CompetitorComparisonReport) ->
         }
     ));
     md.push_str(&format!(
+        "- **Comparison Class**: {}\n",
+        comparison_class_for_metadata(&report.metadata, true).as_str()
+    ));
+    md.push_str(&format!(
         "- **Permission Mode**: {}\n",
         report.metadata.permission_mode
     ));
@@ -151,6 +232,41 @@ pub fn format_competitor_report_markdown(report: &CompetitorComparisonReport) ->
     ));
 
     md
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    #[test]
+    fn confirmed_runner_uses_only_supported_requested_controls() {
+        let harness = ClaudeCodeHarness::with_binary_and_options(
+            "claude",
+            Some("model-x".into()),
+            Some("ask".into()),
+        );
+        let args = harness
+            .confirmed_runner(&HarnessCapabilities {
+                version: Some("Claude Code 1".into()),
+                supports_model_flag: true,
+                supports_permission_mode: true,
+                supports_structured_output: true,
+                supports_system_prompt_override: false,
+            })
+            .extra_args;
+        assert_eq!(
+            args,
+            vec![
+                "--output-format",
+                "json",
+                "--model",
+                "model-x",
+                "--permission-mode",
+                "ask",
+                "-p"
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

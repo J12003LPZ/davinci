@@ -2,6 +2,57 @@
 
 use super::{CapabilityRunState, NativeBehaviorCapability};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityEffectCeiling {
+    Inherit,
+    ReadOnly,
+}
+
+pub fn capability_effect_ceiling(
+    decision: &super::CapabilityDecision,
+    request: &str,
+) -> CapabilityEffectCeiling {
+    if !decision.is_active(NativeBehaviorCapability::CodeReview) {
+        return CapabilityEffectCeiling::Inherit;
+    }
+
+    let words: Vec<String> = request
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_ascii_lowercase())
+        .collect();
+    let review_intent = request.to_ascii_lowercase().contains("review this pr")
+        || words
+            .windows(2)
+            .any(|window| window[0] == "code" && window[1] == "review")
+        || words.iter().any(|word| word == "audit");
+    if !review_intent {
+        return CapabilityEffectCeiling::Inherit;
+    }
+
+    let requests_mutation = words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "address"
+                | "apply"
+                | "change"
+                | "commit"
+                | "edit"
+                | "fix"
+                | "implement"
+                | "modify"
+                | "remove"
+                | "update"
+                | "write"
+        )
+    });
+    if requests_mutation {
+        CapabilityEffectCeiling::Inherit
+    } else {
+        CapabilityEffectCeiling::ReadOnly
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityGateOutcome {
     AllowCompletion,
@@ -187,6 +238,41 @@ mod tests {
         assert_eq!(
             evaluate_completion(&state, MAX_CAPABILITY_COMPLETION_REMINDERS),
             CapabilityGateOutcome::AllowCompletion
+        );
+    }
+
+    #[test]
+    fn review_request_gets_read_only_effect_ceiling() {
+        let decision = CapabilityDecision {
+            capabilities: vec![NativeBehaviorCapability::CodeReview],
+            reasons: Vec::new(),
+            evidence: Vec::new(),
+        };
+
+        assert_eq!(
+            capability_effect_ceiling(&decision, "Review this PR"),
+            CapabilityEffectCeiling::ReadOnly
+        );
+        assert_eq!(
+            capability_effect_ceiling(&decision, "Review this PR and fix critical issues"),
+            CapabilityEffectCeiling::Inherit
+        );
+        assert_eq!(
+            capability_effect_ceiling(&decision, "Run the tests as part of a code review"),
+            CapabilityEffectCeiling::ReadOnly
+        );
+    }
+
+    #[test]
+    fn inactive_review_capability_never_changes_effect_ceiling() {
+        let decision = CapabilityDecision {
+            capabilities: Vec::new(),
+            reasons: Vec::new(),
+            evidence: Vec::new(),
+        };
+        assert_eq!(
+            capability_effect_ceiling(&decision, "Review this PR"),
+            CapabilityEffectCeiling::Inherit
         );
     }
 }

@@ -505,8 +505,10 @@ dependencies = [
 name = "davinci-evals"
 version = "1.0.0"
 dependencies = [
+ "clap",
  "davinci-agent",
  "davinci-ai",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

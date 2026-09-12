@@ -64,6 +64,7 @@ pub use images::{
 };
 pub use jobs::{JobBook, JobNotice, JobStatus, JobSummary};
 pub use mcp::{McpRegistry, McpServerRow};
+pub(crate) use permission::read_only_capability_allows;
 pub use permission::{
     check_path_boundary, glob_matches, is_git_metadata_path, is_outside_or_symlink_escape,
     is_symlink_escape, project_relative, session_rule_for, subject_of, summary_of, tool_class,
@@ -1620,13 +1621,20 @@ impl Agent {
 
     /// Persist current prompt identity as a custom session entry if an active session exists.
     pub fn persist_prompt_session(&mut self) -> Result<(), String> {
-        let Some(session) = &mut self.session else {
-            return Ok(());
-        };
         let Some(record) = PromptSessionRecord::from_session_state(&self.prompt_session) else {
             return Ok(());
         };
         let data = serde_json::to_value(&record).map_err(|e| e.to_string())?;
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        if session.entries.iter().rev().any(|entry| {
+            entry.entry_type == "custom"
+                && entry.custom_type.as_deref() == Some(PROMPT_SESSION_ENTRY_TYPE)
+                && entry.extra.get("data") == Some(&data)
+        }) {
+            return Ok(());
+        }
         let mut extra = serde_json::Map::new();
         extra.insert("data".into(), data);
         let _ = session.append_entry(davinci_session::SessionEntry {
@@ -2424,6 +2432,9 @@ mod tests {
         let mut agent = Agent::new_builtin(prompt::PromptProfile::Stable);
         agent.session = Some(session);
         agent.persist_prompt_session().unwrap();
+        let entry_count = agent.session.as_ref().unwrap().entries.len();
+        agent.persist_prompt_session().unwrap();
+        assert_eq!(agent.session.as_ref().unwrap().entries.len(), entry_count);
 
         let mut resumed = Agent::new("placeholder");
         resumed

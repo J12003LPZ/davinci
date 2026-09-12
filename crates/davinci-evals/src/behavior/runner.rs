@@ -7,6 +7,167 @@ use super::scenario::BehaviorScenario;
 use super::scorer::{score_trace, ScoreCard};
 use super::trace::{BehaviorEvent, BehaviorTrace};
 
+pub const MAX_SCHEDULED_INFRASTRUCTURE_FAILURE_RATE: f64 = 0.10;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunDisposition {
+    BehavioralResult,
+    InfrastructureFailure,
+    ConfigurationFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunDispositionSummary {
+    pub total_runs: usize,
+    pub behavioral_runs: usize,
+    pub infrastructure_failures: usize,
+    pub configuration_failures: usize,
+}
+
+impl RunDispositionSummary {
+    pub fn infrastructure_failure_rate(&self) -> f64 {
+        rate(self.infrastructure_failures, self.total_runs)
+    }
+
+    pub fn configuration_failure_rate(&self) -> f64 {
+        rate(self.configuration_failures, self.total_runs)
+    }
+
+    pub fn minimum_behavioral_runs_met(&self, minimum: usize) -> bool {
+        self.behavioral_runs >= minimum
+    }
+}
+
+pub fn scheduled_infrastructure_gate(summary: &RunDispositionSummary) -> Result<(), String> {
+    let rate = summary.infrastructure_failure_rate();
+    if rate > MAX_SCHEDULED_INFRASTRUCTURE_FAILURE_RATE {
+        Err(format!(
+            "infrastructure failure rate {:.2}% exceeds scheduled-eval limit of {:.2}%",
+            rate * 100.0,
+            MAX_SCHEDULED_INFRASTRUCTURE_FAILURE_RATE * 100.0
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DispositionedSuiteSummary {
+    pub dispositions: RunDispositionSummary,
+    pub behavioral: BehaviorSuiteSummary,
+}
+
+pub fn classify_failure_signal(signal: &str) -> RunDisposition {
+    let lower = signal.to_ascii_lowercase();
+    if [
+        "missing auth",
+        "no credentials",
+        "missing credentials",
+        "api key",
+        "authentication required",
+        "credential",
+        "configuration failure",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        RunDisposition::ConfigurationFailure
+    } else {
+        RunDisposition::InfrastructureFailure
+    }
+}
+
+pub fn classify_process_result(
+    exit_code: i32,
+    timed_out: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Option<RunDisposition> {
+    if timed_out {
+        return Some(RunDisposition::InfrastructureFailure);
+    }
+    // A successful product process may contain failed tool results or provider-
+    // shaped text in its JSON transcript. Those are behavioral evidence, not a
+    // harness outage. Only inspect failure signals when the product itself failed.
+    if exit_code == 0 {
+        return None;
+    }
+    let signal = format!("{stdout}\n{stderr}");
+    let lower = signal.to_ascii_lowercase();
+    if [
+        "missing auth",
+        "no credentials",
+        "missing credentials",
+        "api key",
+        "authentication required",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        return Some(RunDisposition::ConfigurationFailure);
+    }
+    if [
+        "provider error",
+        "status 429",
+        "status 503",
+        "rate limit",
+        "connection refused",
+        "panic",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        return Some(RunDisposition::InfrastructureFailure);
+    }
+    (exit_code != 0 && stdout.trim().is_empty()).then_some(RunDisposition::InfrastructureFailure)
+}
+
+pub fn summarize_dispositions(dispositions: &[RunDisposition]) -> RunDispositionSummary {
+    let mut summary = RunDispositionSummary {
+        total_runs: dispositions.len(),
+        behavioral_runs: 0,
+        infrastructure_failures: 0,
+        configuration_failures: 0,
+    };
+    for disposition in dispositions {
+        match disposition {
+            RunDisposition::BehavioralResult => summary.behavioral_runs += 1,
+            RunDisposition::InfrastructureFailure => summary.infrastructure_failures += 1,
+            RunDisposition::ConfigurationFailure => summary.configuration_failures += 1,
+        }
+    }
+    summary
+}
+
+pub fn aggregate_scenario_results(
+    results: &[super::executor::ScenarioRunResult],
+) -> DispositionedSuiteSummary {
+    let dispositions = summarize_dispositions(
+        &results
+            .iter()
+            .map(|result| result.disposition)
+            .collect::<Vec<_>>(),
+    );
+    let behavioral_results = results
+        .iter()
+        .filter(|result| result.disposition == RunDisposition::BehavioralResult)
+        .map(|result| (&result.scenario, &result.trace, &result.score))
+        .collect::<Vec<_>>();
+    DispositionedSuiteSummary {
+        dispositions,
+        behavioral: aggregate_suite_scores(&behavioral_results),
+    }
+}
+
+fn rate(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BehaviorSuiteSummary {
     pub total_scenarios: usize,
@@ -140,6 +301,8 @@ mod tests {
                 tool: "grep".into(),
             }],
             limits: BehaviorLimits::default(),
+            setup_commands: Vec::new(),
+            verification_commands: Vec::new(),
         };
 
         let mut trace1 = BehaviorTrace::new("s1", None);
@@ -160,6 +323,8 @@ mod tests {
             repo_fixture: "f2".into(),
             requirements: vec![BehaviorRequirement::NoUnverifiedSuccessClaim],
             limits: BehaviorLimits::default(),
+            setup_commands: Vec::new(),
+            verification_commands: Vec::new(),
         };
 
         let mut trace2 = BehaviorTrace::new("s2", None);
@@ -192,5 +357,82 @@ mod tests {
         );
         assert_eq!(summary.unverified_claim_rate, 0.5);
         assert_eq!(summary.median_model_turns, 4.0);
+    }
+
+    #[test]
+    fn disposition_summary_keeps_non_behavioral_runs_out_of_denominator() {
+        let summary = summarize_dispositions(&[
+            RunDisposition::BehavioralResult,
+            RunDisposition::InfrastructureFailure,
+            RunDisposition::ConfigurationFailure,
+        ]);
+
+        assert_eq!(summary.total_runs, 3);
+        assert_eq!(summary.behavioral_runs, 1);
+        assert_eq!(summary.infrastructure_failures, 1);
+        assert_eq!(summary.configuration_failures, 1);
+        assert_eq!(summary.infrastructure_failure_rate(), 1.0 / 3.0);
+        assert!(summary.minimum_behavioral_runs_met(1));
+        assert!(!summary.minimum_behavioral_runs_met(2));
+    }
+
+    #[test]
+    fn classifies_auth_as_configuration_and_other_harness_errors_as_infrastructure() {
+        assert_eq!(
+            classify_failure_signal("provider returned no credentials"),
+            RunDisposition::ConfigurationFailure
+        );
+        assert_eq!(
+            classify_failure_signal("DaVinci process timed out"),
+            RunDisposition::InfrastructureFailure
+        );
+        assert_eq!(
+            classify_process_result(1, false, "", "no credentials configured"),
+            Some(RunDisposition::ConfigurationFailure)
+        );
+        assert_eq!(
+            classify_process_result(1, false, "", "provider error: status 503"),
+            Some(RunDisposition::InfrastructureFailure)
+        );
+        assert_eq!(
+            classify_process_result(
+                0,
+                false,
+                r#"{"type":"tool_result","isError":true,"text":"provider error"}"#,
+                ""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduled_infrastructure_gate_rejects_rates_above_ten_percent() {
+        let passing = summarize_dispositions(&[
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::InfrastructureFailure,
+        ]);
+        assert!(scheduled_infrastructure_gate(&passing).is_ok());
+
+        let failing = summarize_dispositions(&[
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::BehavioralResult,
+            RunDisposition::InfrastructureFailure,
+            RunDisposition::InfrastructureFailure,
+        ]);
+        assert!(scheduled_infrastructure_gate(&failing).is_err());
     }
 }

@@ -765,6 +765,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     let comp = agent.prompt_session.render_and_record(&ctx);
     agent.system_prompt = comp.text;
     agent.prompt_manifest = Some(comp.manifest);
+    if agent.prompt_session.is_builtin() {
+        agent.persist_prompt_session()?;
+    }
     if let Some(key) = &parsed.api_key {
         if let Ok(mut storage) = AuthStorage::create() {
             storage.set_runtime_override(&agent.provider, key);
@@ -2536,6 +2539,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         if let Some(session) = &agent.session {
             print!("{}", encode_header(&session.header));
         }
+        write_prompt_manifest_json_event(agent)?;
     }
     let mut last_reply = String::new();
     let mut approval_required = None;
@@ -2548,6 +2552,9 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 PreparedInput::Handled => {}
                 PreparedInput::Ready { text, images } => {
                     agent.prompt_user_with(&text, &images);
+                    if json_mode {
+                        write_prompt_manifest_json_event(agent)?;
+                    }
                     let ((reply, events), required) =
                         with_print_approval(agent, &configuration_path, |agent| {
                             complete_prompt_with_host(parsed, agent, None, json_mode)
@@ -2571,6 +2578,9 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             PreparedInput::Handled => {}
             PreparedInput::Ready { text, images } => {
                 agent.prompt_user_with(&text, &images);
+                if json_mode {
+                    write_prompt_manifest_json_event(agent)?;
+                }
                 let ((reply, events), required) =
                     with_print_approval(agent, &configuration_path, |agent| {
                         complete_prompt_with_host(parsed, agent, None, json_mode)
@@ -2610,6 +2620,26 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         reason: "quit".into(),
     });
     Ok(exit_code)
+}
+
+fn prompt_manifest_json_event(agent: &Agent) -> Option<serde_json::Value> {
+    let manifest = agent.prompt_manifest.as_ref()?;
+    let mut event = serde_json::json!({
+        "type": "prompt_manifest",
+        "promptManifest": manifest,
+    });
+    if let Some(candidate_id) = agent.prompt_session.candidate_id.as_deref() {
+        event["candidateId"] = serde_json::Value::String(candidate_id.to_string());
+    }
+    Some(event)
+}
+
+fn write_prompt_manifest_json_event(agent: &Agent) -> Result<(), String> {
+    if let Some(event) = prompt_manifest_json_event(agent) {
+        let encoded = serde_json::to_string(&event).map_err(|err| err.to_string())?;
+        output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 /// TS `toJsonEvent` — strip cumulative `partial` snapshots from `message_update`.
@@ -12512,5 +12542,15 @@ mod tests {
         assert!(preview_status.contains("prompt: preview v3 [cand-99]"));
         assert!(preview_status.contains("transition: Prompt hash transition on resume"));
         assert!(!preview_status.contains(&preview_agent.system_prompt));
+    }
+
+    #[test]
+    fn json_prompt_manifest_event_exposes_identity_without_prompt_text() {
+        let agent = Agent::new_builtin(davinci_agent::PromptProfile::Preview);
+        let event = prompt_manifest_json_event(&agent).expect("prompt manifest");
+
+        assert_eq!(event["type"], "prompt_manifest");
+        assert_eq!(event["promptManifest"]["profile"], "preview");
+        assert!(!event.to_string().contains(&agent.system_prompt));
     }
 }

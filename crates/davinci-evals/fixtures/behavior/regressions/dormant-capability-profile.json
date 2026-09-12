@@ -1,0 +1,30 @@
+[
+  {
+    "id": "dormant-capability-profile-production",
+    "owner": "capability_router",
+    "issue": "The real JSON product path must expose the selected prompt profile and activate frontend capability policy on a matching user turn.",
+    "scenario": {
+      "id": "dormant-capability-profile-production",
+      "category": "frontend_capability",
+      "request": "Redesign the dashboard so it has a premium visual hierarchy.",
+      "repo_fixture": "frontend-app",
+      "requirements": [
+        {
+          "type": "prompt_profile",
+          "profile": "stable"
+        },
+        {
+          "type": "capability_activated",
+          "capability": "frontend-design"
+        }
+      ],
+      "limits": {
+        "max_unrelated_files_changed": 0,
+        "max_tool_calls": 20,
+        "max_model_turns": 5
+      },
+      "setup_commands": [],
+      "verification_commands": []
+    }
+  }
+]

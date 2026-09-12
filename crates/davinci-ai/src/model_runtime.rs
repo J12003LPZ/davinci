@@ -156,6 +156,9 @@ pub fn check_auth(
 ) -> Option<AuthCheck> {
     if let Some(cred) = storage.get(provider) {
         if cred.kind == CredentialKind::Oauth {
+            if !crate::auth::oauth_credential_usable(provider, cred) {
+                return None;
+            }
             return if provider_supports_oauth(provider, config) {
                 Some(AuthCheck {
                     kind: "oauth".into(),
@@ -372,6 +375,7 @@ pub fn empty_catalog_error(snapshot: &ModelRuntimeSnapshot) -> Option<String> {
 mod tests {
     use super::*;
     use crate::catalog::ModelCost;
+    use base64::Engine as _;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -513,6 +517,52 @@ mod tests {
             storage.get("anthropic").and_then(|c| c.access.as_deref()),
             Some("expired")
         );
+    }
+
+    #[test]
+    fn check_auth_rejects_unusable_openai_codex_oauth() {
+        let dir = tempdir().unwrap();
+        let mut storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
+        storage
+            .login_oauth(
+                "openai-codex",
+                "pi-fixture-access",
+                Some("pi-fixture-refresh".into()),
+                Some(u64::MAX),
+            )
+            .unwrap();
+
+        assert!(check_auth(
+            "openai-codex",
+            &ModelConfig::empty(),
+            &storage,
+            &Default::default(),
+        )
+        .is_none());
+
+        let encode =
+            |value: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
+        let access = format!(
+            "{}.{}.signature",
+            encode(r#"{"alg":"none"}"#),
+            encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acc-test"}}"#)
+        );
+        storage
+            .login_oauth(
+                "openai-codex",
+                access,
+                Some("refresh".into()),
+                Some(u64::MAX),
+            )
+            .unwrap();
+
+        assert!(check_auth(
+            "openai-codex",
+            &ModelConfig::empty(),
+            &storage,
+            &Default::default(),
+        )
+        .is_some());
     }
 
     #[test]

@@ -5,7 +5,9 @@ pub mod behavior;
 pub mod codex_eval;
 pub mod competitor;
 pub mod harness_table;
+pub mod promotion;
 pub mod reporter;
+pub mod review_scoring;
 pub mod security_eval;
 pub mod summary;
 pub mod visual;
@@ -22,8 +24,8 @@ pub use harness_table::{
 };
 pub use reporter::{
     append_harness_run_report, collect_harness_observations, format_test_run_end, is_harness_run,
-    HarnessRun, HarnessTestCase, HarnessTestModule, HarnessTimings, HarnessUsage,
-    EVAL_COMPARISONS_INTERRUPTED,
+    CapabilityQualityReport, HarnessRun, HarnessTestCase, HarnessTestModule, HarnessTimings,
+    HarnessUsage, EVAL_COMPARISONS_INTERRUPTED,
 };
 pub use summary::{
     format_harness_comparison_report, strip_vt_control_characters, summarize_harness_comparisons,

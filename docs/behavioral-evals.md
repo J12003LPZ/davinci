@@ -1,5 +1,20 @@
 # DaVinci Behavioral Evaluation & Maturity Scorecard Framework
 
+## Live A/B execution
+
+The credentialed workflow is `.github/workflows/behavior-live.yml`. Manual
+runs require an explicit provider, model, suite, and repetition count; the
+weekly matrix uses repository variables for model identifiers. Provider
+credentials are read only from GitHub Actions secrets and are never written to
+the evidence directory.
+
+Each available provider builds the release DaVinci binary and the eval runner,
+then executes the real `behavior ab` product path with Stable and Preview.
+Missing credentials or model configuration produce an explicit configuration
+failure artifact and do not become behavioral failures. The final coverage job
+requires at least one successful matrix run before evidence can be used for a
+promotion decision. Full run directories are retained for 30 days.
+
 This specification defines DaVinci's behavioral reliability scorecard, competitive benchmarking protocol against external harnesses (such as Claude Code), and PR evaluation examples.
 
 ---

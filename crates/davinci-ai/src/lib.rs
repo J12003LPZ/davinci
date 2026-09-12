@@ -35,9 +35,10 @@ pub mod trace;
 pub use attribution::{is_install_telemetry_enabled, merge_provider_attribution_headers};
 pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
-    copilot_base_url_from_token, credential_expires_by, fetch_github_copilot_available_model_ids,
-    parse_copilot_available_model_ids, resolve_provider_auth, vertex_ambient_auth, AuthStorage,
-    AuthStorageError, Credential, CredentialKind, ResolvedAuth,
+    copilot_base_url_from_token, credential_expires_by, default_auth_path,
+    fetch_github_copilot_available_model_ids, parse_copilot_available_model_ids,
+    resolve_provider_auth, vertex_ambient_auth, AuthStorage, AuthStorageError, Credential,
+    CredentialKind, ResolvedAuth,
 };
 pub use catalog::{
     builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models,

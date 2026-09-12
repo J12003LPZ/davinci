@@ -1,0 +1,147 @@
+name: Claude Code differential
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Matched competitor suite
+        required: true
+        default: claude-public-challenges
+        type: string
+      repeats:
+        description: Paired repetitions per harness
+        required: true
+        default: '3'
+        type: string
+      provider:
+        description: DaVinci provider
+        required: true
+        type: choice
+        options:
+          - anthropic
+          - openai
+          - gemini
+      model:
+        description: Exact DaVinci model identifier
+        required: true
+        type: string
+      competitor_binary:
+        description: Claude Code binary or absolute path on the trusted runner
+        required: true
+        default: claude
+        type: string
+      timeout_seconds:
+        description: Per-scenario timeout
+        required: true
+        default: '120'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PI_OFFLINE: '0'
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    env:
+      DAVINCI_PROVIDER: ${{ inputs.provider }}
+      DAVINCI_MODEL: ${{ inputs.model }}
+      COMPETITOR_BINARY: ${{ inputs.competitor_binary }}
+      COMPETITOR_TIMEOUT: ${{ inputs.timeout_seconds }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use repository-pinned Rust
+        run: rustup show
+
+      - name: Probe competitor version
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/competitor-evals
+          if ! version=$("${COMPETITOR_BINARY}" --version 2>&1); then
+            echo "CONFIGURATION_FAILURE: competitor version probe failed" | tee target/competitor-evals/configuration-failure.txt
+            exit 1
+          fi
+          if [[ -z "${version}" ]]; then
+            echo "CONFIGURATION_FAILURE: competitor version was not identifiable" | tee target/competitor-evals/configuration-failure.txt
+            exit 1
+          fi
+          printf '%s\n' "${version}" > target/competitor-evals/competitor-version.txt
+
+      - name: Check DaVinci provider configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${DAVINCI_PROVIDER}" in
+            anthropic) key="${ANTHROPIC_API_KEY:-}" ;;
+            openai) key="${OPENAI_API_KEY:-}" ;;
+            gemini) key="${GEMINI_API_KEY:-}" ;;
+            *) key="" ;;
+          esac
+          if [[ -z "${key}" || -z "${DAVINCI_MODEL}" ]]; then
+            echo "CONFIGURATION_FAILURE: DaVinci provider credentials or model are unavailable" | tee target/competitor-evals/configuration-failure.txt
+            exit 1
+          fi
+
+      - name: Build release DaVinci and eval runner
+        run: |
+          cargo build --release -p davinci-coding-agent --bin davinci --locked
+          cargo build --release -p davinci-evals --bin davinci-evals --locked
+
+      - name: Run matched Claude Code suite
+        env:
+          DAVINCI_PROVIDER: ${{ env.DAVINCI_PROVIDER }}
+          DAVINCI_MODEL: ${{ env.DAVINCI_MODEL }}
+        run: |
+          ./target/release/davinci-evals competitor run \
+            --suite "${{ inputs.suite }}" \
+            --binary "${COMPETITOR_BINARY}" \
+            --repeats "${{ inputs.repeats }}" \
+            --artifacts target/competitor-evals/raw
+
+      - name: Generate normalized differential report
+        run: |
+          ./target/release/davinci-evals competitor compare \
+            --suite "${{ inputs.suite }}" \
+            --repeats "${{ inputs.repeats }}" \
+            --artifacts target/competitor-evals/raw
+
+      - name: Scrub credential-bearing text artifacts
+        if: always()
+        shell: python
+        run: |
+          from pathlib import Path
+          import os
+          import re
+
+          root = Path("target/competitor-evals")
+          secrets = [os.environ.get(name, "") for name in (
+              "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY")]
+          secrets = [value for value in secrets if value]
+          for path in root.rglob("*"):
+              if not path.is_file() or path.name == "competitor-version.txt":
+                  continue
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except (OSError, UnicodeDecodeError):
+                  continue
+              for secret in secrets:
+                  text = text.replace(secret, "[REDACTED]")
+              text = re.sub(r"(?i)(api[_-]?key|authorization)\s*[:=]\s*[^\s,]+", r"\1=[REDACTED]", text)
+              path.write_text(text, encoding="utf-8")
+
+      - name: Upload matched reports and raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitor-differential-${{ github.run_id }}
+          path: target/competitor-evals
+          retention-days: 30
+          if-no-files-found: error

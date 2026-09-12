@@ -2,8 +2,10 @@
 
 use davinci_agent::prompt::manifest::PromptManifest;
 use davinci_agent::AgentEvent;
-use davinci_ai::{content_text, MessageContent};
+use davinci_ai::{content_text, ChatMessage, MessageContent};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BehaviorTrace {
@@ -11,6 +13,8 @@ pub struct BehaviorTrace {
     pub prompt_manifest: Option<PromptManifest>,
     pub events: Vec<BehaviorEvent>,
     pub files_changed: Vec<String>,
+    #[serde(default)]
+    pub file_diffs: Vec<FileDiff>,
     pub verification: Vec<VerificationEvent>,
     pub stats: BehaviorStats,
 }
@@ -42,6 +46,18 @@ pub enum BehaviorEvent {
     PermissionDenied {
         tool: String,
     },
+    MessageLifecycle {
+        phase: String,
+    },
+    PlanEvent {
+        kind: String,
+    },
+    CapabilityIdentity {
+        capability: String,
+    },
+    PromptProfile {
+        profile: String,
+    },
     VerificationClaim {
         claim: String,
     },
@@ -53,6 +69,12 @@ pub struct VerificationEvent {
     pub kind: String,
     pub command: String,
     pub passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub diff: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +163,7 @@ impl BehaviorTrace {
             prompt_manifest,
             events: Vec::new(),
             files_changed: Vec::new(),
+            file_diffs: Vec::new(),
             verification: Vec::new(),
             stats: BehaviorStats::default(),
         }
@@ -157,7 +180,8 @@ impl BehaviorTrace {
             trace.stats = stats;
         }
 
-        let mut pending_shell_class: Option<&'static str> = None;
+        let mut pending_shells: HashMap<String, PendingShell> = HashMap::new();
+        let mut pending_edits: HashMap<String, PendingEdit> = HashMap::new();
 
         for event in events {
             match event {
@@ -165,7 +189,9 @@ impl BehaviorTrace {
                     trace.stats.model_turns += 1;
                 }
                 AgentEvent::ToolExecutionStart {
-                    tool_name, args, ..
+                    tool_call_id,
+                    tool_name,
+                    args,
                 } => {
                     trace.stats.tool_calls += 1;
                     match tool_name.as_str() {
@@ -199,16 +225,36 @@ impl BehaviorTrace {
                             });
                         }
                         "edit" | "write" | "apply_patch" | "notebook_edit" => {
-                            let path = args
-                                .get("path")
-                                .or_else(|| args.get("file_path"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if !path.is_empty() && !trace.files_changed.contains(&path) {
-                                trace.files_changed.push(path.clone());
+                            let patch = (tool_name == "apply_patch")
+                                .then(|| args.get("input").and_then(Value::as_str))
+                                .flatten()
+                                .map(str::to_owned);
+                            let mut paths = patch.as_deref().map(patch_paths).unwrap_or_default();
+                            if paths.is_empty() {
+                                if let Some(path) = args
+                                    .get("path")
+                                    .or_else(|| args.get("file_path"))
+                                    .and_then(|v| v.as_str())
+                                    .filter(|path| !path.is_empty())
+                                {
+                                    paths.push(path.to_owned());
+                                }
                             }
-                            trace.events.push(BehaviorEvent::Edit { path });
+                            for path in &paths {
+                                if !trace.files_changed.contains(path) {
+                                    trace.files_changed.push(path.clone());
+                                }
+                                trace
+                                    .events
+                                    .push(BehaviorEvent::Edit { path: path.clone() });
+                            }
+                            if paths.is_empty() {
+                                trace.events.push(BehaviorEvent::Edit {
+                                    path: String::new(),
+                                });
+                            }
+                            pending_edits
+                                .insert(tool_call_id.clone(), PendingEdit { paths, patch });
                         }
                         "bash" | "powershell" | "exec_command" => {
                             let cmd = args
@@ -217,7 +263,13 @@ impl BehaviorTrace {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
                             let class = classify_shell_command(cmd);
-                            pending_shell_class = Some(class);
+                            pending_shells.insert(
+                                tool_call_id.clone(),
+                                PendingShell {
+                                    class,
+                                    command: cmd.to_string(),
+                                },
+                            );
                         }
                         "agent" => {
                             trace.events.push(BehaviorEvent::SubagentSpawn { count: 1 });
@@ -226,16 +278,23 @@ impl BehaviorTrace {
                     }
                 }
                 AgentEvent::ToolExecutionEnd {
+                    tool_call_id,
                     tool_name,
                     result,
                     is_error,
+                    details,
                     ..
                 } => {
                     if tool_name == "bash"
                         || tool_name == "powershell"
                         || tool_name == "exec_command"
                     {
-                        let class = pending_shell_class.take().unwrap_or("other");
+                        let pending = pending_shells.remove(tool_call_id);
+                        let class = pending.as_ref().map(|shell| shell.class).unwrap_or("other");
+                        let command = pending
+                            .as_ref()
+                            .map(|shell| shell.command.clone())
+                            .unwrap_or_default();
                         let exit_code = if *is_error {
                             result
                                 .get("exit_code")
@@ -258,9 +317,53 @@ impl BehaviorTrace {
                         if class == "test" || class == "build" || class == "lint" {
                             trace.verification.push(VerificationEvent {
                                 kind: class.to_string(),
-                                command: class.to_string(),
+                                command,
                                 passed: exit_code == Some(0),
                             });
+                        }
+                    }
+
+                    if is_edit_tool(tool_name) {
+                        let pending = pending_edits.remove(tool_call_id);
+                        if !*is_error {
+                            let diff = details
+                                .as_ref()
+                                .and_then(|details| details.get("diff"))
+                                .and_then(Value::as_str)
+                                .filter(|diff| !diff.is_empty())
+                                .map(str::to_owned)
+                                .or_else(|| pending.as_ref().and_then(|edit| edit.patch.clone()));
+                            if let Some(diff) = diff {
+                                let paths = details
+                                    .as_ref()
+                                    .and_then(|details| details.get("paths"))
+                                    .and_then(Value::as_array)
+                                    .map(|paths| {
+                                        paths
+                                            .iter()
+                                            .filter_map(Value::as_str)
+                                            .map(str::to_owned)
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .filter(|paths| !paths.is_empty())
+                                    .or_else(|| {
+                                        details
+                                            .as_ref()
+                                            .and_then(|details| details.get("path"))
+                                            .and_then(Value::as_str)
+                                            .filter(|path| !path.is_empty())
+                                            .map(|path| vec![path.to_owned()])
+                                    })
+                                    .or_else(|| pending.as_ref().map(|edit| edit.paths.clone()))
+                                    .filter(|paths| !paths.is_empty())
+                                    .unwrap_or_else(|| vec![String::new()]);
+                                trace
+                                    .file_diffs
+                                    .extend(paths.into_iter().map(|path| FileDiff {
+                                        path,
+                                        diff: diff.clone(),
+                                    }));
+                            }
                         }
                     }
 
@@ -273,21 +376,13 @@ impl BehaviorTrace {
                         }
                     }
                 }
+                AgentEvent::MessageStart { .. } | AgentEvent::MessageUpdate { .. } => {}
                 AgentEvent::MessageEnd { message } | AgentEvent::TurnEnd { message, .. } => {
-                    if message.role == "assistant" {
-                        let text = content_text(&message.content);
-                        for claim in detect_verification_claims(&text) {
-                            trace
-                                .events
-                                .push(BehaviorEvent::VerificationClaim { claim });
-                        }
-                        let has_tool_calls = message
-                            .content
-                            .iter()
-                            .any(|b| matches!(b, MessageContent::ToolCall { .. }));
-                        if !has_tool_calls && !text.is_empty() {
-                            trace.events.push(BehaviorEvent::FinalResponse);
-                        }
+                    record_assistant_message(&mut trace, message);
+                }
+                AgentEvent::AgentEnd { messages, .. } => {
+                    for message in messages {
+                        record_assistant_message(&mut trace, message);
                     }
                 }
                 _ => {}
@@ -296,6 +391,61 @@ impl BehaviorTrace {
 
         trace
     }
+}
+
+fn record_assistant_message(trace: &mut BehaviorTrace, message: &ChatMessage) {
+    if message.role != "assistant" {
+        return;
+    }
+
+    let text = content_text(&message.content);
+    for claim in detect_verification_claims(&text) {
+        trace
+            .events
+            .push(BehaviorEvent::VerificationClaim { claim });
+    }
+    let has_tool_calls = message
+        .content
+        .iter()
+        .any(|block| matches!(block, MessageContent::ToolCall { .. }));
+    if !has_tool_calls && !text.is_empty() {
+        trace.events.push(BehaviorEvent::FinalResponse);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingShell {
+    class: &'static str,
+    command: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingEdit {
+    paths: Vec<String>,
+    patch: Option<String>,
+}
+
+fn patch_paths(patch: &str) -> Vec<String> {
+    davinci_agent::apply_patch::parse_codex_patch(patch)
+        .map(|parsed| {
+            parsed
+                .actions
+                .into_iter()
+                .map(|action| match action {
+                    davinci_agent::apply_patch::FileAction::Add { path, .. }
+                    | davinci_agent::apply_patch::FileAction::Delete { path }
+                    | davinci_agent::apply_patch::FileAction::Update { path, .. } => path,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_edit_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "edit" | "write" | "apply_patch" | "notebook_edit"
+    )
 }
 
 #[cfg(test)]
@@ -342,7 +492,7 @@ mod tests {
                 tool_name: "edit".into(),
                 result: json!({ "success": true }),
                 is_error: false,
-                details: None,
+                details: Some(json!({ "diff": "+return Err(error)" })),
             },
             AgentEvent::ToolExecutionStart {
                 tool_call_id: "c4".into(),
@@ -370,7 +520,15 @@ mod tests {
         assert_eq!(trace.files_changed, vec!["src/lib.rs"]);
         assert_eq!(trace.verification.len(), 1);
         assert_eq!(trace.verification[0].kind, "test");
+        assert_eq!(trace.verification[0].command, "cargo test");
         assert!(trace.verification[0].passed);
+        assert_eq!(
+            trace.file_diffs,
+            vec![FileDiff {
+                path: "src/lib.rs".into(),
+                diff: "+return Err(error)".into(),
+            }]
+        );
 
         assert_eq!(trace.stats.model_turns, 1);
         assert_eq!(trace.stats.tool_calls, 4);
@@ -418,5 +576,74 @@ mod tests {
         assert_eq!(classify_shell_command("git status"), "git");
         assert_eq!(classify_shell_command("ls -la"), "search");
         assert_eq!(classify_shell_command("curl http://example.com"), "other");
+    }
+
+    #[test]
+    fn correlates_interleaved_shell_results_by_tool_call_id() {
+        let events = vec![
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: "test".into(),
+                tool_name: "bash".into(),
+                args: json!({ "command": "cargo test --test regression" }),
+            },
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: "lint".into(),
+                tool_name: "powershell".into(),
+                args: json!({ "command": "cargo clippy" }),
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: "lint".into(),
+                tool_name: "powershell".into(),
+                result: json!({ "exit_code": 1 }),
+                is_error: false,
+                details: None,
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: "test".into(),
+                tool_name: "bash".into(),
+                result: json!({ "exit_code": 0 }),
+                is_error: false,
+                details: None,
+            },
+        ];
+
+        let trace = BehaviorTrace::from_agent_events("scenario-1", None, &events, None);
+
+        assert_eq!(trace.verification[0].command, "cargo clippy");
+        assert!(!trace.verification[0].passed);
+        assert_eq!(
+            trace.verification[1].command,
+            "cargo test --test regression"
+        );
+        assert!(trace.verification[1].passed);
+    }
+
+    #[test]
+    fn captures_successful_apply_patch_diff_without_result_details() {
+        let patch = "*** Begin Patch\n*** Add File: src/service.rs\n+return Ok(())\n*** End Patch";
+        let events = vec![
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: "patch".into(),
+                tool_name: "apply_patch".into(),
+                args: json!({ "input": patch }),
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: "patch".into(),
+                tool_name: "apply_patch".into(),
+                result: json!({ "success": true }),
+                is_error: false,
+                details: None,
+            },
+        ];
+
+        let trace = BehaviorTrace::from_agent_events("scenario-1", None, &events, None);
+        assert_eq!(trace.files_changed, vec!["src/service.rs"]);
+        assert_eq!(
+            trace.file_diffs,
+            vec![FileDiff {
+                path: "src/service.rs".into(),
+                diff: patch.into(),
+            }]
+        );
     }
 }

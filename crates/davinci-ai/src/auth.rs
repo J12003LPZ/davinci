@@ -310,6 +310,15 @@ pub fn env_api_key(spec: &ProviderSpec, env: &HashMap<String, String>) -> Option
     None
 }
 
+pub(crate) fn oauth_credential_usable(provider: &str, credential: &Credential) -> bool {
+    provider != "openai-codex"
+        || credential
+            .access
+            .as_deref()
+            .or(credential.key.as_deref())
+            .is_some_and(|access| crate::codex::extract_account_id(access).is_ok())
+}
+
 pub fn resolve_provider_auth(
     provider: &str,
     storage: &AuthStorage,
@@ -359,6 +368,9 @@ pub fn resolve_provider_auth(
                 }
             }
             CredentialKind::Oauth => {
+                if !oauth_credential_usable(provider, cred) {
+                    return None;
+                }
                 if let Some(access) = cred.access.clone().or_else(|| cred.key.clone()) {
                     let mut headers = HashMap::new();
                     headers.insert("Authorization".into(), format!("Bearer {access}"));
@@ -714,6 +726,23 @@ mod tests {
         let resolved = resolve_provider_auth("openai", &storage, &env, true).unwrap();
         assert_eq!(resolved.api_key.as_deref(), Some("sk-stored"));
         assert_eq!(resolved.source, "stored credential");
+    }
+
+    #[test]
+    fn resolve_provider_auth_rejects_unusable_openai_codex_oauth() {
+        let mut storage = AuthStorage::in_memory();
+        storage
+            .login_oauth(
+                "openai-codex",
+                "pi-fixture-access",
+                Some("pi-fixture-refresh".into()),
+                Some(u64::MAX),
+            )
+            .unwrap();
+
+        assert!(
+            resolve_provider_auth("openai-codex", &storage, &Default::default(), true,).is_none()
+        );
     }
 
     #[test]

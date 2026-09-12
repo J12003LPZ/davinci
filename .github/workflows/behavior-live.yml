@@ -1,0 +1,168 @@
+name: Live behavioral A/B
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Provider for the manual run
+        required: true
+        type: choice
+        options:
+          - anthropic
+          - openai
+          - gemini
+      model:
+        description: Exact provider model identifier
+        required: true
+        type: string
+      suite:
+        description: Behavior suite
+        required: true
+        default: core-200
+        type: string
+      repeats:
+        description: Paired repetitions
+        required: true
+        default: '3'
+        type: string
+  schedule:
+    - cron: '0 3 * * 0'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PI_OFFLINE: '0'
+
+jobs:
+  eval-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: anthropic
+            model_var: DAVINCI_ANTHROPIC_MODEL
+          - provider: openai
+            model_var: DAVINCI_OPENAI_MODEL
+          - provider: gemini
+            model_var: DAVINCI_GEMINI_MODEL
+    runs-on: ubuntu-latest
+    env:
+      EVAL_PROVIDER: ${{ matrix.provider }}
+      EVAL_MODEL: ${{ github.event_name == 'workflow_dispatch' && inputs.model || vars[matrix.model_var] }}
+      EVAL_SUITE: ${{ github.event_name == 'workflow_dispatch' && inputs.suite || 'core-200' }}
+      EVAL_REPEATS: ${{ github.event_name == 'workflow_dispatch' && inputs.repeats || '3' }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record unselected matrix entry
+        if: github.event_name == 'workflow_dispatch' && matrix.provider != inputs.provider
+        run: |
+          mkdir -p "target/behavior-evals/live-${EVAL_PROVIDER}"
+          echo "SKIPPED: provider not selected for this manual run" > "target/behavior-evals/live-${EVAL_PROVIDER}/skipped.txt"
+
+      - name: Use repository-pinned Rust
+        if: github.event_name != 'workflow_dispatch' || matrix.provider == inputs.provider
+        run: rustup show
+
+      - name: Check provider configuration
+        id: credentials
+        if: github.event_name != 'workflow_dispatch' || matrix.provider == inputs.provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "target/behavior-evals/live-${EVAL_PROVIDER}"
+          if [[ -z "${EVAL_MODEL}" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "CONFIGURATION_FAILURE: no model configured for ${EVAL_PROVIDER}" | tee "target/behavior-evals/live-${EVAL_PROVIDER}/configuration-failure.txt"
+            exit 0
+          fi
+          case "${EVAL_PROVIDER}" in
+            anthropic) key="${ANTHROPIC_API_KEY:-}" ;;
+            openai) key="${OPENAI_API_KEY:-}" ;;
+            gemini) key="${GEMINI_API_KEY:-}" ;;
+            *) key="" ;;
+          esac
+          if [[ -z "${key}" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "CONFIGURATION_FAILURE: credential unavailable for ${EVAL_PROVIDER}" | tee "target/behavior-evals/live-${EVAL_PROVIDER}/configuration-failure.txt"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build release DaVinci and eval runner
+        if: steps.credentials.outputs.available == 'true' && (github.event_name != 'workflow_dispatch' || matrix.provider == inputs.provider)
+        run: |
+          cargo build --release -p davinci-coding-agent --bin davinci --locked
+          cargo build --release -p davinci-evals --bin davinci-evals --locked
+
+      - name: Run real behavioral A/B
+        if: steps.credentials.outputs.available == 'true' && (github.event_name != 'workflow_dispatch' || matrix.provider == inputs.provider)
+        env:
+          DAVINCI_PROVIDER: ${{ env.EVAL_PROVIDER }}
+          DAVINCI_MODEL: ${{ env.EVAL_MODEL }}
+        run: |
+          ./target/release/davinci-evals behavior ab \
+            --suite "${EVAL_SUITE}" \
+            --baseline-profile stable \
+            --candidate-profile preview \
+            --provider "${EVAL_PROVIDER}" \
+            --model "${EVAL_MODEL}" \
+            --repeats "${EVAL_REPEATS}" \
+            --davinci-bin ./target/release/davinci \
+            --artifacts "target/behavior-evals/live-${EVAL_PROVIDER}"
+
+      - name: Enforce behavioral disposition gate
+        if: steps.credentials.outputs.available == 'true' && (github.event_name != 'workflow_dispatch' || matrix.provider == inputs.provider)
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_root=$(find "target/behavior-evals/live-${EVAL_PROVIDER}" -name manifest.json -type f -print -quit | xargs -r dirname)
+          if [[ -z "${run_root}" ]]; then
+            echo "No A/B manifest was produced for ${EVAL_PROVIDER}."
+            exit 1
+          fi
+          ./target/release/davinci-evals behavior gate --artifacts "${run_root}"
+
+      - name: Record successful matrix run
+        if: steps.credentials.outputs.available == 'true' && (github.event_name != 'workflow_dispatch' || matrix.provider == inputs.provider)
+        run: |
+          printf 'provider=%s\nmodel=%s\nsuite=%s\nrepeats=%s\n' \
+            "${EVAL_PROVIDER}" "${EVAL_MODEL}" "${EVAL_SUITE}" "${EVAL_REPEATS}" \
+            > "target/behavior-evals/live-${EVAL_PROVIDER}/run-success.txt"
+
+      - name: Upload behavioral evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: behavior-live-${{ matrix.provider }}
+          path: target/behavior-evals/live-${{ matrix.provider }}
+          retention-days: 30
+          if-no-files-found: error
+
+  coverage:
+    if: always()
+    needs: eval-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download matrix evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: behavior-live-*
+          path: target/behavior-evals
+          merge-multiple: false
+
+      - name: Require successful behavioral coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          success_count=$(find target/behavior-evals -name run-success.txt -type f | wc -l)
+          if [[ "${success_count}" -lt 1 ]]; then
+            echo "No successful provider run is available for promotion evidence."
+            exit 1
+          fi
+          echo "Successful provider runs: ${success_count}"

@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::runner::BehaviorSuiteSummary;
+use super::statistics::{
+    bootstrap_pass_delta_ci95, pair_by_scenario_repetition, paired_scenario_deltas,
+    scenario_win_tie_loss, PairedScenarioDelta, ScenarioRunSample,
+};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EvalVariant {
@@ -32,6 +37,72 @@ pub struct PairedComparison {
     pub deltas: BTreeMap<String, f64>,
     pub regressions: Vec<Regression>,
     pub provider_errors: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepeatedPairedComparison {
+    pub scenario_deltas: Vec<PairedScenarioDelta>,
+    pub pass_delta_ci95: (f64, f64),
+    pub wins: usize,
+    pub ties: usize,
+    pub losses: usize,
+    pub repetitions: u32,
+}
+
+pub fn compare_repeated_runs(
+    baseline: &[ScenarioRunSample],
+    candidate: &[ScenarioRunSample],
+    seed: u64,
+    bootstrap_resamples: usize,
+) -> Result<RepeatedPairedComparison, String> {
+    let observations = pair_by_scenario_repetition(baseline, candidate)?;
+    let scenario_deltas = paired_scenario_deltas(&observations);
+    let outcomes = scenario_win_tie_loss(&observations);
+    let (wins, ties, losses) = outcomes.iter().fold((0, 0, 0), |totals, outcome| {
+        (
+            totals.0 + (outcome.wins > outcome.losses) as usize,
+            totals.1 + (outcome.wins == outcome.losses) as usize,
+            totals.2 + (outcome.wins < outcome.losses) as usize,
+        )
+    });
+    let repetitions = observations
+        .iter()
+        .map(|observation| observation.repetition)
+        .collect::<BTreeSet<_>>()
+        .len() as u32;
+    Ok(RepeatedPairedComparison {
+        scenario_deltas,
+        pass_delta_ci95: bootstrap_pass_delta_ci95(&observations, seed, bootstrap_resamples),
+        wins,
+        ties,
+        losses,
+        repetitions,
+    })
+}
+
+pub fn format_repeated_comparison_markdown(comparison: &RepeatedPairedComparison) -> String {
+    let (lower, upper) = comparison.pass_delta_ci95;
+    let mut output = format!(
+        "| Metric | Value |\n| :--- | :--- |\n| Paired pass delta 95% CI | [{lower:.4}, {upper:.4}] |\n| Scenario wins | {} |\n| Scenario ties | {} |\n| Scenario losses | {} |\n| Repetitions | {} |\n",
+        comparison.wins,
+        comparison.ties,
+        comparison.losses,
+        comparison.repetitions,
+    );
+    if !comparison.scenario_deltas.is_empty() {
+        output.push_str("\n| Scenario | Baseline pass rate | Candidate pass rate | Median wall delta (ms) | Median tool delta |\n| :--- | ---: | ---: | ---: | ---: |\n");
+        for delta in &comparison.scenario_deltas {
+            output.push_str(&format!(
+                "| {} | {:.4} | {:.4} | {:.1} | {:.1} |\n",
+                delta.scenario_id,
+                delta.baseline_pass_rate,
+                delta.candidate_pass_rate,
+                delta.wall_ms_delta_median,
+                delta.tool_call_delta_median,
+            ));
+        }
+    }
+    output
 }
 
 pub fn compare_eval_runs(
@@ -400,5 +471,29 @@ mod tests {
         assert_eq!(comp.provider_errors, 3);
         let md = format_comparison_markdown(&comp);
         assert!(md.contains("3 provider/network errors excluded"));
+    }
+
+    #[test]
+    fn repeated_comparison_reports_paired_ci_and_scenario_outcomes() {
+        let baseline = vec![ScenarioRunSample {
+            scenario_id: "s1".into(),
+            repetition: 0,
+            passed: false,
+            wall_ms: 10,
+            tool_calls: 2,
+        }];
+        let candidate = vec![ScenarioRunSample {
+            scenario_id: "s1".into(),
+            repetition: 0,
+            passed: true,
+            wall_ms: 12,
+            tool_calls: 3,
+        }];
+        let comparison = compare_repeated_runs(&baseline, &candidate, 7, 100).unwrap();
+        assert_eq!(comparison.scenario_deltas[0].candidate_pass_rate, 1.0);
+        assert_eq!(comparison.wins, 1);
+        assert_eq!(comparison.ties, 0);
+        assert_eq!(comparison.losses, 0);
+        assert_eq!(comparison.repetitions, 1);
     }
 }

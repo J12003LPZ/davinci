@@ -34,9 +34,32 @@
 ## Running Evals
 
 ```bash
-cargo test -p davinci-evals
-cargo test -p davinci-evals behavior::
-cargo test -p davinci-evals competitor::
+cargo run -p davinci-evals -- corpus verify
+cargo run -p davinci-evals -- behavior run --suite core-200
+cargo run -p davinci-evals -- behavior ab \
+  --suite core-200 \
+  --baseline-profile stable \
+  --candidate-profile preview \
+  --provider openai-codex \
+  --model gpt-5.6-sol \
+  --repeats 3 \
+  --davinci-bin ./target/release/davinci \
+  --artifacts target/behavior-evals
+cargo run -p davinci-evals -- behavior gate --artifacts target/behavior-evals
+cargo run -p davinci-evals -- competitor run --binary claude
+cargo run -p davinci-evals -- competitor compare --artifacts target/competitor-evals
 ```
+
+`behavior run` and `behavior ab` execute the release DaVinci binary in an
+isolated fixture workspace, persist JSON traces, verification results, diffs,
+run dispositions, and content hashes. `behavior ab` also writes the paired
+comparison and a manifest suitable for `behavior gate`; infrastructure and
+configuration failures are retained as evidence and excluded from the
+behavioral denominator. Provider and model values may be supplied by flags or
+the `DAVINCI_PROVIDER`/`DAVINCI_MODEL` environment variables. API credentials
+are passed only through the runner's explicit environment allow-list.
+
+Competitor execution remains fail-closed until its matched runner and
+persisted evidence path are wired.
 
 

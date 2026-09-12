@@ -444,3 +444,128 @@ impl PromptMaturityScorecard {
         )
     }
 }
+
+/// Typed release dimensions for native capabilities and product-path evidence.
+/// Each dimension remains independently inspectable; this structure deliberately
+/// does not provide a composite quality score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityQualityReport {
+    pub frontend_precision: f64,
+    pub frontend_recall: f64,
+    pub visual_verification_rate: f64,
+    pub design_diversity: f64,
+    pub debug_reproducer_capture: f64,
+    pub debug_same_signal_verification: f64,
+    pub debug_symptom_suppression_pass_rate: f64,
+    pub review_trigger_precision: f64,
+    pub review_critical_recall: f64,
+    pub review_false_positive_rate: f64,
+    pub review_duplicate_rate: f64,
+    pub profile_product_path_coverage: f64,
+    pub ab_successful_run_count: usize,
+    pub infrastructure_failure_rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_matched_run_delta: Option<f64>,
+}
+
+impl CapabilityQualityReport {
+    pub fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    pub fn format_markdown(&self) -> String {
+        format!(
+            "Capability quality dimensions (independent)\n\
+             - Frontend precision: {:.1}%\n\
+             - Frontend recall: {:.1}%\n\
+             - Visual verification rate: {:.1}%\n\
+             - Design diversity: {:.1}%\n\
+             - Debug reproducer capture: {:.1}%\n\
+             - Debug same-signal verification: {:.1}%\n\
+             - Debug symptom-suppression pass rate: {:.1}%\n\
+             - Review trigger precision: {:.1}%\n\
+             - Review critical recall: {:.1}%\n\
+             - Review false-positive rate: {:.1}%\n\
+             - Review duplicate rate: {:.1}%\n\
+             - Profile product-path coverage: {:.1}%\n\
+             - A/B successful run count: {}\n\
+             - Infrastructure failure rate: {:.1}%\n\
+             - Claude matched-run delta: {}",
+            self.frontend_precision,
+            self.frontend_recall,
+            self.visual_verification_rate,
+            self.design_diversity,
+            self.debug_reproducer_capture,
+            self.debug_same_signal_verification,
+            self.debug_symptom_suppression_pass_rate,
+            self.review_trigger_precision,
+            self.review_critical_recall,
+            self.review_false_positive_rate,
+            self.review_duplicate_rate,
+            self.profile_product_path_coverage,
+            self.ab_successful_run_count,
+            self.infrastructure_failure_rate,
+            self.claude_matched_run_delta
+                .map(|delta| format!("{delta:+.1} pp"))
+                .unwrap_or_else(|| "unavailable".into()),
+        )
+    }
+}
+
+#[cfg(test)]
+mod capability_scorecard_tests {
+    use super::*;
+
+    fn report() -> CapabilityQualityReport {
+        CapabilityQualityReport {
+            frontend_precision: 97.0,
+            frontend_recall: 94.0,
+            visual_verification_rate: 98.0,
+            design_diversity: 91.0,
+            debug_reproducer_capture: 95.0,
+            debug_same_signal_verification: 98.0,
+            debug_symptom_suppression_pass_rate: 90.0,
+            review_trigger_precision: 97.0,
+            review_critical_recall: 90.0,
+            review_false_positive_rate: 8.0,
+            review_duplicate_rate: 5.0,
+            profile_product_path_coverage: 100.0,
+            ab_successful_run_count: 600,
+            infrastructure_failure_rate: 2.0,
+            claude_matched_run_delta: Some(3.2),
+        }
+    }
+
+    #[test]
+    fn capability_scorecard_markdown_snapshot_keeps_dimensions_separate() {
+        let expected = "Capability quality dimensions (independent)\n\
+             - Frontend precision: 97.0%\n\
+             - Frontend recall: 94.0%\n\
+             - Visual verification rate: 98.0%\n\
+             - Design diversity: 91.0%\n\
+             - Debug reproducer capture: 95.0%\n\
+             - Debug same-signal verification: 98.0%\n\
+             - Debug symptom-suppression pass rate: 90.0%\n\
+             - Review trigger precision: 97.0%\n\
+             - Review critical recall: 90.0%\n\
+             - Review false-positive rate: 8.0%\n\
+             - Review duplicate rate: 5.0%\n\
+             - Profile product-path coverage: 100.0%\n\
+             - A/B successful run count: 600\n\
+             - Infrastructure failure rate: 2.0%\n\
+             - Claude matched-run delta: +3.2 pp";
+        assert_eq!(report().format_markdown(), expected);
+        assert!(!expected.contains("Overall"));
+    }
+
+    #[test]
+    fn capability_scorecard_json_snapshot_is_typed_and_roundtrips() {
+        let json = report().to_pretty_json().unwrap();
+        assert!(json.contains("\"frontendPrecision\": 97.0"));
+        assert!(json.contains("\"abSuccessfulRunCount\": 600"));
+        assert!(json.contains("\"claudeMatchedRunDelta\": 3.2"));
+        let decoded: CapabilityQualityReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, report());
+    }
+}

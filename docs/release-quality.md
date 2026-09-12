@@ -25,6 +25,24 @@ Main CI must be green before any prompt, native capability, or evaluation featur
 graduated. Workflow syntax and lint validity are therefore release prerequisites,
 not advisory checks.
 
+The live behavioral matrix in `.github/workflows/behavior-live.yml` is the
+credentialed product-path workflow. It must build the release binaries, run
+real `behavior ab` turns, retain raw evidence for 30 days, and report missing
+provider configuration explicitly. Offline Rust tests alone do not satisfy
+the live A/B or promotion gates.
+
+Every live run also records its disposition. Infrastructure failures are
+excluded from behavioral pass-rate denominators, configuration failures are
+reported separately, and a scheduled run fails when infrastructure failures
+exceed 10% of all attempted runs.
+
+The manual `.github/workflows/prompt-promotion.yml` workflow checks out the
+exact candidate commit, runs the offline workspace suite, binds the evidence
+candidate to the supplied Preview and Stable hashes, and invokes
+`behavior promote-check` against the content-addressed artifacts. It emits a
+certification JSON artifact only after recording whether the gate passed; it
+does not push or auto-promote a branch.
+
 ---
 
 ## 2. Live Candidate Graduation Gates (Preview -> Stable)
@@ -72,6 +90,23 @@ Release candidates report a 10-dimensional vector (0–100) as specified in [`do
 10. **Prompt efficiency**: >= 80.0
 
 No candidate may graduate if any dimension drops by more than 5.0 points from the current stable baseline.
+
+### Native capability quality dimensions
+
+Release reports must expose the following typed dimensions independently:
+
+- frontend precision and recall;
+- visual verification rate and design diversity;
+- debugging reproducer capture, same-signal verification, and symptom-suppression pass rate;
+- review trigger precision, critical-defect recall, false-positive rate, and duplicate rate;
+- profile product-path coverage;
+- successful A/B run count and infrastructure failure rate; and
+- Claude matched-run delta, when a matched competitor run is available.
+
+The evaluator’s `CapabilityQualityReport` intentionally does not collapse
+these dimensions into an opaque composite score. Missing live or competitor
+evidence remains unavailable rather than being represented as a fabricated
+result.
 
 ---
 

@@ -143,6 +143,28 @@ pub fn tool_class(tool: &str) -> ToolClass {
     }
 }
 
+/// Whether a call is intrinsically read-only or a recognized local check.
+/// This is an additional capability ceiling, not a permission grant: the
+/// ordinary policy still decides whether an otherwise-safe call may run.
+pub(crate) fn read_only_capability_allows(
+    tool: &str,
+    args: &Value,
+    command: &str,
+    cwd: &Path,
+) -> bool {
+    match tool_class(tool) {
+        ToolClass::Read => !matches!(tool, "batch" | "propose_plan" | "todo" | "update_plan"),
+        ToolClass::Shell => permission_risk::routine_local_shell(
+            tool,
+            args,
+            command,
+            cwd,
+            &FilesystemBoundaryPolicy::default(),
+        ),
+        ToolClass::Edit | ToolClass::Network | ToolClass::Other => false,
+    }
+}
+
 /// AST specifier for a permission rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleSpecifier {
