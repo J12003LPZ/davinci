@@ -2159,6 +2159,10 @@ fn tool_summary(name: &str) -> String {
                 .into_iter()
                 .find(|tool| tool.name == name)
                 .map(|tool| tool.description)
+        })
+        .or_else(|| {
+            crate::native_extensions::NativeExtensionHost::describe_tool(name)
+                .map(|tool| tool.description)
         });
     let Some(described) = described else {
         if let Some(rest) = name.strip_prefix("mcp__") {
@@ -3722,8 +3726,9 @@ pub fn perform(
                     .filter(|(name, _, _)| name.starts_with(prefix))
                     .count()
             };
+            let native_tool_names = host.native_tool_names();
             let native_tools = |prefix: &str| {
-                crate::native_extensions::NATIVE_TOOLS
+                native_tool_names
                     .iter()
                     .filter(|name| name.starts_with(prefix))
                     .count()
@@ -3785,17 +3790,16 @@ pub fn perform(
                 Some(path) => path.display().to_string(),
                 None => "node not found — JS extensions inactive".into(),
             };
+            let native_specs = host.native_tool_specs();
             let schema_tokens = serde_json::to_string(&davinci_agent::tool_specs())
                 .map(|text| text.len() / 4)
                 .unwrap_or(0)
-                + serde_json::to_string(
-                    &crate::native_extensions::NativeExtensionHost::tool_specs(),
-                )
-                .map(|text| text.len() / 4)
-                .unwrap_or(0);
+                + serde_json::to_string(&native_specs)
+                    .map(|text| text.len() / 4)
+                    .unwrap_or(0);
             let window = agent.context_window.max(1) as f64;
             let builtin = davinci_agent::tool_specs().len();
-            let native_count = crate::native_extensions::NATIVE_TOOLS.len();
+            let native_count = native_specs.len();
             let extension_count: usize = host.js.iter().map(|ext| ext.tools.len()).sum();
             let total = (builtin + native_count + extension_count).max(1) as f64;
             model.facts.tool_count = builtin + native_count + extension_count;

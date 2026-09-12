@@ -55,6 +55,14 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
             "unavailable"
         }
     ));
+    if state.visual_verification_available {
+        lines.push("Use `visual_snapshot` when visual inspection is required.".to_string());
+    } else {
+        lines.push(
+            "Visual inspection is unavailable; do not claim to have visually verified a result."
+                .to_string(),
+        );
+    }
 
     format!("<runtime_state>\n{}\n</runtime_state>", lines.join("\n"))
 }
@@ -85,6 +93,7 @@ mod tests {
 
         assert!(text.contains("Plan Mode"));
         assert!(text.contains("read-only"));
+        assert!(text.contains("Visual inspection is unavailable"));
         assert!(!text.contains("you are trusted to bypass"));
     }
 
@@ -117,6 +126,7 @@ mod tests {
                 assert!(text1.contains("strictly apply"));
                 assert!(!text1.contains("all tools are unrestricted"));
             }
+            assert!(text1.contains("visual_snapshot"));
         }
     }
 

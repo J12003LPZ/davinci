@@ -90,6 +90,7 @@ mod mcp;
 mod migrations;
 mod model_resolver;
 mod native_extensions;
+mod native_tools;
 mod output;
 mod packages;
 mod permissions;
@@ -718,7 +719,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         }
     }
     let mut host = ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd);
-    let mut names = host.native_tool_names();
+    let native_names = host.native_tool_names();
+    let mut names = native_names.clone();
     // The extension *paths* are not tool names — TS registers only what an
     // extension declares (`resolvedExtensionPaths` never reaches the tool
     // registry). Registering them here put rows like
@@ -736,8 +738,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     // its model either, rather than merely refused when called.
     if !parsed.tools.is_empty() && crate::native_extensions::graph_worker_context().is_some() {
         agent.tools.retain(|tool| {
-            parsed.tools.contains(tool)
-                || !crate::native_extensions::NATIVE_TOOLS.contains(&tool.as_str())
+            parsed.tools.contains(tool) || !native_names.iter().any(|native| native == tool)
         });
     }
     if let Some(coord) = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env() {
@@ -11758,7 +11759,7 @@ mod tests {
     }
 
     #[test]
-    fn visual_verification_prompt_state_follows_registered_native_backend() {
+    fn visual_verification_prompt_state_requires_registered_native_backend() {
         let mut agent = Agent::new("x");
         let host = ExtensionHost::default();
 
@@ -11774,7 +11775,7 @@ mod tests {
             native.visual_verification_available = true;
         }
         sync_visual_verification_availability(&mut agent, &host);
-        assert!(agent.runtime_prompt_state().visual_verification_available);
+        assert!(!agent.runtime_prompt_state().visual_verification_available);
     }
 
     #[test]

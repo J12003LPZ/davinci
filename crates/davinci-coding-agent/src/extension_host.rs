@@ -10,7 +10,7 @@ use crate::js_host::{
     stop_persistent_js_extension, JsAutocompleteProvider, JsExtensionResult, JsRegisteredCommand,
     JsRegisteredProvider, JsRegisteredTool,
 };
-use crate::native_extensions::{NativeExtensionHost, NATIVE_COMMANDS, NATIVE_TOOLS};
+use crate::native_extensions::{NativeExtensionHost, NATIVE_COMMANDS};
 use davinci_agent::{
     tool_class, CapabilitySource, RuntimeCapability, RuntimeCapabilityRegistry, ToolClass,
 };
@@ -378,7 +378,10 @@ impl ExtensionHost {
     }
 
     pub fn native_tool_specs(&self) -> Vec<davinci_ai::ToolSpec> {
-        NativeExtensionHost::tool_specs()
+        self.native
+            .lock()
+            .map(|native| native.available_tool_specs())
+            .unwrap_or_default()
     }
 
     /// Describe extension tools using the runtime-wide capability contract.
@@ -567,7 +570,12 @@ impl ExtensionHost {
     ) -> Option<Result<davinci_agent::ToolResult, davinci_agent::ToolError>> {
         let is_worker_submit = name == crate::native_extensions::GRAPH_SUBMIT_TOOL
             && crate::native_extensions::graph_worker_context().is_some();
-        if !is_worker_submit && !NATIVE_TOOLS.iter().any(|tool| *tool == name) {
+        let is_registered = self
+            .native
+            .lock()
+            .map(|native| native.has_tool(name))
+            .unwrap_or(false);
+        if !is_worker_submit && !is_registered {
             return None;
         }
         // `graph_run` blocks for the whole run. It must not do so while

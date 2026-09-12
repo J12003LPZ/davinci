@@ -138,7 +138,7 @@ pub fn tool_class(tool: &str) -> ToolClass {
         | "graph_submit" => ToolClass::Other,
         "write" | "edit" | "notebook_edit" | "apply_patch" => ToolClass::Edit,
         "bash" | "powershell" | "exec_command" | "write_stdin" => ToolClass::Shell,
-        "web_fetch" | "web_search" => ToolClass::Network,
+        "web_fetch" | "web_search" | "visual_snapshot" => ToolClass::Network,
         _ => ToolClass::Other,
     }
 }
@@ -360,7 +360,9 @@ impl PermissionRule {
             "command" => self.matches_subject(tool, value, subject),
             "path" => self.matches_subject(tool, value, subject),
             "domain" => {
-                let host = if tool_class(tool) == ToolClass::Network && tool == "web_fetch" {
+                let host = if tool_class(tool) == ToolClass::Network
+                    && matches!(tool, "web_fetch" | "visual_snapshot")
+                {
                     subject.to_string()
                 } else if let Some(url) = args.get("url").and_then(Value::as_str) {
                     host_of(url)
@@ -1187,7 +1189,7 @@ pub fn subject_of_with_boundary(
             project_relative_with_boundary(cwd, raw, boundary)
         }
         // A fetch is judged by where it goes, a search by what it asks.
-        ToolClass::Network if tool == "web_fetch" => (
+        ToolClass::Network if matches!(tool, "web_fetch" | "visual_snapshot") => (
             host_of(args.get("url").and_then(Value::as_str).unwrap_or_default()),
             false,
         ),
@@ -2923,6 +2925,42 @@ mod tests {
             ),
             PermissionVerdict::Allow
         );
+    }
+
+    #[test]
+    fn visual_snapshot_is_a_network_tool_scoped_by_url_host() {
+        assert_eq!(tool_class("visual_snapshot"), ToolClass::Network);
+        let root = cwd();
+        let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+        policy
+            .allow
+            .push(PermissionRule::parse("VisualSnapshot(domain:*.example.com)").unwrap());
+        assert_eq!(
+            policy.decide(
+                "visual-1",
+                "visual_snapshot",
+                &json!({
+                    "url": "https://app.example.com",
+                    "viewportWidth": 1280,
+                    "viewportHeight": 720
+                }),
+                &root
+            ),
+            PermissionVerdict::Allow
+        );
+        assert!(matches!(
+            policy.decide(
+                "visual-2",
+                "visual_snapshot",
+                &json!({
+                    "url": "https://evil.example.net",
+                    "viewportWidth": 1280,
+                    "viewportHeight": 720
+                }),
+                &root
+            ),
+            PermissionVerdict::Ask(_)
+        ));
     }
 
     #[test]

@@ -21,9 +21,13 @@ pub use security_scan::{
 pub use token_governor::*;
 pub use vector_memory::*;
 
+use crate::native_tools::visual_snapshot::{
+    visual_snapshot_tool_spec, VisualSnapshotBackend, VisualSnapshotHost, VISUAL_SNAPSHOT_TOOL,
+};
 use davinci_agent::{ToolError, ToolResult};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::Arc;
 
 pub const NATIVE_TOOLS: &[&str] = &[
     "memory_search",
@@ -181,6 +185,7 @@ pub struct NativeExtensionHost {
     pub graph: GraphController,
     pub security: SecurityScanController,
     pub learning: LearningController,
+    pub visual_snapshot: VisualSnapshotHost,
     /// Set by the native visual backend registration path when one exists.
     pub visual_verification_available: bool,
 }
@@ -210,18 +215,36 @@ impl NativeExtensionHost {
         graph.memory = Some(memory.clone());
         graph.learning = Some(learning.clone());
         graph.governor = Some(governor.clone());
+        let visual_snapshot = VisualSnapshotHost::discover(cwd);
         Self {
             governor,
             memory,
             graph,
             security: SecurityScanController::new(cwd.to_path_buf()),
             learning,
-            visual_verification_available: false,
+            visual_verification_available: visual_snapshot.is_available(),
+            visual_snapshot,
         }
     }
 
     pub fn visual_verification_available(&self) -> bool {
-        self.visual_verification_available
+        self.visual_verification_available && self.visual_snapshot.is_available()
+    }
+
+    #[allow(dead_code)]
+    pub fn register_visual_snapshot_backend(
+        &mut self,
+        backend: Arc<dyn VisualSnapshotBackend>,
+        cwd: &Path,
+    ) {
+        self.visual_snapshot = VisualSnapshotHost::from_backend(backend, cwd);
+        self.visual_verification_available = self.visual_snapshot.is_available();
+    }
+
+    pub fn has_tool(&self, name: &str) -> bool {
+        NATIVE_TOOLS.contains(&name)
+            || name == VISUAL_SNAPSHOT_TOOL && self.visual_verification_available()
+            || name == GRAPH_SUBMIT_TOOL && graph_worker_context().is_some()
     }
 
     pub fn tool_names(&self) -> Vec<String> {
@@ -229,6 +252,9 @@ impl NativeExtensionHost {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
+        if self.visual_verification_available() {
+            names.push(VISUAL_SNAPSHOT_TOOL.to_string());
+        }
         if graph_worker_context().is_some() {
             names.push(GRAPH_SUBMIT_TOOL.to_string());
         }
@@ -375,6 +401,7 @@ impl NativeExtensionHost {
         args: &Value,
     ) -> Result<ToolResult, ToolError> {
         match name {
+            VISUAL_SNAPSHOT_TOOL => self.visual_snapshot.execute_tool(_cwd, args),
             "memory_search" => self.memory.search_tool(args),
             "retrieve_output" => self.governor.retrieve(args),
             "skill_list" => {
@@ -488,6 +515,7 @@ impl NativeExtensionHost {
                     "required": ["action", "name"]
                 }),
             ),
+            VISUAL_SNAPSHOT_TOOL => return Some(visual_snapshot_tool_spec()),
             name if name.starts_with("sec_") => security_scan::tool_spec(name),
             // Only a graph worker child sees this tool; it is the worker's one
             // exit door and its schema names the artifact that node owes.
@@ -519,12 +547,46 @@ impl NativeExtensionHost {
             .filter_map(Self::describe_tool)
             .collect()
     }
+
+    pub fn available_tool_specs(&self) -> Vec<davinci_ai::ToolSpec> {
+        let mut specs = Self::tool_specs();
+        if self.visual_verification_available() {
+            specs.push(visual_snapshot_tool_spec());
+        }
+        specs
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeVisualBackend {
+        image_path: std::path::PathBuf,
+    }
+
+    impl VisualSnapshotBackend for FakeVisualBackend {
+        fn name(&self) -> &str {
+            "fake_visual_backend"
+        }
+
+        fn available(&self, _cwd: &Path) -> bool {
+            true
+        }
+
+        fn capture(
+            &self,
+            _cwd: &Path,
+            request: &crate::native_tools::VisualSnapshotRequest,
+        ) -> Result<crate::native_tools::VisualSnapshotResult, String> {
+            Ok(crate::native_tools::VisualSnapshotResult {
+                image_path: self.image_path.clone(),
+                width: request.viewport_width,
+                height: request.viewport_height,
+            })
+        }
+    }
 
     /// PI_GRAPH_* is process-global, so the tests that toggle it run one at a time.
     static GRAPH_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -582,6 +644,31 @@ mod tests {
             .find(|spec| spec.name == GRAPH_SUBMIT_TOOL)
             .expect("graph_submit is offered to a worker");
         assert!(spec.description.contains("final review artifact"));
+    }
+
+    #[test]
+    fn registered_visual_backend_is_advertised_by_the_native_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("snapshot.png");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+        let mut host = NativeExtensionHost::default();
+
+        assert!(!host.has_tool(VISUAL_SNAPSHOT_TOOL));
+        host.register_visual_snapshot_backend(
+            Arc::new(FakeVisualBackend { image_path }),
+            dir.path(),
+        );
+
+        assert!(host.visual_verification_available());
+        assert!(host.has_tool(VISUAL_SNAPSHOT_TOOL));
+        assert!(host
+            .tool_names()
+            .iter()
+            .any(|name| name == VISUAL_SNAPSHOT_TOOL));
+        assert!(host
+            .available_tool_specs()
+            .iter()
+            .any(|spec| spec.name == VISUAL_SNAPSHOT_TOOL));
     }
 
     #[test]
