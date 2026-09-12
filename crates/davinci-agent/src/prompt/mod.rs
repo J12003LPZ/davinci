@@ -1,5 +1,6 @@
 //! Versioned prompt engineering subsystem.
 
+pub mod astra;
 pub mod bundle;
 pub mod capabilities;
 pub mod coding;

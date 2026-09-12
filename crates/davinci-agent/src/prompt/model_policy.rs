@@ -39,11 +39,14 @@ pub fn prompt_model_policy(provider: &str, model_id: &str) -> PromptModelPolicy 
 }
 
 pub fn apply_model_policy(
-    _policy: PromptModelPolicy,
-    _profile: crate::prompt::PromptProfile,
+    policy: PromptModelPolicy,
+    profile: crate::prompt::PromptProfile,
     modules: Vec<crate::prompt::PromptModule>,
 ) -> Vec<crate::prompt::PromptModule> {
-    modules
+    match policy {
+        PromptModelPolicy::Default => modules,
+        PromptModelPolicy::Gpt6Astra => crate::prompt::astra::apply_astra_policy(profile, modules),
+    }
 }
 
 #[cfg(test)]
