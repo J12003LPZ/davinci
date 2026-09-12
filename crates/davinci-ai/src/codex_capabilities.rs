@@ -196,6 +196,23 @@ mod tests {
     }
 
     #[test]
+    fn resolves_oauth_codex_profile_for_gpt6_astra() {
+        let models = crate::load_builtin_models();
+        let astra = models
+            .iter()
+            .find(|model| model.provider == "openai-codex" && model.id == "gpt-6-astra")
+            .expect("gpt-6-astra");
+
+        let caps = CodexCapabilities::resolve(astra, Some("https://chatgpt.com/backend-api"), true);
+
+        assert!(caps.responses_items);
+        assert!(caps.websocket_transport);
+        assert!(caps.incremental_continuation);
+        assert!(caps.encrypted_reasoning);
+        assert!(caps.assistant_phases);
+        assert!(caps.custom_grammar_tools);
+    }
+    #[test]
     fn resolves_public_responses_profile() {
         let model = test_model("openai-responses");
         let caps = CodexCapabilities::resolve(&model, Some("https://api.openai.com/v1"), false);

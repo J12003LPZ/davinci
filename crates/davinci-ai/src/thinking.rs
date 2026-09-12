@@ -249,6 +249,43 @@ mod tests {
     }
 
     #[test]
+    fn catalog_gpt6_astra_matches_supported_reasoning_and_limits() {
+        let models = crate::load_builtin_models();
+        let astra = models
+            .iter()
+            .find(|model| model.provider == "openai-codex" && model.id == "gpt-6-astra")
+            .expect("openai-codex/gpt-6-astra must be in the built-in catalog");
+
+        assert_eq!(astra.api, "openai-codex-responses");
+        assert_eq!(
+            astra.base_url.as_deref(),
+            Some("https://chatgpt.com/backend-api")
+        );
+        assert_eq!(astra.context_window, 1_050_000);
+        assert_eq!(astra.max_tokens, 128_000);
+        assert_eq!(astra.cost.input, 10.0);
+        assert_eq!(astra.cost.cache_read, 1.0);
+        assert_eq!(astra.cost.cache_write, 12.5);
+        assert_eq!(astra.cost.output, 50.0);
+
+        assert_eq!(astra.thinking_level_map.get("off"), Some(&None));
+        assert_eq!(
+            astra.thinking_level_map.get("minimal"),
+            Some(&Some("low".to_string()))
+        );
+        assert_eq!(
+            get_supported_thinking_levels(astra),
+            vec![
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::Xhigh,
+                ThinkingLevel::Max,
+            ]
+        );
+    }
+    #[test]
     fn catalog_fable_5_thinking_map_matches_ts() {
         let models = crate::load_builtin_models();
         let fable = models
