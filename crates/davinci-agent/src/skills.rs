@@ -269,4 +269,20 @@ mod tests {
         assert_eq!(res.skills, vec!["debug-sqlx".to_string()]);
         assert!(res.text.contains("Fix sqlx."));
     }
+
+    #[test]
+    fn ordinary_prompt_never_injects_unselected_skill_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("migration");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: migration\ndescription: Create and validate schema migrations.\n---\nSECRET_SKILL_BODY_SENTINEL\n",
+        )
+        .unwrap();
+        let skills = discover_skills(&[skill_dir]);
+        let expanded = expand_user_text("Fix the parser", &skills, &[]);
+        assert_eq!(expanded, "Fix the parser");
+        assert!(!expanded.contains("SECRET_SKILL_BODY_SENTINEL"));
+    }
 }

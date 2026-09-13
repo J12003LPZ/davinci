@@ -3150,4 +3150,30 @@ mod tests {
         };
         assert_eq!(resolve_json_schema_strict_sampling(&off), None);
     }
+
+    #[test]
+    fn gpt6_astra_codex_request_uses_responses_instructions_without_sampling_fields() {
+        let model = crate::load_builtin_models()
+            .into_iter()
+            .find(|model| model.provider == "openai-codex" && model.id == "gpt-6-astra")
+            .expect("gpt-6-astra");
+        let messages = vec![ChatMessage::text("user", "Fix the parser.")];
+        let body = request_body_with(
+            &model,
+            &messages,
+            Some("ASTRA_SYSTEM_SENTINEL"),
+            &[],
+            &StreamOptions {
+                thinking_level: Some(ThinkingLevel::Low),
+                ..StreamOptions::default()
+            },
+        );
+        assert_eq!(body["model"], "gpt-6-astra");
+        assert_eq!(body["instructions"], "ASTRA_SYSTEM_SENTINEL");
+        assert_eq!(body["store"], false);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("top_logprobs").is_none());
+        assert_ne!(body["reasoning"]["effort"], "none");
+    }
 }

@@ -838,4 +838,32 @@ mod tests {
             .iter()
             .any(|m| m.id == "capability.frontend-design"));
     }
+
+    #[test]
+    fn custom_system_prompt_bypasses_astra_model_policy() {
+        let dir = tempdir().unwrap();
+        let result = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            provider: Some("openai-codex".into()),
+            model: Some("gpt-6-astra".into()),
+            system_prompt: Some("CUSTOM_ONLY_SENTINEL".into()),
+            ..CreateAgentSessionOptions::default()
+        })
+        .expect("session");
+        assert_eq!(result.session.agent.system_prompt, "CUSTOM_ONLY_SENTINEL");
+        assert!(result.session.agent.prompt_session.is_custom());
+        assert_eq!(
+            result
+                .session
+                .agent
+                .prompt_manifest
+                .as_ref()
+                .unwrap()
+                .model_policy,
+            "default"
+        );
+        assert!(!result.session.agent.system_prompt.contains("model.astra"));
+    }
 }
