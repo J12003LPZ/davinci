@@ -60,7 +60,9 @@ pub fn now_ms() -> u64 {
 pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
     let mut merged = baseline.to_vec();
     for model in dynamic {
-        if let Some(index) = merged.iter().position(|entry| entry.id == model.id) {
+        if let Some(index) = merged.iter().position(|entry| {
+            entry.provider == model.provider && entry.id == model.id
+        }) {
             merged[index] = model.clone();
         } else {
             merged.push(model.clone());
@@ -107,6 +109,27 @@ pub fn catalog_url(base: &str, provider_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_models_keeps_same_id_from_different_providers() {
+        let codex = crate::catalog::load_builtin_models()
+            .into_iter()
+            .find(|model| model.provider == "openai-codex" && model.id == "gpt-6-astra")
+            .expect("built-in Codex Astra");
+        let mut openai = codex.clone();
+        openai.provider = "openai".into();
+        openai.api = "openai-responses".into();
+
+        let merged = merge_models(&[codex], &[openai]);
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged
+            .iter()
+            .any(|model| model.provider == "openai-codex" && model.id == "gpt-6-astra"));
+        assert!(merged
+            .iter()
+            .any(|model| model.provider == "openai" && model.id == "gpt-6-astra"));
+    }
 
     #[test]
     fn parse_and_merge_remote_catalog() {
