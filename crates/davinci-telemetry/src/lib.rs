@@ -219,6 +219,10 @@ mod tests {
     }
 }
 
+fn default_model_policy_id() -> String {
+    "default".to_string()
+}
+
 /// Local-first behavioral telemetry summarizing run execution metrics
 /// without exposing private source code, conversation content, or secrets.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -227,6 +231,10 @@ pub struct BehaviorTelemetry {
     pub prompt_version: u32,
     pub prompt_stable_hash_prefix: String,
     pub model_family: String,
+    #[serde(default = "default_model_policy_id")]
+    pub model_policy: String,
+    #[serde(default)]
+    pub model_policy_version: u32,
     pub model_turns: u64,
     pub tool_calls: u64,
     pub permission_prompts: u64,
@@ -365,6 +373,8 @@ mod behavior_telemetry_tests {
             prompt_version: 2,
             prompt_stable_hash_prefix: "a1b2c3d4".to_string(),
             model_family: "claude".to_string(),
+            model_policy: "default".to_string(),
+            model_policy_version: 0,
             model_turns: 6,
             tool_calls: 12,
             permission_prompts: 1,
@@ -432,6 +442,8 @@ mod behavior_telemetry_tests {
             prompt_version: 2,
             prompt_stable_hash_prefix: "b5c6d7e8".to_string(),
             model_family: "claude".to_string(),
+            model_policy: "default".to_string(),
+            model_policy_version: 0,
             model_turns: 4,
             tool_calls: 5,
             permission_prompts: 0,
@@ -468,6 +480,8 @@ mod behavior_telemetry_tests {
                 prompt_version: 2,
                 prompt_stable_hash_prefix: "a1b2c3d4".to_string(),
                 model_family: "claude".to_string(),
+                model_policy: "default".to_string(),
+                model_policy_version: 0,
                 model_turns: if i % 2 == 0 { 5 } else { 7 }, // median 6
                 tool_calls: 10,
                 permission_prompts: if i < 38 { 1 } else { 0 }, // 38 / 42 ~ 0.9
@@ -493,5 +507,13 @@ mod behavior_telemetry_tests {
             formatted,
             "Prompt profile: stable v2\nRuns: 42\nMedian turns: 6\nVerification failures recovered: 8\nPermission prompts/run: 0.9\nUser steers/run: 0.4"
         );
+    }
+
+    #[test]
+    fn old_behavior_telemetry_defaults_model_policy_identity() {
+        let json = r#"{"prompt_profile":"stable","prompt_version":2,"prompt_stable_hash_prefix":"a1b2c3d4","model_family":"openai","model_turns":1,"tool_calls":0,"permission_prompts":0,"permission_denials":0,"files_changed_count":0,"verification_commands_run":0,"verification_failures":0,"aborted":false,"user_steers":0}"#;
+        let decoded: BehaviorTelemetry = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.model_policy, "default");
+        assert_eq!(decoded.model_policy_version, 0);
     }
 }

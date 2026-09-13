@@ -2109,12 +2109,19 @@ impl Agent {
         let family = crate::prompt::provider::prompt_model_family(&self.provider, &self.model_id)
             .name()
             .to_string();
+        let (model_policy, model_policy_version) = self
+            .prompt_manifest
+            .as_ref()
+            .map(|manifest| (manifest.model_policy.clone(), manifest.model_policy_version))
+            .unwrap_or_else(|| ("default".to_string(), 0));
 
         davinci_telemetry::record_behavior_telemetry(davinci_telemetry::BehaviorTelemetry {
             prompt_profile: profile,
             prompt_version: version,
             prompt_stable_hash_prefix: hash_prefix,
             model_family: family,
+            model_policy,
+            model_policy_version,
             model_turns: final_stats.model_turns,
             tool_calls: final_stats.tool_calls,
             permission_prompts: final_stats.permission_prompts,

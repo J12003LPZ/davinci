@@ -6608,8 +6608,16 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         } else {
             String::new()
         };
+        let model_policy_suffix = if manifest.model_policy == "default" {
+            String::new()
+        } else {
+            format!(
+                " · {} v{}",
+                manifest.model_policy, manifest.model_policy_version
+            )
+        };
         text.push_str(&format!(
-            " · prompt: {} v{}{candidate_suffix} · {hash_prefix}",
+            " · prompt: {} v{}{candidate_suffix}{model_policy_suffix} · {hash_prefix}",
             manifest.profile, manifest.profile_version
         ));
         if let Some(diag) = &agent.prompt_session.transition_diagnostic {
@@ -11582,6 +11590,8 @@ mod tests {
                 prompt_version: 2,
                 prompt_stable_hash_prefix: "a1b2c3d4".to_string(),
                 model_family: "claude".to_string(),
+                model_policy: "default".to_string(),
+                model_policy_version: 0,
                 model_turns: 6,
                 tool_calls: 10,
                 permission_prompts: 1,
@@ -12498,6 +12508,18 @@ mod tests {
             error,
             "Invalid prompt profile 'experimental'. Valid profiles: stable, preview, legacy-v1"
         );
+    }
+
+    #[test]
+    fn status_includes_astra_model_policy_identity() {
+        let mut agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+        let manifest = agent.prompt_manifest.as_mut().expect("manifest");
+        manifest.model_policy = "gpt6-astra".to_string();
+        manifest.model_policy_version = 1;
+
+        let status = format_session_status(&Args::default(), &agent);
+        assert!(status.contains("prompt: stable v2 · gpt6-astra v1 ·"));
+        assert!(!status.contains(&agent.system_prompt));
     }
 
     #[test]

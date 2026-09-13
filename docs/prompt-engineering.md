@@ -17,6 +17,12 @@ DaVinci treats agent prompt text as an executable software subsystem rather than
   - **Runtime code owns authority**: Plan mode mutations, filesystem sandbox bounds, permission rules, and tool execution barriers are enforced strictly by Rust runtime code.
   - **Prompt code owns judgment**: Exploration depth, precise diff scoping, avoiding unprompted refactoring, and verifying changes before claiming completion are guided by prompt instructions.
 
+### Prompt Identity
+
+Prompt profile answers "which release channel/version is this?" Model policy answers "which model-specific behavior adapter transformed that profile?" These are independent dimensions. The stable hash is the authoritative cache/session identity after both are applied.
+
+For example, GPT-6 Astra can report `stable v2 · gpt6-astra v1` while remaining on the normal stable release channel. The default policy is omitted from compact `/status` output.
+
 ---
 
 ## 2. Failure-Mode Mining & Intake Pipeline
@@ -107,6 +113,8 @@ Only aggregate counters and version identifiers are recorded:
 - `prompt_version`: e.g. `2`
 - `prompt_stable_hash_prefix`: e.g. `"a1b2c3d4"`
 - `model_family`: e.g. `"anthropic"`, `"gemini"`, `"openai-reasoning"`
+- `model_policy`: e.g. `"default"` or `"gpt6-astra"`
+- `model_policy_version`: model-policy schema/version identifier
 - `model_turns`: count of model completions
 - `tool_calls`: total tool calls
 - `permission_prompts`: approvals requested
