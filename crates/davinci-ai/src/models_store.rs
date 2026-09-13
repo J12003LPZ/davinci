@@ -60,9 +60,10 @@ pub fn now_ms() -> u64 {
 pub fn merge_models(baseline: &[Model], dynamic: &[Model]) -> Vec<Model> {
     let mut merged = baseline.to_vec();
     for model in dynamic {
-        if let Some(index) = merged.iter().position(|entry| {
-            entry.provider == model.provider && entry.id == model.id
-        }) {
+        if let Some(index) = merged
+            .iter()
+            .position(|entry| entry.provider == model.provider && entry.id == model.id)
+        {
             merged[index] = model.clone();
         } else {
             merged.push(model.clone());

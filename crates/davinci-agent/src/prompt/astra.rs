@@ -141,7 +141,9 @@ mod tests {
         assert!(exploration
             .body
             .contains("relevant to the requested change"));
-        assert!(exploration.body.contains("Before editing a file, read its relevant contents"));
+        assert!(exploration
+            .body
+            .contains("Before editing a file, read its relevant contents"));
         assert!(exploration
             .body
             .contains("Do not require a full repository map"));

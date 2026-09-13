@@ -224,10 +224,12 @@ fn load_behavior_suite(name: &str) -> Result<Vec<BehaviorScenario>, String> {
     match name {
         "core-200" => davinci_evals::behavior::load_core_200_corpus(),
         "debugging-hard" => davinci_evals::behavior::load_debugging_hard_corpus(),
-        "gpt6-astra" => Ok(davinci_evals::behavior::load_regression_suite("gpt6-astra")?
-            .into_iter()
-            .map(|case| case.scenario)
-            .collect()),
+        "gpt6-astra" => Ok(
+            davinci_evals::behavior::load_regression_suite("gpt6-astra")?
+                .into_iter()
+                .map(|case| case.scenario)
+                .collect(),
+        ),
         _ => Err(format!(
             "unknown behavior suite '{name}'; valid suites: core-200, debugging-hard, gpt6-astra"
         )),
