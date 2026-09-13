@@ -488,5 +488,8 @@ mod tests {
         assert!(cases
             .iter()
             .all(|case| case.owner == RegressionOwner::ModelFamily));
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/repos/astra-policy-rust/Cargo.lock");
+        assert!(fixture.is_file(), "Astra fixture must pre-seed Cargo.lock");
     }
 }
