@@ -469,7 +469,9 @@ mod tests {
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].owner, RegressionOwner::CapabilityRouter);
         assert!(load_regression_suite("../core-200").is_err());
-        assert_eq!(load_regression_corpus().unwrap().len(), cases.len());
+        let corpus = load_regression_corpus().unwrap();
+        assert!(corpus.len() >= cases.len());
+        assert!(corpus.iter().any(|case| case.id == cases[0].id));
     }
 
     #[test]
@@ -477,5 +479,14 @@ mod tests {
         let scenarios = load_long_horizon_corpus().expect("long-horizon corpus must load");
         assert_eq!(scenarios.len(), 30);
         assert!(scenarios.iter().all(|scenario| scenario.turns.len() >= 5));
+    }
+
+    #[test]
+    fn gpt6_astra_regression_suite_is_valid() {
+        let cases = load_regression_suite("gpt6-astra").expect("gpt6-astra suite");
+        assert_eq!(cases.len(), 4);
+        assert!(cases
+            .iter()
+            .all(|case| case.owner == RegressionOwner::ModelFamily));
     }
 }
