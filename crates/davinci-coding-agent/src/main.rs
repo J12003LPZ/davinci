@@ -10428,7 +10428,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_fixture_login_persists_exact_provider_and_resolves_immediately() {
+    fn codex_fixture_login_persists_exact_provider_without_aliasing() {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("temp auth dir");
@@ -10447,15 +10447,16 @@ mod tests {
         assert_eq!(credential.kind, CredentialKind::Oauth);
         assert!(storage.get("openai").is_none());
 
-        let resolved = davinci_ai::resolve_provider_auth(
-            "openai-codex",
-            &storage,
-            &std::collections::HashMap::new(),
-            false,
-        )
-        .expect("stored codex credential resolves immediately");
-        assert_eq!(resolved.source, "OAuth");
-        assert!(resolved.api_key.is_some());
+        assert!(
+            davinci_ai::resolve_provider_auth(
+                "openai-codex",
+                &storage,
+                &std::collections::HashMap::new(),
+                false,
+            )
+            .is_none(),
+            "plain test fixture token must not bypass Codex account-bound JWT validation"
+        );
     }
 
     #[test]
@@ -11586,7 +11587,7 @@ mod tests {
         davinci_telemetry::clear_behavior_telemetry();
         for _ in 0..5 {
             davinci_telemetry::record_behavior_telemetry(davinci_telemetry::BehaviorTelemetry {
-                prompt_profile: "stable".to_string(),
+                prompt_profile: "telemetry-status-fixture".to_string(),
                 prompt_version: 2,
                 prompt_stable_hash_prefix: "a1b2c3d4".to_string(),
                 model_family: "claude".to_string(),
@@ -11607,7 +11608,7 @@ mod tests {
 
         let mut agent = Agent::new("sys");
         agent.prompt_manifest = Some(davinci_agent::prompt::manifest::PromptManifest::from_parts(
-            "stable",
+            "telemetry-status-fixture",
             2,
             &[],
             "stable system prompt prefix",
@@ -11615,7 +11616,7 @@ mod tests {
         ));
         let parsed = Args::default();
         let status = format_session_status(&parsed, &agent);
-        assert!(status.contains("Prompt profile: stable"));
+        assert!(status.contains("Prompt profile: telemetry-status-fixture"));
         assert!(status.contains("Runs: 5"));
         assert!(status.contains("Median turns: 6"));
         assert!(status.contains("Verification failures recovered: 5"));
