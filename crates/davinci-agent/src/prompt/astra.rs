@@ -23,8 +23,8 @@ pub fn astra_exploration_module() -> PromptModule {
     stable_module(
         "model.astra.exploration",
         1,
-        "Inspect only code, tests, and repository guidance relevant to the requested change; search definitions \
-and call sites when needed. Do not require a full repository map, unrelated docs or ritual pre-reading.",
+        "Before editing a file, read its relevant contents. Inspect only material relevant to the requested change; \
+search definitions/call sites when needed. Do not require a full repository map or unrelated docs.",
     )
 }
 
@@ -141,6 +141,7 @@ mod tests {
         assert!(exploration
             .body
             .contains("relevant to the requested change"));
+        assert!(exploration.body.contains("Before editing a file, read its relevant contents"));
         assert!(exploration
             .body
             .contains("Do not require a full repository map"));
