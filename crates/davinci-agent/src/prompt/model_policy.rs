@@ -25,7 +25,7 @@ impl PromptModelPolicy {
     }
 }
 
-pub fn prompt_model_policy(provider: &str, model_id: &str) -> PromptModelPolicy {
+pub fn inferred_prompt_model_policy(provider: &str, model_id: &str) -> PromptModelPolicy {
     let provider = provider.to_ascii_lowercase();
     let model = model_id.to_ascii_lowercase();
 
@@ -36,6 +36,28 @@ pub fn prompt_model_policy(provider: &str, model_id: &str) -> PromptModelPolicy 
     } else {
         PromptModelPolicy::Default
     }
+}
+
+pub(crate) fn prompt_model_policy_with_eval_override(
+    provider: &str,
+    model_id: &str,
+    eval_mode: bool,
+    override_id: Option<&str>,
+) -> PromptModelPolicy {
+    if eval_mode {
+        match override_id.map(str::trim) {
+            Some("default") => return PromptModelPolicy::Default,
+            Some("gpt6-astra") => return PromptModelPolicy::Gpt6Astra,
+            _ => {}
+        }
+    }
+    inferred_prompt_model_policy(provider, model_id)
+}
+
+pub fn prompt_model_policy(provider: &str, model_id: &str) -> PromptModelPolicy {
+    let eval_mode = std::env::var("DAVINCI_BEHAVIOR_EVAL").as_deref() == Ok("1");
+    let override_id = std::env::var("DAVINCI_EVAL_PROMPT_MODEL_POLICY").ok();
+    prompt_model_policy_with_eval_override(provider, model_id, eval_mode, override_id.as_deref())
 }
 
 pub fn apply_model_policy(
@@ -61,6 +83,28 @@ mod tests {
         );
         assert_eq!(
             prompt_model_policy("openai-codex", "gpt-6-astra-2026-09-10"),
+            PromptModelPolicy::Gpt6Astra
+        );
+    }
+
+    #[test]
+    fn eval_override_is_guarded_and_can_force_default_for_astra() {
+        assert_eq!(
+            prompt_model_policy_with_eval_override(
+                "openai-codex",
+                "gpt-6-astra",
+                true,
+                Some("default"),
+            ),
+            PromptModelPolicy::Default
+        );
+        assert_eq!(
+            prompt_model_policy_with_eval_override(
+                "openai-codex",
+                "gpt-6-astra",
+                false,
+                Some("default"),
+            ),
             PromptModelPolicy::Gpt6Astra
         );
     }

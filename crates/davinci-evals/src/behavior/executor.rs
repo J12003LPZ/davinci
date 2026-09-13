@@ -534,6 +534,7 @@ mod tests {
             provider: "fixture".into(),
             model: "fixture-model".into(),
             prompt_profile: PromptProfile::Stable,
+            prompt_model_policy_override: None,
             permission_mode: "read-only".into(),
             timeout: Duration::from_secs(5),
             clean_agent_dir: std::env::temp_dir().join("unused-agent-dir"),

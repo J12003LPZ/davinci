@@ -1,6 +1,6 @@
 //! Process isolation for real DaVinci JSON-mode evaluation turns.
 
-use davinci_agent::PromptProfile;
+use davinci_agent::{prompt::PromptModelPolicy, PromptProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,6 +19,7 @@ pub struct DavinciProcessConfig {
     pub provider: String,
     pub model: String,
     pub prompt_profile: PromptProfile,
+    pub prompt_model_policy_override: Option<PromptModelPolicy>,
     pub permission_mode: String,
     pub timeout: Duration,
     pub clean_agent_dir: PathBuf,
@@ -136,6 +137,11 @@ pub fn run_davinci_process(
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(policy) = config.prompt_model_policy_override {
+        command
+            .env("DAVINCI_BEHAVIOR_EVAL", "1")
+            .env("DAVINCI_EVAL_PROMPT_MODEL_POLICY", policy.id());
+    }
     for (name, value) in &config.allowed_env {
         command.env(name, value);
     }
@@ -241,6 +247,7 @@ mod tests {
             provider: "fixture".into(),
             model: "fixture-model".into(),
             prompt_profile: PromptProfile::Stable,
+            prompt_model_policy_override: None,
             permission_mode: "read-only".into(),
             timeout: Duration::from_secs(5),
             clean_agent_dir: dir.path().join("agent"),
@@ -253,6 +260,39 @@ mod tests {
         assert_eq!(run.stdout_lines.len(), 1);
         assert!(run.stderr.contains("visible"));
         assert!(dir.path().join("agent").is_dir());
+    }
+
+    #[test]
+    fn model_policy_override_is_forwarded_only_as_guarded_eval_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake_davinci.py");
+        fs::write(
+            &script,
+            r#"import os
+import sys
+print('{"type":"agent_end"}')
+print(os.environ.get('DAVINCI_BEHAVIOR_EVAL', 'missing'), file=sys.stderr)
+print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.stderr)
+"#,
+        )
+        .unwrap();
+        let config = DavinciProcessConfig {
+            binary: "python".into(),
+            launcher_args: vec![script.to_string_lossy().into_owned()],
+            provider: "openai-codex".into(),
+            model: "gpt-6-astra".into(),
+            prompt_profile: PromptProfile::Stable,
+            prompt_model_policy_override: Some(PromptModelPolicy::Default),
+            permission_mode: "read-only".into(),
+            timeout: Duration::from_secs(5),
+            clean_agent_dir: dir.path().join("agent"),
+            auth_source: None,
+            allowed_env: BTreeMap::new(),
+        };
+        let run = run_davinci_process(&config, "hello").unwrap();
+        assert_eq!(run.exit_code, 0);
+        assert!(run.stderr.contains("1"));
+        assert!(run.stderr.contains("default"));
     }
 
     #[test]
@@ -276,6 +316,7 @@ mod tests {
             provider: "selected".into(),
             model: "fixture-model".into(),
             prompt_profile: PromptProfile::Stable,
+            prompt_model_policy_override: None,
             permission_mode: "read-only".into(),
             timeout: Duration::from_secs(5),
             clean_agent_dir: clean_agent_dir.clone(),
@@ -321,6 +362,7 @@ mod tests {
             provider: "fixture".into(),
             model: "fixture-model".into(),
             prompt_profile: PromptProfile::Stable,
+            prompt_model_policy_override: None,
             permission_mode: "read-only".into(),
             timeout: Duration::from_millis(100),
             clean_agent_dir: dir.path().join("agent"),

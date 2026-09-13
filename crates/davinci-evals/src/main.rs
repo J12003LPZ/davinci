@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use davinci_agent::{Agent, PromptProfile};
+use davinci_agent::{prompt::PromptModelPolicy, Agent, PromptProfile};
 use davinci_evals::behavior::{
     aggregate_scenario_results, bootstrap_pass_delta_ci95, compare_repeated_runs, execute_scenario,
     pair_by_scenario_repetition, ArtifactRoot, BehaviorCategory, BehaviorRequirement,
@@ -98,6 +98,10 @@ pub struct BehaviorAbArgs {
     pub baseline_profile: String,
     #[arg(long, default_value = "preview")]
     pub candidate_profile: String,
+    #[arg(long)]
+    pub baseline_model_policy: Option<String>,
+    #[arg(long)]
+    pub candidate_model_policy: Option<String>,
     #[arg(long)]
     pub provider: String,
     #[arg(long)]
@@ -232,6 +236,44 @@ fn parse_profile(name: &str) -> Result<PromptProfile, String> {
     })
 }
 
+fn parse_model_policy(name: Option<&str>) -> Result<Option<PromptModelPolicy>, String> {
+    match name.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some("default") => Ok(Some(PromptModelPolicy::Default)),
+        Some("gpt6-astra") => Ok(Some(PromptModelPolicy::Gpt6Astra)),
+        Some(other) => Err(format!(
+            "invalid model policy '{other}'; valid policies: default, gpt6-astra"
+        )),
+    }
+}
+
+fn stable_hash_for_ab_variant(
+    profile: PromptProfile,
+    provider: &str,
+    model: &str,
+    policy_override: Option<PromptModelPolicy>,
+) -> String {
+    let policy = policy_override.unwrap_or_else(|| {
+        davinci_agent::prompt::model_policy::inferred_prompt_model_policy(provider, model)
+    });
+    let mut modules =
+        davinci_agent::prompt::apply_model_policy(policy, profile, profile.bundle().modules);
+    let family = davinci_agent::prompt::prompt_model_family(provider, model);
+    if let Some(adapter) = davinci_agent::prompt::provider_adapter(family) {
+        modules.push(adapter);
+    }
+    davinci_agent::prompt::compose_modules(&modules)
+        .manifest
+        .stable_sha256
+}
+
+fn ab_variant_label(profile: PromptProfile, policy: Option<PromptModelPolicy>) -> String {
+    match policy {
+        Some(policy) => format!("{} · {} v{}", profile.id(), policy.id(), policy.version()),
+        None => profile.id().to_string(),
+    }
+}
+
 fn first_nonempty_value(requested: Option<&str>, environment_names: &[&str]) -> Option<String> {
     requested
         .map(str::trim)
@@ -252,6 +294,7 @@ fn resolve_runtime_config(
     model: Option<&str>,
     binary: Option<&Path>,
     profile: PromptProfile,
+    model_policy_override: Option<PromptModelPolicy>,
     permission_mode: &str,
     artifact_root: &Path,
 ) -> Result<DavinciProcessConfig, String> {
@@ -303,6 +346,7 @@ fn resolve_runtime_config(
         provider,
         model,
         prompt_profile: profile,
+        prompt_model_policy_override: model_policy_override,
         permission_mode: permission_mode.to_string(),
         timeout: Duration::from_secs(300),
         clean_agent_dir: artifact_root.join("agent"),
@@ -513,6 +557,7 @@ fn run_behavior_once(args: BehaviorRunArgs) -> Result<String, String> {
         args.model.as_deref(),
         args.davinci_bin.as_deref(),
         profile,
+        None,
         &args.permission_mode,
         &run_root,
     )?;
@@ -549,9 +594,37 @@ fn run_behavior_ab(args: BehaviorAbArgs) -> Result<String, String> {
     let scenarios = load_behavior_suite(&args.suite)?;
     let baseline_profile = parse_profile(&args.baseline_profile)?;
     let candidate_profile = parse_profile(&args.candidate_profile)?;
-    if baseline_profile == candidate_profile {
-        return Err("baseline and candidate profiles must differ".into());
+    let baseline_policy = parse_model_policy(args.baseline_model_policy.as_deref())?;
+    let candidate_policy = parse_model_policy(args.candidate_model_policy.as_deref())?;
+    if baseline_profile == candidate_profile
+        && (baseline_policy.is_none()
+            || candidate_policy.is_none()
+            || baseline_policy == candidate_policy)
+    {
+        return Err(
+            "same-profile A/B requires distinct explicit --baseline-model-policy and --candidate-model-policy values"
+                .into(),
+        );
     }
+
+    let baseline_hash = stable_hash_for_ab_variant(
+        baseline_profile,
+        &args.provider,
+        &args.model,
+        baseline_policy,
+    );
+    let candidate_hash = stable_hash_for_ab_variant(
+        candidate_profile,
+        &args.provider,
+        &args.model,
+        candidate_policy,
+    );
+    if baseline_hash == candidate_hash {
+        return Err("baseline and candidate stable prompt hashes must differ".into());
+    }
+
+    let baseline_label = ab_variant_label(baseline_profile, baseline_policy);
+    let candidate_label = ab_variant_label(candidate_profile, candidate_policy);
     let run_id = run_id();
     let run_root = args.artifacts.join(&run_id);
     let baseline_config = resolve_runtime_config(
@@ -559,6 +632,7 @@ fn run_behavior_ab(args: BehaviorAbArgs) -> Result<String, String> {
         Some(&args.model),
         Some(args.davinci_bin.as_path()),
         baseline_profile,
+        baseline_policy,
         &args.permission_mode,
         &run_root,
     )?;
@@ -567,6 +641,7 @@ fn run_behavior_ab(args: BehaviorAbArgs) -> Result<String, String> {
         Some(&args.model),
         Some(args.davinci_bin.as_path()),
         candidate_profile,
+        candidate_policy,
         &args.permission_mode,
         &run_root,
     )?;
@@ -616,8 +691,8 @@ fn run_behavior_ab(args: BehaviorAbArgs) -> Result<String, String> {
         suite_hash,
         provider: args.provider,
         model: args.model,
-        baseline_prompt_hash: baseline_profile.bundle().stable_sha256(),
-        candidate_prompt_hash: candidate_profile.bundle().stable_sha256(),
+        baseline_prompt_hash: baseline_hash,
+        candidate_prompt_hash: candidate_hash,
         permission_mode: args.permission_mode,
         tool_surface_hash: tool_surface_hash()?,
         repeats: args.repeats,
@@ -625,8 +700,8 @@ fn run_behavior_ab(args: BehaviorAbArgs) -> Result<String, String> {
     let markdown = ab_markdown(
         &run_id,
         &args.suite,
-        baseline_profile.id(),
-        candidate_profile.id(),
+        &baseline_label,
+        &candidate_label,
         &baseline,
         &candidate,
         repeated.as_ref(),
@@ -1321,6 +1396,54 @@ mod tests {
                 command: CompetitorCommand::Compare(_)
             }
         ));
+    }
+
+    #[test]
+    fn parses_same_profile_model_policy_ab_overrides() {
+        let cli = parse(&[
+            "davinci-evals",
+            "behavior",
+            "ab",
+            "--provider",
+            "openai-codex",
+            "--model",
+            "gpt-6-astra",
+            "--davinci-bin",
+            "davinci",
+            "--baseline-profile",
+            "stable",
+            "--candidate-profile",
+            "stable",
+            "--baseline-model-policy",
+            "default",
+            "--candidate-model-policy",
+            "gpt6-astra",
+        ]);
+        let TopLevelCommand::Behavior {
+            command: BehaviorCommand::Ab(args),
+        } = cli.command
+        else {
+            panic!("expected behavior ab");
+        };
+        assert_eq!(args.baseline_model_policy.as_deref(), Some("default"));
+        assert_eq!(args.candidate_model_policy.as_deref(), Some("gpt6-astra"));
+    }
+
+    #[test]
+    fn same_profile_model_policies_have_distinct_stable_hashes() {
+        let default_hash = stable_hash_for_ab_variant(
+            PromptProfile::Stable,
+            "openai-codex",
+            "gpt-6-astra",
+            Some(davinci_agent::prompt::PromptModelPolicy::Default),
+        );
+        let astra_hash = stable_hash_for_ab_variant(
+            PromptProfile::Stable,
+            "openai-codex",
+            "gpt-6-astra",
+            Some(davinci_agent::prompt::PromptModelPolicy::Gpt6Astra),
+        );
+        assert_ne!(default_hash, astra_hash);
     }
 
     #[test]
