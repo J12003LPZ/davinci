@@ -125,4 +125,29 @@ mod tests {
         let hash3 = compute_request_shape_hash(&params3);
         assert_ne!(hash1, hash3);
     }
+    #[test]
+    fn model_policy_instruction_change_invalidates_request_shape() {
+        let tools = vec![json!({"name": "read", "type": "function"})];
+        let generic = RequestShapeParams {
+            model_id: "gpt-6-astra",
+            reasoning_effort: Some("low"),
+            instructions: "GENERIC_STABLE_PROMPT",
+            tools: &tools,
+            permissions_summary: "ask",
+            cache_mode: "auto",
+            feature_flags: &[],
+            backend_family: "chatgpt_oauth",
+            compaction_lineage: None,
+        };
+        let astra = RequestShapeParams {
+            instructions: "ASTRA_STABLE_PROMPT",
+            ..generic
+        };
+
+        assert_ne!(
+            compute_request_shape_hash(&generic),
+            compute_request_shape_hash(&astra),
+            "stable instruction changes must invalidate provider request shape"
+        );
+    }
 }

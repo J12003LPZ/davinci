@@ -73,8 +73,12 @@ pub fn execute_multiturn_synthetic_scenario(
         "stale-prompt-hash",
         None,
     );
-    let (_, diagnostic) =
-        davinci_agent::prompt::resolve_resume_prompt_session(Some(&stale_record), Some(profile));
+    let current_manifest = agent
+        .prompt_manifest
+        .as_ref()
+        .ok_or_else(|| format!("missing final prompt manifest: {}", scenario.id))?;
+    let diagnostic =
+        davinci_agent::prompt::prompt_transition_diagnostic(&stale_record, current_manifest);
 
     Ok(MultiTurnSoakResult {
         scenario_id: scenario.id.clone(),

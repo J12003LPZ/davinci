@@ -16,6 +16,10 @@ pub enum PromptSource {
 pub struct PromptSessionRecord {
     pub profile: String,
     pub profile_version: u32,
+    #[serde(default = "crate::prompt::manifest::default_model_policy_id")]
+    pub model_policy: String,
+    #[serde(default)]
+    pub model_policy_version: u32,
     pub stable_sha256: String,
     pub candidate_id: Option<String>,
 }
@@ -30,6 +34,8 @@ impl PromptSessionRecord {
         Self {
             profile: profile.into(),
             profile_version,
+            model_policy: crate::prompt::manifest::default_model_policy_id(),
+            model_policy_version: 0,
             stable_sha256: stable_sha256.into(),
             candidate_id,
         }
@@ -40,6 +46,8 @@ impl PromptSessionRecord {
         Some(Self {
             profile: manifest.profile.clone(),
             profile_version: manifest.profile_version,
+            model_policy: manifest.model_policy.clone(),
+            model_policy_version: manifest.model_policy_version,
             stable_sha256: manifest.stable_sha256.clone(),
             candidate_id: state.candidate_id.clone(),
         })
@@ -147,71 +155,45 @@ pub fn resolve_resume_prompt_session(
     profile_override: Option<PromptProfile>,
 ) -> (PromptSessionState, Option<String>) {
     if let Some(profile) = profile_override {
-        let mut state = PromptSessionState::builtin(profile);
-        let mut diag = None;
-        if let Some(rec) = record {
-            let current_hash = profile.bundle().stable_sha256();
-            if rec.stable_sha256 != current_hash {
-                let msg = format!(
-                    "Prompt hash transition on resume: {} hash changed from {} to {}",
-                    profile.id(),
-                    rec.stable_sha256,
-                    current_hash
-                );
-                state.transition_diagnostic = Some(msg.clone());
-                diag = Some(msg);
-            }
-        }
-        return (state, diag);
+        return (PromptSessionState::builtin(profile), None);
     }
 
     let Some(rec) = record else {
         return (PromptSessionState::builtin(PromptProfile::Stable), None);
     };
 
-    if rec.profile == "legacy-v1" {
-        let mut state = PromptSessionState::builtin(PromptProfile::LegacyV1);
-        let current_hash = PromptProfile::LegacyV1.bundle().stable_sha256();
-        let mut diag = None;
-        if rec.stable_sha256 != current_hash {
-            let msg = format!(
-                "Prompt hash transition on resume: legacy-v1 hash changed from {} to {}",
-                rec.stable_sha256, current_hash
-            );
-            state.transition_diagnostic = Some(msg.clone());
-            diag = Some(msg);
-        }
-        return (state, diag);
-    }
-
-    if rec.profile == "preview" {
-        let mut state = PromptSessionState::builtin(PromptProfile::Preview);
+    let profile = match rec.profile.as_str() {
+        "legacy-v1" => PromptProfile::LegacyV1,
+        "preview" => PromptProfile::Preview,
+        _ => PromptProfile::Stable,
+    };
+    let mut state = PromptSessionState::builtin(profile);
+    if profile == PromptProfile::Preview {
         state.candidate_id = rec.candidate_id.clone();
-        let current_hash = PromptProfile::Preview.bundle().stable_sha256();
-        let mut diag = None;
-        if rec.stable_sha256 != current_hash {
-            let msg = format!(
-                "Prompt hash transition on resume: preview hash changed from {} to {}",
-                rec.stable_sha256, current_hash
-            );
-            state.transition_diagnostic = Some(msg.clone());
-            diag = Some(msg);
-        }
-        return (state, diag);
+    }
+    (state, None)
+}
+
+pub fn prompt_transition_diagnostic(
+    record: &PromptSessionRecord,
+    current: &PromptManifest,
+) -> Option<String> {
+    if record.stable_sha256 == current.stable_sha256
+        && record.model_policy == current.model_policy
+        && record.model_policy_version == current.model_policy_version
+    {
+        return None;
     }
 
-    let mut state = PromptSessionState::builtin(PromptProfile::Stable);
-    let current_hash = PromptProfile::Stable.bundle().stable_sha256();
-    let mut diag = None;
-    if rec.stable_sha256 != current_hash {
-        let msg = format!(
-            "Prompt hash transition on resume: stable hash changed from {} to {}",
-            rec.stable_sha256, current_hash
-        );
-        state.transition_diagnostic = Some(msg.clone());
-        diag = Some(msg);
-    }
-    (state, diag)
+    Some(format!(
+        "Prompt transition on resume: {} v{} / {} v{} changed stable identity from {} to {}",
+        record.profile,
+        record.profile_version,
+        record.model_policy,
+        record.model_policy_version,
+        record.stable_sha256,
+        current.stable_sha256,
+    ))
 }
 
 pub fn compose_session_prompt(
@@ -432,6 +414,29 @@ mod tests {
     }
 
     #[test]
+    fn same_astra_policy_resume_has_no_false_transition_diagnostic() {
+        let ctx = PromptContext {
+            provider: "openai-codex",
+            model_id: "gpt-6-astra",
+            permission_mode: PermissionMode::Ask,
+            plan_active: false,
+        };
+
+        let mut original = PromptSessionState::builtin(PromptProfile::Stable);
+        let composed = original.render_and_record(&ctx);
+        let record = PromptSessionRecord::from_session_state(&original).unwrap();
+
+        let mut resumed = PromptSessionState::builtin(PromptProfile::Stable);
+        let current = resumed.render_and_record(&ctx);
+
+        assert_eq!(record.stable_sha256, current.manifest.stable_sha256);
+        assert_eq!(
+            prompt_transition_diagnostic(&record, &current.manifest),
+            None
+        );
+        assert_eq!(composed.manifest.model_policy, "gpt6-astra");
+    }
+    #[test]
     fn resume_preserves_explicit_legacy_v1_pin() {
         let current_legacy_hash = PromptProfile::LegacyV1.bundle().stable_sha256();
         let record = PromptSessionRecord::new("legacy-v1", 1, &current_legacy_hash, None);
@@ -443,20 +448,19 @@ mod tests {
     }
 
     #[test]
-    fn resume_current_stable_policy_detects_hash_transition() {
+    fn resume_current_stable_policy_detects_hash_transition_after_render() {
         let old_fake_hash = "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000";
         let record = PromptSessionRecord::new("stable", 2, old_fake_hash, None);
 
-        let (resumed, diag) = resolve_resume_prompt_session(Some(&record), None);
+        let (mut resumed, diag) = resolve_resume_prompt_session(Some(&record), None);
         assert_eq!(resumed.profile(), Some(PromptProfile::Stable));
+        assert!(diag.is_none());
 
-        let current_hash = PromptProfile::Stable.bundle().stable_sha256();
-        assert!(diag.is_some());
-        let msg = diag.unwrap();
-        assert!(msg.contains("Prompt hash transition on resume: stable hash changed from"));
+        let current = resumed.render_and_record(&fixture_context());
+        let msg = prompt_transition_diagnostic(&record, &current.manifest).unwrap();
+        assert!(msg.contains("Prompt transition on resume: stable v2 / default v0"));
         assert!(msg.contains(old_fake_hash));
-        assert!(msg.contains(&current_hash));
-        assert_eq!(resumed.transition_diagnostic.as_deref(), Some(msg.as_str()));
+        assert!(msg.contains(&current.manifest.stable_sha256));
     }
 
     #[test]

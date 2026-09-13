@@ -48,7 +48,8 @@ pub use provider::{
 };
 pub use runtime_state::{runtime_state_module, runtime_state_text, RuntimePromptState};
 pub use session::{
-    resolve_resume_prompt_session, PromptSessionRecord, PromptSessionState, PromptSource,
+    prompt_transition_diagnostic, resolve_resume_prompt_session, PromptSessionRecord,
+    PromptSessionState, PromptSource,
 };
 pub use tool_strategy::tool_strategy_module;
 pub use turn::{compose_turn_prompt, PreparedTurnPrompt};

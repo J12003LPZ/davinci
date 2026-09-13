@@ -1683,7 +1683,7 @@ impl Agent {
             None
         };
 
-        let (mut resumed_session, diag) =
+        let (mut resumed_session, _) =
             resolve_resume_prompt_session(record.as_ref(), profile_override);
         resumed_session.append_text = self.prompt_session.append_text.clone();
         let ctx = PromptContext {
@@ -1693,6 +1693,9 @@ impl Agent {
             plan_active: self.is_plan_mode(),
         };
         let composed = resumed_session.render_and_record(&ctx);
+        let diag = record
+            .as_ref()
+            .and_then(|record| prompt::prompt_transition_diagnostic(record, &composed.manifest));
         self.system_prompt = composed.text;
         self.prompt_manifest = Some(composed.manifest);
         resumed_session.transition_diagnostic = diag;
