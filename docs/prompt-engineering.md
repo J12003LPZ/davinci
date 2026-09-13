@@ -23,6 +23,20 @@ Prompt profile answers "which release channel/version is this?" Model policy ans
 
 For example, GPT-6 Astra can report `stable v2 · gpt6-astra v1` while remaining on the normal stable release channel. The default policy is omitted from compact `/status` output.
 
+### GPT-6 Astra policy mapping
+
+| Astra concern | DaVinci implementation |
+| --- | --- |
+| Follow-through | `model.astra.autonomy` |
+| Instruction conflicts | `model.astra.instruction-priority` |
+| Over-reading | `model.astra.exploration` |
+| Over-testing | `model.astra.verification` |
+| Early stopping / endless work | `model.astra.completion` |
+| Skill bloat | Existing explicit skill-body expansion remains progressive |
+| API/runtime settings | Model catalog and Responses transport, not prompt prose |
+
+Current Astra model/API details must be rechecked against official OpenAI documentation before changing catalog limits, pricing, reasoning levels, or transport behavior.
+
 ---
 
 ## 2. Failure-Mode Mining & Intake Pipeline

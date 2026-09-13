@@ -15,6 +15,18 @@ failure artifact and do not become behavioral failures. The final coverage job
 requires at least one successful matrix run before evidence can be used for a
 promotion decision. Full run directories are retained for 30 days.
 
+### Model-specific prompt-policy graduation
+
+A model-specific prompt policy may graduate only when:
+
+1. deterministic prompt/module tests pass;
+2. model-family regression fixtures pass;
+3. paired live A/B shows no verified-success regression;
+4. stable prompt token count decreases or remains within the approved budget; and
+5. cache/session identity remains stable across ordinary turns.
+
+For GPT-6 Astra, the eval-only runner can compare the same profile with different policies using `--baseline-model-policy default --candidate-model-policy gpt6-astra`. These flags exist only on `davinci-evals`; the production DaVinci CLI does not expose a policy override. Promotion is blocked if verified success regresses, median model turns increase, unrelated-file-change rate increases, verification-failure claims increase, or the candidate fails to reduce the Astra stable prompt footprint as required by the rollout plan.
+
 This specification defines DaVinci's behavioral reliability scorecard, competitive benchmarking protocol against external harnesses (such as Claude Code), and PR evaluation examples.
 
 ---

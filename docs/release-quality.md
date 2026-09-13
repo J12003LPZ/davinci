@@ -29,7 +29,9 @@ The live behavioral matrix in `.github/workflows/behavior-live.yml` is the
 credentialed product-path workflow. It must build the release binaries, run
 real `behavior ab` turns, retain raw evidence for 30 days, and report missing
 provider configuration explicitly. Offline Rust tests alone do not satisfy
-the live A/B or promotion gates.
+the live A/B or promotion gates. Model-specific prompt-policy candidates use the
+same release gates; their model-family regression suite and policy-only live A/B
+requirements are defined in [`docs/behavioral-evals.md`](behavioral-evals.md).
 
 Every live run also records its disposition. Infrastructure failures are
 excluded from behavioral pass-rate denominators, configuration failures are

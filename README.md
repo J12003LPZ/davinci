@@ -132,6 +132,7 @@ Wire protocols implemented natively: `anthropic-messages`, `openai-responses`, `
 
 - `--model` accepts `provider/id` patterns with an optional `:thinking` suffix; `--models` sets the `Ctrl+P` cycle ring; `--list-models` fuzzy-searches the catalog.
 - `--thinking off|minimal|low|medium|high|xhigh|max` maps to each provider's own reasoning-budget field.
+- GPT-6 Astra (`openai-codex/gpt-6-astra`) uses the normal OpenAI Codex OAuth/Responses path. DaVinci automatically applies a compact `gpt6-astra` model-policy layer to built-in prompt profiles; prompt profile and model policy are independent. A custom `--system-prompt` replacement bypasses the built-in model policy. Astra does not advertise `off` reasoning; `minimal` maps to `low`.
 - `/login` supports API keys, browser OAuth with PKCE (Anthropic, OpenAI Codex, OpenRouter, xAI, GitHub Copilot, Kimi, Radius), and device-code flow. Credentials live in `~/.pi/agent/auth.json`; Vertex also reads gcloud ADC. Provider API keys can come from the usual environment variables instead.
 - `pi auth print-api-key` / `print-bearer-token` expose a credential (refreshing OAuth if expired) for external clients.
 
