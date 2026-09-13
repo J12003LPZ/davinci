@@ -135,6 +135,7 @@ pub fn run_davinci_process(
             "DAVINCI_CODING_AGENT_SESSION_DIR",
             config.clean_agent_dir.join("sessions"),
         )
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(policy) = config.prompt_model_policy_override {
@@ -351,6 +352,33 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
         assert!(diagnostic.chars().count() <= 2_048);
     }
 
+    #[test]
+    fn evaluator_child_receives_closed_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("stdin_eof_davinci.py");
+        fs::write(
+            &script,
+            "import sys\nsys.stdin.read()\nprint('{\"type\":\"agent_end\"}')\n",
+        )
+        .unwrap();
+        let config = DavinciProcessConfig {
+            binary: "python".into(),
+            launcher_args: vec![script.to_string_lossy().into_owned()],
+            provider: "fixture".into(),
+            model: "fixture-model".into(),
+            prompt_profile: PromptProfile::Stable,
+            prompt_model_policy_override: None,
+            permission_mode: "read-only".into(),
+            timeout: Duration::from_millis(250),
+            clean_agent_dir: dir.path().join("agent"),
+            auth_source: None,
+            allowed_env: BTreeMap::new(),
+        };
+
+        let run = run_davinci_process(&config, "hello").unwrap();
+        assert!(!run.timed_out, "evaluator child must see stdin EOF");
+        assert_eq!(run.exit_code, 0);
+    }
     #[test]
     fn timeout_returns_a_classified_result() {
         let dir = tempfile::tempdir().unwrap();
