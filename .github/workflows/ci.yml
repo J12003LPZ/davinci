@@ -9,6 +9,72 @@ env:
   PI_OFFLINE: "1"
 
 jobs:
+  reliability-followup:
+    if: github.ref == 'refs/heads/fix/luna-reliability-followups-20260914' && github.event.head_commit.message == 'chore: execute reliability follow-up patch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Confirm regression tests are red
+        shell: bash
+        run: |
+          set +e
+          cargo test -p davinci-agent --test luna_reliability_followups
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo 'Expected follow-up regression tests to fail before the patch.'
+            exit 1
+          fi
+      - name: Confirm Linux path regressions are red
+        shell: bash
+        run: |
+          set +e
+          cargo test -p davinci-agent f05_normalize_relative_path_safety
+          a=$?
+          cargo test -p davinci-agent windows_drive_and_unc_path_containment
+          b=$?
+          set -e
+          if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then
+            echo 'Expected both path regressions to reproduce before the patch.'
+            exit 1
+          fi
+      - name: Apply focused fixes
+        run: python scripts/apply_luna_reliability_followups.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Targeted regression tests
+        run: |
+          cargo test -p davinci-agent --test luna_reliability_followups
+          cargo test -p davinci-agent f05_normalize_relative_path_safety
+          cargo test -p davinci-agent f05_same_file_via_alias
+          cargo test -p davinci-agent windows_drive_and_unc_path_containment
+          cargo test -p davinci-agent representative_tools_have_consistent_execution_metadata
+      - name: Focused lint
+        run: |
+          cargo clippy -p davinci-agent --all-targets -- -D warnings
+          cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
+      - name: Workspace verification
+        run: cargo test --workspace
+      - name: Remove one-shot patch machinery
+        run: |
+          git checkout b2562436c4b789baab0dd7489f58510356c76a5f -- .github/workflows/ci.yml
+          git rm scripts/apply_luna_reliability_followups.py
+          git rm .github/workflows/reliability-followup-patch.yml
+      - name: Commit verified fixes
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(agent): close reliability follow-up gaps'
+          git push origin HEAD:fix/luna-reliability-followups-20260914
+
   voice-native:
     strategy:
       fail-fast: false
