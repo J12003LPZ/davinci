@@ -1825,6 +1825,84 @@ mod tests {
     }
 
     #[test]
+    fn content_aware_ablation_reports_reversible_byte_measurement() {
+        let logs = (0..12)
+            .map(|task| {
+                (0..120)
+                    .map(|i| {
+                        if i == 60 + task {
+                            format!(
+                                "test auth_refresh_{task} ... FAILED\nassertion failed: expected 200 actual {}",
+                                401 + task
+                            )
+                        } else {
+                            format!("test task_{task}_case_{i} ... ok")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+
+        let run = |content_aware| {
+            let dir = tempdir().unwrap();
+            let config = TokenGovernorConfig {
+                compress_threshold_bytes: 1,
+                compress_threshold_lines: 1,
+                content_aware,
+                ..Default::default()
+            };
+            let mut governor = TokenGovernor::with_store(
+                format!("ablation-{content_aware}"),
+                config,
+                OutputStore::new(dir.path()),
+            );
+            let mut original_bytes = 0;
+            let mut view_bytes = 0;
+            let mut generic_views = 0;
+            let mut specialized_views = 0;
+            for (task, log) in logs.iter().enumerate() {
+                let args = json!({"command": format!("cargo test --task {task}")});
+                let result = governor.after_tool("bash", &args, ok(log));
+                let details = result.details.as_ref().unwrap()["tokenGovernor"].clone();
+                let id = details["outputId"].as_str().unwrap();
+                let recovered = governor.retrieve(&json!({"id": id})).unwrap().content;
+                let reconstructed = recovered
+                    .lines()
+                    .map(|line| line.split_once(": ").map(|(_, body)| body).unwrap_or(line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(reconstructed, *log);
+
+                original_bytes += details["originalBytes"].as_u64().unwrap();
+                view_bytes += details["viewBytes"].as_u64().unwrap();
+                match details["strategy"].as_str().unwrap() {
+                    "generic" => generic_views += 1,
+                    "specialized" => specialized_views += 1,
+                    strategy => panic!("unexpected governor strategy: {strategy}"),
+                }
+            }
+            println!(
+                "governor_ab tasks={} content_aware={content_aware} original_bytes={original_bytes} view_bytes={view_bytes} withheld_bytes={} generic_views={generic_views} specialized_views={specialized_views}",
+                logs.len(),
+                original_bytes.saturating_sub(view_bytes)
+            );
+            (view_bytes, generic_views, specialized_views)
+        };
+
+        let (generic_bytes, generic_views, generic_specialized_views) = run(false);
+        let (specialized_bytes, specialized_views, specialized_specialized_views) = run(true);
+        assert_eq!(generic_views, 12);
+        assert_eq!(generic_specialized_views, 0);
+        assert_eq!(specialized_views, 0);
+        assert_eq!(specialized_specialized_views, 12);
+        assert!(
+            specialized_bytes < generic_bytes,
+            "content-aware view should be smaller: specialized={specialized_bytes}, generic={generic_bytes}"
+        );
+    }
+
+    #[test]
     fn governor_status_reports_content_routing() {
         let dir = tempdir().unwrap();
         let config = TokenGovernorConfig {

@@ -4710,6 +4710,39 @@ mod tests {
     }
 
     #[test]
+    fn deferred_root_schema_ablation_reports_serialized_reduction() {
+        let mut agent = Agent::new("x");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+
+        let deferred = serde_json::to_vec(&agent.provider_tool_specs()).unwrap();
+        let deferred_names = agent.visible_tool_names();
+        agent.expose_active_tools();
+        let full = serde_json::to_vec(&agent.provider_tool_specs()).unwrap();
+        let full_names = agent.visible_tool_names();
+
+        assert!(full.len() > deferred.len());
+        assert!(deferred_names.is_subset(&full_names));
+        assert!(
+            deferred.len() * 100 <= full.len() * 70,
+            "deferred schemas must save at least 30%: deferred={}, full={}",
+            deferred.len(),
+            full.len()
+        );
+        println!(
+            "schema_ab deferred_tools={} full_tools={} deferred_bytes={} full_bytes={} withheld_bytes={}",
+            deferred_names.len(),
+            full_names.len(),
+            deferred.len(),
+            full.len(),
+            full.len().saturating_sub(deferred.len())
+        );
+    }
+
+    #[test]
     fn batch_duplicate_mutating_calls_executes_once() {
         use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
         use std::sync::atomic::{AtomicUsize, Ordering};
