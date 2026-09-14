@@ -465,31 +465,30 @@ fn is_package_command(command: Option<&str>) -> bool {
     )
 }
 
-/// The system prompt for one request, with the model actually serving it named
-/// in the text.
+/// The request-local identity for the model actually serving the turn.
 ///
 /// A documented divergence from vendor `pi`: `buildSystemPrompt`
 /// (`vendor/pi/packages/coding-agent/src/core/system-prompt.ts`) carries cwd,
 /// tools, context files and skills but no model identity, so "what model are
 /// you?" was answered from the model's training prior rather than from the run.
-/// The line is appended per request rather than stored on the agent, so a
-/// `/model` switch, a thinking-level change, or an extension's `systemPrompt`
-/// override can never leave a stale identity behind.
-fn system_prompt_with_identity(agent: &Agent) -> String {
-    let mut prompt = agent.system_prompt.clone();
+/// The suffix is refreshed for every run and appended to the current turn
+/// prompt at dispatch, so prompt preparation and extension overrides cannot
+/// leave the provider request with a stale prompt body.
+fn provider_identity(agent: &Agent) -> Option<String> {
     if agent.provider.is_empty() || agent.model_id.is_empty() {
-        return prompt;
+        return None;
     }
-    if !prompt.is_empty() {
-        prompt.push_str("\n\n");
-    }
-    prompt.push_str(&format!(
+    Some(format!(
         "You are running as {}/{} (thinking: {}).",
         agent.provider,
         agent.model_id,
         agent.thinking_level.as_str()
-    ));
-    prompt
+    ))
+}
+
+fn synchronize_provider_system_prompt(agent: &mut Agent) {
+    let suffix = provider_identity(agent);
+    agent.set_provider_system_prompt_suffix(suffix);
 }
 
 /// The reply an offline run gives. `PI_OFFLINE_TOOL_CALL` is a fixture —
@@ -616,6 +615,10 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     {
         agent.thinking_level = level;
     }
+    let explicit_tool_selection = parsed.no_tools
+        || parsed.no_builtin_tools
+        || !parsed.tools.is_empty()
+        || settings.default_tools.is_some();
     if parsed.no_tools || parsed.no_builtin_tools {
         agent.tools.clear();
     } else if parsed.tools.is_empty() {
@@ -740,6 +743,11 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.tools.retain(|tool| {
             parsed.tools.contains(tool) || !native_names.iter().any(|native| native == tool)
         });
+    }
+    if explicit_tool_selection {
+        agent.expose_active_tools();
+    } else {
+        agent.sync_tool_authorization();
     }
     if let Some(coord) = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env() {
         agent.tool_context.task_coordinator = Some(coord);
@@ -1585,6 +1593,7 @@ fn run_nested_subagent(
     crate::native_extensions::token_governor::ensure_governor_recovery_tool(&mut tools);
     child.tools = tools.clone();
     child.tool_registry = tools;
+    child.expose_active_tools();
     child.session = None;
     if let Some(runtime) = &req.runtime {
         if req.runtime_agent_id != Some(runtime.agent_id) || runtime.parent_agent_id.is_none() {
@@ -1679,6 +1688,19 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
     complete_prompt_with_host(parsed, agent, None, false)
 }
 
+fn provider_tools(agent: &Agent) -> Vec<ToolSpec> {
+    agent
+        .provider_tool_specs()
+        .into_iter()
+        .map(|tool| ToolSpec {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            constrained_sampling: crate::experimental::experimental_tool_sampling(),
+        })
+        .collect()
+}
+
 fn complete_prompt_with_host(
     parsed: &Args,
     agent: &mut Agent,
@@ -1758,25 +1780,6 @@ fn complete_prompt_with_host(
     let fresh_host = existing_host.is_none();
     let host = existing_host.unwrap_or_else(|| Arc::new(Mutex::new(loaded_extension_host(parsed))));
     attach_shared_tool_executor(agent, host.clone());
-    let native_tool_specs = host
-        .lock()
-        .map(|host| host.native_tool_specs())
-        .unwrap_or_default();
-    let tools: Vec<ToolSpec> = agent
-        .builtin_and_mcp_specs()
-        .into_iter()
-        .map(|tool| ToolSpec {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-            constrained_sampling: crate::experimental::experimental_tool_sampling(),
-        })
-        .chain(
-            native_tool_specs
-                .into_iter()
-                .filter(|tool| agent.tools.iter().any(|name| name == &tool.name)),
-        )
-        .collect();
     agent.clear_ephemeral_context();
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
@@ -1821,15 +1824,6 @@ fn complete_prompt_with_host(
         host.emit(ExtensionEvent::AgentStart);
         host.emit(ExtensionEvent::TurnStart);
     }
-    let schema_bytes = serde_json::to_vec(&tools)
-        .expect("tool specs are JSON")
-        .len();
-    let identity_bytes = system_prompt_with_identity(agent)
-        .len()
-        .saturating_sub(agent.system_prompt.len());
-    agent.set_provider_context_overhead_tokens(Some(
-        ((schema_bytes + identity_bytes) as u64).div_ceil(4),
-    ));
     let js_stream = {
         let host = host.lock().unwrap_or_else(|err| err.into_inner());
         host.js_stream_provider(&agent.provider)
@@ -1992,6 +1986,7 @@ fn complete_prompt_with_host(
             }
         })));
     }
+    synchronize_provider_system_prompt(agent);
     let mut context_visibility = (agent.stats.pruned_results, agent.stats.compactions);
     // Session calls settle after the loop. Hold the final terminal event until
     // their result is known so streaming clients receive one final outcome.
@@ -2023,7 +2018,7 @@ fn complete_prompt_with_host(
                 .find(|m| m.role == "user")
                 .map(|m| content_text(&m.content).len())
                 .unwrap_or(0);
-            let system = system_prompt_with_identity(current);
+            let system = current.provider_system_prompt();
             match (offline, model.as_ref(), auth.as_ref(), js_stream.as_ref()) {
                 (false, Some(model), _, Some((path, name))) => {
                     crate::js_host::run_js_stream_simple(
@@ -2059,7 +2054,7 @@ fn complete_prompt_with_host(
                         &current.messages_for_provider(),
                         auth,
                         Some(&system),
-                        &tools,
+                        &provider_tools(current),
                         &StreamOptions {
                             thinking_level: Some(current.thinking_level),
                             thinking_budgets: current.thinking_budgets.clone(),
@@ -2227,7 +2222,7 @@ fn complete_prompt_with_host(
         for skill in &agent.skills {
             let tag = format!("<skill name=\"{}\"", skill.name);
             if latest_user_text.contains(&tag) {
-                host.native_record_skill_outcome(&skill.name, skill_outcome);
+                host.native_record_skill_outcome_for_skill(&skill.name, &skill.body, skill_outcome);
             }
         }
 
@@ -9988,6 +9983,65 @@ mod tests {
     use super::*;
 
     static OFFLINE_TOOL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn provider_context_accounting_includes_runtime_identity() {
+        let mut agent = Agent::new("base");
+        agent.provider = "openai".into();
+        agent.model_id = "gpt-test".into();
+        let provider_system =
+            "base\n\nYou are running as openai/gpt-test (thinking: off).".to_string();
+        synchronize_provider_system_prompt(&mut agent);
+        let schema_tokens =
+            (serde_json::to_vec(&provider_tools(&agent)).unwrap().len() as u64).div_ceil(4);
+        let expected = (provider_system.len() as u64).div_ceil(4) + schema_tokens;
+
+        assert_eq!(agent.estimated_context_tokens(), expected);
+    }
+
+    #[test]
+    fn provider_context_includes_duplicate_repository_instructions_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("base");
+        agent.provider = "openai".into();
+        agent.model_id = "gpt-test".into();
+        agent.context_files = vec![
+            davinci_agent::ContextFile {
+                path: dir.path().join("AGENTS.md"),
+                name: "AGENTS.md".into(),
+                body: "DISTINCTIVE_REPOSITORY_CONSTRAINT".into(),
+            },
+            davinci_agent::ContextFile {
+                path: dir.path().join("CLAUDE.md"),
+                name: "CLAUDE.md".into(),
+                body: "DISTINCTIVE_REPOSITORY_CONSTRAINT".into(),
+            },
+        ];
+
+        synchronize_provider_system_prompt(&mut agent);
+        let prompt = agent.provider_system_prompt();
+
+        assert_eq!(
+            prompt.matches("DISTINCTIVE_REPOSITORY_CONSTRAINT").count(),
+            1
+        );
+        assert!(prompt.contains("AGENTS.md"), "{prompt}");
+        assert!(prompt.contains("CLAUDE.md"), "{prompt}");
+    }
+
+    #[test]
+    fn provider_context_tracks_turn_prompt_updates() {
+        let mut agent = Agent::new("initial prompt");
+        agent.provider = "openai".into();
+        agent.model_id = "gpt-test".into();
+        synchronize_provider_system_prompt(&mut agent);
+
+        agent.system_prompt = "updated turn prompt".into();
+
+        let prompt = agent.provider_system_prompt();
+        assert!(prompt.starts_with("updated turn prompt"), "{prompt}");
+        assert!(prompt.contains("openai/gpt-test"), "{prompt}");
+    }
 
     struct EnvRestore {
         key: &'static str,

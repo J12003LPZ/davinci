@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::runtime::{conservative_replay_policy, ReplayPolicy};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSideEffect {
@@ -25,6 +27,30 @@ pub enum ToolExecutionStatus {
     Blocked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    NotStarted,
+    StartedUnknown,
+    Succeeded,
+    Failed,
+}
+
+impl Default for AttemptOutcome {
+    fn default() -> Self {
+        Self::NotStarted
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryAction {
+    Execute,
+    Retry,
+    Replay { output: String, is_error: bool },
+    ReconcileBeforeRetry(String),
+    Stop(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     pub call_id: String,
@@ -32,11 +58,25 @@ pub struct ToolCallRecord {
     pub normalized_arguments: Value,
     pub argument_digest: String,
     pub side_effect: ToolSideEffect,
+    #[serde(default)]
+    pub replay_policy: ReplayPolicy,
+    #[serde(default)]
+    pub outcome: AttemptOutcome,
+    #[serde(default)]
+    pub pre_state_hash: Option<String>,
+    #[serde(default)]
+    pub post_state_hash: Option<String>,
     pub status: ToolExecutionStatus,
     pub result_digest: Option<String>,
     pub output: Option<String>,
     pub is_error: bool,
     pub executed_at: Option<u64>,
+}
+
+impl ToolCallRecord {
+    pub fn attempt_id(&self) -> &str {
+        &self.call_id
+    }
 }
 
 pub fn classify_side_effect(tool_name: &str) -> ToolSideEffect {
@@ -81,6 +121,8 @@ pub enum ReservationOutcome {
     Reserved,
     /// Terminal result already exists. Caller should replay cached result.
     Replay { output: String, is_error: bool },
+    /// A terminal result exists, but replay requires explicit reconciliation.
+    ReplayBlocked(String),
     /// An identical call is currently in-flight (Pending or Executing). Caller is a follower and must wait.
     WaitForInFlight,
 }
@@ -91,6 +133,8 @@ pub enum BeginOutcome {
     Execute,
     /// Terminal result already exists.
     Replay { output: String, is_error: bool },
+    /// A terminal result exists, but replay requires explicit reconciliation.
+    ReplayBlocked(String),
     /// An identical call is already executing on another thread; wait for it.
     WaitForInFlight,
     /// Call ID was previously used with different tool name or arguments.
@@ -221,6 +265,24 @@ impl ToolCallLedger {
         tool_name: &str,
         arguments: &Value,
     ) -> Result<ReservationOutcome, String> {
+        self.reserve_call_with_policy(
+            call_id,
+            tool_name,
+            arguments,
+            conservative_replay_policy(tool_name),
+        )
+    }
+
+    /// Atomically check or reserve a tool call using the runtime's replay
+    /// policy. The policy is persisted with a new record so recovery does not
+    /// silently become more permissive when a registry changes.
+    pub fn reserve_call_with_policy(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        replay_policy: ReplayPolicy,
+    ) -> Result<ReservationOutcome, String> {
         let norm_args = normalize_arguments(arguments);
         let arg_digest = canonical_arguments_digest(arguments);
         if let Some(rec) = self.records.get(call_id) {
@@ -239,9 +301,17 @@ impl ToolCallLedger {
                 ToolExecutionStatus::Completed
                 | ToolExecutionStatus::Failed
                 | ToolExecutionStatus::Blocked => {
-                    return Ok(ReservationOutcome::Replay {
-                        output: rec.output.clone().unwrap_or_default(),
-                        is_error: rec.is_error,
+                    return Ok(match rec.replay_policy {
+                        ReplayPolicy::SafeToReplay => ReservationOutcome::Replay {
+                            output: rec.output.clone().unwrap_or_default(),
+                            is_error: rec.is_error,
+                        },
+                        ReplayPolicy::ReconcileBeforeReplay | ReplayPolicy::NeverAutoReplay => {
+                            ReservationOutcome::ReplayBlocked(replay_blocked_message(
+                                &rec.tool_name,
+                                rec.replay_policy,
+                            ))
+                        }
                     });
                 }
                 ToolExecutionStatus::Pending | ToolExecutionStatus::Executing => {
@@ -258,6 +328,10 @@ impl ToolCallLedger {
                 normalized_arguments: norm_args,
                 argument_digest: arg_digest,
                 side_effect: classify_side_effect(tool_name),
+                replay_policy,
+                outcome: AttemptOutcome::NotStarted,
+                pre_state_hash: None,
+                post_state_hash: None,
                 status: ToolExecutionStatus::Pending,
                 result_digest: None,
                 output: None,
@@ -274,6 +348,22 @@ impl ToolCallLedger {
         call_id: &str,
         tool_name: &str,
         arguments: &Value,
+    ) -> BeginOutcome {
+        self.begin_execution_with_policy(
+            call_id,
+            tool_name,
+            arguments,
+            conservative_replay_policy(tool_name),
+        )
+    }
+
+    /// Mark an execution as beginning using an authoritative replay policy.
+    pub fn begin_execution_with_policy(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        replay_policy: ReplayPolicy,
     ) -> BeginOutcome {
         let norm_args = normalize_arguments(arguments);
         let arg_digest = canonical_arguments_digest(arguments);
@@ -292,13 +382,22 @@ impl ToolCallLedger {
             match rec.status {
                 ToolExecutionStatus::Completed
                 | ToolExecutionStatus::Failed
-                | ToolExecutionStatus::Blocked => BeginOutcome::Replay {
-                    output: rec.output.clone().unwrap_or_default(),
-                    is_error: rec.is_error,
+                | ToolExecutionStatus::Blocked => match rec.replay_policy {
+                    ReplayPolicy::SafeToReplay => BeginOutcome::Replay {
+                        output: rec.output.clone().unwrap_or_default(),
+                        is_error: rec.is_error,
+                    },
+                    ReplayPolicy::ReconcileBeforeReplay | ReplayPolicy::NeverAutoReplay => {
+                        BeginOutcome::ReplayBlocked(replay_blocked_message(
+                            &rec.tool_name,
+                            rec.replay_policy,
+                        ))
+                    }
                 },
                 ToolExecutionStatus::Executing => BeginOutcome::WaitForInFlight,
                 ToolExecutionStatus::Pending => {
                     rec.status = ToolExecutionStatus::Executing;
+                    rec.outcome = AttemptOutcome::StartedUnknown;
                     BeginOutcome::Execute
                 }
             }
@@ -312,6 +411,10 @@ impl ToolCallLedger {
                     normalized_arguments: norm_args,
                     argument_digest: arg_digest,
                     side_effect: classify_side_effect(tool_name),
+                    replay_policy,
+                    outcome: AttemptOutcome::StartedUnknown,
+                    pre_state_hash: None,
+                    post_state_hash: None,
                     status: ToolExecutionStatus::Executing,
                     result_digest: None,
                     output: None,
@@ -321,6 +424,102 @@ impl ToolCallLedger {
             );
             BeginOutcome::Execute
         }
+    }
+
+    /// Decide how a persisted attempt may proceed after a crash, timeout, or
+    /// lost response. A retry decision moves the record back to Pending so
+    /// the caller can pass it through the normal begin/execute path.
+    pub fn recover_attempt(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        retries_remaining: u32,
+    ) -> Result<RecoveryAction, String> {
+        let norm_args = normalize_arguments(arguments);
+        let arg_digest = canonical_arguments_digest(arguments);
+        let record = self
+            .records
+            .get_mut(call_id)
+            .ok_or_else(|| format!("Tool call `{call_id}` is not present in the ledger"))?;
+        if record.tool_name != tool_name {
+            return Err(format!(
+                "Tool call id collision for `{call_id}`: previously registered for tool `{}`, but requested for `{tool_name}`",
+                record.tool_name
+            ));
+        }
+        if record.argument_digest != arg_digest && record.normalized_arguments != norm_args {
+            return Err(format!(
+                "Tool call id collision for `{call_id}`: arguments differ from prior call"
+            ));
+        }
+        if record.status == ToolExecutionStatus::Blocked {
+            return Ok(RecoveryAction::Stop(
+                "The tool call was blocked and requires a new authorized call".into(),
+            ));
+        }
+
+        let outcome = match (record.outcome, record.status) {
+            (AttemptOutcome::NotStarted, ToolExecutionStatus::Executing) => {
+                AttemptOutcome::StartedUnknown
+            }
+            (AttemptOutcome::NotStarted, ToolExecutionStatus::Completed) => {
+                AttemptOutcome::Succeeded
+            }
+            (AttemptOutcome::NotStarted, ToolExecutionStatus::Failed) => AttemptOutcome::Failed,
+            (outcome, _) => outcome,
+        };
+
+        match outcome {
+            AttemptOutcome::NotStarted => Ok(RecoveryAction::Execute),
+            AttemptOutcome::Succeeded => match record.output.clone() {
+                Some(output) => Ok(RecoveryAction::Replay {
+                    output,
+                    is_error: record.is_error,
+                }),
+                None => Ok(RecoveryAction::Stop(
+                    "A successful tool attempt has no persisted result".into(),
+                )),
+            },
+            AttemptOutcome::Failed => {
+                if retries_remaining == 0 {
+                    Ok(RecoveryAction::Stop(
+                        "The tool attempt failed and its retry budget is exhausted".into(),
+                    ))
+                } else {
+                    record.status = ToolExecutionStatus::Pending;
+                    Ok(RecoveryAction::Retry)
+                }
+            }
+            AttemptOutcome::StartedUnknown => match record.replay_policy {
+                ReplayPolicy::SafeToReplay => {
+                    record.status = ToolExecutionStatus::Pending;
+                    Ok(RecoveryAction::Retry)
+                }
+                ReplayPolicy::ReconcileBeforeReplay => Ok(RecoveryAction::ReconcileBeforeRetry(
+                    replay_blocked_message(&record.tool_name, record.replay_policy),
+                )),
+                ReplayPolicy::NeverAutoReplay => Ok(RecoveryAction::Stop(replay_blocked_message(
+                    &record.tool_name,
+                    record.replay_policy,
+                ))),
+            },
+        }
+    }
+
+    pub fn set_state_hashes(
+        &mut self,
+        call_id: &str,
+        pre_state_hash: Option<String>,
+        post_state_hash: Option<String>,
+    ) -> Result<(), String> {
+        let record = self
+            .records
+            .get_mut(call_id)
+            .ok_or_else(|| format!("Tool call `{call_id}` is not present in the ledger"))?;
+        record.pre_state_hash = pre_state_hash;
+        record.post_state_hash = post_state_hash;
+        Ok(())
     }
 
     pub fn cancel_reservation(&mut self, call_id: &str) {
@@ -370,6 +569,21 @@ impl ToolCallLedger {
     }
 
     pub fn record_start(&mut self, call_id: &str, tool_name: &str, arguments: &Value) {
+        self.record_start_with_policy(
+            call_id,
+            tool_name,
+            arguments,
+            conservative_replay_policy(tool_name),
+        );
+    }
+
+    pub fn record_start_with_policy(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        replay_policy: ReplayPolicy,
+    ) {
         let norm_args = normalize_arguments(arguments);
         let arg_digest = canonical_arguments_digest(arguments);
         if let Some(entry) = self.records.get_mut(call_id) {
@@ -390,6 +604,10 @@ impl ToolCallLedger {
                     normalized_arguments: norm_args,
                     argument_digest: arg_digest,
                     side_effect: classify_side_effect(tool_name),
+                    replay_policy,
+                    outcome: AttemptOutcome::StartedUnknown,
+                    pre_state_hash: None,
+                    post_state_hash: None,
                     status: ToolExecutionStatus::Executing,
                     result_digest: None,
                     output: None,
@@ -403,6 +621,7 @@ impl ToolCallLedger {
     pub fn record_completion(&mut self, call_id: &str, output: &str, is_error: bool) {
         if let Some(entry) = self.records.get_mut(call_id) {
             entry.status = ToolExecutionStatus::Completed;
+            entry.outcome = AttemptOutcome::Succeeded;
             entry.output = Some(output.to_string());
             entry.result_digest = Some(compute_digest(output));
             entry.is_error = is_error;
@@ -419,6 +638,7 @@ impl ToolCallLedger {
     pub fn record_failure(&mut self, call_id: &str, error: &str) {
         if let Some(entry) = self.records.get_mut(call_id) {
             entry.status = ToolExecutionStatus::Failed;
+            entry.outcome = AttemptOutcome::Failed;
             entry.output = Some(error.to_string());
             entry.result_digest = Some(compute_digest(error));
             entry.is_error = true;
@@ -436,10 +656,110 @@ impl ToolCallLedger {
     }
 }
 
+fn replay_blocked_message(tool_name: &str, replay_policy: ReplayPolicy) -> String {
+    format!(
+        "Tool call `{tool_name}` cannot be replayed automatically; replay policy is {replay_policy:?}. Reconcile the tool state before retrying."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn uncertain_safe_read_can_be_replayed() {
+        let mut ledger = ToolCallLedger::new("sess_recovery", "lin_recovery");
+        let args = json!({"path": "README.md"});
+        ledger.record_start_with_policy("call_read", "read", &args, ReplayPolicy::SafeToReplay);
+
+        let action = ledger
+            .recover_attempt("call_read", "read", &args, 0)
+            .unwrap();
+
+        assert_eq!(action, RecoveryAction::Retry);
+        assert_eq!(
+            ledger.begin_execution_with_policy(
+                "call_read",
+                "read",
+                &args,
+                ReplayPolicy::SafeToReplay,
+            ),
+            BeginOutcome::Execute
+        );
+    }
+
+    #[test]
+    fn uncertain_mutation_requires_reconciliation() {
+        let mut ledger = ToolCallLedger::new("sess_recovery", "lin_recovery");
+        let args = json!({"path": "src/main.rs", "oldText": "old", "newText": "new"});
+        ledger.record_start_with_policy(
+            "call_edit",
+            "edit",
+            &args,
+            ReplayPolicy::ReconcileBeforeReplay,
+        );
+
+        let action = ledger
+            .recover_attempt("call_edit", "edit", &args, 1)
+            .unwrap();
+
+        assert!(matches!(
+            action,
+            RecoveryAction::ReconcileBeforeRetry(message) if message.contains("Reconcile")
+        ));
+        assert_eq!(
+            ledger.records().get("call_edit").unwrap().status,
+            ToolExecutionStatus::Executing
+        );
+    }
+
+    #[test]
+    fn confirmed_failure_can_retry_within_budget() {
+        let mut ledger = ToolCallLedger::new("sess_recovery", "lin_recovery");
+        let args = json!({"path": "README.md"});
+        ledger.record_start_with_policy("call_failed", "read", &args, ReplayPolicy::SafeToReplay);
+        ledger.record_failure("call_failed", "temporary read failure");
+
+        let action = ledger
+            .recover_attempt("call_failed", "read", &args, 1)
+            .unwrap();
+
+        assert_eq!(action, RecoveryAction::Retry);
+        assert_eq!(
+            ledger.begin_execution_with_policy(
+                "call_failed",
+                "read",
+                &args,
+                ReplayPolicy::SafeToReplay,
+            ),
+            BeginOutcome::Execute
+        );
+    }
+
+    #[test]
+    fn attempt_metadata_round_trips_through_ledger_serialization() {
+        let mut ledger = ToolCallLedger::new("sess_recovery", "lin_recovery");
+        let args = json!({"path": "src/main.rs"});
+        ledger.record_start_with_policy(
+            "call_hashes",
+            "edit",
+            &args,
+            ReplayPolicy::ReconcileBeforeReplay,
+        );
+        ledger
+            .set_state_hashes("call_hashes", Some("before".into()), Some("after".into()))
+            .unwrap();
+
+        let encoded = serde_json::to_string(&ledger).unwrap();
+        let restored: ToolCallLedger = serde_json::from_str(&encoded).unwrap();
+        let record = restored.records().get("call_hashes").unwrap();
+        assert_eq!(record.attempt_id(), "call_hashes");
+        assert_eq!(record.outcome, AttemptOutcome::StartedUnknown);
+        assert_eq!(record.replay_policy, ReplayPolicy::ReconcileBeforeReplay);
+        assert_eq!(record.pre_state_hash.as_deref(), Some("before"));
+        assert_eq!(record.post_state_hash.as_deref(), Some("after"));
+    }
 
     #[test]
     fn classifies_side_effects_correctly() {
@@ -511,17 +831,15 @@ mod tests {
         assert!(err.contains("collision"), "{err}");
         assert!(err.contains("arguments differ"), "{err}");
 
-        // Matching args succeed with Replay
+        // Matching args remain blocked because shell execution is never safe
+        // to replay automatically.
         let res = ledger
             .reserve_call(call_id, "bash", &json!({"command": "echo one"}))
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             res,
-            ReservationOutcome::Replay {
-                output: "one\n".into(),
-                is_error: false
-            }
-        );
+            ReservationOutcome::ReplayBlocked(message) if message.contains("replay")
+        ));
     }
 
     #[test]
@@ -530,10 +848,10 @@ mod tests {
         let call_id = "call_canon";
         let args1 = json!({"a": 1, "b": 2});
         let args2 = json!({"b": 2, "a": 1});
-        ledger.record_start(call_id, "my_tool", &args1);
+        ledger.record_start(call_id, "read", &args1);
         ledger.record_completion(call_id, "done", false);
 
-        let res = ledger.reserve_call(call_id, "my_tool", &args2).unwrap();
+        let res = ledger.reserve_call(call_id, "read", &args2).unwrap();
         assert_eq!(
             res,
             ReservationOutcome::Replay {

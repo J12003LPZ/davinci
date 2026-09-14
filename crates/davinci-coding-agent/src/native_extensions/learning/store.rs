@@ -184,12 +184,36 @@ impl LearningStore {
         self.skill_versions.get(&(name.to_string(), version))
     }
 
-    pub fn record_skill_outcome(
-        &mut self,
+    pub fn skill_version_ref_for_content_hash(
+        &self,
         name: &str,
+        content_hash: &str,
+    ) -> Option<SkillVersionRef> {
+        self.skill_versions
+            .values()
+            .filter(|record| record.name == name && record.content_hash == content_hash)
+            .max_by_key(|record| record.version)
+            .map(|record| SkillVersionRef {
+                name: record.name.clone(),
+                version: record.version as u64,
+                content_hash: record.content_hash.clone(),
+            })
+    }
+
+    pub fn record_skill_version_outcome(
+        &mut self,
+        skill: &SkillVersionRef,
         outcome: SkillOutcome,
     ) -> Result<bool, String> {
-        if let Some(mut record) = self.skills.get(name).cloned() {
+        let key = (skill.name.clone(), skill.version);
+        if let Some(mut record) = self.skill_versions.get(&key).cloned() {
+            if record.content_hash != skill.content_hash {
+                self.diagnostics.push(format!(
+                    "skill version content hash mismatch for {}: expected {}, found {}",
+                    skill.name, skill.content_hash, record.content_hash
+                ));
+                return Ok(false);
+            }
             match outcome {
                 SkillOutcome::VerifiedSuccess => {
                     record.success_count += 1;
@@ -207,46 +231,11 @@ impl LearningStore {
             self.upsert_skill(record)?;
             Ok(true)
         } else {
-            Ok(false)
-        }
-    }
-
-    pub fn record_skill_version_outcome(
-        &mut self,
-        skill: &SkillVersionRef,
-        outcome: SkillOutcome,
-    ) -> Result<(), String> {
-        let key = (skill.name.clone(), skill.version);
-        if let Some(mut record) = self.skill_versions.get(&key).cloned() {
-            if record.content_hash != skill.content_hash {
-                self.diagnostics.push(format!(
-                    "skill version content hash mismatch for {}: expected {}, found {}",
-                    skill.name, skill.content_hash, record.content_hash
-                ));
-                return Ok(());
-            }
-            match outcome {
-                SkillOutcome::VerifiedSuccess => {
-                    record.success_count += 1;
-                }
-                SkillOutcome::VerifiedFailure => {
-                    record.failure_count += 1;
-                }
-                SkillOutcome::Neutral => {
-                    record.neutral_count += 1;
-                }
-            }
-            let now = crate::native_extensions::learning::types::now_ms();
-            record.last_used_at_ms = Some(now);
-            record.updated_at_ms = now;
-            self.upsert_skill(record)?;
-            Ok(())
-        } else {
             self.diagnostics.push(format!(
                 "skill version not found for outcome: {} v{}",
                 skill.name, skill.version
             ));
-            Ok(())
+            Ok(false)
         }
     }
 
@@ -440,8 +429,13 @@ mod tests {
         };
         store.upsert_skill(record).unwrap();
 
+        let skill_ref = SkillVersionRef {
+            name: "debug-sqlx".into(),
+            version: 1,
+            content_hash: "hash".into(),
+        };
         assert!(store
-            .record_skill_outcome("debug-sqlx", SkillOutcome::VerifiedSuccess)
+            .record_skill_version_outcome(&skill_ref, SkillOutcome::VerifiedSuccess)
             .unwrap());
         let updated = store.skill("debug-sqlx").unwrap();
         assert_eq!(updated.success_count, 1);
@@ -449,7 +443,7 @@ mod tests {
         assert_eq!(updated.neutral_count, 0);
 
         assert!(store
-            .record_skill_outcome("debug-sqlx", SkillOutcome::VerifiedFailure)
+            .record_skill_version_outcome(&skill_ref, SkillOutcome::VerifiedFailure)
             .unwrap());
         let updated = store.skill("debug-sqlx").unwrap();
         assert_eq!(updated.success_count, 1);
@@ -457,7 +451,7 @@ mod tests {
         assert_eq!(updated.neutral_count, 0);
 
         assert!(store
-            .record_skill_outcome("debug-sqlx", SkillOutcome::Neutral)
+            .record_skill_version_outcome(&skill_ref, SkillOutcome::Neutral)
             .unwrap());
         let updated = store.skill("debug-sqlx").unwrap();
         assert_eq!(updated.success_count, 1);
@@ -465,7 +459,14 @@ mod tests {
         assert_eq!(updated.neutral_count, 1);
 
         assert!(!store
-            .record_skill_outcome("non-existent", SkillOutcome::Neutral)
+            .record_skill_version_outcome(
+                &SkillVersionRef {
+                    name: "non-existent".into(),
+                    version: 1,
+                    content_hash: "missing".into(),
+                },
+                SkillOutcome::Neutral,
+            )
             .unwrap());
     }
 

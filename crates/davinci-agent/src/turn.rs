@@ -78,6 +78,7 @@ impl Agent {
         };
         let mut new_messages = prompt_messages.clone();
         let mut capability_completion_reminders = 0_u32;
+        let mut verification_reminded_generation = None;
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
         if let Some(runtime) = &self.runtime {
@@ -258,6 +259,32 @@ impl Agent {
                         );
                         continue;
                     }
+                }
+
+                let completion_evidence = self.completion_evidence();
+                let mutation_generation = self.mutation_verification_state().mutation_generation;
+                if matches!(
+                    completion_evidence,
+                    crate::CompletionEvidence::Unverified
+                        | crate::CompletionEvidence::VerificationFailed
+                ) && verification_reminded_generation != Some(mutation_generation)
+                {
+                    verification_reminded_generation = Some(mutation_generation);
+                    let message = match completion_evidence {
+                        crate::CompletionEvidence::VerificationFailed => {
+                            "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."
+                        }
+                        _ => {
+                            "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
+                        }
+                    };
+                    self.queue_capability_reminder(
+                        message,
+                        "verification_required",
+                        &mut events,
+                        &mut new_messages,
+                    );
+                    continue;
                 }
             }
 
@@ -972,6 +999,28 @@ impl Agent {
         }
     }
 
+    fn lane_for_tool(
+        &self,
+        name: &str,
+        class: crate::permission::ToolClass,
+    ) -> crate::scheduler::ToolLane {
+        match &self.runtime {
+            Some(runtime) => {
+                let capability = runtime.capability_registry.get(name);
+                crate::scheduler::lane_for_capability(capability.as_ref(), name, class)
+            }
+            None => crate::scheduler::lane_for(name, class),
+        }
+    }
+
+    fn replay_policy_for_tool(&self, name: &str) -> crate::runtime::ReplayPolicy {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capability_registry.get(name))
+            .map(|capability| capability.replay_policy)
+            .unwrap_or_else(|| crate::runtime::conservative_replay_policy(name))
+    }
+
     /// Stage one of a tool call. `depth` is 0 for a call the model made and
     /// 1 for an operation inside a `batch`.
     pub(crate) fn prepare_tool_call(
@@ -1000,8 +1049,9 @@ impl Agent {
                 false,
             );
         }
+        let replay_policy = self.replay_policy_for_tool(name);
         if let Ok(mut ledger) = self.tool_ledger.lock() {
-            match ledger.reserve_call(id, name, args) {
+            match ledger.reserve_call_with_policy(id, name, args, replay_policy) {
                 Err(collision_err) => {
                     return Preparation::Immediate(crate::ToolResult {
                         content: collision_err,
@@ -1016,13 +1066,20 @@ impl Agent {
                         details: Some(serde_json::json!({ "replayed_from_ledger": true })),
                     });
                 }
+                Ok(crate::tool_ledger::ReservationOutcome::ReplayBlocked(reason)) => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: reason,
+                        is_error: true,
+                        details: Some(serde_json::json!({ "replay_blocked": true })),
+                    });
+                }
                 Ok(crate::tool_ledger::ReservationOutcome::WaitForInFlight) => {
                     let class = self
                         .permissions
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
                         .class_of(name);
-                    let lane = crate::scheduler::lane_for(name, class);
+                    let lane = self.lane_for_tool(name, class);
                     return Preparation::Wait {
                         call_id: id.to_string(),
                         lane,
@@ -1090,17 +1147,10 @@ impl Agent {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .class_of(name);
-        // Optional task reads are built-in implementations, but are excluded
-        // from BUILTIN_TOOLS because that list also enables default tools.
-        let lane = if !crate::tools::BUILTIN_TOOLS.contains(&name)
-            && !matches!(name, "task_get" | "task_list")
-            && !name.starts_with("mcp__")
-        {
-            // An extension tool has state the runtime cannot see.
-            crate::scheduler::ToolLane::Serial
-        } else {
-            crate::scheduler::lane_for(name, class)
-        };
+        // Runtime metadata is authoritative when installed; unknown tools fail
+        // closed inside `lane_for_capability`. Without a runtime, the legacy
+        // class-based resolver still keeps unrecognized extensions serial.
+        let lane = self.lane_for_tool(name, class);
         Preparation::Ready { lane }
     }
 
@@ -1152,7 +1202,12 @@ impl Agent {
         }
 
         if let Ok(mut ledger) = self.tool_ledger.lock() {
-            match ledger.begin_execution(id, name, args) {
+            match ledger.begin_execution_with_policy(
+                id,
+                name,
+                args,
+                self.replay_policy_for_tool(name),
+            ) {
                 crate::tool_ledger::BeginOutcome::Collision(collision_err) => {
                     return crate::ToolResult {
                         content: collision_err,
@@ -1165,6 +1220,13 @@ impl Agent {
                         content: output,
                         is_error,
                         details: Some(serde_json::json!({ "replayed_from_ledger": true })),
+                    };
+                }
+                crate::tool_ledger::BeginOutcome::ReplayBlocked(reason) => {
+                    return crate::ToolResult {
+                        content: reason,
+                        is_error: true,
+                        details: Some(serde_json::json!({ "replay_blocked": true })),
                     };
                 }
                 crate::tool_ledger::BeginOutcome::WaitForInFlight => {
@@ -1396,6 +1458,12 @@ impl Agent {
             .and_then(|d| d.get("plan_storage_error"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let replayed = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("replayed_from_ledger"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let pre_hook_error = result.is_error;
         let pre_hook_result = result.clone();
         if !storage_failure {
@@ -1412,6 +1480,23 @@ impl Agent {
                     *details = serde_json::json!({});
                 }
                 details[key] = Value::Bool(true);
+            }
+        }
+        if !replayed {
+            if matches!(name, "write" | "edit" | "apply_patch" | "notebook_edit")
+                && !pre_hook_error
+                && !result.is_error
+            {
+                self.record_successful_mutation();
+            }
+            if matches!(name, "bash" | "powershell" | "exec_command") {
+                let cmd = args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if is_verification_command(cmd) {
+                    self.record_verification_result(!pre_hook_error && !result.is_error);
+                }
             }
         }
         let hook_vetoed = !pre_hook_error && result.is_error;
@@ -2207,7 +2292,7 @@ fn sleep_retry_delay(delay_ms: u64, cancelled: impl Fn() -> bool) {
     }
 }
 
-fn is_verification_command(cmd: &str) -> bool {
+pub(crate) fn is_verification_command(cmd: &str) -> bool {
     let lower = cmd.to_ascii_lowercase();
     lower.contains("cargo test")
         || lower.contains("cargo check")
@@ -3136,6 +3221,45 @@ mod tests {
             _ => panic!("unknown custom effects must fail closed under a hard contract"),
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn registered_extension_uses_authoritative_parallel_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("parallel extension fixture");
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        let mut capability = crate::RuntimeCapability::new(
+            "parallel_extension",
+            crate::CapabilitySource::JsExtension,
+            crate::ToolClass::Other,
+            false,
+            &serde_json::json!({"type": "object"}),
+            None,
+        );
+        capability.concurrency_policy = crate::ConcurrencyPolicy::ParallelSafe;
+        runtime.capability_registry.register(capability);
+        agent.set_runtime(runtime);
+        agent.tools = vec!["parallel_extension".into()];
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+        ));
+
+        assert!(matches!(
+            agent.prepare_tool_call(
+                dir.path(),
+                "parallel-extension",
+                "parallel_extension",
+                &serde_json::json!({}),
+                0,
+            ),
+            Preparation::Ready {
+                lane: crate::scheduler::ToolLane::Parallel
+            }
+        ));
     }
 
     fn f02_turn_question_fixture() -> (tempfile::TempDir, Agent, serde_json::Value) {

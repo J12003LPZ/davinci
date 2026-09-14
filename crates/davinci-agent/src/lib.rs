@@ -54,7 +54,10 @@ pub use compaction::{
     DEFAULT_RESERVE_TOKENS, SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT,
     TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
-pub use context::{load_context_files, ContextFile};
+pub use context::{
+    load_context_files, ContextBudgetReport, ContextContribution, ContextFile, ContextPriority,
+    RootContextAccount,
+};
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
 pub use file_mutation_queue::{mutation_queue_key, with_file_mutation_queue};
@@ -79,7 +82,7 @@ pub use prompt::{
 pub use prompt::{PreparedTurnPrompt, PromptProfile};
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
-pub use scheduler::{lane_for, ToolLane, MAX_TOOL_PARALLELISM};
+pub use scheduler::{lane_for, lane_for_capability, ToolLane, MAX_TOOL_PARALLELISM};
 pub use skills::{
     describe_skill, discover_skills, expand_skill_command, expand_user_text,
     expand_user_text_with_metadata, ExpandedUserText, Skill, SkillDescriptor,
@@ -98,7 +101,8 @@ pub mod living_plan;
 pub use living_plan::{LivingPlan, PLAN_ENTRY_TYPE};
 pub use todo::{TodoItem, TodoList, TodoStatus, TODO_ENTRY_TYPE};
 pub use tool_ledger::{
-    classify_side_effect, ToolCallLedger, ToolCallRecord, ToolExecutionStatus, ToolSideEffect,
+    classify_side_effect, AttemptOutcome, RecoveryAction, ToolCallLedger, ToolCallRecord,
+    ToolExecutionStatus, ToolSideEffect,
 };
 pub use tools::{
     decision_wait, execute_tool, execute_tool_with, tool_specs, validate_builtin_tool_descriptions,
@@ -117,17 +121,18 @@ pub use prompt::{
 
 pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
 pub use runtime::{
-    contract_gate, effect_profile_allows, find_saved_workflow, hash_system_prompt,
-    hash_system_prompt_with_manifest, hash_tool_names, normalize_relative_path, path_scope_allows,
-    save_workflow_to_project, wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState,
-    CacheIdentity, CacheMissReason, CancellationToken, CapabilitySource, ContextBroker,
-    ContextItem, ContextPacket, ContextRequest, ContextSource, ContractError, ContractExecutor,
-    DeclaredEffect, ExecutionError, ExecutorCapabilities, PhaseStatus, PreparedAction,
-    RegistryError, RunId, RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry,
-    RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry,
-    RuntimeSubscriber, ScopeViolation, TaskContract, TaskError, TaskId, TaskRecord, TaskRegistry,
-    TaskState, WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore, WorkflowStatus,
-    WorktreeError, WorktreeLease, WorktreeManager,
+    conservative_replay_policy, contract_gate, default_execution_policies, effect_profile_allows,
+    find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
+    normalize_relative_path, path_scope_allows, save_workflow_to_project, wrap_untrusted_data,
+    AgentId, AgentKind, AgentRecord, AgentState, CacheIdentity, CacheMissReason, CancellationToken,
+    CapabilitySource, ConcurrencyPolicy, ContextBroker, ContextItem, ContextPacket, ContextRequest,
+    ContextSource, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
+    ExecutorCapabilities, OutputPolicy, PhaseStatus, PreparedAction, RegistryError, ReplayPolicy,
+    RunId, RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent,
+    RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, ScopeViolation,
+    TaskContract, TaskError, TaskId, TaskRecord, TaskRegistry, TaskState, ToolExposureState,
+    WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore, WorkflowStatus, WorktreeError,
+    WorktreeLease, WorktreeManager,
 };
 
 use davinci_ai::{
@@ -208,6 +213,26 @@ impl CustomToolExecutor {
 pub enum ToolExecutionMode {
     Sequential,
     Parallel,
+}
+
+/// Lifecycle evidence for mutations and the verification commands that follow
+/// them. A verification attempt is associated with the current generation so
+/// a later mutation cannot inherit an earlier success.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationVerificationState {
+    pub mutation_generation: u64,
+    pub verified_generation: Option<u64>,
+    pub last_verification_succeeded: bool,
+}
+
+/// Evidence available when a coding turn reaches a normal stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionEvidence {
+    Verified,
+    Unverified,
+    VerificationFailed,
+    NotRequired,
 }
 
 #[derive(Debug, Clone)]
@@ -293,14 +318,18 @@ pub struct Agent {
     visual_verification_available: bool,
     /// Typed lifecycle evidence for the currently prepared real user turn.
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
+    /// Mutation generations and verification evidence for the current run.
+    mutation_verification: Arc<Mutex<MutationVerificationState>>,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
     /// Context supplied by extensions for the next provider request only.
     /// These messages never enter the persisted session history.
     ephemeral_context: Vec<ChatMessage>,
-    /// Host-supplied schema/identity estimate, excluding `system_prompt` and messages.
+    /// Host-supplied schema estimate, excluding the system prompt and messages.
     provider_context_overhead_tokens: Option<u64>,
+    /// Request-local suffix appended to the current prompt after repository context.
+    provider_system_prompt_suffix: Option<String>,
     /// Last prepared context manifest before provider dispatch.
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
@@ -330,7 +359,7 @@ impl Agent {
             let session = prompt::PromptSessionState::custom(system_prompt.clone());
             (None, system_prompt, session)
         };
-        Self {
+        let agent = Self {
             system_prompt: system_prompt.clone(),
             prompt_manifest,
             prompt_session,
@@ -392,15 +421,34 @@ impl Agent {
             previous_plan_revision: None,
             visual_verification_available: false,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
+            mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
             provider_context_overhead_tokens: None,
+            provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
             runtime: None,
             runtime_session: None,
-        }
+        };
+        *agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ToolExposureState::new([
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "exec_command",
+            "apply_patch",
+            "update_plan",
+            "agent",
+            "tool_search",
+        ]);
+        agent.sync_tool_authorization();
+        agent
     }
 
     pub fn new_builtin(profile: prompt::PromptProfile) -> Self {
@@ -524,6 +572,59 @@ impl Agent {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    /// Return a read-only snapshot of mutation and verification evidence.
+    pub fn mutation_verification_state(&self) -> MutationVerificationState {
+        self.mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    /// Classify whether the current run has evidence for its latest mutation.
+    pub fn completion_evidence(&self) -> CompletionEvidence {
+        let state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if state.mutation_generation == 0 {
+            return CompletionEvidence::NotRequired;
+        }
+
+        match state.verified_generation {
+            Some(generation) if generation == state.mutation_generation => {
+                if state.last_verification_succeeded {
+                    CompletionEvidence::Verified
+                } else {
+                    CompletionEvidence::VerificationFailed
+                }
+            }
+            _ => CompletionEvidence::Unverified,
+        }
+    }
+
+    /// Invalidate any earlier verification after a successful mutation.
+    pub(crate) fn record_successful_mutation(&self) {
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.mutation_generation = state.mutation_generation.saturating_add(1);
+        state.verified_generation = None;
+        state.last_verification_succeeded = false;
+    }
+
+    /// Record the result of a recognized verification command for the current
+    /// mutation generation. The generation is retained for failed attempts so
+    /// completion can distinguish failure from no verification at all.
+    pub(crate) fn record_verification_result(&self, succeeded: bool) {
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.verified_generation = Some(state.mutation_generation);
+        state.last_verification_succeeded = succeeded;
     }
 
     fn reset_capability_run_state(
@@ -902,9 +1003,9 @@ impl Agent {
                 .plan_provider_context()
                 .map(|text| (text.len() as u64).div_ceil(4))
                 .unwrap_or(0)
-            + (self.system_prompt.len() as u64).div_ceil(4)
+            + (self.provider_system_prompt().len() as u64).div_ceil(4)
             + self.provider_context_overhead_tokens.unwrap_or_else(|| {
-                let specs = self.builtin_and_mcp_specs();
+                let specs = self.provider_tool_specs();
                 (serde_json::to_vec(&specs)
                     .expect("tool schemas are JSON")
                     .len() as u64)
@@ -912,10 +1013,28 @@ impl Agent {
             })
     }
 
-    /// Set once per request configuration using the actual tool catalog and
-    /// any host-added system suffix. `None` restores the builtin/MCP estimate.
+    /// Set once per request configuration using the actual tool catalog.
+    /// `None` restores the builtin/MCP estimate.
     pub fn set_provider_context_overhead_tokens(&mut self, tokens: Option<u64>) {
         self.provider_context_overhead_tokens = tokens;
+    }
+
+    /// Record host-owned request context that follows the mutable turn prompt.
+    pub fn set_provider_system_prompt_suffix(&mut self, suffix: Option<String>) {
+        self.provider_system_prompt_suffix = suffix;
+    }
+
+    /// Build the exact system prompt for the next provider request.
+    pub fn provider_system_prompt(&self) -> String {
+        let mut prompt = self.system_prompt.clone();
+        context::append_repository_context(&mut prompt, &self.context_files);
+        if let Some(suffix) = self.provider_system_prompt_suffix.as_deref() {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(suffix);
+        }
+        prompt
     }
 
     /// Captures the complete prepared provider context manifest.
@@ -932,8 +1051,9 @@ impl Agent {
         let mut entries = Vec::new();
 
         // 1. Mandatory system prompt
-        let sys_tokens = (self.system_prompt.len() as u64).div_ceil(4);
-        let sys_hash = ContextManifestEntry::hash_content(&self.system_prompt);
+        let provider_system_prompt = self.provider_system_prompt();
+        let sys_tokens = (provider_system_prompt.len() as u64).div_ceil(4);
+        let sys_hash = ContextManifestEntry::hash_content(&provider_system_prompt);
         entries.push(ContextManifestEntry::new(
             "system_prompt",
             "system",
@@ -949,19 +1069,17 @@ impl Agent {
         ));
 
         // 2. Mandatory tool schemas
-        let tool_tokens = self.provider_context_overhead_tokens.unwrap_or_else(|| {
-            let specs = self.builtin_and_mcp_specs();
-            (serde_json::to_vec(&specs)
-                .expect("tool schemas are JSON")
-                .len() as u64)
-                .div_ceil(4)
-        });
+        let provider_tool_schemas = serde_json::to_string(&self.provider_tool_schema_value())
+            .expect("provider tool schemas are JSON");
+        let tool_tokens = self
+            .provider_context_overhead_tokens
+            .unwrap_or_else(|| (provider_tool_schemas.len() as u64).div_ceil(4));
         entries.push(ContextManifestEntry::new(
             "tool_schemas",
             "tools",
             ProvenanceKind::MandatoryPolicy,
             "agent::tool_catalog",
-            ContextManifestEntry::hash_content(&self.tools.join(",")),
+            ContextManifestEntry::hash_content(&provider_tool_schemas),
             tool_tokens,
             true,
             Some("mandatory_tool_schemas".into()),
@@ -1451,6 +1569,189 @@ impl Agent {
         specs
     }
 
+    /// Synchronize the shared authorization view with the agent's active tool set.
+    pub fn sync_tool_authorization(&self) {
+        let authorized: std::collections::BTreeSet<String> = self.tools.iter().cloned().collect();
+        *self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = authorized.clone();
+        self.tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain_authorized(&authorized);
+    }
+
+    /// Expose every currently active, authorized tool for an explicit tool selection.
+    pub fn expose_active_tools(&self) {
+        self.sync_tool_authorization();
+        let authorized = self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut exposure = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for name in &self.tools {
+            exposure.activate_authorized(name, authorized.contains(name));
+        }
+    }
+
+    pub fn is_tool_visible(&self, name: &str) -> bool {
+        self.tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_visible(name)
+    }
+
+    pub fn visible_tool_names(&self) -> std::collections::BTreeSet<String> {
+        self.tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .visible_names()
+            .clone()
+    }
+
+    /// Build the provider schema set from the current exposed view.
+    pub fn provider_tool_specs(&self) -> Vec<AgentTool> {
+        self.sync_tool_authorization();
+        let visible = self.visible_tool_names();
+        let mut specs: Vec<AgentTool> = self
+            .builtin_and_mcp_specs()
+            .into_iter()
+            .filter(|tool| visible.contains(&tool.name))
+            .collect();
+        let mut known: std::collections::BTreeSet<String> =
+            specs.iter().map(|tool| tool.name.clone()).collect();
+
+        if let Some(runtime) = &self.runtime {
+            for capability in runtime.capability_registry.list() {
+                if !visible.contains(&capability.name)
+                    || known.contains(&capability.name)
+                    || capability.schema.is_none()
+                {
+                    continue;
+                }
+                let Some(parameters) = capability.schema.clone() else {
+                    continue;
+                };
+                known.insert(capability.name.clone());
+                specs.push(AgentTool {
+                    name: capability.name,
+                    description: capability.description,
+                    parameters,
+                });
+            }
+        }
+
+        specs
+    }
+
+    pub fn provider_tool_schema_identity(&self) -> String {
+        runtime::compute_schema_hash(&self.provider_tool_schema_value())
+    }
+
+    fn provider_tool_schema_value(&self) -> Value {
+        Value::Array(
+            self.provider_tool_specs()
+                .into_iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Account for the normal/root provider request without changing its prompt.
+    pub fn root_context_budget_report(&self, budget: u64) -> ContextBudgetReport {
+        let mut account = RootContextAccount::default();
+        account.add(
+            "system_prompt",
+            self.system_prompt.clone(),
+            true,
+            ContextPriority::Mandatory,
+        );
+        if let Some(suffix) = self.provider_system_prompt_suffix.as_ref() {
+            account.add(
+                "provider_system_prompt_suffix",
+                suffix.clone(),
+                false,
+                ContextPriority::Mandatory,
+            );
+        }
+        for file in &self.context_files {
+            account.add(
+                format!("repository_instruction::{}", file.name),
+                file.body.clone(),
+                true,
+                ContextPriority::Mandatory,
+            );
+        }
+        account.add(
+            "provider_tool_schemas",
+            serde_json::to_string(&self.provider_tool_schema_value()).unwrap_or_default(),
+            true,
+            ContextPriority::Mandatory,
+        );
+        for skill in &self.skills {
+            account.add(
+                format!("skill::{}", skill.name),
+                skill.body.clone(),
+                true,
+                ContextPriority::Deferred,
+            );
+        }
+        for template in &self.templates {
+            account.add(
+                format!("prompt_template::{}", template.name),
+                template.body.clone(),
+                true,
+                ContextPriority::Deferred,
+            );
+        }
+
+        let messages = self.messages_for_provider();
+        let latest_user = messages.iter().rposition(|message| message.role == "user");
+        for (index, message) in messages.iter().enumerate() {
+            let body = serde_json::to_string(message).unwrap_or_default();
+            let priority = if Some(index) == latest_user {
+                ContextPriority::Mandatory
+            } else {
+                ContextPriority::Important
+            };
+            account.add(format!("conversation::{index}"), body, false, priority);
+        }
+
+        if let Some(contract) = self
+            .tool_context
+            .active_contract
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            account.add(
+                "active_task_contract",
+                serde_json::to_string(contract).unwrap_or_default(),
+                false,
+                ContextPriority::Mandatory,
+            );
+        }
+
+        account.report_for_budget(budget)
+    }
+
     pub fn apply_extension_tools(&mut self, names: &[String]) {
         for name in names {
             if !self.tool_registry.contains(name) {
@@ -1460,6 +1761,7 @@ impl Agent {
                 self.tools.push(name.clone());
             }
         }
+        self.sync_tool_authorization();
     }
 
     /// TS `setActiveToolsByName` — only registry names are enabled; unknown names ignored.
@@ -1469,6 +1771,7 @@ impl Agent {
             .filter(|name| self.tool_registry.iter().any(|known| known == *name))
             .cloned()
             .collect();
+        self.expose_active_tools();
     }
 
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
@@ -2527,18 +2830,68 @@ mod tests {
     fn context_budget_counts_system_and_active_tool_schemas() {
         let mut agent = Agent::new("");
         agent.tools.clear();
+        agent.expose_active_tools();
         let empty = agent.estimated_context_tokens();
         agent.system_prompt = "x".repeat(4_000);
         assert!(agent.estimated_context_tokens() >= empty + 1_000);
         let without_tools = agent.estimated_context_tokens();
         agent.tools.push("read".into());
+        agent.expose_active_tools();
         assert!(agent.estimated_context_tokens() > without_tools);
         agent.tools.clear();
+        agent.expose_active_tools();
         assert_eq!(agent.estimated_context_tokens(), without_tools);
         agent.set_provider_context_overhead_tokens(Some(3_000));
         assert_eq!(agent.estimated_context_tokens(), 4_000);
         agent.set_provider_context_overhead_tokens(None);
         assert_eq!(agent.estimated_context_tokens(), without_tools);
+    }
+
+    #[test]
+    fn context_budget_counts_only_provider_visible_tool_schemas() {
+        let agent = Agent::new("");
+        let provider_schema_tokens = (serde_json::to_vec(&agent.provider_tool_specs())
+            .unwrap()
+            .len() as u64)
+            .div_ceil(4);
+
+        assert_eq!(agent.estimated_context_tokens(), provider_schema_tokens);
+    }
+
+    #[test]
+    fn context_manifest_describes_only_provider_visible_tool_schemas() {
+        let mut agent = Agent::new("");
+        let provider_schema = serde_json::to_string(&agent.provider_tool_schema_value()).unwrap();
+        let expected_tokens = (provider_schema.len() as u64).div_ceil(4);
+        let expected_hash =
+            runtime::context_manifest::ContextManifestEntry::hash_content(&provider_schema);
+
+        let manifest = agent.prepare_context_manifest("request", RunId::new(), 1, 1);
+        let tool_schemas = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.id == "tool_schemas")
+            .unwrap();
+
+        assert_eq!(tool_schemas.token_estimate, expected_tokens);
+        assert_eq!(tool_schemas.content_hash, expected_hash);
+    }
+
+    #[test]
+    fn root_context_report_includes_provider_system_suffix() {
+        let mut agent = Agent::new("base");
+        agent.set_provider_system_prompt_suffix(Some("runtime identity".into()));
+
+        let report = agent.root_context_budget_report(u64::MAX);
+        let suffix = report
+            .contributions
+            .iter()
+            .find(|entry| entry.source == "provider_system_prompt_suffix")
+            .unwrap();
+
+        assert!(!suffix.stable);
+        assert_eq!(suffix.priority, ContextPriority::Mandatory);
+        assert!(suffix.selected);
     }
 
     #[test]
@@ -4298,6 +4651,173 @@ mod tests {
         agent.set_active_tools_by_name(&["bash".into(), "read".into()]);
         assert_eq!(agent.tools, vec!["bash".to_string(), "read".to_string()]);
         assert!(agent.tool_registry.contains(&"ticket".into()));
+    }
+
+    #[test]
+    fn mutation_without_verification_requests_evidence() {
+        let agent = Agent::new("x");
+
+        agent.record_successful_mutation();
+
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+
+    #[test]
+    fn mutation_then_successful_verification_is_verified() {
+        let agent = Agent::new("x");
+
+        agent.record_successful_mutation();
+        agent.record_verification_result(true);
+
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    }
+
+    #[test]
+    fn later_mutation_invalidates_previous_verification() {
+        let agent = Agent::new("x");
+
+        agent.record_successful_mutation();
+        agent.record_verification_result(true);
+        agent.record_successful_mutation();
+
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+
+    #[test]
+    fn read_only_turn_does_not_require_verification() {
+        let agent = Agent::new("x");
+
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::NotRequired);
+    }
+
+    #[test]
+    fn tool_search_activates_authorized_deferred_schema() {
+        let mut agent = Agent::new("x");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+
+        assert!(!agent
+            .provider_tool_specs()
+            .iter()
+            .any(|tool| tool.name == "web_search"));
+
+        let result = execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        let activated = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("activated"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+
+        assert!(activated.iter().any(|name| name == "web_search"));
+        assert!(agent
+            .provider_tool_specs()
+            .iter()
+            .any(|tool| tool.name == "web_search"));
+    }
+
+    #[test]
+    fn tool_search_cannot_activate_denied_tool() {
+        let mut agent = Agent::new("x");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.set_active_tools_by_name(&["read".into(), "tool_search".into()]);
+        agent.sync_tool_authorization();
+
+        let result = execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        let activated = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("activated"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+
+        assert!(!activated.iter().any(|name| name == "web_search"));
+        assert!(!agent
+            .provider_tool_specs()
+            .iter()
+            .any(|tool| tool.name == "web_search"));
+    }
+
+    #[test]
+    fn tool_activation_changes_schema_identity_once() {
+        let mut agent = Agent::new("x");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        let before = agent.provider_tool_schema_identity();
+
+        execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        let after = agent.provider_tool_schema_identity();
+        assert_ne!(before, after);
+
+        execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        assert_eq!(after, agent.provider_tool_schema_identity());
+    }
+
+    #[test]
+    fn deferred_root_schema_ablation_reports_serialized_reduction() {
+        let mut agent = Agent::new("x");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+
+        let deferred = serde_json::to_vec(&agent.provider_tool_specs()).unwrap();
+        let deferred_names = agent.visible_tool_names();
+        agent.expose_active_tools();
+        let full = serde_json::to_vec(&agent.provider_tool_specs()).unwrap();
+        let full_names = agent.visible_tool_names();
+
+        assert!(full.len() > deferred.len());
+        assert!(deferred_names.is_subset(&full_names));
+        assert!(
+            deferred.len() * 100 <= full.len() * 70,
+            "deferred schemas must save at least 30%: deferred={}, full={}",
+            deferred.len(),
+            full.len()
+        );
+        println!(
+            "schema_ab deferred_tools={} full_tools={} deferred_bytes={} full_bytes={} withheld_bytes={}",
+            deferred_names.len(),
+            full_names.len(),
+            deferred.len(),
+            full.len(),
+            full.len().saturating_sub(deferred.len())
+        );
     }
 
     #[test]

@@ -385,8 +385,15 @@ impl NativeExtensionHost {
         self.learning.cancel_active_review();
     }
 
-    pub fn record_skill_outcome(&mut self, name: &str, outcome: SkillOutcome) {
-        let _ = self.learning.record_skill_outcome(name, outcome);
+    pub fn record_skill_outcome_for_content_hash(
+        &mut self,
+        name: &str,
+        content_hash: &str,
+        outcome: SkillOutcome,
+    ) {
+        let _ = self
+            .learning
+            .record_skill_outcome_for_content_hash(name, content_hash, outcome);
     }
 
     pub fn set_learning_project_trusted(&mut self, trusted: bool) {
@@ -465,7 +472,7 @@ impl NativeExtensionHost {
             ),
             "retrieve_output" => (
                 "Retrieve a lossless full or ranged tool output saved by token governor.",
-                json!({"type":"object","properties":{"id":{"type":"string","pattern":"^out-[0-9a-f]{12}$"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1},"grep":{"type":"string"}},"required":["id"]}),
+                json!({"type":"object","properties":{"id":{"type":"string","pattern":"^out-[0-9a-f]{12}$"},"startLine":{"type":"integer","minimum":1},"lineByteOffset":{"type":"integer","minimum":0},"endLine":{"type":"integer","minimum":1},"grep":{"type":"string"}},"required":["id"]}),
             ),
             "graph_status" => (
                 "Inspect the active and recent graph runs in this project.",

@@ -47,8 +47,10 @@ pub use cache::{
 };
 pub use cancellation::CancellationToken;
 pub use capabilities::{
-    builtin_capabilities, compute_schema_hash, default_declared_effects, CapabilitySource,
-    DeclaredEffect, PreparedAction, RuntimeCapability, RuntimeCapabilityRegistry,
+    builtin_capabilities, compute_schema_hash, conservative_replay_policy,
+    default_declared_effects, default_execution_policies, CapabilitySource, ConcurrencyPolicy,
+    DeclaredEffect, OutputPolicy, PreparedAction, ReplayPolicy, RuntimeCapability,
+    RuntimeCapabilityRegistry, ToolExposureState,
 };
 pub use checkpoints::{
     may_mutate_with_checkpoint, BlobStore, CheckpointError, CheckpointRef, FileCapture,

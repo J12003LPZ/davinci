@@ -4,7 +4,7 @@
 //! inspect verified tool metadata, enforce least-privilege scoping deterministically, and compute
 //! provider-safe prompt-cache keys using capability schema/version hashes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,157 @@ impl std::fmt::Display for CapabilitySource {
             CapabilitySource::Mcp => write!(f, "mcp"),
         }
     }
+}
+
+/// Whether calls may share a scheduler lane with adjacent calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrencyPolicy {
+    ParallelSafe,
+    SerialBarrier,
+}
+
+impl Default for ConcurrencyPolicy {
+    fn default() -> Self {
+        Self::SerialBarrier
+    }
+}
+
+/// Whether a terminal result may be replayed automatically after recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayPolicy {
+    SafeToReplay,
+    ReconcileBeforeReplay,
+    NeverAutoReplay,
+}
+
+impl Default for ReplayPolicy {
+    fn default() -> Self {
+        Self::NeverAutoReplay
+    }
+}
+
+/// Whether a tool result may enter the Governor's compressible output path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputPolicy {
+    Normal,
+    Compressible,
+    LosslessRequired,
+}
+
+impl Default for OutputPolicy {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+/// Return conservative execution properties for a capability at registration
+/// time. Unknown names remain serial, non-replayable, and uncompressed.
+pub fn default_execution_policies(
+    name: &str,
+    _source: CapabilitySource,
+    read_only: bool,
+    tool_class: ToolClass,
+) -> (ConcurrencyPolicy, ReplayPolicy, OutputPolicy) {
+    if name == "agent" {
+        return (
+            ConcurrencyPolicy::ParallelSafe,
+            ReplayPolicy::NeverAutoReplay,
+            OutputPolicy::Normal,
+        );
+    }
+
+    if matches!(name, "web_search" | "web_fetch") {
+        return (
+            ConcurrencyPolicy::ParallelSafe,
+            ReplayPolicy::ReconcileBeforeReplay,
+            OutputPolicy::Compressible,
+        );
+    }
+
+    if matches!(name, "tool_search") {
+        return (
+            ConcurrencyPolicy::ParallelSafe,
+            ReplayPolicy::SafeToReplay,
+            OutputPolicy::Normal,
+        );
+    }
+
+    if matches!(
+        name,
+        "bash"
+            | "powershell"
+            | "exec_command"
+            | "write_stdin"
+            | "write"
+            | "edit"
+            | "apply_patch"
+            | "notebook_edit"
+            | "todo"
+            | "update_plan"
+            | "batch"
+            | "propose_plan"
+            | "ask_user_question"
+            | "job_kill"
+            | "agent_message"
+            | "agent_stop"
+            | "task_create"
+            | "task_update"
+    ) {
+        return (
+            ConcurrencyPolicy::SerialBarrier,
+            if matches!(name, "write" | "edit" | "apply_patch" | "notebook_edit") {
+                ReplayPolicy::ReconcileBeforeReplay
+            } else {
+                ReplayPolicy::NeverAutoReplay
+            },
+            if matches!(name, "bash" | "powershell" | "exec_command" | "write_stdin") {
+                OutputPolicy::LosslessRequired
+            } else {
+                OutputPolicy::Normal
+            },
+        );
+    }
+
+    if matches!(
+        name,
+        "read" | "grep" | "find" | "ls" | "mcp_read" | "job_output"
+    ) || (read_only && matches!(tool_class, ToolClass::Read | ToolClass::Network))
+    {
+        return (
+            ConcurrencyPolicy::ParallelSafe,
+            ReplayPolicy::SafeToReplay,
+            OutputPolicy::Compressible,
+        );
+    }
+
+    if matches!(tool_class, ToolClass::Edit | ToolClass::Shell) {
+        return (
+            ConcurrencyPolicy::SerialBarrier,
+            ReplayPolicy::NeverAutoReplay,
+            OutputPolicy::Normal,
+        );
+    }
+
+    (
+        ConcurrencyPolicy::SerialBarrier,
+        ReplayPolicy::NeverAutoReplay,
+        OutputPolicy::Normal,
+    )
+}
+
+/// Conservative fallback used when a runtime registry has no record for a
+/// tool. It intentionally does not infer safety from an untrusted name.
+pub fn conservative_replay_policy(name: &str) -> ReplayPolicy {
+    default_execution_policies(
+        name,
+        CapabilitySource::NativeExtension,
+        false,
+        ToolClass::Other,
+    )
+    .1
 }
 
 /// Declared execution effect of a tool capability.
@@ -144,7 +295,17 @@ pub struct RuntimeCapability {
     pub schema_hash: String,
     pub version: Option<String>,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+    #[serde(default)]
     pub declared_effects: Vec<DeclaredEffect>,
+    #[serde(default)]
+    pub concurrency_policy: ConcurrencyPolicy,
+    #[serde(default)]
+    pub replay_policy: ReplayPolicy,
+    #[serde(default)]
+    pub output_policy: OutputPolicy,
 }
 
 impl RuntimeCapability {
@@ -158,6 +319,8 @@ impl RuntimeCapability {
     ) -> Self {
         let name_str = name.into();
         let declared_effects = default_declared_effects(&name_str, tool_class);
+        let (concurrency_policy, replay_policy, output_policy) =
+            default_execution_policies(&name_str, source, read_only, tool_class);
         Self {
             name: name_str,
             source,
@@ -165,7 +328,12 @@ impl RuntimeCapability {
             read_only,
             schema_hash: compute_schema_hash(schema),
             version,
+            description: String::new(),
+            schema: Some(schema.clone()),
             declared_effects,
+            concurrency_policy,
+            replay_policy,
+            output_policy,
         }
     }
 
@@ -179,6 +347,8 @@ impl RuntimeCapability {
     ) -> Self {
         let name_str = name.into();
         let declared_effects = default_declared_effects(&name_str, tool_class);
+        let (concurrency_policy, replay_policy, output_policy) =
+            default_execution_policies(&name_str, source, read_only, tool_class);
         Self {
             name: name_str,
             source,
@@ -186,13 +356,62 @@ impl RuntimeCapability {
             read_only,
             schema_hash: schema_hash.into(),
             version,
+            description: String::new(),
+            schema: None,
             declared_effects,
+            concurrency_policy,
+            replay_policy,
+            output_policy,
         }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
     }
 
     pub fn with_declared_effects(mut self, effects: Vec<DeclaredEffect>) -> Self {
         self.declared_effects = effects;
         self
+    }
+}
+
+/// Provider-facing visibility for schemas that are authorized but initially deferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExposureState {
+    visible: BTreeSet<String>,
+}
+
+impl ToolExposureState {
+    pub fn new<I, S>(initial: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            visible: initial.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn is_visible(&self, name: &str) -> bool {
+        self.visible.contains(name)
+    }
+
+    pub fn activate_authorized(&mut self, name: &str, authorized: bool) -> bool {
+        if authorized {
+            self.visible.insert(name.to_string())
+        } else {
+            self.visible.remove(name);
+            false
+        }
+    }
+
+    pub fn retain_authorized(&mut self, authorized: &BTreeSet<String>) {
+        self.visible.retain(|name| authorized.contains(name));
+    }
+
+    pub fn visible_names(&self) -> &BTreeSet<String> {
+        &self.visible
     }
 }
 
@@ -212,17 +431,15 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
         .map(|tool| {
             let class = tool_class(&tool.name);
             let read_only = matches!(class, ToolClass::Read | ToolClass::Network);
-            let schema_hash = compute_schema_hash(&tool.parameters);
-            let declared_effects = default_declared_effects(&tool.name, class);
-            RuntimeCapability {
-                name: tool.name,
-                source: CapabilitySource::Builtin,
-                tool_class: class,
+            RuntimeCapability::new(
+                tool.name,
+                CapabilitySource::Builtin,
+                class,
                 read_only,
-                schema_hash,
-                version: Some(format!("builtin-{}", env!("CARGO_PKG_VERSION"))),
-                declared_effects,
-            }
+                &tool.parameters,
+                Some(format!("builtin-{}", env!("CARGO_PKG_VERSION"))),
+            )
+            .with_description(tool.description)
         })
         .collect()
 }
@@ -440,5 +657,90 @@ mod tests {
         registry.register(cap1_v2);
         let hash3 = registry.hash_tool_capabilities(&["test_tool"]);
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn representative_tools_have_consistent_execution_metadata() {
+        let registry = RuntimeCapabilityRegistry::with_builtins();
+        registry.register(RuntimeCapability::new(
+            "mcp__memory__echo",
+            CapabilitySource::Mcp,
+            ToolClass::Read,
+            true,
+            &json!({"type": "object"}),
+            None,
+        ));
+
+        let cases = [
+            (
+                "read",
+                ConcurrencyPolicy::ParallelSafe,
+                ReplayPolicy::SafeToReplay,
+                OutputPolicy::Compressible,
+            ),
+            (
+                "edit",
+                ConcurrencyPolicy::SerialBarrier,
+                ReplayPolicy::ReconcileBeforeReplay,
+                OutputPolicy::Normal,
+            ),
+            (
+                "exec_command",
+                ConcurrencyPolicy::SerialBarrier,
+                ReplayPolicy::NeverAutoReplay,
+                OutputPolicy::LosslessRequired,
+            ),
+            (
+                "web_search",
+                ConcurrencyPolicy::ParallelSafe,
+                ReplayPolicy::ReconcileBeforeReplay,
+                OutputPolicy::Compressible,
+            ),
+            (
+                "tool_search",
+                ConcurrencyPolicy::ParallelSafe,
+                ReplayPolicy::SafeToReplay,
+                OutputPolicy::Normal,
+            ),
+            (
+                "agent",
+                ConcurrencyPolicy::ParallelSafe,
+                ReplayPolicy::NeverAutoReplay,
+                OutputPolicy::Normal,
+            ),
+            (
+                "mcp__memory__echo",
+                ConcurrencyPolicy::ParallelSafe,
+                ReplayPolicy::SafeToReplay,
+                OutputPolicy::Compressible,
+            ),
+        ];
+
+        for (name, concurrency, replay, output) in cases {
+            let capability = registry.get(name).unwrap();
+            assert_eq!(capability.concurrency_policy, concurrency, "{name}");
+            assert_eq!(capability.replay_policy, replay, "{name}");
+            assert_eq!(capability.output_policy, output, "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_tool_defaults_to_serial_nonreplayable_mutation() {
+        let capability = RuntimeCapability::with_raw_hash(
+            "unknown_tool",
+            CapabilitySource::NativeExtension,
+            ToolClass::Other,
+            false,
+            "unknown",
+            None,
+        );
+
+        assert!(!capability.read_only);
+        assert_eq!(
+            capability.concurrency_policy,
+            ConcurrencyPolicy::SerialBarrier
+        );
+        assert_eq!(capability.replay_policy, ReplayPolicy::NeverAutoReplay);
+        assert_eq!(capability.output_policy, OutputPolicy::Normal);
     }
 }

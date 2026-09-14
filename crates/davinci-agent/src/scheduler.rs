@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::permission::ToolClass;
+use crate::runtime::{ConcurrencyPolicy, RuntimeCapability};
 
 /// How many tool calls of one message run at once. Matches the reference
 /// subagent extension's `MAX_CONCURRENCY`-style cap: enough to hide I/O
@@ -53,6 +54,24 @@ pub fn lane_for(tool: &str, class: ToolClass) -> ToolLane {
             ToolClass::Read | ToolClass::Network => ToolLane::Parallel,
             ToolClass::Edit | ToolClass::Shell | ToolClass::Other => ToolLane::Serial,
         },
+    }
+}
+
+/// Resolve a scheduler lane from an authoritative runtime capability.
+/// Missing metadata fails closed; callers without a runtime registry can keep
+/// using [`lane_for`] for the legacy class-based behavior.
+pub fn lane_for_capability(
+    capability: Option<&RuntimeCapability>,
+    _tool: &str,
+    _class: ToolClass,
+) -> ToolLane {
+    match capability.map(|capability| capability.concurrency_policy) {
+        Some(ConcurrencyPolicy::ParallelSafe) => ToolLane::Parallel,
+        Some(ConcurrencyPolicy::SerialBarrier) => ToolLane::Serial,
+        // A runtime registry is authoritative when it is installed. A missing
+        // capability therefore cannot inherit the legacy class-based
+        // parallel lane and must fail closed.
+        None => ToolLane::Serial,
     }
 }
 

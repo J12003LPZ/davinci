@@ -146,6 +146,7 @@ impl McpRegistry {
                     &tool.parameters,
                     None,
                 )
+                .with_description(tool.description)
             })
             .collect()
     }

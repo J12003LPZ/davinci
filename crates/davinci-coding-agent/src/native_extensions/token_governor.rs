@@ -1139,6 +1139,15 @@ impl TokenGovernor {
             .and_then(Value::as_u64)
             .unwrap_or(1)
             .max(1) as usize;
+        let line_byte_offset = args
+            .get("lineByteOffset")
+            .and_then(Value::as_u64)
+            .map(|offset| {
+                usize::try_from(offset)
+                    .map_err(|_| ToolError::Failed("lineByteOffset is too large".into()))
+            })
+            .transpose()?
+            .unwrap_or(0);
         let end = args
             .get("endLine")
             .and_then(Value::as_u64)
@@ -1150,6 +1159,7 @@ impl TokenGovernor {
         let mut used = 0usize;
         let mut matched = 0usize;
         let mut stopped_at: Option<usize> = None;
+        let mut next_line_byte_offset: Option<usize> = None;
         for (index, line) in content.lines().enumerate() {
             let line_no = index + 1;
             if line_no < start {
@@ -1162,27 +1172,44 @@ impl TokenGovernor {
                 continue;
             }
             matched += 1;
-            let rendered = format!("{line_no}: {line}");
-            if selected.is_empty() && rendered.len() + 1 > budget {
+            let line_offset = if line_no == start {
+                line_byte_offset
+            } else {
+                0
+            };
+            if line_offset > line.len() || !line.is_char_boundary(line_offset) {
+                return Err(ToolError::Failed(format!(
+                    "lineByteOffset {line_offset} is not a valid UTF-8 boundary for line {line_no}"
+                )));
+            }
+            let rendered = format!("{line_no}: {}", &line[line_offset..]);
+            let rendered_bytes = rendered.len().saturating_add(1);
+            if selected.is_empty() && rendered_bytes > budget {
                 let prefix = format!("{line_no}: ");
-                let available = budget.saturating_sub(prefix.len() + 1);
-                selected.push(format!("{prefix}{}…", truncate_to_bytes(line, available)));
-                used = selected[0].len();
+                let available = budget.saturating_sub(prefix.len().saturating_add(1));
+                let fragment = truncate_to_bytes(&line[line_offset..], available);
+                if fragment.is_empty() {
+                    return Err(ToolError::Failed(
+                        "retrieve_max_bytes is too small to make cursor progress".into(),
+                    ));
+                }
+                selected.push(format!("{prefix}{fragment}…"));
                 stopped_at = Some(line_no);
+                next_line_byte_offset = Some(line_offset + fragment.len());
                 break;
             }
-            if used + rendered.len() + 1 > budget && !selected.is_empty() {
+            if used.saturating_add(rendered_bytes) > budget && !selected.is_empty() {
                 stopped_at = Some(line_no);
+                next_line_byte_offset = Some(0);
                 break;
             }
-            used += rendered.len() + 1;
+            used = used.saturating_add(rendered_bytes);
             selected.push(rendered);
         }
         let mut text = selected.join("\n");
         match stopped_at {
             Some(line_no) => text.push_str(&format!(
-                "\n\n[… stopped before line {line_no} of {total} to stay under {budget} bytes; call retrieve_output again with startLine {line_no}{}]",
-                end.map(|last| format!(" and endLine {last}")).unwrap_or_default()
+                "\n\n[… output truncated at line {line_no} of {total} to stay under {budget} bytes; see tokenGovernor.nextCursor for continuation]"
             )),
             None if matched == 0 => text.push_str(&match pattern {
                 Some(pattern) => format!("[no line of {id} matches \"{pattern}\" in that range; {total} lines total]"),
@@ -1190,15 +1217,22 @@ impl TokenGovernor {
             }),
             None => {}
         }
+        let mut governor_details = json!({
+            "outputId": id,
+            "totalLines": total,
+            "returnedLines": selected.len(),
+            "truncated": stopped_at.is_some(),
+        });
+        if let (Some(line_no), Some(line_byte_offset)) = (stopped_at, next_line_byte_offset) {
+            governor_details["nextCursor"] = json!({
+                "startLine": line_no,
+                "lineByteOffset": line_byte_offset,
+            });
+        }
         Ok(ToolResult {
             content: text,
             is_error: false,
-            details: Some(json!({"tokenGovernor": {
-                "outputId": id,
-                "totalLines": total,
-                "returnedLines": selected.len(),
-                "truncated": stopped_at.is_some(),
-            }})),
+            details: Some(json!({"tokenGovernor": governor_details})),
         })
     }
 
@@ -1588,13 +1622,12 @@ mod tests {
             .to_string();
         let page = governor.retrieve(&json!({"id": id})).unwrap();
         assert!(page.content.len() < 1_024 + 200, "{}", page.content.len());
-        assert!(page
-            .content
-            .contains("call retrieve_output again with startLine"));
-        assert_eq!(
-            page.details.as_ref().unwrap()["tokenGovernor"]["truncated"],
-            true
-        );
+        let page_details = &page.details.as_ref().unwrap()["tokenGovernor"];
+        assert_eq!(page_details["truncated"], true);
+        assert!(page_details["nextCursor"]["startLine"]
+            .as_u64()
+            .is_some_and(|line| line > 1));
+        assert_eq!(page_details["nextCursor"]["lineByteOffset"], 0);
         let filtered = governor
             .retrieve(&json!({"id": id, "grep": "row 0299"}))
             .unwrap();
@@ -1630,6 +1663,30 @@ mod tests {
             true
         );
         assert!(std::str::from_utf8(page.content.as_bytes()).is_ok());
+
+        let first_cursor = page.details.as_ref().unwrap()["tokenGovernor"]["nextCursor"].clone();
+        assert_eq!(first_cursor["startLine"], 1);
+        let first_offset = first_cursor["lineByteOffset"]
+            .as_u64()
+            .expect("oversized line should return a byte cursor");
+        assert!(first_offset > 0);
+
+        let next_page = governor
+            .retrieve(&json!({
+                    "id": id,
+                    "startLine": first_cursor["startLine"],
+                    "lineByteOffset": first_cursor["lineByteOffset"],
+            }))
+            .unwrap();
+        assert!(std::str::from_utf8(next_page.content.as_bytes()).is_ok());
+        assert_ne!(next_page.details, page.details);
+        if next_page.details.as_ref().unwrap()["tokenGovernor"]["truncated"] == true {
+            let second_cursor = &next_page.details.as_ref().unwrap()["tokenGovernor"]["nextCursor"];
+            assert_eq!(second_cursor["startLine"], 1);
+            assert!(second_cursor["lineByteOffset"]
+                .as_u64()
+                .is_some_and(|offset| offset > first_offset));
+        }
     }
 
     #[test]
@@ -1765,6 +1822,84 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(reconstructed, log);
+    }
+
+    #[test]
+    fn content_aware_ablation_reports_reversible_byte_measurement() {
+        let logs = (0..12)
+            .map(|task| {
+                (0..120)
+                    .map(|i| {
+                        if i == 60 + task {
+                            format!(
+                                "test auth_refresh_{task} ... FAILED\nassertion failed: expected 200 actual {}",
+                                401 + task
+                            )
+                        } else {
+                            format!("test task_{task}_case_{i} ... ok")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+
+        let run = |content_aware| {
+            let dir = tempdir().unwrap();
+            let config = TokenGovernorConfig {
+                compress_threshold_bytes: 1,
+                compress_threshold_lines: 1,
+                content_aware,
+                ..Default::default()
+            };
+            let mut governor = TokenGovernor::with_store(
+                format!("ablation-{content_aware}"),
+                config,
+                OutputStore::new(dir.path()),
+            );
+            let mut original_bytes = 0;
+            let mut view_bytes = 0;
+            let mut generic_views = 0;
+            let mut specialized_views = 0;
+            for (task, log) in logs.iter().enumerate() {
+                let args = json!({"command": format!("cargo test --task {task}")});
+                let result = governor.after_tool("bash", &args, ok(log));
+                let details = result.details.as_ref().unwrap()["tokenGovernor"].clone();
+                let id = details["outputId"].as_str().unwrap();
+                let recovered = governor.retrieve(&json!({"id": id})).unwrap().content;
+                let reconstructed = recovered
+                    .lines()
+                    .map(|line| line.split_once(": ").map(|(_, body)| body).unwrap_or(line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(reconstructed, *log);
+
+                original_bytes += details["originalBytes"].as_u64().unwrap();
+                view_bytes += details["viewBytes"].as_u64().unwrap();
+                match details["strategy"].as_str().unwrap() {
+                    "generic" => generic_views += 1,
+                    "specialized" => specialized_views += 1,
+                    strategy => panic!("unexpected governor strategy: {strategy}"),
+                }
+            }
+            println!(
+                "governor_ab tasks={} content_aware={content_aware} original_bytes={original_bytes} view_bytes={view_bytes} withheld_bytes={} generic_views={generic_views} specialized_views={specialized_views}",
+                logs.len(),
+                original_bytes.saturating_sub(view_bytes)
+            );
+            (view_bytes, generic_views, specialized_views)
+        };
+
+        let (generic_bytes, generic_views, generic_specialized_views) = run(false);
+        let (specialized_bytes, specialized_views, specialized_specialized_views) = run(true);
+        assert_eq!(generic_views, 12);
+        assert_eq!(generic_specialized_views, 0);
+        assert_eq!(specialized_views, 0);
+        assert_eq!(specialized_specialized_views, 12);
+        assert!(
+            specialized_bytes < generic_bytes,
+            "content-aware view should be smaller: specialized={specialized_bytes}, generic={generic_bytes}"
+        );
     }
 
     #[test]
