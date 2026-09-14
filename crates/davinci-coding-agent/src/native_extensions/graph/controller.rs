@@ -391,10 +391,7 @@ impl GraphExecution {
         }
     }
 
-    fn worker_spec(&self, task: &GraphTaskState, briefing: String) -> WorkerSpec {
-        let run = self.snapshot();
-        let role = task.role;
-        let configured_model = self.deps.config.models.get(&role).cloned();
+    fn authorized_worker_tools(&self, role: Role) -> Vec<String> {
         let mut tools = role_tools(role);
         // Match the worker-side role guard; do not advertise tools it must refuse.
         let has_coordinator_authority =
@@ -412,6 +409,18 @@ impl GraphExecution {
             );
         }
         ensure_governor_recovery_tool(&mut tools);
+        tools
+    }
+
+    fn worker_spec(
+        &self,
+        task: &GraphTaskState,
+        briefing: String,
+        tools: Vec<String>,
+    ) -> WorkerSpec {
+        let run = self.snapshot();
+        let role = task.role;
+        let configured_model = self.deps.config.models.get(&role).cloned();
         let has_recovery = tools.iter().any(|t| t == "retrieve_output");
         WorkerSpec {
             task_id: task.id.clone(),
@@ -603,7 +612,8 @@ impl GraphExecution {
             }
         }
 
-        let context_packet = {
+        let authorized_tools = self.authorized_worker_tools(role);
+        let capability_selection = {
             let guard = self
                 .learning
                 .lock()
@@ -615,18 +625,24 @@ impl GraphExecution {
                     } else {
                         &briefing
                     };
-                    let req =
-                        crate::native_extensions::ecosystem::ContextPacketRequest::new(prompt)
-                            .with_role(role)
-                            .with_token_cap(
+                    crate::native_extensions::ecosystem::select_capabilities(
+                        mem,
+                        learn,
+                        authorized_tools,
+                        crate::native_extensions::ecosystem::CapabilityRequest::new(prompt, role)
+                            .with_context_token_cap(
                                 crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
                             )
-                            .with_skills(true);
-                    crate::native_extensions::ecosystem::build_context_packet(mem, learn, req)
+                            .with_skills(true),
+                    )
                 }
-                _ => crate::native_extensions::ecosystem::ContextPacket::empty(),
+                _ => crate::native_extensions::ecosystem::CapabilitySelection {
+                    tools: authorized_tools,
+                    context: crate::native_extensions::ecosystem::ContextPacket::empty(),
+                },
             }
         };
+        let context_packet = capability_selection.context;
 
         {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
@@ -718,7 +734,11 @@ impl GraphExecution {
                 format!("{}\n\n{}", context_packet.text, attempt_briefing)
             };
 
-            let mut spec = self.worker_spec(&task, effective_briefing);
+            let mut spec = self.worker_spec(
+                &task,
+                effective_briefing,
+                capability_selection.tools.clone(),
+            );
             // A retry after a timeout gets double time — but only when a
             // timeout was configured at all; 0 stays unlimited.
             if timed_out_before && spec.timeout_ms > 0 {
