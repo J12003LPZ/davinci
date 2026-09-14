@@ -616,6 +616,10 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     {
         agent.thinking_level = level;
     }
+    let explicit_tool_selection = parsed.no_tools
+        || parsed.no_builtin_tools
+        || !parsed.tools.is_empty()
+        || settings.default_tools.is_some();
     if parsed.no_tools || parsed.no_builtin_tools {
         agent.tools.clear();
     } else if parsed.tools.is_empty() {
@@ -740,6 +744,11 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.tools.retain(|tool| {
             parsed.tools.contains(tool) || !native_names.iter().any(|native| native == tool)
         });
+    }
+    if explicit_tool_selection {
+        agent.expose_active_tools();
+    } else {
+        agent.sync_tool_authorization();
     }
     if let Some(coord) = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env() {
         agent.tool_context.task_coordinator = Some(coord);
@@ -1585,6 +1594,7 @@ fn run_nested_subagent(
     crate::native_extensions::token_governor::ensure_governor_recovery_tool(&mut tools);
     child.tools = tools.clone();
     child.tool_registry = tools;
+    child.expose_active_tools();
     child.session = None;
     if let Some(runtime) = &req.runtime {
         if req.runtime_agent_id != Some(runtime.agent_id) || runtime.parent_agent_id.is_none() {
@@ -1679,6 +1689,19 @@ fn complete_prompt(parsed: &Args, agent: &mut Agent) -> (String, Vec<AgentEvent>
     complete_prompt_with_host(parsed, agent, None, false)
 }
 
+fn provider_tools(agent: &Agent) -> Vec<ToolSpec> {
+    agent
+        .provider_tool_specs()
+        .into_iter()
+        .map(|tool| ToolSpec {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            constrained_sampling: crate::experimental::experimental_tool_sampling(),
+        })
+        .collect()
+}
+
 fn complete_prompt_with_host(
     parsed: &Args,
     agent: &mut Agent,
@@ -1758,25 +1781,6 @@ fn complete_prompt_with_host(
     let fresh_host = existing_host.is_none();
     let host = existing_host.unwrap_or_else(|| Arc::new(Mutex::new(loaded_extension_host(parsed))));
     attach_shared_tool_executor(agent, host.clone());
-    let native_tool_specs = host
-        .lock()
-        .map(|host| host.native_tool_specs())
-        .unwrap_or_default();
-    let tools: Vec<ToolSpec> = agent
-        .builtin_and_mcp_specs()
-        .into_iter()
-        .map(|tool| ToolSpec {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-            constrained_sampling: crate::experimental::experimental_tool_sampling(),
-        })
-        .chain(
-            native_tool_specs
-                .into_iter()
-                .filter(|tool| agent.tools.iter().any(|name| name == &tool.name)),
-        )
-        .collect();
     agent.clear_ephemeral_context();
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
@@ -1821,15 +1825,6 @@ fn complete_prompt_with_host(
         host.emit(ExtensionEvent::AgentStart);
         host.emit(ExtensionEvent::TurnStart);
     }
-    let schema_bytes = serde_json::to_vec(&tools)
-        .expect("tool specs are JSON")
-        .len();
-    let identity_bytes = system_prompt_with_identity(agent)
-        .len()
-        .saturating_sub(agent.system_prompt.len());
-    agent.set_provider_context_overhead_tokens(Some(
-        ((schema_bytes + identity_bytes) as u64).div_ceil(4),
-    ));
     let js_stream = {
         let host = host.lock().unwrap_or_else(|err| err.into_inner());
         host.js_stream_provider(&agent.provider)
@@ -2059,7 +2054,7 @@ fn complete_prompt_with_host(
                         &current.messages_for_provider(),
                         auth,
                         Some(&system),
-                        &tools,
+                        &provider_tools(current),
                         &StreamOptions {
                             thinking_level: Some(current.thinking_level),
                             thinking_budgets: current.thinking_budgets.clone(),

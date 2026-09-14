@@ -402,7 +402,8 @@ impl ExtensionHost {
                     read_only,
                     &spec.parameters,
                     Some(env!("CARGO_PKG_VERSION").to_string()),
-                ),
+                )
+                .with_description(spec.description),
             );
         }
 
@@ -417,7 +418,8 @@ impl ExtensionHost {
                         false,
                         &serde_json::json!({"type": "object"}),
                         None,
-                    ),
+                    )
+                    .with_description(tool.description.clone()),
                 );
             }
         }
@@ -437,7 +439,8 @@ impl ExtensionHost {
                         false,
                         &schema,
                         None,
-                    ),
+                    )
+                    .with_description(tool.description.clone()),
                 );
             }
         }

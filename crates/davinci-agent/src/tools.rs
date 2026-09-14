@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -128,6 +129,10 @@ pub struct ToolContext {
     /// of holding the tool thread until the process ends on its own.
     pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub runtime: Option<crate::runtime::RuntimeHandle>,
+    /// Provider-facing schemas that have been authorized and exposed for this run.
+    pub tool_exposure: Arc<Mutex<crate::runtime::ToolExposureState>>,
+    /// The run's current tool authorization set, shared with `tool_search`.
+    pub authorized_tools: Arc<Mutex<BTreeSet<String>>>,
     pub task_coordinator: Option<crate::runtime::task_transport::TaskCoordinatorClient>,
     pub active_contract: Arc<Mutex<Option<crate::runtime::contracts::TaskContract>>>,
     pub semantic: Option<Arc<dyn crate::semantic::SemanticService>>,
@@ -831,11 +836,49 @@ fn tool_search_tool(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_lowercase();
-    let mcp_tools = context.mcp.tool_names();
-    let matches: Vec<String> = mcp_tools
-        .into_iter()
-        .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
-        .collect();
+    let authorized = context
+        .authorized_tools
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut matches = Vec::new();
+    let mut activated = Vec::new();
+
+    if let Some(runtime) = &context.runtime {
+        for capability in runtime.capability_registry.list() {
+            let searchable = format!(
+                "{} {} {}",
+                capability.name, capability.description, capability.source
+            )
+            .to_lowercase();
+            if !authorized.contains(&capability.name)
+                || (!query.is_empty() && !searchable.contains(&query))
+            {
+                continue;
+            }
+            matches.push(capability.name.clone());
+            if capability.schema.is_some()
+                && context
+                    .tool_exposure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .activate_authorized(&capability.name, true)
+            {
+                activated.push(capability.name);
+            }
+            if matches.len() == 5 {
+                break;
+            }
+        }
+    } else {
+        matches = context
+            .mcp
+            .tool_names()
+            .into_iter()
+            .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
+            .take(5)
+            .collect();
+    }
     let content = if matches.is_empty() {
         format!("No tools found matching query `{query}`")
     } else {
@@ -844,7 +887,10 @@ fn tool_search_tool(
     Ok(ToolResult {
         content,
         is_error: false,
-        details: None,
+        details: Some(serde_json::json!({
+            "matches": matches,
+            "activated": activated,
+        })),
     })
 }
 

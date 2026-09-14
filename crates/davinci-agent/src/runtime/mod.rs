@@ -49,6 +49,7 @@ pub use cancellation::CancellationToken;
 pub use capabilities::{
     builtin_capabilities, compute_schema_hash, default_declared_effects, CapabilitySource,
     DeclaredEffect, PreparedAction, RuntimeCapability, RuntimeCapabilityRegistry,
+    ToolExposureState,
 };
 pub use checkpoints::{
     may_mutate_with_checkpoint, BlobStore, CheckpointError, CheckpointRef, FileCapture,

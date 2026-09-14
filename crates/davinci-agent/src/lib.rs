@@ -126,8 +126,8 @@ pub use runtime::{
     RegistryError, RunId, RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry,
     RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry,
     RuntimeSubscriber, ScopeViolation, TaskContract, TaskError, TaskId, TaskRecord, TaskRegistry,
-    TaskState, WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore, WorkflowStatus,
-    WorktreeError, WorktreeLease, WorktreeManager,
+    TaskState, ToolExposureState, WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore,
+    WorkflowStatus, WorktreeError, WorktreeLease, WorktreeManager,
 };
 
 use davinci_ai::{
@@ -330,7 +330,7 @@ impl Agent {
             let session = prompt::PromptSessionState::custom(system_prompt.clone());
             (None, system_prompt, session)
         };
-        Self {
+        let agent = Self {
             system_prompt: system_prompt.clone(),
             prompt_manifest,
             prompt_session,
@@ -400,7 +400,24 @@ impl Agent {
             last_prepared_manifest: None,
             runtime: None,
             runtime_session: None,
-        }
+        };
+        *agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ToolExposureState::new([
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "exec_command",
+            "apply_patch",
+            "update_plan",
+            "agent",
+            "tool_search",
+        ]);
+        agent.sync_tool_authorization();
+        agent
     }
 
     pub fn new_builtin(profile: prompt::PromptProfile) -> Self {
@@ -1451,6 +1468,107 @@ impl Agent {
         specs
     }
 
+    /// Synchronize the shared authorization view with the agent's active tool set.
+    pub fn sync_tool_authorization(&self) {
+        let authorized: std::collections::BTreeSet<String> = self.tools.iter().cloned().collect();
+        *self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = authorized.clone();
+        self.tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain_authorized(&authorized);
+    }
+
+    /// Expose every currently active, authorized tool for an explicit tool selection.
+    pub fn expose_active_tools(&self) {
+        self.sync_tool_authorization();
+        let authorized = self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut exposure = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for name in &self.tools {
+            exposure.activate_authorized(name, authorized.contains(name));
+        }
+    }
+
+    pub fn is_tool_visible(&self, name: &str) -> bool {
+        self.tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_visible(name)
+    }
+
+    pub fn visible_tool_names(&self) -> std::collections::BTreeSet<String> {
+        self.tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .visible_names()
+            .clone()
+    }
+
+    /// Build the provider schema set from the current exposed view.
+    pub fn provider_tool_specs(&self) -> Vec<AgentTool> {
+        self.sync_tool_authorization();
+        let visible = self.visible_tool_names();
+        let mut specs: Vec<AgentTool> = self
+            .builtin_and_mcp_specs()
+            .into_iter()
+            .filter(|tool| visible.contains(&tool.name))
+            .collect();
+        let mut known: std::collections::BTreeSet<String> =
+            specs.iter().map(|tool| tool.name.clone()).collect();
+
+        if let Some(runtime) = &self.runtime {
+            for capability in runtime.capability_registry.list() {
+                if !visible.contains(&capability.name)
+                    || known.contains(&capability.name)
+                    || capability.schema.is_none()
+                {
+                    continue;
+                }
+                let Some(parameters) = capability.schema.clone() else {
+                    continue;
+                };
+                known.insert(capability.name.clone());
+                specs.push(AgentTool {
+                    name: capability.name,
+                    description: capability.description,
+                    parameters,
+                });
+            }
+        }
+
+        specs
+    }
+
+    pub fn provider_tool_schema_identity(&self) -> String {
+        let schema = self
+            .provider_tool_specs()
+            .into_iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect::<Vec<_>>();
+        runtime::compute_schema_hash(&Value::Array(schema))
+    }
+
     pub fn apply_extension_tools(&mut self, names: &[String]) {
         for name in names {
             if !self.tool_registry.contains(name) {
@@ -1460,6 +1578,7 @@ impl Agent {
                 self.tools.push(name.clone());
             }
         }
+        self.sync_tool_authorization();
     }
 
     /// TS `setActiveToolsByName` — only registry names are enabled; unknown names ignored.
@@ -1469,6 +1588,7 @@ impl Agent {
             .filter(|name| self.tool_registry.iter().any(|known| known == *name))
             .cloned()
             .collect();
+        self.expose_active_tools();
     }
 
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
@@ -4298,6 +4418,103 @@ mod tests {
         agent.set_active_tools_by_name(&["bash".into(), "read".into()]);
         assert_eq!(agent.tools, vec!["bash".to_string(), "read".to_string()]);
         assert!(agent.tool_registry.contains(&"ticket".into()));
+    }
+
+    #[test]
+    fn tool_search_activates_authorized_deferred_schema() {
+        let mut agent = Agent::new("x");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+
+        assert!(!agent
+            .provider_tool_specs()
+            .iter()
+            .any(|tool| tool.name == "web_search"));
+
+        let result = execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        let activated = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("activated"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+
+        assert!(activated.iter().any(|name| name == "web_search"));
+        assert!(agent
+            .provider_tool_specs()
+            .iter()
+            .any(|tool| tool.name == "web_search"));
+    }
+
+    #[test]
+    fn tool_search_cannot_activate_denied_tool() {
+        let mut agent = Agent::new("x");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.set_active_tools_by_name(&["read".into(), "tool_search".into()]);
+        agent.sync_tool_authorization();
+
+        let result = execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        let activated = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("activated"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+
+        assert!(!activated.iter().any(|name| name == "web_search"));
+        assert!(!agent
+            .provider_tool_specs()
+            .iter()
+            .any(|tool| tool.name == "web_search"));
+    }
+
+    #[test]
+    fn tool_activation_changes_schema_identity_once() {
+        let mut agent = Agent::new("x");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        let before = agent.provider_tool_schema_identity();
+
+        execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        let after = agent.provider_tool_schema_identity();
+        assert_ne!(before, after);
+
+        execute_tool_with(
+            Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        assert_eq!(after, agent.provider_tool_schema_identity());
     }
 
     #[test]

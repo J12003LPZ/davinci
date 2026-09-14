@@ -4,7 +4,7 @@
 //! inspect verified tool metadata, enforce least-privilege scoping deterministically, and compute
 //! provider-safe prompt-cache keys using capability schema/version hashes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -144,6 +144,10 @@ pub struct RuntimeCapability {
     pub schema_hash: String,
     pub version: Option<String>,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+    #[serde(default)]
     pub declared_effects: Vec<DeclaredEffect>,
 }
 
@@ -165,6 +169,8 @@ impl RuntimeCapability {
             read_only,
             schema_hash: compute_schema_hash(schema),
             version,
+            description: String::new(),
+            schema: Some(schema.clone()),
             declared_effects,
         }
     }
@@ -186,13 +192,59 @@ impl RuntimeCapability {
             read_only,
             schema_hash: schema_hash.into(),
             version,
+            description: String::new(),
+            schema: None,
             declared_effects,
         }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
     }
 
     pub fn with_declared_effects(mut self, effects: Vec<DeclaredEffect>) -> Self {
         self.declared_effects = effects;
         self
+    }
+}
+
+/// Provider-facing visibility for schemas that are authorized but initially deferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExposureState {
+    visible: BTreeSet<String>,
+}
+
+impl ToolExposureState {
+    pub fn new<I, S>(initial: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            visible: initial.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn is_visible(&self, name: &str) -> bool {
+        self.visible.contains(name)
+    }
+
+    pub fn activate_authorized(&mut self, name: &str, authorized: bool) -> bool {
+        if authorized {
+            self.visible.insert(name.to_string())
+        } else {
+            self.visible.remove(name);
+            false
+        }
+    }
+
+    pub fn retain_authorized(&mut self, authorized: &BTreeSet<String>) {
+        self.visible.retain(|name| authorized.contains(name));
+    }
+
+    pub fn visible_names(&self) -> &BTreeSet<String> {
+        &self.visible
     }
 }
 
@@ -212,17 +264,15 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
         .map(|tool| {
             let class = tool_class(&tool.name);
             let read_only = matches!(class, ToolClass::Read | ToolClass::Network);
-            let schema_hash = compute_schema_hash(&tool.parameters);
-            let declared_effects = default_declared_effects(&tool.name, class);
-            RuntimeCapability {
-                name: tool.name,
-                source: CapabilitySource::Builtin,
-                tool_class: class,
+            RuntimeCapability::new(
+                tool.name,
+                CapabilitySource::Builtin,
+                class,
                 read_only,
-                schema_hash,
-                version: Some(format!("builtin-{}", env!("CARGO_PKG_VERSION"))),
-                declared_effects,
-            }
+                &tool.parameters,
+                Some(format!("builtin-{}", env!("CARGO_PKG_VERSION"))),
+            )
+            .with_description(tool.description)
         })
         .collect()
 }
