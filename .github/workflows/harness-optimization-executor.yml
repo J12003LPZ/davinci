@@ -32,7 +32,8 @@ jobs:
             context) python3 .github/scripts/harness_opt_context.py --tests ;;
             verification) python3 .github/scripts/harness_opt_verification.py --tests ;;
             recovery) python3 .github/scripts/harness_opt_recovery.py --tests ;;
-            phase1) : ;;
+            capability) python3 .github/scripts/harness_opt_capability.py --tests ;;
+            phase1|phase2) : ;;
             *) echo "unknown stage: $stage" >&2; exit 2 ;;
           esac
 
@@ -41,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           stage="$(cat .harness-opt-stage)"
-          if [[ "$stage" == "phase1" ]]; then
+          if [[ "$stage" == phase* ]]; then
             echo "Phase gate has no red step"
             exit 0
           fi
@@ -50,6 +51,7 @@ jobs:
             context) test_cmd=(cargo test -p davinci-agent root_budget_shapes_provider_view_without_dropping_authority) ;;
             verification) test_cmd=(cargo test -p davinci-agent unrelated_successful_test_does_not_verify_mutation) ;;
             recovery) test_cmd=(cargo test -p davinci-agent tool_ledger_atomic_persist_replaces_complete_state) ;;
+            capability) test_cmd=(cargo test -p davinci-coding-agent worker_context_query_is_node_specific_and_deterministic) ;;
             *) echo "unknown stage: $stage" >&2; exit 2 ;;
           esac
           if "${test_cmd[@]}"; then
@@ -74,7 +76,9 @@ jobs:
               python3 .github/scripts/harness_opt_verification_fixup.py
               ;;
             recovery) python3 .github/scripts/harness_opt_recovery.py --impl ;;
+            capability) python3 .github/scripts/harness_opt_capability.py --impl ;;
             phase1) python3 .github/scripts/harness_opt_phase1_fixup.py ;;
+            phase2) : ;;
             *) echo "unknown stage: $stage" >&2; exit 2 ;;
           esac
 
@@ -116,6 +120,13 @@ jobs:
               cargo test -p davinci-agent restart_restores_uncertain_mutation_and_blocks_replay
               cargo clippy -p davinci-agent --all-targets -- -D warnings
               ;;
+            capability)
+              cargo test -p davinci-coding-agent worker_context_query_is_node_specific_and_deterministic
+              cargo test -p davinci-coding-agent context_utility_prefers_verified_relevant_value_per_token
+              cargo test -p davinci-coding-agent capability_selection_preserves_tools_and_context_budget
+              cargo test -p davinci-coding-agent ecosystem::context::
+              cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
+              ;;
             phase1)
               cargo test -p davinci-agent context::
               cargo test -p davinci-agent verification
@@ -123,6 +134,12 @@ jobs:
               cargo test -p davinci-coding-agent token_governor
               cargo test -p davinci-coding-agent content_router
               cargo clippy -p davinci-agent --all-targets -- -D warnings
+              cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
+              ;;
+            phase2)
+              cargo test -p davinci-coding-agent ecosystem::
+              cargo test -p davinci-coding-agent learning::
+              cargo test -p davinci-coding-agent vector_memory
               cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
               ;;
             *) echo "unknown stage: $stage" >&2; exit 2 ;;
@@ -145,7 +162,9 @@ jobs:
             context) message="feat(context): enforce bounded scoped root context" ;;
             verification) message="feat(verification): require mutation-scope coverage" ;;
             recovery) message="fix(recovery): harden durable tool attempt metadata" ;;
+            capability) message="feat(capability): make graph context selection node-aware" ;;
             phase1) message="test(governor): align structured test-output expectation" ;;
+            phase2) echo "Phase gate produced changes unexpectedly" >&2; exit 1 ;;
           esac
           git add crates .harness-opt-stage
           git commit -m "$message"
