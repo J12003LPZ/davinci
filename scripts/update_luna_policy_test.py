@@ -40,6 +40,18 @@ replacements = [
 ''',
     ),
     (
+        '''                "tool_search",
+                ConcurrencyPolicy::ParallelSafe,
+                ReplayPolicy::SafeToReplay,
+                OutputPolicy::Normal,
+''',
+        '''                "tool_search",
+                ConcurrencyPolicy::ParallelSafe,
+                ReplayPolicy::SafeToReplay,
+                OutputPolicy::Compressible,
+''',
+    ),
+    (
         '''                "agent",
                 ConcurrencyPolicy::ParallelSafe,
                 ReplayPolicy::NeverAutoReplay,
