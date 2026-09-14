@@ -193,20 +193,22 @@ pub fn build_context_packet(
         est_tokens = (text.chars().count() + 3) / 4;
     }
 
-    // If still over cap with 1 item remaining, truncate the remaining item
+    // Never truncate a skill body. If the packet wrapper makes the selected
+    // skill exceed the aggregate cap, omit skills and preserve complete memory
+    // items for the bounded fallback below.
+    if est_tokens > request.token_cap && !skill_candidates.is_empty() {
+        skill_candidates.clear();
+        text = assemble_packet_text(&memory_hits, &skill_candidates);
+        est_tokens = (text.chars().count() + 3) / 4;
+    }
+
+    // If still over cap with 1 memory item remaining, truncate that item.
     if est_tokens > request.token_cap {
         let char_budget = request.token_cap.saturating_mul(4);
         if char_budget < 60 {
             return ContextPacket::empty();
         }
-        if let Some(s) = skill_candidates.last_mut() {
-            let inner_cap = char_budget.saturating_sub(60);
-            let truncated: String = s.body.chars().take(inner_cap).collect();
-            s.body = truncated;
-            s.estimated_tokens = (s.body.chars().count() + 3) / 4;
-            text = assemble_packet_text(&memory_hits, &skill_candidates);
-            est_tokens = (text.chars().count() + 3) / 4;
-        } else if let Some(m) = memory_hits.last_mut() {
+        if let Some(m) = memory_hits.last_mut() {
             let inner_cap = char_budget.saturating_sub(60);
             let truncated: String = m.text.chars().take(inner_cap).collect();
             m.text = truncated;
@@ -217,7 +219,10 @@ pub fn build_context_packet(
     }
 
     if memory_hits.is_empty() && skill_candidates.is_empty() {
-        return ContextPacket::empty();
+        return ContextPacket {
+            skill_candidates_considered,
+            ..ContextPacket::empty()
+        };
     }
 
     let memory_tokens: usize = memory_hits.iter().map(|m| m.estimated_tokens).sum();
@@ -312,8 +317,12 @@ mod tests {
     fn test_build_context_packet_enforces_aggregate_cap() {
         let temp_dir = tempfile::tempdir().unwrap();
         let memory = crate::native_extensions::VectorMemory::new(temp_dir.path().to_path_buf());
-        let learning =
-            crate::native_extensions::LearningController::new(temp_dir.path(), None, None);
+        let agent_dir = temp_dir.path().join("agent");
+        let learning = crate::native_extensions::LearningController::new(
+            temp_dir.path(),
+            Some(&agent_dir),
+            None,
+        );
 
         // Blank query produces empty packet
         let req_blank = ContextPacketRequest::new("   ");
@@ -325,5 +334,31 @@ mod tests {
         let req_zero = ContextPacketRequest::new("test prompt").with_token_cap(0);
         let zero_pkt = build_context_packet(&memory, &learning, req_zero);
         assert!(zero_pkt.is_empty());
+
+        // A selected skill must be dropped, not partially injected, when the
+        // packet wrapper pushes an otherwise fitting skill over the aggregate cap.
+        let skill_path = learning
+            .project_skills_dir
+            .join("complete-context")
+            .join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill_path,
+            format!(
+                "---\nname: complete-context\ndescription: preserve complete context instructions\n---\nKeep the complete skill body intact. {}",
+                "Follow the verified procedure. ".repeat(14)
+            ),
+        )
+        .unwrap();
+
+        let constrained = build_context_packet(
+            &memory,
+            &learning,
+            ContextPacketRequest::new("complete context instructions")
+                .with_role(crate::native_extensions::graph::Role::Writer)
+                .with_token_cap(150),
+        );
+        assert_eq!(constrained.skill_candidates_considered, 1);
+        assert!(constrained.is_empty());
     }
 }
