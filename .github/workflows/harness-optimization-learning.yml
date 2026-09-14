@@ -1,0 +1,61 @@
+name: Harness optimization learning stage
+
+on:
+  push:
+    branches:
+      - feat/davinci-harness-optimization-20260914
+
+permissions:
+  contents: write
+
+jobs:
+  execute:
+    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, '[opt-learning]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.83.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Add focused regressions
+        run: python3 .github/scripts/harness_opt_learning.py --tests
+      - name: Verify regressions are red
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo test -p davinci-coding-agent cached_semantic_skill_ranking_is_optional_and_deterministic; then
+            echo "semantic skill regression unexpectedly passed before implementation" >&2
+            exit 1
+          fi
+      - name: Apply implementation
+        run: python3 .github/scripts/harness_opt_learning.py --impl
+      - name: Format
+        run: cargo fmt --all
+      - name: Verify learning and memory stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p davinci-coding-agent cached_semantic_skill_ranking_is_optional_and_deterministic
+          cargo test -p davinci-coding-agent skill_applicability_biases_matching_task_without_becoming_authority
+          cargo test -p davinci-coding-agent stale_memory_is_penalized_when_verified_state_changes
+          cargo test -p davinci-coding-agent learning::retrieval
+          cargo test -p davinci-coding-agent vector_memory
+          cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
+          git diff --check
+      - name: Commit verified production changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates
+          if git diff --cached --quiet; then
+            echo "No production changes"
+            exit 0
+          fi
+          git commit -m "feat(learning): improve skill applicability and memory freshness"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
