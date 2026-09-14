@@ -1,6 +1,7 @@
 //! Bounded ecosystem integration contracts for Graph, Token Governor, Vector Memory, and Learning.
 
 pub mod cache_affinity;
+pub mod capability;
 pub mod context;
 pub mod resource;
 pub mod risk;
@@ -9,6 +10,8 @@ pub mod verification;
 
 #[allow(unused_imports)]
 pub use cache_affinity::*;
+#[allow(unused_imports)]
+pub use capability::*;
 #[allow(unused_imports)]
 pub use context::*;
 #[allow(unused_imports)]
