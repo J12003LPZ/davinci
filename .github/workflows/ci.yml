@@ -10,7 +10,9 @@ env:
 
 jobs:
   reliability-followup:
-    if: github.ref == 'refs/heads/fix/luna-reliability-followups-20260914' && github.event.head_commit.message == 'chore: execute reliability follow-up patch'
+    if: >-
+      github.ref == 'refs/heads/fix/luna-reliability-followups-20260914' &&
+      github.event.head_commit.message == 'run reliability followup'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -45,7 +47,9 @@ jobs:
             exit 1
           fi
       - name: Apply focused fixes
-        run: python scripts/apply_luna_reliability_followups.py
+        run: |
+          python scripts/apply_luna_reliability_followups.py
+          sed -i 's/use std::path::{Component, Path, PathBuf};/use std::path::{Path, PathBuf};/' crates/davinci-agent/src/permission.rs
       - name: Format
         run: cargo fmt --all
       - name: Targeted regression tests
@@ -65,7 +69,6 @@ jobs:
         run: |
           git checkout b2562436c4b789baab0dd7489f58510356c76a5f -- .github/workflows/ci.yml
           git rm scripts/apply_luna_reliability_followups.py
-          git rm .github/workflows/reliability-followup-patch.yml
       - name: Commit verified fixes
         shell: bash
         run: |
