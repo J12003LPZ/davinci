@@ -70,14 +70,20 @@ def add_tests() -> None:
             None,
         ));
         agent.set_runtime(runtime);
-        let _ = agent.prepare_tool_call(
-            Path::new("."),
-            "custom-read-call",
-            "custom_read_capability",
-            &serde_json::json!({}),
-            0,
-        );
-        let ledger = agent.tool_ledger.lock().unwrap();
+
+        let side_effect = agent.side_effect_for_tool("custom_read_capability");
+        assert_eq!(side_effect, crate::tool_ledger::ToolSideEffect::ReadOnly);
+
+        let mut ledger = agent.tool_ledger.lock().unwrap();
+        ledger
+            .reserve_call_with_metadata(
+                "custom-read-call",
+                "custom_read_capability",
+                &serde_json::json!({}),
+                crate::runtime::ReplayPolicy::SafeToReplay,
+                side_effect,
+            )
+            .unwrap();
         let record = ledger.records().get("custom-read-call").unwrap();
         assert_eq!(record.side_effect, crate::tool_ledger::ToolSideEffect::ReadOnly);
     }
