@@ -1850,6 +1850,7 @@ edited.
 7. `0101ec9` — `fix(recovery): block replay of uncertain mutations`
 8. `2172b92` — `fix(learning): bind promotion to verified skill versions`
 9. `d25ed22` — `test(eval): record deterministic reliability ablations`
+10. `b89ce9c` — `test(graph): align skill cap fixture with budget`
 
 The learning audit found a real gap: the normal caller could record an
 outcome by skill name alone and promotion could target the latest version.
@@ -1877,13 +1878,11 @@ promotion occurs only after the exact version accepts the verified outcome.
   `17,163` bytes, satisfying the `>=30%` reduction gate while preserving
   authorized discovery.
 - A complete `davinci-agent` package sweep passed `847` tests. The first
-  `davinci-coding-agent` sweep reported `905` passes plus four missing-debug-
-  binary failures and one existing Graph-skill-cap assertion. Building the
-  required debug binary made all security CLI/RPC tests pass (`6` and `2`);
-  the remaining skill test still selects `1` fixture where the unchanged
-  baseline test expects `2` under the `1000`-token cap. The baseline diff for
-  the retrieval implementation and its test is empty, so that unrelated
-  pre-existing mismatch was not changed as part of this plan.
+  `davinci-coding-agent` sweep exposed four missing-debug-binary prerequisites
+  and a stale Graph-skill-cap fixture. The required debug binary was built,
+  the security CLI/RPC checks passed (`6` and `2`), and the fixture was
+  corrected without changing production Graph selection. The final package
+  sweep passed `2,040` tests with `6` ignored.
 
 ## Provider and competitor boundary
 
