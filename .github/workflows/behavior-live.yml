@@ -121,11 +121,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          run_root=$(find "target/behavior-evals/live-${EVAL_PROVIDER}" -name manifest.json -type f -print -quit | xargs -r dirname)
-          if [[ -z "${run_root}" ]]; then
+          manifest=$(find "target/behavior-evals/live-${EVAL_PROVIDER}" -name manifest.json -type f -print -quit)
+          if [[ -z "${manifest}" ]]; then
             echo "No A/B manifest was produced for ${EVAL_PROVIDER}."
             exit 1
           fi
+          run_root=$(dirname -- "${manifest}")
           ./target/release/davinci-evals behavior gate --artifacts "${run_root}"
 
       - name: Record successful matrix run
