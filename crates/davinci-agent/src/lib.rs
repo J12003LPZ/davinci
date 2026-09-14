@@ -101,7 +101,8 @@ pub mod living_plan;
 pub use living_plan::{LivingPlan, PLAN_ENTRY_TYPE};
 pub use todo::{TodoItem, TodoList, TodoStatus, TODO_ENTRY_TYPE};
 pub use tool_ledger::{
-    classify_side_effect, ToolCallLedger, ToolCallRecord, ToolExecutionStatus, ToolSideEffect,
+    classify_side_effect, AttemptOutcome, RecoveryAction, ToolCallLedger, ToolCallRecord,
+    ToolExecutionStatus, ToolSideEffect,
 };
 pub use tools::{
     decision_wait, execute_tool, execute_tool_with, tool_specs, validate_builtin_tool_descriptions,
