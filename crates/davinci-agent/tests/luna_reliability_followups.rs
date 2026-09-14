@@ -1,3 +1,4 @@
+// One-shot branch regression coverage for the reliability follow-up fixes.
 use davinci_agent::{
     Agent, OutputPolicy, ReplayPolicy, ReservationOutcome, RuntimeCapabilityRegistry,
 };
