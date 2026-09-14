@@ -639,7 +639,7 @@ mod tests {
                 "# procedure-{}\nDetail content for procedure {}.\n{}",
                 i,
                 i,
-                "procedure detail step text ".repeat(80)
+                "procedure detail step text ".repeat(60)
             );
             skills.push(Skill {
                 name: format!("procedure-{}", i),
