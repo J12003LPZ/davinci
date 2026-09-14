@@ -1182,11 +1182,16 @@ mod tests {
         let mut book = JobBook::default();
         let agent_id = crate::runtime::ids::AgentId::new();
         let task_id = crate::runtime::ids::TaskId::new();
+        let script = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 > nul"
+        } else {
+            "sleep 30"
+        };
 
-        let child = spawn("echo hello");
+        let child = spawn(script);
         let pid = child.id();
         let job_id = book.register_with_provenance(
-            "echo hello",
+            "sleep 30",
             child,
             Some(task_id),
             Some(agent_id),
@@ -1221,19 +1226,25 @@ mod tests {
         let mut book = JobBook::default();
         let agent1 = crate::runtime::ids::AgentId::new();
         let agent2 = crate::runtime::ids::AgentId::new();
+        let script = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 > nul"
+        } else {
+            "sleep 30"
+        };
 
-        let child1 = spawn("echo worker1");
-        let child2 = spawn("echo worker2");
+        let child1 = spawn(script);
+        let child2 = spawn(script);
 
         let id1 =
-            book.register_with_provenance("echo worker1", child1, None, Some(agent1), Some(1));
+            book.register_with_provenance("worker1", child1, None, Some(agent1), Some(1));
         let id2 =
-            book.register_with_provenance("echo worker2", child2, None, Some(agent2), Some(1));
+            book.register_with_provenance("worker2", child2, None, Some(agent2), Some(1));
 
         let killed = book.kill_jobs_for_agent(&agent1);
         assert_eq!(killed, vec![id1]);
 
         // id2 is not killed by agent1 kill call
         assert_eq!(book.get(id2).unwrap().agent_id, Some(agent2));
+        assert!(book.get(id2).unwrap().status().is_running());
     }
 }
