@@ -1922,7 +1922,7 @@ mod tests {
         assert!(result.content.contains("retrieve_output"));
 
         let details = result.details.as_ref().unwrap();
-        assert_eq!(details["tokenGovernor"]["contentKind"], "log");
+        assert_eq!(details["tokenGovernor"]["contentKind"], "testOutput");
         assert_eq!(details["tokenGovernor"]["strategy"], "specialized");
 
         let id = details["tokenGovernor"]["outputId"].as_str().unwrap();
