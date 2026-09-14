@@ -64,7 +64,10 @@ jobs:
               python3 .github/scripts/harness_optimization_fixup.py
               ;;
             context) python3 .github/scripts/harness_opt_context.py --impl ;;
-            verification) python3 .github/scripts/harness_opt_verification.py --impl ;;
+            verification)
+              python3 .github/scripts/harness_opt_verification.py --impl
+              python3 .github/scripts/harness_opt_verification_fixup.py
+              ;;
             recovery) python3 .github/scripts/harness_opt_recovery.py --impl ;;
             *) echo "unknown stage: $stage" >&2; exit 2 ;;
           esac
