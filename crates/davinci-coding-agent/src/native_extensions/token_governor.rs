@@ -80,6 +80,8 @@ const SEARCH_TOOLS: &[&str] = &["grep", "find", "ls"];
 pub struct TokenGovernorConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub content_aware: bool,
     #[serde(default = "default_compress_threshold_bytes")]
     pub compress_threshold_bytes: usize,
     #[serde(default = "default_compress_threshold_lines")]
@@ -131,6 +133,7 @@ impl Default for TokenGovernorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            content_aware: true,
             compress_threshold_bytes: DEFAULT_COMPRESS_THRESHOLD_BYTES,
             compress_threshold_lines: DEFAULT_COMPRESS_THRESHOLD_LINES,
             keep_head_lines: DEFAULT_KEEP_HEAD_LINES,
@@ -170,6 +173,14 @@ fn apply_env(config: &mut TokenGovernorConfig) {
         "PI_TOKEN_GOVERNOR_ENABLED",
     ]) {
         config.enabled = value;
+    }
+    if let Some(value) = env_bool_any(&[
+        "DAVINCI_GOVERNOR_CONTENT_AWARE",
+        "DAVINCI_TOKEN_GOVERNOR_CONTENT_AWARE",
+        "PI_GOVERNOR_CONTENT_AWARE",
+        "PI_TOKEN_GOVERNOR_CONTENT_AWARE",
+    ]) {
+        config.content_aware = value;
     }
     if let Some(value) = env_usize_any(&[
         "DAVINCI_GOVERNOR_COMPRESS_THRESHOLD",
@@ -776,6 +787,49 @@ fn call_summary(tool: &str, args: &Value) -> String {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ContentRoutingStats {
+    pub log: u64,
+    pub json_array: u64,
+    pub search_results: u64,
+    pub plain_text: u64,
+    pub specialized_views: u64,
+    pub generic_views: u64,
+    pub original_bytes: u64,
+    pub model_view_bytes: u64,
+}
+
+impl ContentRoutingStats {
+    fn record(
+        &mut self,
+        kind: crate::native_extensions::content_router::ContentKind,
+        specialized: bool,
+        original_bytes: usize,
+        model_view_bytes: usize,
+    ) {
+        match kind {
+            crate::native_extensions::content_router::ContentKind::Log => self.log += 1,
+            crate::native_extensions::content_router::ContentKind::JsonArray => {
+                self.json_array += 1
+            }
+            crate::native_extensions::content_router::ContentKind::SearchResults => {
+                self.search_results += 1
+            }
+            crate::native_extensions::content_router::ContentKind::PlainText => {
+                self.plain_text += 1
+            }
+        }
+        if specialized {
+            self.specialized_views += 1;
+        } else {
+            self.generic_views += 1;
+        }
+        self.original_bytes += original_bytes as u64;
+        self.model_view_bytes += model_view_bytes as u64;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GovernorStats {
     pub bytes_withheld: u64,
     pub retrievals: u64,
@@ -784,6 +838,8 @@ pub struct GovernorStats {
     pub blocked_calls: u64,
     #[serde(default)]
     pub prunings: u64,
+    #[serde(default)]
+    pub content_routing: ContentRoutingStats,
 }
 
 #[derive(Debug, Clone)]
@@ -804,6 +860,7 @@ pub struct TokenGovernor {
     bytes_withheld: usize,
     retrievals: Arc<AtomicU64>,
     prunings: usize,
+    content_routing: ContentRoutingStats,
 }
 
 impl Default for TokenGovernor {
@@ -835,6 +892,7 @@ impl TokenGovernor {
             bytes_withheld: 0,
             retrievals: Arc::new(AtomicU64::new(0)),
             prunings: 0,
+            content_routing: ContentRoutingStats::default(),
         }
     }
 
@@ -846,6 +904,7 @@ impl TokenGovernor {
             deduplicated_reads: self.deduplicated_reads as u64,
             blocked_calls: self.blocked_calls as u64,
             prunings: self.prunings as u64,
+            content_routing: self.content_routing,
         }
     }
 
@@ -899,6 +958,7 @@ impl TokenGovernor {
         self.blocked_calls = 0;
         self.bytes_withheld = 0;
         self.retrievals.store(0, Ordering::Relaxed);
+        self.content_routing = ContentRoutingStats::default();
     }
 
     /// `state_hash` must cover the complete search domain's content, not just
@@ -1007,25 +1067,49 @@ impl TokenGovernor {
         let Ok(reference) = self.store.save(&result.content) else {
             return result;
         };
-        let compressed = compress_with_reference(&result.content, &self.config, Some(&reference));
+        let generic = compress_with_reference(&result.content, &self.config, Some(&reference));
+        let kind =
+            crate::native_extensions::content_router::classify_content(name, args, &result.content);
+        let specialized = if self.config.content_aware {
+            crate::native_extensions::content_router::build_specialized_view(
+                kind,
+                name,
+                args,
+                &result.content,
+                &reference.id,
+            )
+        } else {
+            None
+        };
+        let original_bytes = generic.info.original_bytes;
+        let original_lines = generic.info.original_lines;
+        let (chosen_content, strategy) = match specialized {
+            Some(view) if view.content.len() < generic.content.len() => {
+                (view.content, "specialized")
+            }
+            _ => (generic.content, "generic"),
+        };
+        let view_bytes = chosen_content.len();
         self.remember_stored(name, args, &reference);
-        self.bytes_withheld += result
-            .content
-            .len()
-            .saturating_sub(compressed.content.len());
-        result.content = compressed.content;
+        self.bytes_withheld += result.content.len().saturating_sub(view_bytes);
+        result.content = chosen_content;
         result.details = merge_details(
             result.details,
             json!({
                 "tokenGovernor": {
                     "compressed": true,
-                    "originalBytes": compressed.info.original_bytes,
-                    "originalLines": compressed.info.original_lines,
+                    "contentKind": kind.as_str(),
+                    "strategy": strategy,
+                    "originalBytes": original_bytes,
+                    "originalLines": original_lines,
+                    "viewBytes": view_bytes,
                     "outputId": reference.id,
                     "reference": format!("governor://{}", reference.id),
                 }
             }),
         );
+        self.content_routing
+            .record(kind, strategy == "specialized", original_bytes, view_bytes);
         self.compressed_outputs += 1;
         result
     }
@@ -1119,6 +1203,18 @@ impl TokenGovernor {
     }
 
     pub fn status(&self) -> Value {
+        let content_original_bytes = self.content_routing.original_bytes;
+        let content_model_view_bytes = self.content_routing.model_view_bytes;
+        let estimated_byte_reduction_pct = if content_original_bytes == 0 {
+            0.0
+        } else {
+            (1.0 - (content_model_view_bytes as f64 / content_original_bytes as f64)) * 100.0
+        };
+        let retrievals_per_compressed_output = if self.compressed_outputs == 0 {
+            0.0
+        } else {
+            self.retrievals.load(Ordering::Relaxed) as f64 / self.compressed_outputs as f64
+        };
         json!({
             "enabled": self.config.enabled,
             "sessionKey": self.session_key,
@@ -1139,6 +1235,18 @@ impl TokenGovernor {
                 "dedupeWindow": self.config.dedupe_window,
                 "antiLoop": self.config.anti_loop,
                 "retrieveMaxBytes": self.config.retrieve_max_bytes,
+            },
+            "contentRouting": {
+                "log": self.content_routing.log,
+                "jsonArray": self.content_routing.json_array,
+                "searchResults": self.content_routing.search_results,
+                "plainText": self.content_routing.plain_text,
+                "specializedViews": self.content_routing.specialized_views,
+                "genericViews": self.content_routing.generic_views,
+                "originalBytes": content_original_bytes,
+                "modelViewBytes": content_model_view_bytes,
+                "estimatedByteReductionPct": estimated_byte_reduction_pct,
+                "retrievalsPerCompressedOutput": retrievals_per_compressed_output,
             },
         })
     }
@@ -1612,5 +1720,90 @@ mod tests {
         let long = call_summary("bash", &json!({"command": "x".repeat(100)}));
         assert_eq!(long.chars().count(), 73);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn content_aware_views_are_smaller_and_exactly_retrievable() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            content_aware: true,
+            ..Default::default()
+        };
+        let mut governor =
+            TokenGovernor::with_store("router-e2e", config, OutputStore::new(dir.path()));
+
+        let log = (0..120)
+            .map(|i| {
+                if i == 67 {
+                    "test auth_refresh ... FAILED\nassertion failed: expected 200 actual 401"
+                        .to_string()
+                } else {
+                    format!("test case_{i} ... ok")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let result = governor.after_tool("bash", &json!({"command": "cargo test"}), ok(&log));
+
+        assert!(result.content.len() < log.len());
+        assert!(result.content.contains("FAILED"));
+        assert!(result.content.contains("expected 200 actual 401"));
+        assert!(result.content.contains("retrieve_output"));
+
+        let details = result.details.as_ref().unwrap();
+        assert_eq!(details["tokenGovernor"]["contentKind"], "log");
+        assert_eq!(details["tokenGovernor"]["strategy"], "specialized");
+
+        let id = details["tokenGovernor"]["outputId"].as_str().unwrap();
+        let recovered = governor.retrieve(&json!({"id": id})).unwrap().content;
+        let reconstructed = recovered
+            .lines()
+            .map(|line| line.split_once(": ").map(|(_, body)| body).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(reconstructed, log);
+    }
+
+    #[test]
+    fn governor_status_reports_content_routing() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            content_aware: true,
+            ..Default::default()
+        };
+        let mut governor =
+            TokenGovernor::with_store("routing-status", config, OutputStore::new(dir.path()));
+
+        let json = serde_json::Value::Array(
+            (0..30)
+                .map(|i| {
+                    if i == 17 {
+                        serde_json::json!({"id": i, "status": "error", "message": "boom"})
+                    } else {
+                        serde_json::json!({"id": i, "status": "ok", "payload": "repetitive payload"})
+                    }
+                })
+                .collect(),
+        )
+        .to_string();
+
+        let _ = governor.after_tool("bash", &json!({"command": "printf json"}), ok(&json));
+        let status = governor.status();
+
+        assert_eq!(status["contentRouting"]["jsonArray"], 1);
+        assert_eq!(status["contentRouting"]["specializedViews"], 1);
+        assert!(status["contentRouting"]["originalBytes"].as_u64().unwrap() > 0);
+        assert!(status["contentRouting"]["modelViewBytes"].as_u64().unwrap() > 0);
+        assert!(
+            status["contentRouting"]["estimatedByteReductionPct"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
     }
 }

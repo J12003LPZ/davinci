@@ -146,6 +146,7 @@ mod tests {
             deduplicated_reads: 1,
             blocked_calls: 0,
             prunings: 0,
+            content_routing: Default::default(),
         };
 
         let snapshot = ResourceSnapshot::collect(&[t1, t2], Some(&gov_stats));

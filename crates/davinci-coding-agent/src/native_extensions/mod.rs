@@ -1,5 +1,6 @@
 //! Native Rust ports of the bundled pi extensions.
 
+pub mod content_router;
 pub mod ecosystem;
 pub mod graph;
 pub mod learning;
@@ -7,6 +8,8 @@ pub mod security_scan;
 pub mod token_governor;
 pub mod vector_memory;
 
+#[allow(unused_imports)]
+pub use content_router::*;
 #[allow(unused_imports)]
 pub use ecosystem::*;
 pub use graph::*;

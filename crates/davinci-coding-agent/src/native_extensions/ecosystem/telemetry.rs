@@ -23,6 +23,10 @@ pub struct EcosystemStats {
     pub governor_bytes_omitted: u64,
     #[serde(alias = "governor_retrievals")]
     pub governor_retrievals: u64,
+    #[serde(alias = "governor_compressed_outputs")]
+    pub governor_compressed_outputs: u64,
+    #[serde(alias = "governor_specialized_outputs")]
+    pub governor_specialized_outputs: u64,
     #[serde(alias = "prunings")]
     pub prunings: u64,
     #[serde(alias = "cache_read_tokens")]
@@ -58,6 +62,8 @@ impl EcosystemStats {
             && self.context_fingerprint.is_none()
             && self.governor_bytes_omitted == 0
             && self.governor_retrievals == 0
+            && self.governor_compressed_outputs == 0
+            && self.governor_specialized_outputs == 0
             && self.prunings == 0
             && self.cache_read_tokens == 0
             && self.cache_write_tokens == 0
@@ -90,6 +96,8 @@ impl EcosystemStats {
     pub fn record_governor(&mut self, stats: &crate::native_extensions::GovernorStats) {
         self.governor_bytes_omitted = stats.bytes_withheld;
         self.governor_retrievals = stats.retrievals;
+        self.governor_compressed_outputs = stats.compressed_outputs;
+        self.governor_specialized_outputs = stats.content_routing.specialized_views;
         self.prunings = stats.prunings;
     }
 
@@ -164,7 +172,11 @@ impl EcosystemStats {
         }
 
         // 3. Compact: governor omitted · retrievals · prunings
-        if self.governor_bytes_omitted > 0 || self.governor_retrievals > 0 || self.prunings > 0 {
+        if self.governor_bytes_omitted > 0
+            || self.governor_retrievals > 0
+            || self.governor_compressed_outputs > 0
+            || self.prunings > 0
+        {
             let mut parts = Vec::new();
             if self.governor_bytes_omitted > 0 {
                 let kb = (self.governor_bytes_omitted as f64 / 1024.0).round() as u64;
@@ -173,6 +185,9 @@ impl EcosystemStats {
                 } else {
                     parts.push(format!("{} B governed", self.governor_bytes_omitted));
                 }
+            }
+            if self.governor_compressed_outputs > 0 {
+                parts.push(format!("{} routed", self.governor_compressed_outputs));
             }
             if self.governor_retrievals > 0 {
                 parts.push(format!("{} recovered", self.governor_retrievals));
@@ -270,6 +285,8 @@ mod tests {
             context_fingerprint: Some("abc123hash".into()),
             governor_bytes_omitted: 18432,
             governor_retrievals: 1,
+            governor_compressed_outputs: 1,
+            governor_specialized_outputs: 1,
             prunings: 1,
             cache_read_tokens: 4000,
             cache_write_tokens: 400,
@@ -360,6 +377,7 @@ mod tests {
             deduplicated_reads: 0,
             blocked_calls: 0,
             prunings: 1,
+            content_routing: Default::default(),
         };
         stats.record_governor(&gov_stats);
 

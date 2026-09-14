@@ -12,7 +12,7 @@ Every subsystem boundary in the Davinci ecosystem operates under explicit, bound
 | :--- | :--- | :--- | :--- |
 | **Vector Memory** | **Normal Interactive Turn** | Ephemeral similarity search on user/turn prompt | Top-k relevant memories, ephemeral injection |
 | **Vector Memory + Learning** | **Graph Worker Context** | `build_context_packet` produces `<context source="davinci" untrusted="true">` | Strict cap: <= 2,500 aggregate tokens (<= 1,200 memory tok / 4 hits; <= 1,000 skill tok / 2 skills) |
-| **Token Governor** | **Graph Worker Execution** | Compressible tool outputs (>100 B) compacted into digest (`governor://`) | `retrieve_output` preserved in worker allowlist; lossless byte-for-byte recovery on demand |
+| **Token Governor** | **Graph Worker Execution** | Large compressible tool results are stored exactly, classified locally as log / JSON-array / search / plain text, and the smallest safe specialized-or-generic referenced view is delivered | `retrieve_output` preserved in worker allowlist; exact original recovery on demand; no model or network call for routing |
 | **Graph Execution** | **Security Scanner** | File mutations evaluated via `assess_change_risk` | High risk (`ChangeRisk::High`) or `always` mode triggers `verify_changed_surface` before review |
 | **Graph Verification** | **Learning System** | `VerificationBundle` derived deterministically from unit tests and security | Approval eligibility computed pure/deterministic; `record_skill_version_outcome` updates ledger |
 | **Learning System** | **Future Graph Runs** | Verified procedural skills (`SKILL.md`) & high-confidence facts | Selected exact version `(name, version, content_hash)` injected into worker context |
@@ -36,6 +36,10 @@ Every subsystem boundary in the Davinci ecosystem operates under explicit, bound
 5. **Exact Provenance and Attribution**:
    - Tasks record the exact `(name, version, content_hash)` of every injected skill.
    - Outcome ledgers increment only when the executing version's hash matches the store record.
+6. **Reversible Content-Aware Routing**:
+   - Content-aware routing changes only the live tool result; it never rewrites the stable provider prefix, skills, memory packets, or historical messages.
+   - `content_aware=false` falls back to the prior generic Governor path.
+   - Byte-reduction metrics are operational estimates, not measured token savings.
 
 ---
 
@@ -50,6 +54,7 @@ If any ecosystem subsystem needs to be bypassed or isolated during troubleshooti
 | **Learning Background Review** | `PI_LEARNING_DISABLE_BACKGROUND=1` | Enabled | Background reviewer thread skips turn analysis; foreground remains unaffected |
 | **Cache Key Decoupling** | Fallback when `cache_key == None` | `Some(key)` | Reverts to `session_id` provider prompt cache grouping |
 | **Token Governor** | `TokenGovernorConfig::enabled: false` | Enabled | Tools stream full, uncompacted output directly |
+| **Content-Aware Governor Routing** | `TokenGovernorConfig::content_aware: false` or one of the `*_GOVERNOR_CONTENT_AWARE` environment overrides | Enabled | Large outputs use the prior generic referenced Governor view; exact storage and retrieval remain unchanged |
 
 ---
 
