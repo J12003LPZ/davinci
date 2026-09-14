@@ -286,30 +286,21 @@ pub fn select_graph_skill_candidates(
 
     let mut accumulated_tokens = 0;
     let mut selected = Vec::new();
+    let mut selected_names = HashSet::new();
 
     for c in candidates {
         if selected.len() >= max_skills {
             break;
         }
+        if selected_names.contains(&c.skill.name) {
+            continue;
+        }
         let est_tokens = (c.skill.body.chars().count() + 3) / 4;
         if accumulated_tokens + est_tokens > token_cap {
-            let remaining = token_cap.saturating_sub(accumulated_tokens);
-            if remaining > 0 {
-                let char_cap = remaining.saturating_mul(4);
-                let truncated: String = c.skill.body.chars().take(char_cap).collect();
-                let est_trunc = (truncated.chars().count() + 3) / 4;
-                selected.push(SkillContextCandidate {
-                    name: c.skill.name.clone(),
-                    version: c.version,
-                    content_hash: c.content_hash,
-                    body: truncated,
-                    score: c.score,
-                    estimated_tokens: est_trunc,
-                });
-            }
-            break;
+            continue;
         }
         accumulated_tokens += est_tokens;
+        selected_names.insert(c.skill.name.clone());
         selected.push(SkillContextCandidate {
             name: c.skill.name.clone(),
             version: c.version,
@@ -354,6 +345,19 @@ mod tests {
             description: description.to_string(),
             path: PathBuf::from(path),
             body: format!("# {}\n{}", name, description),
+            base_dir: PathBuf::from(path)
+                .parent()
+                .unwrap_or(&PathBuf::from("."))
+                .to_path_buf(),
+        }
+    }
+
+    fn fixture_skill_with_body(name: &str, description: &str, path: &str, body: String) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            path: PathBuf::from(path),
+            body,
             base_dir: PathBuf::from(path)
                 .parent()
                 .unwrap_or(&PathBuf::from("."))
@@ -564,6 +568,70 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_skill_names_are_injected_once() {
+        let skills = vec![
+            fixture_skill(
+                "debug-rust",
+                "Debug Rust compiler and test failures",
+                "/global/debug-rust/SKILL.md",
+            ),
+            fixture_skill(
+                "debug-rust",
+                "Debug Rust compiler and test failures",
+                "/proj/.pi/skills/debug-rust/SKILL.md",
+            ),
+        ];
+        let ledger = vec![fixture_ledger_record(
+            "debug-rust",
+            LearningScope::Project,
+            ArtifactStatus::Active,
+            3,
+            0,
+        )];
+
+        let selected = select_graph_skill_candidates(
+            "debug rust compiler failure",
+            Role::Writer,
+            &skills,
+            &ledger,
+            2,
+            2_000,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "debug-rust");
+    }
+
+    #[test]
+    fn oversized_skill_is_skipped_instead_of_truncated() {
+        let oversized = fixture_skill_with_body(
+            "debug-rust-deep",
+            "Debug Rust compiler failures with deep diagnostics",
+            "/skills/debug-rust-deep/SKILL.md",
+            format!("# Deep\n{}", "x".repeat(8_000)),
+        );
+        let compact = fixture_skill_with_body(
+            "debug-rust-compact",
+            "Debug Rust compiler failures",
+            "/skills/debug-rust-compact/SKILL.md",
+            "# Compact\nRun the failing test, isolate the root cause, patch, and verify.".into(),
+        );
+
+        let selected = select_graph_skill_candidates(
+            "debug rust compiler failure",
+            Role::Writer,
+            &[oversized, compact],
+            &[],
+            2,
+            200,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "debug-rust-compact");
+        assert!(selected[0].body.contains("Run the failing test"));
+    }
+
+    #[test]
     fn graph_skill_context_respects_max_count_and_token_cap() {
         let mut skills = Vec::new();
         for i in 1..=5 {
@@ -595,7 +663,7 @@ mod tests {
         let total_tokens: usize = selected.iter().map(|s| s.estimated_tokens).sum();
         assert!(total_tokens <= 1000);
 
-        // Small token cap enforces truncation
+        // Small token cap skips oversized skills without truncating them
         let tiny = select_graph_skill_candidates(
             "procedure verification",
             Role::TestAnalyzer,
@@ -604,8 +672,7 @@ mod tests {
             2,
             50,
         );
-        assert_eq!(tiny.len(), 1);
-        assert!(tiny[0].estimated_tokens <= 50);
+        assert!(tiny.is_empty());
     }
 
     #[test]
