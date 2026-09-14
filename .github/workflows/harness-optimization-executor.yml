@@ -22,8 +22,29 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: Apply requested optimization stage
-        run: python3 .github/scripts/harness_optimization_apply.py
+      - name: Add regression tests
+        run: python3 .github/scripts/harness_optimization_apply.py --tests
+
+      - name: Verify regression is red
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(cat .harness-opt-stage)"
+          case "$stage" in
+            governor) test_cmd=(cargo test -p davinci-coding-agent large_error_output_is_reversibly_compressed) ;;
+            context) test_cmd=(cargo test -p davinci-agent root_budget_shapes_provider_view_without_dropping_authority) ;;
+            verification) test_cmd=(cargo test -p davinci-agent unrelated_successful_test_does_not_verify_mutation) ;;
+            recovery) test_cmd=(cargo test -p davinci-agent tool_ledger_atomic_persist_replaces_complete_state) ;;
+            *) echo "unknown stage: $stage" >&2; exit 2 ;;
+          esac
+          if "${test_cmd[@]}"; then
+            echo "Regression unexpectedly passed before implementation" >&2
+            exit 1
+          fi
+          echo "Expected red regression confirmed for $stage"
+
+      - name: Apply production implementation
+        run: python3 .github/scripts/harness_optimization_apply.py --impl
 
       - name: Format
         run: cargo fmt --all
@@ -62,10 +83,6 @@ jobs:
               cargo test -p davinci-agent tool_ledger_uses_runtime_capability_side_effect
               cargo test -p davinci-agent restart_restores_uncertain_mutation_and_blocks_replay
               cargo clippy -p davinci-agent --all-targets -- -D warnings
-              ;;
-            *)
-              echo "unknown stage: $stage" >&2
-              exit 2
               ;;
           esac
           git diff --check
