@@ -12,10 +12,22 @@ Every subsystem boundary in the Davinci ecosystem operates under explicit, bound
 | :--- | :--- | :--- | :--- |
 | **Vector Memory** | **Normal Interactive Turn** | Ephemeral similarity search on user/turn prompt | Top-k relevant memories, ephemeral injection |
 | **Vector Memory + Learning** | **Graph Worker Context** | `build_context_packet` produces `<context source="davinci" untrusted="true">` | Strict cap: <= 2,500 aggregate tokens (<= 1,200 memory tok / 4 hits; <= 1,000 skill tok / 2 skills) |
+| **Graph Role + Vector Memory + Learning** | **Capability Toolbox** | Assemble already-authorized tools plus bounded memory/skill context for one worker | 0 model calls; existing role policy remains authority; existing graph context cap remains enforced |
+| **Capability Toolbox** | **Graph Worker** | `CapabilitySelection { tools, context }` | No duplicate skills; no partial skill body; exact skill version/hash refs preserved |
 | **Token Governor** | **Graph Worker Execution** | Compressible tool outputs (>100 B) compacted into digest (`governor://`) | `retrieve_output` preserved in worker allowlist; lossless byte-for-byte recovery on demand |
 | **Graph Execution** | **Security Scanner** | File mutations evaluated via `assess_change_risk` | High risk (`ChangeRisk::High`) or `always` mode triggers `verify_changed_surface` before review |
 | **Graph Verification** | **Learning System** | `VerificationBundle` derived deterministically from unit tests and security | Approval eligibility computed pure/deterministic; `record_skill_version_outcome` updates ledger |
 | **Learning System** | **Future Graph Runs** | Verified procedural skills (`SKILL.md`) & high-confidence facts | Selected exact version `(name, version, content_hash)` injected into worker context |
+
+### Responsibility boundaries
+
+- **Graph** owns orchestration and worker lifecycle.
+- **Role policy** owns tool authority and allowlists.
+- **Capability Toolbox** assembles the already-authorized tools with bounded context for one worker.
+- **Vector Memory** supplies declarative context.
+- **Skills / Learning** supply procedural context and verified history.
+- **Token Governor** owns tool-output compression and recovery.
+- **Verification** remains the deterministic authority for outcomes and promotion.
 
 ---
 

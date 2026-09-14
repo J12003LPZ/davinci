@@ -169,6 +169,11 @@ pub struct SkillVersionRef {
 ```
 At graph completion, `VerificationBundle` derives a deterministic outcome (`VerifiedSuccess`, `VerifiedFailure`, or `Neutral`). The outcome is recorded against the exact injected version (`record_skill_version_outcome`), guaranteeing that successes or regressions are never misattributed across edits.
 
+### Capability Toolbox Closed Loop
+Verified skill outcomes update the existing `SkillLedgerRecord` counters. Future Capability Toolbox selection consumes the same ranking path, so successful skill versions gain selection weight and failed versions are penalized. There is no separate toolbox learner or duplicate skill database.
+
+Capability Toolbox never rewrites user-authored or imported skills; ownership rules remain in the Learning subsystem. Tool authority remains with the existing graph role policy, while toolbox assembly adds no model calls or storage.
+
 ### Conditional Security Gate (`securityVerification`)
 Graph configurations support configurable security verification modes (`off | risk | always`, default `risk`):
 - `off`: Security scanning bypassed (`SecurityVerification::NotRequired`).
