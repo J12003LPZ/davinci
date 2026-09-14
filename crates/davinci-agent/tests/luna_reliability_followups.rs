@@ -48,15 +48,16 @@ fn restart_restores_uncertain_mutation_and_blocks_replay() {
     resumed
         .load_from_session(JsonlSession::open(&session_path).unwrap())
         .unwrap();
-    let outcome = resumed.tool_ledger.lock().unwrap().reserve_call_with_policy(
-        "call-shell",
-        "exec_command",
-        &args,
-        ReplayPolicy::NeverAutoReplay,
-    );
+    let outcome = resumed
+        .tool_ledger
+        .lock()
+        .unwrap()
+        .reserve_call_with_policy(
+            "call-shell",
+            "exec_command",
+            &args,
+            ReplayPolicy::NeverAutoReplay,
+        );
 
-    assert!(matches!(
-        outcome,
-        Ok(ReservationOutcome::ReplayBlocked(_))
-    ));
+    assert!(matches!(outcome, Ok(ReservationOutcome::ReplayBlocked(_))));
 }
