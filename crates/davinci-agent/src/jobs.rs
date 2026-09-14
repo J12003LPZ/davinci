@@ -1235,10 +1235,8 @@ mod tests {
         let child1 = spawn(script);
         let child2 = spawn(script);
 
-        let id1 =
-            book.register_with_provenance("worker1", child1, None, Some(agent1), Some(1));
-        let id2 =
-            book.register_with_provenance("worker2", child2, None, Some(agent2), Some(1));
+        let id1 = book.register_with_provenance("worker1", child1, None, Some(agent1), Some(1));
+        let id2 = book.register_with_provenance("worker2", child2, None, Some(agent2), Some(1));
 
         let killed = book.kill_jobs_for_agent(&agent1);
         assert_eq!(killed, vec![id1]);
