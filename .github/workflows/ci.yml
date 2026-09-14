@@ -65,7 +65,12 @@ jobs:
           cargo clippy -p davinci-agent --all-targets -- -D warnings
           cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
       - name: Workspace verification
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          cargo build -p davinci-coding-agent --bin davinci
+          cargo test --workspace
       - name: Remove one-shot patch machinery
         run: |
           git checkout b2562436c4b789baab0dd7489f58510356c76a5f -- .github/workflows/ci.yml
@@ -119,4 +124,9 @@ jobs:
       - name: Runtime migration baseline
         run: cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
       - name: Workspace tests
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          cargo build -p davinci-coding-agent --bin davinci
+          cargo test --workspace
