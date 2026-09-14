@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -142,6 +143,65 @@ pub enum BeginOutcome {
     Collision(String),
 }
 
+fn atomic_write_json(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "tool ledger path has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("ledger");
+    let temp = parent.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        now_millis()
+    ));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|err| err.to_string())?;
+        file.write_all(bytes).map_err(|err| err.to_string())?;
+        file.sync_all().map_err(|err| err.to_string())?;
+
+        #[cfg(windows)]
+        if path.exists() {
+            let previous = parent.join(format!(".{name}.previous"));
+            let _ = std::fs::remove_file(&previous);
+            std::fs::rename(path, &previous).map_err(|err| err.to_string())?;
+            if let Err(error) = std::fs::rename(&temp, path) {
+                let _ = std::fs::rename(&previous, path);
+                return Err(error.to_string());
+            }
+            let _ = std::fs::remove_file(previous);
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(&temp, path).map_err(|err| err.to_string())?;
+        #[cfg(windows)]
+        if !path.exists() {
+            std::fs::rename(&temp, path).map_err(|err| err.to_string())?;
+        }
+
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    write_result
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 fn default_condvar() -> Arc<Condvar> {
     Arc::new(Condvar::new())
 }
@@ -241,10 +301,7 @@ impl ToolCallLedger {
             return Ok(());
         };
         let bytes = serde_json::to_vec_pretty(self).map_err(|err| err.to_string())?;
-        std::fs::write(path, bytes).map_err(|err| err.to_string())?;
-        std::fs::File::open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(|err| err.to_string())
+        atomic_write_json(path, &bytes)
     }
 
     pub fn records(&self) -> &HashMap<String, ToolCallRecord> {
@@ -351,6 +408,23 @@ impl ToolCallLedger {
         arguments: &Value,
         replay_policy: ReplayPolicy,
     ) -> Result<ReservationOutcome, String> {
+        self.reserve_call_with_metadata(
+            call_id,
+            tool_name,
+            arguments,
+            replay_policy,
+            classify_side_effect(tool_name),
+        )
+    }
+
+    pub fn reserve_call_with_metadata(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        replay_policy: ReplayPolicy,
+        side_effect: ToolSideEffect,
+    ) -> Result<ReservationOutcome, String> {
         let norm_args = normalize_arguments(arguments);
         let arg_digest = canonical_arguments_digest(arguments);
         if let Some(rec) = self.records.get(call_id) {
@@ -395,7 +469,7 @@ impl ToolCallLedger {
                 tool_name: tool_name.to_string(),
                 normalized_arguments: norm_args,
                 argument_digest: arg_digest,
-                side_effect: classify_side_effect(tool_name),
+                side_effect,
                 replay_policy,
                 outcome: AttemptOutcome::NotStarted,
                 pre_state_hash: None,
@@ -1002,5 +1076,33 @@ mod tests {
 
         let res = handle.join().unwrap().unwrap();
         assert_eq!(res, ("hi\n".to_string(), false));
+    }
+
+    #[test]
+    fn tool_ledger_atomic_persist_replaces_complete_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        atomic_write_json(&path, br#"{"generation":1}"#).unwrap();
+        atomic_write_json(&path, br#"{"generation":2,"complete":true}"#).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["generation"], 2);
+        assert_eq!(value["complete"], true);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn corrupt_tool_ledger_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-ledger.json");
+        std::fs::write(&path, b"{not-json").unwrap();
+        let error = ToolCallLedger::load_bound(&path, "session-a").unwrap_err();
+        assert!(error.contains("tool ledger is corrupt"));
     }
 }

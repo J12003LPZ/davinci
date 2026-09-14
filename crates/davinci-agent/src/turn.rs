@@ -1021,6 +1021,20 @@ impl Agent {
             .unwrap_or_else(|| crate::runtime::conservative_replay_policy(name))
     }
 
+    fn side_effect_for_tool(&self, name: &str) -> crate::tool_ledger::ToolSideEffect {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capability_registry.get(name))
+            .map(|capability| {
+                if capability.read_only {
+                    crate::tool_ledger::ToolSideEffect::ReadOnly
+                } else {
+                    crate::tool_ledger::ToolSideEffect::Mutating
+                }
+            })
+            .unwrap_or_else(|| crate::tool_ledger::classify_side_effect(name))
+    }
+
     /// Stage one of a tool call. `depth` is 0 for a call the model made and
     /// 1 for an operation inside a `batch`.
     pub(crate) fn prepare_tool_call(
@@ -1050,8 +1064,9 @@ impl Agent {
             );
         }
         let replay_policy = self.replay_policy_for_tool(name);
+        let side_effect = self.side_effect_for_tool(name);
         if let Ok(mut ledger) = self.tool_ledger.lock() {
-            match ledger.reserve_call_with_policy(id, name, args, replay_policy) {
+            match ledger.reserve_call_with_metadata(id, name, args, replay_policy, side_effect) {
                 Err(collision_err) => {
                     return Preparation::Immediate(crate::ToolResult {
                         content: collision_err,
@@ -3498,5 +3513,45 @@ mod tests {
         assert!(dispatch.is_error);
         assert!(dispatch.content.contains("review-only"));
         assert!(!dir.path().join("dispatch.rs").exists());
+    }
+
+    #[test]
+    fn tool_ledger_uses_runtime_capability_side_effect() {
+        let mut agent = Agent::new("x");
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        runtime
+            .capability_registry
+            .register(crate::RuntimeCapability::new(
+                "custom_read_capability",
+                crate::CapabilitySource::Mcp,
+                crate::ToolClass::Read,
+                true,
+                &serde_json::json!({"type":"object"}),
+                None,
+            ));
+        agent.set_runtime(runtime);
+
+        let side_effect = agent.side_effect_for_tool("custom_read_capability");
+        assert_eq!(side_effect, crate::tool_ledger::ToolSideEffect::ReadOnly);
+
+        let mut ledger = agent.tool_ledger.lock().unwrap();
+        ledger
+            .reserve_call_with_metadata(
+                "custom-read-call",
+                "custom_read_capability",
+                &serde_json::json!({}),
+                crate::runtime::ReplayPolicy::SafeToReplay,
+                side_effect,
+            )
+            .unwrap();
+        let record = ledger.records().get("custom-read-call").unwrap();
+        assert_eq!(
+            record.side_effect,
+            crate::tool_ledger::ToolSideEffect::ReadOnly
+        );
     }
 }
