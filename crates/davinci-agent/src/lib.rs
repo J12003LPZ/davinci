@@ -54,7 +54,10 @@ pub use compaction::{
     DEFAULT_RESERVE_TOKENS, SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT,
     TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
-pub use context::{load_context_files, ContextFile};
+pub use context::{
+    load_context_files, ContextBudgetReport, ContextContribution, ContextFile, ContextPriority,
+    RootContextAccount,
+};
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
 pub use file_mutation_queue::{mutation_queue_key, with_file_mutation_queue};
@@ -1555,18 +1558,92 @@ impl Agent {
     }
 
     pub fn provider_tool_schema_identity(&self) -> String {
-        let schema = self
-            .provider_tool_specs()
-            .into_iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
+        runtime::compute_schema_hash(&self.provider_tool_schema_value())
+    }
+
+    fn provider_tool_schema_value(&self) -> Value {
+        Value::Array(
+            self.provider_tool_specs()
+                .into_iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        runtime::compute_schema_hash(&Value::Array(schema))
+                .collect(),
+        )
+    }
+
+    /// Account for the normal/root provider request without changing its prompt.
+    pub fn root_context_budget_report(&self, budget: u64) -> ContextBudgetReport {
+        let mut account = RootContextAccount::default();
+        account.add(
+            "system_prompt",
+            self.system_prompt.clone(),
+            true,
+            ContextPriority::Mandatory,
+        );
+        for file in &self.context_files {
+            account.add(
+                format!("repository_instruction::{}", file.name),
+                file.body.clone(),
+                true,
+                ContextPriority::Mandatory,
+            );
+        }
+        account.add(
+            "provider_tool_schemas",
+            serde_json::to_string(&self.provider_tool_schema_value()).unwrap_or_default(),
+            true,
+            ContextPriority::Mandatory,
+        );
+        for skill in &self.skills {
+            account.add(
+                format!("skill::{}", skill.name),
+                skill.body.clone(),
+                true,
+                ContextPriority::Deferred,
+            );
+        }
+        for template in &self.templates {
+            account.add(
+                format!("prompt_template::{}", template.name),
+                template.body.clone(),
+                true,
+                ContextPriority::Deferred,
+            );
+        }
+
+        let messages = self.messages_for_provider();
+        let latest_user = messages.iter().rposition(|message| message.role == "user");
+        for (index, message) in messages.iter().enumerate() {
+            let body = serde_json::to_string(message).unwrap_or_default();
+            let priority = if Some(index) == latest_user {
+                ContextPriority::Mandatory
+            } else {
+                ContextPriority::Important
+            };
+            account.add(format!("conversation::{index}"), body, false, priority);
+        }
+
+        if let Some(contract) = self
+            .tool_context
+            .active_contract
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            account.add(
+                "active_task_contract",
+                serde_json::to_string(contract).unwrap_or_default(),
+                false,
+                ContextPriority::Mandatory,
+            );
+        }
+
+        account.report_for_budget(budget)
     }
 
     pub fn apply_extension_tools(&mut self, names: &[String]) {
