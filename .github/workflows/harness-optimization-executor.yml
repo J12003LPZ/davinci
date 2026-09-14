@@ -1,0 +1,92 @@
+name: Harness optimization executor
+
+on:
+  push:
+    branches:
+      - feat/davinci-harness-optimization-20260914
+
+permissions:
+  contents: write
+
+jobs:
+  execute:
+    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, '[opt-exec]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.83.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Apply requested optimization stage
+        run: python3 .github/scripts/harness_optimization_apply.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Run stage verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(cat .harness-opt-stage)"
+          case "$stage" in
+            governor)
+              cargo test -p davinci-coding-agent large_error_output_is_reversibly_compressed
+              cargo test -p davinci-coding-agent content_router_classifies_extended_shapes
+              cargo test -p davinci-coding-agent specialized_view_must_clear_minimum_reduction_threshold
+              cargo test -p davinci-coding-agent governor_tracks_retrievals_by_content_kind
+              cargo test -p davinci-coding-agent content_router_classifies_and_reduces_supported_shapes
+              cargo test -p davinci-coding-agent compression_preserves_notable_lines_and_is_reversible
+              cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
+              ;;
+            context)
+              cargo test -p davinci-agent root_budget_shapes_provider_view_without_dropping_authority
+              cargo test -p davinci-agent scoped_context_files_follow_target_ancestors
+              cargo test -p davinci-agent context::
+              cargo clippy -p davinci-agent --all-targets -- -D warnings
+              ;;
+            verification)
+              cargo test -p davinci-agent unrelated_successful_test_does_not_verify_mutation
+              cargo test -p davinci-agent mutation_then_successful_verification_is_verified
+              cargo test -p davinci-agent later_mutation_invalidates_previous_verification
+              cargo test -p davinci-agent read_only_turn_does_not_require_verification
+              cargo clippy -p davinci-agent --all-targets -- -D warnings
+              ;;
+            recovery)
+              cargo test -p davinci-agent tool_ledger_atomic_persist_replaces_complete_state
+              cargo test -p davinci-agent corrupt_tool_ledger_fails_closed
+              cargo test -p davinci-agent tool_ledger_uses_runtime_capability_side_effect
+              cargo test -p davinci-agent restart_restores_uncertain_mutation_and_blocks_replay
+              cargo clippy -p davinci-agent --all-targets -- -D warnings
+              ;;
+            *)
+              echo "unknown stage: $stage" >&2
+              exit 2
+              ;;
+          esac
+          git diff --check
+
+      - name: Commit verified production changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          stage="$(cat .harness-opt-stage)"
+          case "$stage" in
+            governor) message="feat(governor): improve reversible content routing" ;;
+            context) message="feat(context): enforce bounded scoped root context" ;;
+            verification) message="feat(verification): require mutation-scope coverage" ;;
+            recovery) message="fix(recovery): harden durable tool attempt metadata" ;;
+          esac
+          git add crates .harness-opt-stage
+          git commit -m "$message"
+          git push origin HEAD:${GITHUB_REF_NAME}
