@@ -1894,3 +1894,35 @@ comparisons, three-run task A/Bs, and the external Codex/Claude
 Code/Hermes/OpenCode comparison remain unmeasured. The byte measurements above
 are not token or cost claims. No external credentials, networked provider, or
 competitor harness was assumed.
+
+## Post-implementation review remediation
+
+A cold, single-agent review of the integrated 12-commit branch found and fixed
+the following defects with regression tests that failed before each fix and
+passed afterward:
+
+- Duplicate stable context changed the stable-prefix hash even though the body
+  was excluded from token accounting.
+- A deferred or dynamic duplicate seen before an identical mandatory or stable
+  source could weaken budget selection and omit the stable body from identity.
+- Normal provider requests listed and budgeted `AGENTS.md` / `CLAUDE.md` but did
+  not actually include their instructions. The wire prompt now includes each
+  distinct body once while retaining every source path.
+- Context pruning estimated the full authorized tool catalog rather than the
+  provider-visible deferred catalog.
+- Prepared context manifests repeated the same full-catalog error and hashed
+  tool names instead of the exact serialized provider schema.
+- Host-added model identity was absent from context estimates/manifests, and a
+  captured full-prompt override could become stale after turn prompt changes.
+  The host now records only a suffix that is applied to the current wire prompt.
+- The scheduler overrode authoritative runtime `ParallelSafe` metadata for
+  registered extension tools and forced them into the serial lane.
+- One hash-bound learning outcome was counted twice per store when identical
+  version references existed in project and global stores.
+
+The full post-review gates passed: `cargo fmt --all -- --check`, workspace
+Clippy with warnings denied, `davinci-agent` (`855` tests),
+`davinci-coding-agent` (`2,045` passed, `6` ignored), `davinci-evals` (`151`
+tests), corpus verification, and fresh focused runs of both deterministic
+schema/Governor ablations. The provider/competitor boundary above remains
+unchanged; no provider-backed or external competitor run was authorized.

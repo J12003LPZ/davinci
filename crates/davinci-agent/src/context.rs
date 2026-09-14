@@ -36,6 +36,38 @@ pub struct ContextBudgetReport {
     pub total_estimated_tokens: u64,
 }
 
+pub(crate) fn append_repository_context(prompt: &mut String, files: &[ContextFile]) {
+    if files.is_empty() {
+        return;
+    }
+
+    let mut unique_bodies: Vec<(&str, Vec<String>)> = Vec::new();
+    for file in files {
+        let path = file.path.to_string_lossy().into_owned();
+        if let Some((_, paths)) = unique_bodies
+            .iter_mut()
+            .find(|(body, _)| *body == file.body)
+        {
+            paths.push(path);
+        } else {
+            unique_bodies.push((&file.body, vec![path]));
+        }
+    }
+
+    if !prompt.is_empty() {
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("<project_context>\n\nProject-specific instructions and guidelines:\n\n");
+    for (body, paths) in unique_bodies {
+        prompt.push_str("<project_instructions paths=");
+        prompt.push_str(&serde_json::to_string(&paths).expect("context paths are JSON"));
+        prompt.push_str(">\n");
+        prompt.push_str(body);
+        prompt.push_str("\n</project_instructions>\n\n");
+    }
+    prompt.push_str("</project_context>");
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RootContextAccount {
     entries: Vec<RootContextEntry>,
@@ -57,10 +89,7 @@ impl RootContextAccount {
     ) {
         let body = body.into();
         let content_hash = crate::prompt::manifest::hash_text(&body);
-        let duplicate = self
-            .entries
-            .iter()
-            .any(|entry| entry.contribution.content_hash == content_hash);
+        let duplicate = self.entries.iter().any(|entry| entry.body == body);
         let estimated_tokens = if duplicate {
             0
         } else {
@@ -85,34 +114,33 @@ impl RootContextAccount {
     }
 
     pub fn report_for_budget(&self, budget: u64) -> ContextBudgetReport {
-        let mut selected_by_hash = HashMap::new();
+        let mut selected_by_body = HashMap::new();
         let mut used = 0u64;
 
-        for priority in [ContextPriority::Mandatory, ContextPriority::Important] {
+        for priority in [
+            ContextPriority::Mandatory,
+            ContextPriority::Important,
+            ContextPriority::Deferred,
+        ] {
             for entry in &self.entries {
-                if !entry.contribution.included || entry.contribution.priority != priority {
+                if entry.contribution.priority != priority
+                    || selected_by_body.contains_key(&entry.body)
+                {
                     continue;
                 }
+                let estimated_tokens = self
+                    .entries
+                    .iter()
+                    .find(|candidate| candidate.body == entry.body)
+                    .map(|candidate| candidate.contribution.estimated_tokens)
+                    .unwrap_or(0);
                 let selected = priority == ContextPriority::Mandatory
-                    || used.saturating_add(entry.contribution.estimated_tokens) <= budget;
+                    || used.saturating_add(estimated_tokens) <= budget;
                 if selected {
-                    used = used.saturating_add(entry.contribution.estimated_tokens);
+                    used = used.saturating_add(estimated_tokens);
                 }
-                selected_by_hash.insert(entry.contribution.content_hash.clone(), selected);
+                selected_by_body.insert(entry.body.clone(), selected);
             }
-        }
-
-        for entry in &self.entries {
-            if !entry.contribution.included
-                || entry.contribution.priority != ContextPriority::Deferred
-            {
-                continue;
-            }
-            let selected = used.saturating_add(entry.contribution.estimated_tokens) <= budget;
-            if selected {
-                used = used.saturating_add(entry.contribution.estimated_tokens);
-            }
-            selected_by_hash.insert(entry.contribution.content_hash.clone(), selected);
         }
 
         let contributions = self
@@ -120,10 +148,7 @@ impl RootContextAccount {
             .iter()
             .map(|entry| {
                 let mut contribution = entry.contribution.clone();
-                contribution.selected = selected_by_hash
-                    .get(&contribution.content_hash)
-                    .copied()
-                    .unwrap_or(true);
+                contribution.selected = selected_by_body.get(&entry.body).copied().unwrap_or(true);
                 contribution
             })
             .collect::<Vec<_>>();
@@ -141,13 +166,13 @@ impl RootContextAccount {
 
     /// Stable prompt identity remains independent from dynamic runtime state.
     pub fn stable_prefix_hash(&self) -> String {
-        let stable_body = self
-            .entries
-            .iter()
-            .filter(|entry| entry.contribution.stable)
-            .map(|entry| entry.body.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let mut stable_bodies = Vec::new();
+        for entry in &self.entries {
+            if entry.contribution.stable && !stable_bodies.contains(&entry.body.as_str()) {
+                stable_bodies.push(entry.body.as_str());
+            }
+        }
+        let stable_body = stable_bodies.join("\n\n");
         crate::prompt::manifest::hash_text(&stable_body)
     }
 }
@@ -204,6 +229,93 @@ mod tests {
             report.contributions[0].content_hash,
             report.contributions[1].content_hash
         );
+    }
+
+    #[test]
+    fn repository_prompt_retains_duplicate_provenance_without_duplicate_body() {
+        let mut prompt = "base".to_string();
+        append_repository_context(
+            &mut prompt,
+            &[
+                ContextFile {
+                    path: PathBuf::from("AGENTS.md"),
+                    name: "AGENTS.md".into(),
+                    body: "same instructions".into(),
+                },
+                ContextFile {
+                    path: PathBuf::from("CLAUDE.md"),
+                    name: "CLAUDE.md".into(),
+                    body: "same instructions".into(),
+                },
+            ],
+        );
+
+        assert_eq!(prompt.matches("same instructions").count(), 1);
+        assert!(prompt.contains("AGENTS.md"));
+        assert!(prompt.contains("CLAUDE.md"));
+    }
+
+    #[test]
+    fn duplicate_stable_context_does_not_change_stable_prefix_hash() {
+        let mut account = RootContextAccount::default();
+        account.add(
+            "AGENTS.md",
+            "same instructions",
+            true,
+            ContextPriority::Mandatory,
+        );
+        let before = account.stable_prefix_hash();
+
+        account.add(
+            "CLAUDE.md",
+            "same instructions",
+            true,
+            ContextPriority::Mandatory,
+        );
+
+        assert_eq!(before, account.stable_prefix_hash());
+    }
+
+    #[test]
+    fn mandatory_duplicate_is_not_dropped_when_deferred_copy_precedes_it() {
+        let mut account = RootContextAccount::default();
+        account.add(
+            "optional_memory",
+            "shared authority",
+            false,
+            ContextPriority::Deferred,
+        );
+        account.add(
+            "AGENTS.md",
+            "shared authority",
+            true,
+            ContextPriority::Mandatory,
+        );
+
+        let report = account.report_for_budget(0);
+        assert!(report.contributions.iter().all(|entry| entry.selected));
+        assert!(report.total_estimated_tokens > 0);
+    }
+
+    #[test]
+    fn stable_duplicate_after_dynamic_copy_changes_stable_prefix_hash() {
+        let mut account = RootContextAccount::default();
+        account.add(
+            "runtime_state",
+            "shared authority",
+            false,
+            ContextPriority::Important,
+        );
+        let before = account.stable_prefix_hash();
+
+        account.add(
+            "AGENTS.md",
+            "shared authority",
+            true,
+            ContextPriority::Mandatory,
+        );
+
+        assert_ne!(before, account.stable_prefix_hash());
     }
 
     #[test]

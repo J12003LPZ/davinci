@@ -1147,17 +1147,10 @@ impl Agent {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .class_of(name);
-        // Optional task reads are built-in implementations, but are excluded
-        // from BUILTIN_TOOLS because that list also enables default tools.
-        let lane = if !crate::tools::BUILTIN_TOOLS.contains(&name)
-            && !matches!(name, "task_get" | "task_list")
-            && !name.starts_with("mcp__")
-        {
-            // An extension tool has state the runtime cannot see.
-            crate::scheduler::ToolLane::Serial
-        } else {
-            self.lane_for_tool(name, class)
-        };
+        // Runtime metadata is authoritative when installed; unknown tools fail
+        // closed inside `lane_for_capability`. Without a runtime, the legacy
+        // class-based resolver still keeps unrecognized extensions serial.
+        let lane = self.lane_for_tool(name, class);
         Preparation::Ready { lane }
     }
 
@@ -3228,6 +3221,45 @@ mod tests {
             _ => panic!("unknown custom effects must fail closed under a hard contract"),
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn registered_extension_uses_authoritative_parallel_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("parallel extension fixture");
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        let mut capability = crate::RuntimeCapability::new(
+            "parallel_extension",
+            crate::CapabilitySource::JsExtension,
+            crate::ToolClass::Other,
+            false,
+            &serde_json::json!({"type": "object"}),
+            None,
+        );
+        capability.concurrency_policy = crate::ConcurrencyPolicy::ParallelSafe;
+        runtime.capability_registry.register(capability);
+        agent.set_runtime(runtime);
+        agent.tools = vec!["parallel_extension".into()];
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+        ));
+
+        assert!(matches!(
+            agent.prepare_tool_call(
+                dir.path(),
+                "parallel-extension",
+                "parallel_extension",
+                &serde_json::json!({}),
+                0,
+            ),
+            Preparation::Ready {
+                lane: crate::scheduler::ToolLane::Parallel
+            }
+        ));
     }
 
     fn f02_turn_question_fixture() -> (tempfile::TempDir, Agent, serde_json::Value) {

@@ -600,14 +600,20 @@ impl LearningController {
         content_hash: &str,
         outcome: SkillOutcome,
     ) -> Result<bool, String> {
-        let refs = [
+        let candidates = [
             self.project_store
                 .skill_version_ref_for_content_hash(name, content_hash),
             self.global_store
                 .skill_version_ref_for_content_hash(name, content_hash),
         ];
+        let mut refs = Vec::new();
+        for skill in candidates.into_iter().flatten() {
+            if !refs.contains(&skill) {
+                refs.push(skill);
+            }
+        }
         let mut modified = false;
-        for skill in refs.into_iter().flatten() {
+        for skill in refs {
             modified |= self.record_skill_version_outcome(&skill, outcome)?;
         }
         Ok(modified)
@@ -1836,6 +1842,67 @@ mod tests {
         assert_eq!(unchanged.status, ArtifactStatus::Candidate);
         assert_eq!(unchanged.success_count, 1);
         assert_eq!(controller.stats.verified_skill_successes, 0);
+    }
+
+    #[test]
+    fn identical_cross_scope_skill_version_records_one_outcome_per_use() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let mut controller = LearningController::new(dir.path(), Some(&agent_dir), None);
+        let project_record = SkillLedgerRecord {
+            skill_id: "project-shared-skill".into(),
+            name: "shared-skill".into(),
+            scope: LearningScope::Project,
+            origin: SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Candidate,
+            path: dir.path().join("project-skill.md"),
+            content_hash: "shared-hash".into(),
+            version: 1,
+            success_count: 0,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            pinned: false,
+        };
+        let global_record = SkillLedgerRecord {
+            skill_id: "global-shared-skill".into(),
+            scope: LearningScope::Global,
+            path: agent_dir.join("global-skill.md"),
+            ..project_record.clone()
+        };
+        controller
+            .project_store
+            .upsert_skill(project_record)
+            .unwrap();
+        controller.global_store.upsert_skill(global_record).unwrap();
+
+        assert!(controller
+            .record_skill_outcome_for_content_hash(
+                "shared-skill",
+                "shared-hash",
+                SkillOutcome::VerifiedSuccess,
+            )
+            .unwrap());
+
+        assert_eq!(
+            controller
+                .project_store
+                .skill_version("shared-skill", 1)
+                .unwrap()
+                .success_count,
+            1
+        );
+        assert_eq!(
+            controller
+                .global_store
+                .skill_version("shared-skill", 1)
+                .unwrap()
+                .success_count,
+            1
+        );
+        assert_eq!(controller.stats.verified_skill_successes, 1);
     }
 
     #[test]

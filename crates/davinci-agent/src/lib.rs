@@ -326,8 +326,10 @@ pub struct Agent {
     /// Context supplied by extensions for the next provider request only.
     /// These messages never enter the persisted session history.
     ephemeral_context: Vec<ChatMessage>,
-    /// Host-supplied schema/identity estimate, excluding `system_prompt` and messages.
+    /// Host-supplied schema estimate, excluding the system prompt and messages.
     provider_context_overhead_tokens: Option<u64>,
+    /// Request-local suffix appended to the current prompt after repository context.
+    provider_system_prompt_suffix: Option<String>,
     /// Last prepared context manifest before provider dispatch.
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
@@ -425,6 +427,7 @@ impl Agent {
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
             provider_context_overhead_tokens: None,
+            provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
             runtime: None,
             runtime_session: None,
@@ -1000,9 +1003,9 @@ impl Agent {
                 .plan_provider_context()
                 .map(|text| (text.len() as u64).div_ceil(4))
                 .unwrap_or(0)
-            + (self.system_prompt.len() as u64).div_ceil(4)
+            + (self.provider_system_prompt().len() as u64).div_ceil(4)
             + self.provider_context_overhead_tokens.unwrap_or_else(|| {
-                let specs = self.builtin_and_mcp_specs();
+                let specs = self.provider_tool_specs();
                 (serde_json::to_vec(&specs)
                     .expect("tool schemas are JSON")
                     .len() as u64)
@@ -1010,10 +1013,28 @@ impl Agent {
             })
     }
 
-    /// Set once per request configuration using the actual tool catalog and
-    /// any host-added system suffix. `None` restores the builtin/MCP estimate.
+    /// Set once per request configuration using the actual tool catalog.
+    /// `None` restores the builtin/MCP estimate.
     pub fn set_provider_context_overhead_tokens(&mut self, tokens: Option<u64>) {
         self.provider_context_overhead_tokens = tokens;
+    }
+
+    /// Record host-owned request context that follows the mutable turn prompt.
+    pub fn set_provider_system_prompt_suffix(&mut self, suffix: Option<String>) {
+        self.provider_system_prompt_suffix = suffix;
+    }
+
+    /// Build the exact system prompt for the next provider request.
+    pub fn provider_system_prompt(&self) -> String {
+        let mut prompt = self.system_prompt.clone();
+        context::append_repository_context(&mut prompt, &self.context_files);
+        if let Some(suffix) = self.provider_system_prompt_suffix.as_deref() {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(suffix);
+        }
+        prompt
     }
 
     /// Captures the complete prepared provider context manifest.
@@ -1030,8 +1051,9 @@ impl Agent {
         let mut entries = Vec::new();
 
         // 1. Mandatory system prompt
-        let sys_tokens = (self.system_prompt.len() as u64).div_ceil(4);
-        let sys_hash = ContextManifestEntry::hash_content(&self.system_prompt);
+        let provider_system_prompt = self.provider_system_prompt();
+        let sys_tokens = (provider_system_prompt.len() as u64).div_ceil(4);
+        let sys_hash = ContextManifestEntry::hash_content(&provider_system_prompt);
         entries.push(ContextManifestEntry::new(
             "system_prompt",
             "system",
@@ -1047,19 +1069,17 @@ impl Agent {
         ));
 
         // 2. Mandatory tool schemas
-        let tool_tokens = self.provider_context_overhead_tokens.unwrap_or_else(|| {
-            let specs = self.builtin_and_mcp_specs();
-            (serde_json::to_vec(&specs)
-                .expect("tool schemas are JSON")
-                .len() as u64)
-                .div_ceil(4)
-        });
+        let provider_tool_schemas = serde_json::to_string(&self.provider_tool_schema_value())
+            .expect("provider tool schemas are JSON");
+        let tool_tokens = self
+            .provider_context_overhead_tokens
+            .unwrap_or_else(|| (provider_tool_schemas.len() as u64).div_ceil(4));
         entries.push(ContextManifestEntry::new(
             "tool_schemas",
             "tools",
             ProvenanceKind::MandatoryPolicy,
             "agent::tool_catalog",
-            ContextManifestEntry::hash_content(&self.tools.join(",")),
+            ContextManifestEntry::hash_content(&provider_tool_schemas),
             tool_tokens,
             true,
             Some("mandatory_tool_schemas".into()),
@@ -1663,6 +1683,14 @@ impl Agent {
             true,
             ContextPriority::Mandatory,
         );
+        if let Some(suffix) = self.provider_system_prompt_suffix.as_ref() {
+            account.add(
+                "provider_system_prompt_suffix",
+                suffix.clone(),
+                false,
+                ContextPriority::Mandatory,
+            );
+        }
         for file in &self.context_files {
             account.add(
                 format!("repository_instruction::{}", file.name),
@@ -2802,18 +2830,68 @@ mod tests {
     fn context_budget_counts_system_and_active_tool_schemas() {
         let mut agent = Agent::new("");
         agent.tools.clear();
+        agent.expose_active_tools();
         let empty = agent.estimated_context_tokens();
         agent.system_prompt = "x".repeat(4_000);
         assert!(agent.estimated_context_tokens() >= empty + 1_000);
         let without_tools = agent.estimated_context_tokens();
         agent.tools.push("read".into());
+        agent.expose_active_tools();
         assert!(agent.estimated_context_tokens() > without_tools);
         agent.tools.clear();
+        agent.expose_active_tools();
         assert_eq!(agent.estimated_context_tokens(), without_tools);
         agent.set_provider_context_overhead_tokens(Some(3_000));
         assert_eq!(agent.estimated_context_tokens(), 4_000);
         agent.set_provider_context_overhead_tokens(None);
         assert_eq!(agent.estimated_context_tokens(), without_tools);
+    }
+
+    #[test]
+    fn context_budget_counts_only_provider_visible_tool_schemas() {
+        let agent = Agent::new("");
+        let provider_schema_tokens = (serde_json::to_vec(&agent.provider_tool_specs())
+            .unwrap()
+            .len() as u64)
+            .div_ceil(4);
+
+        assert_eq!(agent.estimated_context_tokens(), provider_schema_tokens);
+    }
+
+    #[test]
+    fn context_manifest_describes_only_provider_visible_tool_schemas() {
+        let mut agent = Agent::new("");
+        let provider_schema = serde_json::to_string(&agent.provider_tool_schema_value()).unwrap();
+        let expected_tokens = (provider_schema.len() as u64).div_ceil(4);
+        let expected_hash =
+            runtime::context_manifest::ContextManifestEntry::hash_content(&provider_schema);
+
+        let manifest = agent.prepare_context_manifest("request", RunId::new(), 1, 1);
+        let tool_schemas = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.id == "tool_schemas")
+            .unwrap();
+
+        assert_eq!(tool_schemas.token_estimate, expected_tokens);
+        assert_eq!(tool_schemas.content_hash, expected_hash);
+    }
+
+    #[test]
+    fn root_context_report_includes_provider_system_suffix() {
+        let mut agent = Agent::new("base");
+        agent.set_provider_system_prompt_suffix(Some("runtime identity".into()));
+
+        let report = agent.root_context_budget_report(u64::MAX);
+        let suffix = report
+            .contributions
+            .iter()
+            .find(|entry| entry.source == "provider_system_prompt_suffix")
+            .unwrap();
+
+        assert!(!suffix.stable);
+        assert_eq!(suffix.priority, ContextPriority::Mandatory);
+        assert!(suffix.selected);
     }
 
     #[test]

@@ -465,31 +465,30 @@ fn is_package_command(command: Option<&str>) -> bool {
     )
 }
 
-/// The system prompt for one request, with the model actually serving it named
-/// in the text.
+/// The request-local identity for the model actually serving the turn.
 ///
 /// A documented divergence from vendor `pi`: `buildSystemPrompt`
 /// (`vendor/pi/packages/coding-agent/src/core/system-prompt.ts`) carries cwd,
 /// tools, context files and skills but no model identity, so "what model are
 /// you?" was answered from the model's training prior rather than from the run.
-/// The line is appended per request rather than stored on the agent, so a
-/// `/model` switch, a thinking-level change, or an extension's `systemPrompt`
-/// override can never leave a stale identity behind.
-fn system_prompt_with_identity(agent: &Agent) -> String {
-    let mut prompt = agent.system_prompt.clone();
+/// The suffix is refreshed for every run and appended to the current turn
+/// prompt at dispatch, so prompt preparation and extension overrides cannot
+/// leave the provider request with a stale prompt body.
+fn provider_identity(agent: &Agent) -> Option<String> {
     if agent.provider.is_empty() || agent.model_id.is_empty() {
-        return prompt;
+        return None;
     }
-    if !prompt.is_empty() {
-        prompt.push_str("\n\n");
-    }
-    prompt.push_str(&format!(
+    Some(format!(
         "You are running as {}/{} (thinking: {}).",
         agent.provider,
         agent.model_id,
         agent.thinking_level.as_str()
-    ));
-    prompt
+    ))
+}
+
+fn synchronize_provider_system_prompt(agent: &mut Agent) {
+    let suffix = provider_identity(agent);
+    agent.set_provider_system_prompt_suffix(suffix);
 }
 
 /// The reply an offline run gives. `PI_OFFLINE_TOOL_CALL` is a fixture —
@@ -1987,6 +1986,7 @@ fn complete_prompt_with_host(
             }
         })));
     }
+    synchronize_provider_system_prompt(agent);
     let mut context_visibility = (agent.stats.pruned_results, agent.stats.compactions);
     // Session calls settle after the loop. Hold the final terminal event until
     // their result is known so streaming clients receive one final outcome.
@@ -2018,7 +2018,7 @@ fn complete_prompt_with_host(
                 .find(|m| m.role == "user")
                 .map(|m| content_text(&m.content).len())
                 .unwrap_or(0);
-            let system = system_prompt_with_identity(current);
+            let system = current.provider_system_prompt();
             match (offline, model.as_ref(), auth.as_ref(), js_stream.as_ref()) {
                 (false, Some(model), _, Some((path, name))) => {
                     crate::js_host::run_js_stream_simple(
@@ -9983,6 +9983,65 @@ mod tests {
     use super::*;
 
     static OFFLINE_TOOL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn provider_context_accounting_includes_runtime_identity() {
+        let mut agent = Agent::new("base");
+        agent.provider = "openai".into();
+        agent.model_id = "gpt-test".into();
+        let provider_system =
+            "base\n\nYou are running as openai/gpt-test (thinking: off).".to_string();
+        synchronize_provider_system_prompt(&mut agent);
+        let schema_tokens =
+            (serde_json::to_vec(&provider_tools(&agent)).unwrap().len() as u64).div_ceil(4);
+        let expected = (provider_system.len() as u64).div_ceil(4) + schema_tokens;
+
+        assert_eq!(agent.estimated_context_tokens(), expected);
+    }
+
+    #[test]
+    fn provider_context_includes_duplicate_repository_instructions_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("base");
+        agent.provider = "openai".into();
+        agent.model_id = "gpt-test".into();
+        agent.context_files = vec![
+            davinci_agent::ContextFile {
+                path: dir.path().join("AGENTS.md"),
+                name: "AGENTS.md".into(),
+                body: "DISTINCTIVE_REPOSITORY_CONSTRAINT".into(),
+            },
+            davinci_agent::ContextFile {
+                path: dir.path().join("CLAUDE.md"),
+                name: "CLAUDE.md".into(),
+                body: "DISTINCTIVE_REPOSITORY_CONSTRAINT".into(),
+            },
+        ];
+
+        synchronize_provider_system_prompt(&mut agent);
+        let prompt = agent.provider_system_prompt();
+
+        assert_eq!(
+            prompt.matches("DISTINCTIVE_REPOSITORY_CONSTRAINT").count(),
+            1
+        );
+        assert!(prompt.contains("AGENTS.md"), "{prompt}");
+        assert!(prompt.contains("CLAUDE.md"), "{prompt}");
+    }
+
+    #[test]
+    fn provider_context_tracks_turn_prompt_updates() {
+        let mut agent = Agent::new("initial prompt");
+        agent.provider = "openai".into();
+        agent.model_id = "gpt-test".into();
+        synchronize_provider_system_prompt(&mut agent);
+
+        agent.system_prompt = "updated turn prompt".into();
+
+        let prompt = agent.provider_system_prompt();
+        assert!(prompt.starts_with("updated turn prompt"), "{prompt}");
+        assert!(prompt.contains("openai/gpt-test"), "{prompt}");
+    }
 
     struct EnvRestore {
         key: &'static str,
