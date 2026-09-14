@@ -178,6 +178,12 @@ impl GraphWorkerContext {
 
     /// Validate and persist the worker's deliverable.
     pub fn submit(&self, params: &Value) -> Result<String, String> {
+        if SUBMITTED.load(Ordering::Relaxed) {
+            return Err(format!(
+                "this {} node already submitted its artifact",
+                self.role
+            ));
+        }
         let raw = params.get("artifact").unwrap_or(&Value::Null);
         let candidate = match raw {
             Value::String(text) => serde_json::from_str::<Value>(text).map_err(|_| {
@@ -415,6 +421,25 @@ mod tests {
         assert!(message.contains("Artifact recorded (review)"));
         let stored: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(stored["verdict"], "approve");
+    }
+
+    #[test]
+    fn graph_submit_accepts_only_one_artifact() {
+        let _guard = submit_guard();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("artifact.json");
+        let context = context(Role::Reviewer, ArtifactKind::Review, &path);
+        context
+            .submit(&json!({"artifact": {"verdict": "approve", "issues": [], "notes": "first"}}))
+            .expect("first submission accepted");
+        let first = std::fs::read_to_string(&path).unwrap();
+
+        let error = context
+            .submit(&json!({"artifact": {"verdict": "approve", "issues": [], "notes": "second"}}))
+            .expect_err("second submission must be rejected");
+
+        assert!(error.contains("already submitted"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
     }
 
     #[test]

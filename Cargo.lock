@@ -410,7 +410,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "davinci-agent"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "base64",
  "davinci-ai",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-ai"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "base64",
  "davinci-protocol",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-client"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "davinci-protocol",
  "serde",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-coding-agent"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "base64",
  "clap",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-evals"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "clap",
  "davinci-agent",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-mcp"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "serde",
  "serde_json",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-parity"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "clap",
  "davinci-agent",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-protocol"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "serde",
  "serde_json",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-server"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "davinci-agent",
  "davinci-ai",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-session"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "davinci-protocol",
  "serde",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-session-sqlite"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "davinci-session",
  "rusqlite",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-telemetry"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "serde",
  "serde_json",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-tui"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "base64",
  "crossterm",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "davinci-voice"
-version = "1.0.0"
+version = "1.0.70"
 dependencies = [
  "cmake",
  "cpal",

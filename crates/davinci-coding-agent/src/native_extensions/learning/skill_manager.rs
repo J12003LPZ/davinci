@@ -96,6 +96,21 @@ pub fn validate_relative_support_path(rel_path: &str) -> Result<PathBuf, String>
     }
 }
 
+fn ensure_skill_path_under_root(root: &Path, skill_name: &str, path: &Path) -> Result<(), String> {
+    let canonical_root = root
+        .join(skill_name)
+        .canonicalize()
+        .map_err(|_| "skill path is outside configured skill root".to_string())?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| "skill path is outside configured skill root".to_string())?;
+    if canonical_path.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        Err("skill path is outside configured skill root".into())
+    }
+}
+
 fn now_ms() -> u64 {
     crate::native_extensions::learning::types::now_ms()
 }
@@ -353,6 +368,12 @@ impl SkillManager {
             return Err(ToolError::Failed(format!("skill '{}' not found", name)));
         };
 
+        let configured_root = match scope {
+            LearningScope::Project => ctx.project_skills_dir,
+            LearningScope::Global => ctx.global_skills_dir,
+        };
+        ensure_skill_path_under_root(configured_root, name, &path).map_err(ToolError::Failed)?;
+
         let skill_origin = ledger_record
             .as_ref()
             .map(|r| r.origin)
@@ -561,6 +582,13 @@ impl SkillManager {
         } else {
             return Err(ToolError::Failed(format!("skill '{}' not found", name)));
         };
+
+        let configured_root = match scope {
+            LearningScope::Project => ctx.project_skills_dir,
+            LearningScope::Global => ctx.global_skills_dir,
+        };
+        ensure_skill_path_under_root(configured_root, name, &skill_dir)
+            .map_err(ToolError::Failed)?;
 
         let skill_origin = ledger_record
             .as_ref()
@@ -949,6 +977,109 @@ mod tests {
         assert!(!res.is_error);
         assert_eq!(fs::read_to_string(&skill_file).unwrap(), "Patched text");
         assert_eq!(p_store.skill("learned-skill").unwrap().version, 2);
+    }
+
+    #[test]
+    fn ledger_path_cannot_escape_declared_skill_root_when_patching() {
+        let (dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let outside_dir = dir.path().join("outside-skill");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("SKILL.md");
+        fs::write(&outside_file, "Original text").unwrap();
+
+        p_store
+            .upsert_skill(SkillLedgerRecord {
+                skill_id: "escaped-skill".into(),
+                name: "escaped-skill".into(),
+                scope: LearningScope::Project,
+                origin: SkillOrigin::LearnedForeground,
+                status: ArtifactStatus::Active,
+                path: outside_file.clone(),
+                content_hash: content_hash("Original text"),
+                version: 1,
+                success_count: 0,
+                failure_count: 0,
+                neutral_count: 0,
+                last_used_at_ms: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+                pinned: false,
+            })
+            .unwrap();
+
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        let args = json!({
+            "action": "patch",
+            "name": "escaped-skill",
+            "oldText": "Original",
+            "newText": "Patched",
+            "expectedHash": content_hash("Original text")
+        });
+
+        let error =
+            SkillManager::execute(ctx, &args).expect_err("out-of-root ledger path must fail");
+        assert!(error.to_string().contains("outside configured skill root"));
+        assert_eq!(fs::read_to_string(outside_file).unwrap(), "Original text");
+    }
+
+    #[test]
+    fn ledger_path_cannot_escape_declared_skill_root_when_writing_support_file() {
+        let (dir, p_skills, g_skills, mut p_store, mut g_store, read_set) = setup_env();
+        let outside_dir = dir.path().join("outside-skill");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("SKILL.md");
+        fs::write(&outside_file, "Original text").unwrap();
+
+        p_store
+            .upsert_skill(SkillLedgerRecord {
+                skill_id: "escaped-skill".into(),
+                name: "escaped-skill".into(),
+                scope: LearningScope::Project,
+                origin: SkillOrigin::LearnedForeground,
+                status: ArtifactStatus::Active,
+                path: outside_file,
+                content_hash: content_hash("Original text"),
+                version: 1,
+                success_count: 0,
+                failure_count: 0,
+                neutral_count: 0,
+                last_used_at_ms: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+                pinned: false,
+            })
+            .unwrap();
+
+        let ctx = SkillManagerContext {
+            project_skills_dir: &p_skills,
+            global_skills_dir: &g_skills,
+            project_store: &mut p_store,
+            global_store: &mut g_store,
+            project_trusted: true,
+            auto_apply_global: false,
+            origin: SkillWriteOrigin::ForegroundUserDirected,
+            read_set: &read_set,
+        };
+        let args = json!({
+            "action": "write_file",
+            "name": "escaped-skill",
+            "filePath": "references/note.md",
+            "content": "should not be written"
+        });
+
+        let error =
+            SkillManager::execute(ctx, &args).expect_err("out-of-root ledger path must fail");
+        assert!(error.to_string().contains("outside configured skill root"));
+        assert!(!outside_dir.join("references").join("note.md").exists());
     }
 
     #[test]

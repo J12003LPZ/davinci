@@ -274,14 +274,29 @@ impl Connection {
                     self.fail_and_close(ClientError::Protocol(error.message.clone()));
                     return;
                 }
-                ServerMessage::Hello { snapshot, .. } => {
+                ServerMessage::Hello {
+                    version, snapshot, ..
+                } => {
                     if !self.inner.borrow().transport_attached {
                         self.fail_and_close(ClientError::Protocol(
                             "Received server hello before the client hello was sent".into(),
                         ));
                         return;
                     }
+                    if *version != PROTOCOL_VERSION {
+                        self.fail_and_close(ClientError::Protocol(format!(
+                            "Unsupported server hello protocol version: {version}"
+                        )));
+                        return;
+                    }
                     let snapshot = snapshot.clone();
+                    if snapshot.protocol_version != PROTOCOL_VERSION {
+                        self.fail_and_close(ClientError::Protocol(format!(
+                            "Unsupported snapshot protocol version: {}",
+                            snapshot.protocol_version
+                        )));
+                        return;
+                    }
                     {
                         let mut inner = self.inner.borrow_mut();
                         inner.state = ConnectionState::Connected;
@@ -544,6 +559,38 @@ mod tests {
         assert_eq!(connection.state(), ConnectionState::Connected);
         let err = connection.connect(&mut factory).unwrap_err().to_string();
         assert_eq!(err, "PiClient is already connected");
+    }
+
+    #[test]
+    fn rejects_mismatched_hello_envelope_version() {
+        let connection = Connection::new(None).unwrap();
+        let mut factory = loopback_factory(|message| match message {
+            ClientMessage::Hello { .. } => (
+                ServerMessage::Hello {
+                    version: PROTOCOL_VERSION + 1,
+                    connection_id: "c1".into(),
+                    snapshot: empty_snapshot(),
+                },
+                Vec::new(),
+            ),
+            _ => unreachable!(),
+        });
+
+        let error = connection.connect(&mut factory).unwrap_err().to_string();
+        assert!(error.contains("server hello protocol version"));
+        assert_eq!(connection.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn rejects_mismatched_snapshot_protocol_version() {
+        let connection = Connection::new(None).unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot.protocol_version = PROTOCOL_VERSION + 1;
+        let mut factory = hello_factory(snapshot);
+
+        let error = connection.connect(&mut factory).unwrap_err().to_string();
+        assert!(error.contains("snapshot protocol version"));
+        assert_eq!(connection.state(), ConnectionState::Disconnected);
     }
 
     #[test]

@@ -22,7 +22,7 @@ members = [
 # vendor commit 853a80d2) when the davinci UI landed; the identity presented
 # to providers and to JavaScript extensions still reports 0.84.4, because that
 # is a wire contract rather than a release number.
-version = "1.0.0"
+version = "1.0.70"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/J12003LPZ/davinci"

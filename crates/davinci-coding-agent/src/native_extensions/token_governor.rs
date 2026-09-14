@@ -591,6 +591,19 @@ fn line_count(content: &str) -> usize {
     }
 }
 
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let end = text
+        .char_indices()
+        .take_while(|(index, _)| *index <= max_bytes)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    &text[..end]
+}
+
 /// Compress a tool result while preserving the head, tail, and notable lines.
 /// The trailer names no output id; `compress_with_reference` is what the
 /// governor uses once the original is on disk.
@@ -1066,6 +1079,14 @@ impl TokenGovernor {
             }
             matched += 1;
             let rendered = format!("{line_no}: {line}");
+            if selected.is_empty() && rendered.len() + 1 > budget {
+                let prefix = format!("{line_no}: ");
+                let available = budget.saturating_sub(prefix.len() + 1);
+                selected.push(format!("{prefix}{}…", truncate_to_bytes(line, available)));
+                used = selected[0].len();
+                stopped_at = Some(line_no);
+                break;
+            }
             if used + rendered.len() + 1 > budget && !selected.is_empty() {
                 stopped_at = Some(line_no);
                 break;
@@ -1476,6 +1497,31 @@ mod tests {
         assert!(empty.content.contains("no line of"));
         let missing = governor.retrieve(&json!({"id": "out-ffffffffffff"}));
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn retrieval_caps_an_oversized_first_line() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            retrieve_max_bytes: 1_024,
+            ..tiny_thresholds()
+        };
+        let mut governor = TokenGovernor::with_store("test", config, OutputStore::new(dir.path()));
+        let original = "é".repeat(4_000);
+        let result = governor.after_tool("bash", &json!({}), ok(&original));
+        let id = result.details.unwrap()["tokenGovernor"]["outputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let page = governor.retrieve(&json!({"id": id})).unwrap();
+
+        assert!(page.content.len() < 1_024 + 200, "{}", page.content.len());
+        assert_eq!(
+            page.details.as_ref().unwrap()["tokenGovernor"]["truncated"],
+            true
+        );
+        assert!(std::str::from_utf8(page.content.as_bytes()).is_ok());
     }
 
     #[test]
