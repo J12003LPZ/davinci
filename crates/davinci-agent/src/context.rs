@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use davinci_ai::ChatMessage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextFile {
@@ -34,6 +36,13 @@ pub struct ContextContribution {
 pub struct ContextBudgetReport {
     pub contributions: Vec<ContextContribution>,
     pub total_estimated_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedRootContext {
+    pub report: ContextBudgetReport,
+    pub repository_files: Vec<ContextFile>,
+    pub ephemeral_messages: Vec<ChatMessage>,
 }
 
 pub(crate) fn append_repository_context(prompt: &mut String, files: &[ContextFile]) {
@@ -190,6 +199,66 @@ pub fn load_context_files(cwd: &Path, enabled: bool) -> Vec<ContextFile> {
                 name: name.to_string(),
                 body,
             });
+        }
+    }
+    files
+}
+
+pub fn load_context_files_for_targets(
+    cwd: &Path,
+    enabled: bool,
+    targets: &[PathBuf],
+) -> Vec<ContextFile> {
+    if !enabled {
+        return Vec::new();
+    }
+
+    let root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut files = load_context_files(cwd, true);
+    let mut seen = HashSet::new();
+    for file in &files {
+        seen.insert(fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone()));
+    }
+
+    for target in targets {
+        let absolute = if target.is_absolute() {
+            target.clone()
+        } else {
+            cwd.join(target)
+        };
+        let start = if absolute.is_dir() {
+            absolute
+        } else {
+            absolute.parent().unwrap_or(cwd).to_path_buf()
+        };
+        let start = fs::canonicalize(&start).unwrap_or(start);
+        if !start.starts_with(&root) {
+            continue;
+        }
+        let mut ancestors = start
+            .ancestors()
+            .take_while(|path| path.starts_with(&root))
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        ancestors.reverse();
+        for directory in ancestors {
+            for name in ["AGENTS.md", "CLAUDE.md"] {
+                let path = directory.join(name);
+                if !path.is_file() {
+                    continue;
+                }
+                let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if !seen.insert(identity) {
+                    continue;
+                }
+                if let Ok(body) = fs::read_to_string(&path) {
+                    files.push(ContextFile {
+                        path,
+                        name: name.to_string(),
+                        body,
+                    });
+                }
+            }
         }
     }
     files
