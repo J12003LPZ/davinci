@@ -17,9 +17,28 @@ pub struct RunHandle {
     publishing: Arc<AtomicBool>,
     budget: Arc<Mutex<Option<super::budget::RequestBudget>>>,
     partial_report: Arc<Mutex<Option<serde_json::Value>>>,
+    worker_exited: Arc<(Mutex<bool>, Condvar)>,
+}
+
+struct WorkerExitGuard(RunHandle);
+
+impl Drop for WorkerExitGuard {
+    fn drop(&mut self) {
+        self.0.mark_worker_exited();
+    }
 }
 
 impl RunHandle {
+    fn mark_worker_exited(&self) {
+        let mut exited = self
+            .worker_exited
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *exited = true;
+        self.worker_exited.1.notify_all();
+    }
+
     pub fn set_partial_report(&self, value: serde_json::Value) -> Result<(), String> {
         let state = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.status.terminal()
@@ -235,6 +254,17 @@ impl RunHandle {
                 .wait_while(state, |state| !state.status.terminal())
                 .unwrap_or_else(|e| e.into_inner()),
         );
+        let exited = self
+            .worker_exited
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        drop(
+            self.worker_exited
+                .1
+                .wait_while(exited, |exited| !*exited)
+                .unwrap_or_else(|e| e.into_inner()),
+        );
     }
 }
 
@@ -309,11 +339,13 @@ impl ScanCoordinator {
             publishing: Arc::new(AtomicBool::new(false)),
             budget: Default::default(),
             partial_report: Default::default(),
+            worker_exited: Arc::new((Mutex::new(false), Condvar::new())),
         };
         let worker = run.clone();
         std::thread::Builder::new()
             .name("security-scan".into())
             .spawn(move || {
+                let _exit_guard = WorkerExitGuard(worker.clone());
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(worker.clone())));
                 if result.is_err() {

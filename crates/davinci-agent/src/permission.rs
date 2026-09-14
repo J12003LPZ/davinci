@@ -8,7 +8,7 @@
 //! `tool_call` hook and before the tool runs.
 
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -1287,6 +1287,61 @@ pub fn has_windows_drive_prefix(s: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+fn is_windows_unc_path(s: &str) -> bool {
+    s.starts_with(r"\\") || s.starts_with("//")
+}
+
+/// Normalize path syntax independently from the host operating system.
+/// Both slash styles are treated as separators so persisted Windows paths
+/// have the same identity when evaluated on Linux/macOS runners.
+pub(crate) fn normalize_portable_path_text(raw: &str) -> String {
+    let trailing_separator = raw.ends_with('/') || raw.ends_with('\\');
+    let normalized = raw.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    let (prefix, rest, absolute) = if normalized.starts_with("//") {
+        ("//".to_string(), normalized.trim_start_matches('/'), true)
+    } else if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = (bytes[0] as char).to_ascii_uppercase();
+        let after = &normalized[2..];
+        if after.starts_with('/') {
+            (format!("{drive}:/"), after.trim_start_matches('/'), true)
+        } else {
+            (format!("{drive}:"), after, false)
+        }
+    } else if normalized.starts_with('/') {
+        ("/".to_string(), normalized.trim_start_matches('/'), true)
+    } else {
+        (String::new(), normalized.as_str(), false)
+    };
+
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+
+    let body = parts.join("/");
+    let mut result = match prefix.as_str() {
+        "//" => format!("//{body}"),
+        "/" => format!("/{body}"),
+        _ if prefix.ends_with('/') => format!("{prefix}{body}"),
+        _ => format!("{prefix}{body}"),
+    };
+    if trailing_separator && !result.is_empty() && !result.ends_with('/') {
+        result.push('/');
+    }
+    result
+}
+
 /// Strip Windows extended verbatim path prefixes (`\\?\` and `\\?\UNC\`) for uniform path matching.
 pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
@@ -1448,9 +1503,10 @@ pub fn project_relative_with_boundary(
     };
 
     let given = Path::new(raw_trimmed);
-    let joined = if given.is_absolute() {
-        given.to_path_buf()
-    } else if has_windows_drive_prefix(raw_trimmed) {
+    let joined = if given.is_absolute()
+        || has_windows_drive_prefix(raw_trimmed)
+        || is_windows_unc_path(raw_trimmed)
+    {
         PathBuf::from(raw_trimmed)
     } else {
         // The executor resolves relative paths from cwd, not the policy root.
@@ -1474,47 +1530,7 @@ pub fn project_relative_with_boundary(
 /// Resolve `.` and `..` without touching the file system: the target may
 /// not exist yet, and a rule is about where it would be.
 pub fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut prefix = None;
-    let mut has_root = false;
-    let mut normals: Vec<std::ffi::OsString> = Vec::new();
-    let mut leading_parents = 0usize;
-
-    for component in path.components() {
-        match component {
-            Component::Prefix(p) => {
-                prefix = Some(p.as_os_str().to_os_string());
-            }
-            Component::RootDir => {
-                has_root = true;
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normals.is_empty() {
-                    normals.pop();
-                } else if !has_root {
-                    leading_parents += 1;
-                }
-            }
-            Component::Normal(n) => {
-                normals.push(n.to_os_string());
-            }
-        }
-    }
-
-    let mut out = PathBuf::new();
-    if let Some(p) = prefix {
-        out.push(p);
-    }
-    if has_root {
-        out.push(std::path::MAIN_SEPARATOR.to_string());
-    }
-    for _ in 0..leading_parents {
-        out.push("..");
-    }
-    for n in normals {
-        out.push(n);
-    }
-    out
+    PathBuf::from(normalize_portable_path_text(&path.to_string_lossy()))
 }
 
 pub fn slashes(path: &Path) -> String {
@@ -3010,7 +3026,7 @@ mod tests {
 
         // Normalization above drive root cannot escape drive root
         let norm = normalize_lexically(Path::new("C:\\a\\..\\..\\b"));
-        assert_eq!(norm, PathBuf::from("C:\\b"));
+        assert_eq!(slashes(&norm), "C:/b");
     }
 
     #[test]

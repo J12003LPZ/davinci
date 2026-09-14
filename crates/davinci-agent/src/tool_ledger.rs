@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -154,6 +155,8 @@ pub struct ToolCallLedger {
     record_order: Vec<String>,
     #[serde(skip, default = "default_condvar")]
     condvar: Arc<Condvar>,
+    #[serde(skip, default)]
+    persistence_path: Option<PathBuf>,
 }
 
 impl Default for ToolCallLedger {
@@ -164,6 +167,7 @@ impl Default for ToolCallLedger {
             records: HashMap::new(),
             record_order: Vec::new(),
             condvar: default_condvar(),
+            persistence_path: None,
         }
     }
 }
@@ -176,7 +180,71 @@ impl ToolCallLedger {
             records: HashMap::new(),
             record_order: Vec::new(),
             condvar: default_condvar(),
+            persistence_path: None,
         }
+    }
+
+    pub fn load_bound(path: &Path, session_id: &str) -> Result<Self, String> {
+        let mut ledger = if path.is_file() {
+            let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+            serde_json::from_slice::<Self>(&bytes)
+                .map_err(|err| format!("tool ledger is corrupt: {err}"))?
+        } else {
+            Self::new(session_id, session_id)
+        };
+        if !ledger.session_id.is_empty() && ledger.session_id != session_id {
+            return Err("tool ledger belongs to a different session".into());
+        }
+        ledger.session_id = session_id.to_string();
+        if ledger.lineage_id.is_empty() {
+            ledger.lineage_id = session_id.to_string();
+        }
+        ledger.persistence_path = Some(path.to_path_buf());
+        ledger.reconcile_after_restart();
+        ledger.persist()?;
+        Ok(ledger)
+    }
+
+    fn reconcile_after_restart(&mut self) {
+        let mut remove = Vec::new();
+        for (id, record) in &mut self.records {
+            if record.outcome == AttemptOutcome::NotStarted
+                && record.status == ToolExecutionStatus::Pending
+            {
+                remove.push(id.clone());
+                continue;
+            }
+            if record.outcome == AttemptOutcome::StartedUnknown
+                || record.status == ToolExecutionStatus::Executing
+            {
+                match record.replay_policy {
+                    ReplayPolicy::SafeToReplay => remove.push(id.clone()),
+                    ReplayPolicy::ReconcileBeforeReplay | ReplayPolicy::NeverAutoReplay => {
+                        record.status = ToolExecutionStatus::Blocked;
+                        record.output = Some(replay_blocked_message(
+                            &record.tool_name,
+                            record.replay_policy,
+                        ));
+                        record.is_error = true;
+                    }
+                }
+            }
+        }
+        for id in &remove {
+            self.records.remove(id);
+        }
+        self.record_order.retain(|id| self.records.contains_key(id));
+    }
+
+    pub fn persist(&self) -> Result<(), String> {
+        let Some(path) = &self.persistence_path else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec_pretty(self).map_err(|err| err.to_string())?;
+        std::fs::write(path, bytes).map_err(|err| err.to_string())?;
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| err.to_string())
     }
 
     pub fn records(&self) -> &HashMap<String, ToolCallRecord> {
@@ -339,6 +407,8 @@ impl ToolCallLedger {
                 executed_at: None,
             },
         );
+        self.persist()
+            .map_err(|err| format!("tool ledger persistence failed: {err}"))?;
         Ok(ReservationOutcome::Reserved)
     }
 
@@ -616,6 +686,7 @@ impl ToolCallLedger {
                 },
             );
         }
+        let _ = self.persist();
     }
 
     pub fn record_completion(&mut self, call_id: &str, output: &str, is_error: bool) {

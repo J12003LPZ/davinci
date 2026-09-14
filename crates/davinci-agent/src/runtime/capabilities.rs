@@ -79,37 +79,55 @@ impl Default for OutputPolicy {
 
 /// Return conservative execution properties for a capability at registration
 /// time. Unknown names remain serial, non-replayable, and uncompressed.
+pub fn output_policy_for_tool(name: &str, tool_class: ToolClass) -> OutputPolicy {
+    if matches!(
+        name,
+        "read"
+            | "edit"
+            | "write"
+            | "notebook_edit"
+            | "batch"
+            | "todo"
+            | "agent"
+            | "retrieve_output"
+            | "memory_search"
+            | "graph_submit"
+    ) {
+        return OutputPolicy::LosslessRequired;
+    }
+    if matches!(
+        tool_class,
+        ToolClass::Read | ToolClass::Edit | ToolClass::Shell | ToolClass::Network
+    ) {
+        OutputPolicy::Compressible
+    } else {
+        OutputPolicy::Normal
+    }
+}
+
+/// Return conservative execution properties for a capability at registration
+/// time. Unknown names remain serial and non-replayable; output policy is
+/// derived from the same lossless contract used by the Token Governor.
 pub fn default_execution_policies(
     name: &str,
     _source: CapabilitySource,
     read_only: bool,
     tool_class: ToolClass,
 ) -> (ConcurrencyPolicy, ReplayPolicy, OutputPolicy) {
-    if name == "agent" {
-        return (
+    let output_policy = output_policy_for_tool(name, tool_class);
+    let (concurrency, replay) = if name == "agent" {
+        (
             ConcurrencyPolicy::ParallelSafe,
             ReplayPolicy::NeverAutoReplay,
-            OutputPolicy::Normal,
-        );
-    }
-
-    if matches!(name, "web_search" | "web_fetch") {
-        return (
+        )
+    } else if matches!(name, "web_search" | "web_fetch") {
+        (
             ConcurrencyPolicy::ParallelSafe,
             ReplayPolicy::ReconcileBeforeReplay,
-            OutputPolicy::Compressible,
-        );
-    }
-
-    if matches!(name, "tool_search") {
-        return (
-            ConcurrencyPolicy::ParallelSafe,
-            ReplayPolicy::SafeToReplay,
-            OutputPolicy::Normal,
-        );
-    }
-
-    if matches!(
+        )
+    } else if name == "tool_search" {
+        (ConcurrencyPolicy::ParallelSafe, ReplayPolicy::SafeToReplay)
+    } else if matches!(
         name,
         "bash"
             | "powershell"
@@ -130,46 +148,27 @@ pub fn default_execution_policies(
             | "task_create"
             | "task_update"
     ) {
-        return (
+        (
             ConcurrencyPolicy::SerialBarrier,
             if matches!(name, "write" | "edit" | "apply_patch" | "notebook_edit") {
                 ReplayPolicy::ReconcileBeforeReplay
             } else {
                 ReplayPolicy::NeverAutoReplay
             },
-            if matches!(name, "bash" | "powershell" | "exec_command" | "write_stdin") {
-                OutputPolicy::LosslessRequired
-            } else {
-                OutputPolicy::Normal
-            },
-        );
-    }
-
-    if matches!(
+        )
+    } else if matches!(
         name,
         "read" | "grep" | "find" | "ls" | "mcp_read" | "job_output"
     ) || (read_only && matches!(tool_class, ToolClass::Read | ToolClass::Network))
     {
-        return (
-            ConcurrencyPolicy::ParallelSafe,
-            ReplayPolicy::SafeToReplay,
-            OutputPolicy::Compressible,
-        );
-    }
-
-    if matches!(tool_class, ToolClass::Edit | ToolClass::Shell) {
-        return (
+        (ConcurrencyPolicy::ParallelSafe, ReplayPolicy::SafeToReplay)
+    } else {
+        (
             ConcurrencyPolicy::SerialBarrier,
             ReplayPolicy::NeverAutoReplay,
-            OutputPolicy::Normal,
-        );
-    }
-
-    (
-        ConcurrencyPolicy::SerialBarrier,
-        ReplayPolicy::NeverAutoReplay,
-        OutputPolicy::Normal,
-    )
+        )
+    };
+    (concurrency, replay, output_policy)
 }
 
 /// Conservative fallback used when a runtime registry has no record for a
@@ -676,19 +675,19 @@ mod tests {
                 "read",
                 ConcurrencyPolicy::ParallelSafe,
                 ReplayPolicy::SafeToReplay,
-                OutputPolicy::Compressible,
+                OutputPolicy::LosslessRequired,
             ),
             (
                 "edit",
                 ConcurrencyPolicy::SerialBarrier,
                 ReplayPolicy::ReconcileBeforeReplay,
-                OutputPolicy::Normal,
+                OutputPolicy::LosslessRequired,
             ),
             (
                 "exec_command",
                 ConcurrencyPolicy::SerialBarrier,
                 ReplayPolicy::NeverAutoReplay,
-                OutputPolicy::LosslessRequired,
+                OutputPolicy::Compressible,
             ),
             (
                 "web_search",
@@ -700,13 +699,13 @@ mod tests {
                 "tool_search",
                 ConcurrencyPolicy::ParallelSafe,
                 ReplayPolicy::SafeToReplay,
-                OutputPolicy::Normal,
+                OutputPolicy::Compressible,
             ),
             (
                 "agent",
                 ConcurrencyPolicy::ParallelSafe,
                 ReplayPolicy::NeverAutoReplay,
-                OutputPolicy::Normal,
+                OutputPolicy::LosslessRequired,
             ),
             (
                 "mcp__memory__echo",
