@@ -1,7 +1,6 @@
 // One-shot branch regression coverage for the reliability follow-up fixes.
-use davinci_agent::{
-    Agent, OutputPolicy, ReplayPolicy, ReservationOutcome, RuntimeCapabilityRegistry,
-};
+use davinci_agent::tool_ledger::ReservationOutcome;
+use davinci_agent::{Agent, OutputPolicy, ReplayPolicy, RuntimeCapabilityRegistry};
 use davinci_session::JsonlSession;
 use serde_json::json;
 
@@ -56,5 +55,8 @@ fn restart_restores_uncertain_mutation_and_blocks_replay() {
         ReplayPolicy::NeverAutoReplay,
     );
 
-    assert!(matches!(outcome, Ok(ReservationOutcome::ReplayBlocked(_))));
+    assert!(matches!(
+        outcome,
+        Ok(ReservationOutcome::ReplayBlocked(_))
+    ));
 }
