@@ -542,13 +542,15 @@ impl ExtensionHost {
         }
     }
 
-    pub fn native_record_skill_outcome(
+    pub fn native_record_skill_outcome_for_skill(
         &self,
         name: &str,
+        content: &str,
         outcome: crate::native_extensions::learning::SkillOutcome,
     ) {
         if let Ok(mut native) = self.native.lock() {
-            native.record_skill_outcome(name, outcome);
+            let content_hash = crate::native_extensions::vector_memory::content_hash(content);
+            native.record_skill_outcome_for_content_hash(name, &content_hash, outcome);
         }
     }
 

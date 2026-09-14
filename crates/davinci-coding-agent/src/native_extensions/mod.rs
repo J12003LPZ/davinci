@@ -385,8 +385,15 @@ impl NativeExtensionHost {
         self.learning.cancel_active_review();
     }
 
-    pub fn record_skill_outcome(&mut self, name: &str, outcome: SkillOutcome) {
-        let _ = self.learning.record_skill_outcome(name, outcome);
+    pub fn record_skill_outcome_for_content_hash(
+        &mut self,
+        name: &str,
+        content_hash: &str,
+        outcome: SkillOutcome,
+    ) {
+        let _ = self
+            .learning
+            .record_skill_outcome_for_content_hash(name, content_hash, outcome);
     }
 
     pub fn set_learning_project_trusted(&mut self, trusted: bool) {

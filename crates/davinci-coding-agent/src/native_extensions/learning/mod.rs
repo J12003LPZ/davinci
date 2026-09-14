@@ -594,23 +594,21 @@ impl LearningController {
         SkillManager::execute(ctx, args)
     }
 
-    pub fn record_skill_outcome(
+    pub fn record_skill_outcome_for_content_hash(
         &mut self,
         name: &str,
+        content_hash: &str,
         outcome: SkillOutcome,
     ) -> Result<bool, String> {
-        let p = self.project_store.record_skill_outcome(name, outcome)?;
-        let g = self.global_store.record_skill_outcome(name, outcome)?;
-        let modified = p || g;
-        if modified {
-            match outcome {
-                SkillOutcome::VerifiedSuccess => {
-                    self.stats.verified_skill_successes += 1;
-                    self.auto_promote_if_threshold_met(name);
-                }
-                SkillOutcome::VerifiedFailure => self.stats.verified_skill_failures += 1,
-                SkillOutcome::Neutral => {}
-            }
+        let refs = [
+            self.project_store
+                .skill_version_ref_for_content_hash(name, content_hash),
+            self.global_store
+                .skill_version_ref_for_content_hash(name, content_hash),
+        ];
+        let mut modified = false;
+        for skill in refs.into_iter().flatten() {
+            modified |= self.record_skill_version_outcome(&skill, outcome)?;
         }
         Ok(modified)
     }
@@ -619,28 +617,38 @@ impl LearningController {
         &mut self,
         skill: &SkillVersionRef,
         outcome: SkillOutcome,
-    ) -> Result<(), String> {
-        self.project_store
+    ) -> Result<bool, String> {
+        let project_modified = self
+            .project_store
             .record_skill_version_outcome(skill, outcome)?;
-        self.global_store
+        let global_modified = self
+            .global_store
             .record_skill_version_outcome(skill, outcome)?;
-        match outcome {
-            SkillOutcome::VerifiedSuccess => {
-                self.stats.verified_skill_successes += 1;
-                self.auto_promote_if_threshold_met(&skill.name);
+        let modified = project_modified || global_modified;
+        if modified {
+            match outcome {
+                SkillOutcome::VerifiedSuccess => {
+                    self.stats.verified_skill_successes += 1;
+                    self.auto_promote_version_if_threshold_met(skill);
+                }
+                SkillOutcome::VerifiedFailure => {
+                    self.stats.verified_skill_failures += 1;
+                }
+                SkillOutcome::Neutral => {}
             }
-            SkillOutcome::VerifiedFailure => {
-                self.stats.verified_skill_failures += 1;
-            }
-            SkillOutcome::Neutral => {}
         }
-        Ok(())
+        Ok(modified)
     }
 
-    pub fn auto_promote_if_threshold_met(&mut self, name: &str) -> bool {
+    fn auto_promote_version_if_threshold_met(&mut self, skill: &SkillVersionRef) -> bool {
         let mut promoted = false;
-        if let Some(mut record) = self.project_store.skill(name).cloned() {
-            if record.status != ArtifactStatus::Active
+        if let Some(mut record) = self
+            .project_store
+            .skill_version(&skill.name, skill.version)
+            .cloned()
+        {
+            if record.content_hash == skill.content_hash
+                && record.status != ArtifactStatus::Active
                 && verified_use_threshold_met(&record, &self.config)
             {
                 record.status = ArtifactStatus::Active;
@@ -648,8 +656,13 @@ impl LearningController {
                 promoted = true;
             }
         }
-        if let Some(mut record) = self.global_store.skill(name).cloned() {
-            if record.status != ArtifactStatus::Active
+        if let Some(mut record) = self
+            .global_store
+            .skill_version(&skill.name, skill.version)
+            .cloned()
+        {
+            if record.content_hash == skill.content_hash
+                && record.status != ArtifactStatus::Active
                 && verified_use_threshold_met(&record, &self.config)
             {
                 record.status = ArtifactStatus::Active;
@@ -661,7 +674,7 @@ impl LearningController {
             self.stats.candidates_approved += 1;
             self.notifications.push(format!(
                 "learning · skill auto-promoted after verified uses: {}",
-                name
+                skill.name
             ));
         }
         promoted
@@ -1757,7 +1770,14 @@ mod tests {
 
         // 2nd verified success reaches auto_promote_verified_uses (default 2)
         controller
-            .record_skill_outcome("auto-test", SkillOutcome::VerifiedSuccess)
+            .record_skill_version_outcome(
+                &SkillVersionRef {
+                    name: "auto-test".into(),
+                    version: 1,
+                    content_hash: "hash".into(),
+                },
+                SkillOutcome::VerifiedSuccess,
+            )
             .unwrap();
 
         let updated = controller.project_store.skill("auto-test").unwrap();
@@ -1766,6 +1786,56 @@ mod tests {
         assert!(notifs
             .iter()
             .any(|n| n.contains("auto-promoted after verified uses")));
+    }
+
+    #[test]
+    fn unverified_skill_version_cannot_be_promoted() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), None, None);
+        controller
+            .project_store
+            .upsert_skill(SkillLedgerRecord {
+                skill_id: "unverified-skill".into(),
+                name: "unverified-skill".into(),
+                scope: LearningScope::Project,
+                origin: SkillOrigin::LearnedReview,
+                status: ArtifactStatus::Candidate,
+                path: dir.path().join("SKILL.md"),
+                content_hash: "known-hash".into(),
+                version: 1,
+                success_count: 1,
+                failure_count: 0,
+                neutral_count: 0,
+                last_used_at_ms: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+                pinned: false,
+            })
+            .unwrap();
+
+        assert!(!controller
+            .record_skill_outcome_for_content_hash(
+                "unverified-skill",
+                "unknown-hash",
+                SkillOutcome::VerifiedSuccess,
+            )
+            .unwrap());
+
+        controller
+            .record_skill_version_outcome(
+                &SkillVersionRef {
+                    name: "unverified-skill".into(),
+                    version: 1,
+                    content_hash: "wrong-hash".into(),
+                },
+                SkillOutcome::VerifiedSuccess,
+            )
+            .unwrap();
+
+        let unchanged = controller.project_store.skill("unverified-skill").unwrap();
+        assert_eq!(unchanged.status, ArtifactStatus::Candidate);
+        assert_eq!(unchanged.success_count, 1);
+        assert_eq!(controller.stats.verified_skill_successes, 0);
     }
 
     #[test]

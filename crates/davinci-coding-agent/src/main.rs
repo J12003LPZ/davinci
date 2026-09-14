@@ -2222,7 +2222,7 @@ fn complete_prompt_with_host(
         for skill in &agent.skills {
             let tag = format!("<skill name=\"{}\"", skill.name);
             if latest_user_text.contains(&tag) {
-                host.native_record_skill_outcome(&skill.name, skill_outcome);
+                host.native_record_skill_outcome_for_skill(&skill.name, &skill.body, skill_outcome);
             }
         }
 
