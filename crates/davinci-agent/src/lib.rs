@@ -55,8 +55,8 @@ pub use compaction::{
     TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use context::{
-    load_context_files, ContextBudgetReport, ContextContribution, ContextFile, ContextPriority,
-    RootContextAccount,
+    load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
+    ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
@@ -955,14 +955,16 @@ impl Agent {
         let plan_context = self
             .plan_provider_context()
             .map(|text| ChatMessage::text("custom", text));
-        if self.ephemeral_context.is_empty()
+        let selected = self.select_root_context(self.context_window);
+        let ephemeral_context = selected.ephemeral_messages;
+        if ephemeral_context.is_empty()
             && self.pruned_tool_results.is_empty()
             && plan_context.is_none()
         {
             return convert_to_llm_for_provider(&self.messages, self.block_images);
         }
         let mut messages = self.project_with_evidence();
-        if self.ephemeral_context.is_empty() && plan_context.is_none() {
+        if ephemeral_context.is_empty() && plan_context.is_none() {
             return convert_to_llm_for_provider(&messages, self.block_images);
         }
         let insertion = messages
@@ -971,9 +973,7 @@ impl Agent {
             .unwrap_or(messages.len());
         messages.splice(
             insertion..insertion,
-            plan_context
-                .into_iter()
-                .chain(self.ephemeral_context.iter().cloned()),
+            plan_context.into_iter().chain(ephemeral_context),
         );
         convert_to_llm_for_provider(&messages, self.block_images)
     }
@@ -998,7 +998,11 @@ impl Agent {
                     .unwrap_or_else(|| compaction::estimate_tokens(message))
             })
             .sum::<u64>()
-            + estimate_context_tokens(&self.ephemeral_context)
+            + estimate_context_tokens(
+                &self
+                    .select_root_context(self.context_window)
+                    .ephemeral_messages,
+            )
             + self
                 .plan_provider_context()
                 .map(|text| (text.len() as u64).div_ceil(4))
@@ -1674,7 +1678,7 @@ impl Agent {
         )
     }
 
-    /// Account for the normal/root provider request without changing its prompt.
+    /// Account for the normal/root provider request and select optional request-local context.
     pub fn root_context_budget_report(&self, budget: u64) -> ContextBudgetReport {
         let mut account = RootContextAccount::default();
         account.add(
@@ -1693,7 +1697,7 @@ impl Agent {
         }
         for file in &self.context_files {
             account.add(
-                format!("repository_instruction::{}", file.name),
+                format!("repository_instruction::{}", file.path.display()),
                 file.body.clone(),
                 true,
                 ContextPriority::Mandatory,
@@ -1705,6 +1709,51 @@ impl Agent {
             true,
             ContextPriority::Mandatory,
         );
+        if let Some(contract) = self
+            .tool_context
+            .active_contract
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            account.add(
+                "active_task_contract",
+                serde_json::to_string(contract).unwrap_or_default(),
+                false,
+                ContextPriority::Mandatory,
+            );
+        }
+        if let Some(plan) = self.plan_provider_context() {
+            account.add("living_plan", plan, false, ContextPriority::Mandatory);
+        }
+
+        // Current extension/memory evidence gets first claim on Important space.
+        for (index, message) in self.ephemeral_context.iter().enumerate() {
+            account.add(
+                format!("ephemeral_context::{index}"),
+                serde_json::to_string(message).unwrap_or_default(),
+                false,
+                ContextPriority::Important,
+            );
+        }
+
+        let latest_user = self
+            .messages
+            .iter()
+            .rposition(|message| message.role == "user");
+        for (index, message) in self.messages.iter().enumerate() {
+            let priority = if Some(index) == latest_user {
+                ContextPriority::Mandatory
+            } else {
+                ContextPriority::Important
+            };
+            account.add(
+                format!("conversation::{index}"),
+                serde_json::to_string(message).unwrap_or_default(),
+                false,
+                priority,
+            );
+        }
         for skill in &self.skills {
             account.add(
                 format!("skill::{}", skill.name),
@@ -1721,35 +1770,31 @@ impl Agent {
                 ContextPriority::Deferred,
             );
         }
-
-        let messages = self.messages_for_provider();
-        let latest_user = messages.iter().rposition(|message| message.role == "user");
-        for (index, message) in messages.iter().enumerate() {
-            let body = serde_json::to_string(message).unwrap_or_default();
-            let priority = if Some(index) == latest_user {
-                ContextPriority::Mandatory
-            } else {
-                ContextPriority::Important
-            };
-            account.add(format!("conversation::{index}"), body, false, priority);
-        }
-
-        if let Some(contract) = self
-            .tool_context
-            .active_contract
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
-            account.add(
-                "active_task_contract",
-                serde_json::to_string(contract).unwrap_or_default(),
-                false,
-                ContextPriority::Mandatory,
-            );
-        }
-
         account.report_for_budget(budget)
+    }
+
+    pub fn select_root_context(&self, budget: u64) -> SelectedRootContext {
+        let report = self.root_context_budget_report(budget);
+        let selected_sources = report
+            .contributions
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.source.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let ephemeral_messages = self
+            .ephemeral_context
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                selected_sources.contains(format!("ephemeral_context::{index}").as_str())
+            })
+            .map(|(_, message)| message.clone())
+            .collect();
+        SelectedRootContext {
+            report,
+            repository_files: self.context_files.clone(),
+            ephemeral_messages,
+        }
     }
 
     pub fn apply_extension_tools(&mut self, names: &[String]) {
