@@ -32,6 +32,7 @@ jobs:
             context) python3 .github/scripts/harness_opt_context.py --tests ;;
             verification) python3 .github/scripts/harness_opt_verification.py --tests ;;
             recovery) python3 .github/scripts/harness_opt_recovery.py --tests ;;
+            phase1) : ;;
             *) echo "unknown stage: $stage" >&2; exit 2 ;;
           esac
 
@@ -40,6 +41,10 @@ jobs:
         run: |
           set -euo pipefail
           stage="$(cat .harness-opt-stage)"
+          if [[ "$stage" == "phase1" ]]; then
+            echo "Phase gate has no red step"
+            exit 0
+          fi
           case "$stage" in
             governor) test_cmd=(cargo test -p davinci-coding-agent large_error_output_is_reversibly_compressed) ;;
             context) test_cmd=(cargo test -p davinci-agent root_budget_shapes_provider_view_without_dropping_authority) ;;
@@ -69,6 +74,7 @@ jobs:
               python3 .github/scripts/harness_opt_verification_fixup.py
               ;;
             recovery) python3 .github/scripts/harness_opt_recovery.py --impl ;;
+            phase1) : ;;
             *) echo "unknown stage: $stage" >&2; exit 2 ;;
           esac
 
@@ -110,6 +116,16 @@ jobs:
               cargo test -p davinci-agent restart_restores_uncertain_mutation_and_blocks_replay
               cargo clippy -p davinci-agent --all-targets -- -D warnings
               ;;
+            phase1)
+              cargo test -p davinci-agent context::
+              cargo test -p davinci-agent verification
+              cargo test -p davinci-agent tool_ledger
+              cargo test -p davinci-coding-agent token_governor
+              cargo test -p davinci-coding-agent content_router
+              cargo clippy -p davinci-agent --all-targets -- -D warnings
+              cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
+              ;;
+            *) echo "unknown stage: $stage" >&2; exit 2 ;;
           esac
           git diff --check
 
@@ -129,6 +145,7 @@ jobs:
             context) message="feat(context): enforce bounded scoped root context" ;;
             verification) message="feat(verification): require mutation-scope coverage" ;;
             recovery) message="fix(recovery): harden durable tool attempt metadata" ;;
+            phase1) echo "Phase gate produced formatted changes; refusing implicit commit" >&2; exit 1 ;;
           esac
           git add crates .harness-opt-stage
           git commit -m "$message"
