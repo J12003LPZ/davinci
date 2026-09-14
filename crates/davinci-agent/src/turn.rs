@@ -999,6 +999,28 @@ impl Agent {
         }
     }
 
+    fn lane_for_tool(
+        &self,
+        name: &str,
+        class: crate::permission::ToolClass,
+    ) -> crate::scheduler::ToolLane {
+        match &self.runtime {
+            Some(runtime) => {
+                let capability = runtime.capability_registry.get(name);
+                crate::scheduler::lane_for_capability(capability.as_ref(), name, class)
+            }
+            None => crate::scheduler::lane_for(name, class),
+        }
+    }
+
+    fn replay_policy_for_tool(&self, name: &str) -> crate::runtime::ReplayPolicy {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capability_registry.get(name))
+            .map(|capability| capability.replay_policy)
+            .unwrap_or_else(|| crate::runtime::conservative_replay_policy(name))
+    }
+
     /// Stage one of a tool call. `depth` is 0 for a call the model made and
     /// 1 for an operation inside a `batch`.
     pub(crate) fn prepare_tool_call(
@@ -1027,8 +1049,9 @@ impl Agent {
                 false,
             );
         }
+        let replay_policy = self.replay_policy_for_tool(name);
         if let Ok(mut ledger) = self.tool_ledger.lock() {
-            match ledger.reserve_call(id, name, args) {
+            match ledger.reserve_call_with_policy(id, name, args, replay_policy) {
                 Err(collision_err) => {
                     return Preparation::Immediate(crate::ToolResult {
                         content: collision_err,
@@ -1043,13 +1066,20 @@ impl Agent {
                         details: Some(serde_json::json!({ "replayed_from_ledger": true })),
                     });
                 }
+                Ok(crate::tool_ledger::ReservationOutcome::ReplayBlocked(reason)) => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: reason,
+                        is_error: true,
+                        details: Some(serde_json::json!({ "replay_blocked": true })),
+                    });
+                }
                 Ok(crate::tool_ledger::ReservationOutcome::WaitForInFlight) => {
                     let class = self
                         .permissions
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
                         .class_of(name);
-                    let lane = crate::scheduler::lane_for(name, class);
+                    let lane = self.lane_for_tool(name, class);
                     return Preparation::Wait {
                         call_id: id.to_string(),
                         lane,
@@ -1126,7 +1156,7 @@ impl Agent {
             // An extension tool has state the runtime cannot see.
             crate::scheduler::ToolLane::Serial
         } else {
-            crate::scheduler::lane_for(name, class)
+            self.lane_for_tool(name, class)
         };
         Preparation::Ready { lane }
     }
@@ -1179,7 +1209,12 @@ impl Agent {
         }
 
         if let Ok(mut ledger) = self.tool_ledger.lock() {
-            match ledger.begin_execution(id, name, args) {
+            match ledger.begin_execution_with_policy(
+                id,
+                name,
+                args,
+                self.replay_policy_for_tool(name),
+            ) {
                 crate::tool_ledger::BeginOutcome::Collision(collision_err) => {
                     return crate::ToolResult {
                         content: collision_err,
@@ -1192,6 +1227,13 @@ impl Agent {
                         content: output,
                         is_error,
                         details: Some(serde_json::json!({ "replayed_from_ledger": true })),
+                    };
+                }
+                crate::tool_ledger::BeginOutcome::ReplayBlocked(reason) => {
+                    return crate::ToolResult {
+                        content: reason,
+                        is_error: true,
+                        details: Some(serde_json::json!({ "replay_blocked": true })),
                     };
                 }
                 crate::tool_ledger::BeginOutcome::WaitForInFlight => {

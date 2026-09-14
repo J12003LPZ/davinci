@@ -82,7 +82,7 @@ pub use prompt::{
 pub use prompt::{PreparedTurnPrompt, PromptProfile};
 pub use pruning::PruneSettings;
 pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
-pub use scheduler::{lane_for, ToolLane, MAX_TOOL_PARALLELISM};
+pub use scheduler::{lane_for, lane_for_capability, ToolLane, MAX_TOOL_PARALLELISM};
 pub use skills::{
     describe_skill, discover_skills, expand_skill_command, expand_user_text,
     expand_user_text_with_metadata, ExpandedUserText, Skill, SkillDescriptor,
@@ -120,17 +120,18 @@ pub use prompt::{
 
 pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
 pub use runtime::{
-    contract_gate, effect_profile_allows, find_saved_workflow, hash_system_prompt,
-    hash_system_prompt_with_manifest, hash_tool_names, normalize_relative_path, path_scope_allows,
-    save_workflow_to_project, wrap_untrusted_data, AgentId, AgentKind, AgentRecord, AgentState,
-    CacheIdentity, CacheMissReason, CancellationToken, CapabilitySource, ContextBroker,
-    ContextItem, ContextPacket, ContextRequest, ContextSource, ContractError, ContractExecutor,
-    DeclaredEffect, ExecutionError, ExecutorCapabilities, PhaseStatus, PreparedAction,
-    RegistryError, RunId, RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry,
-    RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry,
-    RuntimeSubscriber, ScopeViolation, TaskContract, TaskError, TaskId, TaskRecord, TaskRegistry,
-    TaskState, ToolExposureState, WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore,
-    WorkflowStatus, WorktreeError, WorktreeLease, WorktreeManager,
+    conservative_replay_policy, contract_gate, default_execution_policies, effect_profile_allows,
+    find_saved_workflow, hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names,
+    normalize_relative_path, path_scope_allows, save_workflow_to_project, wrap_untrusted_data,
+    AgentId, AgentKind, AgentRecord, AgentState, CacheIdentity, CacheMissReason, CancellationToken,
+    CapabilitySource, ConcurrencyPolicy, ContextBroker, ContextItem, ContextPacket, ContextRequest,
+    ContextSource, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
+    ExecutorCapabilities, OutputPolicy, PhaseStatus, PreparedAction, RegistryError, ReplayPolicy,
+    RunId, RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent,
+    RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, ScopeViolation,
+    TaskContract, TaskError, TaskId, TaskRecord, TaskRegistry, TaskState, ToolExposureState,
+    WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore, WorkflowStatus, WorktreeError,
+    WorktreeLease, WorktreeManager,
 };
 
 use davinci_ai::{
