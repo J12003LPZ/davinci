@@ -78,6 +78,7 @@ impl Agent {
         };
         let mut new_messages = prompt_messages.clone();
         let mut capability_completion_reminders = 0_u32;
+        let mut verification_reminded_generation = None;
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
         if let Some(runtime) = &self.runtime {
@@ -258,6 +259,32 @@ impl Agent {
                         );
                         continue;
                     }
+                }
+
+                let completion_evidence = self.completion_evidence();
+                let mutation_generation = self.mutation_verification_state().mutation_generation;
+                if matches!(
+                    completion_evidence,
+                    crate::CompletionEvidence::Unverified
+                        | crate::CompletionEvidence::VerificationFailed
+                ) && verification_reminded_generation != Some(mutation_generation)
+                {
+                    verification_reminded_generation = Some(mutation_generation);
+                    let message = match completion_evidence {
+                        crate::CompletionEvidence::VerificationFailed => {
+                            "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."
+                        }
+                        _ => {
+                            "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
+                        }
+                    };
+                    self.queue_capability_reminder(
+                        message,
+                        "verification_required",
+                        &mut events,
+                        &mut new_messages,
+                    );
+                    continue;
                 }
             }
 
@@ -1396,6 +1423,12 @@ impl Agent {
             .and_then(|d| d.get("plan_storage_error"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let replayed = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("replayed_from_ledger"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let pre_hook_error = result.is_error;
         let pre_hook_result = result.clone();
         if !storage_failure {
@@ -1412,6 +1445,23 @@ impl Agent {
                     *details = serde_json::json!({});
                 }
                 details[key] = Value::Bool(true);
+            }
+        }
+        if !replayed {
+            if matches!(name, "write" | "edit" | "apply_patch" | "notebook_edit")
+                && !pre_hook_error
+                && !result.is_error
+            {
+                self.record_successful_mutation();
+            }
+            if matches!(name, "bash" | "powershell" | "exec_command") {
+                let cmd = args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if is_verification_command(cmd) {
+                    self.record_verification_result(!pre_hook_error && !result.is_error);
+                }
             }
         }
         let hook_vetoed = !pre_hook_error && result.is_error;
@@ -2207,7 +2257,7 @@ fn sleep_retry_delay(delay_ms: u64, cancelled: impl Fn() -> bool) {
     }
 }
 
-fn is_verification_command(cmd: &str) -> bool {
+pub(crate) fn is_verification_command(cmd: &str) -> bool {
     let lower = cmd.to_ascii_lowercase();
     lower.contains("cargo test")
         || lower.contains("cargo check")

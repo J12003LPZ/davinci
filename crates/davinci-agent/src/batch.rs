@@ -186,9 +186,36 @@ impl Agent {
                         }
                     };
                     let pre_hook_error = pre_hook_result.is_error;
+                    let replayed = pre_hook_result
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("replayed_from_ledger"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     let mut result = pre_hook_result.clone();
                     if let Some(hook) = &agent.post_tool {
                         result = (hook.0)(&op_id, cwd, &tool, &args, result);
+                    }
+                    if !replayed {
+                        if matches!(
+                            tool.as_str(),
+                            "write" | "edit" | "apply_patch" | "notebook_edit"
+                        ) && !pre_hook_error
+                            && !result.is_error
+                        {
+                            agent.record_successful_mutation();
+                        }
+                        if matches!(tool.as_str(), "bash" | "powershell" | "exec_command") {
+                            let command = args
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if crate::turn::is_verification_command(command) {
+                                agent.record_verification_result(
+                                    !pre_hook_error && !result.is_error,
+                                );
+                            }
+                        }
                     }
                     let hook_vetoed = !pre_hook_error && result.is_error;
                     agent.record_receipt(

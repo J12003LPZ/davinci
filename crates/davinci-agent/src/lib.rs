@@ -213,6 +213,26 @@ pub enum ToolExecutionMode {
     Parallel,
 }
 
+/// Lifecycle evidence for mutations and the verification commands that follow
+/// them. A verification attempt is associated with the current generation so
+/// a later mutation cannot inherit an earlier success.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationVerificationState {
+    pub mutation_generation: u64,
+    pub verified_generation: Option<u64>,
+    pub last_verification_succeeded: bool,
+}
+
+/// Evidence available when a coding turn reaches a normal stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionEvidence {
+    Verified,
+    Unverified,
+    VerificationFailed,
+    NotRequired,
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub system_prompt: String,
@@ -296,6 +316,8 @@ pub struct Agent {
     visual_verification_available: bool,
     /// Typed lifecycle evidence for the currently prepared real user turn.
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
+    /// Mutation generations and verification evidence for the current run.
+    mutation_verification: Arc<Mutex<MutationVerificationState>>,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -395,6 +417,7 @@ impl Agent {
             previous_plan_revision: None,
             visual_verification_available: false,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
+            mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -544,6 +567,59 @@ impl Agent {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    /// Return a read-only snapshot of mutation and verification evidence.
+    pub fn mutation_verification_state(&self) -> MutationVerificationState {
+        self.mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    /// Classify whether the current run has evidence for its latest mutation.
+    pub fn completion_evidence(&self) -> CompletionEvidence {
+        let state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if state.mutation_generation == 0 {
+            return CompletionEvidence::NotRequired;
+        }
+
+        match state.verified_generation {
+            Some(generation) if generation == state.mutation_generation => {
+                if state.last_verification_succeeded {
+                    CompletionEvidence::Verified
+                } else {
+                    CompletionEvidence::VerificationFailed
+                }
+            }
+            _ => CompletionEvidence::Unverified,
+        }
+    }
+
+    /// Invalidate any earlier verification after a successful mutation.
+    pub(crate) fn record_successful_mutation(&self) {
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.mutation_generation = state.mutation_generation.saturating_add(1);
+        state.verified_generation = None;
+        state.last_verification_succeeded = false;
+    }
+
+    /// Record the result of a recognized verification command for the current
+    /// mutation generation. The generation is retained for failed attempts so
+    /// completion can distinguish failure from no verification at all.
+    pub(crate) fn record_verification_result(&self, succeeded: bool) {
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.verified_generation = Some(state.mutation_generation);
+        state.last_verification_succeeded = succeeded;
     }
 
     fn reset_capability_run_state(
@@ -4495,6 +4571,43 @@ mod tests {
         agent.set_active_tools_by_name(&["bash".into(), "read".into()]);
         assert_eq!(agent.tools, vec!["bash".to_string(), "read".to_string()]);
         assert!(agent.tool_registry.contains(&"ticket".into()));
+    }
+
+    #[test]
+    fn mutation_without_verification_requests_evidence() {
+        let agent = Agent::new("x");
+
+        agent.record_successful_mutation();
+
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+
+    #[test]
+    fn mutation_then_successful_verification_is_verified() {
+        let agent = Agent::new("x");
+
+        agent.record_successful_mutation();
+        agent.record_verification_result(true);
+
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    }
+
+    #[test]
+    fn later_mutation_invalidates_previous_verification() {
+        let agent = Agent::new("x");
+
+        agent.record_successful_mutation();
+        agent.record_verification_result(true);
+        agent.record_successful_mutation();
+
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+
+    #[test]
+    fn read_only_turn_does_not_require_verification() {
+        let agent = Agent::new("x");
+
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::NotRequired);
     }
 
     #[test]
