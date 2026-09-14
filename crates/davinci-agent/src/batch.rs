@@ -203,7 +203,9 @@ impl Agent {
                         ) && !pre_hook_error
                             && !result.is_error
                         {
-                            agent.record_successful_mutation();
+                            agent.record_successful_mutation_paths(
+                                crate::turn::mutation_paths_from_tool(&tool, &args),
+                            );
                         }
                         if matches!(tool.as_str(), "bash" | "powershell" | "exec_command") {
                             let command = args
@@ -211,7 +213,8 @@ impl Agent {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default();
                             if crate::turn::is_verification_command(command) {
-                                agent.record_verification_result(
+                                agent.record_verification_command(
+                                    command,
                                     !pre_hook_error && !result.is_error,
                                 );
                             }
