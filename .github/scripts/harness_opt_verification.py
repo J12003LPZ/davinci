@@ -277,6 +277,7 @@ fn verification_coverage_for_command(
 
     turn_path = ROOT / "crates/davinci-agent/src/turn.rs"
     turn = turn_path.read_text()
+    turn = replace_once(turn, "use std::path::Path;", "use std::path::{Path, PathBuf};", "turn path imports")
     turn = replace_once(
         turn,
         '''            if matches!(name, "write" | "edit" | "apply_patch" | "notebook_edit")
@@ -313,7 +314,7 @@ fn verification_coverage_for_command(
 ''',
         "turn verification recording",
     )
-    marker = "\npub(crate) fn is_verification_command(command: &str) -> bool {"
+    marker = "\npub(crate) fn is_verification_command(cmd: &str) -> bool {"
     helper = r'''
 
 pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf> {
