@@ -43,22 +43,12 @@ pub const STORE_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// already caps and structures its sub-results; the rest are small or are
 /// themselves the governor's or memory's answer. These are never digested
 /// (the `read` dedupe still applies).
-const LOSSLESS_TOOLS: &[&str] = &[
-    "read",
-    "edit",
-    "write",
-    "notebook_edit",
-    "batch",
-    "todo",
-    "agent",
-    "retrieve_output",
-    "memory_search",
-    "graph_submit",
-];
-
 /// Returns whether a tool's output may be compressed by the token governor.
 pub fn tool_may_be_compressed(name: &str) -> bool {
-    !LOSSLESS_TOOLS.contains(&name)
+    !matches!(
+        davinci_agent::runtime::output_policy_for_tool(name, davinci_agent::tool_class(name)),
+        davinci_agent::OutputPolicy::LosslessRequired
+    )
 }
 
 /// Guarantees that if any tool in the list can generate compressible output under
@@ -1055,7 +1045,7 @@ impl TokenGovernor {
                 }
             }
         }
-        if LOSSLESS_TOOLS.contains(&name) {
+        if !tool_may_be_compressed(name) {
             return result;
         }
         let probe = compress_output(&result.content, &self.config);

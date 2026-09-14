@@ -1910,12 +1910,16 @@ impl Agent {
             )
             .map_err(|error| format!("Runtime recovery required: {error}"))?,
         };
+        let ledger_path = session.path.with_extension("tool-ledger.json");
+        let candidate_ledger = ToolCallLedger::load_bound(&ledger_path, &session.header.id)
+            .map_err(|error| format!("Runtime recovery required: {error}"))?;
         let messages = messages_from_session(&session);
         self.last_real_user_request = last_real_user_request_from_messages(&messages);
         self.reset_session_approvals();
         self.messages = messages;
         self.pending_prompt_messages.clear();
         self.session = Some(session);
+        self.tool_ledger = Arc::new(std::sync::Mutex::new(candidate_ledger));
         self.set_runtime(candidate);
         self.restore_living_plan();
         let _ = self.restore_prompt_session();

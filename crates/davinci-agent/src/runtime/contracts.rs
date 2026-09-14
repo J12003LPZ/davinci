@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use crate::runtime::ids::TaskId;
 
@@ -65,35 +65,19 @@ pub fn normalize_relative_path(raw: &str) -> Result<String, ContractError> {
         });
     }
 
-    // Reject Windows Alternate Data Streams (e.g. file.txt:stream)
+    if raw.starts_with('/')
+        || raw.starts_with('\\')
+        || crate::permission::has_windows_drive_prefix(raw)
+    {
+        return Err(ContractError::AbsolutePath(raw.to_string()));
+    }
     if raw.contains(':') {
         return Err(ContractError::AlternateDataStream(raw.to_string()));
     }
 
-    let p = Path::new(raw);
-    let mut normalized_parts = Vec::new();
-
-    for component in p.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => {
-                return Err(ContractError::AbsolutePath(raw.to_string()));
-            }
-            Component::ParentDir => {
-                if normalized_parts.pop().is_none() {
-                    return Err(ContractError::PathTraversal(raw.to_string()));
-                }
-            }
-            Component::CurDir => continue,
-            Component::Normal(part) => {
-                let part_str = part.to_string_lossy();
-                normalized_parts.push(part_str.to_string());
-            }
-        }
-    }
-
-    let mut result = normalized_parts.join("/");
-    if (raw.ends_with('/') || raw.ends_with('\\')) && !result.is_empty() {
-        result.push('/');
+    let result = crate::permission::normalize_portable_path_text(raw);
+    if result == ".." || result.starts_with("../") {
+        return Err(ContractError::PathTraversal(raw.to_string()));
     }
     Ok(result)
 }

@@ -1234,7 +1234,17 @@ impl Agent {
                     return self.wait_for_tool_call(id);
                 }
                 crate::tool_ledger::BeginOutcome::Execute => {
-                    // Ready to execute tool as leader
+                    // Persist StartedUnknown before dispatch. If this fails,
+                    // do not execute a mutation whose restart state is ambiguous.
+                    if let Err(error) = ledger.persist() {
+                        return crate::ToolResult {
+                            content: format!(
+                                "Tool ledger persistence failed before dispatch: {error}"
+                            ),
+                            is_error: true,
+                            details: Some(serde_json::json!({ "ledger_persistence": true })),
+                        };
+                    }
                 }
             }
         }
