@@ -44,7 +44,9 @@ jobs:
           echo "Expected red regression confirmed for $stage"
 
       - name: Apply production implementation
-        run: python3 .github/scripts/harness_optimization_apply.py --impl
+        run: |
+          python3 .github/scripts/harness_optimization_apply.py --impl
+          python3 .github/scripts/harness_optimization_fixup.py
 
       - name: Format
         run: cargo fmt --all
