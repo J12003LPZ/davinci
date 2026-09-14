@@ -620,20 +620,26 @@ impl GraphExecution {
                 .unwrap_or_else(|error| error.into_inner());
             match (&self.deps.memory, guard.as_ref()) {
                 (Some(mem), Some(learn)) => {
-                    let prompt = if !self.options.goal.trim().is_empty() {
-                        &self.options.goal
-                    } else {
-                        &briefing
-                    };
+                    let context_query = crate::native_extensions::ecosystem::WorkerContextQuery {
+                        role: Some(role),
+                        node_objective: briefing.clone(),
+                        graph_goal: self.options.goal.clone(),
+                        target_hints: task.focus.clone().into_iter().collect(),
+                        failure_hint: None,
+                    }
+                    .render();
                     crate::native_extensions::ecosystem::select_capabilities(
                         mem,
                         learn,
                         authorized_tools,
-                        crate::native_extensions::ecosystem::CapabilityRequest::new(prompt, role)
-                            .with_context_token_cap(
-                                crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
-                            )
-                            .with_skills(true),
+                        crate::native_extensions::ecosystem::CapabilityRequest::new(
+                            &context_query,
+                            role,
+                        )
+                        .with_context_token_cap(
+                            crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
+                        )
+                        .with_skills(true),
                     )
                 }
                 _ => crate::native_extensions::ecosystem::CapabilitySelection {
