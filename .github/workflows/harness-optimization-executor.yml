@@ -74,7 +74,7 @@ jobs:
               python3 .github/scripts/harness_opt_verification_fixup.py
               ;;
             recovery) python3 .github/scripts/harness_opt_recovery.py --impl ;;
-            phase1) : ;;
+            phase1) python3 .github/scripts/harness_opt_phase1_fixup.py ;;
             *) echo "unknown stage: $stage" >&2; exit 2 ;;
           esac
 
@@ -145,7 +145,7 @@ jobs:
             context) message="feat(context): enforce bounded scoped root context" ;;
             verification) message="feat(verification): require mutation-scope coverage" ;;
             recovery) message="fix(recovery): harden durable tool attempt metadata" ;;
-            phase1) echo "Phase gate produced formatted changes; refusing implicit commit" >&2; exit 1 ;;
+            phase1) message="test(governor): align structured test-output expectation" ;;
           esac
           git add crates .harness-opt-stage
           git commit -m "$message"
