@@ -465,7 +465,7 @@ impl NativeExtensionHost {
             ),
             "retrieve_output" => (
                 "Retrieve a lossless full or ranged tool output saved by token governor.",
-                json!({"type":"object","properties":{"id":{"type":"string","pattern":"^out-[0-9a-f]{12}$"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1},"grep":{"type":"string"}},"required":["id"]}),
+                json!({"type":"object","properties":{"id":{"type":"string","pattern":"^out-[0-9a-f]{12}$"},"startLine":{"type":"integer","minimum":1},"lineByteOffset":{"type":"integer","minimum":0},"endLine":{"type":"integer","minimum":1},"grep":{"type":"string"}},"required":["id"]}),
             ),
             "graph_status" => (
                 "Inspect the active and recent graph runs in this project.",

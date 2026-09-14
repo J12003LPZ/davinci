@@ -110,7 +110,7 @@ fn is_large_json_array(content: &str) -> bool {
 }
 
 fn is_log_like(tool: &str, args: &Value, content: &str) -> bool {
-    if !matches!(tool, "bash" | "powershell") {
+    if !matches!(tool, "bash" | "powershell" | "exec_command") {
         return false;
     }
 
@@ -354,6 +354,15 @@ mod tests {
             classify_content(
                 "bash",
                 &serde_json::json!({"command": "cargo test"}),
+                "running 3 tests\ntest a ... ok\ntest b ... FAILED"
+            ),
+            ContentKind::Log
+        );
+
+        assert_eq!(
+            classify_content(
+                "exec_command",
+                &serde_json::json!({"command": "cargo test -p davinci-agent"}),
                 "running 3 tests\ntest a ... ok\ntest b ... FAILED"
             ),
             ContentKind::Log
