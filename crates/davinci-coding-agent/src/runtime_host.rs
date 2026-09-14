@@ -320,15 +320,15 @@ impl GovernorHostAdapter {
     }
 
     /// Process a tool result after execution, applying compression/virtualization if eligible.
-    /// Exempts `memory_search`, `retrieve_output`, and error outputs.
+    /// Exempts `memory_search` and `retrieve_output`; large compressible failures remain reversible.
     pub fn process_tool_output(
         &self,
         name: &str,
         args: &serde_json::Value,
         result: davinci_agent::ToolResult,
     ) -> davinci_agent::ToolResult {
-        // memory_search, retrieve_output, and error outputs are strictly exempt
-        if result.is_error || name == "memory_search" || name == "retrieve_output" {
+        // Recovery and memory tools stay verbatim; error status alone does not bypass reversible compression.
+        if name == "memory_search" || name == "retrieve_output" {
             return result;
         }
         let mut gov = match self.governor.lock() {
@@ -343,7 +343,7 @@ impl GovernorHostAdapter {
         &self,
         args: &serde_json::Value,
     ) -> Result<davinci_agent::ToolResult, davinci_agent::ToolError> {
-        let gov = match self.governor.lock() {
+        let mut gov = match self.governor.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };

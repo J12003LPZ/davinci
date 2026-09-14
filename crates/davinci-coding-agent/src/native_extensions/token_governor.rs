@@ -1,7 +1,7 @@
 //! Lossless token-governor middleware.
 //!
 //! The governor is intentionally deterministic and fail-open.  It keeps a
-//! reversible copy of large successful tool outputs, returns a compact digest
+//! reversible copy of large successful or failing tool outputs, returns a compact digest
 //! to the model, and records enough metadata for `retrieve_output` to recover
 //! the original text.  No network access is required.
 //!
@@ -72,6 +72,8 @@ pub struct TokenGovernorConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub content_aware: bool,
+    #[serde(default = "default_specialized_min_reduction_pct")]
+    pub specialized_min_reduction_pct: u8,
     #[serde(default = "default_compress_threshold_bytes")]
     pub compress_threshold_bytes: usize,
     #[serde(default = "default_compress_threshold_lines")]
@@ -96,6 +98,9 @@ pub struct TokenGovernorConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_specialized_min_reduction_pct() -> u8 {
+    10
 }
 fn default_compress_threshold_bytes() -> usize {
     DEFAULT_COMPRESS_THRESHOLD_BYTES
@@ -124,6 +129,7 @@ impl Default for TokenGovernorConfig {
         Self {
             enabled: true,
             content_aware: true,
+            specialized_min_reduction_pct: default_specialized_min_reduction_pct(),
             compress_threshold_bytes: DEFAULT_COMPRESS_THRESHOLD_BYTES,
             compress_threshold_lines: DEFAULT_COMPRESS_THRESHOLD_LINES,
             keep_head_lines: DEFAULT_KEEP_HEAD_LINES,
@@ -171,6 +177,14 @@ fn apply_env(config: &mut TokenGovernorConfig) {
         "PI_TOKEN_GOVERNOR_CONTENT_AWARE",
     ]) {
         config.content_aware = value;
+    }
+    if let Some(value) = env_usize_any(&[
+        "DAVINCI_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
+        "DAVINCI_TOKEN_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
+        "PI_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
+        "PI_TOKEN_GOVERNOR_SPECIALIZED_MIN_REDUCTION_PCT",
+    ]) {
+        config.specialized_min_reduction_pct = value.min(100) as u8;
     }
     if let Some(value) = env_usize_any(&[
         "DAVINCI_GOVERNOR_COMPRESS_THRESHOLD",
@@ -306,6 +320,10 @@ pub struct StoredOutputEntry {
     pub call: String,
     pub bytes: usize,
     pub lines: usize,
+    #[serde(default)]
+    pub content_kind: String,
+    #[serde(default)]
+    pub strategy: String,
 }
 
 pub fn call_fingerprint(tool_name: &str, args: &Value, state_hash: &str) -> String {
@@ -705,6 +723,12 @@ fn is_notable(line: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn clears_specialized_threshold(specialized: usize, generic: usize, pct: u8) -> bool {
+    specialized < generic
+        && specialized.saturating_mul(100)
+            <= generic.saturating_mul(100usize.saturating_sub(pct as usize))
+}
+
 fn collapse_repeated_lines(lines: Vec<String>) -> Vec<String> {
     let mut output = Vec::new();
     let mut previous: Option<String> = None;
@@ -777,6 +801,68 @@ fn call_summary(tool: &str, args: &Value) -> String {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct KindRetrievalStats {
+    pub compressed: u64,
+    pub specialized: u64,
+    pub original_bytes: u64,
+    pub model_view_bytes: u64,
+    pub retrievals: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentKindStats {
+    pub log: KindRetrievalStats,
+    pub compiler_diagnostics: KindRetrievalStats,
+    pub test_output: KindRetrievalStats,
+    pub json_array: KindRetrievalStats,
+    pub ndjson: KindRetrievalStats,
+    pub json_object: KindRetrievalStats,
+    pub search_results: KindRetrievalStats,
+    pub tree: KindRetrievalStats,
+    pub table: KindRetrievalStats,
+    pub plain_text: KindRetrievalStats,
+}
+
+impl ContentKindStats {
+    fn get_mut(
+        &mut self,
+        kind: crate::native_extensions::content_router::ContentKind,
+    ) -> &mut KindRetrievalStats {
+        use crate::native_extensions::content_router::ContentKind;
+        match kind {
+            ContentKind::Log => &mut self.log,
+            ContentKind::CompilerDiagnostics => &mut self.compiler_diagnostics,
+            ContentKind::TestOutput => &mut self.test_output,
+            ContentKind::JsonArray => &mut self.json_array,
+            ContentKind::Ndjson => &mut self.ndjson,
+            ContentKind::JsonObject => &mut self.json_object,
+            ContentKind::SearchResults => &mut self.search_results,
+            ContentKind::Tree => &mut self.tree,
+            ContentKind::Table => &mut self.table,
+            ContentKind::PlainText => &mut self.plain_text,
+        }
+    }
+
+    fn get_mut_by_name(&mut self, name: &str) -> Option<&mut KindRetrievalStats> {
+        match name {
+            "log" => Some(&mut self.log),
+            "compilerDiagnostics" => Some(&mut self.compiler_diagnostics),
+            "testOutput" => Some(&mut self.test_output),
+            "jsonArray" => Some(&mut self.json_array),
+            "ndjson" => Some(&mut self.ndjson),
+            "jsonObject" => Some(&mut self.json_object),
+            "searchResults" => Some(&mut self.search_results),
+            "tree" => Some(&mut self.tree),
+            "table" => Some(&mut self.table),
+            "plainText" => Some(&mut self.plain_text),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContentRoutingStats {
     pub log: u64,
     pub json_array: u64,
@@ -786,6 +872,8 @@ pub struct ContentRoutingStats {
     pub generic_views: u64,
     pub original_bytes: u64,
     pub model_view_bytes: u64,
+    #[serde(default)]
+    pub by_kind: ContentKindStats,
 }
 
 impl ContentRoutingStats {
@@ -796,17 +884,13 @@ impl ContentRoutingStats {
         original_bytes: usize,
         model_view_bytes: usize,
     ) {
+        use crate::native_extensions::content_router::ContentKind;
         match kind {
-            crate::native_extensions::content_router::ContentKind::Log => self.log += 1,
-            crate::native_extensions::content_router::ContentKind::JsonArray => {
-                self.json_array += 1
-            }
-            crate::native_extensions::content_router::ContentKind::SearchResults => {
-                self.search_results += 1
-            }
-            crate::native_extensions::content_router::ContentKind::PlainText => {
-                self.plain_text += 1
-            }
+            ContentKind::Log => self.log += 1,
+            ContentKind::JsonArray => self.json_array += 1,
+            ContentKind::SearchResults => self.search_results += 1,
+            ContentKind::PlainText => self.plain_text += 1,
+            _ => {}
         }
         if specialized {
             self.specialized_views += 1;
@@ -815,6 +899,19 @@ impl ContentRoutingStats {
         }
         self.original_bytes += original_bytes as u64;
         self.model_view_bytes += model_view_bytes as u64;
+        let entry = self.by_kind.get_mut(kind);
+        entry.compressed += 1;
+        if specialized {
+            entry.specialized += 1;
+        }
+        entry.original_bytes += original_bytes as u64;
+        entry.model_view_bytes += model_view_bytes as u64;
+    }
+
+    fn record_retrieval(&mut self, kind: &str) {
+        if let Some(entry) = self.by_kind.get_mut_by_name(kind) {
+            entry.retrievals += 1;
+        }
     }
 }
 
@@ -1008,18 +1105,17 @@ impl TokenGovernor {
             }
         }
 
-        if result.is_error
-            || result
-                .details
-                .as_ref()
-                .and_then(|details| details.get("tokenGovernor"))
-                .and_then(|details| details.get("skip"))
-                .and_then(Value::as_bool)
-                == Some(true)
-        {
+        let governor_skip = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("tokenGovernor"))
+            .and_then(|details| details.get("skip"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if governor_skip {
             return result;
         }
-        if self.config.dedupe_reads && name == "read" {
+        if !result.is_error && self.config.dedupe_reads && name == "read" {
             if let Some(key) = read_key(args) {
                 let path = args
                     .get("path")
@@ -1074,13 +1170,19 @@ impl TokenGovernor {
         let original_bytes = generic.info.original_bytes;
         let original_lines = generic.info.original_lines;
         let (chosen_content, strategy) = match specialized {
-            Some(view) if view.content.len() < generic.content.len() => {
+            Some(view)
+                if clears_specialized_threshold(
+                    view.content.len(),
+                    generic.content.len(),
+                    self.config.specialized_min_reduction_pct,
+                ) =>
+            {
                 (view.content, "specialized")
             }
             _ => (generic.content, "generic"),
         };
         let view_bytes = chosen_content.len();
-        self.remember_stored(name, args, &reference);
+        self.remember_stored(name, args, &reference, kind.as_str(), strategy);
         self.bytes_withheld += result.content.len().saturating_sub(view_bytes);
         result.content = chosen_content;
         result.details = merge_details(
@@ -1104,7 +1206,14 @@ impl TokenGovernor {
         result
     }
 
-    fn remember_stored(&mut self, tool: &str, args: &Value, reference: &StoredOutputRef) {
+    fn remember_stored(
+        &mut self,
+        tool: &str,
+        args: &Value,
+        reference: &StoredOutputRef,
+        content_kind: &str,
+        strategy: &str,
+    ) {
         self.stored.retain(|entry| entry.id != reference.id);
         self.stored.push_front(StoredOutputEntry {
             id: reference.id.clone(),
@@ -1112,11 +1221,13 @@ impl TokenGovernor {
             call: call_summary(tool, args),
             bytes: reference.bytes,
             lines: reference.lines,
+            content_kind: content_kind.to_string(),
+            strategy: strategy.to_string(),
         });
         self.stored.truncate(STORED_MANIFEST_ENTRIES);
     }
 
-    pub fn retrieve(&self, args: &Value) -> Result<ToolResult, ToolError> {
+    pub fn retrieve(&mut self, args: &Value) -> Result<ToolResult, ToolError> {
         let id = args
             .get("id")
             .or_else(|| args.get("outputId"))
@@ -1124,6 +1235,14 @@ impl TokenGovernor {
             .ok_or_else(|| ToolError::Failed("retrieve_output requires id".into()))?;
         let content = self.store.load(id)?;
         self.retrievals.fetch_add(1, Ordering::Relaxed);
+        if let Some(kind) = self
+            .stored
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.content_kind.clone())
+        {
+            self.content_routing.record_retrieval(&kind);
+        }
         let start = args
             .get("startLine")
             .and_then(Value::as_u64)
@@ -1259,6 +1378,7 @@ impl TokenGovernor {
                 "dedupeWindow": self.config.dedupe_window,
                 "antiLoop": self.config.anti_loop,
                 "retrieveMaxBytes": self.config.retrieve_max_bytes,
+                "specializedMinReductionPct": self.config.specialized_min_reduction_pct,
             },
             "contentRouting": {
                 "log": self.content_routing.log,
@@ -1271,6 +1391,7 @@ impl TokenGovernor {
                 "modelViewBytes": content_model_view_bytes,
                 "estimatedByteReductionPct": estimated_byte_reduction_pct,
                 "retrievalsPerCompressedOutput": retrievals_per_compressed_output,
+                "byKind": self.content_routing.by_kind,
             },
         })
     }
@@ -1929,6 +2050,80 @@ mod tests {
                 .as_f64()
                 .unwrap()
                 > 0.0
+        );
+    }
+
+    #[test]
+    fn large_error_output_is_reversibly_compressed() {
+        let dir = tempdir().unwrap();
+        let mut governor =
+            TokenGovernor::with_store("test", tiny_thresholds(), OutputStore::new(dir.path()));
+        let original = (0..500)
+            .map(|i| format!("error: compile failure {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = governor.after_tool(
+            "exec_command",
+            &json!({"command":"cargo check"}),
+            ToolResult {
+                content: original.clone(),
+                is_error: true,
+                details: None,
+            },
+        );
+        assert!(result.is_error);
+        assert!(result.content.len() < original.len());
+        let id = result.details.as_ref().unwrap()["tokenGovernor"]["outputId"]
+            .as_str()
+            .unwrap();
+        let recovered = governor.retrieve(&json!({"id": id})).unwrap();
+        assert!(recovered.content.contains("compile failure 499"));
+    }
+
+    #[test]
+    fn specialized_view_must_clear_minimum_reduction_threshold() {
+        assert!(clears_specialized_threshold(80, 100, 10));
+        assert!(!clears_specialized_threshold(95, 100, 10));
+        assert!(!clears_specialized_threshold(100, 100, 10));
+    }
+
+    #[test]
+    fn governor_tracks_retrievals_by_content_kind() {
+        let dir = tempdir().unwrap();
+        let mut governor =
+            TokenGovernor::with_store("test", tiny_thresholds(), OutputStore::new(dir.path()));
+        let log = (0..120)
+            .map(|i| format!("running task {i}\nwarning: w{i}\nerror: e{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log_result = governor.after_tool(
+            "exec_command",
+            &json!({"command":"custom runner"}),
+            ok(&log),
+        );
+        assert!(log_result.details.as_ref().unwrap()["tokenGovernor"]["outputId"].is_string());
+
+        let json_body = serde_json::Value::Array(
+            (0..40)
+                .map(|i| serde_json::json!({"id":i,"status":if i == 31 {"error"} else {"ok"}}))
+                .collect(),
+        )
+        .to_string();
+        let json_result = governor.after_tool(
+            "exec_command",
+            &json!({"command":"cat data.json"}),
+            ok(&json_body),
+        );
+        let json_id = json_result.details.as_ref().unwrap()["tokenGovernor"]["outputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = governor.retrieve(&json!({"id":json_id})).unwrap();
+        let status = governor.status();
+        assert_eq!(status["contentRouting"]["byKind"]["log"]["retrievals"], 0);
+        assert_eq!(
+            status["contentRouting"]["byKind"]["jsonArray"]["retrievals"],
+            1
         );
     }
 }
