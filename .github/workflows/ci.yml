@@ -49,49 +49,8 @@ jobs:
       - name: Apply focused fixes
         run: |
           python scripts/apply_luna_reliability_followups.py
+          python scripts/update_luna_policy_test.py
           sed -i 's/use std::path::{Component, Path, PathBuf};/use std::path::{Path, PathBuf};/' crates/davinci-agent/src/permission.rs
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('crates/davinci-agent/src/runtime/capabilities.rs')
-          text = p.read_text()
-          text = text.replace('''                "read",
-                ConcurrencyPolicy::ParallelSafe,
-                ReplayPolicy::SafeToReplay,
-                OutputPolicy::Compressible,
-''', '''                "read",
-                ConcurrencyPolicy::ParallelSafe,
-                ReplayPolicy::SafeToReplay,
-                OutputPolicy::LosslessRequired,
-''', 1)
-          text = text.replace('''                "edit",
-                ConcurrencyPolicy::SerialBarrier,
-                ReplayPolicy::ReconcileBeforeReplay,
-                OutputPolicy::Normal,
-''', '''                "edit",
-                ConcurrencyPolicy::SerialBarrier,
-                ReplayPolicy::ReconcileBeforeReplay,
-                OutputPolicy::LosslessRequired,
-''', 1)
-          text = text.replace('''                "exec_command",
-                ConcurrencyPolicy::SerialBarrier,
-                ReplayPolicy::NeverAutoReplay,
-                OutputPolicy::LosslessRequired,
-''', '''                "exec_command",
-                ConcurrencyPolicy::SerialBarrier,
-                ReplayPolicy::NeverAutoReplay,
-                OutputPolicy::Compressible,
-''', 1)
-          text = text.replace('''                "agent",
-                ConcurrencyPolicy::ParallelSafe,
-                ReplayPolicy::NeverAutoReplay,
-                OutputPolicy::Normal,
-''', '''                "agent",
-                ConcurrencyPolicy::ParallelSafe,
-                ReplayPolicy::NeverAutoReplay,
-                OutputPolicy::LosslessRequired,
-''', 1)
-          p.write_text(text)
-          PY
       - name: Format
         run: cargo fmt --all
       - name: Targeted regression tests
@@ -111,6 +70,7 @@ jobs:
         run: |
           git checkout b2562436c4b789baab0dd7489f58510356c76a5f -- .github/workflows/ci.yml
           git rm scripts/apply_luna_reliability_followups.py
+          git rm scripts/update_luna_policy_test.py
       - name: Commit verified fixes
         shell: bash
         run: |
