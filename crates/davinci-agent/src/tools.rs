@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -978,13 +979,22 @@ fn todo_tool(input: &serde_json::Value, context: &ToolContext) -> Result<ToolRes
 fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     let raw_path = required_str(input, "path")?;
     let path = resolve(cwd, raw_path)?;
-    let bytes = fs::read(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
-    if let Some(mime) = detect_image_mime(&path, &bytes) {
+    let mut prefix_file =
+        fs::File::open(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let mut prefix = [0_u8; 12];
+    let prefix_len = prefix_file
+        .read(&mut prefix)
+        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    if let Some(mime) = detect_image_mime(&path, &prefix[..prefix_len]) {
+        let bytes = fs::read(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
         return read_image(&path, &bytes, mime);
     }
-    let mut content = String::from_utf8_lossy(&bytes).into_owned();
+    let mut content = String::new();
     let mut notebook = None;
-    if crate::notebook::is_notebook_path(&path) {
+    let is_notebook = crate::notebook::is_notebook_path(&path);
+    if is_notebook {
+        let bytes = fs::read(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+        content = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(parsed) = crate::notebook::parse(&content) {
             content = crate::notebook::render(&parsed);
             notebook = Some(serde_json::json!({
@@ -1002,16 +1012,183 @@ fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
         .get("limit")
         .and_then(serde_json::Value::as_u64)
         .map(|value| value as usize);
-    let (content, truncation) = truncate_read(&content, offset, limit);
-    let mut details = serde_json::json!({"path": path, "truncation": truncation});
-    if let Some(notebook) = notebook {
-        details["notebook"] = notebook;
+    let limit = limit.unwrap_or(DEFAULT_MAX_LINES);
+    if is_notebook {
+        let (content, truncation) = truncate_read(&content, offset, Some(limit));
+        let mut details = serde_json::json!({"path": path, "truncation": truncation});
+        if let Some(notebook) = notebook {
+            details["notebook"] = notebook;
+        }
+        return Ok(ToolResult {
+            content,
+            is_error: false,
+            details: Some(details),
+        });
     }
+
+    let window = read_text_window(&path, offset, limit, DEFAULT_MAX_BYTES)?;
+    let truncated_by = if window.truncated {
+        if window.lines_returned >= limit {
+            Some("lines")
+        } else {
+            Some("bytes")
+        }
+    } else {
+        None
+    };
+    let (total_lines, total_bytes) = match small_text_totals(&path)? {
+        Some((lines, bytes)) => (Some(lines), Some(bytes)),
+        None => (None, None),
+    };
+    let truncation = serde_json::json!({
+        "truncated": window.truncated,
+        "truncatedBy": truncated_by,
+        "firstLine": window.first_line,
+        "totalLines": total_lines,
+        "totalBytes": total_bytes,
+        "outputLines": window.lines_returned,
+        "outputBytes": window.content.len(),
+        "maxLines": limit,
+        "maxBytes": DEFAULT_MAX_BYTES,
+    });
     Ok(ToolResult {
-        content,
+        content: window.content,
         is_error: false,
-        details: Some(details),
+        details: Some(serde_json::json!({"path": path, "truncation": truncation})),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextWindow {
+    content: String,
+    first_line: usize,
+    lines_returned: usize,
+    truncated: bool,
+}
+
+struct RawLine {
+    bytes: Vec<u8>,
+    too_long: bool,
+}
+
+fn read_raw_line(
+    reader: &mut BufReader<fs::File>,
+    capture: bool,
+    max_bytes: Option<usize>,
+) -> Result<Option<RawLine>, ToolError> {
+    let mut bytes = Vec::new();
+    let mut saw_any = false;
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        if buffer.is_empty() {
+            return Ok(saw_any.then_some(RawLine {
+                bytes,
+                too_long: false,
+            }));
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(buffer.len());
+        if capture {
+            if max_bytes.is_some_and(|max| bytes.len().saturating_add(content_len) > max) {
+                return Ok(Some(RawLine {
+                    bytes: Vec::new(),
+                    too_long: true,
+                }));
+            }
+            bytes.extend_from_slice(&buffer[..content_len]);
+        }
+
+        let consume_len = newline.map_or(buffer.len(), |index| index + 1);
+        reader.consume(consume_len);
+        saw_any = true;
+        if newline.is_some() {
+            return Ok(Some(RawLine {
+                bytes,
+                too_long: false,
+            }));
+        }
+    }
+}
+
+fn read_text_window(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<TextWindow, ToolError> {
+    let file = fs::File::open(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let mut reader = BufReader::new(file);
+    let first_line = offset.max(1);
+
+    for _ in 1..first_line {
+        if read_raw_line(&mut reader, false, None)?.is_none() {
+            return Ok(TextWindow {
+                content: String::new(),
+                first_line,
+                lines_returned: 0,
+                truncated: false,
+            });
+        }
+    }
+
+    let mut content = String::new();
+    let mut lines_returned = 0;
+    let mut truncated = false;
+    while lines_returned < limit {
+        let separator_bytes = usize::from(lines_returned > 0);
+        let remaining_bytes = max_bytes.saturating_sub(content.len() + separator_bytes);
+        let Some(line) = read_raw_line(&mut reader, true, Some(remaining_bytes))? else {
+            break;
+        };
+        if line.too_long {
+            truncated = true;
+            break;
+        }
+
+        let line = String::from_utf8_lossy(&line.bytes).into_owned();
+        if content.len() + separator_bytes + line.len() > max_bytes {
+            truncated = true;
+            break;
+        }
+        if lines_returned > 0 {
+            content.push('\n');
+        }
+        content.push_str(&line);
+        lines_returned += 1;
+    }
+
+    if !truncated && lines_returned >= limit {
+        truncated = read_raw_line(&mut reader, false, None)?.is_some();
+    }
+
+    Ok(TextWindow {
+        content,
+        first_line,
+        lines_returned,
+        truncated,
+    })
+}
+
+fn small_text_totals(path: &Path) -> Result<Option<(usize, usize)>, ToolError> {
+    let metadata = fs::metadata(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    if metadata.len() > DEFAULT_MAX_BYTES as u64 {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let content = String::from_utf8_lossy(&bytes);
+    let total_lines = if content.is_empty() {
+        0
+    } else {
+        let mut lines = content.split('\n').count();
+        if content.ends_with('\n') {
+            lines = lines.saturating_sub(1);
+        }
+        lines
+    };
+    Ok(Some((total_lines, content.len())))
 }
 
 fn read_image(path: &Path, bytes: &[u8], mime: &str) -> Result<ToolResult, ToolError> {
@@ -2937,6 +3114,37 @@ fn code_rename_preview_tool(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn read_large_text_file_returns_requested_window() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let content = (1..=5000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content).unwrap();
+
+        let window = read_text_window(&path, 2500, 3, 1024).unwrap();
+
+        assert_eq!(window.first_line, 2500);
+        assert_eq!(window.lines_returned, 3);
+        assert_eq!(window.content, "line 2500\nline 2501\nline 2502");
+        assert!(window.truncated);
+    }
+
+    #[test]
+    fn read_window_preserves_utf8_at_byte_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("utf8.txt");
+        fs::write(&path, "éclair\nnext\n").unwrap();
+
+        let window = read_text_window(&path, 1, 1, "éclair".len()).unwrap();
+
+        assert_eq!(window.content, "éclair");
+        assert!(!window.content.contains('\u{fffd}'));
+        assert!(window.truncated);
+    }
 
     #[test]
     fn f02_waiting_mode() {
