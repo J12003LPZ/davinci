@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use davinci_ai::{
     assistant_to_chat, AssistantMessage, ChatMessage, ContentBlock, MessageContent, StopReason,
@@ -1497,7 +1497,7 @@ impl Agent {
                 && !pre_hook_error
                 && !result.is_error
             {
-                self.record_successful_mutation();
+                self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
             }
             if matches!(name, "bash" | "powershell" | "exec_command") {
                 let cmd = args
@@ -1505,7 +1505,7 @@ impl Agent {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if is_verification_command(cmd) {
-                    self.record_verification_result(!pre_hook_error && !result.is_error);
+                    self.record_verification_command(cmd, !pre_hook_error && !result.is_error);
                 }
             }
         }
@@ -2300,6 +2300,37 @@ fn sleep_retry_delay(delay_ms: u64, cancelled: impl Fn() -> bool) {
         }
         std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
     }
+}
+
+pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for key in ["path", "file_path", "notebook_path"] {
+        if let Some(value) = args.get(key).and_then(Value::as_str) {
+            let path = PathBuf::from(value);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    if name == "apply_patch" {
+        if let Some(patch) = args
+            .get("patch")
+            .or_else(|| args.get("input"))
+            .and_then(Value::as_str)
+        {
+            for line in patch.lines() {
+                for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+                    if let Some(path) = line.strip_prefix(prefix) {
+                        let path = PathBuf::from(path.trim());
+                        if !paths.contains(&path) {
+                            paths.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    paths
 }
 
 pub(crate) fn is_verification_command(cmd: &str) -> bool {
