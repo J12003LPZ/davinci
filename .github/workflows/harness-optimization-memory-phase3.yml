@@ -60,7 +60,9 @@ jobs:
         run: cargo fmt --all
 
       - name: Verify T13 labeled retrieval evaluation
-        run: cargo test -p davinci-evals harness_eval::tests::
+        shell: bash
+        run: |
+          cargo test -p davinci-evals 'harness_eval::tests::'
 
       - name: Verify T14 and bounded indexing regressions
         shell: bash
