@@ -26,7 +26,6 @@ jobs:
         run: |
           python3 .github/scripts/harness_opt_learning_stage2.py --tests
           python3 .github/scripts/harness_opt_learning_stage2_fixture.py
-          python3 .github/scripts/harness_opt_learning_stage2_diag.py
 
       - name: Verify focused regressions are red
         shell: bash
@@ -48,6 +47,7 @@ jobs:
         run: |
           python3 .github/scripts/harness_opt_learning_stage2.py --impl
           python3 .github/scripts/harness_opt_learning_stage2_outcome_fix.py
+          python3 .github/scripts/harness_opt_learning_stage2_diag.py
 
       - name: Format
         run: cargo fmt --all
