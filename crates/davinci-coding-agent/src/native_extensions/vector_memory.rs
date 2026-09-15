@@ -24,6 +24,12 @@ const DENSE_BACKOFF: Duration = Duration::from_secs(120);
 /// `memory_search` never answers more than this many hits whatever `limit`
 /// says; the tool schema states the same cap.
 pub const SEARCH_LIMIT_CAP: usize = 20;
+/// Phase 3 chooses the bounded local index as the production projection.
+/// Qdrant configuration remains readable for rollback/experiments but normal
+/// indexing does not perform remote writes until a remote query path clears
+/// the documented break-even gate.
+pub const MEMORY_PROJECTION_PROFILE: &str = "local";
+const EMBEDDING_PREFIX_REVISION: u32 = 1;
 
 /// EmbeddingGemma uses different task prefixes for documents and queries.
 /// Keep these constants alongside the client so callers cannot accidentally
@@ -269,6 +275,31 @@ pub fn provenance_after_review(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingIdentity {
+    pub model: String,
+    pub dimensions: usize,
+    pub prefix_revision: u32,
+}
+
+impl EmbeddingIdentity {
+    pub fn from_config(config: &VectorMemoryConfig) -> Self {
+        Self {
+            model: config.embedding_model.clone(),
+            dimensions: config.embedding_dimensions,
+            prefix_revision: EMBEDDING_PREFIX_REVISION,
+        }
+    }
+}
+
+fn embedding_identity_compatible(
+    stored: Option<&EmbeddingIdentity>,
+    current: &EmbeddingIdentity,
+) -> bool {
+    stored == Some(current)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryRecord {
@@ -282,6 +313,8 @@ pub struct MemoryRecord {
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_identity: Option<EmbeddingIdentity>,
     #[serde(default)]
     pub confidence: Option<f32>,
     #[serde(default)]
@@ -938,6 +971,7 @@ impl VectorMemory {
                 importance: chunk.importance,
                 created_at: davinci_session::now_ms(),
                 embedding: None,
+                embedding_identity: None,
                 confidence: None,
                 source_session_id: None,
                 source_turn: None,
@@ -971,11 +1005,13 @@ impl VectorMemory {
             }
             if let Ok(embeddings) = embeddings {
                 if embeddings.len() == inserted_records.len() {
+                    let embedding_identity = EmbeddingIdentity::from_config(&self.config);
                     for (record, embedding) in inserted_records.iter().zip(embeddings) {
                         if let Some(stored) =
                             self.records.iter_mut().find(|item| item.id == record.id)
                         {
                             stored.embedding = Some(embedding);
+                            stored.embedding_identity = Some(embedding_identity.clone());
                         }
                     }
                     // Local persistence remains authoritative; Qdrant is only
@@ -990,7 +1026,9 @@ impl VectorMemory {
                                 .cloned()
                         })
                         .collect::<Vec<_>>();
-                    let _ = self.upsert_remote(&embedded);
+                    if self.remote_projection_enabled() {
+                        let _ = self.upsert_remote(&embedded);
+                    }
                 }
             }
         }
@@ -1063,6 +1101,7 @@ impl VectorMemory {
                 .unwrap_or_default()
                 .as_secs(),
             embedding: None,
+            embedding_identity: None,
             confidence: prior.confidence,
             source_session_id: prior.source_session_id.clone(),
             source_turn: prior.source_turn,
@@ -1163,8 +1202,15 @@ impl VectorMemory {
         });
         lexical_ranked.truncate(candidate_limit);
 
+        let embedding_identity = self.current_embedding_identity();
         let query_embedding = (self.dense_available()
-            && candidates.iter().any(|record| record.embedding.is_some()))
+            && candidates.iter().any(|record| {
+                record.embedding.is_some()
+                    && embedding_identity_compatible(
+                        record.embedding_identity.as_ref(),
+                        &embedding_identity,
+                    )
+            }))
         .then(|| match self.embed_query(query) {
             Ok(vector) => Some(vector),
             Err(_) => {
@@ -1181,6 +1227,12 @@ impl VectorMemory {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, record)| {
+                        if !embedding_identity_compatible(
+                            record.embedding_identity.as_ref(),
+                            &embedding_identity,
+                        ) {
+                            return None;
+                        }
                         let embedding = record.embedding.as_ref()?;
                         if embedding.len() != query_vector.len() {
                             return None;
@@ -1413,6 +1465,94 @@ impl VectorMemory {
         Ok(self.status())
     }
 
+    /// The selected Phase 3 projection is deliberately local. Remote write
+    /// amplification stays disabled until a filtered remote retrieval path
+    /// demonstrates the documented quality/latency break-even.
+    pub fn remote_projection_enabled(&self) -> bool {
+        false
+    }
+
+    fn current_embedding_identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity::from_config(&self.config)
+    }
+
+    fn drop_incompatible_embeddings(&mut self) -> usize {
+        let current = self.current_embedding_identity();
+        let mut dropped = 0usize;
+        for record in &mut self.records {
+            if record.embedding.is_some()
+                && !embedding_identity_compatible(record.embedding_identity.as_ref(), &current)
+            {
+                record.embedding = None;
+                record.embedding_identity = None;
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
+    fn local_projection_lag(&self) -> usize {
+        let current = self.current_embedding_identity();
+        self.records
+            .iter()
+            .filter(|record| {
+                !self.tombstones.contains(&record.id)
+                    && !self.supersessions.contains_key(&record.id)
+                    && (record.embedding.is_none()
+                        || !embedding_identity_compatible(
+                            record.embedding_identity.as_ref(),
+                            &current,
+                        ))
+            })
+            .count()
+    }
+
+    /// Rebuild a bounded batch of missing or incompatible local embeddings.
+    /// Authoritative records remain readable through lexical retrieval if the
+    /// embedding service is unavailable. Tombstoned/superseded records are
+    /// never projected.
+    #[allow(dead_code)]
+    pub fn rebuild_local_embeddings(&mut self, limit: usize) -> Result<usize, ToolError> {
+        self.drop_incompatible_embeddings();
+        let pending = self
+            .records
+            .iter()
+            .filter(|record| {
+                !self.tombstones.contains(&record.id)
+                    && !self.supersessions.contains_key(&record.id)
+                    && record.embedding.is_none()
+            })
+            .take(limit.max(1))
+            .map(|record| (record.id.clone(), record.text.clone()))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let texts = pending
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        let embeddings = self.embed_documents(&texts)?;
+        if embeddings.len() != pending.len() {
+            return Err(ToolError::Failed(
+                "embedding rebuild response count does not match request".into(),
+            ));
+        }
+        let identity = self.current_embedding_identity();
+        let mut updated = 0usize;
+        for ((id, _), embedding) in pending.into_iter().zip(embeddings) {
+            if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {
+                record.embedding = Some(embedding);
+                record.embedding_identity = Some(identity.clone());
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            self.persist_local()?;
+        }
+        Ok(updated)
+    }
+
     pub fn status(&self) -> Value {
         let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
         for record in &self.records {
@@ -1438,6 +1578,9 @@ impl VectorMemory {
             "lastIndexedAt": self.last_indexed_at,
             "automaticRetrieval": self.config.automatic_retrieval,
             "denseAvailable": self.dense_available(),
+            "projectionProfile": MEMORY_PROJECTION_PROFILE,
+            "remoteProjectionEnabled": self.remote_projection_enabled(),
+            "projectionLag": self.local_projection_lag(),
             "qdrant": self.config.qdrant_url,
             "ollama": self.config.ollama_url,
             "embeddingModel": self.config.embedding_model,
@@ -1591,6 +1734,7 @@ impl VectorMemory {
             importance,
             created_at: davinci_session::now_ms(),
             embedding: None,
+            embedding_identity: None,
             confidence: Some(confidence),
             source_session_id: Some(source_session_id.to_string()),
             source_turn: Some(source_turn),
@@ -1612,12 +1756,17 @@ impl VectorMemory {
                 if let Some(emb) = embeddings.into_iter().next() {
                     if let Some(stored) = self.records.iter_mut().find(|item| item.id == id) {
                         stored.embedding = Some(emb.clone());
+                        stored.embedding_identity =
+                            Some(EmbeddingIdentity::from_config(&self.config));
                     }
                     let _ = self.persist_local();
-                    let _ = self.upsert_remote(&[MemoryRecord {
-                        embedding: Some(emb),
-                        ..record
-                    }]);
+                    if self.remote_projection_enabled() {
+                        let _ = self.upsert_remote(&[MemoryRecord {
+                            embedding: Some(emb),
+                            embedding_identity: Some(EmbeddingIdentity::from_config(&self.config)),
+                            ..record
+                        }]);
+                    }
                 }
             }
         }
@@ -2101,12 +2250,13 @@ mod tests {
     }
 
     #[test]
-    fn indexing_persists_remote_embeddings_and_searches_dense_hits() {
+    fn indexing_persists_local_embeddings_and_searches_dense_hits() {
         let directory = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            for _ in 0..3 {
+            // Local projection performs two embedding-service requests here: document indexing and query embedding. Automatic Qdrant writes are disabled.
+            for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 // Drain the whole request (headers plus Content-Length body)
                 // before answering: ureq writes the JSON body in a second
@@ -2175,6 +2325,7 @@ mod tests {
                 importance: 0.8,
                 created_at: 1000 + i as u64,
                 embedding: None,
+                embedding_identity: None,
                 confidence: None,
                 source_session_id: None,
                 source_turn: None,
@@ -2331,6 +2482,7 @@ mod tests {
             importance: 1.0,
             created_at: 1000,
             embedding: None,
+            embedding_identity: None,
             confidence: Some(1.0),
             source_session_id: None,
             source_turn: None,
@@ -2368,6 +2520,7 @@ mod tests {
             importance: 1.0,
             created_at: 2000,
             embedding: None,
+            embedding_identity: None,
             confidence: None,
             source_session_id: None,
             source_turn: None,
@@ -2400,6 +2553,7 @@ mod tests {
             importance: 1.0,
             created_at: 1000,
             embedding: None,
+            embedding_identity: None,
             confidence: Some(0.8),
             source_session_id: None,
             source_turn: None,
@@ -2451,6 +2605,7 @@ mod tests {
             importance: 1.0,
             created_at: 1,
             embedding: None,
+            embedding_identity: None,
             confidence: Some(0.9),
             source_session_id: None,
             source_turn: None,
@@ -2573,6 +2728,7 @@ mod phase3_memory_retrieval_regressions {
             importance,
             created_at: 1000,
             embedding: None,
+            embedding_identity: None,
             confidence: Some(0.9),
             source_session_id: Some("session-phase3".into()),
             source_turn: Some(1),
@@ -2700,5 +2856,51 @@ mod phase3_memory_retrieval_regressions {
         let hits = memory.search("BUG-8472", 5);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.id, "target");
+    }
+}
+
+#[cfg(test)]
+mod phase3_t15_projection_regressions {
+    use super::*;
+
+    #[test]
+    fn phase3_t15_projection_profile_is_explicit_local() {
+        assert_eq!(MEMORY_PROJECTION_PROFILE, "local");
+        let dir = tempfile::tempdir().unwrap();
+        let memory =
+            VectorMemory::with_config(dir.path().to_path_buf(), VectorMemoryConfig::default());
+        assert!(!memory.remote_projection_enabled());
+    }
+
+    #[test]
+    fn phase3_t15_embedding_identity_changes_with_model_or_dimensions() {
+        let base = VectorMemoryConfig::default();
+        let base_identity = EmbeddingIdentity::from_config(&base);
+
+        let mut changed_model = base.clone();
+        changed_model.embedding_model = "replacement-model".into();
+        assert_ne!(
+            base_identity,
+            EmbeddingIdentity::from_config(&changed_model)
+        );
+
+        let mut changed_dimensions = base;
+        changed_dimensions.embedding_dimensions = 384;
+        assert_ne!(
+            base_identity,
+            EmbeddingIdentity::from_config(&changed_dimensions)
+        );
+    }
+
+    #[test]
+    fn phase3_t15_legacy_or_changed_embedding_is_incompatible() {
+        let config = VectorMemoryConfig::default();
+        let current = EmbeddingIdentity::from_config(&config);
+        assert!(!embedding_identity_compatible(None, &current));
+        assert!(embedding_identity_compatible(Some(&current), &current));
+
+        let mut other = current.clone();
+        other.model = "other-model".into();
+        assert!(!embedding_identity_compatible(Some(&other), &current));
     }
 }

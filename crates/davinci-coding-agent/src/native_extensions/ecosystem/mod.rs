@@ -308,6 +308,8 @@ mod tests {
             importance: 0.9,
             created_at: 1000,
             embedding: None,
+
+            embedding_identity: None,
             confidence: None,
             source_session_id: Some("session-123".into()),
             source_turn: Some(5),
@@ -673,6 +675,8 @@ mod tests {
                     importance: 0.85,
                     created_at: 2000 + i as u64,
                     embedding: None,
+
+                    embedding_identity: None,
                     confidence: None,
                     source_session_id: None,
                     source_turn: None,
@@ -845,6 +849,8 @@ mod tests {
                     importance: 0.9,
                     created_at: 1000 + i as u64,
                     embedding: None,
+
+                    embedding_identity: None,
                     confidence: None,
                     source_session_id: None,
                     source_turn: None,
@@ -1167,6 +1173,8 @@ mod tests {
                     importance: 0.9,
                     created_at: 1000 + i as u64,
                     embedding: None,
+
+                    embedding_identity: None,
                     confidence: None,
                     source_session_id: None,
                     source_turn: None,
@@ -1248,6 +1256,8 @@ mod tests {
                     importance: 0.9,
                     created_at: 1000 + i as u64,
                     embedding: None,
+
+                    embedding_identity: None,
                     confidence: None,
                     source_session_id: None,
                     source_turn: None,
