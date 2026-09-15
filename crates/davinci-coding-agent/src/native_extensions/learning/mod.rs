@@ -513,6 +513,21 @@ impl LearningController {
         )
     }
 
+    pub fn record_skill_usage_outcome(
+        &mut self,
+        skill: &SkillVersionRef,
+        signal: SkillUsageSignal,
+    ) -> Result<bool, String> {
+        let outcome = match signal {
+            SkillUsageSignal::VerifiedHelpful => SkillOutcome::VerifiedSuccess,
+            SkillUsageSignal::VerifiedFailureRelevant => SkillOutcome::VerifiedFailure,
+            SkillUsageSignal::Injected
+            | SkillUsageSignal::ScopeRelevant
+            | SkillUsageSignal::Neutral => SkillOutcome::Neutral,
+        };
+        self.record_skill_version_outcome(skill, outcome)
+    }
+
     pub fn skill_view_tool(&self, _cwd: &Path, args: &Value) -> Result<ToolResult, ToolError> {
         let name = args
             .get("name")
@@ -1791,6 +1806,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         controller.project_store.upsert_skill(skill_record).unwrap();
@@ -1836,6 +1852,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -1885,6 +1902,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         let global_record = SkillLedgerRecord {

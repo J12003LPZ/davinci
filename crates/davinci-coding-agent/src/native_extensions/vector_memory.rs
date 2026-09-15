@@ -281,6 +281,12 @@ pub struct MemoryRecord {
     pub source_turn: Option<u64>,
     #[serde(default)]
     pub verification: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_state_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at_revision: Option<String>,
     #[serde(default)]
     pub use_count: u64,
     #[serde(default)]
@@ -324,22 +330,47 @@ pub fn content_hash(text: &str) -> String {
     sha256_hex(text.as_bytes())
 }
 
-/// Deterministic compatibility factor for memories that carry an optional
-/// verified repository-state marker in `verification` as `state:<digest>`.
-/// Legacy memories remain neutral (1.0); mismatched state is penalized but
-/// remains retrievable because older facts can still be useful historical evidence.
-pub fn freshness_factor(record: &MemoryRecord, current_state: Option<&str>) -> f32 {
-    let Some(expected) = record
-        .verification
-        .as_deref()
-        .and_then(|value| value.strip_prefix("state:"))
-    else {
+pub fn source_state_hash_for_paths(cwd: &Path, paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut normalized = paths
+        .iter()
+        .map(|path| path.replace('\\', "/").trim_start_matches("./").to_string())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    let mut material = String::new();
+    for relative in normalized {
+        if relative.is_empty() {
+            return None;
+        }
+        let bytes = fs::read(cwd.join(&relative)).ok()?;
+        material.push_str(&relative);
+        material.push('\0');
+        material.push_str(&sha256_hex(bytes));
+        material.push('\n');
+    }
+    Some(sha256_hex(material.as_bytes()))
+}
+
+pub fn memory_freshness(record: &MemoryRecord, cwd: &Path) -> f32 {
+    if record.source_paths.is_empty() {
         return 1.0;
+    }
+    let authoritative = record.source == "user"
+        || record.source == "user_decision"
+        || matches!(record.kind, MemoryKind::Decision | MemoryKind::Constraint);
+    let current = source_state_hash_for_paths(cwd, &record.source_paths);
+    let factor: f32 = match (&record.source_state_hash, current) {
+        (_, None) => 0.35,
+        (Some(expected), Some(actual)) if expected != &actual => 0.65,
+        _ => 1.0,
     };
-    match current_state {
-        Some(current) if current == expected => 1.0,
-        Some(_) => 0.55,
-        None => 0.80,
+    if authoritative {
+        factor.max(0.80)
+    } else {
+        factor
     }
 }
 
@@ -883,6 +914,9 @@ impl VectorMemory {
                 source_session_id: None,
                 source_turn: None,
                 verification: None,
+                source_paths: Vec::new(),
+                source_state_hash: None,
+                verified_at_revision: None,
                 use_count: 0,
                 last_used_at: None,
                 agent_profile_name: profile_str.clone(),
@@ -1005,6 +1039,9 @@ impl VectorMemory {
             source_session_id: prior.source_session_id.clone(),
             source_turn: prior.source_turn,
             verification: prior.verification.clone(),
+            source_paths: prior.source_paths.clone(),
+            source_state_hash: prior.source_state_hash.clone(),
+            verified_at_revision: prior.verified_at_revision.clone(),
             use_count: 0,
             last_used_at: None,
             agent_profile_name: prior.agent_profile_name.clone(),
@@ -1101,9 +1138,7 @@ impl VectorMemory {
                     .map(|(query, embedding)| cosine_similarity(query, embedding))
                     .unwrap_or(lexical);
                 let base = (dense * 0.6 + lexical * 0.3 + record.importance * 0.1).clamp(0.0, 1.0);
-                let current_state = std::env::var("DAVINCI_MEMORY_STATE_HASH").ok();
-                let score =
-                    (base * freshness_factor(record, current_state.as_deref())).clamp(0.0, 1.0);
+                let score = (base * memory_freshness(record, &self.cwd)).clamp(0.0, 1.0);
                 (score >= self.config.minimum_score).then(|| MemoryHit {
                     record: (*record).clone(),
                     score,
@@ -1424,6 +1459,9 @@ impl VectorMemory {
             source_session_id: Some(source_session_id.to_string()),
             source_turn: Some(source_turn),
             verification: verification.map(str::to_string),
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -2005,6 +2043,9 @@ mod tests {
                 source_session_id: None,
                 source_turn: None,
                 verification: None,
+                source_paths: Vec::new(),
+                source_state_hash: None,
+                verified_at_revision: None,
                 use_count: 0,
                 last_used_at: None,
                 agent_profile_name: None,
@@ -2158,6 +2199,9 @@ mod tests {
             source_session_id: None,
             source_turn: None,
             verification: None,
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -2192,6 +2236,9 @@ mod tests {
             source_session_id: None,
             source_turn: None,
             verification: None,
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -2221,6 +2268,9 @@ mod tests {
             source_session_id: None,
             source_turn: None,
             verification: None,
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -2254,8 +2304,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_memory_is_penalized_when_verified_state_changes() {
-        let mut record = MemoryRecord {
+    fn legacy_verification_marker_does_not_invent_staleness() {
+        let record = MemoryRecord {
             id: "m1".into(),
             repo_id: "repo".into(),
             kind: MemoryKind::Architecture,
@@ -2269,14 +2319,105 @@ mod tests {
             source_session_id: None,
             source_turn: None,
             verification: Some("state:abc".into()),
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
             memory_scope: None,
         };
-        assert_eq!(freshness_factor(&record, Some("abc")), 1.0);
-        assert!(freshness_factor(&record, Some("def")) < 1.0);
-        record.verification = None;
-        assert_eq!(freshness_factor(&record, Some("def")), 1.0);
+        assert_eq!(memory_freshness(&record, Path::new(".")), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod source_bound_freshness_regressions {
+    use super::*;
+    use serde_json::json;
+
+    fn source_state_hash(path: &str, content: &[u8]) -> String {
+        sha256_hex(format!("{}\0{}\n", path, sha256_hex(content)).as_bytes())
+    }
+
+    #[test]
+    fn legacy_memory_record_has_neutral_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem_dir = dir.path().join(".pi").join("vector-memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let record = json!({
+            "id": "legacy-memory",
+            "repoId": resolve_repo_id(dir.path()),
+            "kind": "architecture",
+            "text": "legacy parser architecture",
+            "source": "learning",
+            "contentHash": "legacy",
+            "importance": 1.0,
+            "createdAt": 1,
+            "embedding": null,
+            "confidence": 0.9,
+            "sourceSessionId": null,
+            "sourceTurn": null,
+            "verification": null,
+            "useCount": 0,
+            "lastUsedAt": null
+        });
+        std::fs::write(mem_dir.join("records.jsonl"), format!("{}\n", record)).unwrap();
+        let memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.0,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        let hits = memory.search("legacy parser architecture", 1);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].score > 0.9);
+    }
+
+    #[test]
+    fn memory_freshness_penalizes_changed_source_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/auth.rs"), b"v1").unwrap();
+        let mem_dir = dir.path().join(".pi").join("vector-memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+
+        let mut record = json!({
+            "id": "source-memory",
+            "repoId": resolve_repo_id(dir.path()),
+            "kind": "architecture",
+            "text": "auth parser architecture",
+            "source": "learning",
+            "contentHash": "source-memory",
+            "importance": 1.0,
+            "createdAt": 1,
+            "embedding": null,
+            "confidence": 0.9,
+            "sourceSessionId": null,
+            "sourceTurn": null,
+            "verification": null,
+            "useCount": 0,
+            "lastUsedAt": null
+        });
+        record["sourcePaths"] = json!(["src/auth.rs"]);
+        record["sourceStateHash"] = json!(source_state_hash("src/auth.rs", b"v1"));
+        record["verifiedAtRevision"] = json!("fixture-r1");
+        std::fs::write(mem_dir.join("records.jsonl"), format!("{}\n", record)).unwrap();
+
+        let memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.0,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        let before = memory.search("auth parser architecture", 1)[0].score;
+        std::fs::write(dir.path().join("src/auth.rs"), b"v2").unwrap();
+        let after = memory.search("auth parser architecture", 1)[0].score;
+        assert!(
+            after < before,
+            "source-bound memory should be penalized after its verified source changes: {before} -> {after}"
+        );
     }
 }

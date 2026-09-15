@@ -67,6 +67,51 @@ impl WorkerContextQuery {
             .take(WORKER_CONTEXT_QUERY_MAX_CHARS)
             .collect()
     }
+
+    /// Render a compact query for reusable skill retrieval. Worker briefings contain
+    /// policy text and execution instructions that are useful to memory retrieval but
+    /// can dilute lexical skill relevance. Prefer the user goal and task-local signals;
+    /// fall back to the node objective only when no stronger signal exists.
+    pub fn render_skill_query(&self) -> String {
+        fn bounded(value: &str, limit: usize) -> String {
+            value.trim().chars().take(limit).collect()
+        }
+
+        let mut lines = Vec::new();
+        if !self.graph_goal.trim().is_empty() {
+            lines.push(bounded(&self.graph_goal, 900));
+        }
+
+        let mut targets = self
+            .target_hints
+            .iter()
+            .map(|value| bounded(value, 180))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        if !targets.is_empty() {
+            lines.push(targets.join(" "));
+        }
+
+        if let Some(failure) = self
+            .failure_hint
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(bounded(failure, 420));
+        }
+
+        if lines.is_empty() && !self.node_objective.trim().is_empty() {
+            lines.push(bounded(&self.node_objective, 900));
+        }
+
+        lines
+            .join("\n")
+            .chars()
+            .take(WORKER_CONTEXT_QUERY_MAX_CHARS)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,6 +154,7 @@ fn skill_context_utility(skill: &SkillContextCandidate) -> f32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPacketRequest<'a> {
     pub prompt: &'a str,
+    pub skill_prompt: Option<&'a str>,
     pub role: Option<crate::native_extensions::graph::Role>,
     pub token_cap: usize,
     pub include_skills: bool,
@@ -119,6 +165,7 @@ impl<'a> ContextPacketRequest<'a> {
     pub fn new(prompt: &'a str) -> Self {
         Self {
             prompt,
+            skill_prompt: None,
             role: None,
             token_cap: DEFAULT_GRAPH_CONTEXT_TOKENS,
             include_skills: true,
@@ -127,6 +174,11 @@ impl<'a> ContextPacketRequest<'a> {
 
     pub fn with_role(mut self, role: crate::native_extensions::graph::Role) -> Self {
         self.role = Some(role);
+        self
+    }
+
+    pub fn with_skill_prompt(mut self, prompt: &'a str) -> Self {
+        self.skill_prompt = Some(prompt);
         self
     }
 
@@ -238,7 +290,8 @@ pub fn build_context_packet(
         let role = request
             .role
             .unwrap_or(crate::native_extensions::graph::Role::Writer);
-        learning.graph_skill_candidates(request.prompt, role, DEFAULT_GRAPH_SKILL_COUNT, skill_cap)
+        let skill_prompt = request.skill_prompt.unwrap_or(request.prompt);
+        learning.graph_skill_candidates(skill_prompt, role, DEFAULT_GRAPH_SKILL_COUNT, skill_cap)
     } else {
         Vec::new()
     };
@@ -509,5 +562,27 @@ mod tests {
         });
         assert!(concise > bloated);
         assert!(concise > stale);
+    }
+}
+
+#[cfg(test)]
+mod skill_query_separation_regressions {
+    use super::*;
+
+    #[test]
+    fn skill_query_is_not_diluted_by_worker_briefing() {
+        let query = WorkerContextQuery {
+            role: Some(crate::native_extensions::graph::Role::Writer),
+            node_objective: "# Implement\n\n## Goal\nshared workflow rust debugging\n\n## Mode\nThis was classified trivial: implement the goal directly, smallest reasonable change.\n\n## Hard rules\n- You are the only process allowed to modify files.\n- Never run git commit, git push, or any git state change.\n- Run the plan's tests yourself before submitting.\n- If the plan cannot work as written, report the reason."
+                .into(),
+            graph_goal: "shared workflow rust debugging".into(),
+            target_hints: vec![],
+            failure_hint: None,
+        };
+
+        let skill_query = query.render_skill_query();
+        assert_eq!(skill_query, "shared workflow rust debugging");
+        assert!(!skill_query.contains("Hard rules"));
+        assert!(!skill_query.contains("git commit"));
     }
 }

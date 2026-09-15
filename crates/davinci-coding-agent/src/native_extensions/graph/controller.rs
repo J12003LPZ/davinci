@@ -620,14 +620,16 @@ impl GraphExecution {
                 .unwrap_or_else(|error| error.into_inner());
             match (&self.deps.memory, guard.as_ref()) {
                 (Some(mem), Some(learn)) => {
-                    let context_query = crate::native_extensions::ecosystem::WorkerContextQuery {
-                        role: Some(role),
-                        node_objective: briefing.clone(),
-                        graph_goal: self.options.goal.clone(),
-                        target_hints: task.focus.clone().into_iter().collect(),
-                        failure_hint: None,
-                    }
-                    .render();
+                    let worker_context_query =
+                        crate::native_extensions::ecosystem::WorkerContextQuery {
+                            role: Some(role),
+                            node_objective: briefing.clone(),
+                            graph_goal: self.options.goal.clone(),
+                            target_hints: task.focus.clone().into_iter().collect(),
+                            failure_hint: None,
+                        };
+                    let context_query = worker_context_query.render();
+                    let skill_query = worker_context_query.render_skill_query();
                     crate::native_extensions::ecosystem::select_capabilities(
                         mem,
                         learn,
@@ -636,6 +638,7 @@ impl GraphExecution {
                             &context_query,
                             role,
                         )
+                        .with_skill_prompt(&skill_query)
                         .with_context_token_cap(
                             crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
                         )
@@ -1049,6 +1052,63 @@ impl GraphExecution {
         true
     }
 
+    fn skill_scope_relevant(
+        record: &crate::native_extensions::learning::types::SkillLedgerRecord,
+        task: &GraphTaskState,
+        goal: &str,
+    ) -> bool {
+        let meta = &record.applicability;
+        if meta == &crate::native_extensions::learning::types::SkillApplicability::default() {
+            return false;
+        }
+        let mut context = goal.replace('\\', "/").to_ascii_lowercase();
+        context.push(' ');
+        context.push_str(&task.role.to_string().to_ascii_lowercase());
+        if let Some(focus) = &task.focus {
+            context.push(' ');
+            context.push_str(&focus.replace('\\', "/").to_ascii_lowercase());
+        }
+        if let Some(mutation) = &task.mutation {
+            for file in &mutation.files {
+                context.push(' ');
+                context.push_str(&file.path.replace('\\', "/").to_ascii_lowercase());
+            }
+        }
+        let matches = |hint: &str| {
+            let normalized = hint
+                .trim()
+                .trim_matches('*')
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            !normalized.is_empty() && context.contains(&normalized)
+        };
+        if !meta.required_signals.is_empty()
+            && !meta.required_signals.iter().all(|hint| matches(hint))
+        {
+            return false;
+        }
+        meta.languages.iter().any(|hint| matches(hint))
+            || meta.task_types.iter().any(|hint| matches(hint))
+            || meta.path_globs.iter().any(|hint| matches(hint))
+            || meta
+                .verification_categories
+                .iter()
+                .any(|hint| matches(hint))
+    }
+
+    fn skill_usage_signal(
+        outcome: crate::native_extensions::learning::types::SkillOutcome,
+        relevant: bool,
+    ) -> crate::native_extensions::learning::types::SkillUsageSignal {
+        use crate::native_extensions::learning::types::{SkillOutcome, SkillUsageSignal};
+        match (outcome, relevant) {
+            (SkillOutcome::VerifiedSuccess, true) => SkillUsageSignal::VerifiedHelpful,
+            (SkillOutcome::VerifiedFailure, true) => SkillUsageSignal::VerifiedFailureRelevant,
+            (SkillOutcome::Neutral, true) => SkillUsageSignal::ScopeRelevant,
+            (_, false) => SkillUsageSignal::Injected,
+        }
+    }
+
     pub fn record_skill_outcomes(&self, run: &GraphRun) {
         let Some(ref verification) = run.verification else {
             return;
@@ -1061,7 +1121,8 @@ impl GraphExecution {
         let changed_files: Vec<String> = run
             .tasks
             .iter()
-            .filter_map(|t| t.artifact_file.clone())
+            .filter_map(|task| task.mutation.as_ref())
+            .flat_map(|mutation| mutation.files.iter().map(|file| file.path.clone()))
             .collect();
         let bundle = verification.to_bundle(
             changed_files,
@@ -1084,19 +1145,33 @@ impl GraphExecution {
             crate::native_extensions::learning::types::SkillOutcome::Neutral
         };
 
-        let mut seen = std::collections::HashSet::new();
+        let mut usage = std::collections::BTreeMap::new();
         for task in &run.tasks {
             for s in &task.skill_refs {
                 let key = (s.name.clone(), s.version, s.content_hash.clone());
-                if seen.insert(key) {
-                    let version_ref = crate::native_extensions::learning::types::SkillVersionRef {
-                        name: s.name.clone(),
-                        version: s.version,
-                        content_hash: s.content_hash.clone(),
-                    };
-                    let _ = learning.record_skill_version_outcome(&version_ref, outcome);
-                }
+                let exact_record = learning
+                    .project_store
+                    .skill_version(&s.name, s.version)
+                    .or_else(|| learning.global_store.skill_version(&s.name, s.version))
+                    .filter(|record| record.content_hash == s.content_hash)
+                    .cloned();
+                let relevant = exact_record
+                    .as_ref()
+                    .is_some_and(|record| Self::skill_scope_relevant(record, task, &run.goal));
+                usage
+                    .entry(key)
+                    .and_modify(|seen_relevant| *seen_relevant |= relevant)
+                    .or_insert(relevant);
             }
+        }
+        for ((name, version, content_hash), relevant) in usage {
+            let version_ref = crate::native_extensions::learning::types::SkillVersionRef {
+                name,
+                version,
+                content_hash,
+            };
+            let signal = Self::skill_usage_signal(outcome, relevant);
+            let _ = learning.record_skill_usage_outcome(&version_ref, signal);
         }
         {
             let mut run_mut = self.run.lock().unwrap_or_else(|e| e.into_inner());
@@ -2815,6 +2890,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         learning.project_store.upsert_skill(skill_v1).unwrap();

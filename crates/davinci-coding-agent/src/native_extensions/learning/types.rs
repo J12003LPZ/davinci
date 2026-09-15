@@ -35,6 +35,31 @@ pub enum SkillOutcome {
     Neutral,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillApplicability {
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default)]
+    pub task_types: Vec<String>,
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+    #[serde(default)]
+    pub required_signals: Vec<String>,
+    #[serde(default)]
+    pub verification_categories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUsageSignal {
+    Injected,
+    ScopeRelevant,
+    VerifiedHelpful,
+    VerifiedFailureRelevant,
+    Neutral,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillUse {
@@ -131,6 +156,8 @@ pub struct SkillLedgerRecord {
     pub failure_count: u64,
     pub neutral_count: u64,
     #[serde(default)]
+    pub applicability: SkillApplicability,
+    #[serde(default)]
     pub last_used_at_ms: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -218,4 +245,37 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod harness_optimization_stage2_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_skill_metadata_defaults_applicability() {
+        let legacy = json!({
+            "skillId": "skill-legacy",
+            "name": "legacy",
+            "scope": "project",
+            "origin": "learned_review",
+            "status": "active",
+            "path": "/tmp/legacy/SKILL.md",
+            "contentHash": "legacy-hash",
+            "version": 1,
+            "successCount": 0,
+            "failureCount": 0,
+            "neutralCount": 0,
+            "lastUsedAtMs": null,
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "pinned": false
+        });
+        let record: SkillLedgerRecord = serde_json::from_value(legacy).unwrap();
+        let serialized = serde_json::to_value(record).unwrap();
+        assert!(
+            serialized.get("applicability").is_some(),
+            "persisted skill metadata must expose backwards-compatible applicability"
+        );
+    }
 }
