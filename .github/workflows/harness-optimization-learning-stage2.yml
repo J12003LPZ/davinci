@@ -1,0 +1,77 @@
+name: Harness optimization learning stage two
+
+on:
+  push:
+    branches:
+      - feat/davinci-harness-optimization-20260914
+
+permissions:
+  contents: write
+
+jobs:
+  execute:
+    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, '[opt-learning2]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.83.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add focused regressions
+        run: python3 .github/scripts/harness_opt_learning_stage2.py --tests
+
+      - name: Verify focused regressions are red
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_name in \
+            persisted_skill_applicability_is_used_for_ranking \
+            memory_freshness_penalizes_changed_source_state \
+            injected_irrelevant_skill_is_not_credited_as_helpful
+          do
+            if cargo test -p davinci-coding-agent "$test_name"; then
+              echo "$test_name unexpectedly passed before implementation" >&2
+              exit 1
+            fi
+            echo "Expected red regression confirmed: $test_name"
+          done
+
+      - name: Apply implementation
+        run: python3 .github/scripts/harness_opt_learning_stage2.py --impl
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Verify learning and memory stage two
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p davinci-coding-agent legacy_skill_metadata_defaults_applicability
+          cargo test -p davinci-coding-agent persisted_skill_applicability_is_used_for_ranking
+          cargo test -p davinci-coding-agent injected_irrelevant_skill_is_not_credited_as_helpful
+          cargo test -p davinci-coding-agent legacy_memory_record_has_neutral_freshness
+          cargo test -p davinci-coding-agent memory_freshness_penalizes_changed_source_state
+          cargo test -p davinci-coding-agent ecosystem_loop_full_circle
+          cargo test -p davinci-coding-agent learning::
+          cargo test -p davinci-coding-agent vector_memory
+          cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
+          git diff --check
+
+      - name: Commit verified production changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates
+          if git diff --cached --quiet; then
+            echo "No production changes"
+            exit 0
+          fi
+          git commit -m "feat(learning): persist applicability and source-bound freshness"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
