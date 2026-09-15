@@ -324,6 +324,25 @@ pub fn content_hash(text: &str) -> String {
     sha256_hex(text.as_bytes())
 }
 
+/// Deterministic compatibility factor for memories that carry an optional
+/// verified repository-state marker in `verification` as `state:<digest>`.
+/// Legacy memories remain neutral (1.0); mismatched state is penalized but
+/// remains retrievable because older facts can still be useful historical evidence.
+pub fn freshness_factor(record: &MemoryRecord, current_state: Option<&str>) -> f32 {
+    let Some(expected) = record
+        .verification
+        .as_deref()
+        .and_then(|value| value.strip_prefix("state:"))
+    else {
+        return 1.0;
+    };
+    match current_state {
+        Some(current) if current == expected => 1.0,
+        Some(_) => 0.55,
+        None => 0.80,
+    }
+}
+
 pub fn hash_to_uuid(hash: &str) -> String {
     let hex = hash
         .chars()
@@ -1081,7 +1100,10 @@ impl VectorMemory {
                     .zip(record.embedding.as_ref())
                     .map(|(query, embedding)| cosine_similarity(query, embedding))
                     .unwrap_or(lexical);
-                let score = (dense * 0.6 + lexical * 0.3 + record.importance * 0.1).clamp(0.0, 1.0);
+                let base = (dense * 0.6 + lexical * 0.3 + record.importance * 0.1).clamp(0.0, 1.0);
+                let current_state = std::env::var("DAVINCI_MEMORY_STATE_HASH").ok();
+                let score =
+                    (base * freshness_factor(record, current_state.as_deref())).clamp(0.0, 1.0);
                 (score >= self.config.minimum_score).then(|| MemoryHit {
                     record: (*record).clone(),
                     score,
@@ -2229,5 +2251,32 @@ mod tests {
             provenance_after_review("unproven", false, false),
             "unproven"
         );
+    }
+
+    #[test]
+    fn stale_memory_is_penalized_when_verified_state_changes() {
+        let mut record = MemoryRecord {
+            id: "m1".into(),
+            repo_id: "repo".into(),
+            kind: MemoryKind::Architecture,
+            text: "parser lives in old.rs".into(),
+            source: "learning".into(),
+            content_hash: "h".into(),
+            importance: 1.0,
+            created_at: 1,
+            embedding: None,
+            confidence: Some(0.9),
+            source_session_id: None,
+            source_turn: None,
+            verification: Some("state:abc".into()),
+            use_count: 0,
+            last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
+        };
+        assert_eq!(freshness_factor(&record, Some("abc")), 1.0);
+        assert!(freshness_factor(&record, Some("def")) < 1.0);
+        record.verification = None;
+        assert_eq!(freshness_factor(&record, Some("def")), 1.0);
     }
 }
