@@ -1,0 +1,38 @@
+name: Harness optimization T15 inspection
+
+on:
+  push:
+    branches:
+      - feat/davinci-harness-optimization-20260914
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, '[opt-t15-inspect]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Show T15 plan context
+        shell: bash
+        run: |
+          set -euo pipefail
+          plan='docs/superpowers/plans/2026-09-06-harness-capability-token-efficiency.md'
+          line=$(grep -n -m1 -E 'T15|projection strategy' "$plan" | cut -d: -f1 || true)
+          if [[ -z "$line" ]]; then
+            echo 'No direct T15/projection-strategy heading found; showing projection references'
+            grep -n -C 8 -i 'projection' "$plan" || true
+          else
+            start=$(( line > 35 ? line - 35 : 1 ))
+            end=$(( line + 90 ))
+            sed -n "${start},${end}p" "$plan"
+          fi
+      - name: Show embedding implementation anchors
+        shell: bash
+        run: |
+          set -euo pipefail
+          file='crates/davinci-coding-agent/src/native_extensions/vector_memory.rs'
+          grep -n -E 'embedding_dimensions|embed_(query|documents|batch)|parse_.*embedding|project|cosine_similarity|qdrant|upsert' "$file" | head -n 160
