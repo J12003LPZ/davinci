@@ -45,6 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/harness_opt_memory_phase3.py impl
+          python3 .github/scripts/harness_opt_memory_phase3_fix.py
           python3 - <<'PY'
           from pathlib import Path
           path = Path('crates/davinci-coding-agent/src/native_extensions/vector_memory.rs')
