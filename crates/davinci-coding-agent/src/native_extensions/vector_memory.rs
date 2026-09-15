@@ -2431,7 +2431,9 @@ mod tests {
 
         // Main agent searches: main-agent behavior remains unchanged and does not see private profile memory
         let hits_main_confidential = memory.search("confidential", 10);
-        assert!(hits_main_confidential.is_empty());
+        assert!(hits_main_confidential
+            .iter()
+            .all(|hit| hit.record.agent_profile_name.is_none()));
 
         let hits_main_global = memory.search("repository build", 10);
         assert_eq!(hits_main_global.len(), 1);

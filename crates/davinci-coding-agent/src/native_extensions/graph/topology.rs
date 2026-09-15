@@ -443,7 +443,7 @@ pub fn build_definition(mode: GraphMode, classification: &Classification) -> Gra
             }];
             let mut edges = Vec::new();
 
-            let research_count = classification.research_tasks.len().max(1);
+            let research_count = classification.research_tasks.len();
             let mut research_ids = Vec::new();
             for i in 1..=research_count {
                 let id = format!("research-{i}");
@@ -474,12 +474,20 @@ pub fn build_definition(mode: GraphMode, classification: &Classification) -> Gra
                 required: true,
                 allows_mutation: false,
             });
-            for r_id in &research_ids {
+            if research_ids.is_empty() {
                 edges.push(EdgeDefinition {
-                    from: r_id.clone(),
+                    from: "classify".to_string(),
                     to: "plan-1".to_string(),
                     condition: EdgeCondition::OnSuccess,
                 });
+            } else {
+                for r_id in &research_ids {
+                    edges.push(EdgeDefinition {
+                        from: r_id.clone(),
+                        to: "plan-1".to_string(),
+                        condition: EdgeCondition::OnSuccess,
+                    });
+                }
             }
 
             nodes.push(NodeDefinition {
@@ -539,7 +547,7 @@ pub fn build_definition(mode: GraphMode, classification: &Classification) -> Gra
             }];
             let mut edges = Vec::new();
 
-            let research_count = classification.research_tasks.len().max(1);
+            let research_count = classification.research_tasks.len();
             let mut research_ids = Vec::new();
             for i in 1..=research_count {
                 let id = format!("research-{i}");
@@ -570,12 +578,20 @@ pub fn build_definition(mode: GraphMode, classification: &Classification) -> Gra
                 required: true,
                 allows_mutation: false,
             });
-            for r_id in &research_ids {
+            if research_ids.is_empty() {
                 edges.push(EdgeDefinition {
-                    from: r_id.clone(),
+                    from: "classify".to_string(),
                     to: "plan-1".to_string(),
                     condition: EdgeCondition::OnSuccess,
                 });
+            } else {
+                for r_id in &research_ids {
+                    edges.push(EdgeDefinition {
+                        from: r_id.clone(),
+                        to: "plan-1".to_string(),
+                        condition: EdgeCondition::OnSuccess,
+                    });
+                }
             }
 
             let milestones = classification

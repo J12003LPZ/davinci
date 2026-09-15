@@ -35,23 +35,68 @@ pub fn role_tools(role: Role) -> Vec<String> {
             let mut tools = READ_TOOLS.to_vec();
             tools.push("bash");
             tools.push(GRAPH_SUBMIT_TOOL);
+            tools.push("tool_search");
             tools
         }
-        Role::Historian => vec!["read", "grep", "bash", GRAPH_SUBMIT_TOOL],
+        Role::Historian => vec!["read", "grep", "bash", GRAPH_SUBMIT_TOOL, "tool_search"],
         Role::Planner => {
             let mut tools = READ_TOOLS.to_vec();
             tools.push(GRAPH_SUBMIT_TOOL);
+            tools.push("tool_search");
             tools
         }
         Role::Writer => {
             let mut tools = READ_TOOLS.to_vec();
-            tools.extend_from_slice(&["bash", "edit", "write", GRAPH_SUBMIT_TOOL]);
+            tools.extend_from_slice(&["bash", "edit", "write", GRAPH_SUBMIT_TOOL, "tool_search"]);
             tools
         }
     };
     let mut tools: Vec<String> = names.into_iter().map(str::to_string).collect();
     ensure_governor_recovery_tool(&mut tools);
     tools
+}
+
+/// Return the bounded hot schema set for a worker while preserving the full
+/// authorization surface in the parent-owned allowlist.
+pub fn initial_worker_tools(role: Role, authorized: &[String]) -> Vec<String> {
+    let preferred: &[&str] = match role {
+        Role::Classifier => &[GRAPH_SUBMIT_TOOL],
+        Role::Researcher | Role::TestAnalyzer | Role::Reviewer => &[
+            "read",
+            "grep",
+            "find",
+            "bash",
+            GRAPH_SUBMIT_TOOL,
+            "tool_search",
+            "retrieve_output",
+        ],
+        Role::Historian => &["read", "grep", "bash", GRAPH_SUBMIT_TOOL, "tool_search"],
+        Role::Planner => &[
+            "read",
+            "grep",
+            "find",
+            "ls",
+            GRAPH_SUBMIT_TOOL,
+            "tool_search",
+        ],
+        Role::Writer => &[
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "bash",
+            "edit",
+            "write",
+            GRAPH_SUBMIT_TOOL,
+            "tool_search",
+            "retrieve_output",
+        ],
+    };
+    preferred
+        .iter()
+        .filter(|tool| authorized.iter().any(|candidate| candidate == **tool))
+        .map(|tool| (*tool).to_string())
+        .collect()
 }
 
 pub fn role_bash_policy(role: Role) -> BashPolicy {
@@ -127,6 +172,32 @@ mod tests {
                 .iter()
                 .any(|tool| tool == GRAPH_SUBMIT_TOOL));
         }
+    }
+
+    #[test]
+    fn graph_worker_defers_authorized_schemas_without_changing_permissions() {
+        for role in [
+            Role::Researcher,
+            Role::TestAnalyzer,
+            Role::Reviewer,
+            Role::Historian,
+            Role::Planner,
+            Role::Writer,
+        ] {
+            let mut authorized = role_tools(role);
+            authorized.extend([
+                "mcp.catalog.search".to_string(),
+                "mcp.catalog.write".to_string(),
+            ]);
+            let initial = initial_worker_tools(role, &authorized);
+
+            assert!(authorized.contains(&"mcp.catalog.search".to_string()));
+            assert!(!initial.contains(&"mcp.catalog.search".to_string()));
+            assert!(initial.contains(&"tool_search".to_string()));
+            assert!(initial.contains(&GRAPH_SUBMIT_TOOL.to_string()));
+        }
+
+        assert!(!role_tools(Role::Classifier).contains(&"tool_search".to_string()));
     }
 
     #[test]

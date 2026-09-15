@@ -10,6 +10,7 @@ description = "Fixture-driven eval harness matching @earendil-works/pi-evals"
 clap.workspace = true
 davinci-agent = { path = "../davinci-agent" }
 davinci-ai = { path = "../davinci-ai" }
+davinci-coding-agent = { path = "../davinci-coding-agent" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

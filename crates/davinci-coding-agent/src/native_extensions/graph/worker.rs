@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! pi --mode json -p --no-session --no-extensions --no-skills
-//!    --no-prompt-templates --tools <role allowlist>
+//!    --no-prompt-templates --tools <initial schema projection>
 //!    [--model provider/id] [--thinking level] [-a]
 //!    --append-system-prompt <role prompt file> @<briefing file>
 //! ```
@@ -241,8 +241,9 @@ pub fn build_worker_args(
     // A worker is a `--print` child: nobody can answer a permission prompt
     // in it, and the product's default mode (`ask`) fails closed there — a
     // writer could not write, and no role could even `graph_submit`. The
-    // worker's gate is the graph's own: the per-role `--tools` allowlist and
-    // the bash policy in `worker_hooks`, both of which the parent set. Deny
+    // worker's gate is the graph's own: the initial provider schema projection
+    // plus the parent-owned authorization surface and bash policy in
+    // `worker_hooks`. Deny
     // rules from the user's settings still win in `always-approve`. This
     // preserves the previous non-interactive worker policy; Auto Mode now
     // escalates risky actions instead of silently approving them.
@@ -268,7 +269,7 @@ pub fn build_worker_args(
     args.push("--no-skills".to_string());
     args.push("--no-prompt-templates".to_string());
     args.push("--tools".to_string());
-    args.push(spec.tools.join(","));
+    args.push(spec.initially_exposed_tools.join(","));
     if let Some(model) = &spec.model {
         args.push("--model".to_string());
         args.push(model.clone());
@@ -385,7 +386,7 @@ pub fn run_worker(
         1,
         spec.role,
         spec.model.as_deref(),
-        &spec.tools,
+        &spec.initially_exposed_tools,
         &spec.system_prompt,
         spec.expect,
     );
@@ -401,7 +402,12 @@ pub fn run_worker(
         .env("PI_GRAPH_EXPECT", spec.expect.as_str())
         .env("PI_GRAPH_ARTIFACT_PATH", &spec.artifact_path)
         .env("PI_GRAPH_EFFECT_REPORT", &effect_report_path)
-        .env("PI_GRAPH_EXTRA_TOOLS", spec.tools.join(","))
+        .env("PI_GRAPH_EXTRA_TOOLS", spec.authorized_tools.join(","))
+        .env("PI_GRAPH_AUTHORIZED_TOOLS", spec.authorized_tools.join(","))
+        .env(
+            "PI_GRAPH_INITIAL_TOOLS",
+            spec.initially_exposed_tools.join(","),
+        )
         .env("PI_GRAPH_CACHE_KEY", &cache_key)
         .env("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1");
     if let Err(error) = configure_task_contract_env(&mut command, spec) {
@@ -773,6 +779,8 @@ mod tests {
             model: Some("openai/gpt".into()),
             thinking_level: Some("high".into()),
             tools: vec!["read".into(), "graph_submit".into()],
+            authorized_tools: vec!["read".into(), "graph_submit".into()],
+            initially_exposed_tools: vec!["read".into(), "graph_submit".into()],
             extra_extensions: vec!["governor".into()],
             timeout_ms: 0,
             run_deadline: None,
@@ -804,14 +812,25 @@ mod tests {
 
     #[test]
     fn worker_args_isolate_the_child_and_carry_the_allowlist() {
-        let args = build_worker_args(&spec(), Path::new("brief.md"), Path::new("system.md"));
+        let mut test_spec = spec();
+        test_spec.tools = vec!["read".into(), "grep".into(), "graph_submit".into()];
+        test_spec.authorized_tools = vec![
+            "read".into(),
+            "grep".into(),
+            "graph_submit".into(),
+            "tool_search".into(),
+        ];
+        test_spec.initially_exposed_tools = vec!["read".into(), "graph_submit".into()];
+        let args = build_worker_args(&test_spec, Path::new("brief.md"), Path::new("system.md"));
         let joined = args.join(" ");
         assert!(joined.contains("--mode json"));
         assert!(joined.contains("--no-session"));
         assert!(joined.contains("--no-extensions"));
         assert!(joined.contains("--no-skills"));
         assert!(joined.contains("--no-prompt-templates"));
-        assert!(joined.contains("--tools read,graph_submit"));
+        let tools_index = args.iter().position(|arg| arg == "--tools").unwrap();
+        assert_eq!(args[tools_index + 1], "read,graph_submit");
+        assert!(!joined.contains("--tools read,grep,graph_submit"));
         assert!(joined.contains("--model openai/gpt"));
         assert!(joined.contains("--thinking high"));
         assert!(joined.contains("-e governor"));

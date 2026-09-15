@@ -243,6 +243,8 @@ mod tests {
             task_id: "test-task".into(),
             role: Role::Researcher,
             tools: tools.clone(),
+            authorized_tools: tools.clone(),
+            initially_exposed_tools: tools.clone(),
             model: Some("claude-3-7-sonnet".into()),
             thinking_level: None,
             project_trusted: false,

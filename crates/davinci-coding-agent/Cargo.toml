@@ -20,7 +20,6 @@ davinci-agent = { path = "../davinci-agent" }
 davinci-ai = { path = "../davinci-ai" }
 davinci-client = { path = "../davinci-client" }
 davinci-mcp = { path = "../davinci-mcp" }
-davinci-evals = { path = "../davinci-evals" }
 davinci-protocol = { path = "../davinci-protocol" }
 davinci-server = { path = "../davinci-server" }
 davinci-session = { path = "../davinci-session" }

@@ -16,6 +16,12 @@ pub struct HarnessCapabilities {
 pub fn probe_harness(binary: &Path) -> Result<HarnessCapabilities, String> {
     let version = run_probe(binary, "--version")?;
     let help = run_probe(binary, "--help")?;
+    if !version.status.success() || !help.status.success() {
+        return Err(format!(
+            "{} did not provide a successful version/help probe",
+            binary.display()
+        ));
+    }
     Ok(parse_capabilities(
         &combined_output(&version),
         &combined_output(&help),

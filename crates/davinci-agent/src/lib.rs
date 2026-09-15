@@ -2473,6 +2473,56 @@ pub fn chat_entry(
     entry
 }
 
+/// Measure deferred root schemas against the same agent with every authorized
+/// schema exposed. The returned units are serialized provider-schema bytes.
+pub fn deferred_root_schema_ablation() -> Result<(bool, bool, u64, u64), String> {
+    let agent = Agent::new("offline-root-schema-ablation");
+    let deferred_names = agent.visible_tool_names();
+    let deferred = serde_json::to_vec(&agent.provider_tool_specs()).map_err(|e| e.to_string())?;
+    agent.expose_active_tools();
+    let full_names = agent.visible_tool_names();
+    let full = serde_json::to_vec(&agent.provider_tool_specs()).map_err(|e| e.to_string())?;
+    Ok((
+        !full.is_empty(),
+        !deferred.is_empty() && deferred_names.is_subset(&full_names),
+        full.len() as u64,
+        deferred.len() as u64,
+    ))
+}
+
+/// Measure query-driven capability exposure against exposing every authorized
+/// schema. The candidate is correct only if the queried schema becomes visible.
+pub fn capability_toolbox_ablation() -> Result<(bool, bool, u64, u64), String> {
+    let mut agent = Agent::new("offline-capability-ablation");
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    let query = execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &serde_json::json!({"query": "web_search"}),
+        &agent.tool_context,
+    )
+    .map_err(|error| error.to_string())?;
+    let activated = query
+        .details
+        .as_ref()
+        .and_then(|details| details.get("activated"))
+        .and_then(Value::as_array)
+        .is_some_and(|names| names.iter().any(|name| name == "web_search"));
+    let queried = serde_json::to_vec(&agent.provider_tool_specs()).map_err(|e| e.to_string())?;
+    agent.expose_active_tools();
+    let full = serde_json::to_vec(&agent.provider_tool_specs()).map_err(|e| e.to_string())?;
+    Ok((
+        !full.is_empty(),
+        activated && agent.is_tool_visible("web_search"),
+        full.len() as u64,
+        queried.len() as u64,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

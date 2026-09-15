@@ -1,7 +1,98 @@
 //! Cache affinity identity and provider cache key generation for graph workers.
 
 use crate::native_extensions::graph::Role;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+/// Provider-reported token counters for one Graph role. These values are kept
+/// separate from local cache identity diagnostics so a stable hash is never
+/// mistaken for a provider cache hit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleCacheStats {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub turns: u64,
+}
+
+impl RoleCacheStats {
+    pub fn from_usage(usage: &crate::native_extensions::graph::WorkerUsage) -> Self {
+        Self {
+            input_tokens: usage.input,
+            cache_read_tokens: usage.cache_read,
+            cache_write_tokens: usage.cache_write,
+            turns: usage.turns,
+        }
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+        self.turns = self.turns.saturating_add(other.turns);
+    }
+
+    /// Provider cache-read ratio, with no local-cache contribution.
+    #[allow(dead_code)]
+    pub fn provider_cache_read_ratio(&self) -> f64 {
+        self.cache_read_tokens as f64
+            / self
+                .input_tokens
+                .saturating_add(self.cache_read_tokens)
+                .max(1) as f64
+    }
+}
+
+/// One worker's provider usage paired with local cache identity diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheObservation {
+    pub role: Role,
+    pub provider_usage: RoleCacheStats,
+    pub identity: davinci_agent::CacheIdentity,
+    #[serde(default)]
+    pub miss_reasons: Vec<davinci_agent::CacheMissReason>,
+}
+
+impl CacheObservation {
+    #[allow(dead_code)]
+    pub fn new(
+        role: Role,
+        usage: &crate::native_extensions::graph::WorkerUsage,
+        identity: davinci_agent::CacheIdentity,
+        previous_identity: Option<&davinci_agent::CacheIdentity>,
+    ) -> Self {
+        let miss_reasons = previous_identity
+            .map(|previous| identity.diff(previous))
+            .unwrap_or_default();
+        Self {
+            role,
+            provider_usage: RoleCacheStats::from_usage(usage),
+            identity,
+            miss_reasons,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn aggregate_role_cache_stats(
+    observations: &[CacheObservation],
+) -> BTreeMap<Role, RoleCacheStats> {
+    let mut totals = BTreeMap::new();
+    for observation in observations {
+        totals
+            .entry(observation.role)
+            .or_insert_with(RoleCacheStats::default)
+            .add(&observation.provider_usage);
+    }
+    totals
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphCacheIdentity<'a> {
@@ -277,5 +368,89 @@ mod tests {
             diff_reasons.contains(&davinci_agent::CacheMissReason::ModelChanged),
             "Diff must report ModelChanged"
         );
+    }
+
+    fn sample_universal_identity() -> davinci_agent::CacheIdentity {
+        davinci_agent::CacheIdentity {
+            provider: "fixture".into(),
+            model_id: "fixture-model".into(),
+            system_prompt_hash: "prompt".into(),
+            tool_schema_hash: "tools".into(),
+            permission_surface_hash: "permissions".into(),
+            context_item_hashes: Vec::new(),
+            agent_profile_hash: None,
+            contract_hash: None,
+            role: Some(Role::Researcher.as_str().into()),
+        }
+    }
+
+    #[test]
+    fn graph_cache_stats_aggregate_provider_usage_by_role() {
+        use crate::native_extensions::graph::WorkerUsage;
+
+        let identity = sample_universal_identity();
+        let observations = [
+            CacheObservation::new(
+                Role::Researcher,
+                &WorkerUsage {
+                    input: 100,
+                    cache_read: 40,
+                    cache_write: 5,
+                    turns: 1,
+                    ..WorkerUsage::default()
+                },
+                identity.clone(),
+                None,
+            ),
+            CacheObservation::new(
+                Role::Researcher,
+                &WorkerUsage {
+                    input: 80,
+                    cache_read: 20,
+                    cache_write: 3,
+                    turns: 2,
+                    ..WorkerUsage::default()
+                },
+                identity.clone(),
+                Some(&identity),
+            ),
+            CacheObservation::new(
+                Role::Writer,
+                &WorkerUsage {
+                    input: 50,
+                    cache_read: 0,
+                    cache_write: 10,
+                    turns: 1,
+                    ..WorkerUsage::default()
+                },
+                identity,
+                None,
+            ),
+        ];
+        let totals = aggregate_role_cache_stats(&observations);
+        assert_eq!(totals[&Role::Researcher].input_tokens, 180);
+        assert_eq!(totals[&Role::Researcher].cache_read_tokens, 60);
+        assert_eq!(totals[&Role::Researcher].cache_write_tokens, 8);
+        assert_eq!(totals[&Role::Researcher].turns, 3);
+        assert_eq!(totals[&Role::Writer].cache_write_tokens, 10);
+        assert!((totals[&Role::Researcher].provider_cache_read_ratio() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn local_cache_identity_is_not_reported_as_provider_hit() {
+        use crate::native_extensions::graph::WorkerUsage;
+
+        let identity = sample_universal_identity();
+        let observation = CacheObservation::new(
+            Role::Researcher,
+            &WorkerUsage::default(),
+            identity.clone(),
+            Some(&identity),
+        );
+        let encoded = serde_json::to_string(&observation).unwrap();
+        assert!(observation.miss_reasons.is_empty());
+        assert_eq!(observation.provider_usage.provider_cache_read_ratio(), 0.0);
+        assert!(!encoded.contains("providerCacheHit"));
+        assert!(!encoded.contains("localCacheHit"));
     }
 }

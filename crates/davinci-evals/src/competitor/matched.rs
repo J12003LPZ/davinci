@@ -3,6 +3,7 @@
 use super::command::{
     list_relative_files_with_content, ExternalHarness, ExternalRun, ExternalTask,
 };
+use super::report::ComparisonMode;
 use crate::behavior::{BehaviorScenario, VerificationCommand, VerificationResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,8 @@ pub struct MatchedRunConfig {
     pub ignore_paths: Vec<String>,
     pub verification_commands: Vec<VerificationCommand>,
     pub source_fixture: Option<PathBuf>,
+    /// Comparison mode is persisted with every matched result.
+    pub comparison_mode: ComparisonMode,
 }
 
 impl Default for MatchedRunConfig {
@@ -30,6 +33,7 @@ impl Default for MatchedRunConfig {
             ignore_paths: Vec::new(),
             verification_commands: Vec::new(),
             source_fixture: None,
+            comparison_mode: ComparisonMode::Product,
         }
     }
 }
@@ -37,6 +41,8 @@ impl Default for MatchedRunConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MatchedRunResult {
     pub scenario_id: String,
+    #[serde(default)]
+    pub comparison_mode: ComparisonMode,
     pub davinci: ExternalRun,
     pub competitor: ExternalRun,
     pub davinci_verification: Vec<VerificationResult>,
@@ -94,6 +100,7 @@ pub fn execute_matched_run(
     }
     Ok(MatchedRunResult {
         scenario_id: scenario.id.clone(),
+        comparison_mode: config.comparison_mode,
         davinci,
         competitor,
         davinci_verification,
@@ -167,6 +174,7 @@ mod tests {
         assert_eq!(result.scenario_id, "matched-fixture");
         assert_eq!(result.davinci.exit_code, 0);
         assert_eq!(result.competitor.exit_code, 0);
+        assert_eq!(result.comparison_mode, ComparisonMode::Product);
         let baseline_transcript = root
             .path()
             .join("artifacts")

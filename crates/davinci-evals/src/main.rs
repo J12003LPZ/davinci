@@ -12,10 +12,13 @@ use davinci_evals::behavior::{
 use davinci_evals::competitor::{
     comparison_class_for_metadata, evaluate_competitor_claim, format_competitor_report_markdown,
     format_competitor_suite_summary, load_claude_public_challenges, ClaudeChallengeCategory,
-    ClaudeCodeHarness, ClaudePublicChallenge, CommandHarness, CompetitorClaimInputs,
-    CompetitorComparisonReport, CompetitorSuiteSummary, ExternalRun, FairComparisonMetadata,
-    HarnessCapabilities, MatchedRunConfig, MatchedRunResult,
+    ClaudeCodeHarness, ClaudePublicChallenge, CodexRunner, CommandHarness, ComparisonMode,
+    CompetitorClaimInputs, CompetitorComparisonReport, CompetitorSuiteSummary, ExternalHarness,
+    ExternalRun, FairComparisonMetadata, HarnessCapabilities, HermesRunner, MatchedRunConfig,
+    MatchedRunResult, OpenCodeRunner, CLAUDE_CODE_BIN_ENV, CODEX_BIN_ENV, HERMES_BIN_ENV,
+    OPENCODE_BIN_ENV, PI_CLAUDE_CODE_BIN_ENV,
 };
+use davinci_evals::optimization::{run_offline_optimization_gate, write_optimization_gate_report};
 use davinci_evals::promotion::{
     validate_promotion_evidence_against_hashes, PromptPromotionEvidence,
 };
@@ -53,6 +56,10 @@ pub enum TopLevelCommand {
     Competitor {
         #[command(subcommand)]
         command: CompetitorCommand,
+    },
+    Optimization {
+        #[command(subcommand)]
+        command: OptimizationCommand,
     },
 }
 
@@ -140,14 +147,31 @@ pub struct BehaviorPromoteCheckArgs {
 pub enum CompetitorCommand {
     Run(CompetitorRunArgs),
     Compare(CompetitorCompareArgs),
+    Probe(CompetitorProbeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OptimizationCommand {
+    Gate(OptimizationGateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct OptimizationGateArgs {
+    /// Run only deterministic local ablations. No provider or competitor is invoked.
+    #[arg(long)]
+    pub offline: bool,
+    #[arg(long, default_value = "target/optimization-evals/offline-gate.json")]
+    pub artifacts: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct CompetitorRunArgs {
     #[arg(long, default_value = "claude-public-challenges")]
     pub suite: String,
+    #[arg(long, default_value = "claude-code")]
+    pub runner: String,
     #[arg(long)]
-    pub binary: PathBuf,
+    pub binary: Option<PathBuf>,
     #[arg(long, default_value_t = DEFAULT_PROMOTION_REPEATS)]
     pub repeats: u32,
     #[arg(long, default_value = "target/competitor-evals")]
@@ -160,6 +184,18 @@ pub struct CompetitorRunArgs {
     pub model: Option<String>,
     #[arg(long, default_value_t = 120)]
     pub timeout_seconds: u64,
+    #[arg(long, default_value = "product")]
+    pub comparison_mode: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CompetitorProbeArgs {
+    /// Probe one named runner. Without this flag, all supported adapters are checked.
+    #[arg(long)]
+    pub runner: Option<String>,
+    /// Override the selected runner executable for a local, read-only probe.
+    #[arg(long)]
+    pub binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -170,6 +206,8 @@ pub struct CompetitorCompareArgs {
     pub repeats: u32,
     #[arg(long)]
     pub artifacts: PathBuf,
+    #[arg(long, default_value = "product")]
+    pub comparison_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +235,10 @@ struct CompetitorSampleArtifact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompetitorRawArtifact {
+    #[serde(default)]
+    comparison_mode: ComparisonMode,
+    #[serde(default = "default_competitor_name")]
+    competitor_name: String,
     suite: String,
     suite_hash: String,
     repeats: u32,
@@ -209,6 +251,10 @@ struct CompetitorRawArtifact {
     timeout_seconds: u64,
     capabilities: HarnessCapabilities,
     samples: Vec<CompetitorSampleArtifact>,
+}
+
+fn default_competitor_name() -> String {
+    "claude-code".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +286,16 @@ fn parse_profile(name: &str) -> Result<PromptProfile, String> {
     PromptProfile::parse(name).ok_or_else(|| {
         format!("invalid prompt profile '{name}'; valid profiles: stable, preview, legacy-v1")
     })
+}
+
+fn parse_comparison_mode(value: &str) -> Result<ComparisonMode, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "harness" => Ok(ComparisonMode::Harness),
+        "product" => Ok(ComparisonMode::Product),
+        _ => Err(format!(
+            "invalid comparison mode '{value}'; expected 'harness' or 'product'"
+        )),
+    }
 }
 
 fn parse_model_policy(name: Option<&str>) -> Result<Option<PromptModelPolicy>, String> {
@@ -403,14 +459,14 @@ fn paired_samples(
 ) -> (Vec<ScenarioRunSample>, Vec<ScenarioRunSample>) {
     let candidate_by_key: BTreeMap<(String, u32), &ScenarioRunResult> = candidate
         .iter()
-        .filter(|(_, result)| result.disposition == RunDisposition::BehavioralResult)
+        .filter(|(_, result)| result.disposition == RunDisposition::Completed)
         .map(|(repetition, result)| ((result.scenario.id.clone(), *repetition), result))
         .collect();
     let mut baseline_samples = Vec::new();
     let mut candidate_samples = Vec::new();
     for (repetition, result) in baseline
         .iter()
-        .filter(|(_, result)| result.disposition == RunDisposition::BehavioralResult)
+        .filter(|(_, result)| result.disposition == RunDisposition::Completed)
     {
         let key = (result.scenario.id.clone(), *repetition);
         let Some(candidate_result) = candidate_by_key.get(&key) else {
@@ -775,6 +831,149 @@ fn resolve_external_binary(path: PathBuf) -> PathBuf {
     }
 }
 
+struct SelectedCompetitor {
+    name: String,
+    binary: PathBuf,
+    capabilities: HarnessCapabilities,
+    harness: Box<dyn ExternalHarness>,
+    supports_controlled_options: bool,
+}
+
+fn resolve_competitor_binary(
+    explicit: Option<PathBuf>,
+    environment_names: &[&str],
+    default_binary: &str,
+) -> PathBuf {
+    let configured = explicit.or_else(|| {
+        environment_names.iter().find_map(|name| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .filter(|value| !value.as_os_str().is_empty())
+        })
+    });
+    resolve_external_binary(configured.unwrap_or_else(|| PathBuf::from(default_binary)))
+}
+
+fn select_competitor_runner(
+    name: &str,
+    explicit_binary: Option<PathBuf>,
+    requested_model: Option<String>,
+) -> Result<SelectedCompetitor, String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "claude-code" => {
+            let binary = resolve_competitor_binary(
+                explicit_binary,
+                &[CLAUDE_CODE_BIN_ENV, PI_CLAUDE_CODE_BIN_ENV],
+                "claude",
+            );
+            let runner = ClaudeCodeHarness::with_binary_and_options(
+                binary.clone(),
+                requested_model,
+                Some("ask".into()),
+            );
+            let capabilities = runner.capabilities()?;
+            ensure_identifiable_runner(name, &capabilities)?;
+            Ok(SelectedCompetitor {
+                name: name.trim().to_ascii_lowercase(),
+                binary,
+                capabilities,
+                harness: Box::new(runner),
+                supports_controlled_options: true,
+            })
+        }
+        "codex" => {
+            let binary = resolve_competitor_binary(explicit_binary, &[CODEX_BIN_ENV], "codex");
+            let runner = CodexRunner::with_binary(binary.clone());
+            let capabilities = runner.capabilities()?;
+            Ok(SelectedCompetitor {
+                name: "codex".into(),
+                binary,
+                capabilities,
+                harness: Box::new(runner),
+                supports_controlled_options: false,
+            })
+        }
+        "hermes" => {
+            let binary = resolve_competitor_binary(explicit_binary, &[HERMES_BIN_ENV], "hermes");
+            let runner = HermesRunner::with_binary(binary.clone());
+            let capabilities = runner.capabilities()?;
+            Ok(SelectedCompetitor {
+                name: "hermes".into(),
+                binary,
+                capabilities,
+                harness: Box::new(runner),
+                supports_controlled_options: false,
+            })
+        }
+        "opencode" => {
+            let binary =
+                resolve_competitor_binary(explicit_binary, &[OPENCODE_BIN_ENV], "opencode");
+            let runner = OpenCodeRunner::with_binary(binary.clone());
+            let capabilities = runner.capabilities()?;
+            Ok(SelectedCompetitor {
+                name: "opencode".into(),
+                binary,
+                capabilities,
+                harness: Box::new(runner),
+                supports_controlled_options: false,
+            })
+        }
+        other => Err(format!(
+            "unknown competitor runner '{other}'; valid runners: claude-code, codex, hermes, opencode"
+        )),
+    }
+}
+
+fn ensure_identifiable_runner(
+    runner_name: &str,
+    capabilities: &HarnessCapabilities,
+) -> Result<(), String> {
+    if capabilities.version.is_none() {
+        Err(format!(
+            "competitor runner '{runner_name}' is unsupported: version is not identifiable"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn run_competitor_probe(args: CompetitorProbeArgs) -> Result<String, String> {
+    let runners = args.runner.map(|runner| vec![runner]).unwrap_or_else(|| {
+        ["claude-code", "codex", "hermes", "opencode"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    });
+    let mut lines = Vec::with_capacity(runners.len());
+    for runner in runners {
+        match select_competitor_runner(&runner, args.binary.clone(), None) {
+            Ok(selected) => lines.push(format!(
+                "{}: installed ({})",
+                selected.name,
+                selected
+                    .capabilities
+                    .version
+                    .as_deref()
+                    .unwrap_or("unknown")
+            )),
+            Err(error) if error.starts_with("failed to probe") => {
+                lines.push(format!("{}: missing", runner.trim().to_ascii_lowercase()))
+            }
+            Err(error)
+                if error.contains("unsupported")
+                    || error.contains("did not provide a successful version/help probe") =>
+            {
+                lines.push(format!(
+                    "{}: unsupported",
+                    runner.trim().to_ascii_lowercase()
+                ))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 fn behavior_category(category: ClaudeChallengeCategory) -> BehaviorCategory {
     match category {
         ClaudeChallengeCategory::FrontendDistinctiveness => BehaviorCategory::FrontendCapability,
@@ -892,8 +1091,13 @@ fn competitor_metadata(raw: &CompetitorRawArtifact) -> FairComparisonMetadata {
         .collect();
     let repo_snapshot_hash = hash_json(&fixture_snapshots).unwrap_or_else(|_| "unavailable".into());
     FairComparisonMetadata {
+        comparison_mode: raw.comparison_mode,
         davinci_version: env!("CARGO_PKG_VERSION").to_string(),
-        competitor_name: "claude-code".into(),
+        competitor_name: if raw.competitor_name.trim().is_empty() {
+            "claude-code".into()
+        } else {
+            raw.competitor_name.clone()
+        },
         competitor_version: raw.capabilities.version.clone(),
         davinci_model: raw.model.clone(),
         competitor_model: raw.competitor_model.clone(),
@@ -979,6 +1183,7 @@ fn competitor_statistics(
         .filter(|sample| sample.passed)
         .count();
     let summary = CompetitorSuiteSummary {
+        comparison_mode: metadata.comparison_mode,
         comparison_class: comparison_class_for_metadata(metadata, !matched.is_empty()),
         shared_scenarios,
         davinci_pass_rate: rate(davinci_passes, denominator),
@@ -999,6 +1204,7 @@ fn competitor_statistics(
 }
 
 fn run_competitor_suite(args: CompetitorRunArgs) -> Result<String, String> {
+    let comparison_mode = parse_comparison_mode(&args.comparison_mode)?;
     if args.suite != "claude-public-challenges" {
         return Err(format!(
             "unknown competitor suite '{}'; valid suite: claude-public-challenges",
@@ -1035,18 +1241,21 @@ fn run_competitor_suite(args: CompetitorRunArgs) -> Result<String, String> {
         first_nonempty_value(None, &["DAVINCI_COMPETITOR_MODELS_CONTROLLED"])
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
             .unwrap_or(false);
-    let competitor = ClaudeCodeHarness::with_binary_and_options(
-        resolve_external_binary(args.binary.clone()),
+    let selected = select_competitor_runner(
+        &args.runner,
+        args.binary.clone(),
         Some(competitor_model.clone()),
-        Some("ask".into()),
-    );
-    let capabilities = competitor.capabilities()?;
-    if capabilities.version.is_none() {
-        return Err("competitor version is not identifiable; refusing to run differential".into());
-    }
+    )?;
+    let capabilities = selected.capabilities.clone();
     let models_controlled = requested_models_controlled
+        && selected.supports_controlled_options
         && capabilities.supports_model_flag
         && capabilities.supports_permission_mode;
+    if comparison_mode == ComparisonMode::Harness && !models_controlled {
+        return Err(
+            "harness comparison requires DAVINCI_COMPETITOR_MODELS_CONTROLLED and supported model/permission flags".into(),
+        );
+    }
     let (davinci, provider, model) = resolve_davinci_harness(
         args.davinci_bin.clone(),
         args.provider.as_deref(),
@@ -1067,11 +1276,12 @@ fn run_competitor_suite(args: CompetitorRunArgs) -> Result<String, String> {
                 ignore_paths: Vec::new(),
                 verification_commands: scenario.verification_commands.clone(),
                 source_fixture: None,
+                comparison_mode,
             };
             let result = davinci_evals::competitor::execute_matched_run(
                 &scenario,
                 &davinci,
-                &competitor,
+                selected.harness.as_ref(),
                 &config,
             );
             match result {
@@ -1091,12 +1301,14 @@ fn run_competitor_suite(args: CompetitorRunArgs) -> Result<String, String> {
         }
     }
     let raw = CompetitorRawArtifact {
+        comparison_mode,
+        competitor_name: selected.name,
         suite: args.suite,
         suite_hash,
         repeats: args.repeats,
         provider,
         model,
-        competitor_binary: args.binary.display().to_string(),
+        competitor_binary: selected.binary.display().to_string(),
         competitor_model,
         models_controlled,
         permission_mode: "ask".into(),
@@ -1115,6 +1327,7 @@ fn run_competitor_suite(args: CompetitorRunArgs) -> Result<String, String> {
 }
 
 fn run_competitor_compare(args: CompetitorCompareArgs) -> Result<String, String> {
+    let comparison_mode = parse_comparison_mode(&args.comparison_mode)?;
     if args.suite != "claude-public-challenges" {
         return Err(format!(
             "unknown competitor suite '{}'; valid suite: claude-public-challenges",
@@ -1128,6 +1341,13 @@ fn run_competitor_compare(args: CompetitorCompareArgs) -> Result<String, String>
         .map_err(|error| format!("failed to read matched-runs.json: {error}"))?;
     let raw: CompetitorRawArtifact = serde_json::from_slice(&raw_bytes)
         .map_err(|error| format!("failed to decode matched-runs.json: {error}"))?;
+    if raw.comparison_mode != comparison_mode {
+        return Err(format!(
+            "artifact comparison mode '{}' does not match requested mode '{}'",
+            raw.comparison_mode.as_str(),
+            comparison_mode.as_str()
+        ));
+    }
     if raw.suite != args.suite {
         return Err(format!(
             "artifact suite '{}' does not match requested suite '{}'",
@@ -1163,7 +1383,8 @@ fn run_competitor_compare(args: CompetitorCompareArgs) -> Result<String, String>
         .collect();
 
     let mut markdown = format!(
-        "# DaVinci versus Claude Code differential\n\n- Suite: `{}`\n- Repetitions: `{}`\n- Runtime-boundary failures: `{}`\n\n## Suite summary\n\n{}",
+        "# DaVinci versus {} differential\n\n- Suite: `{}`\n- Repetitions: `{}`\n- Runtime-boundary failures: `{}`\n\n## Suite summary\n\n{}",
+        metadata.competitor_name,
         raw.suite,
         raw.repeats,
         runtime_boundary_failures,
@@ -1171,13 +1392,15 @@ fn run_competitor_compare(args: CompetitorCompareArgs) -> Result<String, String>
     );
     markdown.push_str("\n## Fair-comparison metadata\n\n");
     markdown.push_str(&format!(
-        "- DaVinci version: `{}`\n- Claude Code version: `{}`\n- DaVinci model: `{}`\n- Competitor model: `{}`\n- Models controlled: `{}`\n- Permission mode: `{}`\n- Suite snapshot: `{}`\n",
+        "- DaVinci version: `{}`\n- {} version: `{}`\n- DaVinci model: `{}`\n- Competitor model: `{}`\n- Models controlled: `{}`\n- Permission mode: `{}`\n- Comparison mode: `{}`\n- Suite snapshot: `{}`\n",
         metadata.davinci_version,
+        metadata.competitor_name,
         metadata.competitor_version.as_deref().unwrap_or("unknown"),
         metadata.davinci_model,
         metadata.competitor_model,
         metadata.models_controlled,
         metadata.permission_mode,
+        metadata.comparison_mode.as_str(),
         metadata.repo_snapshot_hash,
     ));
     if claim_failure_text.is_empty() {
@@ -1286,14 +1509,40 @@ fn dispatch(command: TopLevelCommand) -> Result<String, String> {
         TopLevelCommand::Competitor { command } => match command {
             CompetitorCommand::Run(args) => run_competitor_suite(args),
             CompetitorCommand::Compare(args) => run_competitor_compare(args),
+            CompetitorCommand::Probe(args) => run_competitor_probe(args),
+        },
+        TopLevelCommand::Optimization { command } => match command {
+            OptimizationCommand::Gate(args) => {
+                if !args.offline {
+                    return Err("optimization gate requires --offline".into());
+                }
+                let report = run_offline_optimization_gate();
+                write_optimization_gate_report(&report, &args.artifacts)?;
+                if report.passed {
+                    Ok(format!(
+                        "offline optimization gate passed; report persisted at {}",
+                        args.artifacts.display()
+                    ))
+                } else {
+                    Err(format!(
+                        "offline optimization gate failed; report persisted at {}: {}",
+                        args.artifacts.display(),
+                        report.failures.join("; ")
+                    ))
+                }
+            }
         },
     }
 }
 
 fn main() {
-    if let Err(error) = dispatch(Cli::parse().command) {
-        eprintln!("error: {error}");
-        std::process::exit(2);
+    match dispatch(Cli::parse().command) {
+        Ok(output) if !output.is_empty() => println!("{output}"),
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -1402,6 +1651,46 @@ mod tests {
                 command: CompetitorCommand::Compare(_)
             }
         ));
+        let cli = parse(&["davinci-evals", "competitor", "run", "--runner", "codex"]);
+        let TopLevelCommand::Competitor {
+            command: CompetitorCommand::Run(args),
+        } = cli.command
+        else {
+            panic!("expected competitor run");
+        };
+        assert_eq!(args.runner, "codex");
+
+        assert!(matches!(
+            parse(&["davinci-evals", "competitor", "probe"]).command,
+            TopLevelCommand::Competitor {
+                command: CompetitorCommand::Probe(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_offline_optimization_gate() {
+        let cli = parse(&["davinci-evals", "optimization", "gate", "--offline"]);
+        let TopLevelCommand::Optimization {
+            command: OptimizationCommand::Gate(args),
+        } = cli.command
+        else {
+            panic!("expected optimization gate");
+        };
+        assert!(args.offline);
+    }
+
+    #[test]
+    fn comparison_modes_are_explicit_and_fail_closed() {
+        assert_eq!(
+            parse_comparison_mode("harness"),
+            Ok(ComparisonMode::Harness)
+        );
+        assert_eq!(
+            parse_comparison_mode("product"),
+            Ok(ComparisonMode::Product)
+        );
+        assert!(parse_comparison_mode("mixed").is_err());
     }
 
     #[test]

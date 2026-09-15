@@ -6,11 +6,13 @@
 //! Key invariant: the cache key MUST NOT include random process IDs, wall-clock time,
 //! session IDs when compatible requests should share a prefix, or transient runtime state.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Inputs that constitute the stable identity of a prompt prefix, determining
 /// whether two requests can share a provider prompt-cache slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CacheIdentity {
     /// AI provider name (e.g. "openai", "anthropic", "gemini").
     pub provider: String,
@@ -118,7 +120,8 @@ impl CacheIdentity {
 }
 
 /// Reason-coded explanation for a prompt-cache miss between two CacheIdentity values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheMissReason {
     ProviderChanged,
     ModelChanged,

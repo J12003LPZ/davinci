@@ -25,6 +25,7 @@ pub(crate) mod mutation;
 pub(crate) mod operations;
 pub(crate) mod preflight;
 pub(crate) mod process;
+pub(crate) mod recovery;
 pub(crate) mod render;
 pub(crate) mod replay;
 pub(crate) mod review_coverage;
@@ -43,6 +44,11 @@ pub use control::*;
 pub use mutation::{
     capture_baseline, capture_graph_delta, ChangedFile, FileFingerprint, GraphMutation,
     MutationBaseline, PatchChunk,
+};
+#[allow(unused_imports)]
+pub use recovery::{
+    build_retry_context_delta, classify_worker_failure, retry_decision, RetryDecision,
+    WorkerFailureClass, RETRY_CONTEXT_DELTA_TOKENS,
 };
 #[allow(unused_imports)]
 pub use replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};

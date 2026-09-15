@@ -12,9 +12,12 @@ pub const MAX_SCHEDULED_INFRASTRUCTURE_FAILURE_RATE: f64 = 0.10;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunDisposition {
-    BehavioralResult,
+    #[serde(alias = "behavioral_result")]
+    Completed,
+    VerificationFailed,
     InfrastructureFailure,
     ConfigurationFailure,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,6 +26,10 @@ pub struct RunDispositionSummary {
     pub behavioral_runs: usize,
     pub infrastructure_failures: usize,
     pub configuration_failures: usize,
+    #[serde(default)]
+    pub verification_failures: usize,
+    #[serde(default)]
+    pub timed_out_runs: usize,
 }
 
 impl RunDispositionSummary {
@@ -60,7 +67,17 @@ pub struct DispositionedSuiteSummary {
 
 pub fn classify_failure_signal(signal: &str) -> RunDisposition {
     let lower = signal.to_ascii_lowercase();
-    if [
+    if ["timed out", "timeout"]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        RunDisposition::TimedOut
+    } else if ["verification failed", "verification command failed"]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        RunDisposition::VerificationFailed
+    } else if [
         "missing auth",
         "no credentials",
         "missing credentials",
@@ -85,7 +102,7 @@ pub fn classify_process_result(
     stderr: &str,
 ) -> Option<RunDisposition> {
     if timed_out {
-        return Some(RunDisposition::InfrastructureFailure);
+        return Some(RunDisposition::TimedOut);
     }
     // A successful product process may contain failed tool results or provider-
     // shaped text in its JSON transcript. Those are behavioral evidence, not a
@@ -95,6 +112,12 @@ pub fn classify_process_result(
     }
     let signal = format!("{stdout}\n{stderr}");
     let lower = signal.to_ascii_lowercase();
+    if ["verification failed", "verification command failed"]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return Some(RunDisposition::VerificationFailed);
+    }
     if [
         "missing auth",
         "no credentials",
@@ -129,12 +152,19 @@ pub fn summarize_dispositions(dispositions: &[RunDisposition]) -> RunDisposition
         behavioral_runs: 0,
         infrastructure_failures: 0,
         configuration_failures: 0,
+        verification_failures: 0,
+        timed_out_runs: 0,
     };
     for disposition in dispositions {
         match disposition {
-            RunDisposition::BehavioralResult => summary.behavioral_runs += 1,
+            RunDisposition::Completed => summary.behavioral_runs += 1,
+            RunDisposition::VerificationFailed => {
+                summary.behavioral_runs += 1;
+                summary.verification_failures += 1;
+            }
             RunDisposition::InfrastructureFailure => summary.infrastructure_failures += 1,
             RunDisposition::ConfigurationFailure => summary.configuration_failures += 1,
+            RunDisposition::TimedOut => summary.timed_out_runs += 1,
         }
     }
     summary
@@ -151,7 +181,12 @@ pub fn aggregate_scenario_results(
     );
     let behavioral_results = results
         .iter()
-        .filter(|result| result.disposition == RunDisposition::BehavioralResult)
+        .filter(|result| {
+            matches!(
+                result.disposition,
+                RunDisposition::Completed | RunDisposition::VerificationFailed
+            )
+        })
         .map(|result| (&result.scenario, &result.trace, &result.score))
         .collect::<Vec<_>>();
     DispositionedSuiteSummary {
@@ -360,20 +395,24 @@ mod tests {
     }
 
     #[test]
-    fn disposition_summary_keeps_non_behavioral_runs_out_of_denominator() {
+    fn disposition_summary_counts_verification_failures_as_behavioral_runs() {
         let summary = summarize_dispositions(&[
-            RunDisposition::BehavioralResult,
+            RunDisposition::Completed,
             RunDisposition::InfrastructureFailure,
             RunDisposition::ConfigurationFailure,
+            RunDisposition::VerificationFailed,
+            RunDisposition::TimedOut,
         ]);
 
-        assert_eq!(summary.total_runs, 3);
-        assert_eq!(summary.behavioral_runs, 1);
+        assert_eq!(summary.total_runs, 5);
+        assert_eq!(summary.behavioral_runs, 2);
         assert_eq!(summary.infrastructure_failures, 1);
         assert_eq!(summary.configuration_failures, 1);
-        assert_eq!(summary.infrastructure_failure_rate(), 1.0 / 3.0);
+        assert_eq!(summary.verification_failures, 1);
+        assert_eq!(summary.timed_out_runs, 1);
+        assert_eq!(summary.infrastructure_failure_rate(), 1.0 / 5.0);
         assert!(summary.minimum_behavioral_runs_met(1));
-        assert!(!summary.minimum_behavioral_runs_met(2));
+        assert!(summary.minimum_behavioral_runs_met(2));
     }
 
     #[test]
@@ -384,7 +423,11 @@ mod tests {
         );
         assert_eq!(
             classify_failure_signal("DaVinci process timed out"),
-            RunDisposition::InfrastructureFailure
+            RunDisposition::TimedOut
+        );
+        assert_eq!(
+            classify_failure_signal("verification failed: cargo test"),
+            RunDisposition::VerificationFailed
         );
         assert_eq!(
             classify_process_result(1, false, "", "no credentials configured"),
@@ -393,6 +436,10 @@ mod tests {
         assert_eq!(
             classify_process_result(1, false, "", "provider error: status 503"),
             Some(RunDisposition::InfrastructureFailure)
+        );
+        assert_eq!(
+            classify_process_result(1, true, "", ""),
+            Some(RunDisposition::TimedOut)
         );
         assert_eq!(
             classify_process_result(
@@ -408,31 +455,43 @@ mod tests {
     #[test]
     fn scheduled_infrastructure_gate_rejects_rates_above_ten_percent() {
         let passing = summarize_dispositions(&[
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
             RunDisposition::InfrastructureFailure,
         ]);
         assert!(scheduled_infrastructure_gate(&passing).is_ok());
 
         let failing = summarize_dispositions(&[
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
-            RunDisposition::BehavioralResult,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
+            RunDisposition::Completed,
             RunDisposition::InfrastructureFailure,
             RunDisposition::InfrastructureFailure,
         ]);
         assert!(scheduled_infrastructure_gate(&failing).is_err());
+    }
+
+    #[test]
+    fn provider_configuration_failure_is_not_scored_as_task_failure() {
+        let summary = summarize_dispositions(&[
+            RunDisposition::ConfigurationFailure,
+            RunDisposition::Completed,
+        ]);
+
+        assert_eq!(summary.configuration_failures, 1);
+        assert_eq!(summary.behavioral_runs, 1);
+        assert_eq!(summary.verification_failures, 0);
     }
 }

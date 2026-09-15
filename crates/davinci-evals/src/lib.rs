@@ -6,6 +6,7 @@ pub mod codex_eval;
 pub mod competitor;
 pub mod harness_eval;
 pub mod harness_table;
+pub mod optimization;
 pub mod promotion;
 pub mod reporter;
 pub mod review_scoring;
@@ -22,6 +23,11 @@ pub use artifacts::{
 pub use harness_table::{
     derive_eval_group_key, eval_harness_table, parse_eval_harness_iteration_artifact,
     EvalHarnessIterationArtifact, EvalHarnessTableRow, EVAL_HARNESS_ITERATION_ARTIFACT,
+};
+pub use optimization::{
+    cost_per_verified_success, evaluate_optimization_gate, offline_ablation_registry,
+    run_offline_optimization_gate, write_optimization_gate_report, OptimizationAblationResult,
+    OptimizationGateReport, ProviderUsageSnapshot, VerifiedRunMetrics, OPTIMIZATION_ABLATION_NAMES,
 };
 pub use reporter::{
     append_harness_run_report, collect_harness_observations, format_test_run_end, is_harness_run,

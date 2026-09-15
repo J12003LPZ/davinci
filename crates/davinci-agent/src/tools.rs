@@ -876,6 +876,7 @@ fn tool_search_tool(
             .mcp
             .tool_names()
             .into_iter()
+            .filter(|name| authorized.contains(name))
             .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
             .take(5)
             .collect();
@@ -2848,26 +2849,21 @@ fn code_definition_tool(
     let symbol = input.get("symbol").and_then(Value::as_str);
 
     if let Some(semantic) = &context.semantic {
-        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if semantic.is_server_available(lang, &path)
-            && semantic.capabilities(lang, &path).definition
-        {
-            match semantic.definition(
-                cwd,
-                raw_path,
-                line.saturating_sub(1),
-                character.saturating_sub(1),
-            ) {
-                Ok(res) => {
-                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
-                    return Ok(ToolResult {
-                        content,
-                        is_error: false,
-                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
-                    });
-                }
-                Err(err) => return Err(ToolError::Failed(err)),
+        match semantic.definition(
+            cwd,
+            raw_path,
+            line.saturating_sub(1),
+            character.saturating_sub(1),
+        ) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
             }
+            Err(err) => return Err(ToolError::Failed(err)),
         }
     }
 
@@ -2907,27 +2903,22 @@ fn code_references_tool(
         .unwrap_or(true);
 
     if let Some(semantic) = &context.semantic {
-        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if semantic.is_server_available(lang, &path)
-            && semantic.capabilities(lang, &path).references
-        {
-            match semantic.references(
-                cwd,
-                raw_path,
-                line.saturating_sub(1),
-                character.saturating_sub(1),
-                include_decl,
-            ) {
-                Ok(res) => {
-                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
-                    return Ok(ToolResult {
-                        content,
-                        is_error: false,
-                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
-                    });
-                }
-                Err(err) => return Err(ToolError::Failed(err)),
+        match semantic.references(
+            cwd,
+            raw_path,
+            line.saturating_sub(1),
+            character.saturating_sub(1),
+            include_decl,
+        ) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
             }
+            Err(err) => return Err(ToolError::Failed(err)),
         }
     }
 
@@ -2957,22 +2948,19 @@ fn code_outline_tool(
         return Err(ToolError::Failed("Operation aborted".into()));
     }
     let raw_path = required_str(input, "path")?;
-    let path = resolve(cwd, raw_path)?;
+    let _path = resolve(cwd, raw_path)?;
 
     if let Some(semantic) = &context.semantic {
-        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if semantic.is_server_available(lang, &path) && semantic.capabilities(lang, &path).outline {
-            match semantic.outline(cwd, raw_path) {
-                Ok(res) => {
-                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
-                    return Ok(ToolResult {
-                        content,
-                        is_error: false,
-                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
-                    });
-                }
-                Err(err) => return Err(ToolError::Failed(err)),
+        match semantic.outline(cwd, raw_path) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
             }
+            Err(err) => return Err(ToolError::Failed(err)),
         }
     }
 
@@ -2994,30 +2982,30 @@ fn code_diagnostics_tool(
         return Err(ToolError::Failed("Operation aborted".into()));
     }
     let raw_path = required_str(input, "path")?;
-    let path = resolve(cwd, raw_path)?;
+    let _path = resolve(cwd, raw_path)?;
 
     if let Some(semantic) = &context.semantic {
-        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if semantic.is_server_available(lang, &path)
-            && semantic.capabilities(lang, &path).diagnostics
-        {
-            match semantic.diagnostics(cwd, raw_path) {
-                Ok(res) => {
-                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
-                    return Ok(ToolResult {
-                        content,
-                        is_error: false,
-                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
-                    });
-                }
-                Err(err) => return Err(ToolError::Failed(err)),
+        match semantic.diagnostics(cwd, raw_path) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
             }
+            Err(err) => return Err(ToolError::Failed(err)),
         }
     }
 
-    Err(ToolError::Failed(
-        "Diagnostics unavailable: language server not available for this file type".into(),
-    ))
+    let res =
+        crate::semantic::text_fallback_diagnostics(cwd, raw_path).map_err(ToolError::Failed)?;
+    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+    Ok(ToolResult {
+        content,
+        is_error: false,
+        details: Some(serde_json::to_value(&res).unwrap_or_default()),
+    })
 }
 
 fn code_call_hierarchy_tool(
@@ -3029,7 +3017,7 @@ fn code_call_hierarchy_tool(
         return Err(ToolError::Failed("Operation aborted".into()));
     }
     let raw_path = required_str(input, "path")?;
-    let path = resolve(cwd, raw_path)?;
+    let _path = resolve(cwd, raw_path)?;
     let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
     let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
     let direction = input
@@ -3039,27 +3027,22 @@ fn code_call_hierarchy_tool(
     let incoming = direction != "outgoing";
 
     if let Some(semantic) = &context.semantic {
-        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if semantic.is_server_available(lang, &path)
-            && semantic.capabilities(lang, &path).call_hierarchy
-        {
-            match semantic.call_hierarchy(
-                cwd,
-                raw_path,
-                line.saturating_sub(1),
-                character.saturating_sub(1),
-                incoming,
-            ) {
-                Ok(res) => {
-                    let content = serde_json::to_string_pretty(&res).unwrap_or_default();
-                    return Ok(ToolResult {
-                        content,
-                        is_error: false,
-                        details: Some(serde_json::to_value(&res).unwrap_or_default()),
-                    });
-                }
-                Err(err) => return Err(ToolError::Failed(err)),
+        match semantic.call_hierarchy(
+            cwd,
+            raw_path,
+            line.saturating_sub(1),
+            character.saturating_sub(1),
+            incoming,
+        ) {
+            Ok(res) => {
+                let content = serde_json::to_string_pretty(&res).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&res).unwrap_or_default()),
+                });
             }
+            Err(err) => return Err(ToolError::Failed(err)),
         }
     }
 
@@ -3077,33 +3060,28 @@ fn code_rename_preview_tool(
         return Err(ToolError::Failed("Operation aborted".into()));
     }
     let raw_path = required_str(input, "path")?;
-    let path = resolve(cwd, raw_path)?;
+    let _path = resolve(cwd, raw_path)?;
     let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
     let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
     let new_name = required_str(input, "newName")?;
 
     if let Some(semantic) = &context.semantic {
-        let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if semantic.is_server_available(lang, &path)
-            && semantic.capabilities(lang, &path).rename_preview
-        {
-            match semantic.rename_preview(
-                cwd,
-                raw_path,
-                line.saturating_sub(1),
-                character.saturating_sub(1),
-                new_name,
-            ) {
-                Ok(preview) => {
-                    let content = serde_json::to_string_pretty(&preview).unwrap_or_default();
-                    return Ok(ToolResult {
-                        content,
-                        is_error: false,
-                        details: Some(serde_json::to_value(&preview).unwrap_or_default()),
-                    });
-                }
-                Err(err) => return Err(ToolError::Failed(err)),
+        match semantic.rename_preview(
+            cwd,
+            raw_path,
+            line.saturating_sub(1),
+            character.saturating_sub(1),
+            new_name,
+        ) {
+            Ok(preview) => {
+                let content = serde_json::to_string_pretty(&preview).unwrap_or_default();
+                return Ok(ToolResult {
+                    content,
+                    is_error: false,
+                    details: Some(serde_json::to_value(&preview).unwrap_or_default()),
+                });
             }
+            Err(err) => return Err(ToolError::Failed(err)),
         }
     }
 
@@ -3960,18 +3938,24 @@ impl User {
         assert!(outline_res.content.contains("User"));
         assert!(outline_res.content.contains("greet"));
 
-        // 6. Diagnostics without server returns error (not 0 errors)
+        // 6. Diagnostics without a server are explicitly partial, never a
+        // false claim that an empty result proves the file is error-free.
         let diag_res = execute_tool_with(
             dir.path(),
             "code_diagnostics",
             &serde_json::json!({"path": "user.rs"}),
             &context,
+        )
+        .unwrap();
+        assert!(!diag_res.is_error);
+        assert_eq!(
+            diag_res
+                .details
+                .as_ref()
+                .and_then(|value| value["partial"].as_bool()),
+            Some(true)
         );
-        assert!(diag_res.is_err());
-        assert!(diag_res
-            .unwrap_err()
-            .to_string()
-            .contains("Diagnostics unavailable"));
+        assert!(diag_res.content.contains("no compiler diagnostics"));
 
         // 7. Call hierarchy without server returns unsupported error
         let hier_res = execute_tool_with(

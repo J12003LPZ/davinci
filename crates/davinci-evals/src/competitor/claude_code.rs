@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::command::{CommandHarness, ExternalHarness, ExternalRun, ExternalTask};
 use super::probe::{probe_harness, HarnessCapabilities};
-use super::report::{classify_comparison, ComparisonClass};
+use super::report::{classify_comparison, ComparisonClass, ComparisonMode};
 use crate::behavior::{VerificationCommand, VerificationResult};
 
 pub const CLAUDE_CODE_BIN_ENV: &str = "DAVINCI_CLAUDE_CODE_BIN";
@@ -120,6 +120,8 @@ impl ExternalHarness for ClaudeCodeHarness {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FairComparisonMetadata {
+    #[serde(default)]
+    pub comparison_mode: ComparisonMode,
     pub davinci_version: String,
     pub competitor_name: String,
     pub competitor_version: Option<String>,
@@ -159,6 +161,11 @@ pub fn format_competitor_report_markdown(report: &CompetitorComparisonReport) ->
     md.push_str("## External Harness Differential Report\n\n");
 
     md.push_str("### Fair Comparison Disclosure\n");
+    md.push_str(&format!(
+        "- **Comparison Mode**: {}\n- **Mode Disclosure**: {}\n",
+        report.metadata.comparison_mode.as_str(),
+        report.metadata.comparison_mode.disclosure()
+    ));
     md.push_str(&format!(
         "- **DaVinci version**: {}\n",
         report.metadata.davinci_version
@@ -276,6 +283,7 @@ mod tests {
     #[test]
     fn competitor_report_markdown_includes_fair_comparison_disclosures() {
         let meta = FairComparisonMetadata {
+            comparison_mode: ComparisonMode::Harness,
             davinci_version: "1.0.0".into(),
             competitor_name: "claude-code".into(),
             competitor_version: Some("0.2.29".into()),
@@ -309,6 +317,7 @@ mod tests {
     #[test]
     fn competitor_report_warns_when_models_are_uncontrolled() {
         let meta = FairComparisonMetadata {
+            comparison_mode: ComparisonMode::Product,
             davinci_version: "1.0.0".into(),
             competitor_name: "claude-code".into(),
             competitor_version: None,

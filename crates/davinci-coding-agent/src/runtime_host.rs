@@ -1144,15 +1144,35 @@ mod tests {
         let (adapter, _dir) = make_adapter();
         let content = large_content();
 
-        // 1. Error output is exempt
+        // 1. Error status is preserved while large output remains reversibly compressed
         let error_res = ToolResult {
             content: content.clone(),
             is_error: true,
             details: None,
         };
         let processed_err = adapter.process_tool_output("bash", &json!({}), error_res);
-        assert_eq!(processed_err.content, content);
         assert!(processed_err.is_error);
+        assert!(processed_err
+            .content
+            .contains("Call retrieve_output with id"));
+        assert_eq!(
+            processed_err.details.as_ref().unwrap()["tokenGovernor"]["compressed"],
+            true
+        );
+
+        let output_id = processed_err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("tokenGovernor"))
+            .and_then(|tg| tg.get("outputId"))
+            .and_then(|id| id.as_str())
+            .expect("outputId must be present in error details");
+        let recovered = adapter
+            .retrieve(&json!({"id": output_id}))
+            .expect("error recovery must succeed");
+        assert!(!recovered.is_error);
+        assert!(recovered.content.contains("1: Lorem ipsum dolor sit amet"));
+        assert!(recovered.content.contains("30: Lorem ipsum dolor sit amet"));
 
         // 2. memory_search is exempt
         let mem_res = ToolResult {

@@ -7,6 +7,7 @@ pub mod interaction_testing;
 pub mod interactive_tui;
 pub mod native_extensions;
 pub mod native_tools;
+pub mod optimization;
 pub mod prompt_host;
 pub mod runtime_host;
 pub mod sdk;
