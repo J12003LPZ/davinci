@@ -44,7 +44,9 @@ jobs:
           done
 
       - name: Apply implementation
-        run: python3 .github/scripts/harness_opt_learning_stage2.py --impl
+        run: |
+          python3 .github/scripts/harness_opt_learning_stage2.py --impl
+          python3 .github/scripts/harness_opt_learning_stage2_outcome_fix.py
 
       - name: Format
         run: cargo fmt --all
