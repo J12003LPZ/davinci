@@ -23,7 +23,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Add focused regressions
-        run: python3 .github/scripts/harness_opt_learning_stage2.py --tests
+        run: |
+          python3 .github/scripts/harness_opt_learning_stage2.py --tests
+          python3 .github/scripts/harness_opt_learning_stage2_fixture.py
 
       - name: Verify focused regressions are red
         shell: bash
