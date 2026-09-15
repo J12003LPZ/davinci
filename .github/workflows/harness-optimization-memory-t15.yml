@@ -49,12 +49,26 @@ jobs:
           cargo test -p davinci-coding-agent phase3_t15_embedding_identity_changes_with_model_or_dimensions
           cargo test -p davinci-coding-agent phase3_t15_legacy_or_changed_embedding_is_incompatible
 
-      - name: Verify vector memory suite and clippy
+      - name: Verify vector memory suite
+        timeout-minutes: 12
         shell: bash
         run: |
           set -euo pipefail
+          echo "Running T15 vector_memory regression suite"
           cargo test -p davinci-coding-agent vector_memory
+
+      - name: Verify T15 clippy
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Running T15 package clippy gate"
           cargo clippy -p davinci-coding-agent --all-targets -- -D warnings
+
+      - name: Verify generated diff
+        shell: bash
+        run: |
+          set -euo pipefail
           git diff --check
 
       - name: Commit verified T15 production changes
