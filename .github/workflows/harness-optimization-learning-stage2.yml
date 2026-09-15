@@ -26,6 +26,7 @@ jobs:
         run: |
           python3 .github/scripts/harness_opt_learning_stage2.py --tests
           python3 .github/scripts/harness_opt_learning_stage2_fixture.py
+          python3 .github/scripts/harness_opt_learning_stage2_query_fix.py --tests
 
       - name: Verify focused regressions are red
         shell: bash
@@ -34,6 +35,7 @@ jobs:
           for test_name in \
             persisted_skill_applicability_is_used_for_ranking \
             memory_freshness_penalizes_changed_source_state \
+            skill_query_is_not_diluted_by_worker_briefing \
             injected_irrelevant_skill_is_not_credited_as_helpful
           do
             if cargo test -p davinci-coding-agent "$test_name"; then
@@ -47,7 +49,7 @@ jobs:
         run: |
           python3 .github/scripts/harness_opt_learning_stage2.py --impl
           python3 .github/scripts/harness_opt_learning_stage2_outcome_fix.py
-          python3 .github/scripts/harness_opt_learning_stage2_diag.py
+          python3 .github/scripts/harness_opt_learning_stage2_query_fix.py --impl
 
       - name: Format
         run: cargo fmt --all
@@ -56,7 +58,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p davinci-coding-agent injected_irrelevant_skill_is_not_credited_as_helpful -- --nocapture
+          cargo test -p davinci-coding-agent skill_query_is_not_diluted_by_worker_briefing
+          cargo test -p davinci-coding-agent injected_irrelevant_skill_is_not_credited_as_helpful
           cargo test -p davinci-coding-agent legacy_skill_metadata_defaults_applicability
           cargo test -p davinci-coding-agent persisted_skill_applicability_is_used_for_ranking
           cargo test -p davinci-coding-agent legacy_memory_record_has_neutral_freshness
@@ -78,5 +81,5 @@ jobs:
             echo "No production changes"
             exit 0
           fi
-          git commit -m "feat(learning): persist applicability and source-bound freshness"
+          git commit -m "feat(learning): separate skill retrieval from worker briefing"
           git push origin "HEAD:${GITHUB_REF_NAME}"
