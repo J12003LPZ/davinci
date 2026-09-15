@@ -8,8 +8,8 @@ crate = ROOT / "crates/davinci-coding-agent/src/native_extensions"
 path = crate / "ecosystem/mod.rs"
 text = path.read_text()
 
-anchor0 = '''        let learning = crate::native_extensions::LearningController::new(dir.path(), None, None);\n        let runner: Arc<WorkerRunner> = Arc::new(|spec, _abort, _on_progress| {\n'''
-replacement0 = '''        let learning = crate::native_extensions::LearningController::new(dir.path(), None, None);\n        let short_candidates = learning.graph_skill_candidates(\n            "shared workflow rust debugging",\n            Role::Writer,\n            2,\n            1000,\n        );\n        eprintln!(\n            "credit-debug short-query-candidates={:?}",\n            short_candidates\n                .iter()\n                .map(|candidate| (candidate.name.clone(), candidate.score))\n                .collect::<Vec<_>>()\n        );\n        let runner: Arc<WorkerRunner> = Arc::new(|spec, _abort, _on_progress| {\n'''
+anchor0 = '''        let learning = crate::native_extensions::LearningController::new(dir.path(), None, None);\n        std::fs::create_dir_all(dir.path().join("src")).unwrap();\n'''
+replacement0 = '''        let learning = crate::native_extensions::LearningController::new(dir.path(), None, None);\n        let short_candidates = learning.graph_skill_candidates(\n            "shared workflow rust debugging",\n            Role::Writer,\n            2,\n            1000,\n        );\n        eprintln!(\n            "credit-debug short-query-candidates={:?}",\n            short_candidates\n                .iter()\n                .map(|candidate| (candidate.name.clone(), candidate.score))\n                .collect::<Vec<_>>()\n        );\n        std::fs::create_dir_all(dir.path().join("src")).unwrap();\n'''
 if text.count(anchor0) != 1:
     raise SystemExit(f"short-candidate anchor expected once, found {text.count(anchor0)}")
 text = text.replace(anchor0, replacement0, 1)
