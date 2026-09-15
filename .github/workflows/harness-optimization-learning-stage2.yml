@@ -26,6 +26,7 @@ jobs:
         run: |
           python3 .github/scripts/harness_opt_learning_stage2.py --tests
           python3 .github/scripts/harness_opt_learning_stage2_fixture.py
+          python3 .github/scripts/harness_opt_learning_stage2_diag.py
 
       - name: Verify focused regressions are red
         shell: bash
@@ -55,9 +56,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo test -p davinci-coding-agent injected_irrelevant_skill_is_not_credited_as_helpful -- --nocapture
           cargo test -p davinci-coding-agent legacy_skill_metadata_defaults_applicability
           cargo test -p davinci-coding-agent persisted_skill_applicability_is_used_for_ranking
-          cargo test -p davinci-coding-agent injected_irrelevant_skill_is_not_credited_as_helpful
           cargo test -p davinci-coding-agent legacy_memory_record_has_neutral_freshness
           cargo test -p davinci-coding-agent memory_freshness_penalizes_changed_source_state
           cargo test -p davinci-coding-agent ecosystem_loop_full_circle
