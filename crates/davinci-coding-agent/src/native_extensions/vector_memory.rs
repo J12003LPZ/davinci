@@ -54,6 +54,8 @@ pub struct VectorMemoryConfig {
     pub result_limit: usize,
     #[serde(default = "default_candidate_limit")]
     pub candidate_limit: usize,
+    #[serde(default = "default_max_index_chunks")]
+    pub max_index_chunks: usize,
     #[serde(default = "default_max_injected_tokens")]
     pub max_injected_tokens: usize,
     #[serde(default = "default_minimum_score")]
@@ -95,6 +97,9 @@ fn default_result_limit() -> usize {
 fn default_candidate_limit() -> usize {
     30
 }
+fn default_max_index_chunks() -> usize {
+    64
+}
 fn default_max_injected_tokens() -> usize {
     3_000
 }
@@ -124,6 +129,7 @@ impl Default for VectorMemoryConfig {
             automatic_retrieval: true,
             result_limit: default_result_limit(),
             candidate_limit: default_candidate_limit(),
+            max_index_chunks: default_max_index_chunks(),
             max_injected_tokens: default_max_injected_tokens(),
             minimum_score: default_minimum_score(),
             request_timeout_seconds: default_request_timeout(),
@@ -181,6 +187,9 @@ impl VectorMemoryConfig {
         }
         if let Some(value) = env_usize("PI_MEMORY_CANDIDATE_LIMIT") {
             config.candidate_limit = value.clamp(1, 100);
+        }
+        if let Some(value) = env_usize("PI_MEMORY_MAX_INDEX_CHUNKS") {
+            config.max_index_chunks = value.clamp(1, 512);
         }
         if let Some(value) = env_usize("PI_MEMORY_MAX_INJECTED_TOKENS") {
             config.max_injected_tokens = value.max(100);
@@ -582,6 +591,32 @@ pub fn lexical_score(query: &str, text: &str) -> f32 {
     LexicalQuery::new(query).score(text)
 }
 
+fn exact_identifier_match(query: &str, record: &MemoryRecord) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return false;
+    }
+    if record.id.eq_ignore_ascii_case(query) || record.content_hash.eq_ignore_ascii_case(query) {
+        return true;
+    }
+    let text = record.text.to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                !ch.is_ascii_alphanumeric() && !matches!(ch, '-' | '_' | ':' | '/' | '.')
+            })
+        })
+        .filter(|token| token.len() >= 5)
+        .filter(|token| {
+            token.chars().any(|ch| ch.is_ascii_digit())
+                || token
+                    .chars()
+                    .any(|ch| matches!(ch, '-' | '_' | ':' | '/' | '.'))
+        })
+        .any(|token| text.contains(&token.to_ascii_lowercase()))
+}
+
 pub fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     if left.is_empty() || left.len() != right.len() {
         return 0.0;
@@ -597,17 +632,6 @@ pub fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     } else {
         (dot / (left_norm.sqrt() * right_norm.sqrt())).clamp(0.0, 1.0)
     }
-}
-
-pub fn fuse_hits(mut hits: Vec<MemoryHit>, limit: usize) -> Vec<MemoryHit> {
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-    });
-    hits.truncate(limit);
-    hits
 }
 
 pub fn format_memory_block(hits: &[MemoryHit], max_tokens: usize) -> String {
@@ -891,9 +915,13 @@ impl VectorMemory {
         for chunk in chunks {
             let hash = content_hash(&chunk.text);
             let tag = known_key_scoped(chunk.kind, &hash, agent_profile_name);
-            if !self.known.insert(tag) {
+            if self.known.contains(&tag) {
                 continue;
             }
+            if inserted >= self.config.max_index_chunks.max(1) {
+                break;
+            }
+            self.known.insert(tag);
             let id_seed = format!(
                 "{}\0{}\0{}",
                 target_repo,
@@ -1104,7 +1132,6 @@ impl VectorMemory {
                                 && (record.agent_profile_name.is_none()
                                     || record.agent_profile_name.as_deref() == Some(profile))
                         } else {
-                            // Main agent behavior remains unchanged: only project-wide memory where agent_profile_name is None
                             record.repo_id == self.repo_id && record.agent_profile_name.is_none()
                         }
                     }
@@ -1115,6 +1142,26 @@ impl VectorMemory {
         if candidates.is_empty() {
             return Vec::new();
         }
+
+        let candidate_limit = self.config.candidate_limit.max(1);
+        let lexical_query = LexicalQuery::new(query);
+        let mut lexical_ranked = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                let lexical = lexical_query.score(&record.text);
+                let exact = exact_identifier_match(query, record);
+                (exact || lexical > 0.0).then_some((index, lexical, exact))
+            })
+            .collect::<Vec<_>>();
+        lexical_ranked.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal))
+                .then_with(|| candidates[left.0].id.cmp(&candidates[right.0].id))
+        });
+        lexical_ranked.truncate(candidate_limit);
 
         let query_embedding = (self.dense_available()
             && candidates.iter().any(|record| record.embedding.is_some()))
@@ -1127,27 +1174,111 @@ impl VectorMemory {
         })
         .flatten();
 
-        let lexical_query = LexicalQuery::new(query);
-        let mut hits = candidates
+        let mut dense_ranked = query_embedding
+            .as_ref()
+            .map(|query_vector| {
+                let mut ranked = candidates
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, record)| {
+                        let embedding = record.embedding.as_ref()?;
+                        if embedding.len() != query_vector.len() {
+                            return None;
+                        }
+                        let score = cosine_similarity(query_vector, embedding);
+                        (score > 0.0).then_some((index, score))
+                    })
+                    .collect::<Vec<_>>();
+                ranked.sort_by(|left, right| {
+                    right
+                        .1
+                        .partial_cmp(&left.1)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| candidates[left.0].id.cmp(&candidates[right.0].id))
+                });
+                ranked.truncate(candidate_limit);
+                ranked
+            })
+            .unwrap_or_default();
+
+        #[derive(Default, Clone, Copy)]
+        struct RankState {
+            lexical_rank: Option<usize>,
+            dense_rank: Option<usize>,
+            lexical_score: f32,
+            dense_score: f32,
+            exact: bool,
+        }
+
+        let mut selected = BTreeMap::<usize, RankState>::new();
+        for (rank, (index, score, exact)) in lexical_ranked.into_iter().enumerate() {
+            let state = selected.entry(index).or_default();
+            state.lexical_rank = Some(rank);
+            state.lexical_score = score;
+            state.exact = exact;
+        }
+        for (rank, (index, score)) in dense_ranked.drain(..).enumerate() {
+            let state = selected.entry(index).or_default();
+            state.dense_rank = Some(rank);
+            state.dense_score = score;
+        }
+
+        let rank_value = |rank: usize| -> f32 {
+            1.0 - (rank.min(candidate_limit - 1) as f32 / candidate_limit as f32)
+        };
+        let mut hits = selected
             .into_iter()
-            .filter_map(|record| {
-                let lexical = lexical_query.score(&record.text);
-                let dense = query_embedding
-                    .as_ref()
-                    .zip(record.embedding.as_ref())
-                    .map(|(query, embedding)| cosine_similarity(query, embedding))
-                    .unwrap_or(lexical);
-                let base = (dense * 0.6 + lexical * 0.3 + record.importance * 0.1).clamp(0.0, 1.0);
-                let score = (base * memory_freshness(record, &self.cwd)).clamp(0.0, 1.0);
-                (score >= self.config.minimum_score).then(|| MemoryHit {
+            .map(|(index, state)| {
+                let record = candidates[index];
+                let lexical = state.lexical_score;
+                let dense = if query_embedding.is_some() {
+                    state.dense_score
+                } else {
+                    lexical
+                };
+                let mut rank_sum = 0.0f32;
+                let mut rank_count = 0.0f32;
+                if let Some(rank) = state.lexical_rank {
+                    rank_sum += rank_value(rank);
+                    rank_count += 1.0;
+                }
+                if let Some(rank) = state.dense_rank {
+                    rank_sum += rank_value(rank);
+                    rank_count += 1.0;
+                }
+                let rank_fusion = if rank_count > 0.0 {
+                    rank_sum / rank_count
+                } else {
+                    0.0
+                };
+                let mut base = if query_embedding.is_some() {
+                    dense * 0.50 + lexical * 0.25 + rank_fusion * 0.15 + record.importance * 0.10
+                } else {
+                    lexical * 0.65 + rank_fusion * 0.25 + record.importance * 0.10
+                };
+                if state.exact {
+                    base = base.max(0.95);
+                }
+                let score =
+                    (base.clamp(0.0, 1.0) * memory_freshness(record, &self.cwd)).clamp(0.0, 1.0);
+                MemoryHit {
                     record: (*record).clone(),
                     score,
                     dense_score: dense,
                     lexical_score: lexical,
-                })
+                }
             })
+            .filter(|hit| hit.score >= self.config.minimum_score)
             .collect::<Vec<_>>();
-        fuse_hits(std::mem::take(&mut hits), limit.max(1))
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.record.id.cmp(&right.record.id))
+        });
+        hits.truncate(limit.max(1).min(candidate_limit));
+        hits
     }
 
     /// Retrieve bounded memory context hits for a graph worker query.
@@ -1173,11 +1304,15 @@ impl VectorMemory {
         let hits = self.search_scoped(query, max_hits, agent_profile_name, memory_scope);
         let mut results = Vec::new();
         let mut accumulated_tokens = 0;
+        let mut seen_content = HashSet::new();
         for hit in hits {
+            if !seen_content.insert(hit.record.content_hash.clone()) {
+                continue;
+            }
             let text = redact_secrets(&hit.record.text);
             let estimated_tokens = (text.chars().count() + 3) / 4;
-            if accumulated_tokens + estimated_tokens > token_cap {
-                break;
+            if estimated_tokens > token_cap.saturating_sub(accumulated_tokens) {
+                continue;
             }
             accumulated_tokens += estimated_tokens;
             results.push(MemoryContextHit {
@@ -1310,6 +1445,7 @@ impl VectorMemory {
             "extractionModel": self.config.extraction_model,
             "resultLimit": self.config.result_limit,
             "candidateLimit": self.config.candidate_limit,
+            "maxIndexChunks": self.config.max_index_chunks,
             "maxInjectedTokens": self.config.max_injected_tokens,
             "minimumScore": self.config.minimum_score,
             "localPath": self.local_path(),
@@ -2419,5 +2555,150 @@ mod source_bound_freshness_regressions {
             after < before,
             "source-bound memory should be penalized after its verified source changes: {before} -> {after}"
         );
+    }
+}
+
+#[cfg(test)]
+mod phase3_memory_retrieval_regressions {
+    use super::*;
+
+    fn record(memory: &VectorMemory, id: &str, text: String, importance: f32) -> MemoryRecord {
+        MemoryRecord {
+            id: id.into(),
+            repo_id: memory.repo_id.clone(),
+            kind: MemoryKind::Discovery,
+            text: text.clone(),
+            source: "repository_fact".into(),
+            content_hash: content_hash(&text),
+            importance,
+            created_at: 1000,
+            embedding: None,
+            confidence: Some(0.9),
+            source_session_id: Some("session-phase3".into()),
+            source_turn: Some(1),
+            verification: Some("verified".into()),
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
+            use_count: 0,
+            last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
+        }
+    }
+
+    #[test]
+    fn phase3_candidate_limit_is_a_hard_search_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                candidate_limit: 2,
+                minimum_score: 0.1,
+                promotion: false,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        memory.mark_dense_offline();
+        for index in 0..8 {
+            memory.records.push(record(
+                &memory,
+                &format!("candidate-{index}"),
+                format!("shared authentication candidate {index}"),
+                0.8,
+            ));
+        }
+
+        let hits = memory.search("shared authentication", 20);
+        assert!(
+            hits.len() <= 2,
+            "candidate_limit must cap final retrieval work"
+        );
+    }
+
+    #[test]
+    fn phase3_oversized_first_hit_does_not_starve_smaller_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                candidate_limit: 8,
+                minimum_score: 0.1,
+                promotion: false,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        memory.mark_dense_offline();
+        memory.records.push(record(
+            &memory,
+            "large",
+            format!("authentication token {}", "x".repeat(2000)),
+            1.0,
+        ));
+        memory.records.push(record(
+            &memory,
+            "small",
+            "authentication token uses repository setting AUTH_V2".into(),
+            0.8,
+        ));
+
+        let hits = memory.context_hits("authentication token", 4, 20);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "small");
+    }
+
+    #[test]
+    fn phase3_bounded_indexing_makes_incremental_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                max_index_chunks: 2,
+                promotion: false,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        memory.mark_dense_offline();
+        let messages = (0..6)
+            .map(|index| MemoryMessage {
+                role: "user".into(),
+                content: format!("unique indexing fact number {index}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(memory.index_messages(&messages).unwrap(), 2);
+        assert_eq!(memory.index_messages(&messages).unwrap(), 2);
+        assert_eq!(memory.record_count(), 4);
+    }
+
+    #[test]
+    fn phase3_exact_identifier_survives_small_candidate_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                candidate_limit: 1,
+                minimum_score: 0.1,
+                promotion: false,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        memory.mark_dense_offline();
+        memory.records.push(record(
+            &memory,
+            "noise",
+            "BUG-1000 authentication authentication authentication".into(),
+            1.0,
+        ));
+        memory.records.push(record(
+            &memory,
+            "target",
+            "Regression BUG-8472 is fixed by rotating the cache key".into(),
+            0.4,
+        ));
+
+        let hits = memory.search("BUG-8472", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.id, "target");
     }
 }
