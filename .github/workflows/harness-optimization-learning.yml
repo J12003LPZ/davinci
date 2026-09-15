@@ -33,6 +33,19 @@ jobs:
           fi
       - name: Apply implementation
         run: python3 .github/scripts/harness_opt_learning.py --impl
+      - name: Normalize generated applicability derive
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/davinci-coding-agent/src/native_extensions/learning/retrieval.rs')
+          text = path.read_text()
+          duplicate = '#[derive(Debug, Clone, PartialEq, Debug, Clone, Default, PartialEq, Eq)]'
+          expected = '#[derive(Debug, Clone, Default, PartialEq, Eq)]'
+          if duplicate not in text:
+              raise SystemExit('expected generated duplicate derive was not found')
+          path.write_text(text.replace(duplicate, expected, 1))
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Verify learning and memory stage
