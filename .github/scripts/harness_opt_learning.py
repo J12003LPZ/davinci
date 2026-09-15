@@ -112,6 +112,9 @@ def apply_impl() -> None:
     if "pub struct SkillApplicability" not in text:
         anchor = 'pub struct SkillMatch {\n'
         pos = text.index(anchor)
+        derive_pos = text.rfind("#[derive", 0, pos)
+        if derive_pos < 0:
+            raise SystemExit("skill applicability insertion: SkillMatch derive not found")
         addition = r'''#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillApplicability {
     pub languages: Vec<String>,
@@ -167,7 +170,7 @@ pub fn applicability_score(meta: &SkillApplicability, query: &str, role: Role) -
 }
 
 '''
-        text = text[:pos] + addition + text[pos:]
+        text = text[:derive_pos] + addition + text[derive_pos:]
 
     old_sig = '''pub fn select_graph_skill_candidates(\n    query: &str,\n    role: Role,\n    skills: &[Skill],\n    ledger: &[SkillLedgerRecord],\n    max_skills: usize,\n    token_cap: usize,\n) -> Vec<SkillContextCandidate> {\n'''
     if "pub fn select_graph_skill_candidates_with_embeddings" not in text:
