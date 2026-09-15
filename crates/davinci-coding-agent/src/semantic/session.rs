@@ -171,6 +171,7 @@ impl LazySemanticSessionRegistry {
     /// Register the exact executable specification that passed the caller's
     /// permission check. This prevents a second environment lookup from
     /// selecting a different program between authorization and launch.
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure_resolved_session(
         &mut self,
         root: &Path,
