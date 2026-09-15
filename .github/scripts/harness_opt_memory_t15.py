@@ -3,6 +3,7 @@ import re
 import sys
 
 VECTOR = Path('crates/davinci-coding-agent/src/native_extensions/vector_memory.rs')
+ECOSYSTEM = Path('crates/davinci-coding-agent/src/native_extensions/ecosystem/mod.rs')
 DECISION = Path('docs/superpowers/plans/2026-09-15-memory-projection-decision.md')
 
 TEST_MARKER = 'mod phase3_t15_projection_regressions'
@@ -15,7 +16,11 @@ mod phase3_t15_projection_regressions {
     #[test]
     fn phase3_t15_projection_profile_is_explicit_local() {
         assert_eq!(MEMORY_PROJECTION_PROFILE, "local");
-        let memory = VectorMemory::new_for_test(VectorMemoryConfig::default());
+        let dir = tempfile::tempdir().unwrap();
+        let memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig::default(),
+        );
         assert!(!memory.remote_projection_enabled());
     }
 
@@ -109,7 +114,7 @@ def implement() -> None:
             'record embedding identity field',
         )
 
-    # Every explicit fresh record begins without an embedding identity.
+    # Every explicit fresh record in this module begins without an embedding identity.
     text = re.sub(
         r'(\n\s*embedding: None,\n)(?!\s*embedding_identity:)',
         r'\1                embedding_identity: None,\n',
@@ -139,12 +144,16 @@ def implement() -> None:
         helpers = '''    /// The selected Phase 3 projection is deliberately local. Remote write\n    /// amplification stays disabled until a filtered remote retrieval path\n    /// demonstrates the documented quality/latency break-even.\n    pub fn remote_projection_enabled(&self) -> bool {\n        false\n    }\n\n    fn current_embedding_identity(&self) -> EmbeddingIdentity {\n        EmbeddingIdentity::from_config(&self.config)\n    }\n\n    fn drop_incompatible_embeddings(&mut self) -> usize {\n        let current = self.current_embedding_identity();\n        let mut dropped = 0usize;\n        for record in &mut self.records {\n            if record.embedding.is_some()\n                && !embedding_identity_compatible(record.embedding_identity.as_ref(), &current)\n            {\n                record.embedding = None;\n                record.embedding_identity = None;\n                dropped += 1;\n            }\n        }\n        dropped\n    }\n\n    fn local_projection_lag(&self) -> usize {\n        let current = self.current_embedding_identity();\n        self.records\n            .iter()\n            .filter(|record| {\n                !self.tombstones.contains(&record.id)\n                    && !self.supersessions.contains_key(&record.id)\n                    && (record.embedding.is_none()\n                        || !embedding_identity_compatible(\n                            record.embedding_identity.as_ref(),\n                            &current,\n                        ))\n            })\n            .count()\n    }\n\n    /// Rebuild a bounded batch of missing or incompatible local embeddings.\n    /// Authoritative records remain readable through lexical retrieval if the\n    /// embedding service is unavailable. Tombstoned/superseded records are\n    /// never projected.\n    #[allow(dead_code)]\n    pub fn rebuild_local_embeddings(&mut self, limit: usize) -> Result<usize, ToolError> {\n        self.drop_incompatible_embeddings();\n        let pending = self\n            .records\n            .iter()\n            .filter(|record| {\n                !self.tombstones.contains(&record.id)\n                    && !self.supersessions.contains_key(&record.id)\n                    && record.embedding.is_none()\n            })\n            .take(limit.max(1))\n            .map(|record| (record.id.clone(), record.text.clone()))\n            .collect::<Vec<_>>();\n        if pending.is_empty() {\n            return Ok(0);\n        }\n        let texts = pending.iter().map(|(_, text)| text.clone()).collect::<Vec<_>>();\n        let embeddings = self.embed_documents(&texts)?;\n        if embeddings.len() != pending.len() {\n            return Err(ToolError::Failed(\n                "embedding rebuild response count does not match request".into(),\n            ));\n        }\n        let identity = self.current_embedding_identity();\n        let mut updated = 0usize;\n        for ((id, _), embedding) in pending.into_iter().zip(embeddings) {\n            if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {\n                record.embedding = Some(embedding);\n                record.embedding_identity = Some(identity.clone());\n                updated += 1;\n            }\n        }\n        if updated > 0 {\n            self.persist_local()?;\n        }\n        Ok(updated)\n    }\n\n'''
         text = replace_once(text, status_anchor, helpers + status_anchor, 'projection helper insertion')
 
-    # Never let stale/legacy embeddings participate in dense ranking.
-    if 'self.drop_incompatible_embeddings();\n' not in text[text.find('pub fn search_scoped'):text.find('pub fn search_scoped') + 800]:
-        pattern = re.compile(r'(    pub fn search_scoped\([\s\S]*?\n    \) -> Vec<MemoryHit> \{\n)', re.M)
-        text, count = pattern.subn(r'\1        self.drop_incompatible_embeddings();\n', text, count=1)
-        if count != 1:
-            raise SystemExit('search_scoped compatibility guard: signature anchor not found')
+    # Dense retrieval is read-only. Ignore legacy/model-mismatched vectors in-place
+    # instead of mutating the authoritative store during a search.
+    if 'let embedding_identity = self.current_embedding_identity();' not in text[text.find('pub fn search_scoped'):text.find('pub fn search_scoped') + 5000]:
+        old = '''        let query_embedding = (self.dense_available()\n            && candidates.iter().any(|record| record.embedding.is_some()))'''
+        new = '''        let embedding_identity = self.current_embedding_identity();\n        let query_embedding = (self.dense_available()\n            && candidates.iter().any(|record| {\n                record.embedding.is_some()\n                    && embedding_identity_compatible(\n                        record.embedding_identity.as_ref(),\n                        &embedding_identity,\n                    )\n            }))'''
+        text = replace_once(text, old, new, 'compatible dense query gate')
+
+        old = '''                    .filter_map(|(index, record)| {\n                        let embedding = record.embedding.as_ref()?;\n                        if embedding.len() != query_vector.len() {'''
+        new = '''                    .filter_map(|(index, record)| {\n                        if !embedding_identity_compatible(\n                            record.embedding_identity.as_ref(),\n                            &embedding_identity,\n                        ) {\n                            return None;\n                        }\n                        let embedding = record.embedding.as_ref()?;\n                        if embedding.len() != query_vector.len() {'''
+        text = replace_once(text, old, new, 'compatible dense ranking filter')
 
     # Disable automatic remote projection writes while keeping the helper for rollback/experiments.
     text = text.replace(
@@ -166,6 +175,17 @@ def implement() -> None:
         )
 
     VECTOR.write_text(text)
+
+    # Ecosystem fixtures construct MemoryRecord directly. Keep those source-level
+    # initializers backward-compatible with the new persisted optional field.
+    ecosystem = ECOSYSTEM.read_text()
+    ecosystem = re.sub(
+        r'(\n\s*embedding: None,\n)(?!\s*embedding_identity:)',
+        lambda match: match.group(1) + match.group(1).split('embedding:')[0] + 'embedding_identity: None,\n',
+        ecosystem,
+    )
+    ECOSYSTEM.write_text(ecosystem)
+
     DECISION.parent.mkdir(parents=True, exist_ok=True)
     DECISION.write_text(DECISION_TEXT)
 
