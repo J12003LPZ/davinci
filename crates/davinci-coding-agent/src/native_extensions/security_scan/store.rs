@@ -158,8 +158,19 @@ impl Store {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err("security run is already active".into());
+            // Another thread can fork while this lease is live. CLOEXEC closes
+            // the inherited descriptor at exec, but the child can hold the flock
+            // for a short handoff window before then.
+            const HANDOFF_RETRIES: usize = 10;
+            for attempt in 0..=HANDOFF_RETRIES {
+                if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock || attempt == HANDOFF_RETRIES {
+                    return Err("security run is already active".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         Ok(Self {
