@@ -56,7 +56,9 @@ Render a reproducible, offline contact sheet of actual Ratatui buffers:
 `cargo run -p davinci-tui --example editorial_preview --offline > preview.html`.
 It includes wide and narrow screens plus monochrome; fixture data is illustrative.
 
-- Graph runs show the goal, completed-task progress, topology, and worker ledger.
+- Graph runs use the terminal-native [Living Blueprint](graph-living-blueprint.md):
+  deterministic dependency cards, safe completed-group folding, explicit smart
+  follow, and a public-execution inspector. Small terminals retain a worker ledger.
 - Governor status shows actual stored output metadata, configuration state,
   and explicitly estimated token savings. Compression and unchanged-read
   deduplication produce an eight-second notice above the composer without

@@ -51,6 +51,7 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
     let done = run.tasks.iter().filter(|t| t.state == State::Done).count();
     let mut telemetry = vec![format!("{done}/{} workers complete", run.tasks.len())];
     for (label, value) in [
+        ("Phase", &run.phase),
         ("Elapsed", &run.elapsed),
         ("Cost", &run.cost),
         ("Cap", &run.cost_cap),
@@ -88,6 +89,7 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
         .first()
         .map(String::as_str)
         .or(run.control_status.as_deref())
+        .or(run.blocked_reason.as_deref())
         .unwrap_or(&run.goal);
     rows.push(Line::from(span(
         ui::clip_ellipsis(&public_text(note), model.width),
@@ -98,7 +100,15 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
         height.saturating_sub(HEADER_ROWS + FOOTER_ROWS),
     );
     cells.blit(
-        super::graph_canvas::lines(model, layout, (model.tick % 4) as u8),
+        super::graph_canvas::lines(
+            model,
+            layout,
+            if model.animate {
+                (model.tick % 4) as u8
+            } else {
+                0
+            },
+        ),
         layout.canvas,
     );
     cells.blit(
@@ -185,6 +195,7 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
                 .issues
                 .first()
                 .or(run.control_status.as_ref())
+                .or(run.blocked_reason.as_ref())
                 .unwrap_or(&run.goal)
                 .clone(),
         ),
@@ -211,7 +222,18 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
                 model.width,
                 &model.theme,
                 Some(task.id.as_str()) == selected,
-                &public_text(&format!("{} {}", task.state.glyph(), task.id)),
+                &public_text(&format!(
+                    "{} {}{}",
+                    task.state.glyph(),
+                    task.id,
+                    if task.state == State::Attention {
+                        " · blocked".into()
+                    } else if task.status.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", task.status)
+                    }
+                )),
                 "",
             )
         })
@@ -469,6 +491,20 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    #[test]
+    fn graph_run_disabled_animation_stays_static_across_ticks() {
+        let mut m = model(120);
+        m.graph_run = Some(fixtures::blueprint_graph());
+        m.height = 40;
+        m.animate = false;
+        m.tick = 0;
+        let first = text(&m);
+        m.tick = 1;
+        assert_eq!(first, text(&m));
+        assert!(first.contains("◉ writer"));
+        m.animate = true;
+        assert_ne!(first, text(&m));
     }
     #[test]
     fn structured_fallback_retains_every_real_policy_artifact_and_usage() {

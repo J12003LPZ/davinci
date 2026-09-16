@@ -110,13 +110,20 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
                 }
             }
         }
-        for &(x, y) in edge
-            .points
-            .iter()
-            .skip(1)
-            .take(edge.points.len().saturating_sub(2))
-        {
-            cells.write(x as i32 - pan_x, y as i32 - pan_y, "┼", style);
+        for corner in edge.points.windows(3) {
+            let (before, (x, y), after) = (corner[0], corner[1], corner[2]);
+            let left = before.0 < x || after.0 < x;
+            let right = before.0 > x || after.0 > x;
+            let up = before.1 < y || after.1 < y;
+            let down = before.1 > y || after.1 > y;
+            let glyph = match (left, right, up, down) {
+                (true, false, false, true) => "┐",
+                (false, true, true, false) => "└",
+                (true, false, true, false) => "┘",
+                (false, true, false, true) => "┌",
+                _ => continue,
+            };
+            cells.write(x as i32 - pan_x, y as i32 - pan_y, glyph, style);
         }
         if let Some(&(x, y)) = edge.points.last() {
             cells.write(
@@ -131,15 +138,28 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
             );
         }
     }
+    let mut phases = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
+    for node in &layout.nodes {
+        let phase = &run.tasks[node.task_index].phase;
+        if !phase.is_empty() {
+            phases.entry(node.depth).or_default().insert(phase.as_str());
+        }
+    }
     let mut lanes = std::collections::BTreeSet::new();
     for node in &layout.nodes {
         let task = &run.tasks[node.task_index];
         if lanes.insert(node.depth) {
-            let label = format!("Stage {}", node.depth + 1);
+            let label = phases
+                .get(&node.depth)
+                .map(|names| names.iter().copied().collect::<Vec<_>>().join(" / "))
+                .unwrap_or_else(|| format!("Stage {}", node.depth + 1));
             cells.write(
                 node.rect.x as i32 - pan_x,
                 0,
-                &label,
+                &ui::clip_ellipsis(
+                    &super::graph_inspector::public_text(&label),
+                    node.rect.width,
+                ),
                 Style::default().fg(th.muted),
             );
         }
@@ -218,15 +238,24 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
             style,
         );
         let activity = if node.members.len() > 1 {
-            "completed · enter expand"
+            "completed · enter expand".to_string()
+        } else if task.status == "cancelled" {
+            "cancelled".to_string()
+        } else if task.state == State::Attention {
+            format!(
+                "blocked · {}",
+                task.error.as_deref().unwrap_or(&task.artifact)
+            )
+        } else if task.status == "ready" {
+            "ready".to_string()
         } else {
-            task.error.as_deref().unwrap_or(&task.artifact)
+            task.error.as_deref().unwrap_or(&task.artifact).to_string()
         };
         cells.write(
             x + 1,
             y + 2,
             &ui::clip_ellipsis(
-                &super::graph_inspector::public_text(activity),
+                &super::graph_inspector::public_text(&activity),
                 node.rect.width - 2,
             ),
             text_style,
@@ -311,5 +340,22 @@ mod tests {
             assert!(rows.iter().all(|row| ui::run_width(&row.spans) <= width));
             assert!(rows.len() <= 34);
         }
+    }
+
+    #[test]
+    fn graph_canvas_labels_known_phases_and_distinguishes_cancelled() {
+        let mut model = model(240);
+        let run = model.graph_run.as_mut().unwrap();
+        run.tasks[5].phase = "implement".into();
+        run.tasks[7].status = "cancelled".into();
+        run.tasks[7].artifact = "cancelled".into();
+        let layout = layout_graph(run, &model.graph_canvas, 240, 34);
+        let text = lines(&model, &layout, 0)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("implement"));
+        assert!(text.contains("cancelled"));
     }
 }

@@ -1089,6 +1089,7 @@ pub fn blueprint_graph() -> GraphRunSheet {
     ];
     GraphRunSheet {
         id: "blueprint-fixture".into(),
+        phase: "implement".into(),
         goal: "Validate parallel execution".into(),
         lifecycle: "running".into(),
         mode: "complex".into(),
@@ -1100,6 +1101,23 @@ pub fn blueprint_graph() -> GraphRunSheet {
             .map(|(id, role, state, deps)| GraphTask {
                 id: id.into(),
                 role: role.into(),
+                phase: match role {
+                    "classifier" => "classify",
+                    "researcher" => "investigate",
+                    "planner" => "plan",
+                    "writer" | "test-analyzer" => "implement",
+                    "verifier" => "verify",
+                    "reviewer" => "review",
+                    _ => "",
+                }
+                .into(),
+                status: match state {
+                    State::Done => "succeeded",
+                    State::Active => "running",
+                    State::Failed => "failed",
+                    _ => "pending",
+                }
+                .into(),
                 state,
                 dependencies: deps.into_iter().map(str::to_owned).collect(),
                 policy: "read-only".into(),
@@ -2017,6 +2035,10 @@ pub fn dress_screen(model: &mut Model, id: &str) {
         }
         "4d" => sheet(model, Screen::Export),
         "5a" => sheet(model, Screen::GraphRun),
+        "blueprint" => {
+            sheet(model, Screen::GraphRun);
+            model.graph_run = Some(blueprint_graph());
+        }
         "5b" => sheet(model, Screen::Vectors),
         "5c" => sheet(model, Screen::Governor),
         "5d" => sheet(model, Screen::Securitas),

@@ -136,7 +136,7 @@ pub fn layout_graph(
     } else {
         5
     };
-    let mut rows = BTreeMap::<usize, usize>::new();
+    let mut occupied = BTreeMap::<usize, BTreeMap<usize, usize>>::new();
     let order: BTreeMap<_, _> = canvas
         .node_order
         .iter()
@@ -146,6 +146,7 @@ pub fn layout_graph(
     let mut peers: Vec<_> = (0..run.tasks.len()).collect();
     peers.sort_by_key(|&i| {
         (
+            depths[i],
             order
                 .get(run.tasks[i].id.as_str())
                 .copied()
@@ -155,9 +156,27 @@ pub fn layout_graph(
     });
     let mut slots = vec![0; run.tasks.len()];
     for i in peers {
-        let row = rows.entry(depths[i]).or_default();
-        slots[i] = *row;
-        *row += 1;
+        // Align a child with a declared parent when the lane has room. First-
+        // seen peers reserve their slots first, so newly appended workers do
+        // not displace them. Path compression avoids quadratic sibling scans.
+        let preferred = run.tasks[i]
+            .dependencies
+            .iter()
+            .filter_map(|id| ids.get(id.as_str()).map(|&parent| slots[parent]))
+            .min()
+            .unwrap_or(0);
+        let lane = occupied.entry(depths[i]).or_default();
+        let mut row = preferred;
+        let mut path = Vec::new();
+        while let Some(&next) = lane.get(&row) {
+            path.push(row);
+            row = next;
+        }
+        for visited in path {
+            lane.insert(visited, row + 1);
+        }
+        lane.insert(row, row + 1);
+        slots[i] = row;
     }
     for (i, task) in run.tasks.iter().enumerate() {
         let depth = depths[i];
@@ -184,24 +203,11 @@ pub fn layout_graph(
     }
     for (from, next) in children.iter().enumerate() {
         for &to in next {
-            let start = layout.nodes[from].rect;
-            let end = layout.nodes[to].rect;
-            let a = (start.right(), start.y + start.height / 2);
-            let b = (end.x.saturating_sub(1), end.y + end.height / 2);
-            let mid = start.right().saturating_add(2);
-            let points = if depths[to] > depths[from] + 1 {
-                vec![
-                    a,
-                    (mid, a.1),
-                    (mid, 1),
-                    (b.0.saturating_sub(1), 1),
-                    (b.0.saturating_sub(1), b.1),
-                    b,
-                ]
-            } else {
-                vec![a, (mid, a.1), (mid, b.1), b]
-            };
-            layout.edges.push(LayoutEdge { from, to, points });
+            layout.edges.push(LayoutEdge {
+                from,
+                to,
+                points: Vec::new(),
+            });
         }
     }
     fold_completed(layout, run, canvas)
@@ -229,6 +235,7 @@ fn fold_completed(
             || task.role.is_empty()
             || task.role.contains("verif")
             || task.role.contains("review")
+            || matches!(task.phase.as_str(), "verify" | "review")
             || task
                 .dependencies
                 .iter()
@@ -239,7 +246,13 @@ fn fold_completed(
         }
         let incoming: BTreeSet<_> = task.dependencies.iter().collect();
         groups
-            .entry((node.depth, &task.role, incoming, &outgoing[node.task_index]))
+            .entry((
+                node.depth,
+                &task.role,
+                &task.phase,
+                incoming,
+                &outgoing[node.task_index],
+            ))
             .or_insert_with(Vec::new)
             .push(node.task_index);
     }
@@ -297,7 +310,10 @@ fn fold_completed(
             let b = nodes[to].rect;
             let start = (a.right(), a.y + a.height / 2);
             let end = (b.x - 1, b.y + b.height / 2);
-            let mid = a.right() + 2;
+            // Independent destinations use separate corridor tracks. Equal
+            // destinations may share a join; unrelated joins must not become
+            // one apparent vertical bus. Coordinates keep routing stable.
+            let mid = a.right() + 1 + (b.y / (b.height + 2)) % 4;
             let points = if nodes[to].depth > nodes[from].depth + 1 {
                 vec![
                     start,
@@ -307,6 +323,8 @@ fn fold_completed(
                     (end.0 - 1, end.1),
                     end,
                 ]
+            } else if start.1 == end.1 {
+                vec![start, end]
             } else {
                 vec![start, (mid, start.1), (mid, end.1), end]
             };
@@ -353,9 +371,10 @@ mod tests {
         assert_eq!(layout.nodes.len(), 4);
         assert_eq!(layout.edges.len(), 4);
         assert_eq!(layout, layout_graph(&run, &canvas, 120, 30));
-        let ids: std::collections::BTreeSet<_> = layout.nodes.iter().map(|n| &n.id).collect();
+        let ids: std::collections::BTreeSet<_> =
+            layout.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids.len(), 4);
-        assert!(ids.contains(&"right".to_string()));
+        assert!(ids.contains("right"));
         for edge in &layout.edges {
             assert!(layout.nodes[edge.from].rect.right() < layout.nodes[edge.to].rect.x);
         }
@@ -375,6 +394,33 @@ mod tests {
             assert!(layout.inspector.right() <= width);
             assert!(layout.inspector.bottom() <= height);
         }
+    }
+
+    #[test]
+    fn graph_layout_separates_unrelated_join_routes() {
+        let run = crate::davinci::fixtures::blueprint_graph();
+        let layout = layout_graph(&run, &GraphCanvasState::default(), 120, 34);
+        let buses = |id: &str| {
+            layout
+                .edges
+                .iter()
+                .filter(|e| layout.nodes[e.to].id == id)
+                .flat_map(|e| e.points.windows(2))
+                .filter(|p| p[0].0 == p[1].0 && p[0].1 != p[1].1)
+                .map(|p| p[0].0)
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(buses("blocked").is_disjoint(&buses("review")));
+    }
+
+    #[test]
+    fn graph_layout_aligns_declared_branches_without_false_horizontal_paths() {
+        let run = crate::davinci::fixtures::blueprint_graph();
+        let layout = layout_graph(&run, &GraphCanvasState::default(), 120, 34);
+        let y = |id: &str| layout.nodes.iter().find(|n| n.id == id).unwrap().rect.y;
+        assert_eq!(y("failure"), y("blocked"));
+        assert_eq!(y("writer"), y("review"));
+        assert_ne!(y("writer"), y("blocked"));
     }
 
     #[test]
