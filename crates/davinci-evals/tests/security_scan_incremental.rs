@@ -3,7 +3,11 @@ use davinci_evals::run_offline_optimization_gate;
 #[test]
 fn security_scan_incremental() {
     let report = run_offline_optimization_gate();
-    assert!(report.passed, "offline gate failures: {:?}", report.failures);
+    assert!(
+        report.passed,
+        "offline gate failures: {:?}",
+        report.failures
+    );
     let result = report
         .results
         .iter()

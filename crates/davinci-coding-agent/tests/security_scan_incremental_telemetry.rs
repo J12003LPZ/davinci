@@ -1,6 +1,4 @@
-use davinci_coding_agent::native_extensions::{
-    SecurityScanController, SecurityVerifyRequest,
-};
+use davinci_coding_agent::native_extensions::{SecurityScanController, SecurityVerifyRequest};
 use std::fs;
 
 #[test]
@@ -20,7 +18,11 @@ fn security_scan_incremental_telemetry() {
         .unwrap();
     let cold = controller.current().unwrap().coverage;
     assert_eq!(
-        (cold.files_scanned_cold, cold.files_reused, cold.files_rescanned),
+        (
+            cold.files_scanned_cold,
+            cold.files_reused,
+            cold.files_rescanned
+        ),
         (2, 0, 0)
     );
     assert_eq!((cold.cache_read_errors, cold.cache_write_errors), (0, 0));
@@ -34,7 +36,11 @@ fn security_scan_incremental_telemetry() {
         .unwrap();
     let warm = controller.current().unwrap().coverage;
     assert_eq!(
-        (warm.files_scanned_cold, warm.files_reused, warm.files_rescanned),
+        (
+            warm.files_scanned_cold,
+            warm.files_reused,
+            warm.files_rescanned
+        ),
         (0, 2, 0)
     );
     assert_eq!((warm.cache_read_errors, warm.cache_write_errors), (0, 0));
