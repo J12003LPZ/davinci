@@ -1123,6 +1123,36 @@ pub struct ExportLedger {
 }
 
 /// One worker of a graph run (`5a`).
+/// Presentation state survives snapshot refreshes without owning execution state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphCanvasState {
+    pub follow_live: bool,
+    pub view_mode: GraphViewMode,
+    pub pan_x: i32,
+    pub pan_y: i32,
+    pub expanded_groups: std::collections::BTreeSet<String>,
+    pub selected_group: Option<String>,
+}
+
+impl Default for GraphCanvasState {
+    fn default() -> Self {
+        Self {
+            follow_live: true,
+            view_mode: GraphViewMode::Overview,
+            pan_x: 0,
+            pan_y: 0,
+            expanded_groups: Default::default(),
+            selected_group: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphViewMode {
+    Overview,
+    Focus,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GraphTask {
     pub id: String,
@@ -1741,6 +1771,7 @@ pub struct Model {
     pub export_ledger: Option<ExportLedger>,
     /// `5a` — the graph run.
     pub graph_run: Option<GraphRunSheet>,
+    pub graph_canvas: GraphCanvasState,
     /// `5b` — the vector index.
     pub vector_index: Option<VectorIndex>,
     /// `5c` — the governor's ledger.
@@ -1874,6 +1905,7 @@ impl Model {
             compaction: None,
             export_ledger: None,
             graph_run: None,
+            graph_canvas: GraphCanvasState::default(),
             vector_index: None,
             governor: None,
             security: None,
