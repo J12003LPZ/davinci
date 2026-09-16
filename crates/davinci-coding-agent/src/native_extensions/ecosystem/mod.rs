@@ -243,6 +243,8 @@ mod tests {
             task_id: "test-task".into(),
             role: Role::Researcher,
             tools: tools.clone(),
+            authorized_tools: tools.clone(),
+            initially_exposed_tools: tools.clone(),
             model: Some("claude-3-7-sonnet".into()),
             thinking_level: None,
             project_trusted: false,
@@ -308,10 +310,15 @@ mod tests {
             importance: 0.9,
             created_at: 1000,
             embedding: None,
+
+            embedding_identity: None,
             confidence: None,
             source_session_id: Some("session-123".into()),
             source_turn: Some(5),
             verification: None,
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -386,6 +393,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         learning.project_store.upsert_skill(record).unwrap();
@@ -555,6 +563,10 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: crate::native_extensions::learning::types::SkillApplicability {
+                task_types: vec!["integration".into()],
+                ..Default::default()
+            },
             pinned: false,
         };
         learning.project_store.upsert_skill(record).unwrap();
@@ -665,10 +677,15 @@ mod tests {
                     importance: 0.85,
                     created_at: 2000 + i as u64,
                     embedding: None,
+
+                    embedding_identity: None,
                     confidence: None,
                     source_session_id: None,
                     source_turn: None,
                     verification: None,
+                    source_paths: Vec::new(),
+                    source_state_hash: None,
+                    verified_at_revision: None,
                     use_count: 0,
                     last_used_at: None,
                     agent_profile_name: None,
@@ -834,10 +851,15 @@ mod tests {
                     importance: 0.9,
                     created_at: 1000 + i as u64,
                     embedding: None,
+
+                    embedding_identity: None,
                     confidence: None,
                     source_session_id: None,
                     source_turn: None,
                     verification: None,
+                    source_paths: Vec::new(),
+                    source_state_hash: None,
+                    verified_at_revision: None,
                     use_count: 0,
                     last_used_at: None,
                     agent_profile_name: None,
@@ -1098,6 +1120,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         learning.project_store.upsert_skill(l_record).unwrap();
@@ -1152,10 +1175,15 @@ mod tests {
                     importance: 0.9,
                     created_at: 1000 + i as u64,
                     embedding: None,
+
+                    embedding_identity: None,
                     confidence: None,
                     source_session_id: None,
                     source_turn: None,
                     verification: None,
+                    source_paths: Vec::new(),
+                    source_state_hash: None,
+                    verified_at_revision: None,
                     use_count: 0,
                     last_used_at: None,
                     agent_profile_name: None,
@@ -1230,10 +1258,15 @@ mod tests {
                     importance: 0.9,
                     created_at: 1000 + i as u64,
                     embedding: None,
+
+                    embedding_identity: None,
                     confidence: None,
                     source_session_id: None,
                     source_turn: None,
                     verification: None,
+                    source_paths: Vec::new(),
+                    source_state_hash: None,
+                    verified_at_revision: None,
                     use_count: 0,
                     last_used_at: None,
                     agent_profile_name: None,
@@ -1304,5 +1337,150 @@ mod tests {
 
         assert!(mem_count <= 4, "Memory hits must be <= 4");
         assert!(skill_count <= 2, "Skill candidates must be <= 2");
+    }
+
+    #[test]
+    fn injected_irrelevant_skill_is_not_credited_as_helpful() {
+        let dir = tempdir().unwrap();
+        let skills_root = dir.path().join(".pi").join("skills");
+        let learning_root = dir.path().join(".pi").join("learning");
+        std::fs::create_dir_all(&skills_root).unwrap();
+        std::fs::create_dir_all(&learning_root).unwrap();
+
+        let mut lines = Vec::new();
+        for (name, applicability) in [
+            (
+                "aaa-irrelevant",
+                json!({
+                    "languages": ["python"],
+                    "taskTypes": [],
+                    "pathGlobs": [],
+                    "requiredSignals": [],
+                    "verificationCategories": []
+                }),
+            ),
+            (
+                "zzz-relevant",
+                json!({
+                    "languages": ["rust"],
+                    "taskTypes": ["debugging"],
+                    "pathGlobs": [],
+                    "requiredSignals": [],
+                    "verificationCategories": []
+                }),
+            ),
+        ] {
+            let skill_dir = skills_root.join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            let skill_file = skill_dir.join("SKILL.md");
+            std::fs::write(
+                &skill_file,
+                format!(
+                    "---\nname: {name}\ndescription: shared workflow rust debugging\nroles: [writer]\n---\n# Workflow\nRun verification.\n"
+                ),
+            )
+            .unwrap();
+            lines.push(
+                json!({
+                    "skillId": format!("skill-{name}"),
+                    "name": name,
+                    "scope": "project",
+                    "origin": "learned_review",
+                    "status": "active",
+                    "path": skill_file,
+                    "contentHash": format!("hash-{name}"),
+                    "version": 1,
+                    "successCount": 0,
+                    "failureCount": 0,
+                    "neutralCount": 0,
+                    "lastUsedAtMs": null,
+                    "createdAtMs": 1,
+                    "updatedAtMs": 1,
+                    "pinned": false,
+                    "applicability": applicability
+                })
+                .to_string(),
+            );
+        }
+        std::fs::write(learning_root.join("skills.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let learning = crate::native_extensions::LearningController::new(dir.path(), None, None);
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/auth.rs"), "before").unwrap();
+        let mutation_root = dir.path().to_path_buf();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
+            if matches!(spec.expect, ArtifactKind::PatchReport) {
+                std::fs::write(mutation_root.join("src/auth.rs"), "after").unwrap();
+            }
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Trivial,
+                    complexity: Complexity::Trivial,
+                    rationale: "credit test".into(),
+                    research_tasks: vec![],
+                    milestones: None,
+                }),
+                ArtifactKind::PatchReport => Artifact::PatchReport(Box::new(PatchReport {
+                    changed_files: vec!["src/auth.rs".into()],
+                    summary: "debugged auth".into(),
+                    deviations: vec![],
+                    plan_invalidated: false,
+                    invalidation_reason: None,
+                })),
+                _ => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "ok".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+            };
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+        let deps = ControllerDeps {
+            runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, "all tests pass".into(), 5)),
+            config: GraphConfig {
+                verify_commands: vec![VerifyCommandSpec {
+                    command: "echo test".into(),
+                    name: "test".into(),
+                    from_plan: false,
+                }],
+                ..Default::default()
+            },
+            session_model: None,
+            session_thinking: None,
+            project_trusted: true,
+            on_update: Arc::new(|_, _| {}),
+            memory: Some(VectorMemory::new(dir.path().to_path_buf())),
+            learning: Some(learning),
+            governor: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        };
+        let run = run_graph(
+            RunOptions {
+                goal: "shared workflow rust debugging".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: Some(Complexity::Trivial),
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            deps,
+        );
+        assert_eq!(run.phase, Phase::Done);
+
+        let reloaded = crate::native_extensions::LearningController::new(dir.path(), None, None);
+        let relevant = reloaded.project_store.skill("zzz-relevant").unwrap();
+        let irrelevant = reloaded.project_store.skill("aaa-irrelevant").unwrap();
+        assert_eq!(relevant.success_count, 1);
+        assert_eq!(irrelevant.success_count, 0);
+        assert_eq!(irrelevant.neutral_count, 1);
     }
 }

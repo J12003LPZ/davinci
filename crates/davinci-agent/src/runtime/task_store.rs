@@ -216,15 +216,26 @@ fn open_exclusive(path: &Path) -> Result<File, TaskError> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        // Same platform locking contract as runtime/capacity.rs.
+        // Same platform locking contract as runtime/capacity.rs. A concurrent
+        // fork can briefly retain this open-file description until exec closes
+        // its CLOEXEC descriptor, so allow that handoff without weakening the
+        // single-writer lease.
         extern "C" {
             fn flock(fd: i32, operation: i32) -> i32;
         }
         const LOCK_EX: i32 = 2;
         const LOCK_NB: i32 = 4;
-        // SAFETY: file owns a live descriptor; flock does not retain pointers.
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
-            return Err(persistence(std::io::Error::last_os_error()));
+        const HANDOFF_RETRIES: usize = 10;
+        for attempt in 0..=HANDOFF_RETRIES {
+            // SAFETY: file owns a live descriptor; flock does not retain pointers.
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock || attempt == HANDOFF_RETRIES {
+                return Err(persistence(error));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     #[cfg(not(any(windows, unix)))]

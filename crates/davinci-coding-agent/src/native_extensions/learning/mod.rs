@@ -483,13 +483,49 @@ impl LearningController {
         max_skills: usize,
         token_cap: usize,
     ) -> Vec<SkillContextCandidate> {
+        self.graph_skill_candidates_with_embeddings(query, None, None, role, max_skills, token_cap)
+    }
+
+    pub fn graph_skill_candidates_with_embeddings(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        skill_embeddings: Option<&[Option<Vec<f32>>]>,
+        role: crate::native_extensions::graph::Role,
+        max_skills: usize,
+        token_cap: usize,
+    ) -> Vec<SkillContextCandidate> {
         let discovered = davinci_agent::discover_skills(&[
             self.project_skills_dir.clone(),
             self.global_skills_dir.clone(),
         ]);
         let mut ledger = self.project_store.skills();
         ledger.extend(self.global_store.skills());
-        select_graph_skill_candidates(query, role, &discovered, &ledger, max_skills, token_cap)
+        select_graph_skill_candidates_with_embeddings(
+            query,
+            query_embedding,
+            &discovered,
+            skill_embeddings,
+            &ledger,
+            role,
+            max_skills,
+            token_cap,
+        )
+    }
+
+    pub fn record_skill_usage_outcome(
+        &mut self,
+        skill: &SkillVersionRef,
+        signal: SkillUsageSignal,
+    ) -> Result<bool, String> {
+        let outcome = match signal {
+            SkillUsageSignal::VerifiedHelpful => SkillOutcome::VerifiedSuccess,
+            SkillUsageSignal::VerifiedFailureRelevant => SkillOutcome::VerifiedFailure,
+            SkillUsageSignal::Injected
+            | SkillUsageSignal::ScopeRelevant
+            | SkillUsageSignal::Neutral => SkillOutcome::Neutral,
+        };
+        self.record_skill_version_outcome(skill, outcome)
     }
 
     pub fn skill_view_tool(&self, _cwd: &Path, args: &Value) -> Result<ToolResult, ToolError> {
@@ -1770,6 +1806,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         controller.project_store.upsert_skill(skill_record).unwrap();
@@ -1815,6 +1852,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -1864,6 +1902,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         let global_record = SkillLedgerRecord {

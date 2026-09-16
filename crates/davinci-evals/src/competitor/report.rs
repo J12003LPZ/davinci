@@ -7,6 +7,41 @@ pub const MIN_REPETITIONS: u32 = 3;
 pub const MIN_PASS_RATE_DELTA: f64 = 0.03;
 pub const MAX_WALL_TIME_REGRESSION: f64 = 1.15;
 
+/// Whether a comparison controls the harness around a matched model or
+/// measures each product with its configured/default model stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonMode {
+    Harness,
+    Product,
+}
+
+impl Default for ComparisonMode {
+    fn default() -> Self {
+        Self::Product
+    }
+}
+
+impl ComparisonMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::Product => "product",
+        }
+    }
+
+    pub fn disclosure(self) -> &'static str {
+        match self {
+            Self::Harness => {
+                "Harness comparison: same-model and model-parity controls are required."
+            }
+            Self::Product => {
+                "Product comparison: each system uses its configured/default model stack."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComparisonClass {
@@ -27,6 +62,8 @@ impl ComparisonClass {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompetitorSuiteSummary {
+    #[serde(default)]
+    pub comparison_mode: ComparisonMode,
     pub comparison_class: ComparisonClass,
     pub shared_scenarios: usize,
     pub davinci_pass_rate: f64,
@@ -36,6 +73,17 @@ pub struct CompetitorSuiteSummary {
     pub competitor_unrelated_edit_rate: f64,
     pub davinci_wall_median_ms: f64,
     pub competitor_wall_median_ms: f64,
+}
+
+/// Refuse to combine harness and product observations in one ranking.
+pub fn reject_mixed_comparison_modes(modes: &[ComparisonMode]) -> Result<ComparisonMode, String> {
+    let Some(first) = modes.first().copied() else {
+        return Err("comparison report contains no modes".into());
+    };
+    if modes.iter().any(|mode| *mode != first) {
+        return Err("cannot aggregate harness and product comparison modes".into());
+    }
+    Ok(first)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +190,9 @@ pub fn claim_is_eligible(summary: &CompetitorSuiteSummary, inputs: CompetitorCla
 
 pub fn format_competitor_suite_summary(summary: &CompetitorSuiteSummary) -> String {
     format!(
-        "comparison_class={}\nshared_scenarios={}\ndavinci_pass_rate={:.4}\ncompetitor_pass_rate={:.4}\npass_rate_delta_ci95=({:.4}, {:.4})\ndavinci_unrelated_edit_rate={:.4}\ncompetitor_unrelated_edit_rate={:.4}\ndavinci_wall_median_ms={:.1}\ncompetitor_wall_median_ms={:.1}\n",
+        "comparison_mode={}\ndisclosure={}\ncomparison_class={}\nshared_scenarios={}\ndavinci_pass_rate={:.4}\ncompetitor_pass_rate={:.4}\npass_rate_delta_ci95=({:.4}, {:.4})\ndavinci_unrelated_edit_rate={:.4}\ncompetitor_unrelated_edit_rate={:.4}\ndavinci_wall_median_ms={:.1}\ncompetitor_wall_median_ms={:.1}\n",
+        summary.comparison_mode.as_str(),
+        summary.comparison_mode.disclosure(),
         summary.comparison_class.as_str(),
         summary.shared_scenarios,
         summary.davinci_pass_rate,
@@ -172,6 +222,7 @@ mod tests {
 
     fn passing_summary(comparison_class: ComparisonClass) -> CompetitorSuiteSummary {
         CompetitorSuiteSummary {
+            comparison_mode: ComparisonMode::Product,
             comparison_class,
             shared_scenarios: 150,
             davinci_pass_rate: 0.93,
@@ -213,6 +264,27 @@ mod tests {
         let summary = passing_summary(ComparisonClass::ProductSystem);
         assert!(claim_is_eligible(&summary, passing_inputs()));
         assert!(format_competitor_suite_summary(&summary).contains("product-system"));
+    }
+
+    #[test]
+    fn competitor_report_rejects_mixed_comparison_modes() {
+        assert_eq!(
+            reject_mixed_comparison_modes(&[ComparisonMode::Product, ComparisonMode::Product]),
+            Ok(ComparisonMode::Product)
+        );
+        assert!(reject_mixed_comparison_modes(
+            &[ComparisonMode::Harness, ComparisonMode::Product,]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn competitor_report_discloses_comparison_mode() {
+        let mut summary = passing_summary(ComparisonClass::HarnessControlled);
+        summary.comparison_mode = ComparisonMode::Harness;
+        let formatted = format_competitor_suite_summary(&summary);
+        assert!(formatted.contains("comparison_mode=harness"));
+        assert!(formatted.contains("same-model"));
     }
 
     #[test]

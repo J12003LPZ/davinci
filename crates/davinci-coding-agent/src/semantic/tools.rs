@@ -70,26 +70,13 @@ pub fn uri_to_path(uri: &str) -> Result<PathBuf, String> {
 
 /// Validates whether a target path is contained within an authorized workspace root.
 pub fn is_path_in_root(target: &Path, root: &Path) -> bool {
-    let clean_root = strip_verbatim(&root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
-    let clean_target = if let Ok(canon) = target.canonicalize() {
-        strip_verbatim(&canon)
+    let target = if target.is_absolute() {
+        target.to_path_buf()
     } else {
-        let mut curr = target.to_path_buf();
-        if !curr.is_absolute() {
-            curr = root.join(curr);
-        }
-        strip_verbatim(&curr)
+        root.join(target)
     };
-    clean_target.starts_with(&clean_root)
-}
-
-fn strip_verbatim(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        path.to_path_buf()
-    }
+    let (outside_lexical, symlink_escape) = davinci_agent::check_path_boundary(root, &target);
+    !outside_lexical && !symlink_escape
 }
 
 /// Verifies whether the on-disk file content matches the expected hash.
@@ -154,5 +141,13 @@ mod tests {
 
         assert!(is_path_in_root(&inside, dir.path()));
         assert!(!is_path_in_root(&outside, dir.path()));
+        assert!(!is_path_in_root(
+            &dir.path()
+                .join("missing")
+                .join("..")
+                .join("..")
+                .join("escape.rs"),
+            dir.path()
+        ));
     }
 }

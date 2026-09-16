@@ -175,9 +175,11 @@ pub fn execute_scenario(
             &process_result.stderr,
         ) {
             let label = match disposition {
-                RunDisposition::BehavioralResult => "behavioral result",
+                RunDisposition::Completed => "completed",
+                RunDisposition::VerificationFailed => "verification failure",
                 RunDisposition::InfrastructureFailure => "infrastructure failure",
                 RunDisposition::ConfigurationFailure => "configuration failure",
+                RunDisposition::TimedOut => "timed out",
             };
             let diagnostic = process_result.bounded_diagnostic();
             return Err(format!(
@@ -213,6 +215,13 @@ pub fn execute_scenario(
         verification.extend(run_verification_commands(&reproducer_commands, &workspace)?);
         for result in verification.iter().skip(baseline_count) {
             trace.verification.push(verification_event(result));
+        }
+        if let Some(failed) = verification
+            .iter()
+            .skip(baseline_count)
+            .find(|result| !result.passed)
+        {
+            return Err(format!("verification failed: {}", failed.command));
         }
 
         artifacts.write_json(
@@ -256,7 +265,7 @@ pub fn execute_scenario(
         verification,
         workspace_diff,
         infrastructure_error,
-        disposition: RunDisposition::BehavioralResult,
+        disposition: RunDisposition::Completed,
     }
 }
 

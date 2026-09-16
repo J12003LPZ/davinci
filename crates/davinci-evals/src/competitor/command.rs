@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::behavior::{run_verification_commands, VerificationCommand, VerificationResult};
 
+use super::probe::{probe_harness, HarnessCapabilities};
+
 #[derive(Debug, Clone)]
 pub struct ExternalTask {
     pub repo_path: PathBuf,
@@ -47,6 +49,77 @@ pub trait ExternalHarness: Send + Sync {
         }
         self.run(task).map(|run| (run, Vec::new()))
     }
+}
+
+/// Marker contract for named competitor adapters. The execution and
+/// isolation boundary remains `ExternalHarness`; adapters only add an
+/// explicit identity and capability probe for a specific external CLI.
+pub trait CompetitorRunner: ExternalHarness {}
+
+pub fn resolve_runner_binary(environment_name: &str, default_binary: &str) -> PathBuf {
+    std::env::var(environment_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default_binary))
+}
+
+fn resolve_executable(binary: PathBuf) -> PathBuf {
+    if binary.is_absolute() || binary.components().count() > 1 {
+        return fs::canonicalize(&binary).unwrap_or(binary);
+    }
+
+    let Some(path) = std::env::var_os("PATH") else {
+        return binary;
+    };
+    #[cfg(not(windows))]
+    let names = vec![binary.clone()];
+    #[cfg(windows)]
+    let mut names = vec![binary.clone()];
+    #[cfg(windows)]
+    if binary.extension().is_none() {
+        let extensions = std::env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|extension| !extension.is_empty())
+                    .map(str::to_ascii_lowercase)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|extensions| !extensions.is_empty())
+            .unwrap_or_else(|| vec![".com".into(), ".exe".into(), ".bat".into(), ".cmd".into()]);
+        names.extend(extensions.into_iter().map(|extension| {
+            let mut name = binary.as_os_str().to_os_string();
+            name.push(extension);
+            PathBuf::from(name)
+        }));
+    }
+
+    for directory in std::env::split_paths(&path) {
+        for name in &names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return fs::canonicalize(&candidate).unwrap_or(candidate);
+            }
+        }
+    }
+    binary
+}
+
+pub fn probe_supported_runner(
+    runner_name: &str,
+    binary: &Path,
+) -> Result<HarnessCapabilities, String> {
+    let capabilities = probe_harness(binary)?;
+    if capabilities.version.is_none() {
+        return Err(format!(
+            "competitor runner '{runner_name}' is unsupported: {} did not report a version",
+            binary.display()
+        ));
+    }
+    Ok(capabilities)
 }
 
 pub fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -171,7 +244,7 @@ impl CommandHarness {
     ) -> Self {
         Self {
             harness_name: name.into(),
-            binary: binary.into(),
+            binary: resolve_executable(binary.into()),
             extra_args,
         }
     }

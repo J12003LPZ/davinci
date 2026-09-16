@@ -16,9 +16,145 @@ pub const DEFAULT_GRAPH_MEMORY_HITS: usize = 4;
 pub const DEFAULT_GRAPH_SKILL_TOKENS: usize = 1_000;
 pub const DEFAULT_GRAPH_SKILL_COUNT: usize = 2;
 
+pub const WORKER_CONTEXT_QUERY_MAX_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerContextQuery {
+    pub role: Option<crate::native_extensions::graph::Role>,
+    pub node_objective: String,
+    pub graph_goal: String,
+    pub target_hints: Vec<String>,
+    pub failure_hint: Option<String>,
+}
+
+impl WorkerContextQuery {
+    pub fn render(&self) -> String {
+        fn bounded(value: &str, limit: usize) -> String {
+            value.trim().chars().take(limit).collect()
+        }
+
+        let mut lines = Vec::new();
+        if let Some(role) = self.role {
+            lines.push(format!("role: {}", role.as_str()));
+        }
+        if !self.node_objective.trim().is_empty() {
+            lines.push(format!("objective: {}", bounded(&self.node_objective, 900)));
+        }
+        let mut targets = self
+            .target_hints
+            .iter()
+            .map(|value| bounded(value, 180))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        if !targets.is_empty() {
+            lines.push(format!("targets: {}", targets.join(", ")));
+        }
+        if !self.graph_goal.trim().is_empty() {
+            lines.push(format!("goal: {}", bounded(&self.graph_goal, 650)));
+        }
+        if let Some(failure) = self
+            .failure_hint
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("failure: {}", bounded(failure, 420)));
+        }
+        lines
+            .join("\n")
+            .chars()
+            .take(WORKER_CONTEXT_QUERY_MAX_CHARS)
+            .collect()
+    }
+
+    /// Render a compact query for reusable skill retrieval. Worker briefings contain
+    /// policy text and execution instructions that are useful to memory retrieval but
+    /// can dilute lexical skill relevance. Prefer the user goal and task-local signals;
+    /// fall back to the node objective only when no stronger signal exists.
+    pub fn render_skill_query(&self) -> String {
+        fn bounded(value: &str, limit: usize) -> String {
+            value.trim().chars().take(limit).collect()
+        }
+
+        let mut lines = Vec::new();
+        if !self.graph_goal.trim().is_empty() {
+            lines.push(bounded(&self.graph_goal, 900));
+        }
+
+        let mut targets = self
+            .target_hints
+            .iter()
+            .map(|value| bounded(value, 180))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        if !targets.is_empty() {
+            lines.push(targets.join(" "));
+        }
+
+        if let Some(failure) = self
+            .failure_hint
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(bounded(failure, 420));
+        }
+
+        if lines.is_empty() && !self.node_objective.trim().is_empty() {
+            lines.push(bounded(&self.node_objective, 900));
+        }
+
+        lines
+            .join("\n")
+            .chars()
+            .take(WORKER_CONTEXT_QUERY_MAX_CHARS)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextUtilityInput {
+    pub relevance: f32,
+    pub confidence: f32,
+    pub applicability: f32,
+    pub freshness: f32,
+    pub estimated_tokens: usize,
+}
+
+pub fn context_utility(input: ContextUtilityInput) -> f32 {
+    let numerator = input.relevance.clamp(0.0, 1.0)
+        * input.confidence.clamp(0.0, 1.0)
+        * input.applicability.clamp(0.0, 1.0)
+        * input.freshness.clamp(0.0, 1.0);
+    numerator / (input.estimated_tokens.max(1) as f32).sqrt()
+}
+
+fn memory_context_utility(hit: &MemoryContextHit) -> f32 {
+    context_utility(ContextUtilityInput {
+        relevance: hit.score,
+        confidence: 0.90,
+        applicability: 1.0,
+        freshness: 1.0,
+        estimated_tokens: hit.estimated_tokens,
+    })
+}
+
+fn skill_context_utility(skill: &SkillContextCandidate) -> f32 {
+    context_utility(ContextUtilityInput {
+        relevance: skill.score,
+        confidence: 0.95,
+        applicability: 1.0,
+        freshness: 1.0,
+        estimated_tokens: skill.estimated_tokens,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPacketRequest<'a> {
     pub prompt: &'a str,
+    pub skill_prompt: Option<&'a str>,
     pub role: Option<crate::native_extensions::graph::Role>,
     pub token_cap: usize,
     pub include_skills: bool,
@@ -29,6 +165,7 @@ impl<'a> ContextPacketRequest<'a> {
     pub fn new(prompt: &'a str) -> Self {
         Self {
             prompt,
+            skill_prompt: None,
             role: None,
             token_cap: DEFAULT_GRAPH_CONTEXT_TOKENS,
             include_skills: true,
@@ -37,6 +174,11 @@ impl<'a> ContextPacketRequest<'a> {
 
     pub fn with_role(mut self, role: crate::native_extensions::graph::Role) -> Self {
         self.role = Some(role);
+        self
+    }
+
+    pub fn with_skill_prompt(mut self, prompt: &'a str) -> Self {
+        self.skill_prompt = Some(prompt);
         self
     }
 
@@ -148,7 +290,8 @@ pub fn build_context_packet(
         let role = request
             .role
             .unwrap_or(crate::native_extensions::graph::Role::Writer);
-        learning.graph_skill_candidates(request.prompt, role, DEFAULT_GRAPH_SKILL_COUNT, skill_cap)
+        let skill_prompt = request.skill_prompt.unwrap_or(request.prompt);
+        learning.graph_skill_candidates(skill_prompt, role, DEFAULT_GRAPH_SKILL_COUNT, skill_cap)
     } else {
         Vec::new()
     };
@@ -167,7 +310,7 @@ pub fn build_context_packet(
     {
         match (memory_hits.last(), skill_candidates.last()) {
             (Some(m), Some(s)) => {
-                if m.score <= s.score {
+                if memory_context_utility(m) <= skill_context_utility(s) {
                     memory_hits.pop();
                 } else {
                     skill_candidates.pop();
@@ -360,5 +503,86 @@ mod tests {
         );
         assert_eq!(constrained.skill_candidates_considered, 1);
         assert!(constrained.is_empty());
+    }
+
+    #[test]
+    fn worker_context_query_is_node_specific_and_deterministic() {
+        use crate::native_extensions::graph::Role;
+
+        let writer = WorkerContextQuery {
+            role: Some(Role::Writer),
+            node_objective: "fix parser state handling".into(),
+            graph_goal: "repair authentication flow".into(),
+            target_hints: vec![
+                "src/parser.rs".into(),
+                "AuthState".into(),
+                "src/parser.rs".into(),
+            ],
+            failure_hint: Some("verification failed in parser tests".into()),
+        };
+        let researcher = WorkerContextQuery {
+            role: Some(Role::Researcher),
+            node_objective: "locate token validation call sites".into(),
+            graph_goal: "repair authentication flow".into(),
+            target_hints: vec!["src/token.rs".into()],
+            failure_hint: None,
+        };
+
+        let first = writer.render();
+        assert_eq!(first, writer.render());
+        assert_ne!(first, researcher.render());
+        assert!(first.contains("role: writer"));
+        assert!(first.contains("objective: fix parser state handling"));
+        assert_eq!(first.matches("src/parser.rs").count(), 1);
+        assert!(first.chars().count() <= 2_000);
+    }
+
+    #[test]
+    fn context_utility_prefers_verified_relevant_value_per_token() {
+        let concise = context_utility(ContextUtilityInput {
+            relevance: 0.82,
+            confidence: 0.95,
+            applicability: 1.0,
+            freshness: 1.0,
+            estimated_tokens: 120,
+        });
+        let bloated = context_utility(ContextUtilityInput {
+            relevance: 0.86,
+            confidence: 0.95,
+            applicability: 1.0,
+            freshness: 1.0,
+            estimated_tokens: 900,
+        });
+        let stale = context_utility(ContextUtilityInput {
+            relevance: 0.95,
+            confidence: 0.95,
+            applicability: 1.0,
+            freshness: 0.45,
+            estimated_tokens: 120,
+        });
+        assert!(concise > bloated);
+        assert!(concise > stale);
+    }
+}
+
+#[cfg(test)]
+mod skill_query_separation_regressions {
+    use super::*;
+
+    #[test]
+    fn skill_query_is_not_diluted_by_worker_briefing() {
+        let query = WorkerContextQuery {
+            role: Some(crate::native_extensions::graph::Role::Writer),
+            node_objective: "# Implement\n\n## Goal\nshared workflow rust debugging\n\n## Mode\nThis was classified trivial: implement the goal directly, smallest reasonable change.\n\n## Hard rules\n- You are the only process allowed to modify files.\n- Never run git commit, git push, or any git state change.\n- Run the plan's tests yourself before submitting.\n- If the plan cannot work as written, report the reason."
+                .into(),
+            graph_goal: "shared workflow rust debugging".into(),
+            target_hints: vec![],
+            failure_hint: None,
+        };
+
+        let skill_query = query.render_skill_query();
+        assert_eq!(skill_query, "shared workflow rust debugging");
+        assert!(!skill_query.contains("Hard rules"));
+        assert!(!skill_query.contains("git commit"));
     }
 }

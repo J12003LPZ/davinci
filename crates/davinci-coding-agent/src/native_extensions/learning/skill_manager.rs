@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::native_extensions::learning::store::LearningStore;
 use crate::native_extensions::learning::types::{
-    ArtifactStatus, LearningScope, SkillLedgerRecord, SkillOrigin,
+    ArtifactStatus, LearningScope, SkillApplicability, SkillLedgerRecord, SkillOrigin,
 };
 use crate::native_extensions::vector_memory::{content_hash, redact_secrets};
 
@@ -283,6 +283,14 @@ impl SkillManager {
             .unwrap_or("")
             .trim();
 
+        let applicability: SkillApplicability = args
+            .get("applicability")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| ToolError::Failed(format!("invalid applicability metadata: {e}")))?
+            .unwrap_or_default();
+
         let content = if raw_body.starts_with("---") {
             redact_secrets(raw_body)
         } else {
@@ -317,6 +325,7 @@ impl SkillManager {
             last_used_at_ms: None,
             created_at_ms: now_ms(),
             updated_at_ms: now_ms(),
+            applicability,
             pinned: false,
         };
 
@@ -506,8 +515,14 @@ impl SkillManager {
             last_used_at_ms: None,
             created_at_ms: now_ms(),
             updated_at_ms: now_ms(),
+            applicability: Default::default(),
             pinned: false,
         });
+        if let Some(value) = args.get("applicability") {
+            let parsed: SkillApplicability = serde_json::from_value(value.clone())
+                .map_err(|e| ToolError::Failed(format!("invalid applicability metadata: {e}")))?;
+            rec.applicability = parsed;
+        }
         rec.version = updated_version;
         rec.content_hash = new_hash.clone();
         rec.updated_at_ms = now_ms();
@@ -802,6 +817,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -851,6 +867,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -903,6 +920,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -952,6 +970,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -1003,6 +1022,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -1055,6 +1075,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -1118,6 +1139,7 @@ mod tests {
                 last_used_at_ms: None,
                 created_at_ms: 1000,
                 updated_at_ms: 1000,
+                applicability: Default::default(),
                 pinned: false,
             })
             .unwrap();
@@ -1162,6 +1184,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         p_store.upsert_skill(rec.clone()).unwrap();
@@ -1239,6 +1262,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         p_store.upsert_skill(rec).unwrap();

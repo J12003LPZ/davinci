@@ -6,7 +6,9 @@
 //! PI_GRAPH_ROLE          - the worker's role (drives bash policy + tool bans)
 //! PI_GRAPH_EXPECT        - the artifact kind graph_submit validates against
 //! PI_GRAPH_ARTIFACT_PATH - absolute path graph_submit writes to
-//! PI_GRAPH_EXTRA_TOOLS   - the parent's full --tools allowlist
+//! PI_GRAPH_EXTRA_TOOLS   - legacy parent's full --tools allowlist
+//! PI_GRAPH_AUTHORIZED_TOOLS - parent-owned authorization surface
+//! PI_GRAPH_INITIAL_TOOLS - provider-facing initial schema projection
 //! ```
 //!
 //! `graph_submit` is the worker's single exit door: validation errors come
@@ -83,7 +85,10 @@ impl GraphWorkerContext {
             std::env::var("PI_GRAPH_ROLE").ok().as_deref(),
             std::env::var("PI_GRAPH_EXPECT").ok().as_deref(),
             std::env::var("PI_GRAPH_ARTIFACT_PATH").ok().as_deref(),
-            std::env::var("PI_GRAPH_EXTRA_TOOLS").ok().as_deref(),
+            std::env::var("PI_GRAPH_AUTHORIZED_TOOLS")
+                .ok()
+                .or_else(|| std::env::var("PI_GRAPH_EXTRA_TOOLS").ok())
+                .as_deref(),
             has_coordinator,
             task_contract,
         )

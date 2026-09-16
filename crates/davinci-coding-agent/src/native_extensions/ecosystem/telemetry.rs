@@ -1,6 +1,7 @@
 //! Structured ecosystem integration telemetry across Memory, Skills, Governor, Cache, Graph, Security, and Learning.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -37,6 +38,9 @@ pub struct EcosystemStats {
     pub graph_workers: u64,
     #[serde(alias = "graph_cost_usd")]
     pub graph_cost_usd: f64,
+    #[serde(alias = "graph_cache_by_role")]
+    pub graph_cache_by_role:
+        BTreeMap<crate::native_extensions::graph::Role, super::cache_affinity::RoleCacheStats>,
     #[serde(alias = "security_gate_triggered")]
     pub security_gate_triggered: bool,
     #[serde(alias = "security_result", skip_serializing_if = "Option::is_none")]
@@ -69,6 +73,7 @@ impl EcosystemStats {
             && self.cache_write_tokens == 0
             && self.graph_workers == 0
             && self.graph_cost_usd == 0.0
+            && self.graph_cache_by_role.is_empty()
             && !self.security_gate_triggered
             && self.security_result.is_none()
             && self.learning_reviews_dispatched == 0
@@ -109,6 +114,18 @@ impl EcosystemStats {
         self.cache_read_tokens += usage.cache_read;
         self.cache_write_tokens += usage.cache_write;
         self.graph_cost_usd += usage.cost_usd;
+    }
+
+    #[allow(dead_code)]
+    pub fn record_graph_cache_usage(
+        &mut self,
+        role: crate::native_extensions::graph::Role,
+        usage: &crate::native_extensions::graph::WorkerUsage,
+    ) {
+        self.graph_cache_by_role
+            .entry(role)
+            .or_default()
+            .add(&super::cache_affinity::RoleCacheStats::from_usage(usage));
     }
 
     #[allow(dead_code)]
@@ -292,6 +309,7 @@ mod tests {
             cache_write_tokens: 400,
             graph_workers: 5,
             graph_cost_usd: 0.042,
+            graph_cache_by_role: BTreeMap::new(),
             security_gate_triggered: true,
             security_result: Some("passed".into()),
             learning_reviews_dispatched: 1,

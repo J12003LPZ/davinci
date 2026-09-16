@@ -13,10 +13,15 @@ use super::briefings::{
 use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
 use super::mutation::{capture_baseline, capture_graph_delta, GraphMutation};
 use super::operations;
+use super::recovery::{
+    build_retry_context_delta, classify_worker_failure, retry_decision, RetryDecision,
+    WorkerFailureClass,
+};
 use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
 use super::review_coverage::{chunk_graph_mutation, coverage_complete, ReviewCoverage};
 use super::roles::{
-    ensure_governor_recovery_tool, requires_task_coordinator, role_for_research_kind, role_tools,
+    ensure_governor_recovery_tool, initial_worker_tools, requires_task_coordinator,
+    role_for_research_kind, role_tools,
 };
 use super::store::{
     artifact_path, create_run_dir, new_run_id, now_ms, save_run, transcript_path, write_artifact,
@@ -28,7 +33,7 @@ use super::topology::{
 use super::types::{
     Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters,
     GraphLifecycle, GraphRun, GraphTaskState, ImplementationPlan, Phase, ResearchKind, ReviewIssue,
-    Role, Severity, TaskStatus, Verdict, VerificationResult, WorkerSpec, WorkerUsage,
+    Role, Severity, TaskStatus, Verdict, VerificationResult, WorkerResult, WorkerSpec, WorkerUsage,
 };
 use super::verify::{
     collect_verify_commands, nothing_ran, run_verification, CollectInput, VerifyExec,
@@ -421,7 +426,9 @@ impl GraphExecution {
         let run = self.snapshot();
         let role = task.role;
         let configured_model = self.deps.config.models.get(&role).cloned();
-        let has_recovery = tools.iter().any(|t| t == "retrieve_output");
+        let authorized_tools = self.authorized_worker_tools(role);
+        let has_recovery = authorized_tools.iter().any(|t| t == "retrieve_output");
+        let initially_exposed_tools = initial_worker_tools(role, &authorized_tools);
         WorkerSpec {
             task_id: task.id.clone(),
             role,
@@ -437,6 +444,8 @@ impl GraphExecution {
                 .then(|| self.deps.session_thinking.clone())
                 .flatten(),
             tools,
+            authorized_tools,
+            initially_exposed_tools,
             extra_extensions: if self.deps.project_trusted {
                 self.deps.config.worker_extensions.clone()
             } else {
@@ -539,7 +548,13 @@ impl GraphExecution {
                 }
             }
 
-            run.tasks.push(task.clone());
+            if !run
+                .tasks
+                .iter()
+                .any(|entry| entry.id == task_id && entry.status == TaskStatus::Pending)
+            {
+                run.tasks.push(task.clone());
+            }
         }
 
         if let Some((artifact, usage, stored_fingerprint)) =
@@ -613,6 +628,13 @@ impl GraphExecution {
         }
 
         let authorized_tools = self.authorized_worker_tools(role);
+        let retry_query = crate::native_extensions::ecosystem::WorkerContextQuery {
+            role: Some(role),
+            node_objective: briefing.clone(),
+            graph_goal: self.options.goal.clone(),
+            target_hints: task.focus.clone().into_iter().collect(),
+            failure_hint: None,
+        };
         let capability_selection = {
             let guard = self
                 .learning
@@ -620,20 +642,21 @@ impl GraphExecution {
                 .unwrap_or_else(|error| error.into_inner());
             match (&self.deps.memory, guard.as_ref()) {
                 (Some(mem), Some(learn)) => {
-                    let prompt = if !self.options.goal.trim().is_empty() {
-                        &self.options.goal
-                    } else {
-                        &briefing
-                    };
+                    let context_query = retry_query.render();
+                    let skill_query = retry_query.render_skill_query();
                     crate::native_extensions::ecosystem::select_capabilities(
                         mem,
                         learn,
                         authorized_tools,
-                        crate::native_extensions::ecosystem::CapabilityRequest::new(prompt, role)
-                            .with_context_token_cap(
-                                crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
-                            )
-                            .with_skills(true),
+                        crate::native_extensions::ecosystem::CapabilityRequest::new(
+                            &context_query,
+                            role,
+                        )
+                        .with_skill_prompt(&skill_query)
+                        .with_context_token_cap(
+                            crate::native_extensions::ecosystem::DEFAULT_GRAPH_CONTEXT_TOKENS,
+                        )
+                        .with_skills(true),
                     )
                 }
                 _ => crate::native_extensions::ecosystem::CapabilitySelection {
@@ -677,8 +700,11 @@ impl GraphExecution {
             }
         }
 
-        let mut last_failure: Option<String> = None;
+        let mut last_failure_class: Option<WorkerFailureClass> = None;
+        let mut retry_context_delta = crate::native_extensions::ecosystem::ContextPacket::empty();
+        let mut attempts_run = 0;
         for attempt in 1..=NODE_ATTEMPTS {
+            attempts_run = attempt;
             if self.exec_abort.load(Ordering::Relaxed) {
                 self.end_task(&task_id, TaskStatus::Cancelled, None);
                 self.checkpoint(None);
@@ -710,22 +736,36 @@ impl GraphExecution {
             }
             self.checkpoint(Some(&format!("{task_id}: attempt {attempt} ({role})")));
 
-            let timed_out_before = last_failure
-                .as_ref()
-                .is_some_and(|failure| failure.contains("timed out"));
             let attempt_briefing = if attempt == 1 {
                 briefing.clone()
-            } else if timed_out_before {
-                format!(
-                    "{briefing}\n\nRETRY NOTICE: the previous worker ran out of time before submitting. \
-                     You have twice the time now, but work economically: rely on the evidence already in this \
-                     briefing, avoid repository-wide searches, and call graph_submit well before the deadline."
-                )
             } else {
-                format!(
-                    "{briefing}\n\nRETRY NOTICE: the previous worker exited without a valid submitted artifact. \
-                     Complete the work and call graph_submit exactly once before stopping."
-                )
+                let notice = match last_failure_class {
+                    Some(WorkerFailureClass::Timeout) => {
+                        "the previous worker ran out of time before submitting; work economically, avoid repository-wide searches, and call graph_submit well before the deadline"
+                    }
+                    Some(WorkerFailureClass::VerificationFailed) => {
+                        "verification failed; revise the writer's work against the reported diagnostic before submitting"
+                    }
+                    Some(WorkerFailureClass::PlanInvalidated) => {
+                        "the plan was invalidated; re-check the current task scope and produce a replacement artifact"
+                    }
+                    Some(WorkerFailureClass::ArtifactInvalid) => {
+                        "the previous submission was invalid; complete the contract and call graph_submit exactly once"
+                    }
+                    Some(WorkerFailureClass::ProcessFailure) | Some(WorkerFailureClass::Unknown) => {
+                        "the previous worker exited without a valid submitted artifact; complete the work and call graph_submit exactly once"
+                    }
+                    Some(WorkerFailureClass::PermissionRefused) | Some(WorkerFailureClass::Environment) => {
+                        "the previous worker encountered an unrecoverable environment or permission failure"
+                    }
+                    None => "the previous worker exited without a valid submitted artifact; complete the work and call graph_submit exactly once",
+                };
+                let mut retry = format!("{briefing}\n\nRETRY NOTICE: {notice}.");
+                if !retry_context_delta.is_empty() {
+                    retry.push_str("\n\nRETRY CONTEXT DELTA:\n");
+                    retry.push_str(&retry_context_delta.text);
+                }
+                retry
             };
 
             let effective_briefing = if context_packet.text.is_empty() {
@@ -741,8 +781,10 @@ impl GraphExecution {
             );
             // A retry after a timeout gets double time — but only when a
             // timeout was configured at all; 0 stays unlimited.
-            if timed_out_before && spec.timeout_ms > 0 {
-                spec.timeout_ms *= 2;
+            if matches!(last_failure_class, Some(WorkerFailureClass::Timeout))
+                && spec.timeout_ms > 0
+            {
+                spec.timeout_ms = spec.timeout_ms.saturating_mul(2);
             }
 
             let worker_agent_id = davinci_agent::AgentId::new();
@@ -827,6 +869,7 @@ impl GraphExecution {
                         run.ecosystem_stats.graph_cost_usd += delta.cost_usd;
                         run.ecosystem_stats.cache_read_tokens += delta.cache_read;
                         run.ecosystem_stats.cache_write_tokens += delta.cache_write;
+                        run.ecosystem_stats.record_graph_cache_usage(role, &delta);
                         if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                             task.last_activity = Some(line.to_string());
                         }
@@ -901,6 +944,8 @@ impl GraphExecution {
                 run.ecosystem_stats.graph_cost_usd += trailing.cost_usd;
                 run.ecosystem_stats.cache_read_tokens += trailing.cache_read;
                 run.ecosystem_stats.cache_write_tokens += trailing.cache_write;
+                run.ecosystem_stats
+                    .record_graph_cache_usage(role, &trailing);
             }
 
             let run = self.snapshot();
@@ -995,12 +1040,34 @@ impl GraphExecution {
                     task.error = Some(error.clone());
                 }
             }
-            last_failure = Some(error);
-            self.checkpoint(Some(&format!("{task_id}: attempt {attempt} failed")));
+            let failure_class = classify_worker_failure(&result, Some(&error));
+            let decision = retry_decision(failure_class, attempt as usize);
+            last_failure_class = Some(failure_class);
+            self.checkpoint(Some(&format!(
+                "{task_id}: attempt {attempt} failed ({failure_class}, {decision:?})"
+            )));
+            if matches!(decision, RetryDecision::Stop | RetryDecision::Replan) {
+                break;
+            }
+            let guard = self
+                .learning
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            retry_context_delta = match (&self.deps.memory, guard.as_ref()) {
+                (Some(memory), Some(learning)) => build_retry_context_delta(
+                    memory,
+                    learning,
+                    role,
+                    &retry_query,
+                    failure_class,
+                    &error,
+                ),
+                _ => crate::native_extensions::ecosystem::ContextPacket::empty(),
+            };
         }
         self.end_task(&task_id, TaskStatus::Failed, None);
         self.checkpoint(Some(&format!(
-            "{task_id}: failed after {NODE_ATTEMPTS} attempts"
+            "{task_id}: failed after {attempts_run} attempts"
         )));
         None
     }
@@ -1012,6 +1079,25 @@ impl GraphExecution {
             run.blocked_reason = Some(reason.clone());
         }
         self.checkpoint(Some(&format!("blocked: {reason}")));
+    }
+
+    fn reset_task_for_replan(&self, task_id: &str) {
+        let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.status = TaskStatus::Pending;
+            task.attempts = 0;
+            task.artifact_file = None;
+            task.error = None;
+            task.started_at = None;
+            task.ended_at = None;
+            task.last_activity = None;
+            task.fingerprint = None;
+            task.mutation = None;
+            task.context_fingerprint = None;
+            task.context_tokens = 0;
+            task.memory_refs.clear();
+            task.skill_refs.clear();
+        }
     }
 
     fn task_failure_reason(&self, fallback: &str) -> String {
@@ -1043,6 +1129,63 @@ impl GraphExecution {
         true
     }
 
+    fn skill_scope_relevant(
+        record: &crate::native_extensions::learning::types::SkillLedgerRecord,
+        task: &GraphTaskState,
+        goal: &str,
+    ) -> bool {
+        let meta = &record.applicability;
+        if meta == &crate::native_extensions::learning::types::SkillApplicability::default() {
+            return false;
+        }
+        let mut context = goal.replace('\\', "/").to_ascii_lowercase();
+        context.push(' ');
+        context.push_str(&task.role.to_string().to_ascii_lowercase());
+        if let Some(focus) = &task.focus {
+            context.push(' ');
+            context.push_str(&focus.replace('\\', "/").to_ascii_lowercase());
+        }
+        if let Some(mutation) = &task.mutation {
+            for file in &mutation.files {
+                context.push(' ');
+                context.push_str(&file.path.replace('\\', "/").to_ascii_lowercase());
+            }
+        }
+        let matches = |hint: &str| {
+            let normalized = hint
+                .trim()
+                .trim_matches('*')
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            !normalized.is_empty() && context.contains(&normalized)
+        };
+        if !meta.required_signals.is_empty()
+            && !meta.required_signals.iter().all(|hint| matches(hint))
+        {
+            return false;
+        }
+        meta.languages.iter().any(|hint| matches(hint))
+            || meta.task_types.iter().any(|hint| matches(hint))
+            || meta.path_globs.iter().any(|hint| matches(hint))
+            || meta
+                .verification_categories
+                .iter()
+                .any(|hint| matches(hint))
+    }
+
+    fn skill_usage_signal(
+        outcome: crate::native_extensions::learning::types::SkillOutcome,
+        relevant: bool,
+    ) -> crate::native_extensions::learning::types::SkillUsageSignal {
+        use crate::native_extensions::learning::types::{SkillOutcome, SkillUsageSignal};
+        match (outcome, relevant) {
+            (SkillOutcome::VerifiedSuccess, true) => SkillUsageSignal::VerifiedHelpful,
+            (SkillOutcome::VerifiedFailure, true) => SkillUsageSignal::VerifiedFailureRelevant,
+            (SkillOutcome::Neutral, true) => SkillUsageSignal::ScopeRelevant,
+            (_, false) => SkillUsageSignal::Injected,
+        }
+    }
+
     pub fn record_skill_outcomes(&self, run: &GraphRun) {
         let Some(ref verification) = run.verification else {
             return;
@@ -1055,7 +1198,8 @@ impl GraphExecution {
         let changed_files: Vec<String> = run
             .tasks
             .iter()
-            .filter_map(|t| t.artifact_file.clone())
+            .filter_map(|task| task.mutation.as_ref())
+            .flat_map(|mutation| mutation.files.iter().map(|file| file.path.clone()))
             .collect();
         let bundle = verification.to_bundle(
             changed_files,
@@ -1078,19 +1222,33 @@ impl GraphExecution {
             crate::native_extensions::learning::types::SkillOutcome::Neutral
         };
 
-        let mut seen = std::collections::HashSet::new();
+        let mut usage = std::collections::BTreeMap::new();
         for task in &run.tasks {
             for s in &task.skill_refs {
                 let key = (s.name.clone(), s.version, s.content_hash.clone());
-                if seen.insert(key) {
-                    let version_ref = crate::native_extensions::learning::types::SkillVersionRef {
-                        name: s.name.clone(),
-                        version: s.version,
-                        content_hash: s.content_hash.clone(),
-                    };
-                    let _ = learning.record_skill_version_outcome(&version_ref, outcome);
-                }
+                let exact_record = learning
+                    .project_store
+                    .skill_version(&s.name, s.version)
+                    .or_else(|| learning.global_store.skill_version(&s.name, s.version))
+                    .filter(|record| record.content_hash == s.content_hash)
+                    .cloned();
+                let relevant = exact_record
+                    .as_ref()
+                    .is_some_and(|record| Self::skill_scope_relevant(record, task, &run.goal));
+                usage
+                    .entry(key)
+                    .and_modify(|seen_relevant| *seen_relevant |= relevant)
+                    .or_insert(relevant);
             }
+        }
+        for ((name, version, content_hash), relevant) in usage {
+            let version_ref = crate::native_extensions::learning::types::SkillVersionRef {
+                name,
+                version,
+                content_hash,
+            };
+            let signal = Self::skill_usage_signal(outcome, relevant);
+            let _ = learning.record_skill_usage_outcome(&version_ref, signal);
         }
         {
             let mut run_mut = self.run.lock().unwrap_or_else(|e| e.into_inner());
@@ -1822,6 +1980,50 @@ fn deliver_goal(
             return Delivery::Stop;
         }
         let Some(patch) = patch else {
+            let failure = execution
+                .snapshot()
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .and_then(|task| task.error.clone());
+            if failure.as_deref().is_some_and(|error| {
+                classify_worker_failure(&WorkerResult::default(), Some(error))
+                    == WorkerFailureClass::PlanInvalidated
+            }) {
+                let reason = failure.unwrap_or_else(|| "writer invalidated the plan".into());
+                if replans >= budgets.max_replans {
+                    execution.blocked(format!("plan invalidated {} times: {reason}", replans + 1));
+                    return Delivery::Stop;
+                }
+                replans += 1;
+                execution.reset_task_for_replan(&task_id);
+                indices.implement = indices.implement.saturating_sub(1);
+                {
+                    let mut run = execution
+                        .run
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    run.counters.replans += 1;
+                    run.phase = Phase::Plan;
+                }
+                execution.checkpoint(Some("replanning after writer failure"));
+                plan = produce_plan(
+                    execution,
+                    indices,
+                    goal_text,
+                    evidence_digest,
+                    Some(&reason),
+                );
+                if execution.cancelled_if_aborted() {
+                    return Delivery::Stop;
+                }
+                if plan.is_none() {
+                    execution.blocked(execution.task_failure_reason("replanning failed"));
+                    return Delivery::Stop;
+                }
+                revision_notes = None;
+                continue;
+            }
             execution.blocked(execution.task_failure_reason("implementation failed"));
             return Delivery::Stop;
         };
@@ -1848,6 +2050,8 @@ fn deliver_goal(
                 return Delivery::Stop;
             }
             replans += 1;
+            execution.reset_task_for_replan(&task_id);
+            indices.implement = indices.implement.saturating_sub(1);
             {
                 let mut run = execution
                     .run
@@ -2310,6 +2514,112 @@ mod tests {
     use super::*;
     use crate::native_extensions::graph::types::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn plan_invalidation_replans_before_dispatching_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let planner_calls = Arc::new(AtomicUsize::new(0));
+        let writer_calls = Arc::new(AtomicUsize::new(0));
+        let planner_calls_runner = Arc::clone(&planner_calls);
+        let writer_calls_runner = Arc::clone(&writer_calls);
+
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _, _| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Bug,
+                    complexity: Complexity::Standard,
+                    rationale: "fixture".into(),
+                    research_tasks: vec![],
+                    milestones: None,
+                }),
+                ArtifactKind::Plan => {
+                    planner_calls_runner.fetch_add(1, Ordering::SeqCst);
+                    Artifact::Plan(Box::new(ImplementationPlan {
+                        steps: vec![],
+                        tests_to_add: vec![],
+                        tests_to_run: vec!["fixture-test".into()],
+                        completion_criteria: vec!["done".into()],
+                        invariants: vec![],
+                        out_of_scope: vec![],
+                    }))
+                }
+                ArtifactKind::PatchReport => {
+                    let call = writer_calls_runner.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        return WorkerResult {
+                            ok: false,
+                            failure_reason: Some("plan invalidated: scope changed".into()),
+                            ..WorkerResult::default()
+                        };
+                    }
+                    Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec![],
+                        summary: "implemented replanned work".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
+                ArtifactKind::Review => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "approved".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+                ArtifactKind::Evidence => unreachable!("fixture has no research tasks"),
+            };
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let run = run_graph(
+            RunOptions {
+                goal: "replan fixture".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            ControllerDeps {
+                runner,
+                verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 1)),
+                config: GraphConfig {
+                    verify_commands: vec![VerifyCommandSpec {
+                        name: "fixture-test".into(),
+                        command: "fixture-test".into(),
+                        from_plan: false,
+                    }],
+                    ..Default::default()
+                },
+                session_model: None,
+                session_thinking: None,
+                project_trusted: false,
+                on_update: Arc::new(|_, _| {}),
+                memory: None,
+                learning: None,
+                governor: None,
+                runtime: None,
+                permissions: None,
+                task_contract: None,
+            },
+        );
+
+        assert_eq!(
+            run.phase,
+            Phase::Done,
+            "blocked={:?}, tasks={:?}",
+            run.blocked_reason,
+            run.tasks
+        );
+        assert_eq!(run.counters.replans, 1);
+        assert_eq!(planner_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(writer_calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn f03_graph_controller_does_not_advertise_unbound_task_tools() {
@@ -2809,6 +3119,10 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: crate::native_extensions::learning::types::SkillApplicability {
+                task_types: vec!["bug".into()],
+                ..Default::default()
+            },
             pinned: false,
         };
         learning.project_store.upsert_skill(skill_v1).unwrap();
@@ -3540,6 +3854,16 @@ mod tests {
         };
         learning.review_settled_turn(evidence1);
         std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+
+        // Applicability is deliberately conservative for legacy records. Declare
+        // the learned skill's relevance before asserting positive graph credit.
+        let mut learned_skill = learning
+            .project_store
+            .skill("database-migration")
+            .expect("database-migration skill must exist in store")
+            .clone();
+        learned_skill.applicability.task_types = vec!["database".into()];
+        learning.project_store.upsert_skill(learned_skill).unwrap();
 
         // Assert persistence after Run #1
         let skill_v1 = learning

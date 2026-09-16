@@ -222,11 +222,7 @@ pub fn text_fallback_definition(
     ];
 
     let search_files: Vec<PathBuf> = if let Some(tp) = target_path {
-        let full = if tp.is_absolute() {
-            tp.to_path_buf()
-        } else {
-            cwd.join(tp)
-        };
+        let full = safe_workspace_path(cwd, tp)?;
         if full.is_file() {
             vec![full]
         } else {
@@ -253,11 +249,17 @@ pub fn text_fallback_definition(
                     .or_else(|| trimmed.strip_prefix("async "))
                     .unwrap_or(trimmed);
                 let stripped_async = stripped.strip_prefix("async ").unwrap_or(stripped);
-                let matches_keyword = def_keywords.iter().any(|kw| stripped_async.starts_with(kw));
-                let contains_symbol = line.contains(symbol);
+                let declared_symbol = def_keywords.iter().find_map(|keyword| {
+                    let rest = stripped_async.strip_prefix(keyword)?.trim_start();
+                    let suffix = rest.strip_prefix(symbol)?;
+                    (!suffix
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$')))
+                    .then_some(line.len().saturating_sub(rest.len()))
+                });
 
-                if matches_keyword && contains_symbol {
-                    let col = line.find(symbol).unwrap_or(0);
+                if let Some(col) = declared_symbol {
                     let rel_path = file
                         .strip_prefix(cwd)
                         .unwrap_or(&file)
@@ -325,11 +327,7 @@ pub fn text_fallback_references(
 
     let mut locations = Vec::new();
     let search_files = if let Some(tp) = target_path {
-        let full = if tp.is_absolute() {
-            tp.to_path_buf()
-        } else {
-            cwd.join(tp)
-        };
+        let full = safe_workspace_path(cwd, tp)?;
         if full.is_file() {
             vec![full]
         } else {
@@ -399,7 +397,7 @@ pub fn text_fallback_references(
 
 /// Fallback outline extracting top-level symbols via syntax patterns.
 pub fn text_fallback_outline(cwd: &Path, file_path: &str) -> Result<SemanticResult, String> {
-    let full = cwd.join(file_path);
+    let full = safe_workspace_path(cwd, Path::new(file_path))?;
     let content =
         fs::read_to_string(&full).map_err(|e| format!("Could not read file {file_path}: {e}"))?;
 
@@ -483,6 +481,31 @@ pub fn text_fallback_outline(cwd: &Path, file_path: &str) -> Result<SemanticResu
     })
 }
 
+/// Fallback diagnostic probe that preserves the explicit limitation that no
+/// compiler or language server was run. Reading the file proves the target is
+/// available, but an empty diagnostic set must remain partial rather than being
+/// presented as proof that the file is error-free.
+pub fn text_fallback_diagnostics(cwd: &Path, file_path: &str) -> Result<SemanticResult, String> {
+    let full = safe_workspace_path(cwd, Path::new(file_path))?;
+    fs::read_to_string(&full).map_err(|e| format!("Could not read file {file_path}: {e}"))?;
+
+    Ok(SemanticResult {
+        request_id: format!("fallback_diagnostics_{file_path}"),
+        server_identity: None,
+        capability: "text_fallback_diagnostics".into(),
+        document_version: None,
+        source_manifest: None,
+        locations: Vec::new(),
+        diagnostics: Vec::new(),
+        symbols: Vec::new(),
+        calls: Vec::new(),
+        partial: true,
+        fallback_reason: Some(
+            "Language server unavailable; no compiler diagnostics were executed".into(),
+        ),
+    })
+}
+
 /// Helper to scan directory for code files excluding standard ignore folders.
 fn collect_code_files(dir: &Path, _root: &Path, limit: usize) -> Vec<PathBuf> {
     let mut results = Vec::new();
@@ -516,6 +539,23 @@ fn collect_code_files(dir: &Path, _root: &Path, limit: usize) -> Vec<PathBuf> {
         }
     }
     results
+}
+
+fn safe_workspace_path(cwd: &Path, path: &Path) -> Result<PathBuf, String> {
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let (outside_lexical, symlink_escape) = crate::check_path_boundary(cwd, &full);
+    if outside_lexical || symlink_escape {
+        return Err(format!(
+            "Semantic fallback target {} is outside workspace root {}",
+            full.display(),
+            cwd.display()
+        ));
+    }
+    Ok(full)
 }
 
 #[cfg(test)]
@@ -568,6 +608,14 @@ mod tests {
         let query_lang = "brainfuck";
         let has_server = supported_languages.contains(&query_lang);
         assert_eq!(semantic_route(has_server, true, false), "text_fallback");
+    }
+
+    #[test]
+    fn text_fallback_rejects_missing_path_traversal() {
+        let dir = tempdir().unwrap();
+        let escaped = PathBuf::from("missing/../../escape.rs");
+        let error = safe_workspace_path(dir.path(), &escaped).unwrap_err();
+        assert!(error.contains("outside workspace root"));
     }
 
     #[test]
@@ -632,6 +680,22 @@ fn helper() {
     }
 
     #[test]
+    fn text_fallback_definition_ignores_calls_on_declaration_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fixture.rs");
+        fs::write(
+            &file,
+            "fn target() {}\nfn caller() { target(); }\nfn target_suffix() {}\n",
+        )
+        .unwrap();
+
+        let result = text_fallback_definition(dir.path(), "target", Some(&file), None).unwrap();
+
+        assert_eq!(result.locations.len(), 1);
+        assert_eq!(result.locations[0].range.start.line, 0);
+    }
+
+    #[test]
     fn test_empty_legitimate_references() {
         // When text fallback finds nothing, it returns Ok with empty locations
         let dir = tempdir().unwrap();
@@ -647,5 +711,37 @@ fn helper() {
         .unwrap();
         assert_eq!(ref_res.locations.len(), 0);
         assert!(!ref_res.partial);
+    }
+
+    #[test]
+    fn test_diagnostic_fallback_is_explicitly_partial() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("code.rs"), "fn main() {}\n").unwrap();
+
+        let result = text_fallback_diagnostics(dir.path(), "code.rs").unwrap();
+
+        assert!(result.partial);
+        assert!(result.diagnostics.is_empty());
+        assert!(result
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no compiler diagnostics")));
+    }
+
+    #[test]
+    fn semantic_fallback_rejects_targets_outside_the_workspace() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("outside.rs");
+        fs::write(&outside_file, "fn outside() {}\n").unwrap();
+
+        assert!(text_fallback_outline(workspace.path(), outside_file.to_str().unwrap()).is_err());
+        assert!(
+            text_fallback_diagnostics(workspace.path(), outside_file.to_str().unwrap()).is_err()
+        );
+        assert!(
+            text_fallback_definition(workspace.path(), "outside", Some(&outside_file), None)
+                .is_err()
+        );
     }
 }

@@ -21,6 +21,37 @@ Every pull request that modifies `crates/davinci-agent/src/prompt/` or `crates/d
 
 PR CI runs completely offline (`PI_OFFLINE=1`) without external network access.
 
+Harness optimization changes also require the deterministic offline gate:
+
+```bash
+cargo run -p davinci-evals -- optimization gate --offline
+```
+
+The gate covers the eight named ablations in `davinci-evals`, persists only
+provider usage supplied by a real adapter, and rejects a candidate that loses
+baseline correctness. It does not invoke a provider or competitor executable.
+
+### Required protection for `main`
+
+The desired repository policy is:
+
+```text
+main:
+  require pull request or equivalent protected update path
+  require CI / quality
+  require Workflow lint / actionlint
+  require Security SARIF interoperability / schema
+  block force pushes
+  block branch deletion
+```
+
+The current workflow and job names are `CI / quality`, `Workflow lint /
+actionlint`, and `Security SARIF interoperability / schema`. These names are
+the stable checks to select when configuring protection or an equivalent
+ruleset. Branch protection is a GitHub administration setting, not a repository
+file change. It must not be described as enabled without a credentialed API
+readback after an authorized administration action.
+
 Main CI must be green before any prompt, native capability, or evaluation feature is
 graduated. Workflow syntax and lint validity are therefore release prerequisites,
 not advisory checks.

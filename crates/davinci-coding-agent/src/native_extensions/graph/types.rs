@@ -973,6 +973,12 @@ pub struct WorkerSpec {
     pub thinking_level: Option<String>,
     /// Full --tools allowlist; ALWAYS includes "graph_submit".
     pub tools: Vec<String>,
+    /// Host-authorized role permission surface. This is separate from the
+    /// provider-facing schema projection in `initially_exposed_tools`.
+    pub authorized_tools: Vec<String>,
+    /// Initial provider-facing schema set. Deferred authorized tools can be
+    /// activated through the normal `tool_search` exposure path.
+    pub initially_exposed_tools: Vec<String>,
     /// Extra extension paths passed to the child via -e.
     pub extra_extensions: Vec<String>,
     /// 0 = no timeout.

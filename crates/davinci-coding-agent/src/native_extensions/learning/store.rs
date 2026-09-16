@@ -425,6 +425,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         store.upsert_skill(record).unwrap();
@@ -535,6 +536,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         };
         let v2 = SkillLedgerRecord {
@@ -552,6 +554,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 2000,
             updated_at_ms: 2000,
+            applicability: Default::default(),
             pinned: false,
         };
         store.upsert_skill(v1).unwrap();

@@ -8,6 +8,7 @@ use crate::native_extensions::graph::Role;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityRequest<'a> {
     pub prompt: &'a str,
+    pub skill_prompt: Option<&'a str>,
     pub role: Role,
     pub context_token_cap: usize,
     pub include_skills: bool,
@@ -17,10 +18,16 @@ impl<'a> CapabilityRequest<'a> {
     pub fn new(prompt: &'a str, role: Role) -> Self {
         Self {
             prompt,
+            skill_prompt: None,
             role,
             context_token_cap: DEFAULT_GRAPH_CONTEXT_TOKENS,
             include_skills: true,
         }
+    }
+
+    pub fn with_skill_prompt(mut self, prompt: &'a str) -> Self {
+        self.skill_prompt = Some(prompt);
+        self
     }
 
     pub fn with_context_token_cap(mut self, cap: usize) -> Self {
@@ -46,10 +53,13 @@ pub fn select_capabilities(
     authorized_tools: Vec<String>,
     request: CapabilityRequest<'_>,
 ) -> CapabilitySelection {
-    let context_request = ContextPacketRequest::new(request.prompt)
+    let mut context_request = ContextPacketRequest::new(request.prompt)
         .with_role(request.role)
         .with_token_cap(request.context_token_cap)
         .with_skills(request.include_skills);
+    if let Some(skill_prompt) = request.skill_prompt {
+        context_request = context_request.with_skill_prompt(skill_prompt);
+    }
 
     CapabilitySelection {
         tools: authorized_tools,

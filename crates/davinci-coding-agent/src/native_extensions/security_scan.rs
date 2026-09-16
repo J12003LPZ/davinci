@@ -29,6 +29,7 @@ mod feedback;
 mod git;
 mod grouping;
 mod identity;
+pub mod incremental;
 pub mod interrupt;
 mod partial;
 mod policy;
@@ -51,6 +52,12 @@ pub mod validation;
 mod validation_budget;
 pub mod worker;
 mod worker_cache;
+
+#[allow(unused_imports)]
+pub use incremental::{
+    CachedFileScan, IncrementalSecurityCache, IncrementalSecurityTelemetry, SecurityFileCacheKey,
+    SECURITY_RULESET_VERSION,
+};
 
 pub use config::ScanConfig;
 
@@ -171,6 +178,16 @@ pub struct SecurityCoverage {
     pub candidate_count: usize,
     pub finding_count: usize,
     pub network_used: bool,
+    #[serde(default)]
+    pub files_scanned_cold: usize,
+    #[serde(default)]
+    pub files_reused: usize,
+    #[serde(default)]
+    pub files_rescanned: usize,
+    #[serde(default)]
+    pub cache_read_errors: usize,
+    #[serde(default)]
+    pub cache_write_errors: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -394,6 +411,8 @@ pub struct SecurityScanController {
     review_config: ScanConfig,
     report: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
     review_agent_dir: Option<PathBuf>,
+    incremental_cache: IncrementalSecurityCache,
+    incremental_cache_repo: Option<String>,
 }
 
 impl Default for SecurityScanController {
@@ -414,11 +433,110 @@ impl SecurityScanController {
             review_config: ScanConfig::default(),
             report: Default::default(),
             review_agent_dir: None,
+            incremental_cache: IncrementalSecurityCache::new(),
+            incremental_cache_repo: None,
+        }
+    }
+
+    fn prepare_incremental_cache(&mut self, repo_id: &str) {
+        if self.incremental_cache_repo.as_deref() == Some(repo_id) {
+            self.incremental_cache.reset_telemetry();
+            return;
+        }
+        // Security findings are trusted only when they were produced in this
+        // controller process. A cache loaded from a shared temporary directory
+        // could be forged by another local process and suppress a cold scan.
+        self.incremental_cache = IncrementalSecurityCache::new();
+        self.incremental_cache_repo = Some(repo_id.to_string());
+    }
+
+    fn apply_incremental_telemetry(&self, scan: &mut SecurityScan) {
+        scan.coverage.files_scanned_cold = self.incremental_cache.telemetry.files_scanned_cold;
+        scan.coverage.files_reused = self.incremental_cache.telemetry.files_reused;
+        scan.coverage.files_rescanned = self.incremental_cache.telemetry.files_rescanned;
+        scan.coverage.cache_read_errors = self.incremental_cache.telemetry.cache_read_errors;
+        scan.coverage.cache_write_errors = self.incremental_cache.telemetry.cache_write_errors;
+    }
+
+    fn scan_files_incrementally(&mut self, files: &[PathBuf], scan: &mut SecurityScan) {
+        for path in files {
+            let relative = path.to_string_lossy().replace('\\', "/");
+            let bytes = match read_scan_file(&self.cwd, path, &self.config) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    scan.coverage.files_skipped += 1;
+                    continue;
+                }
+            };
+            let key = SecurityFileCacheKey::for_file(&bytes, &self.config);
+
+            if let Some(cached) = self.incremental_cache.lookup(&relative, &key) {
+                scan.coverage.files_scanned += 1;
+                self.incremental_cache.telemetry.files_reused = self
+                    .incremental_cache
+                    .telemetry
+                    .files_reused
+                    .saturating_add(1);
+                scan.coverage.bytes_scanned = scan
+                    .coverage
+                    .bytes_scanned
+                    .saturating_add(cached.coverage.bytes_scanned);
+                scan.candidates.extend(cached.candidates);
+                scan.findings.extend(cached.findings);
+                continue;
+            }
+
+            let had_entry = self.incremental_cache.contains_path(&relative);
+            let finding_start = scan.findings.len();
+            let candidate_start = scan.candidates.len();
+            if scan_file_bytes(path, &bytes, scan).is_err() {
+                scan.coverage.files_skipped += 1;
+                continue;
+            }
+
+            let findings = scan.findings[finding_start..].to_vec();
+            let candidates = scan.candidates[candidate_start..].to_vec();
+            self.incremental_cache.insert(
+                relative,
+                CachedFileScan {
+                    key,
+                    findings,
+                    candidates,
+                    coverage: SecurityCoverage {
+                        files_scanned: 1,
+                        files_skipped: 0,
+                        bytes_scanned: bytes.len() as u64,
+                        candidate_count: scan.candidates.len() - candidate_start,
+                        finding_count: scan.findings.len() - finding_start,
+                        network_used: false,
+                        files_scanned_cold: 0,
+                        files_reused: 0,
+                        files_rescanned: 0,
+                        cache_read_errors: 0,
+                        cache_write_errors: 0,
+                    },
+                },
+            );
+            scan.coverage.files_scanned += 1;
+            if had_entry {
+                self.incremental_cache.telemetry.files_rescanned = self
+                    .incremental_cache
+                    .telemetry
+                    .files_rescanned
+                    .saturating_add(1);
+            } else {
+                self.incremental_cache.telemetry.files_scanned_cold = self
+                    .incremental_cache
+                    .telemetry
+                    .files_scanned_cold
+                    .saturating_add(1);
+            }
         }
     }
 
     pub fn start(&mut self, scope: Option<&str>) -> Result<SecurityScan, ToolError> {
         let repo_id = repo_id(&self.cwd);
+        self.prepare_incremental_cache(&repo_id);
         let now = now_ms();
         let scan_id = format_scan_id(&repo_id, now, now_nanos());
         let files = enumerate_scope(&self.cwd, scope, &self.config)?;
@@ -451,16 +569,17 @@ impl SecurityScanController {
                 candidate_count: 0,
                 finding_count: 0,
                 network_used: false,
+                files_scanned_cold: 0,
+                files_reused: 0,
+                files_rescanned: 0,
+                cache_read_errors: 0,
+                cache_write_errors: 0,
             },
             candidates: Vec::new(),
             findings: Vec::new(),
         };
-        for path in files {
-            match scan_file(&self.cwd, &path, &self.config, &mut scan) {
-                Ok(()) => scan.coverage.files_scanned += 1,
-                Err(_) => scan.coverage.files_skipped += 1,
-            }
-        }
+        self.scan_files_incrementally(&files, &mut scan);
+        self.apply_incremental_telemetry(&mut scan);
         scan.coverage.candidate_count = scan.candidates.len();
         scan.coverage.finding_count = scan.findings.len();
         scan.manifest.status = ScanStatus::Draft;
@@ -926,6 +1045,7 @@ impl SecurityScanController {
     ) -> Result<SecurityVerification, String> {
         self.cwd = request.cwd.to_path_buf();
         let repo_id = repo_id(&self.cwd);
+        self.prepare_incremental_cache(&repo_id);
         let now = now_ms();
         let sanitized_run = request
             .graph_run_id
@@ -987,17 +1107,18 @@ impl SecurityScanController {
                 candidate_count: 0,
                 finding_count: 0,
                 network_used: false,
+                files_scanned_cold: 0,
+                files_reused: 0,
+                files_rescanned: 0,
+                cache_read_errors: 0,
+                cache_write_errors: 0,
             },
             candidates: Vec::new(),
             findings: Vec::new(),
         };
 
-        for path in &files_to_scan {
-            match scan_file(&self.cwd, path, &self.config, &mut scan) {
-                Ok(()) => scan.coverage.files_scanned += 1,
-                Err(_) => scan.coverage.files_skipped += 1,
-            }
-        }
+        self.scan_files_incrementally(&files_to_scan, &mut scan);
+        self.apply_incremental_telemetry(&mut scan);
         scan.coverage.candidate_count = scan.candidates.len();
         scan.coverage.finding_count = scan.findings.len();
 
@@ -1088,15 +1209,37 @@ fn scan_file(
     scan: &mut SecurityScan,
 ) -> Result<(), ToolError> {
     let path = safe_join(root, relative)?;
-    let metadata = fs::metadata(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let bytes = read_scan_file_at_path(&path, config)?;
+    scan_file_bytes(relative, &bytes, scan)
+}
+
+fn read_scan_file(
+    root: &Path,
+    relative: &Path,
+    config: &SecurityScanConfig,
+) -> Result<Vec<u8>, ToolError> {
+    let path = safe_join(root, relative)?;
+    read_scan_file_at_path(&path, config)
+}
+
+fn read_scan_file_at_path(path: &Path, config: &SecurityScanConfig) -> Result<Vec<u8>, ToolError> {
+    let metadata = fs::metadata(path).map_err(|err| ToolError::Failed(err.to_string()))?;
     if metadata.len() > config.max_file_bytes {
         return Err(ToolError::Failed("file exceeds scan limit".into()));
     }
-    let bytes = fs::read(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let bytes = fs::read(path).map_err(|err| ToolError::Failed(err.to_string()))?;
     if bytes.contains(&0) {
         return Err(ToolError::Failed("binary file".into()));
     }
-    let text = String::from_utf8_lossy(&bytes);
+    Ok(bytes)
+}
+
+fn scan_file_bytes(
+    relative: &Path,
+    bytes: &[u8],
+    scan: &mut SecurityScan,
+) -> Result<(), ToolError> {
+    let text = String::from_utf8_lossy(bytes);
     scan.coverage.bytes_scanned = scan
         .coverage
         .bytes_scanned
@@ -1629,6 +1772,11 @@ mod tests {
                 candidate_count: 1,
                 finding_count: 1,
                 network_used: false,
+                files_scanned_cold: 0,
+                files_reused: 0,
+                files_rescanned: 0,
+                cache_read_errors: 0,
+                cache_write_errors: 0,
             },
             candidates: vec![],
             findings: vec![SecurityFinding {
@@ -1699,6 +1847,108 @@ mod tests {
             }
             other => panic!("expected Passed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn security_scan_reuses_unchanged_files_but_reseals_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("one.rs"), "pub fn one() {}\n").unwrap();
+        fs::write(tmp.path().join("two.rs"), "pub fn two() {}\n").unwrap();
+        let files = vec!["one.rs".to_string(), "two.rs".to_string()];
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+
+        controller
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: tmp.path(),
+                changed_files: &files,
+                graph_run_id: "cold",
+            })
+            .unwrap();
+        let first = controller.current().unwrap();
+        let first_artifact = controller.artifact.as_ref().unwrap().root().to_path_buf();
+
+        controller
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: tmp.path(),
+                changed_files: &files,
+                graph_run_id: "warm",
+            })
+            .unwrap();
+        let second = controller.current().unwrap();
+        let second_artifact = controller.artifact.as_ref().unwrap().root().to_path_buf();
+
+        assert_eq!(second.coverage.files_reused, 2);
+        assert_eq!(second.coverage.files_rescanned, 0);
+        assert_eq!(second.findings, first.findings);
+        assert_eq!(second.candidates, first.candidates);
+        assert_eq!(second.coverage.bytes_scanned, first.coverage.bytes_scanned);
+        assert_ne!(second.manifest.scan_id, first.manifest.scan_id);
+        assert_ne!(second_artifact, first_artifact);
+        assert!(second.manifest.sealed_at.is_some());
+        assert!(second_artifact.join("scan-manifest.json").is_file());
+    }
+
+    #[test]
+    fn security_scan_new_controller_never_inherits_incremental_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("one.rs"), "pub fn one() {}\n").unwrap();
+        let files = vec!["one.rs".to_string()];
+
+        let mut first_controller = SecurityScanController::new(tmp.path().to_path_buf());
+        first_controller
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: tmp.path(),
+                changed_files: &files,
+                graph_run_id: "first-process",
+            })
+            .unwrap();
+
+        let mut second_controller = SecurityScanController::new(tmp.path().to_path_buf());
+        second_controller
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: tmp.path(),
+                changed_files: &files,
+                graph_run_id: "second-process",
+            })
+            .unwrap();
+        let second = second_controller.current().unwrap();
+
+        assert_eq!(second.coverage.files_scanned_cold, 1);
+        assert_eq!(second.coverage.files_reused, 0);
+        assert_eq!(second.coverage.files_rescanned, 0);
+    }
+
+    #[test]
+    fn security_scan_invalidates_changed_file_cache_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("one.rs"), "pub fn one() {}\n").unwrap();
+        fs::write(tmp.path().join("two.rs"), "pub fn two() {}\n").unwrap();
+        let files = vec!["one.rs".to_string(), "two.rs".to_string()];
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        controller
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: tmp.path(),
+                changed_files: &files,
+                graph_run_id: "before-change",
+            })
+            .unwrap();
+
+        fs::write(tmp.path().join("one.rs"), "pub fn one() { eval(input); }\n").unwrap();
+        controller
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: tmp.path(),
+                changed_files: &files,
+                graph_run_id: "after-change",
+            })
+            .unwrap();
+        let scan = controller.current().unwrap();
+        assert_eq!(scan.coverage.files_reused, 1);
+        assert_eq!(scan.coverage.files_rescanned, 1);
+        assert_eq!(scan.coverage.files_scanned_cold, 0);
+        assert!(scan
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "command.eval"));
     }
 
     #[test]

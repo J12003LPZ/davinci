@@ -55,8 +55,8 @@ pub use compaction::{
     TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use context::{
-    load_context_files, ContextBudgetReport, ContextContribution, ContextFile, ContextPriority,
-    RootContextAccount,
+    load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
+    ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
@@ -215,6 +215,25 @@ pub enum ToolExecutionMode {
     Parallel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationCoverage {
+    Targeted,
+    Broad,
+    Unrelated,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationEvidence {
+    pub generation: u64,
+    pub command: String,
+    pub succeeded: bool,
+    pub mutation_paths: Vec<PathBuf>,
+    pub verification_targets: Vec<String>,
+    pub coverage: VerificationCoverage,
+}
+
 /// Lifecycle evidence for mutations and the verification commands that follow
 /// them. A verification attempt is associated with the current generation so
 /// a later mutation cannot inherit an earlier success.
@@ -223,6 +242,10 @@ pub struct MutationVerificationState {
     pub mutation_generation: u64,
     pub verified_generation: Option<u64>,
     pub last_verification_succeeded: bool,
+    #[serde(default)]
+    pub mutation_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub latest_evidence: Option<VerificationEvidence>,
 }
 
 /// Evidence available when a coding turn reaches a normal stop.
@@ -592,39 +615,92 @@ impl Agent {
             return CompletionEvidence::NotRequired;
         }
 
-        match state.verified_generation {
-            Some(generation) if generation == state.mutation_generation => {
-                if state.last_verification_succeeded {
+        match state.latest_evidence.as_ref() {
+            Some(evidence) if evidence.generation == state.mutation_generation => {
+                if !evidence.succeeded {
+                    CompletionEvidence::VerificationFailed
+                } else if matches!(
+                    evidence.coverage,
+                    VerificationCoverage::Targeted | VerificationCoverage::Broad
+                ) {
                     CompletionEvidence::Verified
                 } else {
-                    CompletionEvidence::VerificationFailed
+                    CompletionEvidence::Unverified
                 }
             }
             _ => CompletionEvidence::Unverified,
         }
     }
 
-    /// Invalidate any earlier verification after a successful mutation.
+    /// Compatibility path for mutation sources that cannot yet provide a path.
+    #[allow(dead_code)]
     pub(crate) fn record_successful_mutation(&self) {
+        self.record_successful_mutation_paths(Vec::new());
+    }
+
+    pub(crate) fn record_successful_mutation_paths(&self, paths: Vec<PathBuf>) {
         let mut state = self
             .mutation_verification
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let prior_was_verified = state.verified_generation == Some(state.mutation_generation)
+            && state.last_verification_succeeded;
+        if prior_was_verified {
+            state.mutation_paths.clear();
+        }
         state.mutation_generation = state.mutation_generation.saturating_add(1);
+        for path in paths {
+            if !state.mutation_paths.contains(&path) {
+                state.mutation_paths.push(path);
+            }
+        }
         state.verified_generation = None;
         state.last_verification_succeeded = false;
+        state.latest_evidence = None;
     }
 
-    /// Record the result of a recognized verification command for the current
-    /// mutation generation. The generation is retained for failed attempts so
-    /// completion can distinguish failure from no verification at all.
+    /// Compatibility entry point: a caller with no command/target information
+    /// records broad evidence so existing explicit verification APIs retain
+    /// their prior meaning. Live shell verification uses the scoped method.
+    #[allow(dead_code)]
     pub(crate) fn record_verification_result(&self, succeeded: bool) {
         let mut state = self
             .mutation_verification
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        state.verified_generation = Some(state.mutation_generation);
+        let generation = state.mutation_generation;
+        let paths = state.mutation_paths.clone();
+        state.verified_generation = Some(generation);
         state.last_verification_succeeded = succeeded;
+        state.latest_evidence = Some(VerificationEvidence {
+            generation,
+            command: "legacy_explicit_verifier".into(),
+            succeeded,
+            mutation_paths: paths,
+            verification_targets: Vec::new(),
+            coverage: VerificationCoverage::Broad,
+        });
+    }
+
+    pub(crate) fn record_verification_command(&self, command: &str, succeeded: bool) {
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let generation = state.mutation_generation;
+        let mutation_paths = state.mutation_paths.clone();
+        let (coverage, verification_targets) =
+            verification_coverage_for_command(command, &mutation_paths);
+        state.verified_generation = Some(generation);
+        state.last_verification_succeeded = succeeded;
+        state.latest_evidence = Some(VerificationEvidence {
+            generation,
+            command: command.to_string(),
+            succeeded,
+            mutation_paths,
+            verification_targets,
+            coverage,
+        });
     }
 
     fn reset_capability_run_state(
@@ -955,14 +1031,16 @@ impl Agent {
         let plan_context = self
             .plan_provider_context()
             .map(|text| ChatMessage::text("custom", text));
-        if self.ephemeral_context.is_empty()
+        let selected = self.select_root_context(self.context_window);
+        let ephemeral_context = selected.ephemeral_messages;
+        if ephemeral_context.is_empty()
             && self.pruned_tool_results.is_empty()
             && plan_context.is_none()
         {
             return convert_to_llm_for_provider(&self.messages, self.block_images);
         }
         let mut messages = self.project_with_evidence();
-        if self.ephemeral_context.is_empty() && plan_context.is_none() {
+        if ephemeral_context.is_empty() && plan_context.is_none() {
             return convert_to_llm_for_provider(&messages, self.block_images);
         }
         let insertion = messages
@@ -971,9 +1049,7 @@ impl Agent {
             .unwrap_or(messages.len());
         messages.splice(
             insertion..insertion,
-            plan_context
-                .into_iter()
-                .chain(self.ephemeral_context.iter().cloned()),
+            plan_context.into_iter().chain(ephemeral_context),
         );
         convert_to_llm_for_provider(&messages, self.block_images)
     }
@@ -998,7 +1074,11 @@ impl Agent {
                     .unwrap_or_else(|| compaction::estimate_tokens(message))
             })
             .sum::<u64>()
-            + estimate_context_tokens(&self.ephemeral_context)
+            + estimate_context_tokens(
+                &self
+                    .select_root_context(self.context_window)
+                    .ephemeral_messages,
+            )
             + self
                 .plan_provider_context()
                 .map(|text| (text.len() as u64).div_ceil(4))
@@ -1674,7 +1754,7 @@ impl Agent {
         )
     }
 
-    /// Account for the normal/root provider request without changing its prompt.
+    /// Account for the normal/root provider request and select optional request-local context.
     pub fn root_context_budget_report(&self, budget: u64) -> ContextBudgetReport {
         let mut account = RootContextAccount::default();
         account.add(
@@ -1693,7 +1773,7 @@ impl Agent {
         }
         for file in &self.context_files {
             account.add(
-                format!("repository_instruction::{}", file.name),
+                format!("repository_instruction::{}", file.path.display()),
                 file.body.clone(),
                 true,
                 ContextPriority::Mandatory,
@@ -1705,6 +1785,51 @@ impl Agent {
             true,
             ContextPriority::Mandatory,
         );
+        if let Some(contract) = self
+            .tool_context
+            .active_contract
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            account.add(
+                "active_task_contract",
+                serde_json::to_string(contract).unwrap_or_default(),
+                false,
+                ContextPriority::Mandatory,
+            );
+        }
+        if let Some(plan) = self.plan_provider_context() {
+            account.add("living_plan", plan, false, ContextPriority::Mandatory);
+        }
+
+        // Current extension/memory evidence gets first claim on Important space.
+        for (index, message) in self.ephemeral_context.iter().enumerate() {
+            account.add(
+                format!("ephemeral_context::{index}"),
+                serde_json::to_string(message).unwrap_or_default(),
+                false,
+                ContextPriority::Important,
+            );
+        }
+
+        let latest_user = self
+            .messages
+            .iter()
+            .rposition(|message| message.role == "user");
+        for (index, message) in self.messages.iter().enumerate() {
+            let priority = if Some(index) == latest_user {
+                ContextPriority::Mandatory
+            } else {
+                ContextPriority::Important
+            };
+            account.add(
+                format!("conversation::{index}"),
+                serde_json::to_string(message).unwrap_or_default(),
+                false,
+                priority,
+            );
+        }
         for skill in &self.skills {
             account.add(
                 format!("skill::{}", skill.name),
@@ -1721,35 +1846,31 @@ impl Agent {
                 ContextPriority::Deferred,
             );
         }
-
-        let messages = self.messages_for_provider();
-        let latest_user = messages.iter().rposition(|message| message.role == "user");
-        for (index, message) in messages.iter().enumerate() {
-            let body = serde_json::to_string(message).unwrap_or_default();
-            let priority = if Some(index) == latest_user {
-                ContextPriority::Mandatory
-            } else {
-                ContextPriority::Important
-            };
-            account.add(format!("conversation::{index}"), body, false, priority);
-        }
-
-        if let Some(contract) = self
-            .tool_context
-            .active_contract
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
-            account.add(
-                "active_task_contract",
-                serde_json::to_string(contract).unwrap_or_default(),
-                false,
-                ContextPriority::Mandatory,
-            );
-        }
-
         account.report_for_budget(budget)
+    }
+
+    pub fn select_root_context(&self, budget: u64) -> SelectedRootContext {
+        let report = self.root_context_budget_report(budget);
+        let selected_sources = report
+            .contributions
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.source.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let ephemeral_messages = self
+            .ephemeral_context
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                selected_sources.contains(format!("ephemeral_context::{index}").as_str())
+            })
+            .map(|(_, message)| message.clone())
+            .collect();
+        SelectedRootContext {
+            report,
+            repository_files: self.context_files.clone(),
+            ephemeral_messages,
+        }
     }
 
     pub fn apply_extension_tools(&mut self, names: &[String]) {
@@ -2132,6 +2253,64 @@ impl Agent {
     }
 }
 
+fn command_package_target(command: &str) -> Option<String> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    for (index, part) in parts.iter().enumerate() {
+        if matches!(*part, "-p" | "--package") {
+            return parts
+                .get(index + 1)
+                .map(|value| value.trim_matches('"').to_string());
+        }
+        if let Some(value) = part.strip_prefix("--package=") {
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn mutation_package(path: &Path) -> Option<String> {
+    let parts = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    parts
+        .windows(2)
+        .find(|pair| pair[0] == "crates")
+        .map(|pair| pair[1].to_string())
+}
+
+fn verification_coverage_for_command(
+    command: &str,
+    mutation_paths: &[PathBuf],
+) -> (VerificationCoverage, Vec<String>) {
+    if mutation_paths.is_empty() {
+        return (VerificationCoverage::Broad, Vec::new());
+    }
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("--workspace")
+        || lower.contains("cargo fmt --")
+        || (lower.starts_with("cargo test") && command_package_target(command).is_none())
+        || (lower.starts_with("cargo clippy") && command_package_target(command).is_none())
+        || (lower.starts_with("cargo check") && command_package_target(command).is_none())
+    {
+        return (VerificationCoverage::Broad, vec!["workspace".into()]);
+    }
+    if let Some(package) = command_package_target(command) {
+        let changed_packages = mutation_paths
+            .iter()
+            .filter_map(|path| mutation_package(path))
+            .collect::<std::collections::BTreeSet<_>>();
+        let targets = vec![package.clone()];
+        if !changed_packages.is_empty()
+            && changed_packages.iter().all(|changed| changed == &package)
+        {
+            return (VerificationCoverage::Targeted, targets);
+        }
+        return (VerificationCoverage::Unrelated, targets);
+    }
+    (VerificationCoverage::Unknown, Vec::new())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TreeNavigateResult {
     pub cancelled: bool,
@@ -2292,6 +2471,56 @@ pub fn chat_entry(
         }
     }
     entry
+}
+
+/// Measure deferred root schemas against the same agent with every authorized
+/// schema exposed. The returned units are serialized provider-schema bytes.
+pub fn deferred_root_schema_ablation() -> Result<(bool, bool, u64, u64), String> {
+    let agent = Agent::new("offline-root-schema-ablation");
+    let deferred_names = agent.visible_tool_names();
+    let deferred = serde_json::to_vec(&agent.provider_tool_specs()).map_err(|e| e.to_string())?;
+    agent.expose_active_tools();
+    let full_names = agent.visible_tool_names();
+    let full = serde_json::to_vec(&agent.provider_tool_specs()).map_err(|e| e.to_string())?;
+    Ok((
+        !full.is_empty(),
+        !deferred.is_empty() && deferred_names.is_subset(&full_names),
+        full.len() as u64,
+        deferred.len() as u64,
+    ))
+}
+
+/// Measure query-driven capability exposure against exposing every authorized
+/// schema. The candidate is correct only if the queried schema becomes visible.
+pub fn capability_toolbox_ablation() -> Result<(bool, bool, u64, u64), String> {
+    let mut agent = Agent::new("offline-capability-ablation");
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    let query = execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &serde_json::json!({"query": "web_search"}),
+        &agent.tool_context,
+    )
+    .map_err(|error| error.to_string())?;
+    let activated = query
+        .details
+        .as_ref()
+        .and_then(|details| details.get("activated"))
+        .and_then(Value::as_array)
+        .is_some_and(|names| names.iter().any(|name| name == "web_search"));
+    let queried = serde_json::to_vec(&agent.provider_tool_specs()).map_err(|e| e.to_string())?;
+    agent.expose_active_tools();
+    let full = serde_json::to_vec(&agent.provider_tool_specs()).map_err(|e| e.to_string())?;
+    Ok((
+        !full.is_empty(),
+        activated && agent.is_tool_visible("web_search"),
+        full.len() as u64,
+        queried.len() as u64,
+    ))
 }
 
 #[cfg(test)]
@@ -5228,6 +5457,21 @@ mod tests {
         assert!(
             !agent.system_prompt.contains("frontend_design_policy"),
             "Non-capability turn should not carry forward previous capability"
+        );
+    }
+
+    #[test]
+    fn unrelated_successful_test_does_not_verify_mutation() {
+        let agent = Agent::new("x");
+        agent.record_successful_mutation_paths(vec![PathBuf::from(
+            "crates/davinci-agent/src/lib.rs",
+        )]);
+        agent.record_verification_command("cargo test -p unrelated-crate", true);
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+        let state = agent.mutation_verification_state();
+        assert_eq!(
+            state.latest_evidence.as_ref().map(|e| e.coverage),
+            Some(VerificationCoverage::Unrelated)
         );
     }
 }

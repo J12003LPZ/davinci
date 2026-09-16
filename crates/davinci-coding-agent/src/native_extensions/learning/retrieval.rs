@@ -5,9 +5,73 @@ use davinci_agent::{describe_skill, Skill, SkillDescriptor};
 
 use crate::native_extensions::graph::Role;
 use crate::native_extensions::learning::types::{
-    ArtifactStatus, LearningScope, SkillContextCandidate, SkillLedgerRecord,
+    ArtifactStatus, LearningScope, SkillApplicability, SkillContextCandidate, SkillLedgerRecord,
 };
 use crate::native_extensions::vector_memory::cosine_similarity;
+
+fn applicability_hint_matches(query: &str, hint: &str) -> bool {
+    let normalized = hint
+        .trim()
+        .trim_matches('*')
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    !normalized.is_empty() && query.contains(&normalized)
+}
+
+pub fn applicability_score(meta: &SkillApplicability, query: &str, _role: Role) -> f32 {
+    if meta == &SkillApplicability::default() {
+        return 1.0;
+    }
+    let query = query.replace('\\', "/").to_ascii_lowercase();
+    let mut score: f32 = 1.0;
+    if !meta.languages.is_empty() {
+        if meta
+            .languages
+            .iter()
+            .any(|hint| applicability_hint_matches(&query, hint))
+        {
+            score += 0.08;
+        } else {
+            score -= 0.15;
+        }
+    }
+    if !meta.task_types.is_empty()
+        && meta
+            .task_types
+            .iter()
+            .any(|hint| applicability_hint_matches(&query, hint))
+    {
+        score += 0.08;
+    }
+    if !meta.path_globs.is_empty()
+        && meta
+            .path_globs
+            .iter()
+            .any(|hint| applicability_hint_matches(&query, hint))
+    {
+        score += 0.08;
+    }
+    if !meta.required_signals.is_empty() {
+        if meta
+            .required_signals
+            .iter()
+            .all(|hint| applicability_hint_matches(&query, hint))
+        {
+            score += 0.04;
+        } else {
+            score -= 0.20;
+        }
+    }
+    if !meta.verification_categories.is_empty()
+        && meta
+            .verification_categories
+            .iter()
+            .any(|hint| applicability_hint_matches(&query, hint))
+    {
+        score += 0.04;
+    }
+    score.clamp(0.5, 1.2)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillMatch {
@@ -225,6 +289,7 @@ pub fn role_bias(role: Role, skill_name: &str, skill_desc: &str) -> f32 {
     }
 }
 
+#[allow(dead_code)]
 pub fn select_graph_skill_candidates(
     query: &str,
     role: Role,
@@ -233,11 +298,28 @@ pub fn select_graph_skill_candidates(
     max_skills: usize,
     token_cap: usize,
 ) -> Vec<SkillContextCandidate> {
+    select_graph_skill_candidates_with_embeddings(
+        query, None, skills, None, ledger, role, max_skills, token_cap,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn select_graph_skill_candidates_with_embeddings(
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    skills: &[Skill],
+    skill_embeddings: Option<&[Option<Vec<f32>>]>,
+    ledger: &[SkillLedgerRecord],
+    role: Role,
+    max_skills: usize,
+    token_cap: usize,
+) -> Vec<SkillContextCandidate> {
     if query.trim().is_empty() || max_skills == 0 || token_cap == 0 {
         return Vec::new();
     }
 
-    let matches = rank_skills_with_embeddings(query, None, skills, None, ledger, 0);
+    let matches =
+        rank_skills_with_embeddings(query, query_embedding, skills, skill_embeddings, ledger, 0);
 
     const MIN_SKILL_RELEVANCE: f32 = 0.35;
 
@@ -267,7 +349,10 @@ pub fn select_graph_skill_candidates(
             .unwrap_or_else(|| crate::native_extensions::vector_memory::content_hash(&skill.body));
 
         let role_boost = role_bias(role, &skill.name, &skill.description);
-        let final_score = (m.score + role_boost).clamp(0.0, 1.0);
+        let applicability = record
+            .map(|record| applicability_score(&record.applicability, query, role))
+            .unwrap_or(1.0);
+        let final_score = ((m.score + role_boost) * applicability).clamp(0.0, 1.0);
 
         candidates.push(ScoredCandidate {
             skill,
@@ -387,6 +472,7 @@ mod tests {
             last_used_at_ms: None,
             created_at_ms: 1000,
             updated_at_ms: 1000,
+            applicability: Default::default(),
             pinned: false,
         }
     }
@@ -751,5 +837,130 @@ mod tests {
         assert!(formatted.starts_with("<skill name=\"test-skill\" version=\"2\">"));
         assert!(formatted.ends_with("</skill>"));
         assert!(formatted.contains("Instructions here."));
+    }
+
+    #[test]
+    fn cached_semantic_skill_ranking_is_optional_and_deterministic() {
+        let skills = vec![
+            fixture_skill(
+                "parser-fix",
+                "repair parser state",
+                ".pi/skills/parser/SKILL.md",
+            ),
+            fixture_skill("docs", "write documentation", ".pi/skills/docs/SKILL.md"),
+        ];
+        let ledger = Vec::new();
+        let query = vec![1.0_f32, 0.0];
+        let embeddings = vec![Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0])];
+        let selected = select_graph_skill_candidates_with_embeddings(
+            "repair state",
+            Some(&query),
+            &skills,
+            Some(&embeddings),
+            &ledger,
+            Role::Writer,
+            2,
+            1000,
+        );
+        assert_eq!(
+            selected.first().map(|s| s.name.as_str()),
+            Some("parser-fix")
+        );
+        let lexical =
+            select_graph_skill_candidates("repair state", Role::Writer, &skills, &ledger, 2, 1000);
+        assert!(!lexical.is_empty());
+    }
+
+    #[test]
+    fn skill_applicability_biases_matching_task_without_becoming_authority() {
+        let applicability = SkillApplicability {
+            languages: vec!["rust".into()],
+            task_types: vec!["debugging".into()],
+            path_globs: vec!["crates/davinci-agent/**".into()],
+            required_signals: Vec::new(),
+            verification_categories: Vec::new(),
+        };
+        let matching = applicability_score(
+            &applicability,
+            "debugging rust crates/davinci-agent/src/lib.rs",
+            Role::Writer,
+        );
+        let unrelated =
+            applicability_score(&applicability, "write css documentation", Role::Writer);
+        assert!(matching > unrelated);
+        assert!(matching <= 1.2 && unrelated >= 0.5);
+    }
+}
+
+#[cfg(test)]
+mod persisted_applicability_regressions {
+    use super::*;
+    use crate::native_extensions::learning::types::SkillOrigin;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn skill(name: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: "shared workflow rust debugging".into(),
+            path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            body: "# workflow\nRun the verified workflow.".into(),
+            base_dir: PathBuf::from(format!("/skills/{name}")),
+        }
+    }
+
+    fn record(name: &str, applicability: serde_json::Value) -> SkillLedgerRecord {
+        let base = SkillLedgerRecord {
+            skill_id: format!("id-{name}"),
+            name: name.into(),
+            scope: LearningScope::Project,
+            origin: SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Active,
+            path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            content_hash: format!("hash-{name}"),
+            version: 1,
+            success_count: 0,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            applicability: Default::default(),
+            pinned: false,
+        };
+        let mut value = serde_json::to_value(base).unwrap();
+        value["applicability"] = applicability;
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn persisted_skill_applicability_is_used_for_ranking() {
+        let skills = vec![skill("aaa-skill"), skill("zzz-skill")];
+        let ledger = vec![
+            record("aaa-skill", json!({})),
+            record(
+                "zzz-skill",
+                json!({
+                    "languages": ["rust"],
+                    "taskTypes": ["debugging"],
+                    "pathGlobs": [],
+                    "requiredSignals": [],
+                    "verificationCategories": []
+                }),
+            ),
+        ];
+        let selected = select_graph_skill_candidates(
+            "shared workflow rust debugging",
+            Role::Writer,
+            &skills,
+            &ledger,
+            2,
+            1000,
+        );
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected[0].name, "zzz-skill",
+            "persisted applicability should break an otherwise lexical tie"
+        );
     }
 }

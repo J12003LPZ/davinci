@@ -645,6 +645,11 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             parsed.permission_mode,
         ),
     ));
+    agent.tool_context.semantic = Some(Arc::new(
+        davinci_coding_agent::semantic::NativeSemanticService::with_permissions(
+            agent.permissions.clone(),
+        ),
+    ));
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     agent.attach_mcp(davinci_agent::McpRegistry::connect(
         &mcp::load(&default_agent_dir(), cwd, trusted),
@@ -736,15 +741,40 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     agent.apply_extension_tools(&names);
     sync_visual_verification_availability(&mut agent, &host);
-    // A graph worker's `--tools` is its whole allowlist: the native tools it
-    // was not handed (graph_run, sec_*, memory_search…) are not offered to
-    // its model either, rather than merely refused when called.
-    if !parsed.tools.is_empty() && crate::native_extensions::graph_worker_context().is_some() {
-        agent.tools.retain(|tool| {
-            parsed.tools.contains(tool) || !native_names.iter().any(|native| native == tool)
-        });
-    }
-    if explicit_tool_selection {
+    let graph_worker = crate::native_extensions::graph_worker_context();
+    if let Some(graph_worker) = &graph_worker {
+        // The parent-owned graph contract is the authorization surface. The
+        // initial provider projection is a separate, smaller view: a worker
+        // may discover any authorized deferred schema through tool_search,
+        // but it must not receive that schema in its first request.
+        let authorized_tools: Vec<String> = graph_worker
+            .allowed_tools
+            .iter()
+            .filter(|tool| !parsed.exclude_tools.contains(tool))
+            .cloned()
+            .collect();
+        let initial_source: Vec<String> = match std::env::var("PI_GRAPH_INITIAL_TOOLS") {
+            Ok(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
+                .map(str::to_string)
+                .collect(),
+            Err(_) => parsed.tools.clone(),
+        };
+        let initial_tools: Vec<String> = initial_source
+            .into_iter()
+            .filter(|tool| authorized_tools.contains(tool))
+            .collect();
+        agent.tools = authorized_tools;
+        agent.sync_tool_authorization();
+        *agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            davinci_agent::runtime::ToolExposureState::new(initial_tools);
+    } else if explicit_tool_selection {
         agent.expose_active_tools();
     } else {
         agent.sync_tool_authorization();
@@ -12590,6 +12620,7 @@ mod tests {
             ..Args::default()
         };
         let agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
+        assert!(agent.tool_context.semantic.is_some());
         assert!(agent.prompt_session.is_builtin());
         assert_eq!(
             agent.prompt_session.profile(),

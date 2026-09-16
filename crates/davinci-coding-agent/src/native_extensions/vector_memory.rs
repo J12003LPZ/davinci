@@ -24,6 +24,12 @@ const DENSE_BACKOFF: Duration = Duration::from_secs(120);
 /// `memory_search` never answers more than this many hits whatever `limit`
 /// says; the tool schema states the same cap.
 pub const SEARCH_LIMIT_CAP: usize = 20;
+/// Phase 3 chooses the bounded local index as the production projection.
+/// Qdrant configuration remains readable for rollback/experiments but normal
+/// indexing does not perform remote writes until a remote query path clears
+/// the documented break-even gate.
+pub const MEMORY_PROJECTION_PROFILE: &str = "local";
+const EMBEDDING_PREFIX_REVISION: u32 = 1;
 
 /// EmbeddingGemma uses different task prefixes for documents and queries.
 /// Keep these constants alongside the client so callers cannot accidentally
@@ -54,6 +60,8 @@ pub struct VectorMemoryConfig {
     pub result_limit: usize,
     #[serde(default = "default_candidate_limit")]
     pub candidate_limit: usize,
+    #[serde(default = "default_max_index_chunks")]
+    pub max_index_chunks: usize,
     #[serde(default = "default_max_injected_tokens")]
     pub max_injected_tokens: usize,
     #[serde(default = "default_minimum_score")]
@@ -95,6 +103,9 @@ fn default_result_limit() -> usize {
 fn default_candidate_limit() -> usize {
     30
 }
+fn default_max_index_chunks() -> usize {
+    64
+}
 fn default_max_injected_tokens() -> usize {
     3_000
 }
@@ -124,6 +135,7 @@ impl Default for VectorMemoryConfig {
             automatic_retrieval: true,
             result_limit: default_result_limit(),
             candidate_limit: default_candidate_limit(),
+            max_index_chunks: default_max_index_chunks(),
             max_injected_tokens: default_max_injected_tokens(),
             minimum_score: default_minimum_score(),
             request_timeout_seconds: default_request_timeout(),
@@ -181,6 +193,9 @@ impl VectorMemoryConfig {
         }
         if let Some(value) = env_usize("PI_MEMORY_CANDIDATE_LIMIT") {
             config.candidate_limit = value.clamp(1, 100);
+        }
+        if let Some(value) = env_usize("PI_MEMORY_MAX_INDEX_CHUNKS") {
+            config.max_index_chunks = value.clamp(1, 512);
         }
         if let Some(value) = env_usize("PI_MEMORY_MAX_INJECTED_TOKENS") {
             config.max_injected_tokens = value.max(100);
@@ -260,6 +275,31 @@ pub fn provenance_after_review(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingIdentity {
+    pub model: String,
+    pub dimensions: usize,
+    pub prefix_revision: u32,
+}
+
+impl EmbeddingIdentity {
+    pub fn from_config(config: &VectorMemoryConfig) -> Self {
+        Self {
+            model: config.embedding_model.clone(),
+            dimensions: config.embedding_dimensions,
+            prefix_revision: EMBEDDING_PREFIX_REVISION,
+        }
+    }
+}
+
+fn embedding_identity_compatible(
+    stored: Option<&EmbeddingIdentity>,
+    current: &EmbeddingIdentity,
+) -> bool {
+    stored == Some(current)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryRecord {
@@ -273,6 +313,8 @@ pub struct MemoryRecord {
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_identity: Option<EmbeddingIdentity>,
     #[serde(default)]
     pub confidence: Option<f32>,
     #[serde(default)]
@@ -281,6 +323,12 @@ pub struct MemoryRecord {
     pub source_turn: Option<u64>,
     #[serde(default)]
     pub verification: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_state_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at_revision: Option<String>,
     #[serde(default)]
     pub use_count: u64,
     #[serde(default)]
@@ -322,6 +370,50 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
 
 pub fn content_hash(text: &str) -> String {
     sha256_hex(text.as_bytes())
+}
+
+pub fn source_state_hash_for_paths(cwd: &Path, paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut normalized = paths
+        .iter()
+        .map(|path| path.replace('\\', "/").trim_start_matches("./").to_string())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    let mut material = String::new();
+    for relative in normalized {
+        if relative.is_empty() {
+            return None;
+        }
+        let bytes = fs::read(cwd.join(&relative)).ok()?;
+        material.push_str(&relative);
+        material.push('\0');
+        material.push_str(&sha256_hex(bytes));
+        material.push('\n');
+    }
+    Some(sha256_hex(material.as_bytes()))
+}
+
+pub fn memory_freshness(record: &MemoryRecord, cwd: &Path) -> f32 {
+    if record.source_paths.is_empty() {
+        return 1.0;
+    }
+    let authoritative = record.source == "user"
+        || record.source == "user_decision"
+        || matches!(record.kind, MemoryKind::Decision | MemoryKind::Constraint);
+    let current = source_state_hash_for_paths(cwd, &record.source_paths);
+    let factor: f32 = match (&record.source_state_hash, current) {
+        (_, None) => 0.35,
+        (Some(expected), Some(actual)) if expected != &actual => 0.65,
+        _ => 1.0,
+    };
+    if authoritative {
+        factor.max(0.80)
+    } else {
+        factor
+    }
 }
 
 pub fn hash_to_uuid(hash: &str) -> String {
@@ -532,6 +624,32 @@ pub fn lexical_score(query: &str, text: &str) -> f32 {
     LexicalQuery::new(query).score(text)
 }
 
+fn exact_identifier_match(query: &str, record: &MemoryRecord) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return false;
+    }
+    if record.id.eq_ignore_ascii_case(query) || record.content_hash.eq_ignore_ascii_case(query) {
+        return true;
+    }
+    let text = record.text.to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                !ch.is_ascii_alphanumeric() && !matches!(ch, '-' | '_' | ':' | '/' | '.')
+            })
+        })
+        .filter(|token| token.len() >= 5)
+        .filter(|token| {
+            token.chars().any(|ch| ch.is_ascii_digit())
+                || token
+                    .chars()
+                    .any(|ch| matches!(ch, '-' | '_' | ':' | '/' | '.'))
+        })
+        .any(|token| text.contains(&token.to_ascii_lowercase()))
+}
+
 pub fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     if left.is_empty() || left.len() != right.len() {
         return 0.0;
@@ -547,17 +665,6 @@ pub fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     } else {
         (dot / (left_norm.sqrt() * right_norm.sqrt())).clamp(0.0, 1.0)
     }
-}
-
-pub fn fuse_hits(mut hits: Vec<MemoryHit>, limit: usize) -> Vec<MemoryHit> {
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-    });
-    hits.truncate(limit);
-    hits
 }
 
 pub fn format_memory_block(hits: &[MemoryHit], max_tokens: usize) -> String {
@@ -841,9 +948,13 @@ impl VectorMemory {
         for chunk in chunks {
             let hash = content_hash(&chunk.text);
             let tag = known_key_scoped(chunk.kind, &hash, agent_profile_name);
-            if !self.known.insert(tag) {
+            if self.known.contains(&tag) {
                 continue;
             }
+            if inserted >= self.config.max_index_chunks.max(1) {
+                break;
+            }
+            self.known.insert(tag);
             let id_seed = format!(
                 "{}\0{}\0{}",
                 target_repo,
@@ -860,10 +971,14 @@ impl VectorMemory {
                 importance: chunk.importance,
                 created_at: davinci_session::now_ms(),
                 embedding: None,
+                embedding_identity: None,
                 confidence: None,
                 source_session_id: None,
                 source_turn: None,
                 verification: None,
+                source_paths: Vec::new(),
+                source_state_hash: None,
+                verified_at_revision: None,
                 use_count: 0,
                 last_used_at: None,
                 agent_profile_name: profile_str.clone(),
@@ -890,11 +1005,13 @@ impl VectorMemory {
             }
             if let Ok(embeddings) = embeddings {
                 if embeddings.len() == inserted_records.len() {
+                    let embedding_identity = EmbeddingIdentity::from_config(&self.config);
                     for (record, embedding) in inserted_records.iter().zip(embeddings) {
                         if let Some(stored) =
                             self.records.iter_mut().find(|item| item.id == record.id)
                         {
                             stored.embedding = Some(embedding);
+                            stored.embedding_identity = Some(embedding_identity.clone());
                         }
                     }
                     // Local persistence remains authoritative; Qdrant is only
@@ -909,7 +1026,9 @@ impl VectorMemory {
                                 .cloned()
                         })
                         .collect::<Vec<_>>();
-                    let _ = self.upsert_remote(&embedded);
+                    if self.remote_projection_enabled() {
+                        let _ = self.upsert_remote(&embedded);
+                    }
                 }
             }
         }
@@ -982,10 +1101,14 @@ impl VectorMemory {
                 .unwrap_or_default()
                 .as_secs(),
             embedding: None,
+            embedding_identity: None,
             confidence: prior.confidence,
             source_session_id: prior.source_session_id.clone(),
             source_turn: prior.source_turn,
             verification: prior.verification.clone(),
+            source_paths: prior.source_paths.clone(),
+            source_state_hash: prior.source_state_hash.clone(),
+            verified_at_revision: prior.verified_at_revision.clone(),
             use_count: 0,
             last_used_at: None,
             agent_profile_name: prior.agent_profile_name.clone(),
@@ -1048,7 +1171,6 @@ impl VectorMemory {
                                 && (record.agent_profile_name.is_none()
                                     || record.agent_profile_name.as_deref() == Some(profile))
                         } else {
-                            // Main agent behavior remains unchanged: only project-wide memory where agent_profile_name is None
                             record.repo_id == self.repo_id && record.agent_profile_name.is_none()
                         }
                     }
@@ -1060,8 +1182,35 @@ impl VectorMemory {
             return Vec::new();
         }
 
+        let candidate_limit = self.config.candidate_limit.max(1);
+        let lexical_query = LexicalQuery::new(query);
+        let mut lexical_ranked = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                let lexical = lexical_query.score(&record.text);
+                let exact = exact_identifier_match(query, record);
+                (exact || lexical > 0.0).then_some((index, lexical, exact))
+            })
+            .collect::<Vec<_>>();
+        lexical_ranked.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal))
+                .then_with(|| candidates[left.0].id.cmp(&candidates[right.0].id))
+        });
+        lexical_ranked.truncate(candidate_limit);
+
+        let embedding_identity = self.current_embedding_identity();
         let query_embedding = (self.dense_available()
-            && candidates.iter().any(|record| record.embedding.is_some()))
+            && candidates.iter().any(|record| {
+                record.embedding.is_some()
+                    && embedding_identity_compatible(
+                        record.embedding_identity.as_ref(),
+                        &embedding_identity,
+                    )
+            }))
         .then(|| match self.embed_query(query) {
             Ok(vector) => Some(vector),
             Err(_) => {
@@ -1071,26 +1220,117 @@ impl VectorMemory {
         })
         .flatten();
 
-        let lexical_query = LexicalQuery::new(query);
-        let mut hits = candidates
+        let mut dense_ranked = query_embedding
+            .as_ref()
+            .map(|query_vector| {
+                let mut ranked = candidates
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, record)| {
+                        if !embedding_identity_compatible(
+                            record.embedding_identity.as_ref(),
+                            &embedding_identity,
+                        ) {
+                            return None;
+                        }
+                        let embedding = record.embedding.as_ref()?;
+                        if embedding.len() != query_vector.len() {
+                            return None;
+                        }
+                        let score = cosine_similarity(query_vector, embedding);
+                        (score > 0.0).then_some((index, score))
+                    })
+                    .collect::<Vec<_>>();
+                ranked.sort_by(|left, right| {
+                    right
+                        .1
+                        .partial_cmp(&left.1)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| candidates[left.0].id.cmp(&candidates[right.0].id))
+                });
+                ranked.truncate(candidate_limit);
+                ranked
+            })
+            .unwrap_or_default();
+
+        #[derive(Default, Clone, Copy)]
+        struct RankState {
+            lexical_rank: Option<usize>,
+            dense_rank: Option<usize>,
+            lexical_score: f32,
+            dense_score: f32,
+            exact: bool,
+        }
+
+        let mut selected = BTreeMap::<usize, RankState>::new();
+        for (rank, (index, score, exact)) in lexical_ranked.into_iter().enumerate() {
+            let state = selected.entry(index).or_default();
+            state.lexical_rank = Some(rank);
+            state.lexical_score = score;
+            state.exact = exact;
+        }
+        for (rank, (index, score)) in dense_ranked.drain(..).enumerate() {
+            let state = selected.entry(index).or_default();
+            state.dense_rank = Some(rank);
+            state.dense_score = score;
+        }
+
+        let rank_value = |rank: usize| -> f32 {
+            1.0 - (rank.min(candidate_limit - 1) as f32 / candidate_limit as f32)
+        };
+        let mut hits = selected
             .into_iter()
-            .filter_map(|record| {
-                let lexical = lexical_query.score(&record.text);
-                let dense = query_embedding
-                    .as_ref()
-                    .zip(record.embedding.as_ref())
-                    .map(|(query, embedding)| cosine_similarity(query, embedding))
-                    .unwrap_or(lexical);
-                let score = (dense * 0.6 + lexical * 0.3 + record.importance * 0.1).clamp(0.0, 1.0);
-                (score >= self.config.minimum_score).then(|| MemoryHit {
+            .map(|(index, state)| {
+                let record = candidates[index];
+                let lexical = state.lexical_score;
+                let dense = if query_embedding.is_some() {
+                    state.dense_score
+                } else {
+                    lexical
+                };
+                let mut rank_sum = 0.0f32;
+                let mut rank_count = 0.0f32;
+                if let Some(rank) = state.lexical_rank {
+                    rank_sum += rank_value(rank);
+                    rank_count += 1.0;
+                }
+                if let Some(rank) = state.dense_rank {
+                    rank_sum += rank_value(rank);
+                    rank_count += 1.0;
+                }
+                let rank_fusion = if rank_count > 0.0 {
+                    rank_sum / rank_count
+                } else {
+                    0.0
+                };
+                let mut base = if query_embedding.is_some() {
+                    dense * 0.50 + lexical * 0.25 + rank_fusion * 0.15 + record.importance * 0.10
+                } else {
+                    lexical * 0.65 + rank_fusion * 0.25 + record.importance * 0.10
+                };
+                if state.exact {
+                    base = base.max(0.95);
+                }
+                let score =
+                    (base.clamp(0.0, 1.0) * memory_freshness(record, &self.cwd)).clamp(0.0, 1.0);
+                MemoryHit {
                     record: (*record).clone(),
                     score,
                     dense_score: dense,
                     lexical_score: lexical,
-                })
+                }
             })
+            .filter(|hit| hit.score >= self.config.minimum_score)
             .collect::<Vec<_>>();
-        fuse_hits(std::mem::take(&mut hits), limit.max(1))
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.record.id.cmp(&right.record.id))
+        });
+        hits.truncate(limit.max(1).min(candidate_limit));
+        hits
     }
 
     /// Retrieve bounded memory context hits for a graph worker query.
@@ -1116,11 +1356,15 @@ impl VectorMemory {
         let hits = self.search_scoped(query, max_hits, agent_profile_name, memory_scope);
         let mut results = Vec::new();
         let mut accumulated_tokens = 0;
+        let mut seen_content = HashSet::new();
         for hit in hits {
+            if !seen_content.insert(hit.record.content_hash.clone()) {
+                continue;
+            }
             let text = redact_secrets(&hit.record.text);
             let estimated_tokens = (text.chars().count() + 3) / 4;
-            if accumulated_tokens + estimated_tokens > token_cap {
-                break;
+            if estimated_tokens > token_cap.saturating_sub(accumulated_tokens) {
+                continue;
             }
             accumulated_tokens += estimated_tokens;
             results.push(MemoryContextHit {
@@ -1221,6 +1465,94 @@ impl VectorMemory {
         Ok(self.status())
     }
 
+    /// The selected Phase 3 projection is deliberately local. Remote write
+    /// amplification stays disabled until a filtered remote retrieval path
+    /// demonstrates the documented quality/latency break-even.
+    pub fn remote_projection_enabled(&self) -> bool {
+        false
+    }
+
+    fn current_embedding_identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity::from_config(&self.config)
+    }
+
+    fn drop_incompatible_embeddings(&mut self) -> usize {
+        let current = self.current_embedding_identity();
+        let mut dropped = 0usize;
+        for record in &mut self.records {
+            if record.embedding.is_some()
+                && !embedding_identity_compatible(record.embedding_identity.as_ref(), &current)
+            {
+                record.embedding = None;
+                record.embedding_identity = None;
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
+    fn local_projection_lag(&self) -> usize {
+        let current = self.current_embedding_identity();
+        self.records
+            .iter()
+            .filter(|record| {
+                !self.tombstones.contains(&record.id)
+                    && !self.supersessions.contains_key(&record.id)
+                    && (record.embedding.is_none()
+                        || !embedding_identity_compatible(
+                            record.embedding_identity.as_ref(),
+                            &current,
+                        ))
+            })
+            .count()
+    }
+
+    /// Rebuild a bounded batch of missing or incompatible local embeddings.
+    /// Authoritative records remain readable through lexical retrieval if the
+    /// embedding service is unavailable. Tombstoned/superseded records are
+    /// never projected.
+    #[allow(dead_code)]
+    pub fn rebuild_local_embeddings(&mut self, limit: usize) -> Result<usize, ToolError> {
+        self.drop_incompatible_embeddings();
+        let pending = self
+            .records
+            .iter()
+            .filter(|record| {
+                !self.tombstones.contains(&record.id)
+                    && !self.supersessions.contains_key(&record.id)
+                    && record.embedding.is_none()
+            })
+            .take(limit.max(1))
+            .map(|record| (record.id.clone(), record.text.clone()))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let texts = pending
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        let embeddings = self.embed_documents(&texts)?;
+        if embeddings.len() != pending.len() {
+            return Err(ToolError::Failed(
+                "embedding rebuild response count does not match request".into(),
+            ));
+        }
+        let identity = self.current_embedding_identity();
+        let mut updated = 0usize;
+        for ((id, _), embedding) in pending.into_iter().zip(embeddings) {
+            if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {
+                record.embedding = Some(embedding);
+                record.embedding_identity = Some(identity.clone());
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            self.persist_local()?;
+        }
+        Ok(updated)
+    }
+
     pub fn status(&self) -> Value {
         let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
         for record in &self.records {
@@ -1246,6 +1578,9 @@ impl VectorMemory {
             "lastIndexedAt": self.last_indexed_at,
             "automaticRetrieval": self.config.automatic_retrieval,
             "denseAvailable": self.dense_available(),
+            "projectionProfile": MEMORY_PROJECTION_PROFILE,
+            "remoteProjectionEnabled": self.remote_projection_enabled(),
+            "projectionLag": self.local_projection_lag(),
             "qdrant": self.config.qdrant_url,
             "ollama": self.config.ollama_url,
             "embeddingModel": self.config.embedding_model,
@@ -1253,6 +1588,7 @@ impl VectorMemory {
             "extractionModel": self.config.extraction_model,
             "resultLimit": self.config.result_limit,
             "candidateLimit": self.config.candidate_limit,
+            "maxIndexChunks": self.config.max_index_chunks,
             "maxInjectedTokens": self.config.max_injected_tokens,
             "minimumScore": self.config.minimum_score,
             "localPath": self.local_path(),
@@ -1398,10 +1734,14 @@ impl VectorMemory {
             importance,
             created_at: davinci_session::now_ms(),
             embedding: None,
+            embedding_identity: None,
             confidence: Some(confidence),
             source_session_id: Some(source_session_id.to_string()),
             source_turn: Some(source_turn),
             verification: verification.map(str::to_string),
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -1416,12 +1756,17 @@ impl VectorMemory {
                 if let Some(emb) = embeddings.into_iter().next() {
                     if let Some(stored) = self.records.iter_mut().find(|item| item.id == id) {
                         stored.embedding = Some(emb.clone());
+                        stored.embedding_identity =
+                            Some(EmbeddingIdentity::from_config(&self.config));
                     }
                     let _ = self.persist_local();
-                    let _ = self.upsert_remote(&[MemoryRecord {
-                        embedding: Some(emb),
-                        ..record
-                    }]);
+                    if self.remote_projection_enabled() {
+                        let _ = self.upsert_remote(&[MemoryRecord {
+                            embedding: Some(emb),
+                            embedding_identity: Some(EmbeddingIdentity::from_config(&self.config)),
+                            ..record
+                        }]);
+                    }
                 }
             }
         }
@@ -1905,12 +2250,13 @@ mod tests {
     }
 
     #[test]
-    fn indexing_persists_remote_embeddings_and_searches_dense_hits() {
+    fn indexing_persists_local_embeddings_and_searches_dense_hits() {
         let directory = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            for _ in 0..3 {
+            // Local projection performs two embedding-service requests here: document indexing and query embedding. Automatic Qdrant writes are disabled.
+            for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 // Drain the whole request (headers plus Content-Length body)
                 // before answering: ureq writes the JSON body in a second
@@ -1979,10 +2325,14 @@ mod tests {
                 importance: 0.8,
                 created_at: 1000 + i as u64,
                 embedding: None,
+                embedding_identity: None,
                 confidence: None,
                 source_session_id: None,
                 source_turn: None,
                 verification: None,
+                source_paths: Vec::new(),
+                source_state_hash: None,
+                verified_at_revision: None,
                 use_count: 0,
                 last_used_at: None,
                 agent_profile_name: None,
@@ -2081,7 +2431,9 @@ mod tests {
 
         // Main agent searches: main-agent behavior remains unchanged and does not see private profile memory
         let hits_main_confidential = memory.search("confidential", 10);
-        assert!(hits_main_confidential.is_empty());
+        assert!(hits_main_confidential
+            .iter()
+            .all(|hit| hit.record.agent_profile_name.is_none()));
 
         let hits_main_global = memory.search("repository build", 10);
         assert_eq!(hits_main_global.len(), 1);
@@ -2132,10 +2484,14 @@ mod tests {
             importance: 1.0,
             created_at: 1000,
             embedding: None,
+            embedding_identity: None,
             confidence: Some(1.0),
             source_session_id: None,
             source_turn: None,
             verification: None,
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -2166,10 +2522,14 @@ mod tests {
             importance: 1.0,
             created_at: 2000,
             embedding: None,
+            embedding_identity: None,
             confidence: None,
             source_session_id: None,
             source_turn: None,
             verification: None,
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -2195,10 +2555,14 @@ mod tests {
             importance: 1.0,
             created_at: 1000,
             embedding: None,
+            embedding_identity: None,
             confidence: Some(0.8),
             source_session_id: None,
             source_turn: None,
             verification: None,
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
             use_count: 0,
             last_used_at: None,
             agent_profile_name: None,
@@ -2229,5 +2593,316 @@ mod tests {
             provenance_after_review("unproven", false, false),
             "unproven"
         );
+    }
+
+    #[test]
+    fn legacy_verification_marker_does_not_invent_staleness() {
+        let record = MemoryRecord {
+            id: "m1".into(),
+            repo_id: "repo".into(),
+            kind: MemoryKind::Architecture,
+            text: "parser lives in old.rs".into(),
+            source: "learning".into(),
+            content_hash: "h".into(),
+            importance: 1.0,
+            created_at: 1,
+            embedding: None,
+            embedding_identity: None,
+            confidence: Some(0.9),
+            source_session_id: None,
+            source_turn: None,
+            verification: Some("state:abc".into()),
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
+            use_count: 0,
+            last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
+        };
+        assert_eq!(memory_freshness(&record, Path::new(".")), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod source_bound_freshness_regressions {
+    use super::*;
+    use serde_json::json;
+
+    fn source_state_hash(path: &str, content: &[u8]) -> String {
+        sha256_hex(format!("{}\0{}\n", path, sha256_hex(content)).as_bytes())
+    }
+
+    #[test]
+    fn legacy_memory_record_has_neutral_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem_dir = dir.path().join(".pi").join("vector-memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let record = json!({
+            "id": "legacy-memory",
+            "repoId": resolve_repo_id(dir.path()),
+            "kind": "architecture",
+            "text": "legacy parser architecture",
+            "source": "learning",
+            "contentHash": "legacy",
+            "importance": 1.0,
+            "createdAt": 1,
+            "embedding": null,
+            "confidence": 0.9,
+            "sourceSessionId": null,
+            "sourceTurn": null,
+            "verification": null,
+            "useCount": 0,
+            "lastUsedAt": null
+        });
+        std::fs::write(mem_dir.join("records.jsonl"), format!("{}\n", record)).unwrap();
+        let memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.0,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        let hits = memory.search("legacy parser architecture", 1);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].score > 0.9);
+    }
+
+    #[test]
+    fn memory_freshness_penalizes_changed_source_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/auth.rs"), b"v1").unwrap();
+        let mem_dir = dir.path().join(".pi").join("vector-memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+
+        let mut record = json!({
+            "id": "source-memory",
+            "repoId": resolve_repo_id(dir.path()),
+            "kind": "architecture",
+            "text": "auth parser architecture",
+            "source": "learning",
+            "contentHash": "source-memory",
+            "importance": 1.0,
+            "createdAt": 1,
+            "embedding": null,
+            "confidence": 0.9,
+            "sourceSessionId": null,
+            "sourceTurn": null,
+            "verification": null,
+            "useCount": 0,
+            "lastUsedAt": null
+        });
+        record["sourcePaths"] = json!(["src/auth.rs"]);
+        record["sourceStateHash"] = json!(source_state_hash("src/auth.rs", b"v1"));
+        record["verifiedAtRevision"] = json!("fixture-r1");
+        std::fs::write(mem_dir.join("records.jsonl"), format!("{}\n", record)).unwrap();
+
+        let memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                minimum_score: 0.0,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        let before = memory.search("auth parser architecture", 1)[0].score;
+        std::fs::write(dir.path().join("src/auth.rs"), b"v2").unwrap();
+        let after = memory.search("auth parser architecture", 1)[0].score;
+        assert!(
+            after < before,
+            "source-bound memory should be penalized after its verified source changes: {before} -> {after}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase3_memory_retrieval_regressions {
+    use super::*;
+
+    fn record(memory: &VectorMemory, id: &str, text: String, importance: f32) -> MemoryRecord {
+        MemoryRecord {
+            id: id.into(),
+            repo_id: memory.repo_id.clone(),
+            kind: MemoryKind::Discovery,
+            text: text.clone(),
+            source: "repository_fact".into(),
+            content_hash: content_hash(&text),
+            importance,
+            created_at: 1000,
+            embedding: None,
+            embedding_identity: None,
+            confidence: Some(0.9),
+            source_session_id: Some("session-phase3".into()),
+            source_turn: Some(1),
+            verification: Some("verified".into()),
+            source_paths: Vec::new(),
+            source_state_hash: None,
+            verified_at_revision: None,
+            use_count: 0,
+            last_used_at: None,
+            agent_profile_name: None,
+            memory_scope: None,
+        }
+    }
+
+    #[test]
+    fn phase3_candidate_limit_is_a_hard_search_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                candidate_limit: 2,
+                minimum_score: 0.1,
+                promotion: false,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        memory.mark_dense_offline();
+        for index in 0..8 {
+            memory.records.push(record(
+                &memory,
+                &format!("candidate-{index}"),
+                format!("shared authentication candidate {index}"),
+                0.8,
+            ));
+        }
+
+        let hits = memory.search("shared authentication", 20);
+        assert!(
+            hits.len() <= 2,
+            "candidate_limit must cap final retrieval work"
+        );
+    }
+
+    #[test]
+    fn phase3_oversized_first_hit_does_not_starve_smaller_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                candidate_limit: 8,
+                minimum_score: 0.1,
+                promotion: false,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        memory.mark_dense_offline();
+        memory.records.push(record(
+            &memory,
+            "large",
+            format!("authentication token {}", "x".repeat(2000)),
+            1.0,
+        ));
+        memory.records.push(record(
+            &memory,
+            "small",
+            "authentication token uses repository setting AUTH_V2".into(),
+            0.8,
+        ));
+
+        let hits = memory.context_hits("authentication token", 4, 20);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "small");
+    }
+
+    #[test]
+    fn phase3_bounded_indexing_makes_incremental_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                max_index_chunks: 2,
+                promotion: false,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        memory.mark_dense_offline();
+        let messages = (0..6)
+            .map(|index| MemoryMessage {
+                role: "user".into(),
+                content: format!("unique indexing fact number {index}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(memory.index_messages(&messages).unwrap(), 2);
+        assert_eq!(memory.index_messages(&messages).unwrap(), 2);
+        assert_eq!(memory.record_count(), 4);
+    }
+
+    #[test]
+    fn phase3_exact_identifier_survives_small_candidate_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::with_config(
+            dir.path().to_path_buf(),
+            VectorMemoryConfig {
+                candidate_limit: 1,
+                minimum_score: 0.1,
+                promotion: false,
+                ..VectorMemoryConfig::default()
+            },
+        );
+        memory.mark_dense_offline();
+        memory.records.push(record(
+            &memory,
+            "noise",
+            "BUG-1000 authentication authentication authentication".into(),
+            1.0,
+        ));
+        memory.records.push(record(
+            &memory,
+            "target",
+            "Regression BUG-8472 is fixed by rotating the cache key".into(),
+            0.4,
+        ));
+
+        let hits = memory.search("BUG-8472", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.id, "target");
+    }
+}
+
+#[cfg(test)]
+mod phase3_t15_projection_regressions {
+    use super::*;
+
+    #[test]
+    fn phase3_t15_projection_profile_is_explicit_local() {
+        assert_eq!(MEMORY_PROJECTION_PROFILE, "local");
+        let dir = tempfile::tempdir().unwrap();
+        let memory =
+            VectorMemory::with_config(dir.path().to_path_buf(), VectorMemoryConfig::default());
+        assert!(!memory.remote_projection_enabled());
+    }
+
+    #[test]
+    fn phase3_t15_embedding_identity_changes_with_model_or_dimensions() {
+        let base = VectorMemoryConfig::default();
+        let base_identity = EmbeddingIdentity::from_config(&base);
+
+        let mut changed_model = base.clone();
+        changed_model.embedding_model = "replacement-model".into();
+        assert_ne!(
+            base_identity,
+            EmbeddingIdentity::from_config(&changed_model)
+        );
+
+        let mut changed_dimensions = base;
+        changed_dimensions.embedding_dimensions = 384;
+        assert_ne!(
+            base_identity,
+            EmbeddingIdentity::from_config(&changed_dimensions)
+        );
+    }
+
+    #[test]
+    fn phase3_t15_legacy_or_changed_embedding_is_incompatible() {
+        let config = VectorMemoryConfig::default();
+        let current = EmbeddingIdentity::from_config(&config);
+        assert!(!embedding_identity_compatible(None, &current));
+        assert!(embedding_identity_compatible(Some(&current), &current));
+
+        let mut other = current.clone();
+        other.model = "other-model".into();
+        assert!(!embedding_identity_compatible(Some(&other), &current));
     }
 }

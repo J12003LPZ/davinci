@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use davinci_ai::{
     assistant_to_chat, AssistantMessage, ChatMessage, ContentBlock, MessageContent, StopReason,
@@ -1021,6 +1021,20 @@ impl Agent {
             .unwrap_or_else(|| crate::runtime::conservative_replay_policy(name))
     }
 
+    fn side_effect_for_tool(&self, name: &str) -> crate::tool_ledger::ToolSideEffect {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capability_registry.get(name))
+            .map(|capability| {
+                if capability.read_only {
+                    crate::tool_ledger::ToolSideEffect::ReadOnly
+                } else {
+                    crate::tool_ledger::ToolSideEffect::Mutating
+                }
+            })
+            .unwrap_or_else(|| crate::tool_ledger::classify_side_effect(name))
+    }
+
     /// Stage one of a tool call. `depth` is 0 for a call the model made and
     /// 1 for an operation inside a `batch`.
     pub(crate) fn prepare_tool_call(
@@ -1050,8 +1064,9 @@ impl Agent {
             );
         }
         let replay_policy = self.replay_policy_for_tool(name);
+        let side_effect = self.side_effect_for_tool(name);
         if let Ok(mut ledger) = self.tool_ledger.lock() {
-            match ledger.reserve_call_with_policy(id, name, args, replay_policy) {
+            match ledger.reserve_call_with_metadata(id, name, args, replay_policy, side_effect) {
                 Err(collision_err) => {
                     return Preparation::Immediate(crate::ToolResult {
                         content: collision_err,
@@ -1497,7 +1512,7 @@ impl Agent {
                 && !pre_hook_error
                 && !result.is_error
             {
-                self.record_successful_mutation();
+                self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
             }
             if matches!(name, "bash" | "powershell" | "exec_command") {
                 let cmd = args
@@ -1505,7 +1520,7 @@ impl Agent {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if is_verification_command(cmd) {
-                    self.record_verification_result(!pre_hook_error && !result.is_error);
+                    self.record_verification_command(cmd, !pre_hook_error && !result.is_error);
                 }
             }
         }
@@ -2300,6 +2315,37 @@ fn sleep_retry_delay(delay_ms: u64, cancelled: impl Fn() -> bool) {
         }
         std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
     }
+}
+
+pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for key in ["path", "file_path", "notebook_path"] {
+        if let Some(value) = args.get(key).and_then(Value::as_str) {
+            let path = PathBuf::from(value);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    if name == "apply_patch" {
+        if let Some(patch) = args
+            .get("patch")
+            .or_else(|| args.get("input"))
+            .and_then(Value::as_str)
+        {
+            for line in patch.lines() {
+                for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+                    if let Some(path) = line.strip_prefix(prefix) {
+                        let path = PathBuf::from(path.trim());
+                        if !paths.contains(&path) {
+                            paths.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    paths
 }
 
 pub(crate) fn is_verification_command(cmd: &str) -> bool {
@@ -3467,5 +3513,45 @@ mod tests {
         assert!(dispatch.is_error);
         assert!(dispatch.content.contains("review-only"));
         assert!(!dir.path().join("dispatch.rs").exists());
+    }
+
+    #[test]
+    fn tool_ledger_uses_runtime_capability_side_effect() {
+        let mut agent = Agent::new("x");
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        runtime
+            .capability_registry
+            .register(crate::RuntimeCapability::new(
+                "custom_read_capability",
+                crate::CapabilitySource::Mcp,
+                crate::ToolClass::Read,
+                true,
+                &serde_json::json!({"type":"object"}),
+                None,
+            ));
+        agent.set_runtime(runtime);
+
+        let side_effect = agent.side_effect_for_tool("custom_read_capability");
+        assert_eq!(side_effect, crate::tool_ledger::ToolSideEffect::ReadOnly);
+
+        let mut ledger = agent.tool_ledger.lock().unwrap();
+        ledger
+            .reserve_call_with_metadata(
+                "custom-read-call",
+                "custom_read_capability",
+                &serde_json::json!({}),
+                crate::runtime::ReplayPolicy::SafeToReplay,
+                side_effect,
+            )
+            .unwrap();
+        let record = ledger.records().get("custom-read-call").unwrap();
+        assert_eq!(
+            record.side_effect,
+            crate::tool_ledger::ToolSideEffect::ReadOnly
+        );
     }
 }
