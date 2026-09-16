@@ -1163,6 +1163,9 @@ pub enum GraphViewMode {
 #[derive(Debug, Clone, Default)]
 pub struct GraphTask {
     pub id: String,
+    pub status: String,
+    pub phase: String,
+    pub artifact_file: Option<String>,
     pub policy: String,
     pub artifact: String,
     pub usage: String,
@@ -1180,6 +1183,9 @@ pub struct GraphTask {
 #[derive(Debug, Clone, Default)]
 pub struct GraphRunSheet {
     pub goal: String,
+    pub phase: String,
+    pub blocked_reason: Option<String>,
+    pub verification: Vec<String>,
     pub phases: Vec<(String, State)>,
     pub shape: Vec<String>,
     pub tasks: Vec<GraphTask>,

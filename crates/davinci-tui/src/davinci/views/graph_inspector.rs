@@ -116,11 +116,16 @@ fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Lin
         add("", "Enter expands its real members");
     } else if let Some(task) = task {
         add("", &format!("{} {}", task.state.glyph(), task.id));
+        add("Status: ", &task.status);
+        add("Phase: ", &task.phase);
         add("Work: ", &task.artifact);
         if let Some(error) = &task.error {
             add("Reason: ", error);
         }
         add("Usage: ", &task.usage);
+        if let Some(path) = &task.artifact_file {
+            add("Artifact: ", path);
+        }
         if run.inspecting_node {
             add("Role: ", &task.role);
             add("Policy: ", &task.policy);
@@ -138,6 +143,13 @@ fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Lin
         }
     } else {
         add("", "Arrows select a worker; Enter inspects");
+    }
+    add("Run phase: ", &run.phase);
+    if let Some(reason) = &run.blocked_reason {
+        add("Run blocked: ", reason);
+    }
+    for verification in &run.verification {
+        add("", verification);
     }
     facts
 }
@@ -214,5 +226,40 @@ mod tests {
         let rows = inspector_lines(&model, Some("writer"), 30, 7);
         assert!(rows.iter().any(|r| r.to_string().contains("PUBLIC_END")));
         assert!(rows.len() <= 7);
+    }
+
+    #[test]
+    fn graph_inspector_shows_real_status_artifact_and_run_verification() {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 80, 40, false);
+        let mut run = fixtures::blueprint_graph();
+        run.inspecting_node = true;
+        run.phase = "blocked".into();
+        run.blocked_reason = Some("required tests failed".into());
+        run.verification = vec![
+            "Verification failed".into(),
+            "cargo test · exit 1 · 1.2s".into(),
+            "reasoning: PRIVATE_VERIFICATION".into(),
+        ];
+        run.tasks[5].status = "cancelled".into();
+        run.tasks[5].phase = "implement".into();
+        run.tasks[5].artifact_file = Some("artifacts/writer.json".into());
+        model.graph_run = Some(run);
+        let text = inspector_lines(&model, Some("writer"), 80, 100)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for fact in [
+            "Status: cancelled",
+            "Phase: implement",
+            "artifacts/writer.json",
+            "Run phase: blocked",
+            "required tests failed",
+            "Verification failed",
+            "cargo test",
+        ] {
+            assert!(text.contains(fact), "missing {fact}: {text}");
+        }
+        assert!(!text.contains("PRIVATE_VERIFICATION"));
     }
 }

@@ -6538,6 +6538,39 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
         })
         .collect();
 
+    // Presentation-only dependency propagation. Do not change the persisted
+    // status or infer blockage from a missing dependency.
+    let mut unavailable = std::collections::BTreeSet::new();
+    let mut waiting = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+    let mut frontier = std::collections::VecDeque::new();
+    for task in tasks_json {
+        let Some(id) = task.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        match task.get("status").and_then(serde_json::Value::as_str) {
+            Some("failed" | "cancelled") => {
+                if unavailable.insert(id) {
+                    frontier.push_back(id);
+                }
+            }
+            Some("pending" | "ready") => {
+                if let Some(deps) = task.get("dependsOn").and_then(serde_json::Value::as_array) {
+                    for dep in deps.iter().filter_map(serde_json::Value::as_str) {
+                        waiting.entry(dep).or_default().push(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    while let Some(id) = frontier.pop_front() {
+        for &dependent in waiting.get(id).into_iter().flatten() {
+            if unavailable.insert(dependent) {
+                frontier.push_back(dependent);
+            }
+        }
+    }
+
     // The rows: one per worker the run has spawned so far.
     let policy_of_role = |role: &str| match role {
         "test-analyzer" | "reviewer" => "read-and-test",
@@ -6587,10 +6620,13 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
                         .join(", ")
                 })
                 .unwrap_or_default();
+            let blocked =
+                matches!(status.as_str(), "pending" | "ready") && unavailable.contains(id.as_str());
             let state = match status.as_str() {
                 "succeeded" => State::Done,
                 "running" => State::Active,
                 "failed" | "cancelled" => State::Failed,
+                _ if blocked => State::Attention,
                 _ => State::Queued,
             };
             let artifact = match status.as_str() {
@@ -6617,6 +6653,8 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
                 }
                 "failed" => format!("failed · {}", clip(&json_str(task, "error"), 44)),
                 "cancelled" => "cancelled".into(),
+                _ if blocked => format!("blocked · dependency unavailable: {deps}"),
+                "ready" => "ready".into(),
                 _ if !deps.is_empty() => format!("pending · waits on {deps}"),
                 _ => "pending".into(),
             };
@@ -6683,13 +6721,27 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
                 artifact,
                 usage,
                 state,
-                role,
                 dependencies,
                 owner,
                 attempts,
                 error,
                 recent_tools,
                 public_contract,
+                phase: match role.as_str() {
+                    "classifier" => "classify",
+                    "researcher" | "test-analyzer" | "historian" => "investigate",
+                    "planner" => "plan",
+                    "writer" => "implement",
+                    "reviewer" => "review",
+                    _ => "",
+                }
+                .into(),
+                role,
+                status,
+                artifact_file: task
+                    .get("artifactFile")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
             }
         })
         .collect();
@@ -6845,7 +6897,17 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             number(&budgets, "maxRevisionCycles"),
         ),
         replans: capped(number(&counters, "replans"), number(&budgets, "maxReplans")),
-        artifacts: format!(".pi\\graph\\runs\\{}\\", json_str(run, "runId")),
+        artifacts: match (
+            run.get("cwd").and_then(serde_json::Value::as_str),
+            run.get("runId").and_then(serde_json::Value::as_str),
+        ) {
+            (Some(cwd), Some(id)) => {
+                crate::native_extensions::graph::store::run_dir(std::path::Path::new(cwd), id)
+                    .display()
+                    .to_string()
+            }
+            _ => String::new(),
+        },
         id: json_str(run, "runId"),
         mode,
         milestone,
@@ -6864,13 +6926,205 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             })
             .map(|stats| stats.render_compact_lines())
             .unwrap_or_default(),
-        lifecycle: json_str(run, "lifecycle"),
+        lifecycle: run
+            .get("lifecycle")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(if matches!(phase.as_str(), "done" | "cancelled") {
+                "stopped"
+            } else {
+                "running"
+            })
+            .into(),
+        phase,
+        blocked_reason: run
+            .get("blockedReason")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        verification: graph_verification_facts(run.get("verification")),
         control_status: run
             .get("controlStatus")
             .and_then(serde_json::Value::as_str)
             .map(String::from),
         ..Default::default()
     })
+}
+
+fn graph_verification_facts(verification: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(verification) = verification else {
+        return Vec::new();
+    };
+    let mut facts = Vec::new();
+    if let Some(passed) = verification
+        .get("passed")
+        .and_then(serde_json::Value::as_bool)
+    {
+        facts.push(format!(
+            "Verification {}",
+            if passed { "passed" } else { "failed" }
+        ));
+    }
+    if let Some(commands) = verification
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+    {
+        for command in commands {
+            let mut parts = vec![json_str(command, "name"), json_str(command, "command")];
+            if command.get("skipped").and_then(serde_json::Value::as_bool) == Some(true) {
+                parts.push("skipped".into());
+            } else if let Some(exit) = command.get("exitCode").and_then(serde_json::Value::as_i64) {
+                parts.push(format!("exit {exit}"));
+            }
+            if let Some(ms) = command
+                .get("durationMs")
+                .and_then(serde_json::Value::as_u64)
+            {
+                parts.push(format!("{:.1}s", ms as f64 / 1000.0));
+            }
+            let fact = parts
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if !fact.is_empty() {
+                facts.push(fact);
+            }
+        }
+    }
+    facts
+}
+
+#[cfg(test)]
+mod graph_canvas_fact_tests {
+    use super::*;
+    use crate::native_extensions::graph::types::*;
+    use serde_json::json;
+
+    fn snapshot() -> GraphRun {
+        let mut run: GraphRun = serde_json::from_value(json!({
+            "version": 1, "runId": "canvas-facts", "goal": "fixture", "cwd": ".",
+            "phase": "blocked", "dryRun": true, "budgets": GraphBudgets::default(),
+            "counters": {"workersSpawned": 2, "revisionCycles": 0, "replans": 0, "costUsd": 0.2, "startedAt": 1000},
+            "updatedAt": 2000
+        })).unwrap();
+        let mut writer = GraphTaskState::new(
+            "writer",
+            Role::Writer,
+            ArtifactKind::PatchReport,
+            vec![],
+            None,
+        );
+        writer.status = TaskStatus::Failed;
+        writer.attempts = 2;
+        writer.artifact_file = Some("artifacts/writer.json".into());
+        writer.error = Some("assertion failed".into());
+        writer.started_at = Some(1000);
+        writer.ended_at = Some(2000);
+        writer.usage.input = 1200;
+        writer.usage.output = 300;
+        writer.usage.cost_usd = 0.2;
+        writer.context_fingerprint = Some("PRIVATE_CONTEXT_SENTINEL".into());
+        run.tasks = vec![
+            writer,
+            GraphTaskState::new(
+                "review",
+                Role::Reviewer,
+                ArtifactKind::Review,
+                vec!["writer".into()],
+                None,
+            ),
+        ];
+        run.blocked_reason = Some("required checks failed".into());
+        run.verification = Some(VerificationResult {
+            passed: false,
+            commands: vec![VerificationCommandResult {
+                name: "tests".into(),
+                command: "cargo test".into(),
+                exit_code: 1,
+                duration_ms: 1200,
+                output_tail: "PRIVATE_OUTPUT_SENTINEL".into(),
+                skipped: false,
+            }],
+        });
+        run
+    }
+
+    #[test]
+    fn graph_canvas_facts_match_typed_snapshot_without_private_payloads() {
+        let run = snapshot();
+        let sheet = graph_sheet(&json!({"run": run})).unwrap();
+        assert_eq!(sheet.tasks[0].artifact_file, run.tasks[0].artifact_file);
+        assert_eq!(sheet.tasks[0].attempts, run.tasks[0].attempts);
+        assert_eq!(sheet.tasks[0].status, "failed");
+        assert_eq!(sheet.tasks[0].phase, "implement");
+        assert_eq!(sheet.tasks[0].error, run.tasks[0].error);
+        assert_eq!(sheet.tasks[1].dependencies, run.tasks[1].depends_on);
+        assert_eq!(sheet.tasks[1].state, State::Attention);
+        assert!(sheet.tasks[1].artifact.contains("writer"));
+        assert!(sheet.tasks[0].usage.contains("1.2k↑ 300↓ $0.20 1s"));
+        assert_eq!(sheet.blocked_reason, run.blocked_reason);
+        assert_eq!(sheet.phase, "blocked");
+        assert_eq!(
+            sheet.artifacts,
+            crate::native_extensions::graph::store::run_dir(
+                std::path::Path::new(&run.cwd),
+                &run.run_id
+            )
+            .display()
+            .to_string()
+        );
+        assert_eq!(sheet.lifecycle, "running");
+        assert!(sheet
+            .verification
+            .iter()
+            .any(|v| v.contains("cargo test") && v.contains("exit 1") && v.contains("1.2s")));
+        assert!(sheet.verification.iter().any(|v| v.contains("failed")));
+        assert!(sheet.tasks[0].owner.is_empty() && sheet.tasks[0].recent_tools.is_empty());
+        assert!(sheet.tasks[0].public_contract.is_none());
+        assert!(!format!("{sheet:?}").contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn graph_canvas_facts_keep_cancelled_ready_legacy_lifecycle_and_unknowns_honest() {
+        let mut run = snapshot();
+        run.phase = Phase::Done;
+        run.tasks[0].status = TaskStatus::Cancelled;
+        run.tasks[1].status = TaskStatus::Ready;
+        run.tasks[1].depends_on.clear();
+        run.verification = None;
+        let sheet = graph_sheet(&json!({"run": run})).unwrap();
+        assert_eq!(sheet.lifecycle, "stopped");
+        assert_eq!(sheet.tasks[0].status, "cancelled");
+        assert_eq!(sheet.tasks[1].status, "ready");
+        assert!(sheet.verification.is_empty());
+        assert!(sheet.tasks[1].artifact_file.is_none());
+    }
+
+    #[test]
+    fn graph_canvas_facts_propagate_only_declared_failed_dependencies() {
+        let mut run = snapshot();
+        run.tasks.push(GraphTaskState::new(
+            "dependent",
+            Role::Reviewer,
+            ArtifactKind::Review,
+            vec!["review".into()],
+            None,
+        ));
+        run.tasks.push(GraphTaskState::new(
+            "missing",
+            Role::Reviewer,
+            ArtifactKind::Review,
+            vec!["absent".into()],
+            None,
+        ));
+        let sheet = graph_sheet(&json!({"run": run})).unwrap();
+        assert_eq!(sheet.tasks[2].state, State::Attention);
+        assert_eq!(sheet.tasks[2].status, "pending");
+        assert_eq!(sheet.tasks[3].state, State::Queued);
+        let mut run = snapshot();
+        run.tasks[0].status = TaskStatus::Succeeded;
+        let sheet = graph_sheet(&json!({"run": run})).unwrap();
+        assert_eq!(sheet.tasks[1].state, State::Queued);
+    }
 }
 
 /// `4s`, `1m52s`, `1h03m` for a span in milliseconds.
