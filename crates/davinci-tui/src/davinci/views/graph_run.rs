@@ -1,10 +1,33 @@
 //! Read-only graph-run progress. Worker state is not keyboard focus;
 //! policies, artifacts and usage come from the actual run snapshot.
 
+use super::graph_inspector::{inspector_lines, public_text};
+use super::graph_layout::{GraphLayout, GraphResponsiveMode};
 use super::sheet::{facts, hint, status_meter, Composer, SheetChrome};
-use crate::davinci::ui::{self, section_detail, section_heading, section_state, span};
+use crate::davinci::ui::{self, section_heading, section_state, span};
 use crate::davinci::{model::Model, theme::State};
 use ratatui::text::Line;
+
+pub const HEADER_ROWS: u16 = 3;
+
+fn section_detail(
+    width: u16,
+    theme: &crate::davinci::theme::Theme,
+    text: &str,
+) -> Vec<Line<'static>> {
+    ui::section_detail(width, theme, &public_text(text))
+}
+
+pub fn layout_for(model: &Model, height: u16) -> Option<GraphLayout> {
+    model.graph_run.as_ref().map(|run| {
+        super::graph_layout::layout_graph(
+            run,
+            &model.graph_canvas,
+            model.width,
+            height.saturating_sub(HEADER_ROWS),
+        )
+    })
+}
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     lines_in(model, model.height.saturating_sub(3))
@@ -14,12 +37,7 @@ pub fn lines_in(model: &Model, height: u16) -> Vec<Line<'static>> {
     let Some(run) = &model.graph_run else {
         return structured_lines(model);
     };
-    let layout = super::graph_layout::layout_graph(
-        run,
-        &model.graph_canvas,
-        model.width,
-        height.saturating_sub(2),
-    );
+    let layout = layout_for(model, height).expect("run exists");
     if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
         let mut rows = Vec::new();
         for issue in &layout.issues {
@@ -29,10 +47,21 @@ pub fn lines_in(model: &Model, height: u16) -> Vec<Line<'static>> {
         return rows;
     }
     let done = run.tasks.iter().filter(|t| t.state == State::Done).count();
+    let mut telemetry = vec![format!("{done}/{} workers complete", run.tasks.len())];
+    for (label, value) in [
+        ("Elapsed", &run.elapsed),
+        ("Cost", &run.cost),
+        ("Cap", &run.cost_cap),
+        ("Revisions", &run.cycles),
+    ] {
+        if !value.is_empty() {
+            telemetry.push(format!("{label}: {value}"));
+        }
+    }
     let mut rows = vec![
         Line::from(ui::truncate_run(
             vec![span(
-                format!(
+                public_text(&format!(
                     "{} · {} · Follow {} · {:?}",
                     run.id,
                     run.lifecycle,
@@ -42,30 +71,55 @@ pub fn lines_in(model: &Model, height: u16) -> Vec<Line<'static>> {
                         "off"
                     },
                     model.graph_canvas.view_mode
-                ),
+                )),
                 model.theme.primary,
             )],
             model.width,
         )),
         Line::from(ui::truncate_run(
-            vec![span(
-                format!(
-                    "{done}/{} workers complete · {} · {} / {}",
-                    run.tasks.len(),
-                    run.elapsed,
-                    run.cost,
-                    run.cost_cap
-                ),
-                model.theme.muted,
-            )],
+            vec![span(public_text(&telemetry.join(" · ")), model.theme.muted)],
             model.width,
         )),
     ];
-    rows.extend(super::graph_canvas::lines(
-        model,
-        &layout,
-        (model.tick % 4) as u8,
-    ));
+    let note = layout
+        .issues
+        .first()
+        .map(String::as_str)
+        .or(run.control_status.as_deref())
+        .unwrap_or(&run.goal);
+    rows.push(Line::from(span(
+        ui::clip_ellipsis(&public_text(note), model.width),
+        model.theme.muted,
+    )));
+    let mut cells =
+        super::graph_canvas::Cells::new(model.width, height.saturating_sub(HEADER_ROWS));
+    cells.blit(
+        super::graph_canvas::lines(model, &layout, (model.tick % 4) as u8),
+        layout.canvas,
+    );
+    cells.blit(
+        inspector_lines(
+            model,
+            run.selected_node_id.as_deref(),
+            layout.inspector.width,
+            layout.inspector.height,
+        ),
+        layout.inspector,
+    );
+    let rule = ratatui::style::Style::default().fg(model.theme.border);
+    if layout.mode == GraphResponsiveMode::Full {
+        for y in 0..layout.inspector.height {
+            cells.write(layout.inspector.x as i32 - 1, y as i32, "│", rule);
+        }
+    } else {
+        cells.write(
+            0,
+            layout.inspector.y as i32 - 1,
+            &"─".repeat(model.width as usize),
+            rule,
+        );
+    }
+    rows.extend(cells.into_lines());
     rows
 }
 
@@ -84,7 +138,7 @@ pub fn structured_lines(model: &Model) -> Vec<Line<'static>> {
         .iter()
         .filter(|task| task.state == State::Done)
         .count();
-    let mut rows = section_heading(width, th, &run.goal);
+    let mut rows = section_heading(width, th, &public_text(&run.goal));
     rows.extend(section_detail(
         width,
         th,
@@ -105,18 +159,7 @@ pub fn structured_lines(model: &Model) -> Vec<Line<'static>> {
         rows.extend(section_detail(width, th, &format!("Control: {status}")));
     }
     for (phase, state) in &run.phases {
-        rows.extend(section_state(width, th, *state, phase));
-    }
-    if !run.shape.is_empty() {
-        rows.extend(section_heading(width, th, "Worker graph"));
-        for line in &run.shape {
-            // Keep the authored connector grid; the worker list below provides
-            // full names and paths when the diagram is too wide.
-            rows.push(Line::from(ui::truncate_run(
-                vec![span(format!("   {line}"), th.muted)],
-                width,
-            )));
-        }
+        rows.extend(section_state(width, th, *state, &public_text(phase)));
     }
     if run.tasks.is_empty() {
         rows.extend(section_detail(width, th, "No workers reported yet."));
@@ -128,11 +171,11 @@ pub fn structured_lines(model: &Model) -> Vec<Line<'static>> {
                 width,
                 th,
                 true,
-                &format!("{} {}", task.state.glyph(), task.id),
-                &task.usage,
+                &public_text(&format!("{} {}", task.state.glyph(), task.id)),
+                &public_text(&task.usage),
             ));
         } else {
-            rows.extend(section_state(width, th, task.state, &task.id));
+            rows.extend(section_state(width, th, task.state, &public_text(&task.id)));
         }
         for (label, value) in [
             ("Policy", &task.policy),

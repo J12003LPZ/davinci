@@ -20,6 +20,18 @@ pub(super) struct Cells {
     clip: Rect,
 }
 impl Cells {
+    pub(super) fn blit(&mut self, rows: Vec<Line<'static>>, rect: Rect) {
+        let previous = self.clip;
+        self.clip = rect.intersection(self.buffer.area);
+        for (i, row) in rows.into_iter().take(rect.height as usize).enumerate() {
+            let mut x = rect.x as i32;
+            for span in row.spans {
+                self.write(x, rect.y as i32 + i as i32, &span.content, span.style);
+                x += UnicodeWidthStr::width(span.content.as_ref()) as i32;
+            }
+        }
+        self.clip = previous;
+    }
     pub(super) fn new(width: u16, height: u16) -> Self {
         let clip = Rect::new(0, 0, width, height);
         Self {
@@ -199,7 +211,10 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
         cells.write(
             x + 1,
             y + 1,
-            &ui::clip_ellipsis(&label, node.rect.width - 2),
+            &ui::clip_ellipsis(
+                &super::graph_inspector::public_text(&label),
+                node.rect.width - 2,
+            ),
             style,
         );
         let activity = if node.members.len() > 1 {
@@ -210,14 +225,20 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
         cells.write(
             x + 1,
             y + 2,
-            &ui::clip_ellipsis(activity, node.rect.width - 2),
+            &ui::clip_ellipsis(
+                &super::graph_inspector::public_text(activity),
+                node.rect.width - 2,
+            ),
             text_style,
         );
         if h > 4 {
             cells.write(
                 x + 1,
                 y + 3,
-                &ui::clip_ellipsis(&task.usage, node.rect.width - 2),
+                &ui::clip_ellipsis(
+                    &super::graph_inspector::public_text(&task.usage),
+                    node.rect.width - 2,
+                ),
                 Style::default().fg(th.muted),
             );
         }

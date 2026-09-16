@@ -1132,6 +1132,7 @@ pub struct GraphCanvasState {
     pub pan_y: i32,
     pub expanded_groups: std::collections::BTreeSet<String>,
     pub selected_group: Option<String>,
+    pub inspector_scroll: usize,
 }
 
 impl Default for GraphCanvasState {
@@ -1143,6 +1144,7 @@ impl Default for GraphCanvasState {
             pan_y: 0,
             expanded_groups: Default::default(),
             selected_group: None,
+            inspector_scroll: 0,
         }
     }
 }
