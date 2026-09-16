@@ -52,7 +52,26 @@ jobs:
       - name: Runtime migration baseline
         run: cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
 
-  workspace-tests:
+  workspace-test-shards:
+    name: workspace-test (${{ matrix.package }})
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - davinci-agent
+          - davinci-ai
+          - davinci-client
+          - davinci-coding-agent
+          - davinci-evals
+          - davinci-mcp
+          - davinci-parity
+          - davinci-protocol
+          - davinci-server
+          - davinci-session
+          - davinci-session-sqlite
+          - davinci-telemetry
+          - davinci-tui
+          - davinci-voice
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: "0"
@@ -60,10 +79,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Use repository-pinned Rust
         run: rustup show
-      - name: Workspace tests
+      - name: Workspace package tests
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-          cargo build -p davinci-coding-agent --bin davinci
-          cargo test --workspace
+          if [[ "${{ matrix.package }}" == "davinci-coding-agent" ]]; then
+            cargo build -p davinci-coding-agent --bin davinci
+          fi
+          cargo test -p "${{ matrix.package }}"
+
+  workspace-tests:
+    needs: workspace-test-shards
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all workspace test shards
+        shell: bash
+        run: test "${{ needs['workspace-test-shards'].result }}" = "success"
