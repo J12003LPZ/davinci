@@ -34,10 +34,16 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
 }
 
 pub fn lines_in(model: &Model, height: u16) -> Vec<Line<'static>> {
+    let Some(layout) = layout_for(model, height) else {
+        return structured_lines(model);
+    };
+    lines_with_layout(model, height, &layout)
+}
+
+pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Line<'static>> {
     let Some(run) = &model.graph_run else {
         return structured_lines(model);
     };
-    let layout = layout_for(model, height).expect("run exists");
     if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
         let mut rows = Vec::new();
         for issue in &layout.issues {
@@ -94,7 +100,7 @@ pub fn lines_in(model: &Model, height: u16) -> Vec<Line<'static>> {
     let mut cells =
         super::graph_canvas::Cells::new(model.width, height.saturating_sub(HEADER_ROWS));
     cells.blit(
-        super::graph_canvas::lines(model, &layout, (model.tick % 4) as u8),
+        super::graph_canvas::lines(model, layout, (model.tick % 4) as u8),
         layout.canvas,
     );
     cells.blit(
@@ -271,12 +277,15 @@ pub fn chrome(model: &Model) -> SheetChrome {
             .filter(|run| !run.cost.is_empty() && !run.cost_cap.is_empty())
             .map(|run| status_meter(th, "run cost", run.cost_fraction, &run.cost, &run.cost_cap)),
         hints: vec![
-            hint(th, "↑↓ select"),
+            hint(th, "↑↓←→ select"),
             hint(th, "enter inspect"),
+            hint(th, "f follow"),
+            hint(th, "v focus"),
             hint(th, "p pause/resume"),
             hint(th, "x stop"),
             hint(th, "r retry"),
             hint(th, "d diff"),
+            hint(th, "PgUp/Dn pan/details"),
         ],
         escape: Some("esc close"),
         composer: Composer::Hidden,

@@ -55,6 +55,7 @@ pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
 pub struct ComposedFrame {
     pub lines: Vec<Line<'static>>,
     pub mic_rect: Option<ratatui::layout::Rect>,
+    pub graph: Option<super::views::graph_nav::GraphFrame>,
 }
 
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
@@ -74,12 +75,14 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         return ComposedFrame {
             lines: pad_to(rows, height),
             mic_rect: None,
+            graph: None,
         };
     }
     if height == 0 {
         return ComposedFrame {
             lines: Vec::new(),
             mic_rect: None,
+            graph: None,
         };
     }
     if model.screen == Screen::Models && model.overlay.is_none() {
@@ -98,6 +101,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         return ComposedFrame {
             lines: pad_to(lines, height),
             mic_rect: None,
+            graph: None,
         };
     }
     // While an instrument floats over the transcript, the chrome around it
@@ -148,7 +152,12 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         rows.push(chrome::header(chrome_model));
     }
     rows.extend(top);
-    rows.extend(body(model, body_height));
+    let body_start = rows.len() as u16;
+    let mut graph = None;
+    rows.extend(body_with_graph(model, body_height, &mut graph));
+    if let Some(frame) = &mut graph {
+        frame.origin_y = frame.origin_y.saturating_add(body_start);
+    }
     rows.extend(bottom);
     rows.extend(above);
     rows.extend(working);
@@ -173,6 +182,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     }
     ComposedFrame {
         lines: pad_to(rows, height),
+        graph,
         mic_rect,
     }
 }
@@ -272,14 +282,25 @@ fn section_rows(model: &Model) -> Option<Vec<Line<'static>>> {
 }
 
 fn body(model: &Model, height: usize) -> Vec<Line<'static>> {
+    body_with_graph(model, height, &mut None)
+}
+
+fn body_with_graph(
+    model: &Model,
+    height: usize,
+    graph: &mut Option<super::views::graph_nav::GraphFrame>,
+) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
     }
     if let Some(overlay) = model.overlay {
         return overlay_body(model, overlay, height);
     }
+    if model.screen == Screen::GraphRun {
+        return panel(model, Vec::new(), height, graph);
+    }
     if let Some(rows) = section_rows(model) {
-        return panel(model, rows, height);
+        return panel(model, rows, height, graph);
     }
     if model.codex_open() {
         return codex::lines(model, height);
@@ -316,7 +337,12 @@ fn empty_state(model: &Model, height: usize) -> Vec<Line<'static>> {
 /// rows windowed around the selection, its hint row pinned last (design.md
 /// §11). The screens with a frame of their own (`1c`, `2a`–`2c`) keep the
 /// turn that produced them visible above and anchor to the composer.
-fn panel(model: &Model, rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+fn panel(
+    model: &Model,
+    mut rows: Vec<Line<'static>>,
+    height: usize,
+    graph: &mut Option<super::views::graph_nav::GraphFrame>,
+) -> Vec<Line<'static>> {
     let Some(chrome) = sheet::chrome(model) else {
         let panel = tail(rows, height);
         let room = height - panel.len();
@@ -355,6 +381,32 @@ fn panel(model: &Model, rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'st
     let room = height
         .saturating_sub(out.len())
         .saturating_sub(hint_rows + notice.len());
+    if model.screen == Screen::GraphRun {
+        if let Some(layout) = graph_run::layout_for(model, room as u16) {
+            if layout.mode != super::views::graph_layout::GraphResponsiveMode::Structured {
+                let offset = super::views::graph_nav::viewport(
+                    &layout,
+                    model.graph_run.as_ref().unwrap(),
+                    &model.graph_canvas,
+                );
+                rows = graph_run::lines_with_layout(model, room as u16, &layout);
+                *graph = Some(super::views::graph_nav::GraphFrame {
+                    layout,
+                    origin_y: out.len() as u16 + graph_run::HEADER_ROWS,
+                    offset,
+                });
+                out.extend(rows);
+                out = pad_to(out, height.saturating_sub(hint_rows + notice.len()));
+                out.extend(notice);
+                if let Some(hint) = hint {
+                    out.push(hint);
+                }
+                out.truncate(height);
+                return out;
+            }
+        }
+        rows = graph_run::lines_in(model, room as u16);
+    }
     let picking = matches!(
         model.screen,
         Screen::Models
@@ -665,6 +717,9 @@ fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
 }
 
 fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Flow {
+    if model.screen == Screen::GraphRun && super::views::graph_nav::handle_key(model, key) {
+        return Flow::Continue;
+    }
     if model.codex_open() {
         if action_matches(model, data, "davinci.codex.toggle")
             || action_matches(model, data, "tui.select.cancel")
@@ -894,6 +949,111 @@ fn is_picker(screen: Screen) -> bool {
             | Screen::Agents
             | Screen::ContextInspector
     )
+}
+
+#[cfg(test)]
+mod graph_input_tests {
+    use super::*;
+    use crate::davinci::{
+        fixtures,
+        theme::{ColorDepth, Theme},
+        views::graph_nav,
+    };
+    fn graph_model() -> Model {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 120, 40, false);
+        model.screen = Screen::GraphRun;
+        model.graph_run = Some(fixtures::blueprint_graph());
+        model
+    }
+    fn press(model: &mut Model, code: KeyCode) -> Flow {
+        handle_key(model, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    #[test]
+    fn graph_view_action_keyboard_is_local_and_keeps_controls() {
+        let mut model = graph_model();
+        press(&mut model, KeyCode::Right);
+        assert!(!model.graph_canvas.follow_live);
+        assert!(model.graph_run.as_ref().unwrap().selected_node_id.is_some());
+        press(&mut model, KeyCode::Char('f'));
+        assert!(model.graph_canvas.follow_live);
+        press(&mut model, KeyCode::Char('v'));
+        assert_eq!(
+            model.graph_canvas.view_mode,
+            super::super::model::GraphViewMode::Focus
+        );
+        press(&mut model, KeyCode::Enter);
+        assert!(model.graph_run.as_ref().unwrap().inspecting_node);
+        press(&mut model, KeyCode::Esc);
+        assert!(!model.graph_run.as_ref().unwrap().inspecting_node);
+        assert_eq!(model.screen, Screen::GraphRun);
+        for (key, action) in [
+            ('p', "pause_resume"),
+            ('x', "stop"),
+            ('r', "retry"),
+            ('d', "diff"),
+        ] {
+            assert!(
+                matches!(press(&mut model, KeyCode::Char(key)), Flow::Choose(Choice::GraphAction { action: actual, .. }) if actual == action)
+            );
+        }
+        model.screen = Screen::Agent;
+        press(&mut model, KeyCode::Char('f'));
+        press(&mut model, KeyCode::Char('v'));
+        assert_eq!(model.composer.to_string(), "fv");
+    }
+
+    #[test]
+    fn graph_mouse_uses_composed_geometry_with_notices_and_echo() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut model = graph_model();
+        model.section_notice = Some("notice".into());
+        let composed = compose_frame(&model, model.height);
+        let frame = composed
+            .graph
+            .expect("graph geometry accompanies rendered lines");
+        let node = frame
+            .layout
+            .nodes
+            .iter()
+            .find(|n| n.id == "writer")
+            .unwrap();
+        let x = node.rect.x as i32 - frame.offset.0 + 2;
+        let y = node.rect.y as i32 - frame.offset.1 + frame.origin_y as i32 + 1;
+        assert!(composed.lines[y as usize].to_string().contains("writer"));
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x as u16,
+            row: y as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(graph_nav::handle_mouse(&mut model, mouse, &frame));
+        assert_eq!(
+            model
+                .graph_run
+                .as_ref()
+                .unwrap()
+                .selected_node_id
+                .as_deref(),
+            Some("writer")
+        );
+        assert!(!model.graph_canvas.follow_live);
+        let selected = model.graph_run.as_ref().unwrap().selected_node_id.clone();
+        graph_nav::handle_mouse(
+            &mut model,
+            MouseEvent {
+                column: 0,
+                row: frame.origin_y,
+                ..mouse
+            },
+            &frame,
+        );
+        assert_eq!(model.graph_run.as_ref().unwrap().selected_node_id, selected);
+        assert!(!graph_nav::handle_mouse(
+            &mut model,
+            MouseEvent { row: 0, ..mouse },
+            &frame
+        ));
+    }
 }
 
 fn screen_move(model: &mut Model, delta: isize) {
@@ -2906,13 +3066,8 @@ mod section_input_regressions {
             &mut m,
             crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
         );
-        assert!(matches!(
-            flow_enter,
-            Flow::Choose(Choice::GraphAction {
-                action: "inspect",
-                ..
-            })
-        ));
+        assert!(matches!(flow_enter, Flow::Continue));
+        assert!(m.graph_run.as_ref().unwrap().inspecting_node);
         assert_eq!(&*m.composer, "my draft");
     }
 }

@@ -1646,7 +1646,7 @@ fn run_turn(
                         }
                     }
                     crossterm::event::Event::Mouse(mouse) => {
-                        if session.handle_mouse(mouse) {
+                        if session.handle_model_mouse(model, mouse) {
                             voice.toggle(model);
                         }
                     }
@@ -3051,7 +3051,7 @@ fn resolve_scope_expansion_modal(
                 model.height = height.max(4);
             }
             crossterm::event::Event::Mouse(mouse) => {
-                if session.handle_mouse(mouse) {
+                if session.handle_model_mouse(model, mouse) {
                     voice.toggle(model);
                 }
             }
@@ -4611,7 +4611,7 @@ pub fn run(
                     }
                 }
                 crossterm::event::Event::Mouse(mouse) => {
-                    if terminal.handle_mouse(mouse) {
+                    if terminal.handle_model_mouse(&mut model, mouse) {
                         voice.toggle(&mut model);
                     }
                 }

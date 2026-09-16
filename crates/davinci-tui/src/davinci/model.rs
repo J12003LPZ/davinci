@@ -1207,6 +1207,8 @@ pub fn graph_view_action(key: &str) -> Option<&'static str> {
         "r" => Some("retry"),
         "d" => Some("diff"),
         "enter" => Some("inspect"),
+        "f" => Some("follow"),
+        "v" => Some("focus"),
         _ => None,
     }
 }

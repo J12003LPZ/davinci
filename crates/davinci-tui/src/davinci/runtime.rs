@@ -514,6 +514,20 @@ impl Session {
         }
     }
 
+    /// Graph interaction shares the composed geometry. Microphone activation
+    /// keeps first refusal; other surfaces retain native text selection.
+    pub fn handle_model_mouse(&mut self, model: &mut Model, mouse: event::MouseEvent) -> bool {
+        if self.mic_clicked(mouse) {
+            return self.handle_mouse(mouse);
+        }
+        if route_graph_mouse(model, mouse, self.mic_rect) {
+            self.selection_anchor = None;
+            self.selection_focus = None;
+            return false;
+        }
+        self.handle_mouse(mouse)
+    }
+
     fn selected_text(&self) -> Option<String> {
         let (start, end) = self.selection_range()?;
         if start == end {
@@ -581,6 +595,20 @@ impl Drop for Session {
     }
 }
 
+fn route_graph_mouse(model: &mut Model, mouse: event::MouseEvent, mic: Option<Rect>) -> bool {
+    if model.screen != super::model::Screen::GraphRun
+        || model.overlay.is_some()
+        || model.voice.setup
+        || (mouse.kind == event::MouseEventKind::Down(event::MouseButton::Left)
+            && mic.is_some_and(|r| r.contains((mouse.column, mouse.row).into())))
+    {
+        return false;
+    }
+    app::compose_frame(model, model.height)
+        .graph
+        .is_some_and(|frame| super::views::graph_nav::handle_mouse(model, mouse, &frame))
+}
+
 /// Run the loop until the user leaves. `on_submit` is handed each sent turn.
 pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> io::Result<()> {
     let mut session = Session::open()?;
@@ -614,7 +642,7 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
                 }
                 Event::Paste(text) => model.paste(&text),
                 Event::Mouse(mouse) => {
-                    session.handle_mouse(mouse);
+                    session.handle_model_mouse(model, mouse);
                 }
                 _ => {}
             }
@@ -632,6 +660,60 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_mouse_preserves_microphone_and_other_surfaces() {
+        let mut model = Model::new(
+            super::super::theme::Theme::da_vinci(super::super::theme::ColorDepth::TrueColor, true),
+            120,
+            40,
+            false,
+        );
+        model.width = 120;
+        model.height = 40;
+        model.screen = super::super::model::Screen::GraphRun;
+        model.graph_run = Some(super::super::fixtures::blueprint_graph());
+        let frame = app::compose_frame(&model, model.height).graph.unwrap();
+        let node = frame
+            .layout
+            .nodes
+            .iter()
+            .find(|n| n.id == "writer")
+            .unwrap();
+        let column = (node.rect.x as i32 - frame.offset.0 + 1) as u16;
+        let row = (node.rect.y as i32 - frame.offset.1 + frame.origin_y as i32 + 1) as u16;
+        let click = event::MouseEvent {
+            kind: event::MouseEventKind::Down(event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!route_graph_mouse(
+            &mut model,
+            click,
+            Some(Rect::new(column, row, 1, 1))
+        ));
+        assert!(model.graph_canvas.follow_live);
+        assert!(route_graph_mouse(&mut model, click, None));
+        assert_eq!(
+            model
+                .graph_run
+                .as_ref()
+                .unwrap()
+                .selected_node_id
+                .as_deref(),
+            Some("writer")
+        );
+        model.graph_canvas.follow_live = true;
+        let wheel = event::MouseEvent {
+            kind: event::MouseEventKind::ScrollDown,
+            ..click
+        };
+        assert!(route_graph_mouse(&mut model, wheel, None));
+        assert!(!model.graph_canvas.follow_live);
+        model.screen = super::super::model::Screen::Agent;
+        assert!(!route_graph_mouse(&mut model, click, None));
+    }
 
     #[test]
     fn the_clock_is_two_hundred_and_fifty_milliseconds() {
