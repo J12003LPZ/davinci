@@ -73,6 +73,9 @@ fn resolve_executable(binary: PathBuf) -> PathBuf {
     let Some(path) = std::env::var_os("PATH") else {
         return binary;
     };
+    #[cfg(not(windows))]
+    let names = vec![binary.clone()];
+    #[cfg(windows)]
     let mut names = vec![binary.clone()];
     #[cfg(windows)]
     if binary.extension().is_none() {
