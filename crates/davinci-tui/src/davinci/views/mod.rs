@@ -17,6 +17,7 @@ pub mod disegno;
 pub mod export;
 pub mod governor;
 pub mod grafo;
+pub mod graph_canvas;
 pub mod graph_layout;
 pub mod graph_nav;
 pub mod graph_run;

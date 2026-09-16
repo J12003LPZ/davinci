@@ -152,6 +152,48 @@ pub fn toggle_group(canvas: &mut GraphCanvasState, id: &str) {
     }
 }
 
+pub fn focus_nodes(
+    layout: &GraphLayout,
+    run: &GraphRunSheet,
+    canvas: &GraphCanvasState,
+) -> std::collections::BTreeSet<String> {
+    let selected = canvas
+        .selected_group
+        .as_deref()
+        .or(run.selected_node_id.as_deref());
+    let seeds: Vec<_> = layout
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| {
+            selected.map_or(run.tasks[n.task_index].state == State::Active, |id| {
+                id == n.id
+            })
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let mut result = std::collections::BTreeSet::new();
+    for reverse in [false, true] {
+        let mut links = vec![Vec::new(); layout.nodes.len()];
+        for e in &layout.edges {
+            if reverse {
+                links[e.to].push(e.from);
+            } else {
+                links[e.from].push(e.to);
+            }
+        }
+        let mut pending = seeds.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(i) = pending.pop() {
+            if seen.insert(i) {
+                result.insert(layout.nodes[i].id.clone());
+                pending.extend(&links[i]);
+            }
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::graph_layout::layout_graph;

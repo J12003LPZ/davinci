@@ -7,6 +7,69 @@ use crate::davinci::{model::Model, theme::State};
 use ratatui::text::Line;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
+    lines_in(model, model.height.saturating_sub(3))
+}
+
+pub fn lines_in(model: &Model, height: u16) -> Vec<Line<'static>> {
+    let Some(run) = &model.graph_run else {
+        return structured_lines(model);
+    };
+    let layout = super::graph_layout::layout_graph(
+        run,
+        &model.graph_canvas,
+        model.width,
+        height.saturating_sub(2),
+    );
+    if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
+        let mut rows = Vec::new();
+        for issue in &layout.issues {
+            rows.extend(section_detail(model.width, &model.theme, issue));
+        }
+        rows.extend(structured_lines(model));
+        return rows;
+    }
+    let done = run.tasks.iter().filter(|t| t.state == State::Done).count();
+    let mut rows = vec![
+        Line::from(ui::truncate_run(
+            vec![span(
+                format!(
+                    "{} · {} · Follow {} · {:?}",
+                    run.id,
+                    run.lifecycle,
+                    if model.graph_canvas.follow_live {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    model.graph_canvas.view_mode
+                ),
+                model.theme.primary,
+            )],
+            model.width,
+        )),
+        Line::from(ui::truncate_run(
+            vec![span(
+                format!(
+                    "{done}/{} workers complete · {} · {} / {}",
+                    run.tasks.len(),
+                    run.elapsed,
+                    run.cost,
+                    run.cost_cap
+                ),
+                model.theme.muted,
+            )],
+            model.width,
+        )),
+    ];
+    rows.extend(super::graph_canvas::lines(
+        model,
+        &layout,
+        (model.tick % 4) as u8,
+    ));
+    rows
+}
+
+pub fn structured_lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
     let width = model.width;
     let Some(run) = &model.graph_run else {
@@ -204,9 +267,13 @@ mod tests {
             .join("\n")
     }
     #[test]
-    fn every_worker_retains_its_real_policy_artifact_and_usage() {
+    fn structured_fallback_retains_every_real_policy_artifact_and_usage() {
         let m = model(120);
-        let drawn = text(&m);
+        let drawn = structured_lines(&m)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         let run = m.graph_run.as_ref().unwrap();
         for task in &run.tasks {
             for value in [&task.id, &task.policy, &task.artifact, &task.usage] {
@@ -216,7 +283,7 @@ mod tests {
         for value in [&run.cost, &run.cost_cap, &run.artifacts, &run.elapsed] {
             assert!(drawn.contains(value));
         }
-        assert!(ui::focused_row(&lines(&m)).is_none());
+        assert!(ui::focused_row(&structured_lines(&m)).is_none());
         assert!(!drawn.contains("each one a child process") && !drawn.contains("ctrl+c aborts"));
     }
     #[test]
@@ -257,8 +324,12 @@ mod tests {
         task.public_contract = Some("inputs: user prompt, outputs: Classification".into());
         task.recent_tools = vec!["read(crates/davinci-ai/src/openai.rs)".into()];
 
-        assert!(ui::focused_row(&lines(&m)).is_some());
-        let drawn = text(&m);
+        assert!(ui::focused_row(&structured_lines(&m)).is_some());
+        let drawn = structured_lines(&m)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(drawn.contains("Contract: inputs: user prompt"));
         assert!(drawn.contains("Recent Tool: read"));
     }
