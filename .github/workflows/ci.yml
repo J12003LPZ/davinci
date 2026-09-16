@@ -51,6 +51,15 @@ jobs:
         run: cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
       - name: Runtime migration baseline
         run: cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
+
+  workspace-tests:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use repository-pinned Rust
+        run: rustup show
       - name: Workspace tests
         shell: bash
         run: |
