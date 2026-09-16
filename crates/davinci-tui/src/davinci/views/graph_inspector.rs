@@ -39,6 +39,62 @@ pub fn inspector_lines(
     let Some(run) = &model.graph_run else {
         return Vec::new();
     };
+    let facts = inspector_facts(model, selected, width);
+    let count = facts.len();
+    let room = max_rows.saturating_sub(2) as usize;
+    let offset = model
+        .graph_canvas
+        .inspector_scroll
+        .min(count.saturating_sub(room));
+    let mut rows = vec![Line::from(ui::span(
+        ui::clip_ellipsis(
+            if run.inspecting_node {
+                "INSPECTOR · public execution"
+            } else {
+                "INSPECTOR · Enter for details"
+            },
+            width,
+        ),
+        model.theme.primary,
+    ))];
+    rows.extend(facts.into_iter().skip(offset).take(room));
+    if max_rows > 1 {
+        rows.push(Line::from(ui::span(
+            ui::clip_ellipsis(
+                &format!(
+                    "PgUp/PgDn · {}–{} / {count}",
+                    if count == 0 { 0 } else { offset + 1 },
+                    (offset + room).min(count)
+                ),
+                width,
+            ),
+            model.theme.muted,
+        )));
+    }
+    rows.truncate(max_rows as usize);
+    rows
+}
+
+pub fn page(model: &mut Model, width: u16, height: u16, delta: isize) {
+    let selected = model
+        .graph_run
+        .as_ref()
+        .and_then(|r| r.selected_node_id.as_deref());
+    let maximum = inspector_facts(model, selected, width)
+        .len()
+        .saturating_sub(height.saturating_sub(2) as usize);
+    model.graph_canvas.inspector_scroll = model
+        .graph_canvas
+        .inspector_scroll
+        .min(maximum)
+        .saturating_add_signed(delta)
+        .min(maximum);
+}
+
+fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Line<'static>> {
+    let Some(run) = &model.graph_run else {
+        return Vec::new();
+    };
     let task = selected
         .and_then(|id| run.tasks.iter().find(|t| t.id == id))
         .or_else(|| run.tasks.iter().find(|t| t.state == State::Active));
@@ -83,39 +139,7 @@ pub fn inspector_lines(
     } else {
         add("", "Arrows select a worker; Enter inspects");
     }
-    let count = facts.len();
-    let room = max_rows.saturating_sub(2) as usize;
-    let offset = model
-        .graph_canvas
-        .inspector_scroll
-        .min(count.saturating_sub(room));
-    let mut rows = vec![Line::from(ui::span(
-        ui::clip_ellipsis(
-            if run.inspecting_node {
-                "INSPECTOR · public execution"
-            } else {
-                "INSPECTOR · Enter for details"
-            },
-            width,
-        ),
-        model.theme.primary,
-    ))];
-    rows.extend(facts.into_iter().skip(offset).take(room));
-    if max_rows > 1 {
-        rows.push(Line::from(ui::span(
-            ui::clip_ellipsis(
-                &format!(
-                    "PgUp/PgDn · {}–{} / {count}",
-                    if count == 0 { 0 } else { offset + 1 },
-                    (offset + room).min(count)
-                ),
-                width,
-            ),
-            model.theme.muted,
-        )));
-    }
-    rows.truncate(max_rows as usize);
-    rows
+    facts
 }
 
 #[cfg(test)]

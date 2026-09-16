@@ -10,6 +10,82 @@ pub struct GraphFrame {
     pub offset: (i32, i32),
 }
 
+/// Replace a public snapshot without turning refresh into a navigation event.
+pub fn refresh(model: &mut crate::davinci::model::Model, mut next: GraphRunSheet) {
+    if let Some(previous) = model.graph_run.as_ref().filter(|p| p.id == next.id) {
+        next.inspecting_node = previous.inspecting_node;
+        next.showing_diff = previous.showing_diff;
+        next.selected_node_id = previous
+            .selected_node_id
+            .as_deref()
+            .and_then(|id| nearest_survivor(previous, &next, id));
+        next.selected_index = next
+            .selected_node_id
+            .as_deref()
+            .and_then(|id| next.tasks.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+    } else {
+        model.graph_canvas = GraphCanvasState::default();
+        model.feature_scroll = 0;
+    }
+    let mut known: std::collections::BTreeSet<_> =
+        model.graph_canvas.node_order.iter().cloned().collect();
+    for task in &next.tasks {
+        if known.insert(task.id.clone()) {
+            model.graph_canvas.node_order.push(task.id.clone());
+        }
+    }
+    model.graph_run = Some(next);
+    // A summary can disappear when a member becomes attention-requiring. Never
+    // keep an invisible synthetic selection or infer a controller target.
+    if let Some(group) = &model.graph_canvas.selected_group {
+        let run = model.graph_run.as_ref().unwrap();
+        let layout =
+            super::graph_layout::layout_graph(run, &model.graph_canvas, model.width, model.height);
+        if !layout.nodes.iter().any(|n| &n.id == group) {
+            model.graph_canvas.selected_group = None;
+        }
+    }
+}
+
+fn nearest_survivor(
+    previous: &GraphRunSheet,
+    next: &GraphRunSheet,
+    selected: &str,
+) -> Option<String> {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    let survivors: BTreeSet<_> = next.tasks.iter().map(|t| t.id.as_str()).collect();
+    if survivors.contains(selected) {
+        return Some(selected.into());
+    }
+    let mut neighbors = BTreeMap::<&str, Vec<&str>>::new();
+    for task in &previous.tasks {
+        neighbors
+            .entry(&task.id)
+            .or_default()
+            .extend(task.dependencies.iter().map(String::as_str));
+    }
+    for task in &previous.tasks {
+        for dep in &task.dependencies {
+            neighbors.entry(dep).or_default().push(&task.id);
+        }
+    }
+    let mut seen = BTreeSet::from([selected]);
+    let mut queue = VecDeque::from([selected]);
+    while let Some(id) = queue.pop_front() {
+        for &neighbor in neighbors.get(id).into_iter().flatten() {
+            if !seen.insert(neighbor) {
+                continue;
+            }
+            if survivors.contains(neighbor) {
+                return Some(neighbor.into());
+            }
+            queue.push_back(neighbor);
+        }
+    }
+    None
+}
+
 pub fn handle_mouse(
     model: &mut crate::davinci::model::Model,
     mouse: crossterm::event::MouseEvent,
@@ -19,6 +95,7 @@ pub fn handle_mouse(
     if model.screen != crate::davinci::model::Screen::GraphRun
         || model.overlay.is_some()
         || model.voice.setup
+        || frame.layout.mode == super::graph_layout::GraphResponsiveMode::Structured
     {
         return false;
     }
@@ -118,6 +195,7 @@ pub fn handle_key(
     match key.code {
         KeyCode::Char('f') => {
             model.graph_canvas.follow_live = true;
+            model.graph_canvas.list_scroll = None;
             model.feature_scroll = 0;
         }
         KeyCode::Char('v') => {
@@ -139,6 +217,7 @@ pub fn handle_key(
                 &layout,
                 direction,
             );
+            model.graph_canvas.list_scroll = None;
             model.feature_scroll = 0;
         }
         KeyCode::Enter => {
@@ -152,9 +231,7 @@ pub fn handle_key(
             } else {
                 let run = model.graph_run.as_mut().unwrap();
                 if run.selected_node_id.is_none() {
-                    if let Some(node) = layout.nodes.iter().find(|n| n.members.len() == 1) {
-                        select(run, &mut model.graph_canvas, &layout, &node.id);
-                    }
+                    navigate(run, &mut model.graph_canvas, &layout, NavDirection::Down);
                 }
                 run.inspecting_node = !run.inspecting_node;
             }
@@ -174,19 +251,28 @@ pub fn handle_key(
         KeyCode::PageUp | KeyCode::PageDown => {
             let amount = if key.code == KeyCode::PageUp { -5 } else { 5 };
             if model.graph_run.as_ref().unwrap().inspecting_node {
-                model.graph_canvas.inspector_scroll = model
-                    .graph_canvas
-                    .inspector_scroll
-                    .saturating_add_signed(amount);
+                let (width, height) =
+                    if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
+                        (model.width, layout.canvas.height.saturating_sub(3))
+                    } else {
+                        (layout.inspector.width, layout.inspector.height)
+                    };
+                super::graph_inspector::page(model, width, height, amount);
             } else if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
-                model.feature_scroll = model.feature_scroll.saturating_add_signed(amount);
+                let run = model.graph_run.as_ref().unwrap();
+                let start = model.graph_canvas.list_scroll.unwrap_or(run.selected_index);
+                model.graph_canvas.list_scroll = Some(
+                    start
+                        .saturating_add_signed(amount)
+                        .min(run.tasks.len().saturating_sub(1)),
+                );
             } else {
                 pan(model, &layout, 0, amount as i32);
             }
             model.graph_canvas.follow_live = false;
         }
         KeyCode::Char('x' | 'r' | 'd') if model.graph_canvas.selected_group.is_some() => {
-            model.section_notice = Some("Expand the group and select a worker first".into());
+            model.section_notice = Some("Select a real worker first (Enter expands groups)".into());
         }
         _ => return false,
     }
@@ -276,12 +362,17 @@ pub fn viewport(
         .iter()
         .filter(|n| run.tasks[n.task_index].state == State::Active)
         .collect();
-    let Some(first) = active.first().copied().or_else(|| {
-        layout
-            .nodes
-            .iter()
-            .find(|n| Some(n.id.as_str()) == run.selected_node_id.as_deref())
-    }) else {
+    let Some(first) = active
+        .iter()
+        .copied()
+        .min_by_key(|n| (n.rect.x, n.rect.y))
+        .or_else(|| {
+            layout
+                .nodes
+                .iter()
+                .find(|n| Some(n.id.as_str()) == run.selected_node_id.as_deref())
+        })
+    else {
         return clamp(0, 0);
     };
     let bounds = active.iter().fold(first.rect, |rect, n| rect.union(n.rect));
@@ -327,6 +418,26 @@ pub fn navigate(
     layout: &GraphLayout,
     direction: NavDirection,
 ) {
+    if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
+        let count = run.tasks.len();
+        if count > 0 {
+            let index = run
+                .selected_node_id
+                .as_deref()
+                .and_then(|id| run.tasks.iter().position(|t| t.id == id));
+            let next = match (index, direction) {
+                (Some(i), NavDirection::Up | NavDirection::Left) => i.saturating_sub(1),
+                (Some(i), _) => (i + 1).min(count - 1),
+                _ => 0,
+            };
+            run.selected_node_id = Some(run.tasks[next].id.clone());
+            run.selected_index = next;
+            canvas.selected_group = None;
+            canvas.inspector_scroll = 0;
+        }
+        canvas.follow_live = false;
+        return;
+    }
     let selected = canvas
         .selected_group
         .as_deref()
@@ -392,6 +503,104 @@ mod tests {
     use crate::davinci::{fixtures, theme::State};
 
     #[test]
+    fn graph_refresh_preserves_selection_fold_follow_and_peer_positions() {
+        use crate::davinci::{
+            model::Model,
+            theme::{ColorDepth, Theme},
+        };
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 120, 40, false);
+        refresh(&mut model, fixtures::blueprint_graph());
+        model.graph_run.as_mut().unwrap().selected_node_id = Some("writer".into());
+        model.graph_run.as_mut().unwrap().inspecting_node = true;
+        model.graph_canvas.follow_live = false;
+        model.graph_canvas.pan_x = 7;
+        let old = layout_graph(
+            model.graph_run.as_ref().unwrap(),
+            &model.graph_canvas,
+            120,
+            30,
+        );
+        let mut next = fixtures::blueprint_graph();
+        next.tasks[5].state = State::Done;
+        next.tasks[6].state = State::Failed;
+        let mut added = next.tasks[5].clone();
+        added.id = "new-worker".into();
+        next.tasks.insert(0, added);
+        next.tasks.reverse();
+        refresh(&mut model, next);
+        assert_eq!(
+            model
+                .graph_run
+                .as_ref()
+                .unwrap()
+                .selected_node_id
+                .as_deref(),
+            Some("writer")
+        );
+        assert!(model.graph_run.as_ref().unwrap().inspecting_node);
+        assert!(!model.graph_canvas.follow_live);
+        assert_eq!(model.graph_canvas.pan_x, 7);
+        let new = layout_graph(
+            model.graph_run.as_ref().unwrap(),
+            &model.graph_canvas,
+            120,
+            30,
+        );
+        for node in &old.nodes {
+            assert_eq!(
+                new.nodes.iter().find(|n| n.id == node.id).unwrap().rect,
+                node.rect,
+                "{} moved",
+                node.id
+            );
+        }
+        let group = old
+            .nodes
+            .iter()
+            .find(|n| n.members.len() > 1)
+            .unwrap()
+            .id
+            .clone();
+        model.graph_run.as_mut().unwrap().selected_node_id = None;
+        model.graph_canvas.selected_group = Some(group.clone());
+        let next = model.graph_run.as_ref().unwrap().clone();
+        refresh(&mut model, next);
+        assert!(model.graph_run.as_ref().unwrap().selected_node_id.is_none());
+        assert_eq!(model.graph_canvas.selected_group.as_ref(), Some(&group));
+    }
+
+    #[test]
+    fn graph_refresh_disappearance_uses_real_neighbor_and_new_run_resets_view() {
+        use crate::davinci::{
+            model::Model,
+            theme::{ColorDepth, Theme},
+        };
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 80, 32, false);
+        refresh(&mut model, fixtures::blueprint_graph());
+        model.graph_run.as_mut().unwrap().selected_node_id = Some("writer".into());
+        let mut next = fixtures::blueprint_graph();
+        next.tasks.retain(|t| t.id != "writer");
+        refresh(&mut model, next.clone());
+        assert_eq!(
+            model
+                .graph_run
+                .as_ref()
+                .unwrap()
+                .selected_node_id
+                .as_deref(),
+            Some("plan")
+        );
+        next.tasks.clear();
+        refresh(&mut model, next);
+        assert!(model.graph_run.as_ref().unwrap().selected_node_id.is_none());
+        model.graph_canvas.follow_live = false;
+        let mut next = fixtures::blueprint_graph();
+        next.id = "another-run".into();
+        refresh(&mut model, next);
+        assert!(model.graph_canvas.follow_live);
+    }
+
+    #[test]
     fn graph_nav_semantic_neighbors_and_follow() {
         let mut run = fixtures::blueprint_graph();
         let mut canvas = GraphCanvasState::default();
@@ -408,6 +617,118 @@ mod tests {
         assert!(!canvas.follow_live);
         canvas.follow_live = true;
         assert!(viewport(&layout, &run, &canvas).0 > 0);
+    }
+
+    #[test]
+    fn graph_fallback_keys_and_paging_stay_bounded_even_with_a_cycle() {
+        use crate::davinci::{
+            app,
+            model::{Model, Screen},
+            theme::{ColorDepth, Theme},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 40, 32, false);
+        model.screen = Screen::GraphRun;
+        let mut run = fixtures::blueprint_graph();
+        run.tasks[0].dependencies.push("review".into());
+        refresh(&mut model, run);
+        let press = |model: &mut Model, code| {
+            app::handle_key(model, KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        press(&mut model, KeyCode::Down);
+        press(&mut model, KeyCode::Down);
+        assert_eq!(
+            model
+                .graph_run
+                .as_ref()
+                .unwrap()
+                .selected_node_id
+                .as_deref(),
+            Some("research-a")
+        );
+        assert!(!model.graph_canvas.follow_live);
+        for _ in 0..20 {
+            press(&mut model, KeyCode::PageDown);
+        }
+        assert_eq!(model.graph_canvas.list_scroll, Some(9));
+        press(&mut model, KeyCode::PageUp);
+        assert_eq!(model.graph_canvas.list_scroll, Some(4));
+        press(&mut model, KeyCode::Enter);
+        for _ in 0..20 {
+            press(&mut model, KeyCode::PageDown);
+        }
+        let bottom = model.graph_canvas.inspector_scroll;
+        press(&mut model, KeyCode::PageUp);
+        assert_eq!(
+            model.graph_canvas.inspector_scroll,
+            bottom.saturating_sub(5)
+        );
+        press(&mut model, KeyCode::Esc);
+        assert!(!model.graph_run.as_ref().unwrap().inspecting_node);
+        press(&mut model, KeyCode::Char('f'));
+        assert!(model.graph_canvas.follow_live);
+        assert!(model.graph_canvas.list_scroll.is_none());
+    }
+
+    #[test]
+    fn graph_fold_controls_never_send_synthetic_node_and_attention_unfolds() {
+        use crate::davinci::{
+            app::{self, Flow},
+            model::{Model, Screen},
+            theme::{ColorDepth, Theme},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 120, 40, false);
+        model.screen = Screen::GraphRun;
+        refresh(&mut model, fixtures::blueprint_graph());
+        let layout = layout_graph(
+            model.graph_run.as_ref().unwrap(),
+            &model.graph_canvas,
+            120,
+            30,
+        );
+        let group = layout.nodes.iter().find(|n| n.members.len() > 1).unwrap();
+        select(
+            model.graph_run.as_mut().unwrap(),
+            &mut model.graph_canvas,
+            &layout,
+            &group.id,
+        );
+        for ch in ['x', 'r', 'd'] {
+            assert!(matches!(
+                app::handle_key(
+                    &mut model,
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+                ),
+                Flow::Continue
+            ));
+        }
+        app::handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(model.graph_canvas.expanded_groups.contains(&group.id));
+        assert_eq!(
+            model
+                .graph_run
+                .as_ref()
+                .unwrap()
+                .selected_node_id
+                .as_deref(),
+            Some("research-a")
+        );
+        let mut next = fixtures::blueprint_graph();
+        next.tasks[1].state = State::Failed;
+        refresh(&mut model, next);
+        assert!(layout_graph(
+            model.graph_run.as_ref().unwrap(),
+            &model.graph_canvas,
+            120,
+            30
+        )
+        .nodes
+        .iter()
+        .any(|n| n.id == "research-a"));
     }
 
     #[test]

@@ -132,6 +132,9 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
     chrome.composer = Composer::Hidden;
     chrome.echo = None;
     chrome.escape = Some("esc close");
+    if model.screen == Screen::GraphRun {
+        return Some(chrome);
+    }
     let action = match model.screen {
         Screen::Models | Screen::Thinking => Some("enter select"),
         Screen::Settings => Some("enter change"),

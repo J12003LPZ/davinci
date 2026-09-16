@@ -383,27 +383,25 @@ fn panel(
         .saturating_sub(hint_rows + notice.len());
     if model.screen == Screen::GraphRun {
         if let Some(layout) = graph_run::layout_for(model, room as u16) {
-            if layout.mode != super::views::graph_layout::GraphResponsiveMode::Structured {
-                let offset = super::views::graph_nav::viewport(
-                    &layout,
-                    model.graph_run.as_ref().unwrap(),
-                    &model.graph_canvas,
-                );
-                rows = graph_run::lines_with_layout(model, room as u16, &layout);
-                *graph = Some(super::views::graph_nav::GraphFrame {
-                    layout,
-                    origin_y: out.len() as u16 + graph_run::HEADER_ROWS,
-                    offset,
-                });
-                out.extend(rows);
-                out = pad_to(out, height.saturating_sub(hint_rows + notice.len()));
-                out.extend(notice);
-                if let Some(hint) = hint {
-                    out.push(hint);
-                }
-                out.truncate(height);
-                return out;
+            rows = graph_run::lines_with_layout(model, room as u16, &layout);
+            let offset = super::views::graph_nav::viewport(
+                &layout,
+                model.graph_run.as_ref().unwrap(),
+                &model.graph_canvas,
+            );
+            *graph = Some(super::views::graph_nav::GraphFrame {
+                layout,
+                origin_y: out.len() as u16 + graph_run::HEADER_ROWS,
+                offset,
+            });
+            out.extend(rows);
+            out = pad_to(out, height.saturating_sub(hint_rows + notice.len()));
+            out.extend(notice);
+            if let Some(hint) = hint {
+                out.push(hint);
             }
+            out.truncate(height);
+            return out;
         }
         rows = graph_run::lines_in(model, room as u16);
     }
@@ -2294,10 +2292,10 @@ mod tests {
     fn arrow_keys_and_page_up_down_scroll_feature_sheets() {
         use crate::davinci::fixtures;
 
-        for screen in [Screen::GraphRun, Screen::Governor, Screen::Vectors] {
+        // GraphRun has spatial selection/panning, covered by graph_input_tests.
+        for screen in [Screen::Governor, Screen::Vectors] {
             let mut m = model(100, 30);
             let screen_code = match screen {
-                Screen::GraphRun => "5a",
                 Screen::Vectors => "5b",
                 Screen::Governor => "5c",
                 _ => unreachable!(),

@@ -137,12 +137,32 @@ pub fn layout_graph(
         5
     };
     let mut rows = BTreeMap::<usize, usize>::new();
+    let order: BTreeMap<_, _> = canvas
+        .node_order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    let mut peers: Vec<_> = (0..run.tasks.len()).collect();
+    peers.sort_by_key(|&i| {
+        (
+            order
+                .get(run.tasks[i].id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            i,
+        )
+    });
+    let mut slots = vec![0; run.tasks.len()];
+    for i in peers {
+        let row = rows.entry(depths[i]).or_default();
+        slots[i] = *row;
+        *row += 1;
+    }
     for (i, task) in run.tasks.iter().enumerate() {
         let depth = depths[i];
-        let row = rows.entry(depth).or_default();
         let x = depth.saturating_mul(card_width + 6);
-        let y = row.saturating_mul(card_height + 2).saturating_add(2);
-        *row += 1;
+        let y = slots[i].saturating_mul(card_height + 2).saturating_add(2);
         if x + card_width > u16::MAX as usize || y + card_height > u16::MAX as usize {
             layout.mode = GraphResponsiveMode::Structured;
             layout
@@ -200,6 +220,7 @@ fn fold_completed(
         outgoing[edge.from].push(edge.to);
     }
     let mut groups = BTreeMap::new();
+    let real_ids: BTreeSet<_> = run.tasks.iter().map(|t| t.id.as_str()).collect();
     for node in &layout.nodes {
         let task = &run.tasks[node.task_index];
         if task.state != State::Done
@@ -208,6 +229,10 @@ fn fold_completed(
             || task.role.is_empty()
             || task.role.contains("verif")
             || task.role.contains("review")
+            || task
+                .dependencies
+                .iter()
+                .any(|id| !real_ids.contains(id.as_str()))
             || run.selected_node_id.as_deref() == Some(&task.id)
         {
             continue;
@@ -220,13 +245,14 @@ fn fold_completed(
     }
     let mut membership = BTreeMap::new();
     let mut folded = BTreeMap::new();
-    for members in groups.values().filter(|g| g.len() >= 3) {
+    for members in groups.values_mut().filter(|g| g.len() >= 3) {
+        members.sort_by_key(|&i| layout.nodes[i].rect.y);
         let first = members[0];
         let id = format!("fold:{}", run.tasks[first].id);
-        if canvas.expanded_groups.contains(&id) {
+        if canvas.expanded_groups.contains(&id) || real_ids.contains(id.as_str()) {
             continue;
         }
-        for &member in members {
+        for &member in members.iter() {
             membership.insert(member, first);
         }
         folded.insert(

@@ -2341,7 +2341,7 @@ fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
             }
             "graph" | "graph-status" | "graph-view" => match graph_sheet(&value) {
                 Some(sheet) => {
-                    shell.model.graph_run = Some(sheet);
+                    davinci_tui::davinci::views::graph_nav::refresh(shell.model, sheet);
                     open_sheet(shell.model, Screen::GraphRun);
                 }
                 // `graph-view` answers with a worker transcript, not the run;
@@ -6894,26 +6894,8 @@ fn refresh_graph_sheet(model: &mut Model, host: &Arc<Mutex<ExtensionHost>>) -> b
         .execute_native_command("graph-status", "");
     match status {
         Ok(Some(value)) => match graph_sheet(&value) {
-            Some(mut sheet) => {
-                if let Some(prev) = &model.graph_run {
-                    sheet.inspecting_node = prev.inspecting_node;
-                    sheet.showing_diff = prev.showing_diff;
-                    if let Some(ref prev_id) = prev.selected_node_id {
-                        if let Some(pos) = sheet.tasks.iter().position(|t| &t.id == prev_id) {
-                            sheet.selected_index = pos;
-                            sheet.selected_node_id = Some(prev_id.clone());
-                        } else if !sheet.tasks.is_empty() {
-                            sheet.selected_index = prev.selected_index.min(sheet.tasks.len() - 1);
-                            sheet.selected_node_id =
-                                sheet.tasks.get(sheet.selected_index).map(|t| t.id.clone());
-                        }
-                    } else if !sheet.tasks.is_empty() {
-                        sheet.selected_index = prev.selected_index.min(sheet.tasks.len() - 1);
-                        sheet.selected_node_id =
-                            sheet.tasks.get(sheet.selected_index).map(|t| t.id.clone());
-                    }
-                }
-                model.graph_run = Some(sheet);
+            Some(sheet) => {
+                davinci_tui::davinci::views::graph_nav::refresh(model, sheet);
                 true
             }
             None => false,

@@ -9,6 +9,7 @@ use crate::davinci::{model::Model, theme::State};
 use ratatui::text::Line;
 
 pub const HEADER_ROWS: u16 = 3;
+const FOOTER_ROWS: u16 = 3;
 
 fn section_detail(
     width: u16,
@@ -24,7 +25,7 @@ pub fn layout_for(model: &Model, height: u16) -> Option<GraphLayout> {
             run,
             &model.graph_canvas,
             model.width,
-            height.saturating_sub(HEADER_ROWS),
+            height.saturating_sub(HEADER_ROWS + FOOTER_ROWS),
         )
     })
 }
@@ -45,12 +46,7 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
         return structured_lines(model);
     };
     if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
-        let mut rows = Vec::new();
-        for issue in &layout.issues {
-            rows.extend(section_detail(model.width, &model.theme, issue));
-        }
-        rows.extend(structured_lines(model));
-        return rows;
+        return structured_window(model, height, layout);
     }
     let done = run.tasks.iter().filter(|t| t.state == State::Done).count();
     let mut telemetry = vec![format!("{done}/{} workers complete", run.tasks.len())];
@@ -97,8 +93,10 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
         ui::clip_ellipsis(&public_text(note), model.width),
         model.theme.muted,
     )));
-    let mut cells =
-        super::graph_canvas::Cells::new(model.width, height.saturating_sub(HEADER_ROWS));
+    let mut cells = super::graph_canvas::Cells::new(
+        model.width,
+        height.saturating_sub(HEADER_ROWS + FOOTER_ROWS),
+    );
     cells.blit(
         super::graph_canvas::lines(model, layout, (model.tick % 4) as u8),
         layout.canvas,
@@ -126,6 +124,119 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
         );
     }
     rows.extend(cells.into_lines());
+    rows.extend(controls(model));
+    rows.truncate(height as usize);
+    rows
+}
+
+fn controls(model: &Model) -> Vec<Line<'static>> {
+    let control = if model
+        .graph_run
+        .as_ref()
+        .is_some_and(|r| r.lifecycle == "paused")
+    {
+        "p resume · x stop · r retry · d diff"
+    } else {
+        "p pause · x stop · r retry · d diff"
+    };
+    [
+        "↑↓←→ select · Enter inspect · v focus",
+        control,
+        "f follow · PgUp/Dn pan/details",
+    ]
+    .into_iter()
+    .map(|text| {
+        Line::from(span(
+            ui::clip_ellipsis(text, model.width),
+            model.theme.muted,
+        ))
+    })
+    .collect()
+}
+
+/// A bounded, keyboard-complete ledger; details never push selection offscreen.
+fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Line<'static>> {
+    let run = model.graph_run.as_ref().unwrap();
+    let line = |text: String| {
+        Line::from(span(
+            ui::clip_ellipsis(&public_text(&text), model.width),
+            model.theme.text,
+        ))
+    };
+    let mut rows = vec![
+        line(format!(
+            "{} · Follow {} · {:?}",
+            run.lifecycle,
+            if model.graph_canvas.follow_live {
+                "on"
+            } else {
+                "off"
+            },
+            model.graph_canvas.view_mode
+        )),
+        line(format!(
+            "{} workers · {} · {}",
+            run.tasks.len(),
+            run.cost,
+            run.elapsed
+        )),
+        line(
+            layout
+                .issues
+                .first()
+                .or(run.control_status.as_ref())
+                .unwrap_or(&run.goal)
+                .clone(),
+        ),
+    ];
+    let room = height.saturating_sub(HEADER_ROWS + FOOTER_ROWS) as usize;
+    let selected = run.selected_node_id.as_deref();
+    let anchor = model.graph_canvas.list_scroll.unwrap_or_else(|| {
+        run.tasks
+            .iter()
+            .position(|t| Some(t.id.as_str()) == selected)
+            .or_else(|| run.tasks.iter().position(|t| t.state == State::Active))
+            .unwrap_or(0)
+    });
+    let list_room = if run.inspecting_node {
+        room.min(3)
+    } else {
+        room
+    };
+    let tasks = run
+        .tasks
+        .iter()
+        .map(|task| {
+            ui::section_row(
+                model.width,
+                &model.theme,
+                Some(task.id.as_str()) == selected,
+                &public_text(&format!("{} {}", task.state.glyph(), task.id)),
+                "",
+            )
+        })
+        .collect();
+    rows.extend(
+        ui::window(tasks, list_room, anchor, &model.theme)
+            .into_iter()
+            .map(|row| Line::from(ui::truncate_run(row.spans, model.width))),
+    );
+    while rows.len() < HEADER_ROWS as usize + list_room {
+        rows.push(Line::default());
+    }
+    if run.inspecting_node {
+        rows.extend(inspector_lines(
+            model,
+            selected,
+            model.width,
+            room.saturating_sub(list_room) as u16,
+        ));
+    }
+    while rows.len() < height.saturating_sub(FOOTER_ROWS) as usize {
+        rows.push(Line::default());
+    }
+    rows.extend(controls(model));
+    rows.truncate(height as usize);
     rows
 }
 
@@ -265,28 +376,26 @@ pub fn chrome(model: &Model) -> SheetChrome {
                 [&run.id, &run.mode, &run.milestone]
                     .into_iter()
                     .filter(|value| !value.is_empty())
-                    .map(|value| vec![span(value.clone(), th.muted)])
+                    .map(|value| vec![span(public_text(value), th.muted)])
                     .collect()
             })
             .unwrap_or_default(),
         ),
         status_third: run
             .and_then(|run| run.phases.iter().find(|(_, state)| *state == State::Active))
-            .map(|(phase, _)| vec![span(phase.clone(), th.muted)]),
+            .map(|(phase, _)| vec![span(public_text(phase), th.muted)]),
         status_right: run
             .filter(|run| !run.cost.is_empty() && !run.cost_cap.is_empty())
-            .map(|run| status_meter(th, "run cost", run.cost_fraction, &run.cost, &run.cost_cap)),
-        hints: vec![
-            hint(th, "↑↓←→ select"),
-            hint(th, "enter inspect"),
-            hint(th, "f follow"),
-            hint(th, "v focus"),
-            hint(th, "p pause/resume"),
-            hint(th, "x stop"),
-            hint(th, "r retry"),
-            hint(th, "d diff"),
-            hint(th, "PgUp/Dn pan/details"),
-        ],
+            .map(|run| {
+                status_meter(
+                    th,
+                    "run cost",
+                    run.cost_fraction,
+                    &public_text(&run.cost),
+                    &public_text(&run.cost_cap),
+                )
+            }),
+        hints: vec![hint(th, "Graph controls above")],
         escape: Some("esc close"),
         composer: Composer::Hidden,
         ..SheetChrome::default()
@@ -310,6 +419,49 @@ mod tests {
         fixtures::dress_screen(&mut m, "5a");
         m.width = width;
         m
+    }
+    #[test]
+    fn graph_fallback_selection_controls_inspection_and_viewport_boundaries() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut m = model(40);
+        m.graph_run = Some(fixtures::blueprint_graph());
+        m.graph_run.as_mut().unwrap().selected_node_id = Some("blocked".into());
+        m.graph_run.as_mut().unwrap().selected_index = 8;
+        let text = |m: &Model| {
+            crate::davinci::app::compose_frame(m, m.height)
+                .lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for word in [
+            "blocked",
+            "running",
+            "p pause",
+            "x stop",
+            "r retry",
+            "d diff",
+            "Enter inspect",
+            "f follow",
+            "v focus",
+        ] {
+            assert!(text(&m).contains(word), "missing {word}: {}", text(&m));
+        }
+        crate::davinci::app::handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(text(&m).contains("failed dependency"));
+        for width in [0, 1, 20, 32, 40, 49, 50, 71, 72, 80, 119, 120] {
+            for height in [0, 1, 4, 12, 24, 32, 40] {
+                m.width = width;
+                m.height = height;
+                let frame = crate::davinci::app::compose_frame(&m, height);
+                assert!(frame.lines.len() <= height as usize, "{width}x{height}");
+                assert!(
+                    frame.lines.iter().all(|r| ui::run_width(&r.spans) <= width),
+                    "{width}x{height}"
+                );
+            }
+        }
     }
     fn text(m: &Model) -> String {
         lines(m)

@@ -1133,6 +1133,9 @@ pub struct GraphCanvasState {
     pub expanded_groups: std::collections::BTreeSet<String>,
     pub selected_group: Option<String>,
     pub inspector_scroll: usize,
+    /// First-seen peer order, retained across snapshots of the same run.
+    pub node_order: Vec<String>,
+    pub list_scroll: Option<usize>,
 }
 
 impl Default for GraphCanvasState {
@@ -1145,6 +1148,8 @@ impl Default for GraphCanvasState {
             expanded_groups: Default::default(),
             selected_group: None,
             inspector_scroll: 0,
+            node_order: Vec::new(),
+            list_scroll: None,
         }
     }
 }

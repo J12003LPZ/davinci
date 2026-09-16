@@ -231,7 +231,7 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
             ),
             text_style,
         );
-        if h > 4 {
+        if h > 4 && node.members.len() == 1 {
             cells.write(
                 x + 1,
                 y + 3,
