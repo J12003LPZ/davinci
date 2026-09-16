@@ -1068,6 +1068,59 @@ pub fn export_ledger() -> ExportLedger {
 }
 
 /// `5a` — the graph run.
+/// Offline Living Blueprint acceptance fixture. Every edge is explicit.
+pub fn blueprint_graph() -> GraphRunSheet {
+    let specs = [
+        ("classify", "classifier", State::Done, vec![]),
+        ("research-a", "researcher", State::Done, vec!["classify"]),
+        ("research-b", "researcher", State::Done, vec!["classify"]),
+        ("research-c", "researcher", State::Done, vec!["classify"]),
+        (
+            "plan",
+            "planner",
+            State::Done,
+            vec!["research-a", "research-b", "research-c"],
+        ),
+        ("writer", "writer", State::Active, vec!["plan"]),
+        ("tests", "test-analyzer", State::Active, vec!["plan"]),
+        ("failure", "reviewer", State::Failed, vec!["plan"]),
+        ("blocked", "verifier", State::Attention, vec!["failure"]),
+        ("review", "reviewer", State::Queued, vec!["writer", "tests"]),
+    ];
+    GraphRunSheet {
+        id: "blueprint-fixture".into(),
+        goal: "Validate parallel execution".into(),
+        lifecycle: "running".into(),
+        mode: "complex".into(),
+        elapsed: "1m20s".into(),
+        cost: "$0.42".into(),
+        cost_cap: "$8.00".into(),
+        tasks: specs
+            .into_iter()
+            .map(|(id, role, state, deps)| GraphTask {
+                id: id.into(),
+                role: role.into(),
+                state,
+                dependencies: deps.into_iter().map(str::to_owned).collect(),
+                policy: "read-only".into(),
+                usage: "12k↑ 2k↓ 31s".into(),
+                artifact: if state == State::Active {
+                    "checking public contracts".into()
+                } else {
+                    "evidence.json".into()
+                },
+                error: match state {
+                    State::Failed => Some("test assertion failed".into()),
+                    State::Attention => Some("waiting for failed dependency".into()),
+                    _ => None,
+                },
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
 pub fn graph_run_sheet() -> GraphRunSheet {
     let task = |id: &str, policy: &str, artifact: &str, usage: &str, state: State| GraphTask {
         id: id.into(),

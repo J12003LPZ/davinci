@@ -41,7 +41,7 @@ pub struct GraphLayout {
 
 pub fn layout_graph(
     run: &GraphRunSheet,
-    _canvas: &GraphCanvasState,
+    canvas: &GraphCanvasState,
     width: u16,
     height: u16,
 ) -> GraphLayout {
@@ -184,6 +184,111 @@ pub fn layout_graph(
             layout.edges.push(LayoutEdge { from, to, points });
         }
     }
+    fold_completed(layout, run, canvas)
+}
+
+fn fold_completed(
+    mut layout: GraphLayout,
+    run: &GraphRunSheet,
+    canvas: &GraphCanvasState,
+) -> GraphLayout {
+    use crate::davinci::theme::State;
+    // Equal incoming AND outgoing frontiers ensure a summary never invents
+    // connectivity between a member and a different member's dependent.
+    let mut outgoing = vec![Vec::new(); run.tasks.len()];
+    for edge in &layout.edges {
+        outgoing[edge.from].push(edge.to);
+    }
+    let mut groups = BTreeMap::new();
+    for node in &layout.nodes {
+        let task = &run.tasks[node.task_index];
+        if task.state != State::Done
+            || task.error.is_some()
+            || task.public_contract.is_some()
+            || task.role.is_empty()
+            || task.role.contains("verif")
+            || task.role.contains("review")
+            || run.selected_node_id.as_deref() == Some(&task.id)
+        {
+            continue;
+        }
+        let incoming: BTreeSet<_> = task.dependencies.iter().collect();
+        groups
+            .entry((node.depth, &task.role, incoming, &outgoing[node.task_index]))
+            .or_insert_with(Vec::new)
+            .push(node.task_index);
+    }
+    let mut membership = BTreeMap::new();
+    let mut folded = BTreeMap::new();
+    for members in groups.values().filter(|g| g.len() >= 3) {
+        let first = members[0];
+        let id = format!("fold:{}", run.tasks[first].id);
+        if canvas.expanded_groups.contains(&id) {
+            continue;
+        }
+        for &member in members {
+            membership.insert(member, first);
+        }
+        folded.insert(
+            first,
+            (
+                id,
+                members
+                    .iter()
+                    .map(|&i| run.tasks[i].id.clone())
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    let mut nodes = Vec::new();
+    let mut remap = BTreeMap::new();
+    for node in &layout.nodes {
+        let owner = membership
+            .get(&node.task_index)
+            .copied()
+            .unwrap_or(node.task_index);
+        if owner != node.task_index {
+            continue;
+        }
+        remap.insert(owner, nodes.len());
+        let mut node = node.clone();
+        if let Some((id, members)) = folded.get(&owner) {
+            node.id = id.clone();
+            node.members = members.clone();
+        }
+        nodes.push(node);
+    }
+    let mut pairs = BTreeSet::new();
+    for edge in &layout.edges {
+        let from = membership.get(&edge.from).copied().unwrap_or(edge.from);
+        let to = membership.get(&edge.to).copied().unwrap_or(edge.to);
+        pairs.insert((remap[&from], remap[&to]));
+    }
+    layout.edges = pairs
+        .into_iter()
+        .map(|(from, to)| {
+            let a = nodes[from].rect;
+            let b = nodes[to].rect;
+            let start = (a.right(), a.y + a.height / 2);
+            let end = (b.x - 1, b.y + b.height / 2);
+            let mid = a.right() + 2;
+            let points = if nodes[to].depth > nodes[from].depth + 1 {
+                vec![
+                    start,
+                    (mid, start.1),
+                    (mid, 1),
+                    (end.0 - 1, 1),
+                    (end.0 - 1, end.1),
+                    end,
+                ]
+            } else {
+                vec![start, (mid, start.1), (mid, end.1), end]
+            };
+            LayoutEdge { from, to, points }
+        })
+        .collect();
+    layout.content_height = nodes.iter().map(|n| n.rect.bottom()).max().unwrap_or(0);
+    layout.nodes = nodes;
     layout
 }
 
