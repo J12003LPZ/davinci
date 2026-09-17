@@ -1119,3 +1119,30 @@ checked the handle-bound lookup, fixed buffer limit, unchanged distinct-alias
 denial and preservation, and failure behavior. Prior-head Linux/macOS native
 jobs and quality completed successfully; Windows remains the sole known failure
 and the corrected commit still needs its own CI run.
+
+### Completion audit: concurrency and worktree boundaries
+
+The final requirements comparison found that existing queue/lease tests did not
+directly exercise simultaneous coordinator applications. Two integration cases
+now race preexisting previews against one source (exactly one application wins;
+replay and losing rollback cannot overwrite it), and pause one workspace inside
+its authorization callback while another workspace completes a transaction.
+Channels coordinate the latter without scheduling sleeps, and workers are joined
+after releasing the paused callback even when the independence assertion fails.
+
+A real temporary Git repository and linked worktree fixture verifies their shared
+Git common directory, applies separate edits, copies one recovery journal to the
+other worktree, and proves current workspace validation refuses that journal.
+Authorized rollbacks remain independent and restore each worktree's own bytes.
+These are coverage additions for existing behavior, not new production behavior
+or a claim of an observed pre-fix failure. All 24 transaction integration cases
+and all four commit/worktree cases passed on Windows. Clippy for both affected
+test targets, formatting and diff checks passed. Native CI remains required.
+
+The same audit reconfirmed source-stage partial-write/sync and journal-write fault
+injection, real host exit between writes, resumed recovery, stale identity checks,
+normal CLI and Repo/LSP invalidation, and successful real Graph worker submission.
+The semantic rename module currently produces read-only previews and string edits;
+its apply helpers have no production mutation caller to wrap. Existing production
+write/edit/apply_patch paths all use the coordinator. No unused second semantic
+mutation interface was introduced.

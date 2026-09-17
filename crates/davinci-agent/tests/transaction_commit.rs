@@ -31,6 +31,69 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn transaction_recovery_is_scoped_to_the_git_worktree_not_common_metadata() {
+    let fixture = tempfile::tempdir().unwrap();
+    let main = fixture.path().join("main");
+    let linked = fixture.path().join("linked");
+    fs::create_dir(&main).unwrap();
+    git(&main, &["init", "--quiet"]);
+    fs::write(main.join("source.txt"), b"before").unwrap();
+    git(&main, &["add", "--", "source.txt"]);
+    git(&main, &["commit", "--quiet", "-m", "baseline"]);
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        git(
+            &main,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        ),
+        git(
+            &linked,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        )
+    );
+    let owner = TransactionOwner::default();
+    let first = TransactionCoordinator::new(&main, owner.clone()).unwrap();
+    let second = TransactionCoordinator::new(&linked, owner).unwrap();
+    let preview = first
+        .preview(vec![ProposedChange::write(
+            "source.txt",
+            b"main edit".to_vec(),
+        )])
+        .unwrap();
+    first.apply(&preview.id, &|_| Ok(()), None).unwrap();
+    let linked_preview = second
+        .preview(vec![ProposedChange::write(
+            "source.txt",
+            b"linked edit".to_vec(),
+        )])
+        .unwrap();
+    second.apply(&linked_preview.id, &|_| Ok(()), None).unwrap();
+    // Even an exact copy of a journal with the same owner cannot be adopted by
+    // the other worktree merely because both share Git metadata.
+    let record = format!(".davinci-transactions/{}.json", preview.id);
+    fs::copy(main.join(&record), linked.join(&record)).unwrap();
+    let error = second.rollback(&preview.id, &|_| Ok(()), None).unwrap_err();
+    assert!(error.contains("workspace or owner mismatch"), "{error}");
+    assert_eq!(fs::read(linked.join("source.txt")).unwrap(), b"linked edit");
+    first.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+    assert_eq!(fs::read(main.join("source.txt")).unwrap(), b"before");
+    assert_eq!(fs::read(linked.join("source.txt")).unwrap(), b"linked edit");
+    second
+        .rollback(&linked_preview.id, &|_| Ok(()), None)
+        .unwrap();
+    assert_eq!(fs::read(linked.join("source.txt")).unwrap(), b"before");
+}
+
+#[test]
 fn transaction_commit_requires_exact_git_objects_and_current_authority() {
     for outcome in ["committed", "uncommitted", "changed", "denied"] {
         let root = tempfile::tempdir().unwrap();

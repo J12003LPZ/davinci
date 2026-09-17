@@ -740,6 +740,106 @@ fn transaction_rejects_links_reserved_paths_and_duplicate_aliases() {
 }
 
 #[test]
+fn transaction_concurrent_previews_have_one_winner_without_replay() {
+    use std::sync::{Arc, Barrier};
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("source.txt"), b"before").unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let workers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+        .into_iter()
+        .map(|bytes| {
+            let manager = TransactionCoordinator::new(root.path(), owner()).unwrap();
+            let preview = manager
+                .preview(vec![ProposedChange::write("source.txt", bytes.to_vec())])
+                .unwrap();
+            let barrier = barrier.clone();
+            (manager, preview, barrier, bytes)
+        })
+        .collect();
+    let handles: Vec<_> = workers
+        .into_iter()
+        .map(|(manager, preview, barrier, bytes)| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = manager.apply(&preview.id, &|_| Ok(()), None);
+                (manager, preview.id, bytes, result)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.3.is_ok()).count(), 1);
+    let winner = results.iter().find(|r| r.3.is_ok()).unwrap();
+    let loser = results.iter().find(|r| r.3.is_err()).unwrap();
+    assert!(loser.3.as_ref().unwrap_err().contains("conflict"));
+    assert_eq!(fs::read(root.path().join("source.txt")).unwrap(), winner.2);
+    assert!(winner.0.apply(&winner.1, &|_| Ok(()), None).is_err());
+    assert!(loser.0.rollback(&loser.1, &|_| Ok(()), None).is_err());
+    assert_eq!(fs::read(root.path().join("source.txt")).unwrap(), winner.2);
+    winner.0.rollback(&winner.1, &|_| Ok(()), None).unwrap();
+    assert_eq!(fs::read(root.path().join("source.txt")).unwrap(), b"before");
+}
+
+#[test]
+fn transaction_workspace_mutation_does_not_hold_an_unrelated_workspace() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
+    let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let managers: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            fs::write(root.path().join("source.txt"), b"before").unwrap();
+            let manager = TransactionCoordinator::new(root.path(), owner()).unwrap();
+            let preview = manager
+                .preview(vec![ProposedChange::write("source.txt", b"after".to_vec())])
+                .unwrap();
+            (manager, preview.id)
+        })
+        .collect();
+    let mut managers = managers.into_iter();
+    let (first, first_id) = managers.next().unwrap();
+    let (second, second_id) = managers.next().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let first_thread = std::thread::spawn(move || {
+        let entered = AtomicBool::new(false);
+        first.apply(
+            &first_id,
+            &|_| {
+                if !entered.swap(true, Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            },
+            None,
+        )
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let second_thread = std::thread::spawn(move || {
+        finished_tx
+            .send(second.apply(&second_id, &|_| Ok(()), None))
+            .unwrap();
+    });
+    let independent = finished_rx.recv_timeout(Duration::from_secs(5));
+    // Release and join even if independence failed, so the test leaves no worker.
+    release_tx.send(()).unwrap();
+    first_thread.join().unwrap().unwrap();
+    second_thread.join().unwrap();
+    independent
+        .expect("unrelated workspace was blocked")
+        .unwrap();
+    for root in roots {
+        assert_eq!(fs::read(root.path().join("source.txt")).unwrap(), b"after");
+    }
+}
+
+#[test]
 fn transaction_crash_helper() {
     let Some(root) = std::env::var_os("DAVINCI_TRANSACTION_TEST_ROOT") else {
         return;
