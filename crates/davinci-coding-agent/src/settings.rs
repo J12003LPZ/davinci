@@ -26,6 +26,9 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
+    #[serde(default, rename = "repoIntelligence")]
+    pub repo_intelligence:
+        Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,
     #[serde(default)]
     pub cache: Option<davinci_agent::runtime::cache::CacheConfig>,
     #[serde(default)]

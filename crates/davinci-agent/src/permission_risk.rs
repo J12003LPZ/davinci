@@ -182,6 +182,13 @@ pub(super) fn file_targets(
             | "write"
             | "edit"
             | "notebook_edit"
+            | "repo_map"
+            | "symbol_search"
+            | "file_symbols"
+            | "file_dependencies"
+            | "symbol_relationships"
+            | "related_files"
+            | "code_query"
             | "lsp_definition"
             | "lsp_references"
             | "lsp_hover"
@@ -334,6 +341,42 @@ pub(super) fn routine_local_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_and_language_tools_keep_sensitive_path_checks() {
+        let root = tempfile::tempdir().unwrap();
+        for tool in [
+            "repo_map",
+            "symbol_search",
+            "file_symbols",
+            "file_dependencies",
+            "symbol_relationships",
+            "related_files",
+            "code_query",
+            "lsp_definition",
+            "lsp_references",
+            "lsp_hover",
+            "lsp_document_symbols",
+            "lsp_workspace_symbols",
+            "lsp_implementations",
+            "lsp_type_definition",
+            "lsp_diagnostics",
+        ] {
+            assert_eq!(
+                super::super::tool_class(tool),
+                super::super::ToolClass::Read
+            );
+            let targets = file_targets(
+                tool,
+                &serde_json::json!({"path": ".env"}),
+                root.path(),
+                &FilesystemBoundaryPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(targets.len(), 1, "{tool}");
+            assert!(targets[0].secret, "{tool}");
+        }
+    }
 
     #[test]
     fn protected_names_cover_case_streams_and_nested_credentials() {

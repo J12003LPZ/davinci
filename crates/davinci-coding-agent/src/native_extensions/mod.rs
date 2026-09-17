@@ -5,6 +5,7 @@ pub mod ecosystem;
 pub mod graph;
 pub mod language_intelligence;
 pub mod learning;
+pub mod repo_intelligence;
 pub mod security_scan;
 pub mod token_governor;
 pub mod vector_memory;
@@ -34,6 +35,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const NATIVE_TOOLS: &[&str] = &[
+    "repo_map",
+    "symbol_search",
+    "file_symbols",
+    "file_dependencies",
+    "symbol_relationships",
+    "related_files",
+    "code_query",
     "lsp_definition",
     "lsp_references",
     "lsp_hover",
@@ -66,6 +74,7 @@ pub const NATIVE_TOOLS: &[&str] = &[
 ];
 
 pub const NATIVE_COMMANDS: &[&str] = &[
+    "repo-index-status",
     "cache-status",
     "lsp-status",
     "memory-status",
@@ -99,6 +108,11 @@ pub const NATIVE_COMMANDS: &[&str] = &[
 /// other invocable pi command to clients and autocomplete.
 pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
     vec![
+        (
+            "repo-index-status",
+            "Show structural repository index counts, cache and refresh state.",
+            None,
+        ),
         (
             "cache-status",
             "Show local cache usage and separate provider token counters.",
@@ -204,6 +218,7 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
+    pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
     pub governor: TokenGovernor,
@@ -252,6 +267,14 @@ impl NativeExtensionHost {
         graph.learning = Some(learning.clone());
         graph.governor = Some(governor.clone());
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
+        let repo_agent_dir = agent_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(davinci_session::default_agent_dir);
+        let repo_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .repo_intelligence
+            .unwrap_or_default();
+        let repo_intelligence =
+            repo_intelligence::RepoIntelligence::new(cwd, &repo_agent_dir, repo_config);
         let language_config = agent_dir
             .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
             .unwrap_or_default();
@@ -260,6 +283,7 @@ impl NativeExtensionHost {
         language_intelligence.set_governor(governor.clone());
         graph.language_intelligence = Some(language_intelligence.clone());
         Self {
+            repo_intelligence,
             cache,
             language_intelligence,
             governor,
@@ -454,6 +478,9 @@ impl NativeExtensionHost {
         args: &Value,
     ) -> Result<ToolResult, ToolError> {
         match name {
+            name if repo_intelligence::is_repo_tool(name) => {
+                self.repo_intelligence.execute_tool(name, args)
+            }
             name if language_intelligence::TOOL_NAMES.contains(&name) => {
                 if std::env::var_os("PI_GRAPH_ROLE").is_some() {
                     let client = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
@@ -498,6 +525,7 @@ impl NativeExtensionHost {
 
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
         match name {
+            "repo-index-status" => Ok(Some(self.repo_intelligence.status())),
             "lsp-status" => Ok(Some(self.language_intelligence.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
@@ -533,6 +561,9 @@ impl NativeExtensionHost {
     }
 
     pub fn describe_tool(name: &str) -> Option<davinci_ai::ToolSpec> {
+        if repo_intelligence::is_repo_tool(name) {
+            return repo_intelligence::tool_spec(name);
+        }
         if language_intelligence::TOOL_NAMES.contains(&name) {
             return language_intelligence::tool_spec(name);
         }
@@ -644,10 +675,21 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn language_intelligence_tools_and_status_are_native_and_read_only() {
+    fn repository_language_and_cache_surfaces_coexist() {
         let _guard = graph::worker_hooks::submit_test_guard();
         let mut host = NativeExtensionHost::default();
-        for name in language_intelligence::TOOL_NAMES {
+        for name in language_intelligence::TOOL_NAMES.iter().chain(
+            [
+                "repo_map",
+                "symbol_search",
+                "file_symbols",
+                "file_dependencies",
+                "symbol_relationships",
+                "related_files",
+                "code_query",
+            ]
+            .iter(),
+        ) {
             assert!(host.has_tool(name));
             assert!(host.tool_names().iter().any(|n| n == name));
             assert!(host
@@ -659,9 +701,11 @@ mod tests {
                 davinci_agent::ToolClass::Read
             );
         }
-        assert!(command_specs()
-            .iter()
-            .any(|(name, _, _)| *name == "lsp-status"));
+        for command in ["repo-index-status", "cache-status", "lsp-status"] {
+            assert!(NATIVE_COMMANDS.contains(&command));
+            assert!(command_specs().iter().any(|(name, _, _)| *name == command));
+            assert!(host.command(command, "").unwrap().is_some());
+        }
         assert_eq!(
             host.command("lsp-status", "").unwrap().unwrap()["sessions"],
             json!([])

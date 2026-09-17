@@ -32,7 +32,8 @@ pub fn role_system_prompt_with_recovery(role: Role, has_recovery: bool) -> Strin
     let body = match role {
         Role::Classifier => {
             "You are the task classifier in a graph-engineered coding pipeline. \
-             You never touch the repository; you only judge the request. "
+             Judge the request; use repo_map or code_query for bounded structural context when needed. \
+             You cannot modify repository files. "
         }
         Role::Researcher => {
             "You are a read-only code researcher in a graph-engineered coding pipeline. \
@@ -758,7 +759,7 @@ mod tests {
         );
 
         let classifier_prompt = role_system_prompt(Role::Classifier);
-        assert!(!classifier_prompt.contains("Large tool output may be compacted"));
+        assert!(classifier_prompt.contains("Large tool output may be compacted"));
 
         let classifier_prompt_with_rec = role_system_prompt_with_recovery(Role::Classifier, true);
         assert!(classifier_prompt_with_rec.contains("Large tool output may be compacted"));
