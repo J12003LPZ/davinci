@@ -8,9 +8,9 @@ pub const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RECORD_BYTES: u64 = 192 * 1024 * 1024;
 pub const MAX_RECORDS: usize = 128;
 pub const STORE_NAME: &str = ".davinci-transactions";
-// Windows v2 requires creation time and attributes for every captured file.
+// Windows v3 also records short names and interrupted alias publication.
 // These values cannot be reconstructed safely from a legacy rollback journal.
-pub(super) const RECORD_SCHEMA: u32 = if cfg!(windows) { 2 } else { 1 };
+pub(super) const RECORD_SCHEMA: u32 = if cfg!(windows) { 3 } else { 1 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,6 +136,8 @@ pub(super) struct Image {
     pub access: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_metadata: Option<WindowsMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows_short_name: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unix_owner: Option<[u32; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +155,7 @@ impl Image {
             mode: None,
             access: None,
             windows_metadata: None,
+            windows_short_name: Vec::new(),
             unix_owner: None,
             macos_acl: None,
             xattrs: BTreeMap::new(),
@@ -172,6 +175,10 @@ pub(super) struct Change {
     pub staged_name: Option<String>,
     pub restored: Option<Image>,
     pub restore_name: Option<String>,
+    #[serde(default)]
+    pub alias_pending: bool,
+    #[serde(default)]
+    pub restore_alias_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

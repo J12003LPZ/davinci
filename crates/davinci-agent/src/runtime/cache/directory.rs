@@ -275,6 +275,21 @@ impl Directory {
 }
 
 impl Directory {
+    #[cfg(windows)]
+    pub(crate) fn source_alias_file(&self, name: &str) -> io::Result<File> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        valid_source_name(name)?;
+        let file = OpenOptions::new()
+            .access_mode(0x80010000) // GENERIC_READ | DELETE for SetFileShortNameW.
+            .share_mode(1) // Pin against external writes, renames and alias changes.
+            .custom_flags(0x02200000)
+            .open(self.path.join(name))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::other("linked source denied"));
+        }
+        Ok(file)
+    }
     pub(crate) fn identity(&self) -> io::Result<String> {
         #[cfg(unix)]
         {

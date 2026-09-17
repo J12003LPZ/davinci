@@ -376,6 +376,11 @@ after the correction. No shell-string fallback or dependency install was added.
 
 ## P4 current checkpoint
 
+The Windows short-name follow-up preserves aliases through edit/delete/recovery
+and journals interrupted alias publication. Its 49 focused unit tests, 30
+transaction integration/evaluation cases and the formerly failing normal-agent
+CI test pass locally. Native exact-head CI remains required; P4 is still open.
+
 Implementation is in draft [PR #11](https://github.com/J12003LPZ/davinci/pull/11)
 on `codex/transactional-edits-01a0ad48` in the isolated worktree. The latest
 checkpoint in the [P4 plan](04-transactional-edits.md) supersedes the historical

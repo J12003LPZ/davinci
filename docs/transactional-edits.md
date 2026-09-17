@@ -60,19 +60,21 @@ private staging files.
 ## Windows metadata boundaries
 
 Supported replacement and recovery preserve named streams, creation time,
-supported attributes/compression, owner/group/DACL, resource attributes and
+supported attributes/compression, alternate 8.3 names, owner/group/DACL, resource attributes and
 mandatory integrity labels. Metadata changes participate in conflict checks.
 This is not a guarantee to preserve every NTFS security or filesystem feature;
 full audit SACL and process-trust/capability label preservation is not established.
 
-Encrypted files, files with object IDs, and files with alternate 8.3 names are
-rejected before source content is journaled. This includes ordinary files on
-volumes that automatically assign short names. Source aliases and object IDs are
-not removed to make an edit succeed. Private staging aliases may be cleared
-before content is written.
+Encrypted files and files with object IDs are rejected before source content is
+journaled. Private staging aliases are cleared before content is written. Source
+aliases are captured and restored after publication, with durable intent allowing
+recovery if the process exits between those steps. Recovery refuses an alias
+claimed by another file. Use the primary filename when requesting an edit;
+addressing the file through its short alias is rejected to preserve the primary
+directory entry.
 
-Windows journals now require schema version 2, including captured creation time
-and attributes. Older records are rejected rather than guessed or migrated.
+Windows journals now require schema version 3, including captured creation time,
+attributes, aliases and pending alias publication. Older records are rejected rather than guessed or migrated.
 Preserve an older record for recovery with its original version; do not change
 its schema number manually.
 

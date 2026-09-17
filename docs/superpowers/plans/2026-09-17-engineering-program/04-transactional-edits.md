@@ -1021,3 +1021,69 @@ integration tests passed. The preceding run separately passed three commit tests
 four verification tests and the offline rollback evaluation. Formatting and
 agent all-target Clippy passed. The integrity-label conflict follow-up also
 passed both focused cases. Native CI must still validate the corrected head.
+
+### Native Windows short-name compatibility regression
+
+Implementation head `98e363d` failed CI run `35283245859`, Windows job
+`105409749119`, at `normal_agent_discovers_edits_replans_and_runs_tests_without_graph`:
+`transaction cannot preserve an existing Windows short name`. The runner assigns
+8.3 names to ordinary files. Refusing those files is therefore a demonstrated
+normal-edit compatibility defect, not an acceptable completion boundary.
+
+Documentation head `3106598` adds the capability guide; CI run `35283684663` is
+active. That documentation-only commit does not repair this failure.
+
+The local short-name fixture now requires successful edit, delete and recovery
+while preserving the explicit alias. Its focused run failed at preview with the
+same error (0 passed, 1 failed), establishing RED. The regression is intentionally
+uncommitted pending implementation. A separate temporary NTFS probe confirmed
+that MoveFileExW replacement removes an existing ALIAS.TXT alias, so removing the
+guard alone is incorrect. The probe changed only its temporary fixture.
+
+Next implementation must persist the captured alias, detect alias-only conflicts,
+and restore it with recovery coverage for interruption between content publication
+and alias restoration. It must preserve existing descriptor/stream checks and
+avoid adopting or deleting an alias claimed by another file. ReplaceFileW is not
+a drop-in fix because its descriptor merging caused the earlier inheritance
+regression. Add failure-window cases before claiming short-name recovery complete.
+P4 remains open; do not start P3 while this native failure is unresolved.
+
+Short-name capture preparation now decodes the handle-bound alternate-name
+response into bounded UTF-16 units, rejecting invalid byte lengths and path
+separators. The private-stage fixture checks the exact alias before clearing it
+and an empty alias afterward. Its missing-helper RED was followed by one passing
+focused test. `cargo fmt --all` and `git diff --check` passed. The end-to-end
+edit/delete/recovery regression still fails at the existing preview guard; alias
+journaling and interruption-safe publication remain unimplemented. These changes
+are uncommitted and do not close the Windows compatibility gate.
+
+## Windows short-name preservation implementation
+
+The formerly failing alias edit/delete/fresh-host recovery regression now passes,
+including named streams. Windows journal schema 3 records bounded aliases and
+pending publication separately from the final file image. Private stages keep no
+alias; publication restores the captured alias using a pinned DELETE handle after
+verifying the full staged image. Completed publications clear their pending flag
+durably, so later alias-only changes remain conflicts.
+
+Interrupted apply and interrupted rollback fixtures exercise the real durable
+journal and rename boundary. Recovery preserves a foreign alias claimant, and a
+fresh host can retry after that fixture releases its alias. Interrupted rollback
+finishes the alias on the already-restored file without replacing its durable
+identity. Alias-addressed source edits are refused to preserve primary filenames.
+Schema 1/2 records remain untouched and require their original recovery version.
+
+Executed validation for this follow-up:
+
+- `cargo test -p davinci-agent --offline --locked --lib transaction`: 49 passed.
+- Agent transaction, commit, verification and evaluation integration targets:
+  30 passed across four suites.
+- `cargo test -p davinci-coding-agent --offline --locked --bin davinci test_impact_integration_tests`:
+  one passed, matching the previously failing native CI step. An earlier `--lib`
+  selector ran zero tests and is not counted as validation.
+- Agent all-target Clippy with warnings denied passed; formatting and diff checks
+  passed. Final review was solo as explicitly requested.
+
+Previous-head CI `35283684663` is terminal: Linux/macOS native paths, quality and
+workspace shards passed; Windows failed the known ordinary-edit short-name gate.
+This implementation still requires its own exact-head CI before closing P4.

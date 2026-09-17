@@ -72,20 +72,38 @@ pub(super) fn capture(root: &Path, path: &str) -> Result<(Image, Option<Vec<u8>>
 }
 
 fn capture_in(dir: &Directory, name: &str) -> Result<(Image, Option<Vec<u8>>), String> {
-    let mut file = match dir.source_file(name) {
+    let file = match dir.source_file(name) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Image::missing(), None)),
         Err(e) => return Err(format!("confined source read: {e}")),
     };
+    capture_file(dir, name, file, false)
+}
+
+fn capture_file(
+    dir: &Directory,
+    name: &str,
+    mut file: File,
+    alias_handle: bool,
+) -> Result<(Image, Option<Vec<u8>>), String> {
     let before = file.metadata().map_err(|e| e.to_string())?;
     #[cfg(windows)]
     super::windows_metadata::ensure_replaceable(&file)?;
     let identity = identity(&file, &before)?;
     let windows_metadata = super::windows_metadata::capture(&before);
+    #[cfg(windows)]
+    let windows_short_name = super::windows_metadata::short_name(&file)?;
+    #[cfg(windows)]
+    super::windows_metadata::ensure_primary_name(name, &windows_short_name)?;
+    #[cfg(not(windows))]
+    let windows_short_name = {
+        let _ = (alias_handle, name);
+        Vec::new()
+    };
     let xattrs = super::unix_xattrs::capture(&file)?;
     let macos_acl = super::macos_acl::capture(&file)?;
     #[cfg(windows)]
-    let streams = super::windows_streams::capture(dir, name, &file)?;
+    let streams = super::windows_streams::capture_for_transaction(dir, name, &file, alias_handle)?;
     #[cfg(not(windows))]
     let streams = std::collections::BTreeMap::new();
     if before.len() > MAX_FILE_BYTES as u64 {
@@ -117,6 +135,7 @@ fn capture_in(dir: &Directory, name: &str) -> Result<(Image, Option<Vec<u8>>), S
             mode: Some(mode(&after)),
             access: access(&file)?,
             windows_metadata,
+            windows_short_name,
             unix_owner: unix_owner(&after),
             macos_acl,
             xattrs,
@@ -185,6 +204,7 @@ pub(super) fn stage(
                 mode: Some(mode(&metadata)),
                 access: access(&file)?,
                 windows_metadata: super::windows_metadata::capture(&metadata),
+                windows_short_name: original.windows_short_name.clone(),
                 unix_owner: unix_owner(&metadata),
                 macos_acl: super::macos_acl::capture(&file)?,
                 xattrs: super::unix_xattrs::capture(&file)?,
@@ -213,19 +233,80 @@ pub(super) fn replace(
     dir.check_current()
         .map_err(|e| format!("source directory changed: {e}"))?;
     if let Some(staged) = staged {
-        if capture_in(&dir, staged)?.0 != *proposed {
+        if capture_in(&dir, staged)?.0 != unpublished(proposed) {
             return Err(format!(
                 "conflict: staged bytes or identity changed for {path}"
             ));
         }
+        check_alias_available(&dir, &name, proposed, expected)?;
         dir.replace_source(staged, &name, expected.hash.is_some(), true)
-            .map_err(|e| format!("replace {path}: {e}"))
+            .map_err(|e| format!("replace {path}: {e}"))?;
+        publish_alias(&dir, &name, proposed)
     } else if expected.hash.is_some() {
         dir.remove_source(&name)
             .map_err(|e| format!("remove {path}: {e}"))
     } else {
         Ok(())
     }
+}
+
+pub(super) fn unpublished(image: &Image) -> Image {
+    Image {
+        windows_short_name: Vec::new(),
+        ..image.clone()
+    }
+}
+
+fn check_alias_available(
+    dir: &Directory,
+    name: &str,
+    proposed: &Image,
+    expected: &Image,
+) -> Result<(), String> {
+    if proposed.windows_short_name.is_empty() {
+        return Ok(());
+    }
+    let alias = String::from_utf16(&proposed.windows_short_name)
+        .map_err(|_| "invalid short name encoding")?;
+    match dir.source_file(&alias) {
+        Ok(file) => {
+            let id = identity(&file, &file.metadata().map_err(|e| e.to_string())?)?;
+            if expected.identity.as_ref() != Some(&id) {
+                return Err(format!("conflict: short name for {name} is occupied"));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot check short name: {e}")),
+    }
+    Ok(())
+}
+
+fn publish_alias(dir: &Directory, name: &str, proposed: &Image) -> Result<(), String> {
+    if proposed.windows_short_name.is_empty() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let file = dir.source_alias_file(name).map_err(|e| e.to_string())?;
+        let pin = file.try_clone().map_err(|e| e.to_string())?;
+        if capture_file(dir, name, file, true)?.0 != unpublished(proposed) {
+            return Err("conflict: source changed before alias publication".into());
+        }
+        super::windows_metadata::set_short_name(&pin, &proposed.windows_short_name)?;
+        dir.check_current().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (dir, name);
+        Err("Windows short name on unsupported platform".into())
+    }
+}
+
+pub(super) fn complete_alias(root: &Path, path: &str, proposed: &Image) -> Result<(), String> {
+    let (dir, name) = directory(root, path, false)?;
+    check_alias_available(&dir, &name, proposed, &unpublished(proposed))?;
+    publish_alias(&dir, &name, proposed)
 }
 
 pub(super) fn cleanup(root: &Path, path: &str, name: Option<&str>) {

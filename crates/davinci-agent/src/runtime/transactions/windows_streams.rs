@@ -108,7 +108,12 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<String, usize>, String> {
     Ok(streams)
 }
 
-pub(super) fn capture(dir: &Directory, name: &str, base: &File) -> Result<Streams, String> {
+pub(super) fn capture_for_transaction(
+    dir: &Directory,
+    name: &str,
+    base: &File,
+    alias_handle: bool,
+) -> Result<Streams, String> {
     let descriptors = enumerate(base)?;
     let base_id = super::files::identity(base, &base.metadata().map_err(|e| e.to_string())?)?;
     let mut streams = Streams::new();
@@ -118,7 +123,9 @@ pub(super) fn capture(dir: &Directory, name: &str, base: &File) -> Result<Stream
         dir.check_current().map_err(|e| e.to_string())?;
         let mut file = OpenOptions::new()
             .read(true)
-            .share_mode(1)
+            // An alias-publication base handle holds DELETE access while denying
+            // deletion itself. Stream readers must share that owned access.
+            .share_mode(if alias_handle { 1 | 4 } else { 1 })
             .custom_flags(0x00200000)
             .open(dir.path.join(format!("{name}{stream}")))
             .map_err(|e| e.to_string())?;

@@ -227,6 +227,22 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
     let mut paths = std::collections::BTreeSet::new();
     let mut bytes = 0usize;
     for change in &record.changes {
+        if (change.alias_pending && change.proposed.windows_short_name.is_empty())
+            || (change.restore_alias_pending
+                && change
+                    .restored
+                    .as_ref()
+                    .is_none_or(|image| image.windows_short_name.is_empty()))
+            || ((change.alias_pending || change.restore_alias_pending)
+                && !matches!(
+                    record.summary.state,
+                    super::TransactionState::Applying
+                        | super::TransactionState::RollingBack
+                        | super::TransactionState::Conflicted
+                ))
+        {
+            return Err("invalid pending transaction alias publication".into());
+        }
         let path = files::normalize(root, &change.path)?;
         let key = if cfg!(windows) {
             path.to_ascii_lowercase()
@@ -271,6 +287,10 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
                     restored.windows_metadata == change.before.windows_metadata,
                 ),
                 ("owner", restored.unix_owner == change.before.unix_owner),
+                (
+                    "short_name",
+                    restored.windows_short_name == change.before.windows_short_name,
+                ),
                 ("macos_acl", restored.macos_acl == change.before.macos_acl),
                 ("xattrs", restored.xattrs == change.before.xattrs),
                 ("streams", restored.streams == change.before.streams),
@@ -330,6 +350,10 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
 }
 
 fn validate_image(image: &Image) -> Result<(), String> {
+    super::windows_metadata::validate_short_name(&image.windows_short_name)?;
+    if !image.windows_short_name.is_empty() && (!cfg!(windows) || image.hash.is_none()) {
+        return Err("invalid transaction short name".into());
+    }
     #[cfg(windows)]
     if let Some(metadata) = &image.windows_metadata {
         super::windows_metadata::ensure_snapshot_attributes(metadata.attributes)?;
@@ -411,10 +435,10 @@ mod failure_tests {
             .unwrap();
         let store = Store::open(&root).unwrap();
         let original = store.load(&preview.id, &root, &owner, false).unwrap();
-        for case in ["legacy", "missing", "encrypted"] {
+        for case in ["legacy", "legacy_v2", "missing", "encrypted"] {
             let mut record = original.clone();
-            let expected = if case == "legacy" {
-                record.schema = 1;
+            let expected = if case.starts_with("legacy") {
+                record.schema = if case == "legacy_v2" { 2 } else { 1 };
                 "unsupported transaction journal schema; preserve the record for recovery with its original version"
             } else if case == "missing" {
                 record.changes[0].before.windows_metadata = None;

@@ -121,6 +121,7 @@ impl TransactionCoordinator {
                     mode: before.mode.or(Some(0o644)),
                     access: before.access.clone(),
                     windows_metadata: before.windows_metadata.clone(),
+                    windows_short_name: before.windows_short_name.clone(),
                     unix_owner: before.unix_owner,
                     macos_acl: before.macos_acl.clone(),
                     xattrs: before.xattrs.clone(),
@@ -138,6 +139,8 @@ impl TransactionCoordinator {
                 staged_name: None,
                 restored: None,
                 restore_name: None,
+                alias_pending: false,
+                restore_alias_pending: false,
             });
         }
         let summary = TransactionSummary {
@@ -353,7 +356,7 @@ impl TransactionCoordinator {
             for index in 0..record.changes.len() {
                 let change = &mut record.changes[index];
                 match files::stage(&self.root,&change.path,change.proposed_bytes.as_deref(),&change.before) {
-                    Ok((image,name)) => { change.proposed=image; change.staged_name=name; }
+                    Ok((image,name)) => { change.alias_pending = !image.windows_short_name.is_empty(); change.proposed=image; change.staged_name=name; }
                     Err(error) => { self.cleanup(&record); return Err(error); }
                 }
             }
@@ -378,6 +381,10 @@ impl TransactionCoordinator {
                     };
                 }
                 record.summary.applied_hashes.insert(change.path.clone(),change.proposed.hash.clone());
+                if record.changes[index].alias_pending {
+                    record.changes[index].alias_pending = false;
+                    store.save(&record)?;
+                }
             }
             for change in &record.changes {
                 if files::capture(&self.root,&change.path)?.0 != change.proposed {
@@ -426,6 +433,7 @@ impl TransactionCoordinator {
             return Err("transaction state does not allow rollback".into());
         }
         let mut restore = Vec::new();
+        let mut resume_aliases = Vec::new();
         for change in &record.changes {
             cancelled(abort)?;
             authority(&self.root.join(&change.path))?;
@@ -433,7 +441,20 @@ impl TransactionCoordinator {
             if current == change.before || change.restored.as_ref() == Some(&current) {
                 continue;
             }
-            if current != change.proposed
+            let interrupted_apply =
+                change.alias_pending && current == files::unpublished(&change.proposed);
+            let interrupted_restore = change.restore_alias_pending
+                && change
+                    .restored
+                    .as_ref()
+                    .is_some_and(|image| current == files::unpublished(image));
+            if interrupted_restore {
+                // Retain the durable restored identity. Restaging here would lose
+                // ownership of the current image if recovery itself were interrupted.
+                resume_aliases.push(change.path.clone());
+                continue;
+            }
+            if (current != change.proposed && !interrupted_apply && !interrupted_restore)
                 || change.proposed.identity.is_none() && change.proposed.hash.is_some()
             {
                 let reason = format!("conflict: {} no longer has transaction-owned bytes and identity; no rollback writes",change.path);
@@ -462,6 +483,10 @@ impl TransactionCoordinator {
             };
             change.restored = Some(image);
             change.restore_name = name;
+            change.restore_alias_pending = change
+                .restored
+                .as_ref()
+                .is_some_and(|image| !image.windows_short_name.is_empty());
         }
         let prepare = store.active().and_then(|active| {
             if active.is_none() {
@@ -478,6 +503,24 @@ impl TransactionCoordinator {
         if let Err(error) = store.save(record) {
             self.cleanup(record);
             return Err(error);
+        }
+        for path in resume_aliases {
+            self.check_root()?;
+            cancelled(abort)?;
+            authority(&self.root.join(&path))?;
+            cancelled(abort)?;
+            let change = record
+                .changes
+                .iter_mut()
+                .find(|c| c.path == path)
+                .expect("validated path");
+            files::complete_alias(
+                &self.root,
+                &path,
+                change.restored.as_ref().expect("restored image"),
+            )?;
+            change.restore_alias_pending = false;
+            store.save(record)?;
         }
         for (path, current) in restore.into_iter().rev() {
             self.check_root()?;
@@ -505,6 +548,15 @@ impl TransactionCoordinator {
                     format!("rollback incomplete; journal retained: {error}"),
                 );
             }
+            let change = record
+                .changes
+                .iter_mut()
+                .find(|c| c.path == path)
+                .expect("validated path");
+            if change.restore_alias_pending {
+                change.restore_alias_pending = false;
+                store.save(record)?;
+            }
         }
         for change in &record.changes {
             let current = files::capture(&self.root, &change.path)?.0;
@@ -515,6 +567,10 @@ impl TransactionCoordinator {
                 );
                 return self.conflict(store, record, reason);
             }
+        }
+        for change in &mut record.changes {
+            change.alias_pending = false;
+            change.restore_alias_pending = false;
         }
         transition(record, TransactionState::RolledBack);
         record.summary.verification_state = "invalidated by rollback".into();

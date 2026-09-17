@@ -25,7 +25,6 @@ pub(super) fn ensure_replaceable(file: &std::fs::File) -> Result<(), String> {
             .map_err(|e| e.to_string())?
             .file_attributes(),
     )?;
-    ensure_no_short_name(file)?;
     let mut identifier = [0u8; 64];
     let mut returned = 0;
     // Query only: never create, transfer, or delete filesystem object identities.
@@ -55,15 +54,12 @@ pub(super) fn ensure_replaceable(file: &std::fs::File) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn ensure_no_short_name(file: &std::fs::File) -> Result<(), String> {
-    if short_name_present(file)? {
-        return Err("transaction cannot preserve an existing Windows short name".into());
-    }
-    Ok(())
+fn short_name_present(file: &std::fs::File) -> Result<bool, String> {
+    Ok(!short_name(file)?.is_empty())
 }
 
 #[cfg(windows)]
-fn short_name_present(file: &std::fs::File) -> Result<bool, String> {
+pub(super) fn short_name(file: &std::fs::File) -> Result<Vec<u16>, String> {
     use std::{ffi::c_void, os::windows::io::AsRawHandle};
     #[repr(C)]
     struct IoStatus {
@@ -99,7 +95,7 @@ fn short_name_present(file: &std::fs::File) -> Result<bool, String> {
     };
     if result as u32 == 0xc0000034 {
         // STATUS_OBJECT_NAME_NOT_FOUND: no alias.
-        return Ok(false);
+        return Ok(Vec::new());
     }
     if result != 0 {
         return Err(format!(
@@ -109,7 +105,73 @@ fn short_name_present(file: &std::fs::File) -> Result<bool, String> {
     if status.information < 4 || status.information > 64 {
         return Err("invalid transaction short name response".into());
     }
-    Ok(information[0] != 0)
+    let byte_len = information[0] as usize;
+    if byte_len > 24 || byte_len % 2 != 0 || byte_len > status.information - 4 {
+        return Err("invalid transaction short name length".into());
+    }
+    // Decode only the reported UTF-16 units, never padding or a C terminator.
+    let name: Vec<u16> = information[1..]
+        .iter()
+        .flat_map(|word| [*word as u16, (*word >> 16) as u16])
+        .take(byte_len / 2)
+        .collect();
+    validate_short_name(&name)?;
+    Ok(name)
+}
+
+pub(super) fn validate_short_name(name: &[u16]) -> Result<(), String> {
+    if name.is_empty() {
+        return Ok(());
+    }
+    let text = String::from_utf16(name).map_err(|_| "invalid transaction short name encoding")?;
+    let mut parts = text.split('.');
+    let base = parts.next().unwrap_or_default();
+    let extension = parts.next();
+    if name.len() > 12
+        || base.is_empty()
+        || base.encode_utf16().count() > 8
+        || extension.is_some_and(|s| s.is_empty() || s.encode_utf16().count() > 3)
+        || parts.next().is_some()
+        || text.chars().any(|c| c <= ' ' || "\\/:*?\"<>|".contains(c))
+    {
+        return Err("invalid transaction short name component".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn ensure_primary_name(name: &str, alias: &[u16]) -> Result<(), String> {
+    if alias.is_empty() {
+        return Ok(());
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CompareStringOrdinal(
+            a: *const u16,
+            a_len: i32,
+            b: *const u16,
+            b_len: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+    let name: Vec<_> = name.encode_utf16().collect();
+    // SAFETY: bounded live UTF-16 arrays; explicit lengths, no terminator required.
+    let result = unsafe {
+        CompareStringOrdinal(
+            name.as_ptr(),
+            name.len() as i32,
+            alias.as_ptr(),
+            alias.len() as i32,
+            1,
+        )
+    };
+    if result == 0 {
+        return Err("cannot compare transaction short name".into());
+    }
+    if result == 2 {
+        return Err("transaction requires the primary filename, not its short alias".into());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -132,6 +194,28 @@ pub(super) fn prepare_stage(file: &std::fs::File) -> Result<(), String> {
         }
     }
     ensure_replaceable(file)
+}
+
+#[cfg(windows)]
+pub(super) fn set_short_name(file: &std::fs::File, name: &[u16]) -> Result<(), String> {
+    validate_short_name(name)?;
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetFileShortNameW(handle: *mut std::ffi::c_void, name: *const u16) -> i32;
+    }
+    let terminated: Vec<_> = name.iter().copied().chain(Some(0)).collect();
+    // SAFETY: caller owns a pinned DELETE handle and a bounded terminated name.
+    if unsafe { SetFileShortNameW(file.as_raw_handle(), terminated.as_ptr()) } == 0 {
+        return Err(format!(
+            "restore transaction short name: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if short_name(file)? != name {
+        return Err("transaction short name did not round-trip".into());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -277,8 +361,13 @@ mod tests {
             std::io::Error::last_os_error()
         );
         assert!(short_name_present(&stage).unwrap());
+        assert_eq!(
+            short_name(&stage).unwrap(),
+            "STAGE.TMP".encode_utf16().collect::<Vec<_>>()
+        );
         prepare_stage(&stage).unwrap();
         assert!(!short_name_present(&stage).unwrap());
+        assert!(short_name(&stage).unwrap().is_empty());
         stage.write_all(b"after").unwrap();
         stage.sync_all().unwrap();
         drop(stage);
@@ -293,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_refuses_to_drop_an_existing_short_name() {
+    fn transaction_preserves_existing_short_name_across_edit_delete_and_recovery() {
         use std::os::windows::fs::OpenOptionsExt;
         #[link(name = "kernel32")]
         extern "system" {
@@ -302,6 +391,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("source-with-an-explicit-alias.txt");
         std::fs::write(&path, b"before").unwrap();
+        let stream = format!("{}:metadata", path.display());
+        std::fs::write(&stream, b"named stream").unwrap();
         let file = std::fs::OpenOptions::new()
             .access_mode(0x00010000) // DELETE, required by SetFileShortNameW.
             .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS.
@@ -321,9 +412,24 @@ mod tests {
             ProposedChange::write("source-with-an-explicit-alias.txt", b"after".to_vec()),
             ProposedChange::delete("source-with-an-explicit-alias.txt"),
         ] {
-            let error = manager.preview(vec![proposal]).unwrap_err();
-            assert!(error.contains("short name"), "{error}");
+            let deleting = proposal.bytes.is_none();
+            let preview = manager.preview(vec![proposal]).unwrap();
+            manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+            if deleting {
+                assert!(!path.exists());
+                assert!(!root.path().join("ALIAS.TXT").exists());
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), b"after");
+                assert_eq!(std::fs::read(&stream).unwrap(), b"named stream");
+                assert_eq!(
+                    std::fs::read(root.path().join("ALIAS.TXT")).unwrap(),
+                    b"after"
+                );
+            }
+            let recovered = TransactionCoordinator::new(root.path(), preview.owner).unwrap();
+            recovered.rollback(&preview.id, &|_| Ok(()), None).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), b"before");
+            assert_eq!(std::fs::read(&stream).unwrap(), b"named stream");
             assert_eq!(
                 std::fs::read(root.path().join("ALIAS.TXT")).unwrap(),
                 b"before"
@@ -339,6 +445,212 @@ mod tests {
         }
         for attributes in [0, 0x20, 0x800, 0x2002] {
             ensure_snapshot_attributes(attributes).unwrap();
+        }
+    }
+
+    #[test]
+    fn transaction_short_name_interrupted_publication_recovers_without_claiming_foreign_alias() {
+        use super::super::{files, model::TransactionState, store::Store};
+        for restoring in [false, true] {
+            for collision in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let path = "source-with-short-name.txt";
+                std::fs::write(root.path().join(path), b"before").unwrap();
+                let (dir, name) = files::directory(root.path(), path, false).unwrap();
+                set_short_name(
+                    &dir.source_alias_file(&name).unwrap(),
+                    &"ALIAS.TXT".encode_utf16().collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let owner = TransactionOwner::default();
+                let manager = TransactionCoordinator::new(root.path(), owner.clone()).unwrap();
+                let preview = manager
+                    .preview(vec![ProposedChange::write(path, b"after".to_vec())])
+                    .unwrap();
+                if restoring {
+                    manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+                }
+                let root_path = root.path().canonicalize().unwrap();
+                let store = Store::open(&root_path).unwrap();
+                let mut record = store.load(&preview.id, &root_path, &owner, false).unwrap();
+                let change = &mut record.changes[0];
+                let content = if restoring {
+                    change.before_bytes.as_deref()
+                } else {
+                    change.proposed_bytes.as_deref()
+                };
+                let (image, stage) =
+                    files::stage(&root_path, path, content, &change.before).unwrap();
+                if restoring {
+                    change.restored = Some(image);
+                    change.restore_name = stage.clone();
+                    change.restore_alias_pending = true;
+                    record.summary.state = TransactionState::RollingBack;
+                } else {
+                    change.proposed = image;
+                    change.staged_name = stage.clone();
+                    change.alias_pending = true;
+                    record.summary.state = TransactionState::Applying;
+                }
+                store.begin(&preview.id).unwrap();
+                store.save(&record).unwrap();
+                // Reproduce a host exit after the durable intent and content rename,
+                // before SetFileShortNameW. No test-only recovery path is involved.
+                dir.replace_source(stage.as_deref().unwrap(), &name, true, true)
+                    .unwrap();
+                assert!(!root.path().join("ALIAS.TXT").exists());
+                if collision {
+                    std::fs::write(root.path().join("foreign.txt"), b"user").unwrap();
+                    set_short_name(
+                        &dir.source_alias_file("foreign.txt").unwrap(),
+                        &"ALIAS.TXT".encode_utf16().collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                }
+                let interrupted_identity = files::capture(&root_path, path).unwrap().0.identity;
+                let recovered = TransactionCoordinator::new(&root_path, owner.clone()).unwrap();
+                let result = recovered.rollback(&preview.id, &|_| Ok(()), None);
+                if collision {
+                    assert!(result.unwrap_err().contains("occupied"));
+                    assert_eq!(
+                        std::fs::read(root.path().join("ALIAS.TXT")).unwrap(),
+                        b"user"
+                    );
+                    assert_eq!(
+                        std::fs::read(root.path().join(path)).unwrap(),
+                        if restoring {
+                            b"before".as_slice()
+                        } else {
+                            b"after".as_slice()
+                        }
+                    );
+                    // Release only the fixture alias, then retry through a new host.
+                    set_short_name(&dir.source_alias_file("foreign.txt").unwrap(), &[]).unwrap();
+                    let retry = TransactionCoordinator::new(&root_path, owner).unwrap();
+                    assert_eq!(
+                        retry
+                            .rollback(&preview.id, &|_| Ok(()), None)
+                            .unwrap()
+                            .state,
+                        TransactionState::RolledBack
+                    );
+                    assert_eq!(
+                        std::fs::read(root.path().join("foreign.txt")).unwrap(),
+                        b"user"
+                    );
+                } else {
+                    assert_eq!(result.unwrap().state, TransactionState::RolledBack);
+                    assert_eq!(std::fs::read(root.path().join(path)).unwrap(), b"before");
+                    assert_eq!(
+                        std::fs::read(root.path().join("ALIAS.TXT")).unwrap(),
+                        b"before"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(root.path().join("ALIAS.TXT")).unwrap(),
+                    b"before"
+                );
+                if restoring {
+                    assert_eq!(
+                        files::capture(&root_path, path).unwrap().0.identity,
+                        interrupted_identity
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transaction_short_name_only_changes_are_conflicts() {
+        use super::super::files;
+        for applied in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = "source-with-short-name.txt";
+            std::fs::write(root.path().join(path), b"before").unwrap();
+            let (dir, name) = files::directory(root.path(), path, false).unwrap();
+            set_short_name(
+                &dir.source_alias_file(&name).unwrap(),
+                &"ALIAS.TXT".encode_utf16().collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let manager =
+                TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+            let preview = manager
+                .preview(vec![ProposedChange::write(path, b"after".to_vec())])
+                .unwrap();
+            if applied {
+                manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+            }
+            set_short_name(&dir.source_alias_file(&name).unwrap(), &[]).unwrap();
+            let result = if applied {
+                manager.rollback(&preview.id, &|_| Ok(()), None)
+            } else {
+                manager.apply(&preview.id, &|_| Ok(()), None)
+            };
+            assert!(result.unwrap_err().contains("conflict"));
+            assert!(!root.path().join("ALIAS.TXT").exists());
+            assert_eq!(
+                std::fs::read(root.path().join(path)).unwrap(),
+                if applied {
+                    b"after".as_slice()
+                } else {
+                    b"before".as_slice()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_short_alias_cannot_replace_the_primary_name() {
+        use super::super::files;
+        let root = tempfile::tempdir().unwrap();
+        let path = "primary-source-name.txt";
+        std::fs::write(root.path().join(path), b"before").unwrap();
+        let (dir, name) = files::directory(root.path(), path, false).unwrap();
+        set_short_name(
+            &dir.source_alias_file(&name).unwrap(),
+            &"ALIAS.TXT".encode_utf16().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let manager =
+            TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+        for alias in ["ALIAS.TXT", "alias.txt"] {
+            let error = manager
+                .preview(vec![ProposedChange::write(alias, b"after".to_vec())])
+                .unwrap_err();
+            assert!(error.contains("primary filename"), "{error}");
+        }
+        assert_eq!(std::fs::read(root.path().join(path)).unwrap(), b"before");
+        assert_eq!(
+            std::fs::read(root.path().join("ALIAS.TXT")).unwrap(),
+            b"before"
+        );
+    }
+
+    #[test]
+    fn transaction_short_name_validation_rejects_unsafe_components() {
+        for name in [
+            ".",
+            "..",
+            "A/B",
+            "A\\B",
+            "A:B",
+            "A B",
+            "A*B",
+            "A\0B",
+            "ABCDEFGHI",
+            "A.LONG",
+            "A.B.C",
+            "A.",
+        ] {
+            assert!(
+                validate_short_name(&name.encode_utf16().collect::<Vec<_>>()).is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(validate_short_name(&[0xd800]).is_err());
+        for name in ["", "ALIAS.TXT", "ABCDEFGH.XYZ", "FILE~1"] {
+            validate_short_name(&name.encode_utf16().collect::<Vec<_>>()).unwrap();
         }
     }
 
