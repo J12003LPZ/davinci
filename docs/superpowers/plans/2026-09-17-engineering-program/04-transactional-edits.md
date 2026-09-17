@@ -675,3 +675,40 @@ library tests pass locally, as does agent all-target Clippy with warnings denied
 These are supervisor prerequisites, not completed foreground shell integration.
 The shell tools still need to consume the owned supervisor and prove bounded
 timeout/cancellation/descendant cleanup before P4 can be marked complete.
+
+### Foreground host integration and macOS fixture correction
+
+The CLI now installs a foreground supervisor independently of the optional
+process-manager setting. Foreground Bash and PowerShell use that existing owned
+lifetime, retain separate bounded streams, acknowledge stdin EOF, and reject
+incomplete output before creating a command receipt. A focused regression was
+red before the adapter existed and now passes for literal stdin, nonzero exit,
+stream hashes, real `exec_command`, timeout, cancellation, and a descendant
+holding explicitly inherited pipes. The descendant listener is closed before
+return. An initial Node-only inheritance fixture did not reproduce held handles
+on Windows and was replaced with explicit Rust handle inheritance.
+
+Local validation: the foreground regression, 30 transaction library tests,
+normal-agent test-impact acceptance, four existing packaged transaction CLI
+tests, and the new packaged foreground test passed. The latter disables managed
+process tools while running a real foreground command. Agent and coding-agent
+all-target Clippy, formatting and diff checks passed. All five packaged CLI
+tests passed together after the fixture update. CI remains required for this head.
+
+CI `35275466425` for `e3c43df197be2052ae6f69a1d02e7c28a59f1da3`
+passed Linux native, all workspace packages and quality. macOS passed the normal
+edit path, then failed five internal store fixtures with `Not a directory`.
+Those fixtures passed the noncanonical temporary-directory alias directly to
+the no-follow store. They now canonicalize the fixture root as the production
+coordinator already does. The production no-follow protection is unchanged.
+Native macOS confirmation is pending the next CI run.
+
+The same prior-head run also finished Windows with four failures in recovery and
+explicit rollback tests: `transaction restore image mismatch`. These passed on
+the local Windows machine, so runner metadata differences require diagnosis.
+The failing job is `105384905165`; no success is claimed for that platform gate.
+
+P4 is still incomplete. Standalone library contexts without an installed host
+retain the legacy foreground path; its lifecycle and verification contract still
+need resolution. Final assembled package checks, platform CI and the P4 completion
+audit remain open. P3 has not started.

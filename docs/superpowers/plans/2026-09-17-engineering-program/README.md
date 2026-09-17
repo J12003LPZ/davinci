@@ -374,8 +374,10 @@ after the correction. No shell-string fallback or dependency install was added.
 
 ## P4 current checkpoint
 
-Implementation remains uncommitted on `codex/transactional-edits-01a0ad48` in
-the isolated worktree. The [P4 plan](04-transactional-edits.md) records executed
+Implementation is in draft [PR #11](https://github.com/J12003LPZ/davinci/pull/11)
+on `codex/transactional-edits-01a0ad48` in the isolated worktree. The latest
+checkpoint in the [P4 plan](04-transactional-edits.md) supersedes the historical
+notes below. P4 remains incomplete; P3 has not started. The plan records executed
 RED/GREEN checks and limitations. Ordinary mutations and explicit transaction
 tools share durable provenance, current authority and conflict-safe recovery.
 Source-bound command receipts and conservative Cargo target-root coverage are

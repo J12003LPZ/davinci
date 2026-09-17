@@ -54,6 +54,8 @@ jobs:
         run: cargo test -p davinci-agent --locked --lib directory_lease
       - name: Supervisor output capture integrity
         run: cargo test -p davinci-agent --locked --lib supervisor_capture
+      - name: Foreground supervised command lifecycle
+        run: cargo test -p davinci-agent --locked --lib foreground_supervisor_capture_and_cancellation
       - name: Transaction recovery, commit evidence and verification
         run: cargo test -p davinci-agent --locked --test transactions --test transaction_commit --test transaction_verification
       - name: Transaction CLI and intelligence integration

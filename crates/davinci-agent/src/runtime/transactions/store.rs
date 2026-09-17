@@ -448,7 +448,7 @@ mod failure_tests {
                     b"before".as_slice()
                 }
             );
-            let store = Store::open(root.path()).unwrap();
+            let store = Store::open(&root.path().canonicalize().unwrap()).unwrap();
             assert_eq!(store.active().unwrap().is_some(), failed_write != 1);
             assert_eq!(
                 manager.status(&preview.id).unwrap().state,
@@ -472,7 +472,7 @@ mod failure_tests {
     #[test]
     fn transaction_marker_partial_write_is_not_published() {
         let root = tempfile::tempdir().unwrap();
-        let store = Store::open(root.path()).unwrap();
+        let store = Store::open(&root.path().canonicalize().unwrap()).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let result = store.atomic_with("active.json", id.as_bytes(), true, |file, bytes| {
             file.write_all(&bytes[..5])?;
@@ -526,7 +526,7 @@ mod failure_tests {
                 recovered.status(&preview.id).unwrap().state,
                 TransactionState::RolledBack
             );
-            assert!(Store::open(root.path())
+            assert!(Store::open(&root.path().canonicalize().unwrap())
                 .unwrap()
                 .active()
                 .unwrap()
@@ -547,7 +547,7 @@ mod failure_tests {
     #[test]
     fn transaction_record_partial_write_preserves_previous_journal() {
         let root = tempfile::tempdir().unwrap();
-        let store = Store::open(root.path()).unwrap();
+        let store = Store::open(&root.path().canonicalize().unwrap()).unwrap();
         let name = "fixture.json";
         store.atomic(name, b"previous durable journal").unwrap();
         assert!(store

@@ -640,7 +640,7 @@ mod discovery_tests {
         let preview = manager
             .preview(vec![ProposedChange::write("source", b"after".to_vec())])
             .unwrap();
-        let store = Store::open(root.path()).unwrap();
+        let store = Store::open(&root.path().canonicalize().unwrap()).unwrap();
         let size = store
             .directory
             .file(&format!("{}.json", preview.id), false)

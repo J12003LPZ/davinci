@@ -23,7 +23,8 @@ fn run_with_identity(
     fs::create_dir_all(&config).unwrap();
     fs::write(
         config.join("settings.json"),
-        json!({"editingTransactions":{"enabled":enabled}}).to_string(),
+        json!({"editingTransactions":{"enabled":enabled},"processManager":{"enabled":false}})
+            .to_string(),
     )
     .unwrap();
     let stdout = root.join("stdout.jsonl");
@@ -46,7 +47,7 @@ fn run_with_identity(
             "--permission-mode",
             "always-approve",
             "--tools",
-            "write,patch_preview,patch_apply,patch_status,patch_rollback",
+            "write,patch_preview,patch_apply,patch_status,patch_rollback,exec_command",
             "--mode",
             "json",
             "--print",
@@ -108,6 +109,27 @@ fn run_with_identity(
         .take(4096)
         .collect();
     (status.success(), format!("{output}\n{errors}"))
+}
+
+#[test]
+fn ordinary_cli_foreground_command_works_with_process_manager_disabled() {
+    let root = tempfile::tempdir().unwrap();
+    let command = if cfg!(windows) {
+        "[Console]::Out.Write('FOREGROUND_OK'); exit 7"
+    } else {
+        "printf FOREGROUND_OK; exit 7"
+    };
+    let (ok, output) = run(
+        root.path(),
+        "exec_command",
+        json!({"command":command}),
+        None,
+        false,
+    );
+    assert!(ok, "{output}");
+    let event: Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+    assert!(output.contains("FOREGROUND_OK"), "{output}");
+    assert_eq!(event["isError"], true, "{event}");
 }
 
 #[test]

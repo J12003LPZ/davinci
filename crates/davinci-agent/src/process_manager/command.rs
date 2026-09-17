@@ -132,7 +132,7 @@ fn candidates(name: &str, cwd: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn direct(name: &str, cwd: &Path) -> Result<PathBuf, String> {
+pub(crate) fn direct(name: &str, cwd: &Path) -> Result<PathBuf, String> {
     for path in candidates(name, cwd) {
         let mut options = vec![path.clone()];
         if cfg!(windows) && path.extension().is_none() {

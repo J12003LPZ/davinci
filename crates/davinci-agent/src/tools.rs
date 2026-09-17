@@ -13,6 +13,8 @@ use thiserror::Error;
 use crate::jobs::JobBook;
 use crate::todo::TodoList;
 
+mod foreground;
+
 #[allow(dead_code)]
 pub fn decision_wait(interactive: bool, deferred: bool, cancelled: bool) -> &'static str {
     if cancelled {
@@ -131,6 +133,8 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
 /// tool thread and the davinci shell all read them.
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
+    /// Trusted host entry point for foreground process ownership.
+    pub foreground_supervisor: Option<crate::jobs::supervisor::SupervisorCommand>,
     /// Per-dispatch host capture; never reconstructed from tool result JSON.
     pub command_receipt: Option<crate::command_receipt::CommandReceiptCapture>,
     /// Trusted host setting; ordinary mutation safety cannot be disabled.
@@ -1763,8 +1767,8 @@ fn shell_tool(
     };
     let background = wants_background(input);
     let started_at_ms = crate::command_receipt::now();
-    let child = spawn_shell(cwd, &command, background)?;
     if background {
+        let child = spawn_shell(cwd, &command, true)?;
         let shown = required_str(input, "command")?;
         let pid = child.id();
         let id = context
@@ -1778,7 +1782,36 @@ fn shell_tool(
         serde_json::Value::Number(number) => number.to_string(),
         other => other.to_string(),
     });
-    let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
+    let output = if let Some(host) = &context.foreground_supervisor {
+        let custom = std::env::var("PI_SHELL")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let shell =
+            davinci_ai::resolve_shell_config(custom.as_deref()).map_err(ToolError::Failed)?;
+        let mut argv = shell.args;
+        let stdin = match shell.command_transport {
+            davinci_ai::CommandTransport::Argv => {
+                argv.push(command.clone());
+                &[][..]
+            }
+            davinci_ai::CommandTransport::Stdin => command.as_bytes(),
+        };
+        foreground::run(
+            host,
+            foreground::config(cwd, shell.shell.into(), argv)?,
+            stdin,
+            timeout_ms,
+            timeout_label.as_deref(),
+            context,
+        )?
+    } else {
+        wait_shell_output(
+            spawn_shell(cwd, &command, false)?,
+            timeout_ms,
+            timeout_label.as_deref(),
+            context,
+        )?
+    };
     if let Some(capture) = &context.command_receipt {
         capture.completed(cwd, &command, started_at_ms, &output);
     }
@@ -1914,6 +1947,49 @@ fn powershell_tool(
     }
     let wrapped = format!("{POWERSHELL_UTF8_PREFIX}{command}");
     let background = wants_background(input);
+    if !background {
+        if let Some(host) = &context.foreground_supervisor {
+            let executable = ["pwsh", "powershell"]
+                .into_iter()
+                .find_map(|program| {
+                    crate::process_manager::resolve_native_executable(program, cwd).ok()
+                })
+                .ok_or_else(|| {
+                    ToolError::Failed(
+                        "PowerShell is not available and could not be launched".into(),
+                    )
+                })?;
+            let started_at_ms = crate::command_receipt::now();
+            let config = foreground::config(
+                cwd,
+                executable,
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    wrapped,
+                ],
+            )?;
+            let timeout_ms = resolve_bash_timeout_ms(input)?;
+            let label = input.get("timeout").map(ToString::to_string);
+            let output = foreground::run(host, config, &[], timeout_ms, label.as_deref(), context)?;
+            if let Some(capture) = &context.command_receipt {
+                capture.completed(cwd, command, started_at_ms, &output);
+            }
+            let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !output.stderr.is_empty() {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            return Ok(ToolResult {
+                content,
+                is_error: !output.status.success(),
+                details: Some(serde_json::json!({"exitCode": output.status.code()})),
+            });
+        }
+    }
     for program in ["pwsh", "powershell"] {
         let stdin = if background {
             std::process::Stdio::piped()

@@ -707,6 +707,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             agent.tool_context.cache.clone(),
         ),
     ));
+    agent.tool_context.foreground_supervisor = std::env::current_exe().ok().map(|executable| {
+        davinci_agent::jobs::supervisor::SupervisorCommand {
+            executable,
+            argv: vec!["--internal-process-supervisor".into()],
+        }
+    });
     if settings
         .process_manager
         .as_ref()
