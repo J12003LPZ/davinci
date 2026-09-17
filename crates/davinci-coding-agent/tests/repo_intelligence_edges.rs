@@ -210,6 +210,10 @@ fn repo_intelligence_query_path_impact_and_partial_evidence() {
     .unwrap();
     fs::write(repo.path().join("README.md"), "needle\nneedle\nneedle\n").unwrap();
     let manager = RepoIntelligence::new(repo.path(), cache.path(), Default::default());
+    let outline = manager
+        .query("file_symbols", &json!({"path":"./core.ts"}))
+        .unwrap();
+    assert!(!outline["results"].as_array().unwrap().is_empty());
     let result = manager
         .query("code_query", &json!({"query":"dependencies of app.ts"}))
         .unwrap();

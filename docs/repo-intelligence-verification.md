@@ -87,7 +87,7 @@ Numbers correspond to the supplied plan's 36 criteria.
 | 30 context reduction | Measured A/B/C scenarios above, correctness assertions passed |
 | 31 capabilities | Native RuntimeCapabilityRegistry tests and Graph role allowlists/recovery tests |
 | 32–34 compatibility, tests, clippy | Required package and workspace gates above |
-| 35 CI | Pending feature-branch publication and GitHub Actions |
+| 35 CI | [PR #7 checks](https://github.com/J12003LPZ/davinci/pull/7/checks) track the current head; completion requires green CI |
 | 36 future adapters | Language-neutral normalized records and semantic provider contract; no Rust parsing added |
 
 Documentation review checked tool/settings fields against schemas, source and
@@ -97,5 +97,7 @@ was exercised in tests. No paid evaluation or live LSP session was run.
 
 Known limits are documented in [the user guide](repo-intelligence.md), including
 conservative module resolution, dynamic JavaScript, hash I/O, and synthetic timing.
-CI is the remaining delivery gate; this report is not a completion claim until it
-has been updated with the feature-branch results.
+The PR records current CI results, including Linux package tests and Unix boundary
+coverage. Use checks for the latest head rather than assuming an earlier green run
+covers later edits. A follow-up regression also verifies normalized `./file.ts`
+queries; traversal remains rejected.

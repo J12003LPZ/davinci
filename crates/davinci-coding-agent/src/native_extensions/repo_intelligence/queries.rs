@@ -278,8 +278,20 @@ impl RepoIntelligence {
             None => ".".to_string(),
             Some(value) => {
                 let raw = value.as_str().ok_or("invalid_path")?;
-                self.validate_path(raw)?;
-                raw.trim_end_matches('/').to_string()
+                let validated = self.validate_path(raw)?;
+                let normalized = validated
+                    .components()
+                    .filter_map(|component| match component {
+                        std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if normalized.is_empty() {
+                    ".".into()
+                } else {
+                    normalized
+                }
             }
         };
         let query = object
