@@ -243,7 +243,7 @@ impl RepoIntelligence {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let base = existing
+        let mut base = existing
             .as_deref()
             .cloned()
             .or_else(|| {
@@ -342,6 +342,10 @@ impl RepoIntelligence {
                         || !root.join(p).is_file()
                 })
             {
+                // A late event requires another full content check, but records
+                // parsed in this attempt are reusable when that check hashes to
+                // the same bytes. Keep them private until reconciliation settles.
+                base = index;
                 continue;
             }
             index.bytes_read = bytes_read;

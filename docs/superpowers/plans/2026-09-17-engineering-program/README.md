@@ -26,7 +26,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 | Order | Project/plan | Implementation | Design approval | Local gates/eval | CI |
 | --- | --- | --- | --- | --- | --- |
-| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Local implementation validated | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Pending push |
+| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Local implementation validated | Approved | Package tests, fmt, Clippy, integration, security and eval passed | PR #9; retry fix awaiting CI |
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Planned | Approved | Not run | Not pushed |
 | 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Planned | Approved | Not run | Not pushed |
 | 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
@@ -161,7 +161,7 @@ The prior merged PR test counts are not evidence for this new program.
 
 ## Next action
 
-Publish the P1 feature branch and verify its exact-head CI before starting P2.
+Verify P1's exact-head CI in PR #9 before starting P2.
 Approval is recorded above; routine implementation decisions need no new approval.
 Keep the full program goal active until all global acceptance is verified.
 
@@ -190,7 +190,7 @@ User-facing behavior and limits are documented in [test impact](../../../test-im
 | 11. Evaluation | [After artifact](evidence/p1-monorepo-after.json): explicit ignored evaluation passed with real Node tests, 3/23 selected, all 3 planted failures caught, no false-positive paths in this fixture, warm 59/6,173 source bytes, force/fallback/zero-test cases. [Baseline](evidence/p1-monorepo-baseline.json) remains frozen. |
 | 12. Docs | User guide, repository freshness guide, documentation index, and this ledger updated. |
 | 13. Diff review | Reviewed shared index refresh/observer lifecycle, bounded traversal, command argv, current permissions/cache delivery, host lock release, settings, and normal/Graph dispatch. No subagents, per user instruction. |
-| 14. CI | Pending feature-branch push and exact-head GitHub Actions. A dedicated native matrix covers Windows, Linux, and macOS; local results above are Windows only. |
+| 14. CI | [PR #9](https://github.com/J12003LPZ/davinci/pull/9) is published. Initial CI found the retry reparse defect below. Exact-head success remains pending; the native matrix covers Windows, Linux, and macOS. |
 
 Executed explicit after evaluation:
 
@@ -232,3 +232,21 @@ directory enumeration. Exact timings are one debug-profile Windows sample.
   resolver/config cases, no history yet, no installed-package inspection,
   bounded traversal/commands, periodic/explicit content reconciliation.
 - Next input is P2's approved process-manager plan, after P1 CI is green.
+
+### CI correction: reparse reuse during reconciliation
+
+The [initial Linux package job](https://github.com/J12003LPZ/davinci/actions/runs/35193158815/job/105110104119)
+failed the existing warm-edit regression at `a7f94531b5a640b2c051d2f7ac2b80047070dc5d`:
+`impact_warm_requests_read_only_changed_sources_and_allow_forced_reconciliation`
+reported two reparses for one changed file. A late watcher event correctly forced
+another content reconciliation, but each attempt reused the old published index
+instead of the records already parsed in the preceding attempt.
+
+Refresh now keeps unpublished attempt records as the next attempt's parse seed.
+The retry still hashes every source and only reuses a record when its hash matches;
+it publishes nothing until reconciliation settles. The regression assertion is
+unchanged. After this correction, the 14 impact, 6 observer, 7 repository, and
+3 cross-process repository tests passed locally, as did the explicit after eval,
+format check, and affected library Clippy. The exact-head CI rerun is the remaining
+gate. The initial Linux native job independently passed all 22 impact/observer/
+normal-agent/eval cases; its log is available on the same CI run.
