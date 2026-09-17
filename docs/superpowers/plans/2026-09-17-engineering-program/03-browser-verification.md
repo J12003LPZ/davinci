@@ -6,6 +6,42 @@ Dependencies: P2 and P4 green; existing interaction_testing protocol/evidence/ar
 Requirements authority: project section 8 and cross-cutting sections 18-40;
 project numbers are kept stable while execution order follows the program design.
 
+### HTTP network boundary implementation checkpoint
+
+Implemented `interaction_testing/browser_network.js` using Node built-in HTTP.
+It validates canonical trusted origins before listening, checks every absolute
+request before outbound I/O, does not follow redirects, replaces Host, strips
+proxy credentials and hop headers, and owns inbound/outbound connection cleanup.
+Bounds: 32 origins, 64 inbound sockets, 32 active requests, 4096 total requests,
+16 KiB headers, 8192-character URLs, 1 MiB request bodies, 16 MiB responses,
+15-second request deadline, and five-second header deadline. This is a development
+foundation; authorized HTTPS CONNECT and WebSocket upgrades currently return 403
+and remain required implementation work.
+
+Observed RED: the initial Node acceptance file exited 1 with MODULE_NOT_FOUND
+before any of its six cases ran. After implementation, all six cases passed;
+four additional tests covering header filtering, held upstream cancellation,
+concurrent admission, and response-byte bounds passed (10 total, zero skipped).
+Command: `rtk proxy node --test crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs`.
+
+Actual installed Chromium acceptance ran `browser_network.real.test.cjs` with
+`DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH` pointing explicitly to the host-installed
+Playwright package recorded in `evidence/p3-browser-baseline.json`. One actual
+browser test passed, zero skipped. Both a foreign-port redirect and a foreign-port
+image subresource produced zero hits at the forbidden server. The allowed
+same-origin redirect retained its final URL and expected DOM. The test always
+closes its context, browser, proxy and fixture servers through teardown hooks.
+Without an explicit trusted test package, this optional real test skips; that
+skip is not acceptance. No runtime dependency installation or project module
+resolution was performed.
+
+Foundation CI run 35288205170 at pushed head 2f4214c currently has 21 successful
+jobs and one running Windows native job. This is not CI for the uncommitted
+network helper and does not close P3. The production bridge, request-time native
+authorization, HTTPS/WebSocket enforcement, artifacts, cancellation and reuse,
+normal/Graph dispatch, planted login failure/fix evaluation, and milestone
+package/platform checks remain required.
+
 ## Outcome
 
 An ordinary session verifies a real local frontend flow and returns bounded DOM/accessibility, console/network and screenshot evidence.
@@ -144,3 +180,32 @@ Cargo runs integration tests from the package directory. The final run used an
 absolute artifact path and passed. Neither attempt is counted as a successful
 artifact-producing run. The existing JS bridge still needs replacement/hardening,
 native tools are not registered, and P3 completion is unproven.
+
+### Real redirect boundary experiment
+
+Draft [PR #12](https://github.com/J12003LPZ/davinci/pull/12) targets the validated
+P4 branch. Foundation source/eval commit is `2f4214ce1902067a82aba4a9b747cb8f40c3467f`.
+Its CI `35288205170` is running; green has not been claimed.
+
+Two real-browser loopback-only probes tested the security assumption behind the
+old bridge's route.continue implementation. Even context-wide routing with an
+origin check and blocked service workers did not route a redirected URL: the
+forbidden destination server received one request and the browser navigated to it.
+Installed types.d.ts also explicitly states the handler runs only for the first
+URL on a redirect. A post-navigation check would detect the problem too late.
+
+A per-context forward proxy using the same canonical origin allowlist and
+`bypass: '<-loopback>'` blocked the cross-origin redirect (403, zero forbidden
+server hits), while allowing a same-origin redirect (200, actual final URL and
+DOM preserved). All browsers, contexts and temporary servers closed. Exact probe
+commands/results are in [p3-browser-redirect-probes.json](evidence/p3-browser-redirect-probes.json).
+These temporary probes are experiments, not shipped regression tests or production
+implementations, and do not establish HTTPS/WebSocket/general egress confinement.
+
+Implementation refinement: enforce the approved backend origin boundary at a
+host-owned per-context forward proxy before Chromium sends requests. Use Node's
+built-in HTTP/TCP APIs; do not add a permission registry or project-configurable
+proxy. The managed process lease and trusted policy still supply the origin set.
+Context routing remains defense in depth and telemetry. Add actual bridge tests
+for redirect/subresource/popup traffic, HTTPS CONNECT and WebSocket upgrades,
+resource bounds, cleanup and cancellation before accepting this implementation.
