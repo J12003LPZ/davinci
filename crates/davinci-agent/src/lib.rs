@@ -8,6 +8,7 @@ pub mod process_manager;
 pub use permission_state::PermissionState;
 mod batch;
 mod branch;
+pub mod command_receipt;
 mod compaction;
 mod context;
 mod edit_diff;
@@ -33,6 +34,7 @@ mod templates;
 pub mod todo;
 pub mod tool_ledger;
 pub mod tools;
+mod transaction_verification;
 mod turn;
 pub mod web;
 
@@ -344,6 +346,11 @@ pub struct Agent {
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
+    pending_transaction_verification:
+        Arc<Mutex<std::collections::BTreeMap<String, Vec<transaction_verification::Pending>>>>,
+    /// Bounded actual command evidence, populated only by built-in execution.
+    command_receipts:
+        Arc<Mutex<std::collections::VecDeque<runtime::evidence_store::ExecutionReceipt>>>,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -446,6 +453,10 @@ impl Agent {
             visual_verification_available: false,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
+            pending_transaction_verification: Arc::new(Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
+            command_receipts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),

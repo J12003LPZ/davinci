@@ -437,7 +437,26 @@ pub fn extract_tool_targets(tool: &str, args: &serde_json::Value) -> Vec<String>
                 }
             }
         }
-        "apply_patch" => {
+        "patch_apply" | "patch_status" | "patch_rollback" => {
+            if let Some(paths) = args.get("paths").and_then(serde_json::Value::as_array) {
+                targets.extend(
+                    paths
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
+        "apply_patch" | "patch_preview" => {
+            if let Some(input) = args.get("input").and_then(serde_json::Value::as_str) {
+                if let Ok(parsed) = crate::apply_patch::parse_codex_patch(input) {
+                    targets.extend(parsed.actions.into_iter().map(|action| match action {
+                        crate::apply_patch::FileAction::Add { path, .. }
+                        | crate::apply_patch::FileAction::Update { path, .. }
+                        | crate::apply_patch::FileAction::Delete { path } => path,
+                    }));
+                }
+            }
             if let Some(patch) = args.get("patch").and_then(serde_json::Value::as_str) {
                 for line in patch.lines() {
                     let trimmed = line.trim();

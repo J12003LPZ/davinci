@@ -211,7 +211,26 @@ fn ordinary_file_targets(
     cwd: &Path,
     boundary: &FilesystemBoundaryPolicy,
 ) -> Result<Vec<FileTarget>, String> {
-    if tool == "apply_patch" {
+    if matches!(tool, "patch_apply" | "patch_status" | "patch_rollback") {
+        let paths = args
+            .get("paths")
+            .and_then(Value::as_array)
+            .ok_or("transaction requires paths")?;
+        if paths.is_empty() || paths.len() > 64 {
+            return Err("transaction requires 1..64 paths".into());
+        }
+        return paths
+            .iter()
+            .map(|value| {
+                let path = value
+                    .as_str()
+                    .filter(|p| !p.is_empty())
+                    .ok_or("invalid transaction path")?;
+                Ok(target(cwd, path, boundary, tool == "patch_rollback"))
+            })
+            .collect();
+    }
+    if matches!(tool, "apply_patch" | "patch_preview") {
         let input = args
             .get("input")
             .and_then(Value::as_str)

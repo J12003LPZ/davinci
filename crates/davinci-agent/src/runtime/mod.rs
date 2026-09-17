@@ -29,6 +29,7 @@ pub mod rewind;
 pub mod session;
 pub mod source_manifest;
 mod task_migration;
+pub mod transactions;
 pub use task_migration::LegacyTaskRecovery;
 pub mod task_store;
 pub mod task_transport;

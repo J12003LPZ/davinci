@@ -32,6 +32,10 @@ pub struct ExecutionReceipt {
     pub tool_name: String,
     #[serde(default)]
     pub argv: Vec<String>,
+    /// Workspace-relative target roots reported by an actual compiler invocation.
+    /// Does not imply coverage of transitive modules or arbitrary sibling files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compiler_source_roots: Vec<String>,
     #[serde(default)]
     pub cwd: String,
     pub started: bool,
@@ -69,6 +73,7 @@ impl Default for ExecutionReceipt {
             requirement_id: None,
             tool_name: String::new(),
             argv: Vec::new(),
+            compiler_source_roots: Vec::new(),
             cwd: ".".into(),
             started: false,
             exit_code: None,

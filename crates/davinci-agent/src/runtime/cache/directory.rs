@@ -3,7 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-pub(super) struct Directory {
+#[derive(Debug)]
+pub(crate) struct Directory {
     pub path: PathBuf,
     #[cfg(unix)]
     handle: File,
@@ -14,7 +15,7 @@ fn valid_name(name: &str) -> io::Result<()> {
     if name.is_empty()
         || !name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
         || name == "."
         || name == ".."
     {
@@ -55,6 +56,9 @@ impl Directory {
                 if status != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
                 {
                     return Err(io::Error::last_os_error());
+                }
+                if status == 0 {
+                    handle.sync_all()?;
                 }
             }
             let fd = unsafe {
@@ -256,6 +260,179 @@ impl Directory {
 }
 
 impl Directory {
+    pub(crate) fn identity(&self) -> io::Result<String> {
+        #[cfg(unix)]
+        {
+            file_identity(&self.handle)
+        }
+        #[cfg(windows)]
+        {
+            let file = self
+                ._pins
+                .last()
+                .ok_or_else(|| io::Error::other("directory has no identity handle"))?;
+            file_identity(file)
+        }
+    }
+
+    pub(crate) fn stage_file(&self, name: &str) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            self.file(name, true)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            valid_name(name)?;
+            // GENERIC_WRITE, READ_CONTROL, WRITE_DAC and WRITE_OWNER on our exclusive new file.
+            OpenOptions::new()
+                .write(true)
+                .access_mode(0x400e0000)
+                .create_new(true)
+                .share_mode(1)
+                .custom_flags(0x00200000)
+                .open(self.path.join(name))
+        }
+    }
+
+    pub(crate) fn check_current(&self) -> io::Result<()> {
+        let current = Self::open(&self.path, false)?;
+        if current.identity()? != self.identity()? {
+            return Err(io::Error::other("directory identity changed"));
+        }
+        Ok(())
+    }
+
+    /// Replace a single ordinary source entry from an exclusively created sibling.
+    /// Callers verify the destination identity immediately before this operation.
+    pub(crate) fn replace_source(&self, temp: &str, name: &str, existing: bool) -> io::Result<()> {
+        valid_name(temp)?;
+        valid_source_name(name)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let temp = std::ffi::CString::new(temp).map_err(io::Error::other)?;
+            let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+            let fd = self.handle.as_raw_fd();
+            // SAFETY: live directory handle and validated NUL-terminated names.
+            if existing {
+                if unsafe { libc::renameat(fd, temp.as_ptr(), fd, name.as_ptr()) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            } else {
+                // One atomic no-clobber rename: a link/unlink pair leaves an
+                // ambiguous two-link postimage if the host exits between calls.
+                #[cfg(target_os = "linux")]
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        fd,
+                        temp.as_ptr(),
+                        fd,
+                        name.as_ptr(),
+                        libc::RENAME_NOREPLACE,
+                    )
+                };
+                #[cfg(target_os = "macos")]
+                let result = unsafe {
+                    libc::renameatx_np(fd, temp.as_ptr(), fd, name.as_ptr(), libc::RENAME_EXCL)
+                };
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                let result = {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "atomic no-clobber source rename is unavailable",
+                    ));
+                };
+                if result != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            self.handle.sync_all()
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+                fn ReplaceFileW(
+                    replaced: *const u16,
+                    replacement: *const u16,
+                    backup: *const u16,
+                    flags: u32,
+                    exclude: *mut std::ffi::c_void,
+                    reserved: *mut std::ffi::c_void,
+                ) -> i32;
+            }
+            let temp: Vec<u16> = self
+                .path
+                .join(temp)
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let name: Vec<u16> = self
+                .path
+                .join(name)
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            // ReplaceFile preserves the destination DACL, streams and creation attributes.
+            // No IGNORE_* flag: failure to preserve metadata fails the transaction.
+            // For creates, omit REPLACE_EXISTING so a concurrent creator is protected.
+            let result = if existing {
+                unsafe {
+                    ReplaceFileW(
+                        name.as_ptr(),
+                        temp.as_ptr(),
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                }
+            } else {
+                unsafe { MoveFileExW(temp.as_ptr(), name.as_ptr(), 8) }
+            };
+            if result == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.handle.sync_all()
+        }
+        // Windows has no supported directory-fsync equivalent. File contents are
+        // flushed separately; process-crash recovery does not promise power-loss atomicity.
+        #[cfg(windows)]
+        {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn remove_source(&self, name: &str) -> io::Result<()> {
+        valid_source_name(name)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+            if unsafe { libc::unlinkat(self.handle.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.handle.sync_all()
+        }
+        #[cfg(windows)]
+        {
+            fs::remove_file(self.path.join(name))
+        }
+    }
+
     pub fn names(&self) -> io::Result<Vec<String>> {
         // Enumeration is advisory; every read/write/unlink is handle-confined.
         // Reject an overfull directory rather than perform unbounded maintenance.
@@ -270,5 +447,48 @@ impl Directory {
             return Err(io::Error::other("cache directory entry limit exceeded"));
         }
         Ok(names)
+    }
+}
+
+pub(crate) fn file_identity(file: &File) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        #[derive(Default)]
+        struct Information {
+            attributes: u32,
+            created: [u32; 2],
+            accessed: [u32; 2],
+            written: [u32; 2],
+            volume: u32,
+            size_high: u32,
+            size_low: u32,
+            links: u32,
+            index_high: u32,
+            index_low: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileInformationByHandle(
+                handle: *mut std::ffi::c_void,
+                result: *mut Information,
+            ) -> i32;
+        }
+        let mut information = Information::default();
+        // SAFETY: owned live handle and the documented BY_HANDLE_FILE_INFORMATION layout.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!(
+            "{}:{}:{}",
+            information.volume, information.index_high, information.index_low
+        ))
     }
 }

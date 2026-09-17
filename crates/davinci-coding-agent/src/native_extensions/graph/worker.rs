@@ -399,6 +399,7 @@ pub fn run_worker(
         .args(build_worker_args(spec, &briefing_file, &system_prompt_file))
         .current_dir(&spec.cwd)
         .env("PI_GRAPH_ROLE", spec.role.as_str())
+        .env("PI_GRAPH_NODE_ID", &spec.task_id)
         .env("PI_GRAPH_EXPECT", spec.expect.as_str())
         .env("PI_GRAPH_ARTIFACT_PATH", &spec.artifact_path)
         .env("PI_GRAPH_EFFECT_REPORT", &effect_report_path)
@@ -1089,6 +1090,115 @@ mod tests {
             validate_artifact(*kind, &value)
                 .unwrap_or_else(|errors| panic!("{kind} canned artifact invalid: {errors:?}"));
         }
+    }
+
+    /// Run with a built binary and the offline write fixture. The missing artifact
+    /// must not turn a successfully journaled edit into a successful Graph node.
+    #[test]
+    #[ignore = "requires PI_GRAPH_WORKER_EXECUTABLE and offline write fixture"]
+    fn transaction_parent_launch_preserves_worker_provenance_and_recovery() {
+        transaction_parent_launch(false);
+    }
+
+    #[test]
+    #[ignore = "requires PI_GRAPH_WORKER_EXECUTABLE and offline write/submit sequence"]
+    fn transaction_parent_launch_accepts_submitted_edit_and_preserves_recovery() {
+        transaction_parent_launch(true);
+    }
+
+    fn transaction_parent_launch(submit: bool) {
+        use davinci_agent::runtime::transactions::{
+            TransactionCoordinator, TransactionOwner, TransactionState,
+        };
+        let executable =
+            std::env::var_os("PI_GRAPH_WORKER_EXECUTABLE").expect("built worker binary");
+        assert!(Path::new(&executable).is_file());
+        assert_eq!(std::env::var("PI_OFFLINE").unwrap(), "1");
+        let fixture: Value =
+            serde_json::from_str(&std::env::var("PI_OFFLINE_TOOL_CALL").unwrap()).unwrap();
+        let write = json!({"name":"write","arguments":{"path":"a.txt","content":"worker edit"}});
+        let report = json!({"changedFiles":["a.txt"],"summary":"Updated a.txt transactionally","deviations":[],"planInvalidated":false});
+        let expected = if submit {
+            json!([write, {"name":"graph_submit","arguments":{"artifact":report}}])
+        } else {
+            write
+        };
+        assert_eq!(fixture, expected);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"before").unwrap();
+        let mut spec = spec();
+        spec.task_id = "transaction-writer-1".into();
+        spec.role = Role::Writer;
+        spec.expect = ArtifactKind::PatchReport;
+        spec.cwd = dir.path().to_path_buf();
+        spec.artifact_path = dir.path().join("artifact.json");
+        spec.transcript_path = Some(dir.path().join("live.log"));
+        spec.model = None;
+        spec.thinking_level = None;
+        spec.extra_extensions.clear();
+        spec.tools = vec!["write".into(), "graph_submit".into()];
+        spec.authorized_tools = spec.tools.clone();
+        spec.initially_exposed_tools = spec.tools.clone();
+        spec.timeout_ms = 30_000;
+        let worker_id = davinci_agent::AgentId::new();
+        spec.runtime_agent_id = Some(worker_id);
+        let result = run_worker(&spec, &Arc::new(AtomicBool::new(false)), &mut |_, _| {});
+        assert!(result.child_pid.is_some(), "{result:?}");
+        if submit {
+            assert!(result.ok, "{result:?}");
+            assert!(!result.timed_out, "{result:?}");
+            assert!(result.failure_reason.is_none(), "{result:?}");
+            let submitted: Value =
+                serde_json::from_slice(&fs::read(&spec.artifact_path).unwrap()).unwrap();
+            assert_eq!(submitted, report);
+            assert!(result.artifact.is_some());
+        } else {
+            assert!(
+                !result.ok,
+                "an edit alone is not a submitted Graph artifact"
+            );
+            assert!(
+                result
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("without submitting a graph artifact")),
+                "{result:?}"
+            );
+        }
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"worker edit");
+        let records: Vec<_> = fs::read_dir(dir.path().join(".davinci-transactions"))
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert_eq!(records.len(), 1);
+        let record: Value = serde_json::from_slice(&fs::read(&records[0]).unwrap()).unwrap();
+        let owner: TransactionOwner =
+            serde_json::from_value(record["summary"]["owner"].clone()).unwrap();
+        assert_eq!(owner.graph_node.as_deref(), Some(spec.task_id.as_str()));
+        assert_eq!(owner.agent_id, worker_id);
+        let id = record["summary"]["id"].as_str().unwrap();
+        assert_eq!(record["summary"]["state"], "applied");
+        let effects =
+            fs::read_to_string(spec.artifact_path.with_extension("effects.jsonl")).unwrap();
+        assert!(effects.contains(id), "{effects}");
+        let mut stranger = owner.clone();
+        stranger.graph_node = Some("different-node".into());
+        assert!(TransactionCoordinator::new(dir.path(), stranger)
+            .unwrap()
+            .rollback(id, &|_| Ok(()), None)
+            .is_err());
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"worker edit");
+        let recovery = TransactionCoordinator::new(dir.path(), owner).unwrap();
+        let denied = recovery.rollback(id, &|_| Err("revoked".into()), None);
+        assert!(denied.is_err());
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"worker edit");
+        assert_eq!(
+            recovery.rollback(id, &|_| Ok(()), None).unwrap().state,
+            TransactionState::RolledBack
+        );
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"before");
     }
 
     #[test]
