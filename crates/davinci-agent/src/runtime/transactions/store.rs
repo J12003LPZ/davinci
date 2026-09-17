@@ -260,15 +260,18 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
         }
         if let Some(restored) = &change.restored {
             validate_image(restored)?;
-            if restored.hash != change.before.hash
-                || restored.mode != change.before.mode
-                || restored.access != change.before.access
-                || restored.unix_owner != change.before.unix_owner
-                || restored.macos_acl != change.before.macos_acl
-                || restored.xattrs != change.before.xattrs
-                || restored.streams != change.before.streams
-            {
-                return Err("transaction restore image mismatch".into());
+            for (field, matches) in [
+                ("content", restored.hash == change.before.hash),
+                ("mode", restored.mode == change.before.mode),
+                ("access", restored.access == change.before.access),
+                ("owner", restored.unix_owner == change.before.unix_owner),
+                ("macos_acl", restored.macos_acl == change.before.macos_acl),
+                ("xattrs", restored.xattrs == change.before.xattrs),
+                ("streams", restored.streams == change.before.streams),
+            ] {
+                if !matches {
+                    return Err(format!("transaction restore image mismatch: {field}"));
+                }
             }
         }
         if change.before.hash.is_some() && change.before.identity.is_none() {
@@ -377,6 +380,27 @@ fn validate_image(image: &Image) -> Result<(), String> {
 mod failure_tests {
     use super::super::{ProposedChange, TransactionCoordinator, TransactionState};
     use super::*;
+
+    #[test]
+    fn transaction_restore_mismatch_identifies_field_without_metadata_values() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), b"private contents").unwrap();
+        let owner = TransactionOwner::default();
+        let manager = TransactionCoordinator::new(&root, owner.clone()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("file.txt", b"after".to_vec())])
+            .unwrap();
+        let store = Store::open(&root).unwrap();
+        let mut record = store.load(&preview.id, &root, &owner, false).unwrap();
+        let mut restored = record.changes[0].before.clone();
+        restored.mode = Some(restored.mode.unwrap() ^ 0o200);
+        record.changes[0].restored = Some(restored);
+        assert_eq!(
+            validate(&record, &root).unwrap_err(),
+            "transaction restore image mismatch: mode"
+        );
+    }
 
     #[test]
     fn transaction_unix_ownership_validation_rejects_invalid_images() {

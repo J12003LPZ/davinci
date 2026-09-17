@@ -712,3 +712,18 @@ P4 is still incomplete. Standalone library contexts without an installed host
 retain the legacy foreground path; its lifecycle and verification contract still
 need resolution. Final assembled package checks, platform CI and the P4 completion
 audit remain open. P3 has not started.
+
+### Runner diagnosis checkpoint
+
+CI `35276628781` for `0284d19ddebe338fc4700c2731404b584aa7816c`
+reported an agent-package failure in the new foreground regression: the Linux
+descendant listener accepted a connection after the foreground call returned.
+The earlier listener-closure result above applies only to local Windows testing;
+it is not a cross-platform guarantee. Native matrix jobs were still running when
+this failure was observed. Cleanup completion remains an open gate.
+
+Restore-image validation now identifies the first mismatching field without
+printing contents, descriptors, attributes, or stream values. All prior equality
+checks remain enforced. The focused diagnostic regression and formatting check
+passed locally. This is diagnostic instrumentation, not a Windows rollback fix;
+the next runner failure must identify the field before changing restoration.
