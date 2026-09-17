@@ -117,3 +117,30 @@ The selector was `--lib interaction_testing::browser::tests::browser_` (zero
 passed, five failed, 1020 filtered). These are existing-adapter defects to fix
 before attaching the live backend. Real-browser workflow, native dispatch,
 request-time authorization and every P3 milestone gate remain open.
+
+### Existing-adapter safety foundation
+
+The five initial RED cases are GREEN. Evidence now rejects credential-bearing or
+non-HTTP origins, caps JSONL before parsing at 64 KiB, and retains at most 128
+events. Budget exhaustion makes evidence incomplete/failing; a close event still
+updates lifecycle. Policy-denial and malformed-message paths share the budget.
+Console/network failures and zero assertions cannot yield successful receipts or
+exit outcomes. Strict validation rejects unexpected event fields, including unit
+events that Serde's enum-level deny_unknown_fields alone did not reject.
+
+A follow-up unit-field test initially failed (58 interaction cases passed, one
+failed). The explicit strict unit-object validation resolved it. Final executed
+checks: all 59 interaction_testing unit cases passed (968 filtered); the separate
+browser_evidence_eval integration case passed with six deterministic classifications;
+library plus eval-target Clippy with warnings denied passed; formatting and diff
+checks passed. Solo review also caught and bounded mixed malformed/normal events.
+The persisted [classification artifact](evidence/p3-browser-evidence-after.json)
+has zero false successes and zero missed valid cases for those six fixtures. It
+proves evidence classification only, not real frontend behavior or live cleanup.
+
+Artifact execution first omitted its environment variable due to nested-shell
+expansion; the no-artifact test passed. A relative output path then failed because
+Cargo runs integration tests from the package directory. The final run used an
+absolute artifact path and passed. Neither attempt is counted as a successful
+artifact-producing run. The existing JS bridge still needs replacement/hardening,
+native tools are not registered, and P3 completion is unproven.
