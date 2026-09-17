@@ -131,6 +131,14 @@ pub fn tool_class(tool: &str) -> ToolClass {
         | "symbol_relationships"
         | "related_files"
         | "code_query" => ToolClass::Read,
+        "lsp_definition"
+        | "lsp_references"
+        | "lsp_hover"
+        | "lsp_document_symbols"
+        | "lsp_workspace_symbols"
+        | "lsp_implementations"
+        | "lsp_type_definition"
+        | "lsp_diagnostics" => ToolClass::Read,
         // Reading a job's output or keeping the ledger changes nothing the
         // user would want to be asked about.
         // A batch is judged operation by operation; the wrapper itself

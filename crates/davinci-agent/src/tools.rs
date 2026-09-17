@@ -121,6 +121,7 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
 /// tool thread and the davinci shell all read them.
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
+    pub cache: crate::runtime::cache::CacheRuntime,
     pub jobs: Arc<Mutex<JobBook>>,
     pub todos: Arc<Mutex<TodoList>>,
     pub living_plan: Arc<Mutex<crate::LivingPlan>>,
@@ -531,7 +532,7 @@ pub fn execute_tool_with(
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     match name {
-        "read" => read_tool(cwd, input),
+        "read" => read_tool_cached(cwd, input, context),
         "write" => write_tool(cwd, input),
         "edit" => edit_tool(cwd, input),
         "apply_patch" => apply_patch_tool(cwd, input),
@@ -977,6 +978,124 @@ fn todo_tool(input: &serde_json::Value, context: &ToolContext) -> Result<ToolRes
     })
 }
 
+fn read_tool_cached(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    use crate::runtime::cache::*;
+    if !context.cache.config().enabled {
+        return read_tool(cwd, input);
+    }
+    let path = resolve(cwd, required_str(input, "path")?)?;
+    let root = match cwd.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return read_tool(cwd, input),
+    };
+    let absolute = match path.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return read_tool(cwd, input),
+    };
+    let Ok(relative) = absolute.strip_prefix(&root) else {
+        return read_tool(cwd, input);
+    };
+    // The agent's permission gate executes before this dispatch on every call.
+    // A fresh confined read additionally proves that cached bytes cannot grant file access.
+    let snapshot = match context
+        .cache
+        .read_current_file(&root, relative, DEFAULT_MAX_BYTES, || Ok(()))
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => return read_tool(cwd, input),
+    };
+    if detect_image_mime(&path, &snapshot.bytes[..snapshot.bytes.len().min(12)]).is_some()
+        || crate::notebook::is_notebook_path(&path)
+    {
+        return read_tool(cwd, input);
+    }
+    let offset = input
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(DEFAULT_MAX_LINES);
+    let key = CacheKey::new(
+        CacheNamespace::File,
+        format!("text-window:{offset}:{limit}"),
+        1,
+        "read-window-v1",
+        vec![CacheDependency::ContentHash(snapshot.content_hash.clone())],
+    );
+    let window = context.cache.get_or_compute(
+        &CacheRequest::new(key, CachePolicy::MemoryOnly),
+        || Ok(()),
+        None,
+        || {
+            read_text_window_from(
+                std::io::Cursor::new(&snapshot.bytes),
+                offset,
+                limit,
+                DEFAULT_MAX_BYTES,
+            )
+            .map_err(|e| CacheError::Compute(e.to_string()))
+        },
+    );
+    let Ok(window) = window else {
+        return read_tool(cwd, input);
+    };
+    // Only line/byte counts are eligible for disk; no source or tool output is serialized.
+    let counts_key = CacheKey::new(
+        CacheNamespace::File,
+        "text-counts",
+        1,
+        "lossy-utf8-lines-v1",
+        vec![CacheDependency::ContentHash(snapshot.content_hash)],
+    );
+    let counts = context.cache.get_or_compute(
+        &CacheRequest::new(counts_key, CachePolicy::PersistentImmutable),
+        || Ok(()),
+        None,
+        || {
+            let text = String::from_utf8_lossy(&snapshot.bytes);
+            let lines = if text.is_empty() {
+                0
+            } else {
+                text.split('\n')
+                    .count()
+                    .saturating_sub(usize::from(text.ends_with('\n')))
+            };
+            Ok((lines, text.len()))
+        },
+    );
+    let Ok(counts) = counts else {
+        return read_tool(cwd, input);
+    };
+    let truncated_by = if window.truncated {
+        Some(if window.lines_returned >= limit {
+            "lines"
+        } else {
+            "bytes"
+        })
+    } else {
+        None
+    };
+    Ok(ToolResult {
+        content: window.content.clone(),
+        is_error: false,
+        details: Some(serde_json::json!({
+            "path":path, "truncation": {
+                "truncated":window.truncated, "truncatedBy":truncated_by, "firstLine":window.first_line,
+                "totalLines":counts.0, "totalBytes":counts.1, "outputLines":window.lines_returned,
+                "outputBytes":window.content.len(), "maxLines":limit, "maxBytes":DEFAULT_MAX_BYTES
+            }
+        })),
+    })
+}
+
 fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     let raw_path = required_str(input, "path")?;
     let path = resolve(cwd, raw_path)?;
@@ -1059,7 +1178,7 @@ fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TextWindow {
     content: String,
     first_line: usize,
@@ -1073,7 +1192,7 @@ struct RawLine {
 }
 
 fn read_raw_line(
-    reader: &mut BufReader<fs::File>,
+    reader: &mut BufReader<impl Read>,
     capture: bool,
     max_bytes: Option<usize>,
 ) -> Result<Option<RawLine>, ToolError> {
@@ -1121,6 +1240,15 @@ fn read_text_window(
     max_bytes: usize,
 ) -> Result<TextWindow, ToolError> {
     let file = fs::File::open(path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    read_text_window_from(file, offset, limit, max_bytes)
+}
+
+fn read_text_window_from(
+    file: impl Read,
+    offset: usize,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<TextWindow, ToolError> {
     let mut reader = BufReader::new(file);
     let first_line = offset.max(1);
 

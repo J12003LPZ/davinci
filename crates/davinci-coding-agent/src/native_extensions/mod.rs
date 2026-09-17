@@ -3,6 +3,7 @@
 pub mod content_router;
 pub mod ecosystem;
 pub mod graph;
+pub mod language_intelligence;
 pub mod learning;
 pub mod repo_intelligence;
 pub mod security_scan;
@@ -41,6 +42,14 @@ pub const NATIVE_TOOLS: &[&str] = &[
     "symbol_relationships",
     "related_files",
     "code_query",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_hover",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
+    "lsp_implementations",
+    "lsp_type_definition",
+    "lsp_diagnostics",
     "memory_search",
     "retrieve_output",
     "graph_status",
@@ -66,6 +75,8 @@ pub const NATIVE_TOOLS: &[&str] = &[
 
 pub const NATIVE_COMMANDS: &[&str] = &[
     "repo-index-status",
+    "cache-status",
+    "lsp-status",
     "memory-status",
     "memory-search",
     "memory-reindex",
@@ -100,6 +111,16 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         (
             "repo-index-status",
             "Show structural repository index counts, cache and refresh state.",
+            None,
+        ),
+        (
+            "cache-status",
+            "Show local cache usage and separate provider token counters.",
+            None,
+        ),
+        (
+            "lsp-status",
+            "Show native TypeScript/JavaScript language-server sessions and availability.",
             None,
         ),
         (
@@ -198,6 +219,8 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
+    pub cache: davinci_agent::runtime::cache::CacheRuntime,
+    pub language_intelligence: language_intelligence::LanguageIntelligence,
     pub governor: TokenGovernor,
     pub memory: VectorMemory,
     pub graph: GraphController,
@@ -215,6 +238,17 @@ impl NativeExtensionHost {
         agent_dir: Option<&Path>,
     ) -> Self {
         let session_key = session_key.into();
+        let cache_settings = agent_dir.map(|dir| crate::settings::load_merged_settings(dir, cwd));
+        let cache = match agent_dir {
+            Some(dir) => davinci_agent::runtime::cache::CacheRuntime::shared(
+                cache_settings
+                    .as_ref()
+                    .and_then(|s| s.cache.clone())
+                    .unwrap_or_default(),
+                dir.into(),
+            ),
+            None => davinci_agent::runtime::cache::CacheRuntime::default(),
+        };
         let governor_config = agent_dir
             .map(|dir| TokenGovernorConfig::from_file(&dir.join("token-governor.json")))
             .unwrap_or_else(TokenGovernorConfig::from_env);
@@ -225,8 +259,7 @@ impl NativeExtensionHost {
         // Only the product host sweeps: other sessions' stored outputs past
         // the retention window go, never the live session's.
         let _ = governor.sweep_stale_outputs();
-        let learning_config =
-            agent_dir.and_then(|dir| crate::settings::load_merged_settings(dir, cwd).learning);
+        let learning_config = cache_settings.and_then(|settings| settings.learning);
         let learning = LearningController::new(cwd, agent_dir, learning_config);
         let memory = VectorMemory::with_config(cwd.to_path_buf(), memory_config);
         let mut graph = GraphController::new(cwd.to_path_buf());
@@ -242,8 +275,17 @@ impl NativeExtensionHost {
             .unwrap_or_default();
         let repo_intelligence =
             repo_intelligence::RepoIntelligence::new(cwd, &repo_agent_dir, repo_config);
+        let language_config = agent_dir
+            .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
+            .unwrap_or_default();
+        let language_intelligence =
+            language_intelligence::LanguageIntelligence::new(cwd, language_config);
+        language_intelligence.set_governor(governor.clone());
+        graph.language_intelligence = Some(language_intelligence.clone());
         Self {
             repo_intelligence,
+            cache,
+            language_intelligence,
             governor,
             memory,
             graph,
@@ -334,6 +376,7 @@ impl NativeExtensionHost {
 
     /// A background graph run must not outlive the session that started it.
     pub fn session_shutdown(&mut self) {
+        self.language_intelligence.shutdown();
         graph::abort_all_runs();
         self.learning.cancel_active_review();
     }
@@ -438,9 +481,27 @@ impl NativeExtensionHost {
             name if repo_intelligence::is_repo_tool(name) => {
                 self.repo_intelligence.execute_tool(name, args)
             }
+            name if language_intelligence::TOOL_NAMES.contains(&name) => {
+                if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+                    let client = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
+                        .ok_or_else(||ToolError::Failed("Parent language-intelligence transport unavailable; no worker-local server is allowed".into()))?;
+                    client.call_with_timeout(name, args, None, std::time::Duration::from_secs(35))
+                } else {
+                    self.language_intelligence.execute(name, args)
+                }
+            }
             VISUAL_SNAPSHOT_TOOL => self.visual_snapshot.execute_tool(_cwd, args),
             "memory_search" => self.memory.search_tool(args),
-            "retrieve_output" => self.governor.retrieve(args),
+            "retrieve_output" => self.governor.retrieve(args).or_else(|error| {
+                if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+                    if let Some(client) =
+                        davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
+                    {
+                        return client.call(name, args);
+                    }
+                }
+                Err(error)
+            }),
             "skill_list" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let query_embedding = if !query.trim().is_empty() && self.memory.dense_available() {
@@ -465,10 +526,17 @@ impl NativeExtensionHost {
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
         match name {
             "repo-index-status" => Ok(Some(self.repo_intelligence.status())),
+            "lsp-status" => Ok(Some(self.language_intelligence.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
             "memory-clear" => Ok(Some(self.memory.clear().map_err(|err| err.to_string())?)),
+            "cache-status" => Ok(Some(json!({
+                "enabled":self.cache.config().enabled, "summary":self.cache.stats().summary(),
+                "namespaces":self.cache.stats().namespaces,
+                "diskUsage":"last observed on write or explicit sweep; no startup scan",
+                "providerSource":"provider-reported usage only"
+            }))),
             "governor-status" => Ok(Some(self.governor.status())),
             "governor-reset" => {
                 self.governor.reset();
@@ -495,6 +563,9 @@ impl NativeExtensionHost {
     pub fn describe_tool(name: &str) -> Option<davinci_ai::ToolSpec> {
         if repo_intelligence::is_repo_tool(name) {
             return repo_intelligence::tool_spec(name);
+        }
+        if language_intelligence::TOOL_NAMES.contains(&name) {
+            return language_intelligence::tool_spec(name);
         }
         let (description, parameters) = match name {
             "memory_search" => (
@@ -601,7 +672,73 @@ impl NativeExtensionHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+
+    #[test]
+    fn repository_language_and_cache_surfaces_coexist() {
+        let _guard = graph::worker_hooks::submit_test_guard();
+        let mut host = NativeExtensionHost::default();
+        for name in language_intelligence::TOOL_NAMES.iter().chain(
+            [
+                "repo_map",
+                "symbol_search",
+                "file_symbols",
+                "file_dependencies",
+                "symbol_relationships",
+                "related_files",
+                "code_query",
+            ]
+            .iter(),
+        ) {
+            assert!(host.has_tool(name));
+            assert!(host.tool_names().iter().any(|n| n == name));
+            assert!(host
+                .available_tool_specs()
+                .iter()
+                .any(|spec| spec.name == *name));
+            assert_eq!(
+                davinci_agent::tool_class(name),
+                davinci_agent::ToolClass::Read
+            );
+        }
+        for command in ["repo-index-status", "cache-status", "lsp-status"] {
+            assert!(NATIVE_COMMANDS.contains(&command));
+            assert!(command_specs().iter().any(|(name, _, _)| *name == command));
+            assert!(host.command(command, "").unwrap().is_some());
+        }
+        assert_eq!(
+            host.command("lsp-status", "").unwrap().unwrap()["sessions"],
+            json!([])
+        );
+        let result = host
+            .execute_tool(
+                Path::new("."),
+                "lsp_hover",
+                &json!({"path":"missing.ts","line":1,"column":1}),
+            )
+            .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            result.details.unwrap()["error"]["code"],
+            "invalid_source_path"
+        );
+    }
+
+    #[test]
+    fn cache_status_is_lazy_and_separates_provider_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut host = NativeExtensionHost::new_with_agent_dir(
+            "cache-status-test",
+            root.path(),
+            Some(state.path()),
+        );
+        host.cache.record_provider_usage(100, 30, 4);
+        let status = host.command("cache-status", "").unwrap().unwrap();
+        assert_eq!(status["summary"]["provider"]["cacheReadTokens"], 30);
+        assert_eq!(status["summary"]["memory"]["hits"], 0);
+        assert!(!state.path().join("cache-runtime").exists());
+    }
 
     struct FakeVisualBackend {
         image_path: std::path::PathBuf,
@@ -628,9 +765,6 @@ mod tests {
             })
         }
     }
-
-    /// PI_GRAPH_* is process-global, so the tests that toggle it run one at a time.
-    static GRAPH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct WorkerEnv;
 
@@ -659,9 +793,7 @@ mod tests {
 
     #[test]
     fn graph_submit_exists_only_inside_a_worker_process() {
-        let _lock = GRAPH_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _lock = graph::worker_hooks::submit_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let artifact = dir.path().join("artifact.json");
 
@@ -714,10 +846,7 @@ mod tests {
 
     #[test]
     fn a_worker_submits_and_is_policed_through_the_native_host() {
-        let _lock = GRAPH_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _submit = graph::worker_hooks::submit_test_guard();
+        let _lock = graph::worker_hooks::submit_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let artifact = dir.path().join("artifact.json");
         let _env = WorkerEnv::set(&artifact);

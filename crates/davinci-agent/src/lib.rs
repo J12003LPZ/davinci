@@ -505,6 +505,7 @@ impl Agent {
         if self.abort_signal.is_none() || owns_abort_signal {
             self.abort_signal = Some(runtime.cancellation_token.as_atomic_bool());
         }
+        self.tool_context.cache = runtime.cache.clone();
         self.tool_context.runtime = Some(runtime.clone());
         self.runtime_session = self.session.as_ref().and_then(|session| {
             let source = std::fs::canonicalize(&session.path).ok()?;
