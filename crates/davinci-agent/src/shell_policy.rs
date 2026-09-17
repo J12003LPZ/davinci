@@ -10,6 +10,9 @@
 use regex::RegexSet;
 use std::sync::OnceLock;
 
+mod argv;
+pub use argv::{argv_subject, evaluate_argv};
+
 /// Policy profile governing allowed shell capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellPolicyProfile {

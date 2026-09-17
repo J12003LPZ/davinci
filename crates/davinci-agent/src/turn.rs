@@ -1186,6 +1186,7 @@ impl Agent {
         args: &Value,
         depth: usize,
     ) -> crate::ToolResult {
+        let dispatch_permit = self.approval_registry.take_dispatch(id);
         if let Err(violation) = self.check_contract_gate(cwd, id, name, args) {
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.cancel_reservation(id);
@@ -1352,6 +1353,7 @@ impl Agent {
             // The tool sees the turn's abort flag so a long shell command
             // or a `job_output` wait ends when the user interrupts.
             let mut context = self.tool_context.clone();
+            context.dispatch_permit = dispatch_permit;
             context.abort = self
                 .runtime
                 .as_ref()
@@ -1766,6 +1768,8 @@ impl Agent {
     /// block there wins) and after the unknown-tool check (nobody is asked
     /// about a tool that does not exist).
     fn permission_denial(&self, cwd: &Path, id: &str, name: &str, args: &Value) -> Option<String> {
+        // A new preparation supersedes any abandoned consent for this call ID.
+        self.approval_registry.take_dispatch(id);
         // Asking for user intent is a host interaction, not a repository or
         // global-permission grant. The operations selected later still pass
         // the normal permission and task-contract gates.
@@ -1898,7 +1902,12 @@ impl Agent {
                     PermissionVerdict::Ask(current) if current == request => {
                         let current_digest = self.approval_registry.digest(&current, cwd, self.runtime.as_ref());
                         match pending.resolve(&reply, &current_digest, policy.revision(), davinci_session::now_ms()) {
-                            Ok(crate::approval::GrantScope::Once) => None,
+                            Ok(crate::approval::GrantScope::Once) => {
+                                if crate::tools::is_managed_process_tool(name) {
+                                    self.approval_registry.retain_dispatch(&request, cwd, &self.permissions, revision)
+                                        .err().map(|reason| format!("Permission denied: {reason}."))
+                                } else { None }
+                            },
                             Ok(crate::approval::GrantScope::Session | crate::approval::GrantScope::Project) => {
                                 policy.remember(&request.session_rule);
                                 None

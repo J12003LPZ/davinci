@@ -1,6 +1,6 @@
 # P2: Persistent Process Manager
 
-Status: design approved by the user on 2026-09-17; implementation pending.
+Status: design approved by the user on 2026-09-17; implementation and local gates passed; exact-head platform CI pending.
 Execution sequence: 2 of 12.
 Dependencies: P1 green; existing JobBook, process leases, command policy and RuntimeBus.
 Requirements authority: project section 7 and cross-cutting sections 18-40;

@@ -28,6 +28,26 @@ jobs:
         run: cargo test -p davinci-coding-agent --locked --bin davinci test_impact_integration_tests
       - name: Offline test selection evaluation
         run: cargo test -p davinci-coding-agent --locked --test test_impact_eval -- --ignored --nocapture
+      - name: Managed process authorization and lifecycle
+        run: cargo test -p davinci-agent --locked --lib process_manager::tests
+      - name: Native supervisor ownership and public process contracts
+        run: cargo test -p davinci-agent --locked --test process_supervisor --test process_manager
+      - name: Graph process leases
+        run: cargo test -p davinci-coding-agent --locked --lib graph_managed_process
+      - name: Normal agent process path
+        run: cargo test -p davinci-coding-agent --locked --bin davinci process_manager_integration_tests
+      - name: Packaged supervisor entry point
+        run: cargo test -p davinci-coding-agent --locked --test process_manager
+      - name: Offline process reuse and cleanup evaluation
+        env:
+          DAVINCI_PROCESS_EVAL_ARTIFACT: ${{ runner.temp }}/process-evaluation.json
+        run: cargo test -p davinci-coding-agent --locked --test process_manager -- --ignored --nocapture
+      - name: Preserve native process measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-evaluation-${{ runner.os }}
+          path: ${{ runner.temp }}/process-evaluation.json
+          if-no-files-found: error
 
   voice-native:
     strategy:

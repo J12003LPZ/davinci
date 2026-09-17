@@ -416,6 +416,7 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
             runtime: None,
             permissions: None,
             task_contract: None,

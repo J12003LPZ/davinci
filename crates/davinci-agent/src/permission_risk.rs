@@ -282,7 +282,7 @@ pub(super) fn routine_local_shell(
     cwd: &Path,
     boundary: &FilesystemBoundaryPolicy,
 ) -> bool {
-    if tool == "write_stdin"
+    if matches!(tool, "write_stdin" | "process_start" | "process_write")
         || args.get("run_in_background").and_then(Value::as_bool) == Some(true)
         || args.get("background").and_then(Value::as_bool) == Some(true)
     {

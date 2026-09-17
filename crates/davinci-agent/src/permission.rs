@@ -124,6 +124,9 @@ pub fn is_sensitive_file_path(path: &str) -> bool {
 
 pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
+        "process_status" | "process_output" | "process_list" => ToolClass::Read,
+        "process_start" | "process_write" => ToolClass::Shell,
+        "process_stop" => ToolClass::Other,
         "test_related" | "test_impacted" | "test_plan" => ToolClass::Read,
         "repo_map"
         | "symbol_search"
@@ -975,7 +978,7 @@ impl PermissionPolicy {
                 .iter()
                 .map(|target| target.subject.clone())
                 .collect::<Vec<_>>()
-        } else if class == ToolClass::Shell {
+        } else if class == ToolClass::Shell && tool != "process_start" {
             let segments = shell_segments(&subject);
             if segments.is_empty() {
                 vec![subject.clone()]
@@ -997,6 +1000,34 @@ impl PermissionPolicy {
                     summary_of(tool, &subject)
                 ),
             };
+        }
+        // The structured process route must not sidestep an existing shell
+        // deny. Only deny rules cross this boundary; a Bash allow is not a
+        // grant to start persistent processes or inject stdin into one.
+        if tool == "process_start" {
+            let shell_names = ["bash", "powershell", "exec_command"];
+            let shell_args = serde_json::json!({"command": subject, "cmd": subject});
+            let shell_denies = self
+                .deny
+                .iter()
+                .filter(|rule| shell_names.iter().any(|name| rule.tool_matches(name)))
+                .collect::<Vec<_>>();
+            if shell_denies.iter().any(|rule| {
+                shell_names
+                    .iter()
+                    .any(|name| rule.matches_call(name, &shell_args, &subject))
+            }) {
+                return PermissionVerdict::Deny {
+                    reason: "Permission denied: process command matches an active shell deny rule."
+                        .into(),
+                };
+            }
+            let report = crate::shell_policy::analyze_command(&subject);
+            if !shell_denies.is_empty()
+                && (report.has_nested_shell || report.has_substitution || report.has_unknown_syntax)
+            {
+                return PermissionVerdict::Deny { reason: "Permission denied: process arguments cannot be proven to satisfy active shell deny rules.".into() };
+            }
         }
         // A deny rule naming shell commands cannot be proven satisfied by
         // examining only the outer program of a substitution. Fail closed.
@@ -1191,6 +1222,39 @@ pub fn subject_of_with_boundary(
     cwd: &Path,
     boundary: Option<&FilesystemBoundaryPolicy>,
 ) -> (String, bool) {
+    if tool == "process_start" {
+        let executable = args
+            .get("executable")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let argv = args
+            .get("argv")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return (crate::shell_policy::argv_subject(executable, &argv), false);
+    }
+    if matches!(
+        tool,
+        "process_write" | "process_status" | "process_output" | "process_stop"
+    ) {
+        return (
+            format!(
+                "process:{}",
+                args.get("id").and_then(Value::as_u64).unwrap_or(0)
+            ),
+            false,
+        );
+    }
+    if tool == "process_list" {
+        return ("owned processes".into(), false);
+    }
     match tool_class(tool) {
         ToolClass::Shell => (
             args.get("command")

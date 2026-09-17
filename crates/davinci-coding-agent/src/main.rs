@@ -11,6 +11,8 @@ mod davinci_surfaces;
 #[cfg(unix)]
 mod experimental;
 #[cfg(test)]
+mod process_manager_integration_tests;
+#[cfg(test)]
 mod test_impact_integration_tests;
 mod voice_input;
 mod voice_models;
@@ -292,6 +294,11 @@ fn run_davinci_screens(raw: &[String]) -> Result<i32, String> {
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.as_slice() == ["--internal-process-supervisor"]
+        && std::env::var("DAVINCI_INTERNAL_PROCESS_SUPERVISOR").as_deref() == Ok("1")
+    {
+        davinci_agent::jobs::supervisor::run();
+    }
     match run(raw) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
@@ -658,6 +665,39 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             agent.tool_context.cache.clone(),
         ),
     ));
+    if settings
+        .process_manager
+        .as_ref()
+        .is_none_or(|config| config.enabled)
+    {
+        let manager = std::env::current_exe()
+            .map_err(|_| "process supervisor host unavailable".to_string())
+            .and_then(|executable| {
+                davinci_agent::process_manager::ProcessManager::new(
+                    cwd,
+                    agent.tool_context.jobs.clone(),
+                    agent.permissions.clone(),
+                    davinci_agent::jobs::supervisor::SupervisorCommand {
+                        executable,
+                        argv: vec!["--internal-process-supervisor".into()],
+                    },
+                )
+            });
+        match manager {
+            Ok(manager) => {
+                agent.tool_context.processes = Some(manager.with_counters(agent.counters.clone()))
+            }
+            Err(error) => eprintln!("Managed processes unavailable: {error}"),
+        }
+    }
+    if agent.tool_context.processes.is_none() {
+        agent
+            .tools
+            .retain(|name| !davinci_agent::tools::is_managed_process_tool(name));
+        agent
+            .tool_registry
+            .retain(|name| !davinci_agent::tools::is_managed_process_tool(name));
+    }
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     agent.attach_mcp(davinci_agent::McpRegistry::connect(
         &mcp::load(&default_agent_dir(), cwd, trusted),
@@ -7610,6 +7650,7 @@ fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHos
             .graph
             .set_permissions(Some(agent.permissions.clone()));
         native.graph.set_task_contract(agent.active_contract());
+        native.graph.processes = agent.tool_context.processes.clone();
     }
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),
