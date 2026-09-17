@@ -133,7 +133,8 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
 /// tool thread and the davinci shell all read them.
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
-    /// Trusted host entry point for foreground process ownership.
+    /// Trusted host entry point for foreground process ownership. Without this,
+    /// legacy commands remain available but cannot emit verification receipts.
     pub foreground_supervisor: Option<crate::jobs::supervisor::SupervisorCommand>,
     /// Per-dispatch host capture; never reconstructed from tool result JSON.
     pub command_receipt: Option<crate::command_receipt::CommandReceiptCapture>,
@@ -1796,14 +1797,18 @@ fn shell_tool(
             }
             davinci_ai::CommandTransport::Stdin => command.as_bytes(),
         };
-        foreground::run(
+        let output = foreground::run(
             host,
             foreground::config(cwd, shell.shell.into(), argv)?,
             stdin,
             timeout_ms,
             timeout_label.as_deref(),
             context,
-        )?
+        )?;
+        if let Some(capture) = &context.command_receipt {
+            capture.completed(cwd, &command, started_at_ms, &output);
+        }
+        output
     } else {
         wait_shell_output(
             spawn_shell(cwd, &command, false)?,
@@ -1812,9 +1817,6 @@ fn shell_tool(
             context,
         )?
     };
-    if let Some(capture) = &context.command_receipt {
-        capture.completed(cwd, &command, started_at_ms, &output);
-    }
     let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
         if !content.is_empty() {
@@ -1938,6 +1940,8 @@ fn powershell_tool(
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     let command = required_str(input, "command")?;
+    let timeout_ms = resolve_bash_timeout_ms(input)?;
+    let timeout_label = input.get("timeout").map(ToString::to_string);
     if let Ok(reply) = std::env::var("PI_POWERSHELL_REPLY") {
         return Ok(ToolResult {
             content: reply,
@@ -1970,9 +1974,14 @@ fn powershell_tool(
                     wrapped,
                 ],
             )?;
-            let timeout_ms = resolve_bash_timeout_ms(input)?;
-            let label = input.get("timeout").map(ToString::to_string);
-            let output = foreground::run(host, config, &[], timeout_ms, label.as_deref(), context)?;
+            let output = foreground::run(
+                host,
+                config,
+                &[],
+                timeout_ms,
+                timeout_label.as_deref(),
+                context,
+            )?;
             if let Some(capture) = &context.command_receipt {
                 capture.completed(cwd, command, started_at_ms, &output);
             }
@@ -1996,7 +2005,6 @@ fn powershell_tool(
         } else {
             std::process::Stdio::null()
         };
-        let started_at_ms = crate::command_receipt::now();
         let spawned = Command::new(program)
             .args(["-NoProfile", "-NonInteractive", "-Command", &wrapped])
             .current_dir(cwd)
@@ -2017,10 +2025,7 @@ fn powershell_tool(
                 .register(command, child);
             return Ok(crate::jobs::started_result(id, pid, command));
         }
-        let output = wait_shell_output(child, None, None, context)?;
-        if let Some(capture) = &context.command_receipt {
-            capture.completed(cwd, command, started_at_ms, &output);
-        }
+        let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
         let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.stderr.is_empty() {
             if !content.is_empty() {
@@ -3892,6 +3897,40 @@ mod tests {
         assert!(timed_out
             .to_string()
             .contains("Command timed out after 0.2 seconds"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_powershell_honors_and_validates_timeout() {
+        let dir = tempdir().unwrap();
+        let capture =
+            crate::command_receipt::CommandReceiptCapture::new("timeout", "powershell", None);
+        let context = ToolContext {
+            command_receipt: Some(capture.clone()),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let error = execute_tool_with(
+            dir.path(),
+            "powershell",
+            &serde_json::json!({"command":"Start-Sleep -Seconds 2", "timeout":0.2}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Command timed out after 0.2 seconds"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(capture.take().is_none());
+        let invalid = execute_tool_with(dir.path(), "powershell", &serde_json::json!({"command":"Set-Content -Path should-not-exist.txt -Value ran", "timeout":0}), &context).unwrap_err();
+        assert_eq!(
+            invalid.to_string(),
+            "Invalid timeout: must be a finite number of seconds"
+        );
+        assert!(!dir.path().join("should-not-exist.txt").exists());
     }
 
     #[test]

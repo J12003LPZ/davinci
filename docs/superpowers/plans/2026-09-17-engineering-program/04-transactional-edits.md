@@ -736,3 +736,138 @@ cannot satisfy this deadline after the foreground return bound of five seconds.
 This corrects a scheduling-sensitive assertion; it does not change termination
 code or claim synchronous socket closure when the helper is reaped. The focused
 foreground regression passed locally; native confirmation remains required.
+
+### Windows legacy DACL reproduction (working change, not ready to ship)
+
+Diagnostic CI `35277212922`, Windows job `105390598493`, confirmed `access`
+as the mismatching field in all four rollback/recovery failures. A local legacy
+inheritance fixture reproduced descriptor drift: SetSecurityInfo introduces the
+auto-inherited flag, and ReplaceFileW can rewrite a staged descriptor during
+replacement. The regression failed before the working change.
+
+The working tree experiments with NtSetSecurityObject on the owned staging
+handle and intact source-image rename. It retains the old journal replacement
+path separately. Legacy edit/delete rollback and durable status reload now pass;
+all 32 transaction-filtered agent library tests and agent all-target Clippy pass
+locally. This is not yet a completed fix: ReplaceFileW also preserves creation
+time, short names, object identifiers, security resource attributes, encryption,
+and compression. The new source rename must account for this metadata before
+the change is committed. Do not treat the green ACL tests as proof of full file
+metadata preservation. No native CI has run these uncommitted changes.
+
+API references: [native descriptor setter](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntsetsecurityobject),
+[inheritance conversion](https://learn.microsoft.com/en-us/windows/win32/secauthz/automatic-propagation-of-inheritable-aces),
+and [ReplaceFileW metadata contract](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew).
+
+CI `35277525581` for pushed `8cf4a9667bc373fd7cdc75528fc438de934692e3`
+completed: Linux and macOS native checks, all workspace package jobs, quality,
+and the workspace aggregate passed. Windows native job `105391600967` still
+failed the transaction metadata step. Workflow lint `35277525613` and Security
+SARIF `35277525689` passed. This confirms the bounded foreground cleanup fixture
+on both Unix platforms; it does not cover the pending Windows working-tree fix.
+
+### Windows metadata checkpoint (uncommitted)
+
+The creation-time/hidden/system/not-content-indexed regression failed on the
+working rename implementation: the replacement acquired its staging creation
+time. Images now capture Windows creation time and attributes, include them in
+capture stability and stale-state comparison, and restore them through the owned
+staging handle. Durable restore validation compares the new metadata field.
+Missing-file images cannot carry it; non-Windows record validation rejects it.
+
+A compressed-file edit/delete regression then failed because setting basic
+attributes does not enable NTFS compression. Staging now restores compression
+with FSCTL_SET_COMPRESSION before setting basic information and verifies the
+result. The extra read access is restricted to the exclusively created stage;
+source access is unchanged. Attribute-only changes after preview/apply conflict
+without overwriting the changed file. Creation-time, attribute, and compression
+restoration regressions pass for edit and delete rollback.
+
+Validation actually run at this checkpoint:
+
+- `rtk cargo test -p davinci-agent --offline --locked --lib transaction_preserves_windows_creation_time_and_attributes`: RED, then GREEN.
+- `rtk cargo test -p davinci-agent --offline --locked --lib transaction_preserves_compression_after_edit_and_delete`: RED before compression restoration.
+- `rtk cargo test -p davinci-agent --offline --locked --lib transaction`: 35 passed, 889 filtered; includes both regressions and attribute conflicts.
+- `rtk cargo fmt --all`: passed.
+- `rtk cargo clippy -p davinci-agent --offline --locked --all-targets -- -D warnings`: passed.
+- `rtk git diff --check`: passed before this documentation addition.
+
+Remaining before shipping: encryption and security resource attributes, short
+names and object identifiers, compatibility of prior persisted images without
+the new metadata field, and native CI for the combined change. Exact creation
+times represented by Windows API sentinel values currently fail staging rather
+than silently changing them. Full Windows metadata preservation is not proven.
+The separate no-host foreground execution/evidence contract also remains open.
+
+API references: [FILE_BASIC_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_basic_info)
+and [FSCTL_SET_COMPRESSION](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_set_compression).
+
+### Security resource attribute checkpoint (uncommitted)
+
+The next RED regression created a real Windows resource ACE (`Department`),
+then demonstrated that source replacement lost it. ACL snapshots now query
+ATTRIBUTE_SECURITY_INFORMATION in addition to owner/group/DACL; the native
+staging setter restores those properties with existing WRITE_DAC rights.
+There is no privilege adjustment or request for audit-SACL access.
+
+The wider transaction filter exposed four recovery failures: restoring absent
+properties causes Windows to materialize a null filtered resource SACL. The
+snapshot encoder now represents absent/null/empty resource-only SACLs as no
+resource properties, while retaining every nonempty resource ACE. This rule is
+not applied to the DACL. The query does not capture audit ACEs, so this is not a
+claim that audit SACL backup/restore is implemented.
+
+Validation: resource-preservation regression RED then GREEN for edit and delete
+rollback; all 37 transaction-filtered agent library tests passed (889 filtered).
+The strengthened resource-conflict regression also passed separately: changing
+an existing property value after preview or apply conflicts and preserves both
+the other actor's value and current bytes. Formatting, final agent all-target
+Clippy with warnings denied, and diff whitespace checks passed. No native CI
+has run these uncommitted changes.
+
+Still open: encryption, short-name/object-ID handling, old images without the
+Windows metadata field, combined native CI, and the no-host foreground contract.
+Reference: [Windows security information access rights](https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information).
+
+### Foreground evidence boundary checkpoint
+
+The no-host evidence defect was reproduced: an `exec_command` without a trusted
+foreground supervisor returned a successful verification receipt. Shell and
+PowerShell receipt capture now occurs only after the supervised adapter returns
+complete, bounded output. Legacy execution remains available without a receipt;
+its successful exit alone cannot mark a transaction verified. This does not yet
+repair the legacy runner's descendant-held pipe or cancellation lifecycle.
+
+The real-command receipt and hook-veto tests now launch the existing supervisor
+fixture, rather than relying on the legacy fallback. The normal transaction
+verification test retains all previous success/stale/permission/hook cases and
+adds no-supervisor execution, which must leave the transaction applied. CLI host
+configuration is unchanged.
+
+Validation actually run:
+
+- `rtk cargo test -p davinci-agent --offline --locked --lib unsupervised_commands_do_not_produce_verification_receipts`: RED before the fix.
+- `rtk cargo test -p davinci-agent --offline --locked --lib command_receipt`: four passed, including successful legacy shell/PowerShell execution without receipts, supervised receipts, and hook veto.
+- `rtk cargo test -p davinci-agent --offline --locked --lib normal_command_verifies_transaction_only_after_unchanged_source_and_hooks`: one passed; covers nine normal-session variants using actual Cargo execution.
+- `rtk cargo fmt --all`: passed.
+- `rtk cargo clippy -p davinci-agent --offline --locked --all-targets -- -D warnings`: passed.
+
+The evidence boundary is locally fixed. Legacy fallback lifecycle, remaining
+Windows metadata/recovery work, and combined native CI remain required. No
+subproject completion or exact-head CI claim follows from this checkpoint.
+
+### Legacy PowerShell timeout correction
+
+The fallback PowerShell runner passed no timeout to its wait loop. A real
+`Start-Sleep -Seconds 2` command with a 0.2-second timeout incorrectly succeeded
+after 2.43 seconds (RED). Timeout parsing now happens before any PowerShell spawn
+and feeds both supervised and fallback execution. The regression passed in
+0.37 seconds (GREEN), and verifies that a zero timeout rejects a command before
+it creates its marker file. No receipt is produced on timeout.
+
+Final focused validation: `rtk cargo test -p davinci-agent --offline --locked
+--lib powershell` passed all three matching tests; formatting and agent all-target
+Clippy with warnings denied passed. The execution/evidence correction is a
+separate commit from the unfinished Windows metadata working changes. Legacy
+descendant-held pipe cleanup remains open; honoring the timer for a direct
+PowerShell process does not prove descendant cleanup. Native CI is still required.

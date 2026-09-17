@@ -3671,6 +3671,7 @@ mod tests {
             "pass",
             "resumed",
             "no-runtime",
+            "no-supervisor",
             "stale",
             "veto",
             "uncompiled",
@@ -3727,6 +3728,10 @@ mod tests {
                     .unwrap()
                     .deny
                     .push(crate::PermissionRule::bare("read"));
+            }
+            if outcome != "no-supervisor" {
+                agent.tool_context.foreground_supervisor =
+                    Some(crate::command_receipt::test_supervisor());
             }
             let command = serde_json::json!({"command":"cargo check --workspace --offline --quiet --message-format=json"});
             assert!(matches!(
@@ -3786,6 +3791,7 @@ mod tests {
     fn actual_command_receipt_survives_decoration_with_hook_veto() {
         let root = tempfile::tempdir().unwrap();
         let mut agent = Agent::new("receipt fixture");
+        agent.tool_context.foreground_supervisor = Some(crate::command_receipt::test_supervisor());
         agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
             crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
         ));

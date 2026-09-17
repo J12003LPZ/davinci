@@ -123,9 +123,48 @@ fn compiler_source_roots(root: &std::path::Path, command: &str, stdout: &[u8]) -
 }
 
 #[cfg(test)]
+pub(crate) fn test_supervisor() -> crate::jobs::supervisor::SupervisorCommand {
+    crate::jobs::supervisor::SupervisorCommand {
+        executable: std::env::current_exe().unwrap(),
+        argv: vec![
+            "--exact".into(),
+            "tools::foreground::tests::foreground_supervisor_fixture".into(),
+            "--nocapture".into(),
+        ],
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::{execute_tool_with, ToolContext};
+
+    #[test]
+    fn unsupervised_commands_do_not_produce_verification_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        for tool in ["exec_command", "powershell"] {
+            if tool == "powershell" && !cfg!(windows) {
+                continue;
+            }
+            let capture = CommandReceiptCapture::new("unowned-process", tool, None);
+            let context = ToolContext {
+                command_receipt: Some(capture.clone()),
+                ..Default::default()
+            };
+            let result = execute_tool_with(
+                root.path(),
+                tool,
+                &serde_json::json!({"command":"exit 0"}),
+                &context,
+            )
+            .unwrap();
+            assert!(!result.is_error, "{}", result.content);
+            assert!(
+                capture.take().is_none(),
+                "{tool}: an unowned process cannot prove bounded verification"
+            );
+        }
+    }
 
     #[test]
     fn compiler_roots_require_completion_and_cannot_escape_workspace() {
@@ -176,6 +215,7 @@ mod tests {
         for (command, expected) in [("exit 0", 0), ("exit 7", 7)] {
             let capture = CommandReceiptCapture::new("actual-process", "exec_command", None);
             let context = ToolContext {
+                foreground_supervisor: Some(test_supervisor()),
                 command_receipt: Some(capture.clone()),
                 ..Default::default()
             };
