@@ -583,6 +583,15 @@ impl ExtensionHost {
         if !is_worker_submit && !is_registered {
             return None;
         }
+        if crate::native_extensions::repo_intelligence::is_repo_tool(name) {
+            let repo = self
+                .native
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .repo_intelligence
+                .clone();
+            return Some(repo.execute_tool(name, args));
+        }
         // `graph_run` blocks for the whole run. It must not do so while
         // holding the native host: every other tool call's pre-hook, the
         // status commands and session shutdown (`abort_all_runs`) take the
@@ -1459,6 +1468,20 @@ mod tests {
         let memory = registry.get("memory_search").expect("native capability");
         assert_eq!(memory.source, CapabilitySource::NativeExtension);
         assert!(memory.read_only);
+        for name in [
+            "repo_map",
+            "symbol_search",
+            "file_symbols",
+            "file_dependencies",
+            "symbol_relationships",
+            "related_files",
+            "code_query",
+        ] {
+            let capability = registry.get(name).expect("repository native capability");
+            assert_eq!(capability.source, CapabilitySource::NativeExtension);
+            assert!(capability.read_only);
+            assert!(!registry.is_mutating(name));
+        }
         assert!(registry.is_mutating("graph_run"));
     }
 

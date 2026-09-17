@@ -175,7 +175,20 @@ pub(super) fn file_targets(
     }
     if matches!(
         tool,
-        "read" | "grep" | "find" | "ls" | "write" | "edit" | "notebook_edit"
+        "read"
+            | "grep"
+            | "find"
+            | "ls"
+            | "write"
+            | "edit"
+            | "notebook_edit"
+            | "repo_map"
+            | "symbol_search"
+            | "file_symbols"
+            | "file_dependencies"
+            | "symbol_relationships"
+            | "related_files"
+            | "code_query"
     ) {
         if matches!(tool, "write" | "edit" | "notebook_edit")
             && args

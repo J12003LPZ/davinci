@@ -13,7 +13,19 @@
 
 use super::types::{BashPolicy, ResearchKind, Role};
 
-const READ_TOOLS: &[&str] = &["read", "grep", "find", "ls"];
+const READ_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "repo_map",
+    "symbol_search",
+    "file_symbols",
+    "file_dependencies",
+    "symbol_relationships",
+    "related_files",
+    "code_query",
+];
 
 pub const GRAPH_SUBMIT_TOOL: &str = "graph_submit";
 
@@ -30,7 +42,7 @@ pub use crate::native_extensions::token_governor::ensure_governor_recovery_tool;
 
 pub fn role_tools(role: Role) -> Vec<String> {
     let names: Vec<&str> = match role {
-        Role::Classifier => vec![GRAPH_SUBMIT_TOOL],
+        Role::Classifier => vec![GRAPH_SUBMIT_TOOL, "repo_map", "code_query"],
         Role::Researcher | Role::TestAnalyzer | Role::Reviewer => {
             let mut tools = READ_TOOLS.to_vec();
             tools.push("bash");
@@ -60,7 +72,12 @@ pub fn role_tools(role: Role) -> Vec<String> {
 /// authorization surface in the parent-owned allowlist.
 pub fn initial_worker_tools(role: Role, authorized: &[String]) -> Vec<String> {
     let preferred: &[&str] = match role {
-        Role::Classifier => &[GRAPH_SUBMIT_TOOL],
+        Role::Classifier => &[
+            GRAPH_SUBMIT_TOOL,
+            "repo_map",
+            "code_query",
+            "retrieve_output",
+        ],
         Role::Researcher | Role::TestAnalyzer | Role::Reviewer => &[
             "read",
             "grep",
@@ -332,9 +349,11 @@ mod tests {
             );
         }
 
-        // Classifier has only lossless graph_submit by default, so it doesn't get retrieve_output
+        // Classifier structural queries can be compacted and require recovery.
         let classifier_tools = role_tools(Role::Classifier);
-        assert!(!classifier_tools.contains(&"retrieve_output".to_string()));
+        assert!(classifier_tools.contains(&"repo_map".to_string()));
+        assert!(classifier_tools.contains(&"code_query".to_string()));
+        assert!(classifier_tools.contains(&"retrieve_output".to_string()));
 
         // When a compressible tool is added to Classifier, ensure_governor_recovery_tool adds retrieve_output
         let mut custom_classifier = classifier_tools.clone();

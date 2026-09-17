@@ -7,6 +7,9 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
+    #[serde(default, rename = "repoIntelligence")]
+    pub repo_intelligence:
+        Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,
     #[serde(default)]
     pub extensions: Vec<String>,
     #[serde(default)]

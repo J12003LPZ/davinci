@@ -118,12 +118,19 @@ pub enum ToolClass {
 
 /// Shared sensitive-file classification for auxiliary readers such as plan
 /// evidence. Auxiliary readers may be stricter, never less strict, than policy.
-pub(crate) fn is_sensitive_file_path(path: &str) -> bool {
+pub fn is_sensitive_file_path(path: &str) -> bool {
     permission_risk::is_protected_path(path)
 }
 
 pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
+        "repo_map"
+        | "symbol_search"
+        | "file_symbols"
+        | "file_dependencies"
+        | "symbol_relationships"
+        | "related_files"
+        | "code_query" => ToolClass::Read,
         // Reading a job's output or keeping the ledger changes nothing the
         // user would want to be asked about.
         // A batch is judged operation by operation; the wrapper itself

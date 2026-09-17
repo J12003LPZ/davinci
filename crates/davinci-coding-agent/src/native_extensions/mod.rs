@@ -4,6 +4,7 @@ pub mod content_router;
 pub mod ecosystem;
 pub mod graph;
 pub mod learning;
+pub mod repo_intelligence;
 pub mod security_scan;
 pub mod token_governor;
 pub mod vector_memory;
@@ -33,6 +34,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const NATIVE_TOOLS: &[&str] = &[
+    "repo_map",
+    "symbol_search",
+    "file_symbols",
+    "file_dependencies",
+    "symbol_relationships",
+    "related_files",
+    "code_query",
     "memory_search",
     "retrieve_output",
     "graph_status",
@@ -57,6 +65,7 @@ pub const NATIVE_TOOLS: &[&str] = &[
 ];
 
 pub const NATIVE_COMMANDS: &[&str] = &[
+    "repo-index-status",
     "memory-status",
     "memory-search",
     "memory-reindex",
@@ -88,6 +97,11 @@ pub const NATIVE_COMMANDS: &[&str] = &[
 /// other invocable pi command to clients and autocomplete.
 pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
     vec![
+        (
+            "repo-index-status",
+            "Show structural repository index counts, cache and refresh state.",
+            None,
+        ),
         (
             "security-scan",
             "Start an experimental source-grounded security review.",
@@ -183,6 +197,7 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
+    pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub governor: TokenGovernor,
     pub memory: VectorMemory,
     pub graph: GraphController,
@@ -219,7 +234,16 @@ impl NativeExtensionHost {
         graph.learning = Some(learning.clone());
         graph.governor = Some(governor.clone());
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
+        let repo_agent_dir = agent_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(davinci_session::default_agent_dir);
+        let repo_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .repo_intelligence
+            .unwrap_or_default();
+        let repo_intelligence =
+            repo_intelligence::RepoIntelligence::new(cwd, &repo_agent_dir, repo_config);
         Self {
+            repo_intelligence,
             governor,
             memory,
             graph,
@@ -411,6 +435,9 @@ impl NativeExtensionHost {
         args: &Value,
     ) -> Result<ToolResult, ToolError> {
         match name {
+            name if repo_intelligence::is_repo_tool(name) => {
+                self.repo_intelligence.execute_tool(name, args)
+            }
             VISUAL_SNAPSHOT_TOOL => self.visual_snapshot.execute_tool(_cwd, args),
             "memory_search" => self.memory.search_tool(args),
             "retrieve_output" => self.governor.retrieve(args),
@@ -437,6 +464,7 @@ impl NativeExtensionHost {
 
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
         match name {
+            "repo-index-status" => Ok(Some(self.repo_intelligence.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
@@ -465,6 +493,9 @@ impl NativeExtensionHost {
     }
 
     pub fn describe_tool(name: &str) -> Option<davinci_ai::ToolSpec> {
+        if repo_intelligence::is_repo_tool(name) {
+            return repo_intelligence::tool_spec(name);
+        }
         let (description, parameters) = match name {
             "memory_search" => (
                 "Search durable vector and lexical memory for supporting context.",
