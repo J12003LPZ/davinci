@@ -990,3 +990,34 @@ The fixture now verifies exact descriptor preservation after edit, delete and
 rollback (GREEN). All 44 focused transaction tests passed; formatting and agent
 all-target Clippy with warnings denied passed. Full audit SACL preservation is
 not established by this test, and native CI for these changes remains pending.
+
+### Integrity-label conflict validation and publication
+
+The metadata work above is published as `b4781e4` on draft PR #11. Native CI run
+`35282774087` is live at this checkpoint. A follow-up real-file test changes only
+the integrity label after preview or apply, then proves apply/rollback returns
+conflict and preserves both the external label and expected source bytes. Both
+integrity-label tests passed; formatting and all-target agent Clippy passed.
+
+The foreground lifecycle review confirms packaged sessions install the existing
+supervisor in `main.rs`. The library fallback without a supplied supervisor still
+joins descendant-held pipes without a deadline and cannot issue verification
+receipts. That limitation remains explicit; the label tests do not validate or
+repair that separate lifecycle path.
+
+### Named-stream restoration sharing regression
+
+The Windows integration lane exposed three failures after `b4781e4`: applying
+or recovering files with named streams returned sharing violation 32. The new
+private base handle's DELETE access (needed for staging short-name cleanup)
+was incompatible with the named-stream restoration handle's share flags.
+Only private restoration now includes FILE_SHARE_DELETE. The existing base
+handle continues to deny deletion; source capture continues denying writes and
+deletion. No source sharing policy is relaxed.
+
+The existing edit, deleted-stream recovery and stream-conflict integration tests
+provided RED. After the fix all four Windows-specific cases and all 22 transaction
+integration tests passed. The preceding run separately passed three commit tests,
+four verification tests and the offline rollback evaluation. Formatting and
+agent all-target Clippy passed. The integrity-label conflict follow-up also
+passed both focused cases. Native CI must still validate the corrected head.

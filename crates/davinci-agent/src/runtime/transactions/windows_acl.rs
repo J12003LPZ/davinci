@@ -246,12 +246,7 @@ mod tests {
     use super::*;
     use crate::runtime::transactions::{ProposedChange, TransactionCoordinator, TransactionOwner};
 
-    #[test]
-    fn transaction_preserves_mandatory_integrity_label() {
-        let root = tempfile::tempdir().unwrap();
-        let directory =
-            crate::runtime::cache::directory::Directory::open(root.path(), false).unwrap();
-        let file = directory.stage_file("label.txt").unwrap();
+    fn set_low_integrity_label(file: &File) {
         let words: Vec<u16> = "S:(ML;;NW;;;LW)".encode_utf16().chain(Some(0)).collect();
         let mut descriptor = ptr::null_mut();
         // SAFETY: private fixture, bounded terminated SDDL, no privilege changes.
@@ -273,6 +268,61 @@ mod tests {
                 RtlNtStatusToDosError(status)
             );
         }
+    }
+
+    #[test]
+    fn transaction_integrity_label_changes_conflict() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for rollback in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("label.txt");
+            std::fs::write(&path, b"before").unwrap();
+            let manager =
+                TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+            let preview = manager
+                .preview(vec![ProposedChange::write("label.txt", b"after".to_vec())])
+                .unwrap();
+            if rollback {
+                manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+            }
+            let file = std::fs::OpenOptions::new()
+                .access_mode(0xa0000)
+                .open(&path)
+                .unwrap();
+            let before = read(&file).unwrap();
+            set_low_integrity_label(&file);
+            let changed = read(&file).unwrap();
+            assert!(before != changed, "fixture must change the integrity label");
+            drop(file);
+            let error = if rollback {
+                manager.rollback(&preview.id, &|_| Ok(()), None)
+            } else {
+                manager.apply(&preview.id, &|_| Ok(()), None)
+            }
+            .unwrap_err();
+            assert!(error.contains("conflict"), "{error}");
+            assert!(
+                read(&File::open(&path).unwrap()).unwrap() == changed,
+                "conflict must preserve external integrity label"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                if rollback {
+                    b"after".as_slice()
+                } else {
+                    b"before".as_slice()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_preserves_mandatory_integrity_label() {
+        let root = tempfile::tempdir().unwrap();
+        let directory =
+            crate::runtime::cache::directory::Directory::open(root.path(), false).unwrap();
+        let file = directory.stage_file("label.txt").unwrap();
+        set_low_integrity_label(&file);
         let before = read_information(&file, 7 | 0x10).unwrap();
         assert!(
             before.contains("(ML;;NW;;;LW)"),

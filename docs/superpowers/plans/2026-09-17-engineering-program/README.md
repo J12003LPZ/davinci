@@ -1,9 +1,11 @@
 # Engineering program ledger
 
 Status: design package approved; P1 and P2 validated; P4 implementation in progress.
-Latest P4 checkpoint: named-stream recovery fixed; source-stage failure injection,
-repo/LSP refresh integration and after evaluation passed. Agent library/test
-Clippy passed. Full P4 gates remain open; see its plan for evidence and limitations.
+Latest P4 published checkpoint: `b4781e4` fixes Windows descriptor inheritance,
+creation attributes, compression and integrity-label preservation, with explicit
+unsupported-metadata guards. All 44 focused transaction tests and agent all-target
+Clippy passed locally. Native CI run `35282774087` is in progress at this
+checkpoint. Full P4 gates remain open; see its plan for evidence and limitations.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 [unchanged supplied requirements](../../specs/2026-09-17-engineering-program-requirements.md).
@@ -12,7 +14,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 - Date: 2026-09-17.
 - Fetched remote main: `ca9fe69cd0da21bf161af25b2bed681748fb0d58`.
-- Branch: `codex/engineering-program-01a0ad48`.
+- Current branch: `codex/transactional-edits-01a0ad48`.
 - Worktree: `C:/Users/sergi/.claude-worktrees/pi-rust-9416e5cee6/01a0ad48`.
 - Git worktree admin path differs from common Git directory; isolation verified.
 - Shared checkout has pre-existing changes and divergent local main. Preserved.
@@ -31,7 +33,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | --- | --- | --- | --- | --- | --- |
 | 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
-| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | In progress | Approved | Targeted checks passed; full gates open | Not pushed |
+| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | In progress; draft PR #11 | Approved | Targeted checks passed; full gates open | Run `35282774087` in progress at `b4781e4` |
 | 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
@@ -393,7 +395,8 @@ tests, 23 approval-focused tests, and all 35 turn tests. The latter include real
 command verification and one-time transaction read approval. Agent library
 Clippy with warnings denied passed. These targeted results do not close the
 affected-package, Graph end-to-end, fault-injection, metadata, eval, or platform
-CI gates. No P4 PR exists yet, and P3 has not started.
+CI gates. P3 has not started. The paragraphs below retain earlier checkpoint
+evidence; the current status and latest P4 plan entry supersede their pending items.
 
 The recovery follow-up adds atomic no-clobber active-marker publication and
 cleanup after failed rollback preparation. Four storage fault-injection tests

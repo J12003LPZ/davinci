@@ -157,7 +157,10 @@ pub(super) fn restore(
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .share_mode(1)
+            // The pinned private base handle owns DELETE access to clear its
+            // generated short name. Stream sharing must admit that existing
+            // access; the base itself still denies deletion by other handles.
+            .share_mode(1 | 4)
             .custom_flags(0x00200000)
             .open(dir.path.join(format!("{name}{stream}")))
             .map_err(|e| e.to_string())?;
