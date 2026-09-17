@@ -291,14 +291,22 @@ mod tests {
         assert!(error.to_string().contains("incomplete"), "{error}");
         assert!(start.elapsed() < Duration::from_secs(5));
         let port: u16 = serde_json::from_slice(&std::fs::read(ready).unwrap()).unwrap();
-        assert!(
-            std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                Duration::from_millis(100)
-            )
-            .is_err(),
-            "descendant must be stopped before returning"
-        );
+        // Group termination requests precede helper reaping, but the kernel may
+        // close a descendant's socket just after it reaps the helper. Require
+        // bounded cleanup, well before the fixture's ten-second self-exit.
+        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        while std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            assert!(
+                Instant::now() < cleanup_deadline,
+                "descendant cleanup timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         for cancel in [false, true] {
             let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));

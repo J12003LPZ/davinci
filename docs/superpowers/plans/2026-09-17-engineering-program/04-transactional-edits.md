@@ -727,3 +727,12 @@ printing contents, descriptors, attributes, or stream values. All prior equality
 checks remain enforced. The focused diagnostic regression and formatting check
 passed locally. This is diagnostic instrumentation, not a Windows rollback fix;
 the next runner failure must identify the field before changing restoration.
+
+The Linux and macOS native failures in that run both resolve to the same new
+instantaneous listener assertion, after native transaction metadata tests passed.
+The foreground fixture now observes closure within two seconds, following the
+existing supervisor tests' bounded cleanup contract. Its ten-second self-exit
+cannot satisfy this deadline after the foreground return bound of five seconds.
+This corrects a scheduling-sensitive assertion; it does not change termination
+code or claim synchronous socket closure when the helper is reaped. The focused
+foreground regression passed locally; native confirmation remains required.
