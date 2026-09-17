@@ -118,6 +118,7 @@ impl MutationAuthority {
 
 pub(crate) struct ToolTransaction<'a> {
     root: PathBuf,
+    requested_root: PathBuf,
     coordinator: TransactionCoordinator,
     context: &'a ToolContext,
 }
@@ -151,6 +152,7 @@ impl<'a> ToolTransaction<'a> {
         });
         Ok(Self {
             root,
+            requested_root: cwd.to_path_buf(),
             coordinator,
             context,
         })
@@ -159,8 +161,17 @@ impl<'a> ToolTransaction<'a> {
         self.authorize(path).map_err(ToolError::Failed)?;
         let path = crate::permission::strip_verbatim_prefix(path);
         let root = crate::permission::strip_verbatim_prefix(&self.root);
+        let requested_root = crate::permission::strip_verbatim_prefix(&self.requested_root);
+        // Preserve the host's workspace spelling (case on Windows, /var aliases
+        // on macOS), without canonicalizing a target and following its symlinks.
+        if super::files::root(&self.requested_root).map_err(ToolError::Failed)? != self.root {
+            return Err(ToolError::Failed(
+                "transaction workspace alias changed".into(),
+            ));
+        }
         let relative = path
             .strip_prefix(&root)
+            .or_else(|_| path.strip_prefix(&requested_root))
             .map_err(|_| ToolError::Failed("transaction target is outside the workspace".into()))?;
         let relative = relative
             .to_str()
@@ -370,5 +381,33 @@ mod tests {
             None,
         );
         assert!(authority.check(&root.path().join("other.txt")).is_err());
+    }
+
+    #[test]
+    fn transaction_snapshot_accepts_workspace_alias_without_following_target_links() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("Workspace");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("a.txt"), "before").unwrap();
+        #[cfg(windows)]
+        let alias = root.path().join("workspace");
+        #[cfg(unix)]
+        let alias = {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            alias
+        };
+        let context = ToolContext::default();
+        let transaction = ToolTransaction::new(&alias, &context).unwrap();
+        let snapshot = transaction.snapshot(&alias.join("a.txt")).unwrap();
+        assert_eq!(snapshot.bytes().unwrap(), b"before");
+        assert!(transaction
+            .snapshot(&root.path().join("outside.txt"))
+            .is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(real.join("a.txt"), real.join("link.txt")).unwrap();
+            assert!(transaction.snapshot(&alias.join("link.txt")).is_err());
+        }
     }
 }

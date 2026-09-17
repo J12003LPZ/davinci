@@ -50,6 +50,8 @@ jobs:
           if-no-files-found: error
       - name: Native transaction metadata and authorization
         run: cargo test -p davinci-agent --locked --lib transaction
+      - name: Native directory lease lifetime
+        run: cargo test -p davinci-agent --locked --lib directory_lease
       - name: Transaction recovery, commit evidence and verification
         run: cargo test -p davinci-agent --locked --test transactions --test transaction_commit --test transaction_verification
       - name: Transaction CLI and intelligence integration

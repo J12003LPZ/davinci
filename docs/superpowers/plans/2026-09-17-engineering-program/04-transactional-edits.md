@@ -622,3 +622,29 @@ records before qualifying workspace commands, with a bounded worst-case cost.
 P4 remains incomplete pending native Linux/macOS execution, foreground descendant
 pipe lifecycle, final assembled checks, review and CI. No P4 commit or push has
 been made at this checkpoint.
+
+### First native CI follow-up
+
+Implementation commit `948130fd4c089d8db830ed74dbfd07192ae9f06a` was pushed
+as draft PR #11. CI run `35273255591` passed the Linux native matrix, including
+transaction metadata, recovery, CLI/intelligence integration, actual Graph worker
+submit/recovery and the transaction evaluation. Quality checks and the coding-agent
+package passed. The agent package failed with a transient Unix transaction lease
+conflict; Windows and macOS native lanes failed earlier in normal edit acceptance
+with `transaction target is outside the workspace`.
+
+The directory lease now explicitly releases Unix flock on scope exit so an
+inherited open file description cannot prolong the parent's lock. Its regression
+duplicates that description and checks both release and subsequent exclusion.
+Windows still uses exclusive handle lifetime. The native matrix now runs these
+lease tests on all three operating systems. Unix execution of this follow-up is
+pending CI; the local Windows machine has no running Linux test environment.
+
+Transaction snapshots now retain the host's workspace spelling when deriving
+relative paths, while validating the alias still resolves to the pinned canonical
+root. Targets are not canonicalized to bypass symlink rejection. A case-alias
+regression failed locally before the change and passed afterward; the Unix variant
+also covers a workspace alias and rejection of a target symlink. The 30 transaction
+library tests, six cache library tests and agent all-target Clippy passed locally.
+P4 remains incomplete: follow-up native CI and foreground descendant lifecycle
+are still required before the final completion audit.

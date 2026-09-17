@@ -3,6 +3,21 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) struct DirectoryLease {
+    _file: File,
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // A concurrent fork can retain this open file description until exec,
+        // even with CLOEXEC. Closing our descriptor alone need not release flock.
+        // SAFETY: the lease still owns this live descriptor.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Directory {
     pub path: PathBuf,
@@ -145,7 +160,7 @@ impl Directory {
         }
         Ok(())
     }
-    pub fn lease(&self) -> io::Result<File> {
+    pub fn lease(&self) -> io::Result<DirectoryLease> {
         use std::os::fd::AsRawFd;
         let file = match self.file("active.lock", true) {
             Ok(file) => file,
@@ -157,7 +172,7 @@ impl Directory {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(file)
+        Ok(DirectoryLease { _file: file })
     }
 }
 
@@ -242,7 +257,7 @@ impl Directory {
         valid_name(name)?;
         fs::remove_file(self.path.join(name))
     }
-    pub fn lease(&self) -> io::Result<File> {
+    pub fn lease(&self) -> io::Result<DirectoryLease> {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         let file = OpenOptions::new()
             .read(true)
@@ -255,7 +270,7 @@ impl Directory {
         if file.metadata()?.file_attributes() & 0x400 != 0 {
             return Err(io::Error::other("linked cache lease denied"));
         }
-        Ok(file)
+        Ok(DirectoryLease { _file: file })
     }
 }
 
@@ -490,5 +505,42 @@ pub(crate) fn file_identity(file: &File) -> io::Result<String> {
             "{}:{}:{}",
             information.volume, information.index_high, information.index_low
         ))
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[test]
+    fn directory_lease_excludes_contenders_until_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap();
+        let first = Directory::open(&path, false).unwrap();
+        let second = Directory::open(&path, false).unwrap();
+        let lease = first.lease().unwrap();
+        assert!(second.lease().is_err());
+        drop(lease);
+        assert!(second.lease().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_lease_releases_with_inherited_description_still_open() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap();
+        let directory = Directory::open(&path, false).unwrap();
+        let lease = directory.lease().unwrap();
+        // dup shares the same open file description, just like a forked child.
+        let inherited = lease._file.try_clone().unwrap();
+        assert!(directory.lease().is_err());
+        drop(lease);
+        let next = directory
+            .lease()
+            .expect("the owner's scope releases its lock");
+        drop(inherited);
+        assert!(directory.lease().is_err());
+        drop(next);
+        assert!(directory.lease().is_ok());
     }
 }
