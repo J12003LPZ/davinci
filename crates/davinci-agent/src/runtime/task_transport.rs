@@ -21,6 +21,12 @@ const MAX_FRAME: usize = 8 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(10);
 
+/// Narrow parent-owned native capability carried by the existing worker channel.
+pub trait CoordinatorToolHandler: Send + Sync {
+    fn handles(&self, tool: &str) -> bool;
+    fn execute(&self, tool: &str, args: &Value) -> Result<ToolResult, ToolError>;
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -88,6 +94,16 @@ impl TaskCoordinatorClient {
         args: &Value,
         abort: Option<&AtomicBool>,
     ) -> Result<ToolResult, ToolError> {
+        self.call_with_timeout(tool, args, abort, IO_TIMEOUT)
+    }
+
+    pub fn call_with_timeout(
+        &self,
+        tool: &str,
+        args: &Value,
+        abort: Option<&AtomicBool>,
+        timeout: Duration,
+    ) -> Result<ToolResult, ToolError> {
         if abort.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
             return Err(ToolError::Failed("task coordinator aborted".into()));
         }
@@ -99,7 +115,7 @@ impl TaskCoordinatorClient {
         };
         let default_stop = AtomicBool::new(false);
         let stop = abort.unwrap_or(&default_stop);
-        let deadline = Instant::now() + IO_TIMEOUT;
+        let deadline = Instant::now() + timeout.min(Duration::from_secs(35));
         let mut stream =
             TcpStream::connect_timeout(&self.address, IO_TIMEOUT).map_err(|_| transport_error())?;
         configure(&stream)?;
@@ -127,7 +143,23 @@ impl TaskCoordinatorTransport {
         cwd: PathBuf,
         abort: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        if tools.iter().any(|tool| !is_task_tool(tool)) {
+        Self::bind_with_handler(parent, child, permissions, tools, cwd, abort, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_with_handler(
+        parent: &RuntimeHandle,
+        child: AgentId,
+        permissions: Arc<PermissionState>,
+        tools: Vec<String>,
+        cwd: PathBuf,
+        abort: Arc<AtomicBool>,
+        handler: Option<Arc<dyn CoordinatorToolHandler>>,
+    ) -> Result<Self, String> {
+        if tools
+            .iter()
+            .any(|tool| !is_task_tool(tool) && !handler.as_ref().is_some_and(|h| h.handles(tool)))
+        {
             return Err("task coordinator allowlist contains a non-task tool".into());
         }
         let mut worker = parent.for_worker(child, None)?;
@@ -178,6 +210,7 @@ impl TaskCoordinatorTransport {
                                 &permissions,
                                 &cwd,
                                 &stopping,
+                                handler.as_deref(),
                             );
                             let _ = write_frame(
                                 &mut stream,
@@ -223,6 +256,7 @@ pub fn is_task_tool(tool: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     request: Request,
     credential: &str,
@@ -231,6 +265,7 @@ fn dispatch(
     permissions: &PermissionState,
     cwd: &std::path::Path,
     stop: &AtomicBool,
+    handler: Option<&dyn CoordinatorToolHandler>,
 ) -> Result<ToolResult, String> {
     // Fixed-size comparison does not reveal a matching credential prefix.
     let authenticated = request.credential.len() == credential.len()
@@ -246,7 +281,26 @@ fn dispatch(
     if stop.load(Ordering::SeqCst) || context.is_aborted() {
         return Err("task coordinator stopped".into());
     }
-    if !is_task_tool(&request.tool) || !tools.contains(&request.tool) {
+    if let Some(runtime) = &context.runtime {
+        if runtime
+            .registry
+            .get(&runtime.agent_id)
+            .is_none_or(|record| {
+                !matches!(
+                    record.state,
+                    super::AgentState::Starting
+                        | super::AgentState::Running
+                        | super::AgentState::Waiting
+                        | super::AgentState::Idle
+                )
+            })
+        {
+            return Err("worker attempt is no longer active".into());
+        }
+    }
+    if (!is_task_tool(&request.tool) && !handler.is_some_and(|h| h.handles(&request.tool)))
+        || !tools.contains(&request.tool)
+    {
         return Err("task tool is not authorized for this worker".into());
     }
     let (issued_policy, _issued_revision) = {
@@ -294,7 +348,9 @@ fn dispatch(
         "task_update" => super::task_update_tool(&request.args, context),
         "task_get" => super::task_get_tool(&request.args, context),
         "task_list" => super::task_list_tool(&request.args, context),
-        _ => unreachable!(),
+        _ => handler
+            .ok_or_else(|| "parent native handler unavailable".to_string())?
+            .execute(&request.tool, &request.args),
     }
     .map_err(|error| error.to_string())
 }
@@ -449,6 +505,69 @@ mod tests {
                 .list_tasks(None),
             tasks
         );
+    }
+
+    #[test]
+    fn native_handler_obeys_allowlist_credentials_policy_and_worker_lifetime() {
+        struct Handler;
+        impl CoordinatorToolHandler for Handler {
+            fn handles(&self, tool: &str) -> bool {
+                tool == "lsp_hover"
+            }
+            fn execute(&self, _tool: &str, _args: &Value) -> Result<ToolResult, ToolError> {
+                Ok(ToolResult {
+                    content: "parent-owned".into(),
+                    is_error: false,
+                    details: None,
+                })
+            }
+        }
+        let parent = RuntimeHandle::new(
+            super::super::RunId::new(),
+            AgentId::new(),
+            super::super::RuntimeBus::new(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let child = register(&parent, dir.path());
+        let permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+            PermissionMode::ReadOnly,
+        )));
+        let server = TaskCoordinatorTransport::bind_with_handler(
+            &parent,
+            child,
+            permissions.clone(),
+            vec!["lsp_hover".into()],
+            dir.path().into(),
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(Handler)),
+        )
+        .unwrap();
+        let client = server.client();
+        assert_eq!(
+            client
+                .call("lsp_hover", &json!({"path":"a.ts"}))
+                .unwrap()
+                .content,
+            "parent-owned"
+        );
+        assert!(client
+            .call("lsp_definition", &json!({"path":"a.ts"}))
+            .is_err());
+        let mut forged = client.clone();
+        forged.credential = "0".repeat(64);
+        assert!(forged.call("lsp_hover", &json!({"path":"a.ts"})).is_err());
+        permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(crate::PermissionRule::parse("lsp_hover(*)").unwrap());
+        assert!(client.call("lsp_hover", &json!({"path":"a.ts"})).is_err());
+        permissions.lock().unwrap().deny.clear();
+        parent
+            .registry
+            .transition(child, AgentState::Completed)
+            .unwrap();
+        assert!(client.call("lsp_hover", &json!({"path":"a.ts"})).is_err());
     }
 
     fn register(parent: &RuntimeHandle, cwd: &std::path::Path) -> AgentId {

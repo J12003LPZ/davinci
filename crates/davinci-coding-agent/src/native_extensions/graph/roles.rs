@@ -23,7 +23,7 @@ pub(super) fn requires_task_coordinator(tool: &str) -> bool {
     matches!(
         tool,
         "task_create" | "task_update" | "task_list" | "task_get"
-    )
+    ) || crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&tool)
 }
 
 pub use crate::native_extensions::token_governor::ensure_governor_recovery_tool;
@@ -52,6 +52,15 @@ pub fn role_tools(role: Role) -> Vec<String> {
         }
     };
     let mut tools: Vec<String> = names.into_iter().map(str::to_string).collect();
+    let semantic: &[&str] = match role {
+        Role::Researcher | Role::Planner | Role::Writer => {
+            crate::native_extensions::language_intelligence::TOOL_NAMES
+        }
+        Role::Reviewer => &["lsp_references", "lsp_implementations", "lsp_diagnostics"],
+        Role::TestAnalyzer => &["lsp_diagnostics"],
+        Role::Classifier | Role::Historian => &[],
+    };
+    tools.extend(semantic.iter().map(|name| (*name).to_string()));
     ensure_governor_recovery_tool(&mut tools);
     tools
 }
@@ -151,6 +160,18 @@ pub fn is_bash_command_allowed(policy: BashPolicy, command: &str) -> BashDecisio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_tools_require_parent_authority_and_follow_role_selection() {
+        for name in crate::native_extensions::language_intelligence::TOOL_NAMES {
+            assert!(requires_task_coordinator(name));
+            assert!(role_tools(Role::Researcher).contains(&name.to_string()));
+            assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
+        }
+        assert!(!role_tools(Role::Reviewer).contains(&"lsp_hover".into()));
+        assert!(role_tools(Role::TestAnalyzer).contains(&"lsp_diagnostics".into()));
+        assert!(!requires_task_coordinator("read"));
+    }
 
     fn allowed(policy: BashPolicy, command: &str) -> bool {
         is_bash_command_allowed(policy, command) == BashDecision::Allowed

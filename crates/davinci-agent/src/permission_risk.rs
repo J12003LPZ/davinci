@@ -175,7 +175,21 @@ pub(super) fn file_targets(
     }
     if matches!(
         tool,
-        "read" | "grep" | "find" | "ls" | "write" | "edit" | "notebook_edit"
+        "read"
+            | "grep"
+            | "find"
+            | "ls"
+            | "write"
+            | "edit"
+            | "notebook_edit"
+            | "lsp_definition"
+            | "lsp_references"
+            | "lsp_hover"
+            | "lsp_document_symbols"
+            | "lsp_workspace_symbols"
+            | "lsp_implementations"
+            | "lsp_type_definition"
+            | "lsp_diagnostics"
     ) {
         if matches!(tool, "write" | "edit" | "notebook_edit")
             && args

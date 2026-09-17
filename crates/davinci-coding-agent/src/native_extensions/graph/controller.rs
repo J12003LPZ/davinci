@@ -92,6 +92,8 @@ pub struct ControllerDeps {
     pub memory: Option<crate::native_extensions::VectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
     pub governor: Option<crate::native_extensions::TokenGovernor>,
+    pub language_intelligence:
+        Option<crate::native_extensions::language_intelligence::LanguageIntelligence>,
     pub runtime: Option<davinci_agent::RuntimeHandle>,
     pub permissions: Option<Arc<davinci_agent::PermissionState>>,
     pub task_contract: Option<davinci_agent::runtime::TaskContract>,
@@ -412,6 +414,12 @@ impl GraphExecution {
                     })
                     .cloned(),
             );
+        }
+        if !has_coordinator_authority || self.deps.language_intelligence.is_none() {
+            tools.retain(|name| {
+                !crate::native_extensions::language_intelligence::TOOL_NAMES
+                    .contains(&name.as_str())
+            });
         }
         ensure_governor_recovery_tool(&mut tools);
         tools
@@ -822,20 +830,27 @@ impl GraphExecution {
             let task_tools: Vec<String> = spec
                 .tools
                 .iter()
-                .filter(|tool| davinci_agent::runtime::task_transport::is_task_tool(tool))
+                .filter(|tool| {
+                    davinci_agent::runtime::task_transport::is_task_tool(tool)
+                        || tool.as_str() == "retrieve_output"
+                            && self.deps.language_intelligence.is_some()
+                        || crate::native_extensions::language_intelligence::TOOL_NAMES
+                            .contains(&tool.as_str())
+                })
                 .cloned()
                 .collect();
             let _coordinator_transport = if !task_tools.is_empty() {
                 if let (Some(runtime), Some(permissions)) =
                     (&self.deps.runtime, &self.deps.permissions)
                 {
-                    match davinci_agent::runtime::task_transport::TaskCoordinatorTransport::bind(
+                    match davinci_agent::runtime::task_transport::TaskCoordinatorTransport::bind_with_handler(
                         runtime,
                         worker_agent_id,
                         permissions.clone(),
                         task_tools,
                         spec.cwd.clone(),
                         self.exec_abort.clone(),
+                        self.deps.language_intelligence.as_ref().map(|manager| Arc::new(manager.for_workspace(&spec.cwd)) as Arc<dyn davinci_agent::runtime::task_transport::CoordinatorToolHandler>),
                     ) {
                         Ok(transport) => {
                             spec.coordinator_client = Some(transport.client());
@@ -2603,6 +2618,7 @@ mod tests {
                 memory: None,
                 learning: None,
                 governor: None,
+                language_intelligence: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -2678,6 +2694,7 @@ mod tests {
                 memory: None,
                 learning: None,
                 governor: None,
+                language_intelligence: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -2812,6 +2829,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: Some(parent_runtime.clone()),
             permissions: Some(permissions),
             task_contract: None,
@@ -2871,6 +2889,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -2938,6 +2957,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3062,6 +3082,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3184,6 +3205,7 @@ mod tests {
             memory: None,
             learning: Some(learning),
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3391,6 +3413,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3521,6 +3544,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3647,6 +3671,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3782,6 +3807,7 @@ mod tests {
             memory: Some(vector_mem.clone()),
             learning: Some(learning.clone()),
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3889,6 +3915,7 @@ mod tests {
             memory: Some(vector_mem.clone()),
             learning: Some(learning.clone()),
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4116,6 +4143,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4228,6 +4256,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4329,6 +4358,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4421,6 +4451,7 @@ mod tests {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4493,6 +4524,7 @@ mod tests {
                 memory: None,
                 learning: None,
                 governor: None,
+                language_intelligence: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -4600,6 +4632,7 @@ mod tests {
                 memory: None,
                 learning: None,
                 governor: None,
+                language_intelligence: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -4686,6 +4719,7 @@ mod tests {
                 memory: None,
                 learning: None,
                 governor: None,
+                language_intelligence: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -4791,6 +4825,7 @@ mod tests {
                 memory: None,
                 learning: None,
                 governor: None,
+                language_intelligence: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,

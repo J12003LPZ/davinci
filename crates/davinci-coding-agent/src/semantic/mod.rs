@@ -444,7 +444,7 @@ impl NativeSemanticService {
     }
 }
 
-fn render_command_for_policy(spec: &LanguageServerSpec) -> String {
+pub fn render_command_for_policy(spec: &LanguageServerSpec) -> String {
     std::iter::once(spec.program.as_str())
         .chain(spec.args.iter().map(String::as_str))
         .map(quote_command_argument)

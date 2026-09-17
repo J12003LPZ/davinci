@@ -5,6 +5,25 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<
+    Option<crate::native_extensions::language_intelligence::LanguageIntelligenceConfig>,
+    D::Error,
+> {
+    use crate::native_extensions::language_intelligence::LanguageIntelligenceConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| LanguageIntelligenceConfig {
+            enabled: false,
+            configuration_error: Some(
+                "Invalid languageIntelligence settings; check backend and value types".into(),
+            ),
+            ..Default::default()
+        })
+    }))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
@@ -145,6 +164,13 @@ pub struct Settings {
     pub permissions: Option<PermissionSettings>,
     #[serde(default)]
     pub learning: Option<crate::native_extensions::learning::LearningConfig>,
+    #[serde(
+        default,
+        rename = "languageIntelligence",
+        deserialize_with = "parse_language_intelligence"
+    )]
+    pub language_intelligence:
+        Option<crate::native_extensions::language_intelligence::LanguageIntelligenceConfig>,
     #[serde(default, rename = "languageServers")]
     pub language_servers: Option<HashMap<String, LspServerConfigSetting>>,
     /// Settings keys this struct does not model (for example `subagents`,
@@ -1262,6 +1288,16 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_language_settings_preserve_unrelated_settings() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "theme":"fixture", "languageIntelligence":{"typescript":{"backend":"typo"}}
+        }))
+        .unwrap();
+        assert_eq!(settings.theme.as_deref(), Some("fixture"));
+        assert!(!settings.language_intelligence.unwrap().enabled);
+    }
 
     #[test]
     fn rewriting_settings_keeps_unknown_keys_and_writes_no_nulls() {
