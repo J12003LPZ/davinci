@@ -116,7 +116,56 @@ pub(super) fn short_name(file: &std::fs::File) -> Result<Vec<u16>, String> {
         .take(byte_len / 2)
         .collect();
     validate_short_name(&name)?;
-    Ok(name)
+    normalize_short_name(file, name)
+}
+
+#[cfg(windows)]
+fn normalize_short_name(file: &std::fs::File, alias: Vec<u16>) -> Result<Vec<u16>, String> {
+    use std::os::windows::io::AsRawHandle;
+    if alias.is_empty() {
+        return Ok(alias);
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFinalPathNameByHandleW(
+            handle: *mut std::ffi::c_void,
+            path: *mut u16,
+            capacity: u32,
+            flags: u32,
+        ) -> u32;
+    }
+    let mut path = vec![0u16; 32768];
+    // FILE_NAME_NORMALIZED resolves the primary name even if opened by alias.
+    // SAFETY: pinned live file and an initialized buffer of the supplied size.
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            path.as_mut_ptr(),
+            path.len() as u32,
+            0,
+        )
+    } as usize;
+    if length == 0 {
+        return Err(format!(
+            "query transaction primary filename: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if length >= path.len() {
+        return Err("transaction primary filename exceeds limit".into());
+    }
+    let primary = path[..length]
+        .rsplit(|unit| *unit == b'\\' as u16)
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or("invalid transaction primary filename")?;
+    // NTFS may report a DOS spelling identical to the primary name. It is not
+    // an independent alias, and setting it on replacement may return no alias.
+    if names_equal(primary, &alias)? {
+        Ok(Vec::new())
+    } else {
+        Ok(alias)
+    }
 }
 
 pub(super) fn validate_short_name(name: &[u16]) -> Result<(), String> {
@@ -144,6 +193,14 @@ pub(super) fn ensure_primary_name(name: &str, alias: &[u16]) -> Result<(), Strin
     if alias.is_empty() {
         return Ok(());
     }
+    if names_equal(&name.encode_utf16().collect::<Vec<_>>(), alias)? {
+        return Err("transaction requires the primary filename, not its short alias".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn names_equal(name: &[u16], alias: &[u16]) -> Result<bool, String> {
     #[link(name = "kernel32")]
     extern "system" {
         fn CompareStringOrdinal(
@@ -154,7 +211,6 @@ pub(super) fn ensure_primary_name(name: &str, alias: &[u16]) -> Result<(), Strin
             ignore_case: i32,
         ) -> i32;
     }
-    let name: Vec<_> = name.encode_utf16().collect();
     // SAFETY: bounded live UTF-16 arrays; explicit lengths, no terminator required.
     let result = unsafe {
         CompareStringOrdinal(
@@ -168,10 +224,7 @@ pub(super) fn ensure_primary_name(name: &str, alias: &[u16]) -> Result<(), Strin
     if result == 0 {
         return Err("cannot compare transaction short name".into());
     }
-    if result == 2 {
-        return Err("transaction requires the primary filename, not its short alias".into());
-    }
-    Ok(())
+    Ok(result == 2)
 }
 
 #[cfg(windows)]
@@ -598,6 +651,36 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn transaction_primary_name_matching_its_short_name_remains_editable() {
+        use super::super::files;
+        let root = tempfile::tempdir().unwrap();
+        let path = "token.mjs";
+        std::fs::write(root.path().join(path), b"before").unwrap();
+        let (dir, name) = files::directory(root.path(), path, false).unwrap();
+        let alias: Vec<_> = "TOKEN.MJS".encode_utf16().collect();
+        // Some NTFS volumes report the DOS spelling even when it names the
+        // primary directory entry. Exercise that response without changing the
+        // machine-wide short-name generation policy.
+        assert!(
+            normalize_short_name(&dir.source_file(&name).unwrap(), alias)
+                .unwrap()
+                .is_empty()
+        );
+        let manager =
+            TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write(path, b"after".to_vec())])
+            .unwrap();
+        manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+        assert_eq!(std::fs::read(root.path().join(path)).unwrap(), b"after");
+        manager.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+        assert_eq!(std::fs::read(root.path().join(path)).unwrap(), b"before");
+        assert!(short_name(&dir.source_file(&name).unwrap())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

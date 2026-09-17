@@ -1087,3 +1087,35 @@ Executed validation for this follow-up:
 Previous-head CI `35283684663` is terminal: Linux/macOS native paths, quality and
 workspace shards passed; Windows failed the known ordinary-edit short-name gate.
 This implementation still requires its own exact-head CI before closing P4.
+
+### Primary filename also reported as a DOS short name
+
+Head `055b938` failed Windows native job `105416462064` in CI `35285393973`
+at the normal-agent edit case with `transaction requires the primary filename,
+not its short alias`. The fixture edits `token.mjs`: NTFS can report its uppercase
+DOS spelling even though it is the primary filename. The old comparison rejected
+that ordinary primary-name edit.
+
+Short-name capture now compares the reported name to the normalized primary
+filename obtained from the pinned file handle. An equivalent spelling represents
+no independent alias; distinct aliases retain their existing preservation and
+alias-addressed mutation restrictions. The bounded handle query uses
+[GetFinalPathNameByHandleW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
+with normalized-name flags, and query failure prevents mutation.
+
+The first local fixture tried explicitly setting an identical short name; NTFS
+discarded that redundant alias, so the setter's round-trip assertion failed
+before the intended path. The revised test supplies the observed DOS-name
+response to normalization against a real file handle, then edits and rolls back
+that file. It initially failed to compile with the missing normalization helper.
+After implementation, all 50 focused transaction tests passed, including existing
+distinct-alias edit/recovery, interrupted publication, foreign-alias collision,
+and alias-addressed source refusal. This does not replace exact-head Windows CI.
+
+The normal-agent binary selector also passed (one case), followed by all 30
+transaction/commit/verification/evaluation integration cases. Agent all-target
+Clippy with warnings denied, formatting and diff checks passed. Solo review
+checked the handle-bound lookup, fixed buffer limit, unchanged distinct-alias
+denial and preservation, and failure behavior. Prior-head Linux/macOS native
+jobs and quality completed successfully; Windows remains the sole known failure
+and the corrected commit still needs its own CI run.

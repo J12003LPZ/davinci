@@ -1,11 +1,11 @@
 # Engineering program ledger
 
 Status: design package approved; P1 and P2 validated; P4 implementation in progress.
-Latest P4 published checkpoint: `b4781e4` fixes Windows descriptor inheritance,
-creation attributes, compression and integrity-label preservation, with explicit
-unsupported-metadata guards. All 44 focused transaction tests and agent all-target
-Clippy passed locally. Native CI run `35282774087` is in progress at this
-checkpoint. Full P4 gates remain open; see its plan for evidence and limitations.
+Latest P4 follow-up distinguishes redundant DOS spellings from distinct Windows
+short aliases. Head `055b938` passed affected package tests but failed the native
+Windows normal-agent edit case; the follow-up passes 50 focused transaction tests
+locally. Full P4 gates remain open pending the corrected head's native CI; see
+its plan for evidence and limitations.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 [unchanged supplied requirements](../../specs/2026-09-17-engineering-program-requirements.md).
@@ -33,7 +33,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | --- | --- | --- | --- | --- | --- |
 | 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
-| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | In progress; draft PR #11 | Approved | Targeted checks passed; full gates open | Run `35282774087` in progress at `b4781e4` |
+| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | In progress; draft PR #11 | Approved | Targeted checks passed; full gates open | Windows failure at `055b938`; correction awaits native CI |
 | 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
