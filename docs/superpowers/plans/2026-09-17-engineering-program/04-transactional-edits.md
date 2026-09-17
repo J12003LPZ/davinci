@@ -648,3 +648,30 @@ also covers a workspace alias and rejection of a target symlink. The 30 transact
 library tests, six cache library tests and agent all-target Clippy passed locally.
 P4 remains incomplete: follow-up native CI and foreground descendant lifecycle
 are still required before the final completion audit.
+
+### Supervisor capture and dispatch alias follow-up
+
+CI run `35274279940` for `5d9ac196c3273cfa7640c4de8e6f84066beb8ea4`
+passed all workspace package tests, quality checks and the Linux native matrix,
+including the new inherited-descriptor lease regression. Windows and macOS
+normal-agent acceptance exposed the next alias mismatch at dispatch authorization.
+The alias regression now goes through authorized apply: it failed with
+`transaction target was not authorized by this dispatch`, then passed after
+authorization learned the equivalent canonical workspace prefix. This only
+substitutes the workspace prefix and revalidates the alias; target symlinks do not
+grant authority to additional files. Native confirmation remains pending.
+
+The existing supervisor now distinguishes pipe EOF from read failure, retries
+interrupted reads, and requires successful reader completion and delivery before
+reporting complete output. Reader panic and a descendant retaining a pipe remain
+incomplete output. Two failure regressions were red before the fix; all three
+capture tests pass. A separate stderr callback preserves foreground stream
+identity while the existing spawn API retains merged output. The real subprocess
+stream regression was red before tagging streams and green afterward. An
+acknowledged stdin-close operation supports EOF after acknowledged writes and
+rejects later writes. All 17 supervisor integration tests and 30 transaction
+library tests pass locally, as does agent all-target Clippy with warnings denied.
+
+These are supervisor prerequisites, not completed foreground shell integration.
+The shell tools still need to consume the owned supervisor and prove bounded
+timeout/cancellation/descendant cleanup before P4 can be marked complete.

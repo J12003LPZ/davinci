@@ -37,6 +37,7 @@ impl MutationAuthority {
         permit: Option<Arc<crate::approval::DispatchPermit>>,
     ) -> Self {
         let cwd = cwd.to_path_buf();
+        let canonical_cwd = cwd.canonicalize().ok();
         let name = name.to_owned();
         let args = args.clone();
         let targets = crate::runtime::contracts::extract_tool_targets(&name, &args);
@@ -54,9 +55,28 @@ impl MutationAuthority {
                 } else {
                     cwd.join(target)
                 };
-                crate::permission::normalize_lexically(&crate::permission::strip_verbatim_prefix(
-                    &absolute,
-                )) == normalized
+                let lexical = crate::permission::normalize_lexically(
+                    &crate::permission::strip_verbatim_prefix(&absolute),
+                );
+                if lexical == normalized {
+                    return true;
+                }
+                // Only substitute the workspace prefix, never resolve a target
+                // symlink into an additional authorized file.
+                let Some(root) = canonical_cwd.as_ref() else {
+                    return false;
+                };
+                if cwd.canonicalize().ok().as_ref() != Some(root) {
+                    return false;
+                }
+                let requested = crate::permission::normalize_lexically(
+                    &crate::permission::strip_verbatim_prefix(&cwd),
+                );
+                lexical.strip_prefix(&requested).is_ok_and(|relative| {
+                    crate::permission::normalize_lexically(
+                        &crate::permission::strip_verbatim_prefix(&root.join(relative)),
+                    ) == normalized
+                })
             });
             if !in_call {
                 return Err("transaction target was not authorized by this dispatch".into());
@@ -397,10 +417,24 @@ mod tests {
             std::os::unix::fs::symlink(&real, &alias).unwrap();
             alias
         };
-        let context = ToolContext::default();
+        let mut context = ToolContext::default();
+        context.mutation_authority = Some(MutationAuthority::for_dispatch(
+            &alias,
+            "write",
+            &serde_json::json!({"path":"a.txt","content":"after"}),
+            Arc::new(PermissionState::new(PermissionPolicy::new(
+                PermissionMode::AlwaysApprove,
+            ))),
+            context.active_contract.clone(),
+            None,
+        ));
         let transaction = ToolTransaction::new(&alias, &context).unwrap();
         let snapshot = transaction.snapshot(&alias.join("a.txt")).unwrap();
         assert_eq!(snapshot.bytes().unwrap(), b"before");
+        transaction
+            .apply(vec![snapshot.change(Some(b"after".to_vec()))])
+            .unwrap();
+        assert_eq!(std::fs::read(real.join("a.txt")).unwrap(), b"after");
         assert!(transaction
             .snapshot(&root.path().join("outside.txt"))
             .is_err());

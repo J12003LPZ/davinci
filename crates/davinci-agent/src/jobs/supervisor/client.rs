@@ -52,6 +52,25 @@ impl Supervisor {
         config: ProcessConfig,
         event: Arc<dyn Fn(ProcessEvent) + Send + Sync>,
     ) -> Result<Self, String> {
+        let stderr_event = event.clone();
+        Self::spawn_with_stderr(
+            host,
+            config,
+            event,
+            Arc::new(move |bytes| {
+                stderr_event(ProcessEvent::Output(bytes));
+            }),
+        )
+    }
+
+    /// Retains stream identity for foreground capture. `spawn` continues to
+    /// merge both streams for existing managed-process consumers.
+    pub fn spawn_with_stderr(
+        host: &SupervisorCommand,
+        config: ProcessConfig,
+        event: Arc<dyn Fn(ProcessEvent) + Send + Sync>,
+        stderr: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    ) -> Result<Self, String> {
         if serde_json::to_vec(&config)
             .map_err(|_| "invalid process configuration")?
             .len()
@@ -132,7 +151,7 @@ impl Supervisor {
                 Err(_) => break,
             }
         });
-        thread::spawn(move || monitor(child, event_rx, control, event));
+        thread::spawn(move || monitor(child, event_rx, control, event, stderr));
         owner
             .control
             .input
@@ -167,6 +186,15 @@ impl Supervisor {
         if bytes.len() > MAX_INPUT {
             return Err("stdin exceeds 16 KiB".into());
         }
+        self.send_input(Some(bytes))
+    }
+
+    /// Acknowledged EOF after all previously acknowledged writes.
+    pub fn close_stdin(&self) -> Result<(), String> {
+        self.send_input(None).map(|_| ())
+    }
+
+    fn send_input(&self, bytes: Option<&[u8]>) -> Result<usize, String> {
         let _single = self
             .control
             .write
@@ -184,9 +212,12 @@ impl Supervisor {
         state.ack = None;
         self.control
             .input
-            .try_send(Request::Write {
-                id,
-                bytes: bytes.to_vec(),
+            .try_send(match bytes {
+                Some(bytes) => Request::Write {
+                    id,
+                    bytes: bytes.to_vec(),
+                },
+                None => Request::CloseStdin { id },
             })
             .map_err(|_| "stdin queue is unavailable")?;
         let (mut state, _) = self
@@ -248,6 +279,7 @@ fn monitor(
     events: mpsc::Receiver<Event>,
     control: Arc<Control>,
     callback: Arc<dyn Fn(ProcessEvent) + Send + Sync>,
+    stderr_callback: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 ) {
     let mut code = None;
     let mut exit_reported = false;
@@ -259,9 +291,13 @@ fn monitor(
                 control.state.lock().unwrap_or_else(|e| e.into_inner()).pid = Some(pid);
                 control.changed.notify_all();
             }
-            Ok(Event::Output { bytes }) => {
+            Ok(Event::Output { bytes, stderr }) => {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    callback(ProcessEvent::Output(bytes))
+                    if stderr {
+                        stderr_callback(bytes)
+                    } else {
+                        callback(ProcessEvent::Output(bytes))
+                    }
                 }))
                 .is_err()
                 {
