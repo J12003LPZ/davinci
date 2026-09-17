@@ -419,6 +419,7 @@ dependencies = [
  "davinci-session",
  "davinci-telemetry",
  "image",
+ "libc",
  "regex",
  "serde",
  "serde_json",

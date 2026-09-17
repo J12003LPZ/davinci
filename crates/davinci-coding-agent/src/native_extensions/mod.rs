@@ -66,6 +66,7 @@ pub const NATIVE_TOOLS: &[&str] = &[
 ];
 
 pub const NATIVE_COMMANDS: &[&str] = &[
+    "cache-status",
     "lsp-status",
     "memory-status",
     "memory-search",
@@ -98,6 +99,11 @@ pub const NATIVE_COMMANDS: &[&str] = &[
 /// other invocable pi command to clients and autocomplete.
 pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
     vec![
+        (
+            "cache-status",
+            "Show local cache usage and separate provider token counters.",
+            None,
+        ),
         (
             "lsp-status",
             "Show native TypeScript/JavaScript language-server sessions and availability.",
@@ -198,6 +204,7 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
+    pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
     pub governor: TokenGovernor,
     pub memory: VectorMemory,
@@ -216,6 +223,17 @@ impl NativeExtensionHost {
         agent_dir: Option<&Path>,
     ) -> Self {
         let session_key = session_key.into();
+        let cache_settings = agent_dir.map(|dir| crate::settings::load_merged_settings(dir, cwd));
+        let cache = match agent_dir {
+            Some(dir) => davinci_agent::runtime::cache::CacheRuntime::shared(
+                cache_settings
+                    .as_ref()
+                    .and_then(|s| s.cache.clone())
+                    .unwrap_or_default(),
+                dir.into(),
+            ),
+            None => davinci_agent::runtime::cache::CacheRuntime::default(),
+        };
         let governor_config = agent_dir
             .map(|dir| TokenGovernorConfig::from_file(&dir.join("token-governor.json")))
             .unwrap_or_else(TokenGovernorConfig::from_env);
@@ -226,8 +244,7 @@ impl NativeExtensionHost {
         // Only the product host sweeps: other sessions' stored outputs past
         // the retention window go, never the live session's.
         let _ = governor.sweep_stale_outputs();
-        let learning_config =
-            agent_dir.and_then(|dir| crate::settings::load_merged_settings(dir, cwd).learning);
+        let learning_config = cache_settings.and_then(|settings| settings.learning);
         let learning = LearningController::new(cwd, agent_dir, learning_config);
         let memory = VectorMemory::with_config(cwd.to_path_buf(), memory_config);
         let mut graph = GraphController::new(cwd.to_path_buf());
@@ -243,6 +260,7 @@ impl NativeExtensionHost {
         language_intelligence.set_governor(governor.clone());
         graph.language_intelligence = Some(language_intelligence.clone());
         Self {
+            cache,
             language_intelligence,
             governor,
             memory,
@@ -485,6 +503,12 @@ impl NativeExtensionHost {
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
             "memory-clear" => Ok(Some(self.memory.clear().map_err(|err| err.to_string())?)),
+            "cache-status" => Ok(Some(json!({
+                "enabled":self.cache.config().enabled, "summary":self.cache.stats().summary(),
+                "namespaces":self.cache.stats().namespaces,
+                "diskUsage":"last observed on write or explicit sweep; no startup scan",
+                "providerSource":"provider-reported usage only"
+            }))),
             "governor-status" => Ok(Some(self.governor.status())),
             "governor-reset" => {
                 self.governor.reset();
@@ -654,6 +678,22 @@ mod tests {
             result.details.unwrap()["error"]["code"],
             "invalid_source_path"
         );
+    }
+
+    #[test]
+    fn cache_status_is_lazy_and_separates_provider_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut host = NativeExtensionHost::new_with_agent_dir(
+            "cache-status-test",
+            root.path(),
+            Some(state.path()),
+        );
+        host.cache.record_provider_usage(100, 30, 4);
+        let status = host.command("cache-status", "").unwrap().unwrap();
+        assert_eq!(status["summary"]["provider"]["cacheReadTokens"], 30);
+        assert_eq!(status["summary"]["memory"]["hits"], 0);
+        assert!(!state.path().join("cache-runtime").exists());
     }
 
     struct FakeVisualBackend {

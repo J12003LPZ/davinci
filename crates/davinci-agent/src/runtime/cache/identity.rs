@@ -115,6 +115,9 @@ impl CacheIdentity {
         if self.contract_hash != previous.contract_hash {
             reasons.push(CacheMissReason::ContractChanged);
         }
+        if self.role != previous.role {
+            reasons.push(CacheMissReason::RoleChanged);
+        }
         reasons
     }
 }
@@ -131,6 +134,7 @@ pub enum CacheMissReason {
     ContextChanged,
     AgentProfileChanged,
     ContractChanged,
+    RoleChanged,
     Unknown,
 }
 
@@ -145,10 +149,22 @@ impl std::fmt::Display for CacheMissReason {
             CacheMissReason::ContextChanged => "context_changed",
             CacheMissReason::AgentProfileChanged => "agent_profile_changed",
             CacheMissReason::ContractChanged => "contract_changed",
+            CacheMissReason::RoleChanged => "role_changed",
             CacheMissReason::Unknown => "unknown",
         };
         write!(f, "{}", s)
     }
+}
+
+/// Compatibility adapter for pre-runtime prompt identities. New consumers use
+/// CacheIdentity; keeping this framing avoids invalidating existing Graph keys.
+pub fn legacy_prompt_cache_key(domain: &str, fields: &[&str], prefix: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(domain.as_bytes());
+    hash.update(b"\n");
+    hash.update(fields.join("\n").as_bytes());
+    let hex = format!("{:x}", hash.finalize());
+    format!("{prefix}{}", &hex[..16])
 }
 
 /// Compute a SHA-256 hash of an ordered list of tool names (sorted for stability).
@@ -241,6 +257,9 @@ mod tests {
     #[test]
     fn test_diff_detects_all_change_reasons() {
         let prev = sample_identity();
+        let mut changed_role = prev.clone();
+        changed_role.role = Some("another-role".into());
+        assert_eq!(changed_role.diff(&prev), vec![CacheMissReason::RoleChanged]);
 
         let mut changed_model = sample_identity();
         changed_model.model_id = "gpt-4-turbo".into();

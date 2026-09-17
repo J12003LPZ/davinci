@@ -646,9 +646,14 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             parsed.permission_mode,
         ),
     ));
+    agent.tool_context.cache = davinci_agent::runtime::cache::CacheRuntime::shared(
+        settings.cache.clone().unwrap_or_default(),
+        default_agent_dir(),
+    );
     agent.tool_context.semantic = Some(Arc::new(
-        davinci_coding_agent::semantic::NativeSemanticService::with_permissions(
+        davinci_coding_agent::semantic::NativeSemanticService::with_permissions_and_cache(
             agent.permissions.clone(),
+            agent.tool_context.cache.clone(),
         ),
     ));
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
@@ -1879,7 +1884,8 @@ fn complete_prompt_with_host(
         davinci_agent::RunId::new(),
         davinci_agent::AgentId::new(),
         runtime_bus.clone(),
-    );
+    )
+    .with_cache(agent.tool_context.cache.clone());
     let wt_mgr =
         davinci_agent::WorktreeManager::new(&agent.cwd, default_agent_dir().join("worktrees"))
             .with_bus(runtime_bus.clone());
@@ -2102,7 +2108,18 @@ fn complete_prompt_with_host(
                                 .map(|session| session.header.id.clone()),
                             cache_key: std::env::var("PI_GRAPH_CACHE_KEY")
                                 .ok()
-                                .filter(|s| !s.is_empty()),
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| Some(davinci_agent::CacheIdentity {
+                                    provider: model.provider.clone(),
+                                    model_id: model.id.clone(),
+                                    system_prompt_hash: davinci_agent::hash_system_prompt_with_manifest(&system, current.prompt_manifest.as_ref()),
+                                    tool_schema_hash: current.provider_tool_schema_identity(),
+                                    permission_surface_hash: davinci_agent::hash_tool_names(&current.visible_tool_names().iter().map(String::as_str).collect::<Vec<_>>()),
+                                    context_item_hashes: Vec::new(),
+                                    agent_profile_hash: None,
+                                    contract_hash: None,
+                                    role: Some("root".into()),
+                                }.cache_key())),
                             cache_retention: None,
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
