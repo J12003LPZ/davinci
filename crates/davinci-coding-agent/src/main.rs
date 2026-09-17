@@ -98,6 +98,7 @@ mod rpc;
 mod runtime_host;
 mod self_update;
 mod settings;
+use davinci_coding_agent::semantic;
 mod shutdown;
 mod slash;
 mod startup;
@@ -7553,6 +7554,9 @@ fn configure_security_review(
 
 fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHost) {
     if let Ok(mut native) = host.native.lock() {
+        native
+            .language_intelligence
+            .set_permissions(Some(agent.permissions.clone()));
         native.security.set_review_storage(default_agent_dir());
         native
             .graph

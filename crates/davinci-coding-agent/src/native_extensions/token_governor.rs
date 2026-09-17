@@ -1227,6 +1227,18 @@ impl TokenGovernor {
         self.stored.truncate(STORED_MANIFEST_ENTRIES);
     }
 
+    /// Retain a native tool's normalized full result before applying its semantic cap.
+    pub(crate) fn retain_native_output(
+        &mut self,
+        name: &str,
+        args: &Value,
+        content: &str,
+    ) -> Result<String, ToolError> {
+        let reference = self.store.save(content)?;
+        self.remember_stored(name, args, &reference, "json", "semantic-cap");
+        Ok(reference.id)
+    }
+
     pub fn retrieve(&mut self, args: &Value) -> Result<ToolResult, ToolError> {
         let id = args
             .get("id")

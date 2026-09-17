@@ -3,6 +3,7 @@
 pub mod content_router;
 pub mod ecosystem;
 pub mod graph;
+pub mod language_intelligence;
 pub mod learning;
 pub mod security_scan;
 pub mod token_governor;
@@ -33,6 +34,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const NATIVE_TOOLS: &[&str] = &[
+    "lsp_definition",
+    "lsp_references",
+    "lsp_hover",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
+    "lsp_implementations",
+    "lsp_type_definition",
+    "lsp_diagnostics",
     "memory_search",
     "retrieve_output",
     "graph_status",
@@ -57,6 +66,7 @@ pub const NATIVE_TOOLS: &[&str] = &[
 ];
 
 pub const NATIVE_COMMANDS: &[&str] = &[
+    "lsp-status",
     "memory-status",
     "memory-search",
     "memory-reindex",
@@ -88,6 +98,11 @@ pub const NATIVE_COMMANDS: &[&str] = &[
 /// other invocable pi command to clients and autocomplete.
 pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
     vec![
+        (
+            "lsp-status",
+            "Show native TypeScript/JavaScript language-server sessions and availability.",
+            None,
+        ),
         (
             "security-scan",
             "Start an experimental source-grounded security review.",
@@ -183,6 +198,7 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
+    pub language_intelligence: language_intelligence::LanguageIntelligence,
     pub governor: TokenGovernor,
     pub memory: VectorMemory,
     pub graph: GraphController,
@@ -219,7 +235,15 @@ impl NativeExtensionHost {
         graph.learning = Some(learning.clone());
         graph.governor = Some(governor.clone());
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
+        let language_config = agent_dir
+            .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
+            .unwrap_or_default();
+        let language_intelligence =
+            language_intelligence::LanguageIntelligence::new(cwd, language_config);
+        language_intelligence.set_governor(governor.clone());
+        graph.language_intelligence = Some(language_intelligence.clone());
         Self {
+            language_intelligence,
             governor,
             memory,
             graph,
@@ -310,6 +334,7 @@ impl NativeExtensionHost {
 
     /// A background graph run must not outlive the session that started it.
     pub fn session_shutdown(&mut self) {
+        self.language_intelligence.shutdown();
         graph::abort_all_runs();
         self.learning.cancel_active_review();
     }
@@ -411,9 +436,27 @@ impl NativeExtensionHost {
         args: &Value,
     ) -> Result<ToolResult, ToolError> {
         match name {
+            name if language_intelligence::TOOL_NAMES.contains(&name) => {
+                if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+                    let client = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
+                        .ok_or_else(||ToolError::Failed("Parent language-intelligence transport unavailable; no worker-local server is allowed".into()))?;
+                    client.call_with_timeout(name, args, None, std::time::Duration::from_secs(35))
+                } else {
+                    self.language_intelligence.execute(name, args)
+                }
+            }
             VISUAL_SNAPSHOT_TOOL => self.visual_snapshot.execute_tool(_cwd, args),
             "memory_search" => self.memory.search_tool(args),
-            "retrieve_output" => self.governor.retrieve(args),
+            "retrieve_output" => self.governor.retrieve(args).or_else(|error| {
+                if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+                    if let Some(client) =
+                        davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
+                    {
+                        return client.call(name, args);
+                    }
+                }
+                Err(error)
+            }),
             "skill_list" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let query_embedding = if !query.trim().is_empty() && self.memory.dense_available() {
@@ -437,6 +480,7 @@ impl NativeExtensionHost {
 
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
         match name {
+            "lsp-status" => Ok(Some(self.language_intelligence.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
@@ -465,6 +509,9 @@ impl NativeExtensionHost {
     }
 
     pub fn describe_tool(name: &str) -> Option<davinci_ai::ToolSpec> {
+        if language_intelligence::TOOL_NAMES.contains(&name) {
+            return language_intelligence::tool_spec(name);
+        }
         let (description, parameters) = match name {
             "memory_search" => (
                 "Search durable vector and lexical memory for supporting context.",
@@ -570,7 +617,44 @@ impl NativeExtensionHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+
+    #[test]
+    fn language_intelligence_tools_and_status_are_native_and_read_only() {
+        let _guard = graph::worker_hooks::submit_test_guard();
+        let mut host = NativeExtensionHost::default();
+        for name in language_intelligence::TOOL_NAMES {
+            assert!(host.has_tool(name));
+            assert!(host.tool_names().iter().any(|n| n == name));
+            assert!(host
+                .available_tool_specs()
+                .iter()
+                .any(|spec| spec.name == *name));
+            assert_eq!(
+                davinci_agent::tool_class(name),
+                davinci_agent::ToolClass::Read
+            );
+        }
+        assert!(command_specs()
+            .iter()
+            .any(|(name, _, _)| *name == "lsp-status"));
+        assert_eq!(
+            host.command("lsp-status", "").unwrap().unwrap()["sessions"],
+            json!([])
+        );
+        let result = host
+            .execute_tool(
+                Path::new("."),
+                "lsp_hover",
+                &json!({"path":"missing.ts","line":1,"column":1}),
+            )
+            .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            result.details.unwrap()["error"]["code"],
+            "invalid_source_path"
+        );
+    }
 
     struct FakeVisualBackend {
         image_path: std::path::PathBuf,
@@ -597,9 +681,6 @@ mod tests {
             })
         }
     }
-
-    /// PI_GRAPH_* is process-global, so the tests that toggle it run one at a time.
-    static GRAPH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct WorkerEnv;
 
@@ -628,9 +709,7 @@ mod tests {
 
     #[test]
     fn graph_submit_exists_only_inside_a_worker_process() {
-        let _lock = GRAPH_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _lock = graph::worker_hooks::submit_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let artifact = dir.path().join("artifact.json");
 
@@ -683,10 +762,7 @@ mod tests {
 
     #[test]
     fn a_worker_submits_and_is_policed_through_the_native_host() {
-        let _lock = GRAPH_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _submit = graph::worker_hooks::submit_test_guard();
+        let _lock = graph::worker_hooks::submit_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let artifact = dir.path().join("artifact.json");
         let _env = WorkerEnv::set(&artifact);
