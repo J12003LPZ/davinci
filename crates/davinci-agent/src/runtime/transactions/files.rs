@@ -78,7 +78,10 @@ fn capture_in(dir: &Directory, name: &str) -> Result<(Image, Option<Vec<u8>>), S
         Err(e) => return Err(format!("confined source read: {e}")),
     };
     let before = file.metadata().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    super::windows_metadata::ensure_replaceable(&file)?;
     let identity = identity(&file, &before)?;
+    let windows_metadata = super::windows_metadata::capture(&before);
     let xattrs = super::unix_xattrs::capture(&file)?;
     let macos_acl = super::macos_acl::capture(&file)?;
     #[cfg(windows)]
@@ -98,6 +101,7 @@ fn capture_in(dir: &Directory, name: &str) -> Result<(Image, Option<Vec<u8>>), S
         || before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
         || mode(&before) != mode(&after)
+        || windows_metadata != super::windows_metadata::capture(&after)
         || unix_owner(&before) != unix_owner(&after)
         || xattrs != super::unix_xattrs::capture(&file)?
         || macos_acl != super::macos_acl::capture(&file)?
@@ -112,6 +116,7 @@ fn capture_in(dir: &Directory, name: &str) -> Result<(Image, Option<Vec<u8>>), S
             identity: Some(identity),
             mode: Some(mode(&after)),
             access: access(&file)?,
+            windows_metadata,
             unix_owner: unix_owner(&after),
             macos_acl,
             xattrs,
@@ -134,6 +139,8 @@ pub(super) fn stage(
     let name = format!(".davinci-txn-{}.tmp", uuid::Uuid::new_v4());
     let result = (|| {
         let mut file = dir.stage_file(&name).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        super::windows_metadata::prepare_stage(&file)?;
         #[cfg(test)]
         failure_tests::before_write(&mut file, bytes)?;
         file.write_all(bytes).map_err(|e| e.to_string())?;
@@ -157,6 +164,7 @@ pub(super) fn stage(
         #[cfg(windows)]
         {
             super::windows_streams::restore(&dir, &name, &file, &original.streams)?;
+            super::windows_metadata::restore(&file, original.windows_metadata.as_ref())?;
             if let Some(access) = &original.access {
                 super::windows_acl::apply(&file, access)?;
             }
@@ -176,6 +184,7 @@ pub(super) fn stage(
                 identity: Some(identity(&file, &metadata)?),
                 mode: Some(mode(&metadata)),
                 access: access(&file)?,
+                windows_metadata: super::windows_metadata::capture(&metadata),
                 unix_owner: unix_owner(&metadata),
                 macos_acl: super::macos_acl::capture(&file)?,
                 xattrs: super::unix_xattrs::capture(&file)?,
@@ -209,7 +218,7 @@ pub(super) fn replace(
                 "conflict: staged bytes or identity changed for {path}"
             ));
         }
-        dir.replace_source(staged, &name, expected.hash.is_some())
+        dir.replace_source(staged, &name, expected.hash.is_some(), true)
             .map_err(|e| format!("replace {path}: {e}"))
     } else if expected.hash.is_some() {
         dir.remove_source(&name)

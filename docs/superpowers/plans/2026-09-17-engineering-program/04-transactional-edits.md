@@ -871,3 +871,122 @@ Clippy with warnings denied passed. The execution/evidence correction is a
 separate commit from the unfinished Windows metadata working changes. Legacy
 descendant-held pipe cleanup remains open; honoring the timer for a direct
 PowerShell process does not prove descendant cleanup. Native CI is still required.
+
+### Windows journal format boundary
+
+Windows records now use schema 2 because captured files require creation time
+and attributes. Other platforms retain schema 1. Loading a Windows schema-1
+record returns an explicit unsupported-schema error and leaves the record and
+source intact; there is no automatic migration that guesses lost metadata from
+the current source. Recover legacy records with the original implementation
+before upgrading. This is an intentional compatibility boundary, not a claim
+that old records have been migrated or their recovery defects repaired.
+
+Schema-2 captured images with omitted Windows metadata are also rejected before
+mutation. New-file proposals may lack metadata until a real staged file exists.
+The regression first demonstrated that a legacy record was incorrectly applied
+(RED), then passed after the format gate (GREEN), checking both unchanged source
+bytes and unchanged journal bytes. The targeted transaction tests passed:
+`rtk cargo test -p davinci-agent --offline --locked --lib transaction` — 38 passed.
+These changes remain part of the uncommitted Windows metadata work; remaining
+replacement metadata and native CI gates still prevent P4 completion.
+
+### Inherited compression validation and current CI
+
+Added a real NTFS fixture that marks its temporary parent directory compressed,
+confirms a newly created file inherits compression, then explicitly uncompresses
+that file. Transaction edit and delete/rollback preserve its uncompressed state,
+creation time, attributes, and bytes even though each private stage inherits
+compression from the parent. This exercises the clear-compression branch rather
+than only compression enablement. The three `windows_metadata` tests passed;
+formatting passed. Directory inheritance semantics were checked against
+[FSCTL_SET_COMPRESSION](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_set_compression).
+
+On pushed commit `92bc071`, CI run `35280267775` passed workspace tests and
+quality; Windows native job `105400313288` failed with the same four
+`transaction restore image mismatch: access` errors in source-stage failure,
+journal failure, rollback-journal failure, and explicit-dispatch recovery tests.
+The working Windows changes were not present in that run. Linux native passed;
+macOS native was still building its transaction worker at the last observation.
+
+### Object-ID safety boundary
+
+The Windows staging format cannot transfer an NTFS object identifier safely.
+Source capture now queries the pinned handle before reading contents and refuses
+files that carry one. It never creates, deletes, or transfers production object
+IDs. This is an explicit unsupported-file case, not object-ID-preserving edit
+support. It prevents silently losing identifiers through replacement or delete.
+Microsoft documents that applications should not modify these identifiers:
+[FSCTL_GET_OBJECT_ID](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_get_object_id).
+
+A temporary NTFS fixture creates its own object ID, then proves edit and delete
+previews refuse while the source bytes and complete identifier buffer remain
+unchanged. After correcting the fixture to close its write handle before source
+capture, the regression failed because preview incorrectly succeeded (RED), then
+passed after the query guard (GREEN). Local NTFS reports error 2 for a missing
+object ID on an existing pinned file; the initial guard rejected that case and
+the transaction suite caught it. The corrected guard accepts that absence,
+explicit no-object errors, and unsupported control codes, while propagating
+other query failures.
+
+Validation: all 40 `--lib transaction` tests passed; after consolidating the
+Windows API declaration, all four `--lib windows_metadata` tests and agent
+all-target Clippy with warnings denied passed. Formatting passed. No native CI
+has tested these working changes. CI run `35280267775` is now terminal failure
+on the pushed commit. Encryption and short-name preservation remain unresolved;
+the object-ID refusal does not establish complete replacement metadata safety.
+
+### Encrypted-source journal boundary
+
+Source capture now rejects FILE_ATTRIBUTE_ENCRYPTED on the pinned Windows file
+before reading default or named streams. EFS read handles expose decrypted data;
+the transaction JSON journal has no encrypted recovery-blob format. This prevents
+silently recording decrypted preimages. Loading a journal image marked encrypted
+also fails before apply changes the source. Encrypted-file editing remains
+unsupported; this is not an implementation of encrypted recovery storage.
+
+The attribute-level regression failed before enforcement and passed afterwards.
+The real journal/apply rejection test additionally injects the encrypted bit into
+a stored image and verifies both source and record bytes remain unchanged.
+`rtk cargo test -p davinci-agent --offline --locked --lib transaction` passed
+41 tests. Formatting and diff checks passed. No live EFS fixture was created:
+validation covers the metadata policy and journal/apply boundary, not an actual
+encrypted-file lifecycle. Short-name handling and native CI for the working
+metadata changes remain outstanding.
+
+### Windows short-name boundary and private stages
+
+Source capture now queries the pinned handle for an alternate short name and
+refuses replacement when one exists. The NTFS fixture assigns `ALIAS.TXT` and
+verifies both edit and delete preview preserve the source and alias. This is an
+unsupported-source boundary, not short-name-preserving editing; it also affects
+ordinary files on volumes that automatically assign 8.3 names.
+
+Exclusively created private stages request DELETE access and backup semantics so
+their generated alias can be removed before content is written. Stage preparation
+then checks the same encryption/object-ID/short-name constraints as source
+capture. A real fixture assigns `STAGE.TMP` to a private stage, prepares and
+publishes it, and verifies the content exists only under the published long name.
+No source alias is removed by this operation.
+
+Validation: all 43 focused `davinci-agent --lib transaction` tests passed on
+Windows, including private-stage publication. Formatting and agent all-target
+Clippy with warnings denied passed. These changes remain unpublished and native
+CI has not validated them. Full security metadata coverage and source short-name
+support remain limitations; this checkpoint does not complete Project 4.
+
+### Mandatory integrity label preservation
+
+A real NTFS fixture with an explicit low-integrity, no-write-up label reproduced
+another replacement defect: apply dropped the label (RED). The bounded security
+snapshot now includes LABEL_SECURITY_INFORMATION alongside resource attributes;
+stage restoration sets both using the existing handle rights. Empty filtered
+SACLs are canonicalized without changing DACL semantics. This requires no token
+privilege changes: Microsoft documents READ_CONTROL for label queries and
+WRITE_OWNER for setting labels in
+[SECURITY_INFORMATION](https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information).
+
+The fixture now verifies exact descriptor preservation after edit, delete and
+rollback (GREEN). All 44 focused transaction tests passed; formatting and agent
+all-target Clippy with warnings denied passed. Full audit SACL preservation is
+not established by this test, and native CI for these changes remains pending.

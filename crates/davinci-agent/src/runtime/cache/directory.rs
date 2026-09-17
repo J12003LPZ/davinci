@@ -299,13 +299,15 @@ impl Directory {
         {
             use std::os::windows::fs::OpenOptionsExt;
             valid_name(name)?;
-            // GENERIC_WRITE, READ_CONTROL, WRITE_DAC and WRITE_OWNER on our exclusive new file.
+            // GENERIC_READ/WRITE (compression restore), READ_CONTROL, WRITE_DAC
+            // WRITE_OWNER and DELETE (clear generated short name) only on our
+            // exclusive new staging file.
             OpenOptions::new()
                 .write(true)
-                .access_mode(0x400e0000)
+                .access_mode(0xc00f0000)
                 .create_new(true)
                 .share_mode(1)
-                .custom_flags(0x00200000)
+                .custom_flags(0x02200000)
                 .open(self.path.join(name))
         }
     }
@@ -320,7 +322,13 @@ impl Directory {
 
     /// Replace a single ordinary source entry from an exclusively created sibling.
     /// Callers verify the destination identity immediately before this operation.
-    pub(crate) fn replace_source(&self, temp: &str, name: &str, existing: bool) -> io::Result<()> {
+    pub(crate) fn replace_source(
+        &self,
+        temp: &str,
+        name: &str,
+        existing: bool,
+        _staged_metadata: bool,
+    ) -> io::Result<()> {
         valid_name(temp)?;
         valid_source_name(name)?;
         #[cfg(unix)]
@@ -394,11 +402,13 @@ impl Directory {
                 .encode_wide()
                 .chain(Some(0))
                 .collect();
-            // ReplaceFile preserves the destination DACL, streams and creation attributes.
-            // No IGNORE_* flag: failure to preserve metadata fails the transaction.
-            // For creates, omit REPLACE_EXISTING so a concurrent creator is protected.
-            let result = if existing {
-                unsafe {
+            // The transaction already stages and verifies its supported metadata
+            // image. ReplaceFileW would merge/rewrite that DACL (including legacy
+            // inheritance flags) after validation. Rename the staged image intact.
+            // For creates, omit REPLACE_EXISTING to protect concurrent creators.
+            let result = unsafe {
+                if existing && !_staged_metadata {
+                    // Journals do not stage metadata; retain their destination ACL.
                     ReplaceFileW(
                         name.as_ptr(),
                         temp.as_ptr(),
@@ -407,9 +417,9 @@ impl Directory {
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                     )
+                } else {
+                    MoveFileExW(temp.as_ptr(), name.as_ptr(), 8 | u32::from(existing))
                 }
-            } else {
-                unsafe { MoveFileExW(temp.as_ptr(), name.as_ptr(), 8) }
             };
             if result == 0 {
                 return Err(io::Error::last_os_error());

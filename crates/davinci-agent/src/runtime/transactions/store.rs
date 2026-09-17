@@ -59,8 +59,10 @@ impl Store {
             && owner.parent_agent_id.is_none()
             && original.graph_node.is_none()
             && owner.graph_node.is_none();
-        if record.schema != 1
-            || record.summary.id != id
+        if record.schema != RECORD_SCHEMA {
+            return Err("unsupported transaction journal schema; preserve the record for recovery with its original version".into());
+        }
+        if record.summary.id != id
             || (original != owner && !resumed_owner)
             || Path::new(&record.summary.workspace) != root
         {
@@ -141,7 +143,7 @@ impl Store {
                 }
             };
             self.directory
-                .replace_source(&temp, name, existing)
+                .replace_source(&temp, name, existing, false)
                 .map_err(|e| e.to_string())
         })();
         if result.is_err() {
@@ -264,6 +266,10 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
                 ("content", restored.hash == change.before.hash),
                 ("mode", restored.mode == change.before.mode),
                 ("access", restored.access == change.before.access),
+                (
+                    "windows_metadata",
+                    restored.windows_metadata == change.before.windows_metadata,
+                ),
                 ("owner", restored.unix_owner == change.before.unix_owner),
                 ("macos_acl", restored.macos_acl == change.before.macos_acl),
                 ("xattrs", restored.xattrs == change.before.xattrs),
@@ -324,6 +330,16 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
 }
 
 fn validate_image(image: &Image) -> Result<(), String> {
+    #[cfg(windows)]
+    if let Some(metadata) = &image.windows_metadata {
+        super::windows_metadata::ensure_snapshot_attributes(metadata.attributes)?;
+    }
+    if cfg!(windows) && image.identity.is_some() && image.windows_metadata.is_none() {
+        return Err("missing Windows transaction metadata".into());
+    }
+    if image.windows_metadata.is_some() && !cfg!(windows) {
+        return Err("Windows transaction metadata on unsupported platform".into());
+    }
     if let Some(acl) = &image.macos_acl {
         super::macos_acl::validate(acl)?;
         if !cfg!(target_os = "macos") {
@@ -352,6 +368,7 @@ fn validate_image(image: &Image) -> Result<(), String> {
         && (image.identity.is_some()
             || image.mode.is_some()
             || image.access.is_some()
+            || image.windows_metadata.is_some()
             || image.unix_owner.is_some()
             || image.macos_acl.is_some()
             || !image.xattrs.is_empty()
@@ -380,6 +397,48 @@ fn validate_image(image: &Image) -> Result<(), String> {
 mod failure_tests {
     use super::super::{ProposedChange, TransactionCoordinator, TransactionState};
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn transaction_rejects_legacy_or_incomplete_windows_images_without_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        std::fs::write(root.join("file.txt"), b"before").unwrap();
+        let owner = TransactionOwner::default();
+        let manager = TransactionCoordinator::new(&root, owner.clone()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("file.txt", b"after".to_vec())])
+            .unwrap();
+        let store = Store::open(&root).unwrap();
+        let original = store.load(&preview.id, &root, &owner, false).unwrap();
+        for case in ["legacy", "missing", "encrypted"] {
+            let mut record = original.clone();
+            let expected = if case == "legacy" {
+                record.schema = 1;
+                "unsupported transaction journal schema; preserve the record for recovery with its original version"
+            } else if case == "missing" {
+                record.changes[0].before.windows_metadata = None;
+                "missing Windows transaction metadata"
+            } else {
+                record.changes[0]
+                    .before
+                    .windows_metadata
+                    .as_mut()
+                    .unwrap()
+                    .attributes |= 0x4000;
+                "transaction cannot journal an encrypted Windows file"
+            };
+            store.save(&record).unwrap();
+            assert_eq!(
+                manager.apply(&preview.id, &|_| Ok(()), None).unwrap_err(),
+                expected
+            );
+            assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"before");
+            let bytes =
+                std::fs::read(root.join(STORE_NAME).join(format!("{}.json", preview.id))).unwrap();
+            assert_eq!(bytes, serde_json::to_vec(&record).unwrap());
+        }
+    }
 
     #[test]
     fn transaction_restore_mismatch_identifies_field_without_metadata_values() {

@@ -8,6 +8,9 @@ pub const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RECORD_BYTES: u64 = 192 * 1024 * 1024;
 pub const MAX_RECORDS: usize = 128;
 pub const STORE_NAME: &str = ".davinci-transactions";
+// Windows v2 requires creation time and attributes for every captured file.
+// These values cannot be reconstructed safely from a legacy rollback journal.
+pub(super) const RECORD_SCHEMA: u32 = if cfg!(windows) { 2 } else { 1 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,11 +122,20 @@ impl SourceSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct WindowsMetadata {
+    pub created: u64,
+    pub attributes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Image {
     pub hash: Option<String>,
     pub identity: Option<String>,
     pub mode: Option<u32>,
     pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_metadata: Option<WindowsMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unix_owner: Option<[u32; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,6 +152,7 @@ impl Image {
             identity: None,
             mode: None,
             access: None,
+            windows_metadata: None,
             unix_owner: None,
             macos_acl: None,
             xattrs: BTreeMap::new(),

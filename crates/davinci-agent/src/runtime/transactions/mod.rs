@@ -12,6 +12,7 @@ pub use verification::{TransactionVerification, VerificationObservation};
 pub(crate) mod tools;
 #[cfg(windows)]
 mod windows_acl;
+mod windows_metadata;
 #[cfg(windows)]
 mod windows_streams;
 pub(crate) use api::execute;
@@ -119,6 +120,7 @@ impl TransactionCoordinator {
                     identity: None,
                     mode: before.mode.or(Some(0o644)),
                     access: before.access.clone(),
+                    windows_metadata: before.windows_metadata.clone(),
                     unix_owner: before.unix_owner,
                     macos_acl: before.macos_acl.clone(),
                     xattrs: before.xattrs.clone(),
@@ -167,7 +169,7 @@ impl TransactionCoordinator {
             warnings: Vec::new(),
         };
         let record = Record {
-            schema: 1,
+            schema: RECORD_SCHEMA,
             summary,
             changes,
         };
