@@ -1,6 +1,6 @@
 # P3: Browser / Playwright Verification
 
-Status: design approved by the user on 2026-09-17; implementation pending.
+Status: design approved by the user on 2026-09-17; implementation in progress.
 Execution sequence: 4 of 12.
 Dependencies: P2 and P4 green; existing interaction_testing protocol/evidence/artifact contracts.
 Requirements authority: project section 8 and cross-cutting sections 18-40;
@@ -90,3 +90,30 @@ does not authorize merging new PRs into main.
 The handoff in README records files/APIs changed, validated commands and results,
 metric/artifact paths, head SHA/CI URLs, limitations, and the next dependency input.
 No production capability is called done from this plan alone.
+
+## Observed baseline and initial RED
+
+The next branch is `codex/browser-verification-01a0ad48`, stacked on validated
+P4 `a2054d3` in the same isolated worktree. Fetched main remains `ca9fe69`.
+The existing adapter has no production caller, and its receipts deliberately
+remain FixtureOnly. Its 11 existing focused unit tests passed (1009 filtered).
+
+Installed Node v24.19.0 and the existing host-installed Python Playwright driver
+package 1.62.0 launched Chromium 151.0.7922.34 successfully, with service workers
+blocked in a new context. Both context and browser closed. One cold sample from
+before launch through page creation measured 429.1058 ms; no improvement is claimed.
+The actual context routeWebSocket and locator ariaSnapshot methods were functions.
+Exact paths and scope are in [p3-browser-baseline.json](evidence/p3-browser-baseline.json).
+No project node_modules package was executed and no installation/download ran.
+The maintained APIs were also checked against official
+[BrowserContext](https://playwright.dev/docs/api/class-browsercontext),
+[WebSocketRoute](https://playwright.dev/docs/api/class-websocketroute), and
+[ARIA snapshot](https://playwright.dev/docs/aria-snapshots) documentation.
+
+Five regression tests ran and failed before the first production edit: URL
+credentials were accepted, passing assertions ignored console/network errors,
+JSONL allowed a 1 MiB event, and event/snapshot queues grew beyond the budget.
+The selector was `--lib interaction_testing::browser::tests::browser_` (zero
+passed, five failed, 1020 filtered). These are existing-adapter defects to fix
+before attaching the live backend. Real-browser workflow, native dispatch,
+request-time authorization and every P3 milestone gate remain open.

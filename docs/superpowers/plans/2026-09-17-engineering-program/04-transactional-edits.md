@@ -1,6 +1,6 @@
 # P4: Transactional Edit Engine
 
-Status: design approved by the user on 2026-09-17; implementation in progress.
+Status: completed at `a2054d30d539f0c54aa30c589fd5fa701f49200e`; design approved 2026-09-17.
 Execution sequence: 3 of 12.
 Dependencies: P2 green; existing apply_patch journal, mutation confinement, effects/checkpoints/rewind.
 Requirements authority: project section 9 and cross-cutting sections 18-40;
@@ -1146,3 +1146,47 @@ The semantic rename module currently produces read-only previews and string edit
 its apply helpers have no production mutation caller to wrap. Existing production
 write/edit/apply_patch paths all use the coordinator. No unused second semantic
 mutation interface was introduced.
+
+## Final completion record and P3 handoff
+
+CI [35286634815](https://github.com/J12003LPZ/davinci/actions/runs/35286634815)
+completed successfully at `a2054d30d539f0c54aa30c589fd5fa701f49200e`.
+Workflow lint and Security SARIF also passed at that head. This supersedes the
+historical pending/failing CI entries above. All 22 CI jobs passed, including
+quality, every workspace package shard, and the Windows/Linux/macOS native lanes.
+Machine-readable log excerpts are in [p4-ci-platforms.json](evidence/p4-ci-platforms.json).
+
+| Section-34 gate | Observed evidence |
+| --- | --- |
+| 1 Design approved | User approval 2026-09-17, recorded in README |
+| 2 Plan exists | This approved plan and unchanged requirements |
+| 3 RED/GREEN | Ownership, stale-write, metadata, short-name and verification cases recorded above; coverage-only additions identified separately |
+| 4 Package tests | Exact-head CI: agent 998 passed/3 ignored; coding agent 2297 passed/18 ignored; zero failed |
+| 5 Format | Local formatting checks and CI quality Format passed |
+| 6 Clippy | Local affected checks and CI workspace quality Clippy passed |
+| 7 Integration | Real filesystem crash/recovery, CLI, commit/worktree, verification, Repo/LSP refresh cases passed |
+| 8 Security | Current authority/owner/root/alias checks, stale rollback, forged/foreign journal and source-bound receipt cases passed |
+| 9 Normal path | Real normal-agent edit/test-plan/verification and packaged CLI paths passed on all native platforms |
+| 10 Graph | Actual parent-launched worker mutation, graph_submit provenance and recovery passed on all native platforms |
+| 11 Eval | Baseline/after JSON artifacts and native offline transaction eval passed on all three platforms; single debug timing samples are not a performance improvement claim |
+| 12 Docs | Transaction guide, plan, requirement ledger and evidence updated |
+| 13 Review | Solo source/diff and requirement audit; no agents per user instruction |
+| 14 CI | All jobs successful at the exact tested head above |
+
+P4 is complete within its documented contract. It is not an OS-atomic multi-file
+transaction or a power-loss guarantee. Windows directory sync is not established;
+final external-actor CAS/rename races and pre-journal private-stage orphans remain
+explicit limitations. Unsupported EFS/object-ID metadata fails before mutation;
+full audit-SACL/process-trust/capability preservation is not established. Windows
+schema 1/2 journals require their original recovery version. Store bounds fail
+closed without automatic archiving. The fixture LSP invalidation test is not a
+real TypeScript compiler test. P10 owns additional verification adapters.
+
+The next branch stacks on this tested head without rewriting it. P3 consumes
+P2 resource leases/supervision and P4 source/transaction-bound evidence. Core
+ownership is `davinci-agent/src/runtime/transactions`, existing mutation tools,
+coding-agent native transaction adapters, and existing verification/Graph
+receipt paths. It must reuse those contracts rather than invent another registry,
+permission system or evidence store. PR #11 remains open; no merge is authorized
+by program implementation approval. No running service needs restart for this
+documentation handoff; consuming the implementation requires a rebuilt DaVinci.

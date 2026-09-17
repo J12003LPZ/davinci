@@ -1,11 +1,8 @@
 # Engineering program ledger
 
-Status: design package approved; P1 and P2 validated; P4 implementation in progress.
-Latest P4 follow-up distinguishes redundant DOS spellings from distinct Windows
-short aliases. Head `055b938` passed affected package tests but failed the native
-Windows normal-agent edit case; the follow-up passes 50 focused transaction tests
-locally. Full P4 gates remain open pending the corrected head's native CI; see
-its plan for evidence and limitations.
+Status: design package approved; P1, P2 and P4 validated; P3 implementation in progress.
+P4 head `a2054d3` passed CI, including Windows/Linux/macOS native transaction,
+normal-agent and Graph paths. Its evidence and limitations remain in its plan.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 [unchanged supplied requirements](../../specs/2026-09-17-engineering-program-requirements.md).
@@ -14,7 +11,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 - Date: 2026-09-17.
 - Fetched remote main: `ca9fe69cd0da21bf161af25b2bed681748fb0d58`.
-- Current branch: `codex/transactional-edits-01a0ad48`.
+- Current branch: `codex/browser-verification-01a0ad48`, stacked on validated P4.
 - Worktree: `C:/Users/sergi/.claude-worktrees/pi-rust-9416e5cee6/01a0ad48`.
 - Git worktree admin path differs from common Git directory; isolation verified.
 - Shared checkout has pre-existing changes and divergent local main. Preserved.
@@ -33,8 +30,8 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | --- | --- | --- | --- | --- | --- |
 | 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
-| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | In progress; draft PR #11 | Approved | Targeted checks passed; full gates open | Windows failure at `055b938`; correction awaits native CI |
-| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
+| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 open | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3` |
+| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | In progress; baseline inspection | Approved | Not run | Not pushed |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Planned | Approved | Not run | Not pushed |
