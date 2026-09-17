@@ -124,6 +124,7 @@ pub fn is_sensitive_file_path(path: &str) -> bool {
 
 pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
+        "test_related" | "test_impacted" | "test_plan" => ToolClass::Read,
         "repo_map"
         | "symbol_search"
         | "file_symbols"

@@ -21,10 +21,24 @@ pub struct RepoIndex {
     pub reparsed: usize,
     #[serde(skip)]
     pub bytes_read: usize,
+    #[serde(skip)]
+    pub files_read: usize,
+    #[serde(skip)]
+    pub refresh_mode: String,
     pub warnings: Vec<String>,
 }
 
 impl RepoIndex {
+    /// The same resolved import edges used by native repository queries.
+    pub fn dependencies(&self) -> Vec<super::Dependency> {
+        super::graph::dependencies(self)
+    }
+
+    /// Conservative path hints for an unresolved import (for deleted-source impact).
+    pub fn missing_dependency_candidates(&self, from: &str, specifier: &str) -> Vec<String> {
+        super::graph::missing_candidates(self, from, specifier)
+    }
+
     pub(super) fn empty(root: String, config_identity: String) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -38,6 +52,8 @@ impl RepoIndex {
             updated_ms: 0,
             reparsed: 0,
             bytes_read: 0,
+            files_read: 0,
+            refresh_mode: "full".into(),
             warnings: Vec::new(),
         }
     }

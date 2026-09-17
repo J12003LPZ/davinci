@@ -4,6 +4,7 @@ mod index;
 mod languages;
 mod manager;
 mod modules;
+mod observation;
 mod parser;
 mod queries;
 mod scanner;
@@ -16,8 +17,10 @@ pub use tools::{is_repo_tool, tool_spec};
 #[allow(unused_imports)]
 pub use unified::{SemanticEvidence, SemanticLanguageProvider, SemanticOperation};
 
+pub use graph::Dependency;
 pub use index::RepoIndex;
 pub use manager::{RepoIntelligence, RepoIntelligenceConfig};
+pub(crate) use scanner::config_file;
 
 pub use languages::LanguageAdapter;
 pub use parser::parse_source;

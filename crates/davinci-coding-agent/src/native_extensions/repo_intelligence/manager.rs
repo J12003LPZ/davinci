@@ -14,6 +14,7 @@ pub struct RepoIntelligenceConfig {
     pub max_file_bytes: usize,
     pub max_results: usize,
     pub persist_index: bool,
+    pub observe_changes: bool,
 }
 impl Default for RepoIntelligenceConfig {
     fn default() -> Self {
@@ -22,6 +23,7 @@ impl Default for RepoIntelligenceConfig {
             max_file_bytes: 1_000_000,
             max_results: 25,
             persist_index: true,
+            observe_changes: true,
         }
     }
 }
@@ -30,6 +32,7 @@ impl Default for RepoIntelligenceConfig {
 struct SharedIndex {
     snapshot: RwLock<Option<Arc<RepoIndex>>>,
     refresh: Mutex<()>,
+    observation: Mutex<super::observation::Observation>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +123,40 @@ impl RepoIntelligence {
         Ok(relative)
     }
 
+    /// A deleted source is a valid impact input, but linked/outside ancestors are not.
+    pub fn validate_changed_path(&self, raw: &str) -> Result<String, String> {
+        if raw.len() > 4096 {
+            return Err("invalid_path: path length".into());
+        }
+        let relative = scanner::validate_relative(raw)?;
+        let mut current = self.root.clone();
+        let mut parts = Vec::new();
+        for part in relative.components() {
+            if let std::path::Component::Normal(part) = part {
+                current.push(part);
+                parts.push(part.to_string_lossy().to_string());
+                match std::fs::symlink_metadata(&current) {
+                    Ok(meta) if scanner::linked(&meta) => {
+                        return Err("outside_workspace: linked path".into())
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err("invalid_path: metadata unavailable".into()),
+                }
+            }
+        }
+        if parts.is_empty() {
+            return Err("invalid_path: source or config required".into());
+        }
+        Ok(parts.join("/"))
+    }
+
+    /// Bounded, confined configuration read for deterministic index consumers.
+    pub fn read_project_file(&self, path: &str, limit: usize) -> Result<String, String> {
+        let relative = self.validate_path(path)?;
+        scanner::read_bounded(&self.root, &relative, limit.min(1_000_000))
+    }
+
     #[allow(dead_code)] // Public diagnostics/evaluation API, also compiled in the CLI.
     pub fn cache_path(&self) -> Result<PathBuf, String> {
         Ok(storage::directory(&self.agent_dir, &self.root)?.join("index.json"))
@@ -130,7 +167,8 @@ impl RepoIntelligence {
             .shared
             .snapshot
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let index = snapshot.as_ref();
         json!({
             "root": self.root, "enabled": self.config.enabled, "initialized": index.is_some(),
@@ -141,10 +179,30 @@ impl RepoIntelligence {
             "last_incremental_refresh_ms": index.map(|i| i.updated_ms),
             "cache_state": if self.config.persist_index { "persistent" } else { "memory_only" },
             "parse_failures": index.map_or(0, |i| i.files.values().filter(|f| f.parse_status != "ok").count()),
+            "observation":self.shared.observation.lock().unwrap_or_else(|e|e.into_inner()).status(),
         })
     }
 
     pub fn refresh(&self) -> Result<Arc<RepoIndex>, String> {
+        self.refresh_authorized(&|_| Ok(()))
+    }
+
+    /// Consumers may impose current read policy before any source/config read.
+    pub fn refresh_authorized(
+        &self,
+        authorize: &impl Fn(&str) -> Result<(), String>,
+    ) -> Result<Arc<RepoIndex>, String> {
+        self.refresh_observed_authorized(&[], true, authorize)
+    }
+
+    /// Warm planning uses observed changes plus fresh inventory and input reads.
+    /// Set `force` for full content reconciliation at a verification boundary.
+    pub fn refresh_observed_authorized(
+        &self,
+        changed: &[String],
+        force: bool,
+        authorize: &impl Fn(&str) -> Result<(), String>,
+    ) -> Result<Arc<RepoIndex>, String> {
         if !self.config.enabled {
             return Err("index_unavailable: disabled".into());
         }
@@ -160,6 +218,12 @@ impl RepoIntelligence {
         if root != self.root {
             return Err("outside_workspace: root identity changed".into());
         }
+        let mut observation = self
+            .shared
+            .observation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        observation.start(&root, self.config.observe_changes);
         let identity = digest(
             serde_json::to_string(&self.config)
                 .unwrap_or_default()
@@ -179,75 +243,132 @@ impl RepoIntelligence {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let disk = directory
-            .as_ref()
-            .and_then(|d| storage::load(d, &root.to_string_lossy(), &identity));
-        let mut index = disk
-            .or_else(|| existing.as_deref().cloned())
+        let base = existing
+            .as_deref()
+            .cloned()
+            .or_else(|| {
+                directory
+                    .as_ref()
+                    .and_then(|d| storage::load(d, &root.to_string_lossy(), &identity))
+            })
             .unwrap_or_else(|| RepoIndex::empty(root.to_string_lossy().into(), identity));
-        let scan = scanner::scan(&root)?;
-        index.reparsed = 0;
-        index.bytes_read = 0;
-        index.warnings = scan.warnings;
-        if self.config.persist_index && directory.is_none() {
-            index
-                .warnings
-                .push("persistent cache unavailable; using memory".into());
-        }
-        let mut files = BTreeMap::new();
-        let mut records = 0usize;
-        for path in scan.sources {
-            match scanner::read_bounded(&root, Path::new(&path), self.config.max_file_bytes) {
-                Ok(source) => {
-                    index.bytes_read += source.len();
-                    if index.bytes_read > 64 * 1024 * 1024 {
-                        index.warnings.push("repository source byte limit".into());
-                        break;
+        let mut bytes_read = 0;
+        let mut files_read = 0;
+        let mut reparsed = 0;
+        for attempt in 0..3 {
+            let mut dirty = observation.drain(&root).paths;
+            dirty.extend(changed.iter().cloned());
+            let scan =
+                match scanner::scan(&root, authorize, |path| observation.watch_directory(path)) {
+                    Ok(scan) => scan,
+                    Err(error) => {
+                        observation.needs_full = true;
+                        return Err(error);
                     }
-                    let hash = digest(source.as_bytes());
-                    let file = match index.files.get(&path).filter(|f| f.content_hash == hash) {
-                        Some(file) => file.clone(),
-                        None => {
-                            index.reparsed += 1;
-                            Arc::new(parse_source(&path, &source)?)
+                };
+            dirty.extend(observation.drain(&root).paths);
+            let full = force || attempt > 0 || observation.full_required();
+            // Errors/cancellation cannot leave consumed events trusted on retry.
+            observation.needs_full = true;
+            let mut index = base.clone();
+            index.warnings = scan.warnings;
+            if self.config.persist_index && directory.is_none() {
+                index
+                    .warnings
+                    .push("persistent cache unavailable; using memory".into());
+            }
+            let mut files = BTreeMap::new();
+            let mut records = 0usize;
+            let mut source_bytes = 0u64;
+            for path in &scan.sources {
+                authorize(path)?;
+                let cached = base.files.get(path);
+                let reusable = !full
+                    && !dirty.contains(path)
+                    && observation.stamps.get(path) == scan.stamps.get(path);
+                let (file, file_bytes) = if let Some(file) = cached.filter(|_| reusable) {
+                    (
+                        file.clone(),
+                        scan.stamps.get(path).map_or(0, |stamp| stamp.len),
+                    )
+                } else {
+                    let source = match scanner::read_bounded(
+                        &root,
+                        Path::new(path),
+                        self.config.max_file_bytes,
+                    ) {
+                        Ok(source) => source,
+                        Err(reason) => {
+                            if index.warnings.len() < 32 {
+                                index.warnings.push(format!("{path}: {reason}"));
+                            }
+                            continue;
                         }
                     };
-                    records += file.symbols.len() + file.edges.len();
-                    if records > 250_000 {
-                        index
-                            .warnings
-                            .push("repository structural record limit".into());
-                        break;
-                    }
-                    files.insert(path, file);
+                    bytes_read += source.len();
+                    files_read += 1;
+                    let hash = digest(source.as_bytes());
+                    let file = match cached.filter(|f| f.content_hash == hash) {
+                        Some(file) => file.clone(),
+                        None => {
+                            reparsed += 1;
+                            Arc::new(parse_source(path, &source)?)
+                        }
+                    };
+                    (file, source.len() as u64)
+                };
+                source_bytes += file_bytes;
+                records += file.symbols.len() + file.edges.len();
+                if source_bytes > 64 * 1024 * 1024 || records > 250_000 {
+                    index
+                        .warnings
+                        .push("repository source/structural record limit".into());
+                    break;
                 }
-                Err(reason) => {
-                    if index.warnings.len() < 32 {
-                        index.warnings.push(format!("{path}: {reason}"));
+                files.insert(path.clone(), file);
+            }
+            index.files = files;
+            index.metadata = scan.metadata;
+            for path in &index.metadata {
+                authorize(path)?;
+            }
+            index.aliases = super::modules::collect(&root, &index.metadata);
+            index.text_files = scan.text_files;
+            let pending = observation.drain(&root);
+            if pending.rescan
+                || pending.paths.iter().any(|p| {
+                    super::LanguageAdapter::for_path(p).is_some()
+                        || index.metadata.contains(p)
+                        || !root.join(p).is_file()
+                })
+            {
+                continue;
+            }
+            index.bytes_read = bytes_read;
+            index.files_read = files_read;
+            index.reparsed = reparsed;
+            index.refresh_mode = if full { "full" } else { "observed" }.into();
+            index.updated_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if let Some(directory) = &directory {
+                if full || reparsed > 0 || index.files.len() != base.files.len() {
+                    if let Err(reason) = storage::save(directory, &index) {
+                        index.warnings.push(format!("cache save failed: {reason}"));
                     }
                 }
             }
+            index.warnings.truncate(32);
+            observation.publish(&root, &scan.directories, scan.stamps, full);
+            let index = Arc::new(index);
+            *self
+                .shared
+                .snapshot
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some(index.clone());
+            return Ok(index);
         }
-        index.files = files;
-        index.metadata = scan.metadata;
-        index.aliases = super::modules::collect(&root, &index.metadata);
-        index.text_files = scan.text_files;
-        index.updated_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        if let Some(directory) = directory {
-            if let Err(reason) = storage::save(&directory, &index) {
-                index.warnings.push(format!("cache save failed: {reason}"));
-            }
-        }
-        index.warnings.truncate(32);
-        let index = Arc::new(index);
-        *self
-            .shared
-            .snapshot
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some(index.clone());
-        Ok(index)
+        Err("index_unavailable: workspace kept changing during bounded reconciliation".into())
     }
 }

@@ -10,6 +10,8 @@ mod davinci_sources;
 mod davinci_surfaces;
 #[cfg(unix)]
 mod experimental;
+#[cfg(test)]
+mod test_impact_integration_tests;
 mod voice_input;
 mod voice_models;
 #[cfg(not(unix))]
@@ -1949,6 +1951,10 @@ fn complete_prompt_with_host(
         .unwrap_or_else(|error| error.into_inner())
         .register_with(&runtime_handle.capability_registry);
     agent.set_runtime(runtime_handle);
+    bind_test_impact_context(
+        agent,
+        &host.lock().unwrap_or_else(|error| error.into_inner()),
+    );
 
     let pre_hooks = user_hooks.clone();
     agent.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, args| {
@@ -7456,7 +7462,21 @@ fn collect_custom_theme_files(parsed: &Args) -> Vec<(String, PathBuf)> {
     files
 }
 
+fn bind_test_impact_context(agent: &Agent, host: &ExtensionHost) {
+    let native = host
+        .native
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    native
+        .test_impact
+        .set_permissions(agent.permissions.clone());
+    native
+        .test_impact
+        .set_cancellation(agent.abort_signal.clone());
+}
+
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
+    bind_test_impact_context(agent, host);
     let host = host.clone();
     agent.custom_tool_executor = Some(CustomToolExecutor::new(move |cwd, name, args| {
         host.execute_js_or_manifest_tool(cwd, name, args)
@@ -7464,10 +7484,15 @@ fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
 }
 
 fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>>) {
+    bind_test_impact_context(
+        agent,
+        &host.lock().unwrap_or_else(|error| error.into_inner()),
+    );
     agent.custom_tool_executor = Some(CustomToolExecutor::new(move |cwd, name, args| {
         let host = host
             .lock()
-            .map_err(|error| davinci_agent::ToolError::Failed(error.to_string()))?;
+            .map_err(|error| davinci_agent::ToolError::Failed(error.to_string()))?
+            .clone();
         host.execute_js_or_manifest_tool(cwd, name, args)
     }));
 }
@@ -7571,6 +7596,9 @@ fn configure_security_review(
 
 fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHost) {
     if let Ok(mut native) = host.native.lock() {
+        native
+            .test_impact
+            .set_permissions(agent.permissions.clone());
         native
             .language_intelligence
             .set_permissions(Some(agent.permissions.clone()));

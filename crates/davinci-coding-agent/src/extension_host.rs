@@ -583,6 +583,15 @@ impl ExtensionHost {
         if !is_worker_submit && !is_registered {
             return None;
         }
+        if crate::native_extensions::test_impact::TOOL_NAMES.contains(&name) {
+            let impact = self
+                .native
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .test_impact
+                .clone();
+            return Some(impact.execute(name, args));
+        }
         if crate::native_extensions::repo_intelligence::is_repo_tool(name) {
             let repo = self
                 .native

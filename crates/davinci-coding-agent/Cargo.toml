@@ -45,6 +45,8 @@ tree-sitter.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-javascript.workspace = true
 ignore.workspace = true
+globset.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
