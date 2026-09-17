@@ -113,6 +113,7 @@ pub use worktree::{has_uncommitted_changes, WorktreeError, WorktreeLease, Worktr
 /// Handle held by an executing Agent or worker to participate in the shared runtime.
 #[derive(Clone)]
 pub struct RuntimeHandle {
+    pub cache: cache::CacheRuntime,
     pub run_id: RunId,
     pub agent_id: AgentId,
     pub parent_agent_id: Option<AgentId>,
@@ -153,6 +154,7 @@ impl RuntimeHandle {
         let task_registry = TaskRegistry::with_bus(bus.clone());
         let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus.clone());
         Self {
+            cache: cache::CacheRuntime::default(),
             run_id,
             agent_id,
             parent_agent_id: None,
@@ -177,6 +179,10 @@ impl RuntimeHandle {
 
     pub fn with_budget_ledger(mut self, ledger: Arc<ResourceLedger>) -> Self {
         self.budget_ledger = Some(ledger);
+        self
+    }
+    pub fn with_cache(mut self, cache: cache::CacheRuntime) -> Self {
+        self.cache = cache;
         self
     }
 
@@ -208,6 +214,7 @@ impl RuntimeHandle {
     /// Continue a host-validated session with fresh turn observers and cancellation token.
     /// Retain live identities, coordination state, writer lease and event counters.
     pub fn with_session_state_from(mut self, previous: &Self) -> Self {
+        self.cache = previous.cache.clone();
         self.run_id = previous.run_id;
         self.agent_id = previous.agent_id;
         self.parent_agent_id = previous.parent_agent_id;
@@ -232,6 +239,7 @@ impl RuntimeHandle {
 
     /// Preserve a host-bound worker's coordinator without replacing parent observers.
     pub fn with_worker_state_from(mut self, worker: &Self) -> Self {
+        self.cache = worker.cache.clone();
         self.run_id = worker.run_id;
         self.agent_id = worker.agent_id;
         self.parent_agent_id = worker.parent_agent_id;

@@ -612,6 +612,13 @@ impl Agent {
                 Ok(output) => {
                     let output = output.into();
                     let message = output.message;
+                    if let Some(usage) = &message.usage {
+                        self.tool_context.cache.record_provider_usage(
+                            usage.input,
+                            usage.cache_read,
+                            usage.cache_write,
+                        );
+                    }
                     if let Some(runtime) = &self.runtime {
                         if let Some(ledger) = &runtime.budget_ledger {
                             let total_tokens =

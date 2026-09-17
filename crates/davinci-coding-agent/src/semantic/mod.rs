@@ -126,7 +126,17 @@ impl NativeSemanticService {
     /// started only when a semantic tool is called and the exact command is
     /// already allowed by the current permission policy.
     pub fn with_permissions(permissions: Arc<PermissionState>) -> Self {
+        Self::with_permissions_and_cache(permissions, Default::default())
+    }
+
+    pub fn with_permissions_and_cache(
+        permissions: Arc<PermissionState>,
+        cache: davinci_agent::runtime::cache::CacheRuntime,
+    ) -> Self {
+        let local_backend = LocalSemanticBackend::shared(cache);
         let mut service = Self::new();
+        service.backend = Arc::new(Mutex::new(Some(local_backend.clone())));
+        service.local_backend = local_backend;
         service.launch_permissions = Some(permissions);
         service
     }
@@ -142,7 +152,7 @@ impl NativeSemanticService {
         authority: SemanticLaunchAuthority,
         request_timeout: Duration,
     ) -> Result<SemanticCapabilities, String> {
-        let spec = resolve_language_server(language, root).ok_or_else(|| {
+        let spec = self.local_backend.discover(language, root).ok_or_else(|| {
             format!(
                 "No locally installed language server is available for {}",
                 normalize_language(language)
@@ -194,12 +204,12 @@ impl NativeSemanticService {
         Ok(capabilities)
     }
 
-    fn try_launch_authorized_session(&self, root: &Path, language: &str) {
+    fn try_launch_authorized_session(&self, root: &Path, language: &str) -> bool {
         let Some(permissions) = &self.launch_permissions else {
-            return;
+            return false;
         };
-        let Some(spec) = resolve_language_server(language, root) else {
-            return;
+        let Some(spec) = self.local_backend.discover(language, root) else {
+            return false;
         };
         let command = render_command_for_policy(&spec);
         // Keep the policy guard until the process has started so a concurrent
@@ -207,7 +217,7 @@ impl NativeSemanticService {
         // execution.
         let policy = match permissions.lock() {
             Ok(policy) => policy,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let authority = SemanticLaunchAuthority {
             project_trusted: policy.project_trusted,
@@ -223,16 +233,17 @@ impl NativeSemanticService {
             effects_contained: true,
         };
         if !authority.project_trusted || !authority.execution_allowed {
-            return;
+            return false;
         }
-        let _ = self.request_resolved_semantic_session(
+        self.request_resolved_semantic_session(
             root,
             language,
             "default",
             spec,
             authority,
             Duration::from_secs(5),
-        );
+        )
+        .is_ok()
     }
 
     pub fn set_backend(&self, backend: Option<Arc<dyn SemanticBackend>>) -> Result<(), String> {
@@ -339,8 +350,13 @@ impl NativeSemanticService {
             .map_err(|_| "Semantic session registry is unavailable".to_string())?
             .ready_key_for_path(&target, language)
             .is_some();
-        if !ready {
-            self.try_launch_authorized_session(cwd, language);
+        // Recheck current authority and child health even when the registry is ready.
+        if self.launch_permissions.is_some() {
+            if !self.try_launch_authorized_session(cwd, language) {
+                return Ok(None);
+            }
+        } else if !ready {
+            return Ok(None);
         }
         let registry = self
             .sessions

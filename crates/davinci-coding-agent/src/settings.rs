@@ -8,6 +8,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
+    pub cache: Option<davinci_agent::runtime::cache::CacheConfig>,
+    #[serde(default)]
     pub extensions: Vec<String>,
     #[serde(default)]
     pub packages: Vec<PackageSource>,
