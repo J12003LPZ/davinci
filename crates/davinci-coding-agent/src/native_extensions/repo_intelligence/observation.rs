@@ -29,6 +29,7 @@ pub(super) struct Observation {
     watched: BTreeSet<PathBuf>,
     reason: Option<&'static str>,
     pub stamps: BTreeMap<String, FileStamp>,
+    ignore_hashes: BTreeMap<String, String>,
     pub needs_full: bool,
     last_full: Option<Instant>,
 }
@@ -171,8 +172,9 @@ impl Observation {
         changes
     }
 
-    pub fn full_required(&self) -> bool {
+    pub fn full_required(&self, ignore_hashes: &BTreeMap<String, String>) -> bool {
         self.needs_full
+            || self.ignore_hashes != *ignore_hashes
             || self.watcher.is_none()
             || self
                 .last_full
@@ -184,6 +186,7 @@ impl Observation {
         root: &Path,
         directories: &BTreeSet<PathBuf>,
         stamps: BTreeMap<String, FileStamp>,
+        ignore_hashes: BTreeMap<String, String>,
         full: bool,
     ) {
         let stale: Vec<_> = self
@@ -199,6 +202,7 @@ impl Observation {
             self.watched.remove(&path);
         }
         self.stamps = stamps;
+        self.ignore_hashes = ignore_hashes;
         self.needs_full = false;
         if full {
             self.last_full = Some(Instant::now());
@@ -225,10 +229,10 @@ mod tests {
         observer.last_full = Some(Instant::now());
         observer.lost.store(true, Ordering::Release);
         assert!(observer.drain(root.path()).rescan);
-        assert!(observer.full_required());
+        assert!(observer.full_required(&BTreeMap::new()));
         observer.failed.store(true, Ordering::Release);
         observer.drain(root.path());
-        assert!(observer.full_required());
+        assert!(observer.full_required(&BTreeMap::new()));
         assert!(observer.watcher.is_none());
     }
 }

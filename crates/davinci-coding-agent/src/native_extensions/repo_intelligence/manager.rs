@@ -267,7 +267,9 @@ impl RepoIntelligence {
                     }
                 };
             dirty.extend(observation.drain(&root).paths);
-            let full = force || attempt > 0 || observation.full_required();
+            // Ignore contents are already read during inventory. Their identity
+            // catches rule changes even before a delayed watcher event arrives.
+            let full = force || attempt > 0 || observation.full_required(&scan.ignore_hashes);
             // Errors/cancellation cannot leave consumed events trusted on retry.
             observation.needs_full = true;
             let mut index = base.clone();
@@ -364,7 +366,13 @@ impl RepoIntelligence {
                 }
             }
             index.warnings.truncate(32);
-            observation.publish(&root, &scan.directories, scan.stamps, full);
+            observation.publish(
+                &root,
+                &scan.directories,
+                scan.stamps,
+                scan.ignore_hashes,
+                full,
+            );
             let index = Arc::new(index);
             *self
                 .shared

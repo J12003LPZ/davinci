@@ -17,6 +17,7 @@ pub(super) struct Scan {
     pub warnings: Vec<String>,
     pub stamps: BTreeMap<String, FileStamp>,
     pub directories: BTreeSet<PathBuf>,
+    pub ignore_hashes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +168,10 @@ pub(super) fn scan(
             authorize(&ignore_path.to_string_lossy().replace('\\', "/"))?;
             match read_bounded(root, &ignore_path, 64 * 1024) {
                 Ok(body) => {
+                    scan.ignore_hashes.insert(
+                        ignore_path.to_string_lossy().replace('\\', "/"),
+                        super::symbols::digest(body.as_bytes()),
+                    );
                     let mut builder = GitignoreBuilder::new(&directory);
                     for line in body.lines() {
                         if builder

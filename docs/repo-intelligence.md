@@ -93,6 +93,8 @@ repository tools retain full content reconciliation. The shared index also expos
 an observed refresh for [test-impact planning](test-impact.md): fresh inventory,
 bounded native change events, file stamps, and explicit changed-path reads allow
 unchanged source records to be reused between full reconciliations.
+Ignore-file contents are fingerprinted during inventory; a changed set of ignore
+rules forces full content reconciliation even if its watcher event is delayed.
 
 Controllers share immutable snapshots within a process. Graph worker processes
 coordinate through the same workspace cache and an OS-owned exclusive lease.

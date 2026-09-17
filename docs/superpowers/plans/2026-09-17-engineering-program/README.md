@@ -26,7 +26,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 | Order | Project/plan | Implementation | Design approval | Local gates/eval | CI |
 | --- | --- | --- | --- | --- | --- |
-| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Local implementation validated | Approved | Package tests, fmt, Clippy, integration, security and eval passed | PR #9; retry fix awaiting CI |
+| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Local implementation validated | Approved | Package tests, fmt, Clippy, integration, security and eval passed | PR #9; ignore-change fix awaiting CI |
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Planned | Approved | Not run | Not pushed |
 | 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Planned | Approved | Not run | Not pushed |
 | 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
@@ -250,3 +250,17 @@ unchanged. After this correction, the 14 impact, 6 observer, 7 repository, and
 format check, and affected library Clippy. The exact-head CI rerun is the remaining
 gate. The initial Linux native job independently passed all 22 impact/observer/
 normal-agent/eval cases; its log is available on the same CI run.
+
+### CI correction: ignore changes before watcher delivery
+
+At `722a23a41cda28980151960646af124fdb93808b`, 21 CI jobs passed and the
+[macOS native job](https://github.com/J12003LPZ/davinci/actions/runs/35193764325/job/105112057975)
+failed the existing ignore-change regression: inventory correctly removed ignored
+files, but the refresh was labeled `observed` because the native notification had
+not arrived. The scan now fingerprints the ignore contents it already reads;
+changed, added, or removed ignore rules force full content reconciliation without
+depending on event timing. The regression retains its `full` assertion and now
+also verifies that an unaffected source is reread without being reparsed.
+
+After this correction, 14 impact, 6 observer, and 7 repository tests passed locally,
+along with the explicit after evaluation. The new commit must pass CI before P2.

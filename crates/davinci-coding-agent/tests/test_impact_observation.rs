@@ -59,20 +59,30 @@ fn observed_inventory_reconciles_add_delete_rename_and_ignore_changes() {
     )
     .unwrap();
     fs::write(root.path().join("created.ts"), "export const created = 1;").unwrap();
+    fs::write(
+        root.path().join("retained.ts"),
+        "export const retained = 1;",
+    )
+    .unwrap();
     let first = repo
         .refresh_observed_authorized(&[], false, &|_| Ok(()))
         .unwrap();
     assert_eq!(
         first.files.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["created.ts", "nested/after.ts"]
+        ["created.ts", "nested/after.ts", "retained.ts"]
     );
     fs::remove_file(root.path().join("created.ts")).unwrap();
     fs::write(root.path().join(".gitignore"), "nested/\n").unwrap();
     let next = repo
         .refresh_observed_authorized(&[], false, &|_| Ok(()))
         .unwrap();
-    assert!(next.files.is_empty());
+    assert_eq!(
+        next.files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["retained.ts"]
+    );
     assert_eq!(next.refresh_mode, "full");
+    assert!(next.files_read >= 1);
+    assert_eq!(next.reparsed, 0);
 }
 
 #[test]
