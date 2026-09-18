@@ -556,3 +556,27 @@ proxy. The managed process lease and trusted policy still supply the origin set.
 Context routing remains defense in depth and telemetry. Add actual bridge tests
 for redirect/subresource/popup traffic, HTTPS CONNECT and WebSocket upgrades,
 resource bounds, cleanup and cancellation before accepting this implementation.
+
+### In-flight cancellation checkpoint
+
+Normal and Graph browser actions now pass their live abort flag to the shared
+supervised transport. A host-assigned cancellation request interrupts the targeted
+open or action, closes its context, and waits for the original response before
+retiring its correlation. Control requests have reserved bounded admission.
+Unconfirmed cancellation invalidates the transport without retrying an action.
+Pre-cancelled calls do not write input. Explicit close remains cleanup authority.
+
+Executed checks: all 11 Node transport tests passed; the focused Rust browser
+selector passed 17 tests with two explicitly configured browser fixtures ignored.
+The explicitly enabled supervised Chromium fixture passed without skips. It
+interrupts a missing-selector action within two seconds, checks empty pending
+correlations and no transport failure, then navigates and snapshots another
+context successfully. Its first run exposed an uninitialized second page in the
+fixture; navigation was added before asserting surviving page content. Package
+formatting and all-target Clippy with warnings denied passed.
+
+P3 remains incomplete. Native normal/Graph in-flight cancellation integration,
+stale-resource reconciliation, dead-engine recovery, remaining platform ownership
+proofs, transaction-bound receipts, artifact retrieval and final evaluations still
+require implementation or direct evidence. This checkpoint is not its completion
+gate, and existing-head CI does not validate these uncommitted changes.

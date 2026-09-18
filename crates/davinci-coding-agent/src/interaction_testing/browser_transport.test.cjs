@@ -20,6 +20,46 @@ function harness(backend, artifact) {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+test('cancel interrupts only the targeted action and preserves another context', async () => {
+  let release;
+  let opened = 0;
+  const held = new Promise((_, reject) => {release = () => reject(new Error('cancelled'));});
+  const h = harness({open: async () => {
+    const first = ++opened === 1;
+    return {browserVersion: 'test', execute: async () => first ? held : {done: true},
+      close: async () => {if (first) release();}};
+  }, close: async () => {}});
+  h.send({id: 1, op: 'open', options: {origins: ['http://localhost:3000']}});
+  h.send({id: 2, op: 'open', options: {origins: ['http://localhost:3000']}});
+  await tick();
+  h.send({id: 3, op: 'execute', resource: 1, command: {action: 'click'}});
+  h.send({id: 4, op: 'cancel', target: 3});
+  await tick();
+  assert.equal(h.responses.find(r => r.id === 4)?.ok, true);
+  assert.equal(h.responses.find(r => r.id === 3)?.ok, false);
+  h.send({id: 5, op: 'execute', resource: 2, command: {action: 'snapshot'}});
+  await tick();
+  assert.equal(h.responses.find(r => r.id === 5)?.ok, true);
+  h.input.end(); assert.equal((await h.transport.done).failed, false);
+});
+
+test('cancel interrupts pending open and its raced completed context', async () => {
+  for (const held of [true, false]) {
+    let aborted = false;
+    let closed = 0;
+    const h = harness({open: async (_, signal) => held ? new Promise((_, reject) => {
+      signal.addEventListener('abort', () => {aborted = true; reject(new Error('cancelled'));}, {once: true});
+    }) : {browserVersion: 'test', close: async () => {closed++;}}, close: async () => {}});
+    h.send({id: 1, op: 'open', options: {origins: ['http://localhost:3000']}});
+    if (!held) await tick();
+    h.send({id: 2, op: 'cancel', target: 1});
+    await tick();
+    assert.equal(h.responses.find(r => r.id === 2)?.ok, true);
+    assert.equal(aborted, held); assert.equal(closed, held ? 0 : 1);
+    h.input.end(); assert.equal((await h.transport.done).failed, false);
+  }
+});
+
 test('fragments and correlated responses; duplicate IDs fail closed', async () => {
   let closed = 0;
   const h = harness({open: async () => ({browserVersion: 'test', close: async () => {closed++;},

@@ -9,7 +9,10 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, Weak,
+    },
     time::{Duration, Instant},
 };
 
@@ -258,15 +261,35 @@ impl BrowserProcess {
 
     /// Correlates bounded responses, including out-of-order context operations.
     /// An unknown delivery outcome invalidates the transport; it is never retried.
-    pub fn request(&self, mut request: Value, timeout: Duration) -> Result<Value, String> {
+    pub fn request(&self, request: Value, timeout: Duration) -> Result<Value, String> {
+        self.request_with_abort(request, timeout, None)
+    }
+
+    pub fn request_with_abort(
+        &self,
+        mut request: Value,
+        timeout: Duration,
+        abort: Option<&AtomicBool>,
+    ) -> Result<Value, String> {
         if timeout.is_zero() || timeout > Duration::from_secs(30) {
             return Err("invalid browser request deadline".into());
         }
+        if abort.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err("browser request cancelled".into());
+        }
         let started = Instant::now();
-        let writer = self
-            .writer
-            .try_lock()
-            .map_err(|_| "browser input is busy")?;
+        let control = request["op"] == "cancel";
+        let writer = loop {
+            match self.writer.try_lock() {
+                Ok(writer) => break writer,
+                Err(std::sync::TryLockError::WouldBlock)
+                    if control && started.elapsed() < timeout.min(Duration::from_secs(1)) =>
+                {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(_) => return Err("browser input is busy".into()),
+            }
+        };
         let mut state = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(failure) = &state.failure {
             return Err(failure.clone());
@@ -274,7 +297,7 @@ impl BrowserProcess {
         if state.closed {
             return Err("browser host is closed".into());
         }
-        if state.pending.len() >= 16 {
+        if state.pending.len() >= if control { 32 } else { 16 } {
             return Err("browser pending request limit".into());
         }
         let id = state
@@ -306,6 +329,28 @@ impl BrowserProcess {
             if let Some(failure) = &state.failure {
                 return Err(failure.clone());
             }
+            if abort.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                drop(state);
+                // The control response follows target completion on the same
+                // ordered stream, so correlation can be retired without a
+                // tombstone or retry of an unknown action outcome.
+                let cancelled =
+                    self.request(json!({"op":"cancel","target":id}), Duration::from_secs(5));
+                if !cancelled
+                    .as_ref()
+                    .is_ok_and(|value| value["cancelled"].is_boolean())
+                {
+                    self.invalidate("browser cancellation unconfirmed");
+                    return Err("browser cancellation unconfirmed".into());
+                }
+                self.state
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .remove(&id);
+                return Err("browser request cancelled".into());
+            }
             // A complete response may precede the process's orderly shutdown.
             if let Some(Some(_)) = state.pending.get(&id) {
                 return state.pending.remove(&id).unwrap().unwrap();
@@ -322,7 +367,14 @@ impl BrowserProcess {
             state = self
                 .state
                 .1
-                .wait_timeout(state, remaining)
+                .wait_timeout(
+                    state,
+                    if abort.is_some() {
+                        remaining.min(Duration::from_millis(10))
+                    } else {
+                        remaining
+                    },
+                )
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
@@ -555,7 +607,51 @@ mod tests {
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(compute_sha256(bytes), retained["sha256"]);
         assert!(bridge.retain_screenshot(&screenshot, &mut tracker).is_err());
-        request(json!({"op":"close","resource":resource}));
+        let other = request(json!({"op":"open","options":{"origins":[origin]}}))["resource"]
+            .as_u64()
+            .unwrap();
+        let abort = AtomicBool::new(true);
+        let sequence = bridge.state.0.lock().unwrap().sequence;
+        assert_eq!(
+            bridge.request_with_abort(
+                json!({"op":"execute","resource":resource,"command":{"action":"snapshot"}}),
+                Duration::from_secs(10),
+                Some(&abort)
+            ),
+            Err("browser request cancelled".into())
+        );
+        assert_eq!(bridge.state.0.lock().unwrap().sequence, sequence);
+        abort.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while bridge.state.0.lock().unwrap().pending.is_empty() {
+                    assert!(Instant::now() < deadline, "action was not admitted");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // Give Chromium time to begin waiting for the absent selector.
+                std::thread::sleep(Duration::from_millis(100));
+                abort.store(true, Ordering::SeqCst);
+            });
+            assert_eq!(bridge.request_with_abort(json!({"op":"execute","resource":resource,"command":{"action":"click","selector":{"kind":"role","role":"button","name":"Missing"}}}), Duration::from_secs(10), Some(&abort)), Err("browser request cancelled".into()));
+        });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        {
+            let state = bridge.state.0.lock().unwrap();
+            assert!(state.pending.is_empty());
+            assert!(state.failure.is_none());
+        }
+        request(
+            json!({"op":"execute","resource":other,"command":{"action":"navigate","url":origin}}),
+        );
+        let surviving =
+            request(json!({"op":"execute","resource":other,"command":{"action":"snapshot"}}));
+        assert!(surviving["html"]
+            .as_str()
+            .unwrap()
+            .contains(">Start</button>"));
+        request(json!({"op":"close","resource":other}));
         request(json!({"op":"shutdown"}));
         assert_eq!(
             bridge.supervisor.wait(Duration::from_secs(5)).unwrap().code,

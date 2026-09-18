@@ -26,6 +26,10 @@ function validate(request) {
       if (!ACTIONS.has(request.command.action)) throw new Error('Invalid action');
       break;
     case 'close': fields(request, ['id', 'op', 'resource']); id(request.resource); break;
+    case 'cancel':
+      fields(request, ['id', 'op', 'target']); id(request.target);
+      if (request.target >= request.id) throw new Error('Invalid cancellation target');
+      break;
     case 'shutdown': fields(request, ['id', 'op']); break;
     default: throw new Error('Invalid operation');
   }
@@ -39,7 +43,8 @@ function createBrowserTransport({input, output, backend, artifact}) {
   let finish;
   const done = new Promise(resolve => {finish = resolve;});
   const resources = new Map();
-  const opening = new Set();
+  const opening = new Map();
+  const active = new Map();
   const pending = new Set();
   function respond(value) {
     let serialized = JSON.stringify(value);
@@ -65,7 +70,7 @@ function createBrowserTransport({input, output, backend, artifact}) {
     // is independent of the per-context action queue, allowing interruption.
     input.off('data', receive); input.pause();
     stopping = (async () => {
-      for (const controller of opening) controller.abort();
+      for (const controller of opening.values()) controller.abort();
       const results = await Promise.allSettled([...resources.values()].map(async resource => {
         resource.controller.abort(); await resource.session.close();
       }));
@@ -85,12 +90,27 @@ function createBrowserTransport({input, output, backend, artifact}) {
   async function dispatch(request) {
     let result;
     try {
-      if (request.op === 'open') {
+      if (request.op === 'cancel') {
+        const operation = active.get(request.target);
+        if (operation && !['open', 'execute'].includes(operation.request.op)) throw new Error('Invalid cancellation target');
+        const controller = opening.get(request.target);
+        controller?.abort();
+        // An open response can race the host cancellation flag. Its correlation
+        // ID remains the resource ID, so that context can still be reclaimed.
+        const resourceId = operation?.request.op === 'execute' ? operation.request.resource : request.target;
+        const resource = resources.get(resourceId);
+        if (resource) {
+          resources.delete(resourceId); resource.controller.abort();
+          try {await resource.session.close();} catch (error) {failed = true; throw error;}
+        }
+        if (operation) await operation.promise;
+        result = {cancelled: Boolean(controller || resource || operation)};
+      } else if (request.op === 'open') {
         const controller = new AbortController();
-        opening.add(controller);
+        opening.set(request.id, controller);
         let session;
         try {session = await backend.open(request.options, controller.signal);}
-        finally {opening.delete(controller);}
+        finally {opening.delete(request.id);}
         if (stopping || controller.signal.aborted) {await session.close(); throw new Error('Cancelled');}
         resources.set(request.id, {session, controller});
         result = {resource: request.id, browserVersion: session.browserVersion};
@@ -129,10 +149,13 @@ function createBrowserTransport({input, output, backend, artifact}) {
     if (request.id <= highWater) throw new Error('Replayed request');
     highWater = request.id;
     if (request.op === 'shutdown') {void stop(false, request.id); return;}
-    if (pending.size >= MAX_PENDING) throw new Error('Pending limit');
+    // Reserve bounded control capacity so saturation cannot prevent cancellation.
+    if (pending.size >= (request.op === 'cancel' ? MAX_PENDING * 2 : MAX_PENDING)) throw new Error('Pending limit');
+    const record = {request}; active.set(request.id, record);
     const operation = dispatch(request);
+    record.promise = operation;
     pending.add(operation);
-    operation.finally(() => pending.delete(operation)).catch(() => {void stop(true);});
+    operation.finally(() => {pending.delete(operation); active.delete(request.id);}).catch(() => {void stop(true);});
   }
   function receive(chunk) {
     try {

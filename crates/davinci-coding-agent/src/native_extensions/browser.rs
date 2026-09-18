@@ -426,14 +426,14 @@ impl BrowserController {
                         let origin = lease.origin();
                         let mut options = json!({"origins":[origin]});
                         if let Some(viewport) = open.viewport { options["viewport"] = json!(viewport); }
-                        let opened = engine.request(json!({"op":"open","options":options}), Duration::from_secs(30))?;
+                        let opened = engine.request_with_abort(json!({"op":"open","options":options}), Duration::from_secs(30), context.abort.as_deref())?;
                         let backend = opened["resource"].as_u64().filter(|id| *id > 0).ok_or("invalid browser resource")?;
                         let id = Uuid::new_v4();
                         let resource = Arc::new(Resource { backend, process_id, port, lease: lease.clone(), engine: engine.clone() });
                         self.store.lock().map_err(|_| "browser state unavailable")?.resources.insert(id, resource);
                         created = Some(id);
-                        let navigation = engine.request(json!({"op":"execute","resource":backend,
-                            "command":{"action":"navigate","url":format!("{origin}{}",open.path)}}), Duration::from_secs(10))?;
+                        let navigation = engine.request_with_abort(json!({"op":"execute","resource":backend,
+                            "command":{"action":"navigate","url":format!("{origin}{}",open.path)}}), Duration::from_secs(10), context.abort.as_deref())?;
                         Ok(json!({"status":"opened","browser_id":id,"origin":origin,
                             "browser_version":opened["browserVersion"],"navigation":navigation}))
                     })();
@@ -447,7 +447,7 @@ impl BrowserController {
                         self.store.lock().map_err(|_| "browser state unavailable")?.resources.remove(&id);
                         Ok(result)
                     } else {
-                        let mut result = resource.engine.request(json!({"op":"execute","resource":resource.backend,"command":command}), Duration::from_secs(10))?;
+                        let mut result = resource.engine.request_with_abort(json!({"op":"execute","resource":resource.backend,"command":command}), Duration::from_secs(10), context.abort.as_deref())?;
                         if name == "browser_screenshot" {
                             let mut artifacts = self.artifacts.lock().map_err(|_| "browser artifacts unavailable")?;
                             result = resource.engine.retain_screenshot(&result, &mut artifacts)?;
