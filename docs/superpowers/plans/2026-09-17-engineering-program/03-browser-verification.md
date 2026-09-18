@@ -636,3 +636,31 @@ Exact-head CI is required after pushing this checkpoint.
 Additional checks passed: all four `process_manager::tests::browser_` tests,
 formatting of both affected crates, all-target Clippy for `davinci-agent` and
 `davinci-coding-agent` with warnings denied, and `git diff --check`.
+
+### Shared startup completion checkpoint
+
+Six simultaneous callers reproduced `browser startup busy` from the reservation
+flag (RED). The same real-backend test now passes (GREEN): all six receive the
+same backend reference and that backend opens Chromium successfully. Startup
+reserves one attempt under the store lock, performs supervised I/O outside it,
+then publishes one result to the attempt's waiters. A failed attempt releases the
+reservation for a fresh caller; its existing waiters retain its original result.
+No interrupted action is replayed. Each waiter has a 30-second deadline and
+checks its own cancellation signal at most every 10 milliseconds. A cancelled
+waiter does not invalidate the shared startup. Browser admission rechecks current
+permission, process lifetime and OS socket ownership after waiting.
+
+Executed checks: 30 focused offline Rust browser tests passed; four real fixtures
+were ignored in that lane and then explicitly enabled, with all four passing and
+zero skips. The real normal-session native fixture also passed across both
+executor attachments. Two offline startup cases cover waiter cancellation and
+failure sharing/fresh retry. Formatting, all-target coding-agent Clippy with
+warnings denied, and diff whitespace checks passed. These checks establish shared
+startup and preserve the existing normal/Graph transport behavior; full Graph
+scheduler evaluation and the remaining P3 evidence/sandbox/platform gates are
+still open. No subagents were used.
+
+Managed-lifetime prerequisite `77a9d4b` CI run `35296495119` was inspected while
+active: no failed jobs, with affected coding-agent/native/quality jobs still
+running. Workflow lint passed; a pending run is not a completion gate. This
+startup checkpoint requires its own exact-head CI after pushing.

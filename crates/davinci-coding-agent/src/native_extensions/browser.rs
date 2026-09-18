@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -43,9 +43,47 @@ pub struct BrowserConfig {
 #[derive(Default)]
 struct Store {
     engine: Option<Arc<BrowserProcess>>,
-    starting: bool,
+    starting: Option<Arc<Startup>>,
     opening: usize,
     resources: HashMap<Uuid, Arc<Resource>>,
+}
+#[derive(Default)]
+struct Startup {
+    result: Mutex<Option<Result<Arc<BrowserProcess>, String>>>,
+    ready: Condvar,
+}
+impl Startup {
+    fn wait(&self, context: &ToolContext) -> Result<Arc<BrowserProcess>, String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut result = self
+            .result
+            .lock()
+            .map_err(|_| "browser startup unavailable")?;
+        loop {
+            if context.is_aborted() {
+                return Err("browser request cancelled".into());
+            }
+            if let Some(result) = &*result {
+                return result.clone();
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("browser startup wait timed out".into());
+            }
+            result = self
+                .ready
+                .wait_timeout(result, remaining.min(Duration::from_millis(10)))
+                .map_err(|_| "browser startup unavailable")?
+                .0;
+        }
+    }
+    fn complete(&self, result: Result<Arc<BrowserProcess>, String>) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(result);
+        self.ready.notify_all();
+    }
 }
 struct Resource {
     backend: u64,
@@ -360,16 +398,25 @@ impl BrowserController {
         Ok(())
     }
     fn engine(&self, context: &ToolContext) -> Result<Arc<BrowserProcess>, String> {
+        if context.is_aborted() {
+            return Err("browser request cancelled".into());
+        }
         self.reconcile_backend()?;
-        {
+        let (startup, owner) = {
             let mut store = self.store.lock().map_err(|_| "browser state unavailable")?;
             if let Some(engine) = &store.engine {
                 return Ok(engine.clone());
             }
-            if store.starting {
-                return Err("browser startup busy".into());
+            if let Some(startup) = &store.starting {
+                (startup.clone(), false)
+            } else {
+                let startup = Arc::new(Startup::default());
+                store.starting = Some(startup.clone());
+                (startup, true)
             }
-            store.starting = true;
+        };
+        if !owner {
+            return startup.wait(context);
         }
         // Only a small reservation spans startup; the store/native host locks do not.
         let result = context
@@ -388,12 +435,26 @@ impl BrowserController {
                     },
                 )
                 .map_err(|_| "trusted browser backend unavailable")
-            });
-        let mut store = self.store.lock().map_err(|_| "browser state unavailable")?;
-        store.starting = false;
-        let engine = Arc::new(result?);
-        store.engine = Some(engine.clone());
-        Ok(engine)
+            })
+            .map(Arc::new)
+            .map_err(str::to_owned);
+        let published = self
+            .store
+            .lock()
+            .map(|mut store| {
+                if let Ok(engine) = &result {
+                    store.engine = Some(engine.clone());
+                }
+                store.starting = None;
+            })
+            .is_ok();
+        if !published {
+            startup.complete(Err("browser state unavailable".into()));
+            return Err("browser state unavailable".into());
+        }
+        // Waiters retain this attempt's result even if a later caller retries.
+        startup.complete(result);
+        startup.wait(context)
     }
     fn close(&self, id: Uuid) {
         let resource = self
@@ -475,6 +536,11 @@ impl BrowserController {
                     }
                     let result = (|| {
                         let engine = self.engine(context)?;
+                        // Waiting for shared startup cannot preserve stale authority.
+                        manager.with_verified_browser_dev_server(BrowserRequest {
+                            cwd, name, args, abort: context.abort.as_deref(), permit: context.dispatch_permit.as_deref(),
+                            process_id, port, lease: Some(lease),
+                        }, |_| Ok(()))?;
                         let origin = lease.origin();
                         let mut options = json!({"origins":[origin]});
                         if let Some(viewport) = open.viewport { options["viewport"] = json!(viewport); }
@@ -560,6 +626,136 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_startup_waiter_cancellation_preserves_shared_attempt() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let controller = BrowserController::default();
+        let startup = Arc::new(Startup::default());
+        controller.store.lock().unwrap().starting = Some(startup.clone());
+        let abort = Arc::new(AtomicBool::new(false));
+        let context = ToolContext {
+            abort: Some(abort.clone()),
+            ..Default::default()
+        };
+        let waiting_controller = controller.clone();
+        let waiter = std::thread::spawn(move || waiting_controller.engine(&context));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !waiter.is_finished(),
+            "waiter must remain pending during startup"
+        );
+        let cancelled_at = Instant::now();
+        abort.store(true, Ordering::SeqCst);
+        assert_eq!(
+            waiter.join().unwrap().err().as_deref(),
+            Some("browser request cancelled")
+        );
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert!(Arc::ptr_eq(
+            controller.store.lock().unwrap().starting.as_ref().unwrap(),
+            &startup
+        ));
+        startup.complete(Err("original startup failed".into()));
+        assert_eq!(
+            controller.engine(&ToolContext::default()).err().as_deref(),
+            Some("original startup failed")
+        );
+    }
+
+    #[test]
+    fn browser_startup_failure_is_shared_and_allows_fresh_attempt() {
+        let controller = BrowserController::default();
+        let old_attempt = Arc::new(Startup::default());
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let startup = old_attempt.clone();
+                std::thread::spawn(move || startup.wait(&ToolContext::default()))
+            })
+            .collect();
+        old_attempt.complete(Err("original startup failed".into()));
+        // A new caller may retry, but previous waiters keep their original result.
+        assert_eq!(
+            controller.engine(&ToolContext::default()).err().as_deref(),
+            Some("browser supervisor unavailable")
+        );
+        assert!(controller.store.lock().unwrap().starting.is_none());
+        for thread in threads {
+            assert_eq!(
+                thread.join().unwrap().err().as_deref(),
+                Some("original startup failed")
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
+    fn browser_concurrent_startup_shares_one_supervised_backend() {
+        let root = tempfile::tempdir().unwrap();
+        let controller = BrowserController::new(
+            root.path(),
+            BrowserConfig {
+                enabled: true,
+                node: std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH")
+                    .unwrap()
+                    .into(),
+                package: std::env::var("DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH")
+                    .unwrap()
+                    .into(),
+                version: "1.62.0".into(),
+            },
+        );
+        let context = ToolContext {
+            foreground_supervisor: Some(davinci_agent::jobs::supervisor::SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: vec![
+                    "--exact".into(),
+                    "native_extensions::graph::coordinator_handler::tests::helper_entry".into(),
+                    "--nocapture".into(),
+                ],
+            }),
+            ..Default::default()
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(6));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let controller = controller.clone();
+                let context = context.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    controller.engine(&context)
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let first = results[0].as_ref().unwrap();
+        for result in &results {
+            let engine = result
+                .as_ref()
+                .expect("concurrent callers must await shared startup");
+            assert!(Arc::ptr_eq(first, engine));
+        }
+        let mut cancelled = context.clone();
+        cancelled.abort = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        assert_eq!(
+            controller.engine(&cancelled).err().as_deref(),
+            Some("browser request cancelled")
+        );
+        let opened = first
+            .request(
+                json!({"op":"open","options":{"origins":["http://127.0.0.1:3000"]}}),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(opened["resource"].is_u64());
+        first
+            .request(json!({"op":"shutdown"}), Duration::from_secs(5))
+            .unwrap();
+    }
 
     #[test]
     #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
