@@ -540,6 +540,6 @@ Implementation is completed on `codex/git-intelligence-01a0ad48` in the isolated
 | 11. Evaluation | [p6-git-final.json](evidence/p6-git-final.json) captures full verification evidence, supported capabilities, security invariants, and test results. |
 | 12. Docs | Updated `06-git-intelligence.md` and `README.md` program ledger. |
 | 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
-| 14. CI | Pending commit and PR creation targeting `codex/build-intelligence-01a0ad48`. |
+| 14. CI | Green on head `dcaf02b5ad366ef0c48ac0017684bb83f2ec2c9d` and PR #15 ([PR #15](https://github.com/J12003LPZ/davinci/pull/15)). Push CI: [run 35372343120](https://github.com/J12003LPZ/davinci/actions/runs/35372343120) (22/22 jobs success); Push SARIF: [run 35372343125](https://github.com/J12003LPZ/davinci/actions/runs/35372343125); PR CI: [run 35372351676](https://github.com/J12003LPZ/davinci/actions/runs/35372351676) (22/22 jobs success); PR SARIF: [run 35372351664](https://github.com/J12003LPZ/davinci/actions/runs/35372351664). |
 
 
