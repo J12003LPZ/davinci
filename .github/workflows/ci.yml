@@ -32,6 +32,9 @@ jobs:
         run: cargo test -p davinci-coding-agent --locked --test test_impact_eval -- --ignored --nocapture
       - name: Managed process authorization and lifecycle
         run: cargo test -p davinci-agent --locked --lib process_manager::tests
+      - name: Native listener ownership proof
+        if: runner.os != 'macOS'
+        run: cargo test -p davinci-agent --locked --lib process_manager::socket_owner::tests
       - name: Native supervisor ownership and public process contracts
         run: cargo test -p davinci-agent --locked --test process_supervisor --test process_manager
       - name: Graph process leases

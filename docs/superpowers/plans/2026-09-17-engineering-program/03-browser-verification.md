@@ -679,3 +679,18 @@ All nine llama tests passed locally with eight test threads and no ignores.
 Coding-agent formatting passed. This repairs a CI prerequisite; it does not
 complete P3's macOS ownership, sandbox, artifact, receipt or evaluation gates.
 The repaired head still requires exact-head remote CI.
+
+### Native ownership CI coverage checkpoint
+
+The native CI lifecycle selector omitted the sibling socket-ownership unit
+module. Windows and Linux now run its direct live-listener proof explicitly.
+The focused Windows run passed one test with zero ignores: the actual live owner
+is accepted, a foreign PID and a closed listener are rejected, and port zero is
+rejected. macOS is deliberately excluded from this step while its native proof
+remains unimplemented; an empty test selection must not imply platform coverage.
+
+The coding-agent and agent package jobs for fixture-repair head `1cdcd8b` passed
+in CI run `35297281753`; that complete run was still active at inspection. Local
+diff whitespace checks passed. Local actionlint was unavailable; the pushed
+workflow-lint check must validate this workflow change. This checkpoint adds CI
+coverage, without completing P3's platform, sandbox or evidence gates.
