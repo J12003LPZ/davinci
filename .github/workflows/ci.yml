@@ -24,6 +24,10 @@ jobs:
         run: node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_host.test.cjs
       - name: Use repository-pinned Rust
         run: rustup show
+      - name: Native listener ownership proof
+        run: |
+          cargo test -p davinci-agent --locked --lib process_manager::socket_owner
+          cargo clippy -p davinci-agent --locked --lib --tests -- -D warnings
       - name: Test planning and filesystem observation
         run: cargo test -p davinci-coding-agent --locked --test test_impact --test test_impact_observation
       - name: Normal agent edit and verification path
@@ -32,9 +36,6 @@ jobs:
         run: cargo test -p davinci-coding-agent --locked --test test_impact_eval -- --ignored --nocapture
       - name: Managed process authorization and lifecycle
         run: cargo test -p davinci-agent --locked --lib process_manager::tests
-      - name: Native listener ownership proof
-        if: runner.os != 'macOS'
-        run: cargo test -p davinci-agent --locked --lib process_manager::socket_owner::tests
       - name: Native supervisor ownership and public process contracts
         run: cargo test -p davinci-agent --locked --test process_supervisor --test process_manager
       - name: Graph process leases

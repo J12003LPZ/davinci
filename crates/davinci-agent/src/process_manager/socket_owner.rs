@@ -1,5 +1,11 @@
 //! Request-time OS proof for managed loopback listeners. No shell commands.
 
+#[cfg(any(target_os = "macos", test))]
+mod macos;
+
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 pub(super) fn verify(pid: u32, port: u16) -> Result<(), String> {
     if pid == 0 || port == 0 {
         return Err("invalid managed socket binding".into());
@@ -302,7 +308,7 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod platform {
     pub(super) fn birth(_pid: u32) -> Result<u64, ()> {
         Err(())
@@ -314,7 +320,7 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn listener_requires_the_actual_live_owner() {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

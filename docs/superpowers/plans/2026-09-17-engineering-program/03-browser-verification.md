@@ -694,3 +694,39 @@ in CI run `35297281753`; that complete run was still active at inspection. Local
 diff whitespace checks passed. Local actionlint was unavailable; the pushed
 workflow-lint check must validate this workflow change. This checkpoint adds CI
 coverage, without completing P3's platform, sandbox or evidence gates.
+
+### Darwin listener ownership implementation checkpoint
+
+The macOS implementation now queries `net.inet.tcp.pcblist_n` and matches every
+IPv4 loopback/wildcard TCP listener at the requested port to a live socket
+descriptor. It uses the common hashed socket identity from Apple's
+[global socket table](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/in_pcblist.c)
+and [per-process socket query](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/socket_info.c).
+The historical `so_last_pid` field is not an ownership proof. Descriptor holders
+must belong to the managed process tree; birth times prevent admitting a reused
+PID. The root identity and global endpoint identities are rechecked after the
+descriptor scan. This is request-time observation, not a reservation against
+changes after the check.
+
+The parser bounds snapshots at 1 MiB and 4,096 complete groups, requires stable
+generation/count framing, and rejects incomplete, ambiguous or unknown record
+sequences. Descriptor inspection is bounded at 4,096 processes and 65,536 file
+descriptors, with a 32-parent ancestry limit. Unreadable descriptors do not grant
+ownership: every global matching listener still needs a proven managed holder.
+IPv6-only listeners remain a separate unfinished gate.
+
+RED: the new valid-listener parser regression failed with the unavailable proof.
+GREEN: all four focused socket tests passed on Windows with zero ignores,
+including three portable Darwin parser cases. The existing managed-root/child,
+foreign-listener and takeover regression also passed on Windows. Agent formatting,
+all-target Clippy with warnings denied and diff whitespace checks passed.
+
+Native CI now runs the ownership selector and affected agent Clippy on all three
+platforms before the downstream integration checks. The macOS lane additionally
+checks Rust offsets against its installed C SDK and probes two simultaneous
+reuse-port listeners: a genuine child listener must not hide the foreign parent
+listener on the same endpoint. These macOS checks have not run locally and must
+pass on this checkpoint's exact pushed head before platform completion is claimed.
+The earlier `c192282` macOS job passed while ownership was excluded; it is not
+evidence for this new implementation. No subagents were used. P3 and the full
+engineering program remain in progress.

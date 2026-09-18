@@ -45,7 +45,7 @@ fn server() -> Value {
     json!({"executable":"node", "argv":["-e", "process.stdout.write('READY\\n');process.stdin.on('data',b=>process.stdout.write(b));setTimeout(()=>process.exit(0),20000)"]})
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {
     let directory = tempfile::tempdir().unwrap();
