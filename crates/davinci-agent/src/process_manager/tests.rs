@@ -45,6 +45,125 @@ fn server() -> Value {
     json!({"executable":"node", "argv":["-e", "process.stdout.write('READY\\n');process.stdin.on('data',b=>process.stdout.write(b));setTimeout(()=>process.exit(0),20000)"]})
 }
 
+#[test]
+fn process_worker_workspace_isolation_preserves_parent_shutdown_and_reuse() {
+    let parent_dir = tempfile::tempdir().unwrap();
+    let worker_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let session = agent(parent_dir.path(), PermissionMode::AlwaysApprove);
+    let parent = session.tool_context.processes.as_ref().unwrap();
+    let child = |cwd: &Path| {
+        parent
+            .child_lease_for_workspace(
+                cwd,
+                session.permissions.clone(),
+                crate::shell_policy::ShellPolicyProfile::Permissive,
+            )
+            .unwrap()
+    };
+    let first = child(worker_dir.path());
+    let second = child(worker_dir.path());
+    let other = child(other_dir.path());
+    let args = server();
+    let started = first
+        .execute(worker_dir.path(), "process_start", &args, None, None)
+        .unwrap();
+    let details = started.details.unwrap();
+    let id = details["process"]["id"].as_u64().unwrap() as u32;
+    assert_eq!(
+        details["process"]["workspace"],
+        json!(worker_dir.path().canonicalize().unwrap())
+    );
+    let reused = second
+        .execute(worker_dir.path(), "process_start", &args, None, None)
+        .unwrap()
+        .details
+        .unwrap();
+    assert_eq!(reused["process"]["id"], id);
+    assert_eq!(reused["reused"], true);
+    assert!(first
+        .execute(
+            parent_dir.path(),
+            "process_status",
+            &json!({"id":id}),
+            None,
+            None
+        )
+        .is_err());
+    assert!(other
+        .execute(
+            other_dir.path(),
+            "process_status",
+            &json!({"id":id}),
+            None,
+            None
+        )
+        .is_err());
+    let separate = other
+        .execute(other_dir.path(), "process_start", &args, None, None)
+        .unwrap()
+        .details
+        .unwrap();
+    assert_ne!(separate["process"]["id"], id);
+    // Equal command cwd does not make distinct workspace roots equivalent.
+    let nested_dir = worker_dir.path().join("nested");
+    std::fs::create_dir(&nested_dir).unwrap();
+    let nested = child(&nested_dir);
+    let mut nested_args = server();
+    nested_args["cwd"] = json!(nested_dir);
+    let from_outer = first
+        .execute(worker_dir.path(), "process_start", &nested_args, None, None)
+        .unwrap()
+        .details
+        .unwrap();
+    let from_nested = nested
+        .execute(&nested_dir, "process_start", &nested_args, None, None)
+        .unwrap()
+        .details
+        .unwrap();
+    assert_ne!(from_outer["process"]["id"], from_nested["process"]["id"]);
+    drop(first);
+    assert!(second
+        .execute(
+            worker_dir.path(),
+            "process_status",
+            &json!({"id":id}),
+            None,
+            None
+        )
+        .is_ok());
+    parent.shutdown();
+    assert!(second
+        .execute(
+            worker_dir.path(),
+            "process_status",
+            &json!({"id":id}),
+            None,
+            None
+        )
+        .is_err());
+    assert!(other
+        .execute(other_dir.path(), "process_list", &json!({}), None, None)
+        .is_err());
+    let until = Instant::now() + Duration::from_secs(5);
+    while session
+        .tool_context
+        .jobs
+        .lock()
+        .unwrap()
+        .get(id)
+        .unwrap()
+        .status()
+        == crate::jobs::JobStatus::Running
+    {
+        assert!(
+            Instant::now() < until,
+            "worktree server survived parent shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {

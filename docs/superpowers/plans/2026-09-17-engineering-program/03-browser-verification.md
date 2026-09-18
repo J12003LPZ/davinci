@@ -781,3 +781,40 @@ Native Linux/macOS IPv6 behavior is not established by Windows or portable parse
 tests; the new head must pass those native CI lanes. Contracted sandbox execution,
 distinct Graph worktrees, transaction-bound receipts, public artifact retrieval
 and full scheduler/frontend evaluation remain open. No subagents were used.
+
+### Parent-owned Graph worktree checkpoint
+
+The trusted Graph controller now binds process and browser worker leases to the
+canonical checkout selected by the worker specification. Process workspace views
+share the parent session's job book, supervisor and terminal shutdown state.
+Equivalent commands reuse a process only within the same canonical workspace;
+even equal command directories under distinct nested workspace roots do not
+cross-reuse. Worker ownership still gates process IDs. Weak workspace views avoid
+retaining departed workers and preserve same-workspace restart supervision.
+
+Browser workers retain the parent-owned engine and artifact budget while binding
+requests to their own checkout. Trusted Node and Playwright dependencies are
+revalidated outside each worker checkout before its browser adapter is admitted.
+The model cannot select this host workspace binding through tool arguments.
+
+RED: the new distinct-workspace process regression failed before implementation.
+GREEN: 23 focused process-manager tests passed, and the extended nested-workspace
+regression passed independently. Both public process-manager integration tests
+passed. Eight offline Graph coordinator tests passed (the real browser case was
+ignored there), and five offline browser tests passed (two real cases ignored).
+The explicitly enabled authenticated Chromium Graph fixture passed without
+ignores across IPv4/IPv6 and same-checkout/distinct Git-worktree combinations.
+It proves managed server reuse, context isolation, all ten browser actions,
+revocation, cancellation and cleanup. This is not a full scheduler evaluation.
+The explicitly enabled normal-session Chromium fixture also passed without
+ignores, retaining the UI failure/edit/fix and cleanup coverage in normal mode.
+Affected-crate formatting, all-target Clippy with warnings denied and diff
+whitespace checks passed. No subagents were used.
+
+At IPv6 head `4f2b64b`, CI run `35299365146` passed native listener ownership on
+Windows, Linux and macOS, plus quality and all workspace package shards. The
+Linux native lane completed successfully; Windows and macOS downstream native
+steps remained running at observation. This does not establish exact-head CI
+for the new workspace changes. Contracted sandbox execution, transaction-bound
+receipts, public artifact retrieval and full scheduler/frontend evaluation
+remain open; P3 and the full program remain in progress.

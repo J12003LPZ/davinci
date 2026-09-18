@@ -29,17 +29,20 @@ pub(super) fn for_worker(
         .language_intelligence
         .as_ref()
         .map(|manager| manager.for_workspace(&spec.cwd));
-    let processes =
-        deps.processes
-            .as_ref()
-            .zip(deps.permissions.as_ref())
-            .map(|(manager, permissions)| {
-                manager
-                    .child_lease(
-                        permissions.clone(),
-                        roles::shell_profile(roles::role_bash_policy(spec.role)),
-                    )
-                    .with_provenance(davinci_agent::jobs::managed::Provenance {
+    let processes = deps
+        .processes
+        .as_ref()
+        .zip(deps.permissions.as_ref())
+        .and_then(|(manager, permissions)| {
+            manager
+                .child_lease_for_workspace(
+                    &spec.cwd,
+                    permissions.clone(),
+                    roles::shell_profile(roles::role_bash_policy(spec.role)),
+                )
+                .ok()
+                .map(|manager| {
+                    manager.with_provenance(davinci_agent::jobs::managed::Provenance {
                         session_id: deps
                             .runtime
                             .as_ref()
@@ -48,12 +51,16 @@ pub(super) fn for_worker(
                         task_id: spec.task_contract.as_ref().map(|contract| contract.task_id),
                         graph_node: Some(spec.task_id.clone()),
                     })
-            });
+                })
+        });
     let browser = deps
         .browser
         .as_ref()
         .zip(processes.as_ref())
-        .map(|(host, manager)| host.for_worker(manager.clone(), abort.clone()));
+        .and_then(|(host, manager)| {
+            host.for_worker(&spec.cwd, manager.clone(), abort.clone())
+                .ok()
+        });
     (language.is_some() || processes.is_some() || browser.is_some()).then(|| {
         Arc::new(ParentTools {
             language,
@@ -198,10 +205,13 @@ mod tests {
                 failure_reason: None,
             })
             .unwrap();
-        let processes = manager.child_lease(
-            permissions.clone(),
-            roles::shell_profile(roles::role_bash_policy(Role::Writer)),
-        );
+        let processes = manager
+            .child_lease_for_workspace(
+                cwd,
+                permissions.clone(),
+                roles::shell_profile(roles::role_bash_policy(Role::Writer)),
+            )
+            .unwrap();
         let mut tools: Vec<String> = [
             "process_start",
             "process_status",
@@ -217,7 +227,10 @@ mod tests {
                     .map(|v| (*v).to_string()),
             );
         }
-        let browser = browser.map(|host| host.for_worker(processes.clone(), abort.clone()));
+        let browser = browser.map(|host| {
+            host.for_worker(cwd, processes.clone(), abort.clone())
+                .unwrap()
+        });
         TaskCoordinatorTransport::bind_with_handler(
             parent,
             child,
@@ -342,24 +355,61 @@ mod tests {
     #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
     fn graph_browser_transport_shares_server_and_isolates_worker_contexts() {
         for host in ["127.0.0.1", "::1"] {
-            graph_browser_transport_for(host);
+            for worktree in [false, true] {
+                graph_browser_transport_for(host, worktree);
+            }
         }
     }
 
-    fn graph_browser_transport_for(loopback_host: &str) {
+    fn graph_browser_transport_for(loopback_host: &str, worktree: bool) {
         use crate::native_extensions::browser::{
             BrowserConfig, BrowserController, BrowserWorkerHost,
         };
-        let dir = tempfile::tempdir().unwrap();
+        let parent_dir = tempfile::tempdir().unwrap();
+        let worker_dir = tempfile::tempdir().unwrap();
+        if worktree {
+            let git = |args: &[&std::ffi::OsStr]| {
+                let output = std::process::Command::new("git")
+                    .current_dir(parent_dir.path())
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init".as_ref(), "--quiet".as_ref()]);
+            git(&[
+                "-c".as_ref(),
+                "user.name=fixture".as_ref(),
+                "-c".as_ref(),
+                "user.email=fixture@example.invalid".as_ref(),
+                "commit".as_ref(),
+                "--quiet".as_ref(),
+                "--allow-empty".as_ref(),
+                "-m".as_ref(),
+                "fixture".as_ref(),
+            ]);
+            git(&[
+                "worktree".as_ref(),
+                "add".as_ref(),
+                "--quiet".as_ref(),
+                "--detach".as_ref(),
+                worker_dir.path().as_os_str(),
+            ]);
+        }
+        let dir = if worktree { &worker_dir } else { &parent_dir };
         let jobs = Arc::new(Mutex::new(JobBook::default()));
         let permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
             PermissionMode::AlwaysApprove,
         )));
-        let manager = manager(dir.path(), jobs.clone(), permissions.clone());
+        let manager = manager(parent_dir.path(), jobs.clone(), permissions.clone());
         let parent = parent();
         let host = BrowserWorkerHost {
             controller: BrowserController::new(
-                dir.path(),
+                parent_dir.path(),
                 BrowserConfig {
                     enabled: true,
                     node: std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH")
@@ -414,6 +464,10 @@ mod tests {
             .details
             .unwrap();
         let id = started["process"]["id"].as_u64().unwrap();
+        assert_eq!(
+            started["process"]["workspace"],
+            json!(dir.path().canonicalize().unwrap())
+        );
         let reused = second
             .client()
             .call("process_start", &args)

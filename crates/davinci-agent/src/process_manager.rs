@@ -303,6 +303,26 @@ impl ProcessManager {
         }
     }
 
+    /// The trusted host chooses the worker's checkout, never model arguments.
+    pub fn child_lease_for_workspace(
+        &self,
+        workspace: &Path,
+        permissions: Arc<PermissionState>,
+        profile: crate::shell_policy::ShellPolicyProfile,
+    ) -> Result<Self, String> {
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|_| "process workspace unavailable")?;
+        Ok(Self {
+            owner: self.owner.child_lease_for_workspace(&workspace)?,
+            workspace,
+            permissions,
+            profile,
+            counters: self.counters.clone(),
+            provenance: self.provenance.clone(),
+        })
+    }
+
     pub fn execute(
         &self,
         cwd: &Path,

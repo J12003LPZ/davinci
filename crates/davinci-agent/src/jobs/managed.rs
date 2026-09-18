@@ -10,7 +10,7 @@ pub use restarts::{Provenance, RestartCheck, RestartPolicy, StartOptions};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -92,7 +92,8 @@ impl Drop for Waiter<'_> {
 
 struct Scope {
     id: Uuid,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
+    workspaces: Arc<Mutex<HashMap<PathBuf, Weak<Scope>>>>,
     workspace: PathBuf,
     jobs: Arc<Mutex<JobBook>>,
     host: SupervisorCommand,
@@ -199,15 +200,22 @@ impl ManagedOwner {
         if !workspace.is_dir() {
             return Err("process workspace is not a directory".into());
         }
+        let scope = Arc::new(Scope {
+            id: Uuid::new_v4(),
+            closed: Arc::new(AtomicBool::new(false)),
+            workspaces: Arc::new(Mutex::new(HashMap::new())),
+            workspace,
+            jobs,
+            host,
+        });
+        scope
+            .workspaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope.workspace.clone(), Arc::downgrade(&scope));
         Ok(Self(Arc::new(Owner {
             id: Uuid::new_v4(),
-            scope: Arc::new(Scope {
-                id: Uuid::new_v4(),
-                closed: AtomicBool::new(false),
-                workspace,
-                jobs,
-                host,
-            }),
+            scope,
         })))
     }
 
@@ -218,6 +226,44 @@ impl ManagedOwner {
             id: Uuid::new_v4(),
             scope: self.0.scope.clone(),
         }))
+    }
+
+    /// Host-selected workspace view in the same session and job book.
+    /// Weak views keep same-workspace restart supervision shared without
+    /// retaining departed workers or granting access to another owner's jobs.
+    pub fn child_lease_for_workspace(&self, workspace: &Path) -> Result<Self, String> {
+        self.ensure_open()?;
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|_| "process workspace unavailable")?;
+        if !workspace.is_dir() {
+            return Err("process workspace is not a directory".into());
+        }
+        let parent = &self.0.scope;
+        let mut views = parent.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+        views.retain(|_, scope| scope.strong_count() > 0);
+        let scope = match views.get(&workspace).and_then(Weak::upgrade) {
+            Some(scope) => scope,
+            None => {
+                if views.len() >= MAX_LEASES {
+                    return Err("process workspace limit reached".into());
+                }
+                let scope = Arc::new(Scope {
+                    id: parent.id,
+                    closed: parent.closed.clone(),
+                    workspaces: parent.workspaces.clone(),
+                    workspace: workspace.clone(),
+                    jobs: parent.jobs.clone(),
+                    host: parent.host.clone(),
+                });
+                views.insert(workspace, Arc::downgrade(&scope));
+                scope
+            }
+        };
+        Ok(Self(Arc::new(Owner {
+            id: Uuid::new_v4(),
+            scope,
+        })))
     }
 
     pub fn id(&self) -> Uuid {
@@ -317,8 +363,14 @@ impl ManagedOwner {
         if !config.cwd.starts_with(&self.0.scope.workspace) {
             return Err("process cwd is outside its workspace".into());
         }
-        let identity = serde_json::to_vec(&(&config, revision, self.0.scope.id, &options))
-            .map_err(|_| "invalid command identity")?;
+        let identity = serde_json::to_vec(&(
+            &config,
+            revision,
+            self.0.scope.id,
+            &self.0.scope.workspace,
+            &options,
+        ))
+        .map_err(|_| "invalid command identity")?;
         let key = format!("{:x}", Sha256::digest(identity));
         let (flight, leader) = {
             let mut book = self.0.scope.jobs.lock().unwrap_or_else(|e| e.into_inner());

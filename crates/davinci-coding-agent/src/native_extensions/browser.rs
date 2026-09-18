@@ -96,6 +96,7 @@ struct Resource {
 pub struct BrowserController {
     config: BrowserConfig,
     workspace: PathBuf,
+    host_workspace: PathBuf,
     store: Arc<Mutex<Store>>,
     artifacts: Arc<Mutex<ArtifactBudgetTracker>>,
 }
@@ -129,11 +130,34 @@ pub(super) struct BrowserWorker {
 impl BrowserWorkerHost {
     pub(super) fn for_worker(
         &self,
+        workspace: &Path,
         processes: davinci_agent::process_manager::ProcessManager,
         abort: Arc<std::sync::atomic::AtomicBool>,
-    ) -> BrowserWorker {
-        BrowserWorker {
-            host: self.clone(),
+    ) -> Result<BrowserWorker, String> {
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|_| "browser workspace unavailable")?;
+        if !workspace.is_dir() {
+            return Err("browser workspace is not a directory".into());
+        }
+        if self.controller.config.enabled {
+            for dependency in [
+                &self.controller.config.node,
+                &self.controller.config.package,
+            ] {
+                if dependency
+                    .canonicalize()
+                    .map_err(|_| "trusted browser dependency unavailable")?
+                    .starts_with(&workspace)
+                {
+                    return Err("browser dependencies must be outside the worker workspace".into());
+                }
+            }
+        }
+        let mut host = self.clone();
+        host.controller.workspace = workspace;
+        Ok(BrowserWorker {
+            host,
             context: ToolContext {
                 processes: Some(processes),
                 foreground_supervisor: Some(self.supervisor.clone()),
@@ -141,7 +165,7 @@ impl BrowserWorkerHost {
                 ..Default::default()
             },
             owned: Mutex::new(Default::default()),
-        }
+        })
     }
 }
 
@@ -360,11 +384,13 @@ impl BrowserController {
         self.store.lock().unwrap().resources.len()
     }
     pub fn new(workspace: &Path, config: BrowserConfig) -> Self {
+        let workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.into());
         Self {
             config,
-            workspace: workspace
-                .canonicalize()
-                .unwrap_or_else(|_| workspace.into()),
+            host_workspace: workspace.clone(),
+            workspace,
             store: Arc::new(Mutex::new(Store::default())),
             artifacts: Arc::new(Mutex::new(ArtifactBudgetTracker::new(MAX_RUN_BYTES))),
         }
@@ -436,7 +462,7 @@ impl BrowserController {
                         node: &self.config.node,
                         package: &self.config.package,
                         version: &self.config.version,
-                        workspace: &self.workspace,
+                        workspace: &self.host_workspace,
                         environment: Default::default(),
                     },
                 )
