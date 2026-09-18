@@ -83,6 +83,16 @@ pub fn role_tools(role: Role) -> Vec<String> {
     tools.extend(semantic.iter().map(|name| (*name).to_string()));
     if matches!(
         role,
+        Role::Researcher | Role::Planner | Role::TestAnalyzer | Role::Writer | Role::Reviewer
+    ) {
+        tools.extend(
+            crate::native_extensions::package_intelligence::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+    }
+    if matches!(
+        role,
         Role::Planner | Role::TestAnalyzer | Role::Writer | Role::Reviewer
     ) {
         tools.extend(
@@ -250,6 +260,19 @@ mod tests {
         assert!(!role_tools(Role::Reviewer).contains(&"lsp_hover".into()));
         assert!(role_tools(Role::TestAnalyzer).contains(&"lsp_diagnostics".into()));
         assert!(!requires_task_coordinator("read"));
+    }
+
+    #[test]
+    fn package_intelligence_tools_follow_role_selection() {
+        for name in crate::native_extensions::package_intelligence::TOOL_NAMES {
+            assert!(!requires_task_coordinator(name));
+            assert!(role_tools(Role::Researcher).contains(&name.to_string()));
+            assert!(role_tools(Role::Planner).contains(&name.to_string()));
+            assert!(role_tools(Role::Writer).contains(&name.to_string()));
+            assert!(role_tools(Role::Reviewer).contains(&name.to_string()));
+            assert!(role_tools(Role::TestAnalyzer).contains(&name.to_string()));
+            assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
+        }
     }
 
     fn allowed(policy: BashPolicy, command: &str) -> bool {

@@ -88,3 +88,25 @@ does not authorize merging new PRs into main.
 The handoff in README records files/APIs changed, validated commands and results,
 metric/artifact paths, head SHA/CI URLs, limitations, and the next dependency input.
 No production capability is called done from this plan alone.
+
+## P5 implementation evidence
+
+Implementation is completed on `codex/package-intelligence-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 10 and cross-cutting sections 18-40. |
+| 2. Plan | [P5 ordered plan](05-package-intelligence.md). |
+| 3. RED/GREEN | Observed failing test suite on initial implementation due to fixture expectations, missing kebab-case lock parsing, and unvalidated package traversal; all 10 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test package_intelligence`: exit 0 (10 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 10 integration tests passed in `package_intelligence.rs`: npm v1, npm v3 with selective symbol resolution, version mismatch detection, pnpm workspace virtual store, yarn classic, yarn berry, conditional exports, path traversal & script non-execution, cache hit/miss telemetry, host registration. |
+| 8. Security | All 5 package intelligence tools classified as `ToolClass::Read`. Traversal attempts in package name or workspace parameter rejected. Workspace isolation verified. Zero package lifecycle scripts executed. No recursive indexing of node_modules into RepoIntelligence. |
+| 9. Normal path | Normal Agent session dispatch executes `package_info`, `package_exports`, `package_symbol`, `package_dependents`, `package_why` and `/package-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Researcher`, `Role::Planner`, `Role::Writer`, `Role::Reviewer`, and `Role::TestAnalyzer` authorized for all 5 tools; `Role::Classifier` denied (least privilege). Unit test `package_intelligence_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p5-package-final.json](evidence/p5-package-final.json) captures full verification evidence, supported formats, security invariants, and test results. |
+| 12. Docs | Updated `05-package-intelligence.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
+| 14. CI | Pending push to `codex/package-intelligence-01a0ad48` and exact-head CI run monitoring. |
+

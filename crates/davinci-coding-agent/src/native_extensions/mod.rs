@@ -6,6 +6,7 @@ pub mod ecosystem;
 pub mod graph;
 pub mod language_intelligence;
 pub mod learning;
+pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
 pub mod test_impact;
@@ -51,6 +52,11 @@ pub const NATIVE_TOOLS: &[&str] = &[
     "test_related",
     "test_impacted",
     "test_plan",
+    "package_info",
+    "package_exports",
+    "package_symbol",
+    "package_dependents",
+    "package_why",
     "repo_map",
     "symbol_search",
     "file_symbols",
@@ -93,6 +99,7 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "repo-index-status",
     "cache-status",
     "test-impact-status",
+    "package-status",
     "lsp-status",
     "memory-status",
     "memory-search",
@@ -138,6 +145,11 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         (
             "test-impact-status",
             "Show test-impact availability and repository observation state.",
+            None,
+        ),
+        (
+            "package-status",
+            "Show installed dependency resolution status, lockfile kinds, and cache telemetry.",
             None,
         ),
         (
@@ -242,6 +254,7 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 pub struct NativeExtensionHost {
     pub browser: browser::BrowserController,
     pub test_impact: test_impact::TestImpact,
+    pub package_intelligence: package_intelligence::PackageIntelligence,
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
@@ -307,6 +320,11 @@ impl NativeExtensionHost {
                 .test_impact
                 .unwrap_or_default(),
         );
+        let package_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .package_intelligence
+            .unwrap_or_default();
+        let package_intelligence =
+            package_intelligence::PackageIntelligence::new(cwd, cache.clone(), package_config);
         let language_config = agent_dir
             .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
             .unwrap_or_default();
@@ -334,6 +352,7 @@ impl NativeExtensionHost {
                     .unwrap_or_default(),
             ),
             test_impact,
+            package_intelligence,
             repo_intelligence,
             cache,
             language_intelligence,
@@ -536,6 +555,9 @@ impl NativeExtensionHost {
                 "browser tool requires engine dispatch context".into(),
             )),
             name if test_impact::TOOL_NAMES.contains(&name) => self.test_impact.execute(name, args),
+            name if package_intelligence::TOOL_NAMES.contains(&name) => {
+                self.package_intelligence.execute_tool(name, args)
+            }
             name if repo_intelligence::is_repo_tool(name) => {
                 self.repo_intelligence.execute_tool(name, args)
             }
@@ -586,6 +608,7 @@ impl NativeExtensionHost {
             "repo-index-status" => Ok(Some(self.repo_intelligence.status())),
             "lsp-status" => Ok(Some(self.language_intelligence.status())),
             "test-impact-status" => Ok(Some(self.test_impact.status())),
+            "package-status" => Ok(Some(self.package_intelligence.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
@@ -628,6 +651,9 @@ impl NativeExtensionHost {
         }
         if test_impact::TOOL_NAMES.contains(&name) {
             return test_impact::tool_spec(name);
+        }
+        if package_intelligence::TOOL_NAMES.contains(&name) {
+            return package_intelligence::tool_spec(name);
         }
         if language_intelligence::TOOL_NAMES.contains(&name) {
             return language_intelligence::tool_spec(name);

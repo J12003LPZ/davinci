@@ -1,0 +1,7 @@
+{
+  "name": "malicious-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "evil-pkg": "^1.0.0"
+  }
+}
