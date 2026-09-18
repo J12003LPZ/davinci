@@ -314,6 +314,25 @@ absolute artifact path and passed. Neither attempt is counted as a successful
 artifact-producing run. The existing JS bridge still needs replacement/hardening,
 native tools are not registered, and P3 completion is unproven.
 
+### Managed dev-server attachment checkpoint
+
+The host-only `ProcessManager::with_browser_dev_server` boundary now checks the
+exact request against current permissions, cancellation, workspace, and the
+caller's active managed process lease. It pins owner/session/process lifetime and
+declared port, then rechecks authority and the binding after host I/O. Historical
+status access after lease release remains unchanged. A cached binding does not
+grant permission. Declared port metadata remains unverified; this does not prove
+that the managed PID owns the listening socket.
+
+Executed validation: all 14 `process_manager::tests` cases passed, including three
+browser boundary cases using actual supervised Node processes. They cover foreign
+owners, undeclared ports, release while another caller keeps the process running,
+pre-dispatch cancellation/revocation, and cancellation/revocation/release during
+the callback. Agent formatting and all-target Clippy with warnings denied passed.
+The diff was reviewed solo as requested. Native browser dispatch, supervised Rust
+bridge integration, real source-bound receipts and retained screenshots remain
+unfinished, so this checkpoint does not satisfy P3's completion gate.
+
 ### Real redirect boundary experiment
 
 Draft [PR #12](https://github.com/J12003LPZ/davinci/pull/12) targets the validated

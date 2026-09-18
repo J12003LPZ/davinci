@@ -62,7 +62,127 @@ struct Authority<'a> {
     once: Option<&'a DispatchPermit>,
 }
 
+/// Trusted per-dispatch inputs; never deserialized from model JSON.
+#[derive(Clone, Copy)]
+pub struct BrowserRequest<'a> {
+    pub cwd: &'a Path,
+    pub name: &'a str,
+    pub args: &'a Value,
+    pub abort: Option<&'a AtomicBool>,
+    pub permit: Option<&'a DispatchPermit>,
+    pub process_id: u32,
+    pub port: u16,
+    pub lease: Option<&'a BrowserDevServerLease>,
+}
+
+/// Immutable binding to an active P2 process lifetime and declared local port.
+/// Port metadata is request provenance, not proof that this PID owns a socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserDevServerLease {
+    process_id: u32,
+    owner: uuid::Uuid,
+    session: uuid::Uuid,
+    lifetime: uuid::Uuid,
+    port: u16,
+}
+
+impl BrowserDevServerLease {
+    pub fn origin(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
 impl ProcessManager {
+    /// Authorize the exact browser request and check its active process binding
+    /// before and after host I/O. Cached bindings confer no permission.
+    pub fn with_browser_dev_server<T>(
+        &self,
+        request: BrowserRequest<'_>,
+        operation: impl FnOnce(&BrowserDevServerLease) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let BrowserRequest {
+            cwd,
+            name,
+            args,
+            abort,
+            permit,
+            process_id,
+            port,
+            lease,
+        } = request;
+        if !matches!(
+            name,
+            "browser_open"
+                | "browser_snapshot"
+                | "browser_click"
+                | "browser_type"
+                | "browser_select"
+                | "browser_console"
+                | "browser_network"
+                | "browser_accessibility"
+                | "browser_screenshot"
+                | "browser_close"
+        ) {
+            return Err("unknown browser request".into());
+        }
+        self.owner.ensure_open()?;
+        let cancelled = || abort.is_some_and(|value| value.load(Ordering::SeqCst));
+        if cancelled() {
+            return Err("browser request cancelled".into());
+        }
+        if serde_json::to_vec(args)
+            .map_err(|_| "invalid browser arguments")?
+            .len()
+            > 64 * 1024
+        {
+            return Err("browser arguments exceed 64 KiB".into());
+        }
+        if !cwd
+            .canonicalize()
+            .map_err(|_| "browser cwd unavailable")?
+            .starts_with(&self.workspace)
+        {
+            return Err("browser request is outside its workspace".into());
+        }
+        let authority = self.authorize(cwd, name, args, permit)?;
+        let current = self.browser_binding(process_id, port)?;
+        if lease.is_some_and(|expected| expected != &current) {
+            return Err("browser dev-server lifetime changed".into());
+        }
+        self.recheck(cwd, name, args, &authority)?;
+        if cancelled() {
+            return Err("browser request cancelled".into());
+        }
+        let result = operation(&current)?;
+        self.recheck(cwd, name, args, &authority)?;
+        if cancelled() {
+            return Err("browser request cancelled".into());
+        }
+        if self.browser_binding(process_id, port)? != current {
+            return Err("browser dev-server lifetime changed during the request".into());
+        }
+        Ok(result)
+    }
+
+    fn browser_binding(&self, process_id: u32, port: u16) -> Result<BrowserDevServerLease, String> {
+        let process = self.owner.active_snapshot(process_id)?;
+        if port == 0
+            || !process
+                .ports
+                .iter()
+                .any(|row| row["port"].as_u64() == Some(u64::from(port)))
+        {
+            return Err("browser port is not declared by its managed process".into());
+        }
+        Ok(BrowserDevServerLease {
+            process_id,
+            owner: process.owner,
+            session: process.session,
+            lifetime: process.lifetime,
+            port,
+        })
+    }
+
     pub fn with_counters(mut self, counters: Arc<crate::SharedCounters>) -> Self {
         self.counters = counters;
         self

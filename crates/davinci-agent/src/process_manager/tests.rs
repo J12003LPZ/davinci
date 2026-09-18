@@ -45,6 +45,166 @@ fn server() -> Value {
     json!({"executable":"node", "argv":["-e", "process.stdout.write('READY\\n');process.stdin.on('data',b=>process.stdout.write(b));setTimeout(()=>process.exit(0),20000)"]})
 }
 
+#[test]
+fn browser_dev_server_requires_active_owned_declared_port_and_current_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = session.tool_context.processes.as_ref().unwrap();
+    let mut start = server();
+    start["ports"] = json!([3000]);
+    let result = manager
+        .execute(directory.path(), "process_start", &start, None, None)
+        .unwrap();
+    let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+    let args = json!({"process_id":id,"port":3000});
+    let request = BrowserRequest {
+        cwd: directory.path(),
+        name: "browser_open",
+        args: &args,
+        abort: None,
+        permit: None,
+        process_id: id,
+        port: 3000,
+        lease: None,
+    };
+    let lease = manager
+        .with_browser_dev_server(request, |lease| Ok(lease.clone()))
+        .unwrap();
+    assert_eq!(lease.origin(), "http://127.0.0.1:3000");
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                port: 3001,
+                ..request
+            },
+            |_| Ok(())
+        )
+        .is_err());
+    let foreign = agent(directory.path(), PermissionMode::AlwaysApprove);
+    assert!(foreign
+        .tool_context
+        .processes
+        .as_ref()
+        .unwrap()
+        .with_browser_dev_server(request, |_| Ok(()))
+        .is_err());
+    let child = manager.child_lease(
+        session.permissions.clone(),
+        crate::shell_policy::ShellPolicyProfile::Permissive,
+    );
+    let reused = child
+        .execute(directory.path(), "process_start", &start, None, None)
+        .unwrap();
+    let reused = reused.details.unwrap();
+    assert_eq!(reused["process"]["id"], id);
+    assert_eq!(reused["reused"], true);
+    manager.owner.release(id).unwrap();
+    assert_eq!(child.owner.active_snapshot(id).unwrap().state, "running");
+    // Historical status is still useful; it is not authority to attach a browser.
+    assert!(manager.owner.snapshot(id).is_ok());
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                name: "browser_snapshot",
+                lease: Some(&lease),
+                ..request
+            },
+            |_| Ok(())
+        )
+        .is_err());
+}
+
+#[test]
+fn browser_dev_server_refuses_revocation_and_cancellation_before_callback() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = agent.tool_context.processes.as_ref().unwrap();
+    let mut start = server();
+    start["ports"] = json!([3000]);
+    let result = manager
+        .execute(directory.path(), "process_start", &start, None, None)
+        .unwrap();
+    let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+    let args = json!({"process_id":id,"port":3000});
+    let request = BrowserRequest {
+        cwd: directory.path(),
+        name: "browser_open",
+        args: &args,
+        abort: None,
+        permit: None,
+        process_id: id,
+        port: 3000,
+        lease: None,
+    };
+    let lease = manager
+        .with_browser_dev_server(request, |lease| Ok(lease.clone()))
+        .unwrap();
+    let abort = AtomicBool::new(true);
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                name: "browser_snapshot",
+                abort: Some(&abort),
+                lease: Some(&lease),
+                ..request
+            },
+            |_| -> Result<(), String> { panic!("cancelled callback") }
+        )
+        .is_err());
+    agent.permissions.lock().unwrap().mode = PermissionMode::ReadOnly;
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                name: "browser_click",
+                lease: Some(&lease),
+                ..request
+            },
+            |_| -> Result<(), String> { panic!("revoked callback") }
+        )
+        .is_err());
+}
+
+#[test]
+fn browser_dev_server_rejects_evidence_after_authority_changes_during_callback() {
+    for change in ["permission", "cancel", "release"] {
+        let directory = tempfile::tempdir().unwrap();
+        let session = agent(directory.path(), PermissionMode::AlwaysApprove);
+        let manager = session.tool_context.processes.as_ref().unwrap();
+        let mut start = server();
+        start["ports"] = json!([3000]);
+        let result = manager
+            .execute(directory.path(), "process_start", &start, None, None)
+            .unwrap();
+        let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+        let args = json!({"process_id":id,"port":3000});
+        let abort = AtomicBool::new(false);
+        let result = manager.with_browser_dev_server(
+            BrowserRequest {
+                cwd: directory.path(),
+                name: "browser_click",
+                args: &args,
+                abort: Some(&abort),
+                permit: None,
+                process_id: id,
+                port: 3000,
+                lease: None,
+            },
+            |_| {
+                match change {
+                    "permission" => {
+                        session.permissions.lock().unwrap().mode = PermissionMode::ReadOnly
+                    }
+                    "cancel" => abort.store(true, Ordering::SeqCst),
+                    "release" => manager.owner.release(id).unwrap(),
+                    _ => unreachable!(),
+                }
+                Ok("stale browser evidence")
+            },
+        );
+        assert!(result.is_err(), "accepted stale evidence after {change}");
+    }
+}
+
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(5);
     while !condition() {

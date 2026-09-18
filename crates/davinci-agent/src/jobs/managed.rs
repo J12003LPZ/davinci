@@ -543,6 +543,26 @@ impl ManagedOwner {
         })
     }
 
+    /// Host resource attachment requires this caller's active lease. Historical
+    /// status access remains available after release through `snapshot`.
+    pub fn active_snapshot(&self, id: u32) -> Result<ProcessSnapshot, String> {
+        let (_, record) = self.owned(id)?;
+        if !record
+            .owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .contains(&self.0.id)
+        {
+            return Err("managed process lease has been released".into());
+        }
+        let snapshot = self.snapshot(id)?;
+        if snapshot.state != "running" {
+            return Err("managed process is not running".into());
+        }
+        Ok(snapshot)
+    }
+
     pub fn ids(&self) -> Vec<u32> {
         let book = self.0.scope.jobs.lock().unwrap_or_else(|e| e.into_inner());
         book.jobs
