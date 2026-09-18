@@ -314,6 +314,40 @@ absolute artifact path and passed. Neither attempt is counted as a successful
 artifact-producing run. The existing JS bridge still needs replacement/hardening,
 native tools are not registered, and P3 completion is unproven.
 
+### Supervised browser transport checkpoint
+
+The new host-only `BrowserProcess` launches embedded bridge JavaScript through the
+existing OS supervisor in a private directory outside the project. Node and the
+pinned Playwright dependency must also be outside the project. It retains stdout
+stream identity, limits request/response frames and pending calls, assigns monotonic
+host correlation IDs, rejects replay/malformed responses, and invalidates unknown
+delivery outcomes rather than retrying. No model-visible registry or permission
+system is added. Platform path environment variables use the supervisor's existing
+allowlist; loader and credential environment variables are not inherited.
+
+Screenshots use eight bounded, exclusive staging files with separate transfer
+identities and content hashes. Rust validates references, size and SHA-256 with a
+bounded read before importing bytes into the existing `ArtifactBudgetTracker` under
+unique labels. JSONL carries references rather than binary/base64 data. Shutdown
+closes browser resources and streams; dropping the host stops its supervised OS
+lifetime and removes known private files after reaping.
+
+Actual Windows Chromium regression evidence: navigation to a loopback button page,
+role-based click, changed DOM, verified PNG retained in the existing tracker, replay
+refusal, zero exit and private-directory cleanup passed. The actual test requires
+explicit trusted Node/Playwright settings and is ignored in ordinary offline CI;
+it was explicitly enabled locally. Red runs found empty-environment Node crypto
+initialization failure, Windows extended-path resolution failure, and a paused
+stdin pipe keeping Node alive. The platform allowlist, native realpath resolver,
+and post-cleanup stream closure fixed those failures.
+
+Executed checks: 62 affected Rust interaction cases passed (one explicitly ignored
+real-browser case), 31 deterministic Node cases passed, the separately enabled
+supervised Chromium case passed, coding-agent all-target Clippy with warnings denied
+and formatting passed. Solo diff review was used as requested. Native normal/Graph
+browser dispatch, current-source/transaction binding and completion receipts remain
+unfinished; P3 is not complete.
+
 ### Managed dev-server attachment checkpoint
 
 The host-only `ProcessManager::with_browser_dev_server` boundary now checks the

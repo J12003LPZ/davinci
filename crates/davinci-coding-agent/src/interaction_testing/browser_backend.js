@@ -36,8 +36,10 @@ function loadTrustedPlaywright(config) {
   if (!path.isAbsolute(config.packagePath) || !path.isAbsolute(config.workspace)) {
     throw new Error('Trusted browser paths must be absolute');
   }
-  const packagePath = fs.realpathSync(config.packagePath);
-  const workspace = fs.realpathSync(config.workspace);
+  // Rust canonical paths use Windows' extended prefix; the native resolver
+  // handles it without the JavaScript resolver's drive-relative lstat fallback.
+  const packagePath = fs.realpathSync.native(config.packagePath);
+  const workspace = fs.realpathSync.native(config.workspace);
   const relative = path.relative(workspace, packagePath);
   if (relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) {
     throw new Error('Trusted browser package must be outside the workspace');
