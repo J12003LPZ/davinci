@@ -85,6 +85,7 @@ pub struct BrowserDevServerLease {
     session: uuid::Uuid,
     lifetime: uuid::Uuid,
     port: u16,
+    ipv6: bool,
     pid: u32,
     pid_birth: Option<u64>,
     liveness: crate::jobs::managed::ManagedProcessLease,
@@ -97,7 +98,8 @@ impl BrowserDevServerLease {
     }
 
     pub fn origin(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        let host = if self.ipv6 { "[::1]" } else { "127.0.0.1" };
+        format!("http://{host}:{}", self.port)
     }
 
     /// Requires OS evidence that the local listener belongs to the managed
@@ -109,7 +111,7 @@ impl BrowserDevServerLease {
         if socket_owner::identity(self.pid)? != birth {
             return Err("managed process identity changed".into());
         }
-        socket_owner::verify(self.pid, self.port)?;
+        socket_owner::verify_for(self.pid, self.port, self.ipv6)?;
         if socket_owner::identity(self.pid)? != birth {
             return Err("managed process identity changed".into());
         }
@@ -186,7 +188,19 @@ impl ProcessManager {
             return Err("browser request is outside its workspace".into());
         }
         let authority = self.authorize(cwd, name, args, permit)?;
-        let current = self.browser_binding(process_id, port)?;
+        let ipv6 = if name == "browser_open" {
+            match args.get("host") {
+                None => false,
+                Some(Value::String(host)) if host == "127.0.0.1" => false,
+                Some(Value::String(host)) if host == "::1" => true,
+                _ => return Err("browser host must be 127.0.0.1 or ::1".into()),
+            }
+        } else {
+            lease
+                .ok_or("browser action requires its original lease")?
+                .ipv6
+        };
+        let current = self.browser_binding(process_id, port, ipv6)?;
         if lease.is_some_and(|expected| expected != &current) {
             return Err("browser dev-server lifetime changed".into());
         }
@@ -199,13 +213,18 @@ impl ProcessManager {
         if cancelled() {
             return Err("browser request cancelled".into());
         }
-        if self.browser_binding(process_id, port)? != current {
+        if self.browser_binding(process_id, port, ipv6)? != current {
             return Err("browser dev-server lifetime changed during the request".into());
         }
         Ok(result)
     }
 
-    fn browser_binding(&self, process_id: u32, port: u16) -> Result<BrowserDevServerLease, String> {
+    fn browser_binding(
+        &self,
+        process_id: u32,
+        port: u16,
+        ipv6: bool,
+    ) -> Result<BrowserDevServerLease, String> {
         let (process, liveness) = self.owner.active_lease(process_id)?;
         if port == 0
             || !process
@@ -221,6 +240,7 @@ impl ProcessManager {
             session: process.session,
             lifetime: process.lifetime,
             port,
+            ipv6,
             pid: process.pid,
             pid_birth: socket_owner::identity(process.pid).ok(),
             liveness,

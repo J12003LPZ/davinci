@@ -220,12 +220,17 @@ impl Drop for BrowserWorker {
 struct Open {
     process_id: u32,
     port: u16,
+    #[serde(default = "loopback_host")]
+    host: String,
     #[serde(default = "root_path")]
     path: String,
     viewport: Option<Viewport>,
 }
 fn root_path() -> String {
     "/".into()
+}
+fn loopback_host() -> String {
+    "127.0.0.1".into()
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -254,6 +259,7 @@ fn parse(name: &str, args: &Value) -> Result<Request, String> {
             serde_json::from_value(args.clone()).map_err(|_| "invalid browser open arguments")?;
         if request.process_id == 0
             || request.port == 0
+            || !matches!(request.host.as_str(), "127.0.0.1" | "::1")
             || request.path.len() > 8192
             || !request.path.starts_with('/')
             || request.path.starts_with("//")
@@ -603,7 +609,7 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
         {"type":"object","properties":{"kind":{"enum":["label","test_id"]},"value":{"type":"string","minLength":1,"maxLength":1024}},"required":["kind","value"],"additionalProperties":false}]});
     let mut parameters = json!({"type":"object","properties":{"browser_id":{"type":"string","format":"uuid"}},"required":["browser_id"],"additionalProperties":false});
     if name == "browser_open" {
-        parameters = json!({"type":"object","properties":{"process_id":{"type":"integer","minimum":1},"port":{"type":"integer","minimum":1,"maximum":65535},"path":{"type":"string","maxLength":8192,"description":"Local path beginning with /; defaults to /."},"viewport":{"type":"object","properties":{"width":{"type":"integer","minimum":128,"maximum":1920},"height":{"type":"integer","minimum":128,"maximum":1080}},"required":["width","height"],"additionalProperties":false}},"required":["process_id","port"],"additionalProperties":false});
+        parameters = json!({"type":"object","properties":{"process_id":{"type":"integer","minimum":1},"port":{"type":"integer","minimum":1,"maximum":65535},"host":{"type":"string","enum":["127.0.0.1","::1"],"description":"Managed loopback address; defaults to 127.0.0.1."},"path":{"type":"string","maxLength":8192,"description":"Local path beginning with /; defaults to /."},"viewport":{"type":"object","properties":{"width":{"type":"integer","minimum":128,"maximum":1920},"height":{"type":"integer","minimum":128,"maximum":1080}},"required":["width","height"],"additionalProperties":false}},"required":["process_id","port"],"additionalProperties":false});
     } else if matches!(name, "browser_click" | "browser_type" | "browser_select") {
         parameters["properties"]["selector"] = selector;
         parameters["required"]
@@ -873,6 +879,27 @@ mod tests {
     }
     #[test]
     fn browser_parser_denies_protocols_extra_fields_and_unsafe_selectors() {
+        for host in ["127.0.0.1", "::1"] {
+            assert!(parse(
+                "browser_open",
+                &json!({"process_id":1,"port":3000,"host":host})
+            )
+            .is_ok());
+        }
+        for host in [
+            json!("localhost"),
+            json!("[::1]"),
+            json!("external.example"),
+            json!("::"),
+            json!(null),
+            json!(1),
+        ] {
+            assert!(parse(
+                "browser_open",
+                &json!({"process_id":1,"port":3000,"host":host})
+            )
+            .is_err());
+        }
         for path in [
             "https://example.com/",
             "//example.com/",

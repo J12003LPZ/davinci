@@ -48,10 +48,18 @@ fn server() -> Value {
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[test]
 fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {
+    for host in ["127.0.0.1", "::1"] {
+        browser_socket_proof_for(host);
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn browser_socket_proof_for(host: &str) {
+    let address: std::net::IpAddr = host.parse().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let session = agent(directory.path(), PermissionMode::AlwaysApprove);
     let manager = session.tool_context.processes.as_ref().unwrap();
-    let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let foreign = std::net::TcpListener::bind((address, 0)).unwrap();
     let port = foreign.local_addr().unwrap().port();
     let mut start = server();
     start["ports"] = json!([port]);
@@ -59,7 +67,7 @@ fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {
         .execute(directory.path(), "process_start", &start, None, None)
         .unwrap();
     let id = started.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
-    let args = json!({"process_id":id,"port":port});
+    let args = json!({"process_id":id,"port":port,"host":host});
     let lease = manager
         .with_browser_dev_server(
             BrowserRequest {
@@ -94,10 +102,10 @@ fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {
         .is_err());
 
     for descendant in [false, true] {
-        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reserved = std::net::TcpListener::bind((address, 0)).unwrap();
         let port = reserved.local_addr().unwrap().port();
         drop(reserved);
-        let script = format!("const s=require('net').createServer();s.listen({port},'127.0.0.1',()=>console.log('LISTENING'));process.stdin.on('data',()=>s.close(()=>console.log('CLOSED')));setTimeout(()=>process.exit(),20000)");
+        let script = format!("const s=require('net').createServer();s.listen({port},'{host}',()=>console.log('LISTENING'));process.stdin.on('data',()=>s.close(()=>console.log('CLOSED')));setTimeout(()=>process.exit(),20000)");
         let script = if descendant {
             format!("const c=require('child_process').spawn(process.execPath,['-e',{}],{{stdio:['pipe','pipe','pipe']}});c.stdout.pipe(process.stdout);c.stderr.pipe(process.stderr);process.stdin.pipe(c.stdin);setTimeout(()=>process.exit(),20000)", serde_json::to_string(&script).unwrap())
         } else {
@@ -123,7 +131,7 @@ fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {
                 .text
                 .contains("LISTENING")
         });
-        let args = json!({"process_id":id,"port":port});
+        let args = json!({"process_id":id,"port":port,"host":host});
         let lease = manager
             .with_browser_dev_server(
                 BrowserRequest {
@@ -175,8 +183,7 @@ fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {
                     .text
                     .contains("CLOSED")
             });
-            takeover =
-                Some(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap());
+            takeover = Some(std::net::TcpListener::bind((address, port)).unwrap());
             Ok("untrusted browser result")
         });
         assert!(result.is_err());
@@ -221,6 +228,35 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
         .with_browser_dev_server(request, |lease| Ok(lease.clone()))
         .unwrap();
     assert_eq!(lease.origin(), "http://127.0.0.1:3000");
+    let ipv6_args = json!({"process_id":id,"port":3000,"host":"::1"});
+    let ipv6_request = BrowserRequest {
+        args: &ipv6_args,
+        ..request
+    };
+    let ipv6_lease = manager
+        .with_browser_dev_server(ipv6_request, |lease| Ok(lease.clone()))
+        .unwrap();
+    assert_eq!(ipv6_lease.origin(), "http://[::1]:3000");
+    assert_ne!(ipv6_lease, lease);
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                lease: Some(&lease),
+                ..ipv6_request
+            },
+            |_| Ok(())
+        )
+        .is_err());
+    let invalid_args = json!({"process_id":id,"port":3000,"host":"external.example"});
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                args: &invalid_args,
+                ..request
+            },
+            |_| Ok(())
+        )
+        .is_err());
     assert!(lease.is_live());
     assert!(manager
         .with_browser_dev_server(

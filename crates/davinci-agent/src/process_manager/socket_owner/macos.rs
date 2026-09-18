@@ -80,19 +80,30 @@ fn record<'a>(
     }
     Ok(result)
 }
-fn matching(inp: &[u8], socket: &[u8], port: u16) -> Result<bool, ()> {
-    let address = value::<4>(inp, offset_of!(Inpcb, local_address) + 12)?;
+fn matching(inp: &[u8], socket: &[u8], port: u16, ipv6: bool) -> Result<bool, ()> {
+    let (address_matches, version, family) = if ipv6 {
+        let address = std::net::Ipv6Addr::from(value::<16>(inp, offset_of!(Inpcb, local_address))?);
+        (address.is_unspecified() || address.is_loopback(), 2, 30)
+    } else {
+        let address = value::<4>(inp, offset_of!(Inpcb, local_address) + 12)?;
+        (address == [0; 4] || address == [127, 0, 0, 1], 1, 2)
+    };
     Ok(
         u16::from_be_bytes(value(inp, offset_of!(Inpcb, local_port))?) == port
-            && inp[offset_of!(Inpcb, version)] & 1 != 0
-            && (address == [0; 4] || address == [127, 0, 0, 1])
+            && inp[offset_of!(Inpcb, version)] & version != 0
+            && address_matches
             && i16::from_ne_bytes(value(socket, offset_of!(Socket, socket_type))?) == 1
             && word(socket, offset_of!(Socket, options))? & 2 != 0
             && word(socket, offset_of!(Socket, protocol))? == 6
-            && word(socket, offset_of!(Socket, family))? == 2,
+            && word(socket, offset_of!(Socket, family))? == family,
     )
 }
+#[cfg(test)]
 fn listeners(bytes: &[u8], port: u16) -> Result<HashSet<u64>, ()> {
+    listeners_for(bytes, port, false)
+}
+
+fn listeners_for(bytes: &[u8], port: u16, ipv6: bool) -> Result<HashSet<u64>, ()> {
     let header_size = size_of::<Generation>();
     if port == 0 || bytes.len() > 1024 * 1024 || word(bytes, 0)? as usize != header_size {
         return Err(());
@@ -126,7 +137,7 @@ fn listeners(bytes: &[u8], port: u16) -> Result<HashSet<u64>, ()> {
         if wide(inp, offset_of!(Inpcb, generation))? > generation {
             return Err(());
         }
-        if matching(inp, socket, port)? {
+        if matching(inp, socket, port, ipv6)? {
             let handle = wide(socket, offset_of!(Socket, handle))?;
             if handle == 0 || !result.insert(handle) {
                 return Err(());
@@ -145,8 +156,8 @@ pub(super) fn birth(pid: u32) -> Result<u64, ()> {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn verify(root: u32, port: u16) -> Result<(), ()> {
-    native::verify(root, port)
+pub(super) fn verify(root: u32, port: u16, ipv6: bool) -> Result<(), ()> {
+    native::verify_for(root, port, ipv6)
 }
 
 #[cfg(target_os = "macos")]
@@ -334,9 +345,14 @@ mod native {
         let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), count as usize) };
         wide(bytes, SOCKET_HANDLE)
     }
-    pub(super) fn verify(root: u32, port: u16) -> Result<(), ()> {
+    #[cfg(test)]
+    fn verify(root: u32, port: u16) -> Result<(), ()> {
+        verify_for(root, port, false)
+    }
+
+    pub(super) fn verify_for(root: u32, port: u16, ipv6: bool) -> Result<(), ()> {
         let birth = identity(root)?.1;
-        let handles = listeners(&snapshot()?, port)?;
+        let handles = listeners_for(&snapshot()?, port, ipv6)?;
         let mut pids = [0_i32; 4097];
         // SAFETY: writable aligned PID array; libproc returns the PID count,
         // unlike proc_pidinfo, which returns bytes.
@@ -382,7 +398,7 @@ mod native {
         }
         // Re-read the endpoint after descriptor inspection: a distinct listener
         // must not take over the port during this bounded observation.
-        if listeners(&snapshot()?, port)? != handles {
+        if listeners_for(&snapshot()?, port, ipv6)? != handles {
             return Err(());
         }
         Ok(())
@@ -406,7 +422,7 @@ mod native {
 #include <sys/proc_info.h>
 _Static_assert(sizeof(struct xinpgen) == {generation_size}, "generation size");
 _Static_assert(offsetof(struct socket_fdinfo, psi) + offsetof(struct socket_info, soi_so) == {descriptor}, "descriptor handle offset");
-_Static_assert(AF_INET == 2 && SOCK_STREAM == 1 && IPPROTO_TCP == 6 && SO_ACCEPTCONN == 2, "listener constants");
+_Static_assert(AF_INET == 2 && AF_INET6 == 30 && SOCK_STREAM == 1 && IPPROTO_TCP == 6 && SO_ACCEPTCONN == 2, "listener constants");
 _Static_assert(PROC_PIDFDSOCKETINFO == 3 && sizeof(struct socket_fdinfo) <= 4096, "descriptor ABI cap");
 int main(void) {{ return 0; }}
 "#, generation_size=size_of::<Generation>(), descriptor=SOCKET_HANDLE)).unwrap();
@@ -614,6 +630,39 @@ mod tests {
         }
         bytes.extend(framing);
         bytes
+    }
+
+    #[test]
+    fn ipv6_records_match_only_the_selected_loopback_family() {
+        let mut groups = Vec::new();
+        for (handle, address) in [
+            (91, std::net::Ipv6Addr::LOCALHOST),
+            (92, std::net::Ipv6Addr::UNSPECIFIED),
+            (93, "2001:db8::1".parse().unwrap()),
+        ] {
+            let mut group = group(handle, [0; 4], 4321);
+            group[offset_of!(Inpcb, version)] = 2;
+            put(
+                &mut group,
+                offset_of!(Inpcb, local_address),
+                address.octets(),
+            );
+            put(
+                &mut group,
+                size_of::<Inpcb>().next_multiple_of(8) + offset_of!(Socket, family),
+                30_i32.to_ne_bytes(),
+            );
+            groups.push(group);
+        }
+        let bytes = snapshot(&groups);
+        assert_eq!(
+            listeners_for(&bytes, 4321, true),
+            Ok(HashSet::from([91, 92]))
+        );
+        assert!(listeners_for(&bytes, 4321, false).is_err());
+        for length in 0..bytes.len() {
+            assert!(listeners_for(&bytes[..length], 4321, true).is_err());
+        }
     }
 
     #[test]

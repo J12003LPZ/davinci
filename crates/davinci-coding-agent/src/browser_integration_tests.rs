@@ -16,7 +16,13 @@ use std::{
 #[test]
 #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
 fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
-    for shared in [false, true] {
+    for (shared, ipv6) in [(false, false), (true, false), (false, true), (true, true)] {
+        let address: std::net::IpAddr = if ipv6 {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        };
+        let loopback_host = address.to_string();
         let root = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut agent = build_agent(
@@ -70,7 +76,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         } else {
             attach_tool_executor(&mut agent, &host);
         }
-        let port = TcpListener::bind("127.0.0.1:0")
+        let port = TcpListener::bind((address, 0))
             .unwrap()
             .local_addr()
             .unwrap()
@@ -82,7 +88,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         )
         .unwrap();
         let script = format!(
-            "const http=require('node:http');const fs=require('node:fs');const server=http.createServer((req,res)=>{{res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}});server.listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>server.close(),60000);"
+            "const http=require('node:http');const fs=require('node:fs');const server=http.createServer((req,res)=>{{res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}});server.listen({port},'{loopback_host}',()=>console.log('READY'));setTimeout(()=>server.close(),60000);"
         );
         let (started, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
@@ -112,7 +118,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         let (opened, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
             "browser_open",
-            json!({"process_id":process_id,"port":port,"viewport":{"width":800,"height":600}}),
+            json!({"process_id":process_id,"port":port,"host":loopback_host,"viewport":{"width":800,"height":600}}),
         );
         assert!(!error, "{output}");
         assert_eq!(opened["verification"], "observations_only");
@@ -148,7 +154,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         let (opened, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
             "browser_open",
-            json!({"process_id":process_id,"port":port}),
+            json!({"process_id":process_id,"port":port,"host":loopback_host}),
         );
         assert!(!error, "{output}");
         let id = opened["browser_id"].as_str().unwrap();
@@ -226,7 +232,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         let (interrupted, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
             "browser_open",
-            json!({"process_id":process_id,"port":port}),
+            json!({"process_id":process_id,"port":port,"host":loopback_host}),
         );
         assert!(!error, "{output}");
         let interrupted_id = interrupted["browser_id"].as_str().unwrap();
@@ -272,7 +278,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         let (reopened, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
             "browser_open",
-            json!({"process_id":process_id,"port":port}),
+            json!({"process_id":process_id,"port":port,"host":loopback_host}),
         );
         assert!(!error, "fresh request must recover the backend: {output}");
         let recovered_id = reopened["browser_id"].as_str().unwrap();
@@ -308,7 +314,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         let (expired, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
             "browser_open",
-            json!({"process_id":process_id,"port":port}),
+            json!({"process_id":process_id,"port":port,"host":loopback_host}),
         );
         assert!(!error, "{output}");
         let expired_id = expired["browser_id"].as_str().unwrap();

@@ -746,3 +746,38 @@ correction needs its own native CI result before the SDK gate is closed.
 For this correction, all four portable/Windows socket tests passed without
 ignores; agent formatting, all-target Clippy with warnings denied and diff
 whitespace checks passed. Production ownership code is unchanged.
+
+### IPv6 managed origin checkpoint
+
+The SDK correction at `00ea149` passed all jobs in CI run `35298502457`,
+including the Windows, Linux and macOS native ownership lanes. This closes that
+correction's CI gate, without completing P3.
+
+`browser_open` now accepts an optional `host` of `127.0.0.1` or `::1`, defaulting
+to IPv4. The selected family becomes part of the immutable dev-server lease;
+subsequent actions use that lease and cannot switch origins. Other host values,
+including `localhost`, bracketed input and null, are rejected. IPv6 origins use
+the canonical bracketed URL spelling. Windows queries the IPv6 owner table,
+Linux reads the IPv6 proc listener table, and Darwin checks the IPv6 address and
+family in its existing bounded socket records. All matching listeners still
+require current managed ownership and process identity checks.
+
+RED: the new actual IPv6 ownership regression failed before implementation.
+GREEN: all 22 focused process-manager tests passed on Windows, with zero skips,
+including managed root/child listeners, foreign listeners and port takeover for
+both address families, plus portable Linux/Darwin address parser cases. Five
+offline native browser cases passed; two real-backend cases were explicitly
+ignored in that offline lane. The explicitly enabled normal-session Chromium
+fixture passed with zero skips across all four address-family/executor attachment
+combinations, including the planted UI failure, edit/fix, all ten actions,
+revocation, cancellation and cleanup. Affected-crate formatting, all-target
+Clippy with warnings denied and diff whitespace checks passed. The explicitly
+enabled authenticated Graph transport fixture also passed with zero skips for
+both families, proving server reuse, cookie/context isolation, all ten actions,
+cancellation, revocation and teardown. This is not the full scheduler evaluation.
+Exact-head native CI remains required.
+
+Native Linux/macOS IPv6 behavior is not established by Windows or portable parser
+tests; the new head must pass those native CI lanes. Contracted sandbox execution,
+distinct Graph worktrees, transaction-bound receipts, public artifact retrieval
+and full scheduler/frontend evaluation remain open. No subagents were used.

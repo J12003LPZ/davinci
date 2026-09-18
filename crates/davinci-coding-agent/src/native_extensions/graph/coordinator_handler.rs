@@ -341,6 +341,12 @@ mod tests {
     #[test]
     #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
     fn graph_browser_transport_shares_server_and_isolates_worker_contexts() {
+        for host in ["127.0.0.1", "::1"] {
+            graph_browser_transport_for(host);
+        }
+    }
+
+    fn graph_browser_transport_for(loopback_host: &str) {
         use crate::native_extensions::browser::{
             BrowserConfig, BrowserController, BrowserWorkerHost,
         };
@@ -390,13 +396,14 @@ mod tests {
             false,
             Some(&host),
         );
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
+        let address: std::net::IpAddr = loopback_host.parse().unwrap();
+        let port = std::net::TcpListener::bind((address, 0))
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
         let script = format!(
-            r#"const http=require('node:http');const s=http.createServer((q,r)=>{{r.setHeader('content-type','text/html');if(q.url==='/set')r.setHeader('set-cookie','owner=first; Path=/');r.end(`<label>Name<input aria-label=Name></label><select aria-label=Choice><option value=a>A</option><option value=b>B</option></select><button onclick="this.textContent='Done'">Start</button><p>`+ (q.headers.cookie||'NO_COOKIE')+'</p>');}});s.listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>s.close(),60000)"#
+            r#"const http=require('node:http');const s=http.createServer((q,r)=>{{r.setHeader('content-type','text/html');if(q.url==='/set')r.setHeader('set-cookie','owner=first; Path=/');r.end(`<label>Name<input aria-label=Name></label><select aria-label=Choice><option value=a>A</option><option value=b>B</option></select><button onclick="this.textContent='Done'">Start</button><p>`+ (q.headers.cookie||'NO_COOKIE')+'</p>');}});s.listen({port},'{loopback_host}',()=>console.log('READY'));setTimeout(()=>s.close(),60000)"#
         );
         std::fs::write(dir.path().join("server.cjs"), script).unwrap();
         let args = json!({"executable":"node","argv":["server.cjs"],"ports":[port]});
@@ -440,14 +447,14 @@ mod tests {
         let one = call(
             &first,
             "browser_open",
-            json!({"process_id":id,"port":port,"path":"/set"}),
+            json!({"process_id":id,"port":port,"host":loopback_host,"path":"/set"}),
         )
         .details
         .unwrap();
         let two = call(
             &second,
             "browser_open",
-            json!({"process_id":id,"port":port}),
+            json!({"process_id":id,"port":port,"host":loopback_host}),
         )
         .details
         .unwrap();
@@ -506,7 +513,7 @@ mod tests {
         let opened = call(
             &cancelled,
             "browser_open",
-            json!({"process_id":id,"port":port}),
+            json!({"process_id":id,"port":port,"host":loopback_host}),
         );
         let cancelled_id = opened.details.unwrap()["browser_id"]
             .as_str()

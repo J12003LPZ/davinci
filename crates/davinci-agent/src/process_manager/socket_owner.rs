@@ -6,15 +6,41 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as platform;
 
+#[cfg(test)]
 pub(super) fn verify(pid: u32, port: u16) -> Result<(), String> {
+    verify_for(pid, port, false)
+}
+
+pub(super) fn verify_for(pid: u32, port: u16, ipv6: bool) -> Result<(), String> {
     if pid == 0 || port == 0 {
         return Err("invalid managed socket binding".into());
     }
-    platform::verify(pid, port).map_err(|_| "managed listener ownership could not be proven".into())
+    platform::verify(pid, port, ipv6)
+        .map_err(|_| "managed listener ownership could not be proven".into())
 }
 
 pub(super) fn identity(pid: u32) -> Result<u64, String> {
     platform::birth(pid).map_err(|_| "managed process identity unavailable".into())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn proc_address_matches(address: &str, ipv6: bool) -> Result<bool, ()> {
+    let mut bytes = [0_u8; 16];
+    let words = if ipv6 { 4 } else { 1 };
+    if address.len() != words * 8 {
+        return Err(());
+    }
+    for i in 0..words {
+        let word =
+            u32::from_str_radix(address.get(i * 8..i * 8 + 8).ok_or(())?, 16).map_err(|_| ())?;
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+    }
+    Ok(if ipv6 {
+        let address = std::net::Ipv6Addr::from(bytes);
+        address.is_unspecified() || address.is_loopback()
+    } else {
+        bytes[..4] == [0; 4] || bytes[..4] == [127, 0, 0, 1]
+    })
 }
 
 #[cfg(windows)]
@@ -144,12 +170,15 @@ mod platform {
         }
         Err(())
     }
-    pub(super) fn verify(root: u32, port: u16) -> Result<(), ()> {
+    pub(super) fn verify(root: u32, port: u16, ipv6: bool) -> Result<(), ()> {
         let birth = started(root)?;
+        let family = if ipv6 { 23 } else { 2 };
+        let columns = if ipv6 { 14 } else { 6 };
         let mut size = 0;
         // SAFETY: null table requests the required size; other inputs are fixed
-        // AF_INET and TCP_TABLE_OWNER_PID_LISTENER, reserved zero.
-        let status = unsafe { GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, 2, 3, 0) };
+        // AF_INET/AF_INET6 and TCP_TABLE_OWNER_PID_LISTENER, reserved zero.
+        let status =
+            unsafe { GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, family, 3, 0) };
         if status != 122 {
             return Err(());
         }
@@ -161,8 +190,9 @@ mod platform {
             }
             table.resize((size as usize).div_ceil(4), 0);
             // SAFETY: u32 storage is aligned, allocated for at least size bytes.
-            let status =
-                unsafe { GetExtendedTcpTable(table.as_mut_ptr().cast(), &mut size, 0, 2, 3, 0) };
+            let status = unsafe {
+                GetExtendedTcpTable(table.as_mut_ptr().cast(), &mut size, 0, family, 3, 0)
+            };
             if status == 0 {
                 complete = true;
                 break;
@@ -175,16 +205,36 @@ mod platform {
             return Err(());
         }
         let count = table[0] as usize;
-        if count > (size as usize / 4).saturating_sub(1) / 6 {
+        if count > (size as usize / 4).saturating_sub(1) / columns {
             return Err(());
         }
         let mut owners = Vec::new();
-        for row in table[1..1 + count * 6].chunks_exact(6) {
-            if row[0] == 2
-                && u16::from_be(row[2] as u16) == port
-                && (row[1] == 0 || row[1].to_ne_bytes() == [127, 0, 0, 1])
-            {
-                owners.push(row[5]);
+        for row in table[1..1 + count * columns].chunks_exact(columns) {
+            let (state, candidate, address, owner) = if ipv6 {
+                // MIB_TCP6ROW_OWNER_PID: 16-byte addresses, scope and port
+                // DWORDs, then state and owner. Address bytes are network order.
+                let bytes: Vec<_> = row[..4]
+                    .iter()
+                    .flat_map(|word| word.to_ne_bytes())
+                    .collect();
+                let address =
+                    std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes).map_err(|_| ())?);
+                (
+                    row[12],
+                    row[5],
+                    row[4] == 0 && (address.is_unspecified() || address.is_loopback()),
+                    row[13],
+                )
+            } else {
+                (
+                    row[0],
+                    row[2],
+                    row[1] == 0 || row[1].to_ne_bytes() == [127, 0, 0, 1],
+                    row[5],
+                )
+            };
+            if state == 2 && u16::from_be(candidate as u16) == port && address {
+                owners.push(owner);
             }
         }
         if owners.is_empty() {
@@ -242,9 +292,16 @@ mod platform {
         }
         Err(())
     }
-    pub(super) fn verify(root: u32, port: u16) -> Result<(), ()> {
+    pub(super) fn verify(root: u32, port: u16, ipv6: bool) -> Result<(), ()> {
         let birth = identity(root)?.1;
-        let tcp = read("/proc/net/tcp", 1024 * 1024)?;
+        let tcp = read(
+            if ipv6 {
+                "/proc/net/tcp6"
+            } else {
+                "/proc/net/tcp"
+            },
+            1024 * 1024,
+        )?;
         let mut inodes = HashSet::new();
         for line in tcp.lines().skip(1) {
             let row: Vec<_> = line.split_whitespace().collect();
@@ -254,7 +311,7 @@ mod platform {
             let (address, candidate) = row[1].split_once(':').ok_or(())?;
             if row[3] == "0A"
                 && u16::from_str_radix(candidate, 16).map_err(|_| ())? == port
-                && (address == "00000000" || address == "0100007F")
+                && super::proc_address_matches(address, ipv6)?
             {
                 inodes.insert(format!("socket:[{}]", row[9]));
             }
@@ -313,13 +370,73 @@ mod platform {
     pub(super) fn birth(_pid: u32) -> Result<u64, ()> {
         Err(())
     }
-    pub(super) fn verify(_pid: u32, _port: u16) -> Result<(), ()> {
+    pub(super) fn verify(_pid: u32, _port: u16, _ipv6: bool) -> Result<(), ()> {
         Err(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proc_addresses_require_exact_loopback_or_wildcard() {
+        fn encoded(bytes: &[u8]) -> String {
+            use std::fmt::Write;
+            let mut encoded = String::new();
+            for chunk in bytes.chunks_exact(4) {
+                write!(
+                    &mut encoded,
+                    "{:08X}",
+                    u32::from_ne_bytes(chunk.try_into().unwrap())
+                )
+                .unwrap();
+            }
+            encoded
+        }
+        for bytes in [
+            std::net::Ipv6Addr::LOCALHOST.octets(),
+            std::net::Ipv6Addr::UNSPECIFIED.octets(),
+        ] {
+            assert_eq!(
+                super::proc_address_matches(&encoded(&bytes), true),
+                Ok(true)
+            );
+        }
+        assert_eq!(
+            super::proc_address_matches(
+                &encoded(
+                    &"2001:db8::1"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets()
+                ),
+                true
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            super::proc_address_matches(&encoded(&[127, 0, 0, 1]), false),
+            Ok(true)
+        );
+        for invalid in [
+            "",
+            "00000000",
+            "Z0000000000000000000000000000000",
+            "é0000000000000000000000000000000",
+        ] {
+            assert!(super::proc_address_matches(invalid, true).is_err());
+        }
+    }
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ipv6_listener_requires_the_selected_family_and_live_owner() {
+        let socket = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert!(super::verify_for(std::process::id(), port, true).is_ok());
+        assert!(super::verify_for(u32::MAX, port, true).is_err());
+        assert!(super::verify_for(std::process::id(), port, false).is_err());
+        drop(socket);
+        assert!(super::verify_for(std::process::id(), port, true).is_err());
+    }
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn listener_requires_the_actual_live_owner() {
