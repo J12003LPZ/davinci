@@ -33,7 +33,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 open | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3` |
 | 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Complete; PR #12 updated | Approved | Package tests, fmt, Clippy, real Chromium normal/Graph paths, network confinement, RPC verification and eval passed | Green at `cdbfe00` |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Complete; PR #13 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `9a3fdf9` |
-| 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
+| 6 | [P7 Build Intelligence](07-build-intelligence.md) | Complete; PR pending | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Pending push |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 8 | [P9 Change Impact Engine](09-change-impact.md) | Planned | Approved | Not run | Not pushed |
 | 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Planned | Approved | Not run | Not pushed |

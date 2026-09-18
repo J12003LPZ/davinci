@@ -132,6 +132,8 @@ pub fn tool_class(tool: &str) -> ToolClass {
         "test_related" | "test_impacted" | "test_plan" => ToolClass::Read,
         "package_info" | "package_exports" | "package_symbol" | "package_dependents"
         | "package_why" => ToolClass::Read,
+        "workspace_packages" | "build_targets" | "build_dependencies" | "build_affected"
+        | "build_command" => ToolClass::Read,
         "repo_map"
         | "symbol_search"
         | "file_symbols"

@@ -87,3 +87,25 @@ does not authorize merging new PRs into main.
 The handoff in README records files/APIs changed, validated commands and results,
 metric/artifact paths, head SHA/CI URLs, limitations, and the next dependency input.
 No production capability is called done from this plan alone.
+
+## P7 implementation evidence
+
+Implementation is completed on `codex/build-intelligence-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 12 and cross-cutting sections 18-40. |
+| 2. Plan | [P7 ordered plan](07-build-intelligence.md). |
+| 3. RED/GREEN | Initial compilation and fixture tests failed; all 12 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test build_intelligence`: exit 0 (12 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 12 integration tests passed in `build_intelligence.rs`: workspace package discovery, Turborepo target pipeline, Nx target defaults & dependsOn, TypeScript composite project references, non-omission downstream reverse dependency traversal, deterministic build command synthesis for Turbo/Nx/pnpm, cyclic dependencies, custom tasks, Vite/Next framework detection, path traversal rejection, CacheRuntime caching & telemetry, NativeExtensionHost registration and permission classification. |
+| 8. Security | All 5 build intelligence tools classified as `ToolClass::Read`. Traversal attempts in package, scope, or file paths rejected. Zero discovery execution: manifests and config files inspected declaratively with no compiler or package code execution. Project-native caches preserved without modification or clearing. |
+| 9. Normal path | Normal Agent session dispatch executes `workspace_packages`, `build_targets`, `build_dependencies`, `build_affected`, `build_command` and `/build-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Researcher`, `Role::Planner`, `Role::Writer`, `Role::Reviewer`, and `Role::TestAnalyzer` authorized for all 5 tools; `Role::Classifier` denied (least privilege). Unit test `build_intelligence_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p7-build-final.json](evidence/p7-build-final.json) captures full verification evidence, supported runners, security invariants, and test results. |
+| 12. Docs | Updated `07-build-intelligence.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
+| 14. CI | Exact-head CI run pending commit push and PR creation. |
+

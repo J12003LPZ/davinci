@@ -1,0 +1,10 @@
+{
+  "name": "@ts/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@ts/core": "*"
+  },
+  "scripts": {
+    "build": "tsc -b"
+  }
+}

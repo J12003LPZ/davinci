@@ -64,6 +64,17 @@ fn parse_package_intelligence<'de, D: serde::Deserializer<'de>>(
     }))
 }
 
+fn parse_build_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::build_intelligence::BuildIntelligenceConfig>, D::Error>
+{
+    use crate::native_extensions::build_intelligence::BuildIntelligenceConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or(BuildIntelligenceConfig { enabled: false })
+    }))
+}
+
 fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<
@@ -112,6 +123,13 @@ pub struct Settings {
     )]
     pub package_intelligence:
         Option<crate::native_extensions::package_intelligence::PackageIntelligenceConfig>,
+    #[serde(
+        default,
+        rename = "buildIntelligence",
+        deserialize_with = "parse_build_intelligence"
+    )]
+    pub build_intelligence:
+        Option<crate::native_extensions::build_intelligence::BuildIntelligenceConfig>,
     #[serde(default, rename = "repoIntelligence")]
     pub repo_intelligence:
         Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,
