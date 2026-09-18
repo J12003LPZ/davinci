@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
     },
     time::{Duration, Instant},
 };
@@ -106,6 +106,43 @@ struct Owner {
 /// A session owner or a child lease explicitly issued by that owner.
 #[derive(Clone)]
 pub struct ManagedOwner(Arc<Owner>);
+
+/// Host-only lifetime observation. It neither grants execution authority nor
+/// keeps the owner (and its processes) alive after session/worker teardown.
+#[derive(Clone)]
+pub struct ManagedProcessLease {
+    owner: Weak<Owner>,
+    process_id: u32,
+    lifetime: Uuid,
+}
+
+impl std::fmt::Debug for ManagedProcessLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedProcessLease")
+            .field("process_id", &self.process_id)
+            .field("lifetime", &self.lifetime)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ManagedProcessLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner.ptr_eq(&other.owner)
+            && self.process_id == other.process_id
+            && self.lifetime == other.lifetime
+    }
+}
+impl Eq for ManagedProcessLease {}
+
+impl ManagedProcessLease {
+    pub fn is_live(&self) -> bool {
+        self.owner.upgrade().is_some_and(|owner| {
+            ManagedOwner(owner)
+                .active_snapshot(self.process_id)
+                .is_ok_and(|snapshot| snapshot.lifetime == self.lifetime)
+        })
+    }
+}
 
 impl std::fmt::Debug for ManagedOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -561,6 +598,16 @@ impl ManagedOwner {
             return Err("managed process is not running".into());
         }
         Ok(snapshot)
+    }
+
+    pub fn active_lease(&self, id: u32) -> Result<(ProcessSnapshot, ManagedProcessLease), String> {
+        let snapshot = self.active_snapshot(id)?;
+        let lease = ManagedProcessLease {
+            owner: Arc::downgrade(&self.0),
+            process_id: id,
+            lifetime: snapshot.lifetime,
+        };
+        Ok((snapshot, lease))
     }
 
     pub fn ids(&self) -> Vec<u32> {

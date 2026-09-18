@@ -611,3 +611,28 @@ managed-server stale-resource reconciliation, remaining platform ownership
 proofs, transaction-bound receipts, artifact retrieval and final evaluations still
 require implementation or direct evidence. This checkpoint is not its completion
 gate, and existing-head CI does not validate these uncommitted changes.
+
+### Managed-server lifetime reconciliation checkpoint
+
+The normal-session Chromium fixture reproduced a stale quota entry after
+`process_stop` (RED: one context remained). It now passes across both attachment
+variants (GREEN). Before browser admission, the controller observes each
+resource's originating managed-owner lifetime and closes expired resources.
+Observation uses an opaque weak owner reference, so it neither grants permission
+nor retains a stopped session. Process metadata and browser cleanup run outside
+the browser store lock. Current request authorization remains mandatory.
+
+The focused ownership regression passed: a released parent lease expires while
+its child's shared server lease remains live; dropping the child invalidates its
+observer. The explicitly enabled real Graph browser fixture also passed without
+skips, preserving independent worker contexts during reconciliation.
+
+This proves explicit process release and owner teardown, rather than every
+unannounced crash race. P3 remains incomplete: full Graph scheduler evaluation,
+contracted execution, remaining platform ownership proofs, transaction-bound
+receipts, artifact retrieval, startup coordination and final evaluations remain.
+Exact-head CI is required after pushing this checkpoint.
+
+Additional checks passed: all four `process_manager::tests::browser_` tests,
+formatting of both affected crates, all-target Clippy for `davinci-agent` and
+`davinci-coding-agent` with warnings denied, and `git diff --check`.

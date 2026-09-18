@@ -87,9 +87,15 @@ pub struct BrowserDevServerLease {
     port: u16,
     pid: u32,
     pid_birth: Option<u64>,
+    liveness: crate::jobs::managed::ManagedProcessLease,
 }
 
 impl BrowserDevServerLease {
+    /// Cleanup observation only; permission must still be checked per request.
+    pub fn is_live(&self) -> bool {
+        self.liveness.is_live()
+    }
+
     pub fn origin(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
@@ -200,7 +206,7 @@ impl ProcessManager {
     }
 
     fn browser_binding(&self, process_id: u32, port: u16) -> Result<BrowserDevServerLease, String> {
-        let process = self.owner.active_snapshot(process_id)?;
+        let (process, liveness) = self.owner.active_lease(process_id)?;
         if port == 0
             || !process
                 .ports
@@ -217,6 +223,7 @@ impl ProcessManager {
             port,
             pid: process.pid,
             pid_birth: socket_owner::identity(process.pid).ok(),
+            liveness,
         })
     }
 

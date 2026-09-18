@@ -305,12 +305,30 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
             json!({"browser_id":id}),
         );
         assert!(!error, "{output}");
+        let (expired, output, error) = super::test_impact_integration_tests::call(
+            &mut agent,
+            "browser_open",
+            json!({"process_id":process_id,"port":port}),
+        );
+        assert!(!error, "{output}");
+        let expired_id = expired["browser_id"].as_str().unwrap();
         let (_, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
             "process_stop",
             json!({"id":process_id}),
         );
         assert!(!error, "{output}");
+        let (_, _, error) = super::test_impact_integration_tests::call(
+            &mut agent,
+            "browser_console",
+            json!({"browser_id":expired_id}),
+        );
+        assert!(error, "released managed-server lifetime must not be usable");
+        assert_eq!(
+            controller.context_count(),
+            0,
+            "stale context must leave the quota"
+        );
         drop(controller);
         drop(host);
         drop(agent);

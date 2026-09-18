@@ -343,6 +343,22 @@ impl BrowserController {
         drop(stale);
         Ok(())
     }
+    fn reconcile_servers(&self) -> Result<(), String> {
+        let resources: Vec<_> = self
+            .store
+            .lock()
+            .map_err(|_| "browser state unavailable")?
+            .resources
+            .iter()
+            .map(|(id, resource)| (*id, resource.clone()))
+            .collect();
+        for (id, resource) in resources {
+            if !resource.lease.is_live() {
+                self.close(id);
+            }
+        }
+        Ok(())
+    }
     fn engine(&self, context: &ToolContext) -> Result<Arc<BrowserProcess>, String> {
         self.reconcile_backend()?;
         {
@@ -423,6 +439,7 @@ impl BrowserController {
             .as_ref()
             .ok_or_else(|| ToolError::Failed("managed process context required".into()))?;
         self.reconcile_backend().map_err(ToolError::Failed)?;
+        self.reconcile_servers().map_err(ToolError::Failed)?;
         let (process_id, port, expected, existing) = match &request {
             Request::Open(open) => (open.process_id, open.port, None, None),
             Request::Action { id, .. } => {

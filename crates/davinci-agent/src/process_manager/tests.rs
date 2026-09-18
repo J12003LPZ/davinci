@@ -221,6 +221,7 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
         .with_browser_dev_server(request, |lease| Ok(lease.clone()))
         .unwrap();
     assert_eq!(lease.origin(), "http://127.0.0.1:3000");
+    assert!(lease.is_live());
     assert!(manager
         .with_browser_dev_server(
             BrowserRequest {
@@ -248,7 +249,12 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
     let reused = reused.details.unwrap();
     assert_eq!(reused["process"]["id"], id);
     assert_eq!(reused["reused"], true);
+    let child_lease = child
+        .with_browser_dev_server(request, |lease| Ok(lease.clone()))
+        .unwrap();
     manager.owner.release(id).unwrap();
+    assert!(!lease.is_live());
+    assert!(child_lease.is_live());
     assert_eq!(child.owner.active_snapshot(id).unwrap().state, "running");
     // Historical status is still useful; it is not authority to attach a browser.
     assert!(manager.owner.snapshot(id).is_ok());
@@ -262,6 +268,11 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
             |_| Ok(())
         )
         .is_err());
+    drop(child);
+    assert!(
+        !child_lease.is_live(),
+        "observation must not retain its owner"
+    );
 }
 
 #[test]
