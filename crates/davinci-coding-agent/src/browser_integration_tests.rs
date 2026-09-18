@@ -14,6 +14,278 @@ use std::{
 };
 
 #[test]
+fn rpc_artifact_helper_entry() {
+    if std::env::var_os("DAVINCI_TEST_RPC_ARTIFACT_HELPER").is_none() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let parsed = Args {
+        offline: true,
+        project_trust_override: Some(true),
+        permission_mode: Some(PermissionMode::AlwaysApprove),
+        ..Default::default()
+    };
+    let mut agent = build_agent(&parsed, state.path(), root.path()).unwrap();
+    let supervisor = SupervisorCommand {
+        executable: std::env::current_exe().unwrap(),
+        argv: vec![
+            "--exact".into(),
+            "process_manager_integration_tests::helper_entry".into(),
+            "--nocapture".into(),
+        ],
+    };
+    agent.tool_context.foreground_supervisor = Some(supervisor.clone());
+    let manager = ProcessManager::new(
+        root.path(),
+        agent.tool_context.jobs.clone(),
+        agent.permissions.clone(),
+        supervisor,
+    )
+    .unwrap();
+    agent.tool_context.processes = Some(manager.clone());
+    let controller = BrowserController::new(
+        root.path(),
+        BrowserConfig {
+            enabled: true,
+            node: std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH")
+                .unwrap()
+                .into(),
+            package: std::env::var("DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH")
+                .unwrap()
+                .into(),
+            version: "1.62.0".into(),
+        },
+    );
+    let host = ExtensionHost::load_with_cwd(state.path(), &[], root.path());
+    host.native.lock().unwrap().browser = controller.clone();
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let script = format!("require('node:http').createServer((q,r)=>r.end('<html><button>Login</button></html>')).listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>process.exit(0),60000);");
+    let started = manager
+        .execute(
+            root.path(),
+            "process_start",
+            &json!({"executable":"node","argv":["-e",script],"ports":[port]}),
+            None,
+            None,
+        )
+        .unwrap();
+    let process_id = started.details.unwrap()["process"]["id"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !manager
+        .execute(
+            root.path(),
+            "process_output",
+            &json!({"id":process_id}),
+            None,
+            None,
+        )
+        .unwrap()
+        .content
+        .contains("READY")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "fixture server did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let opened = controller
+        .execute(
+            root.path(),
+            "browser_open",
+            &json!({"process_id":process_id,"port":port}),
+            &agent.tool_context,
+        )
+        .unwrap()
+        .details
+        .unwrap();
+    let browser_id = opened["browser_id"].clone();
+    let screenshot = controller
+        .execute(
+            root.path(),
+            "browser_screenshot",
+            &json!({"browser_id":browser_id}),
+            &agent.tool_context,
+        )
+        .unwrap()
+        .details
+        .unwrap();
+    controller
+        .execute(
+            root.path(),
+            "browser_close",
+            &json!({"browser_id":browser_id}),
+            &agent.tool_context,
+        )
+        .unwrap();
+    manager
+        .execute(
+            root.path(),
+            "process_stop",
+            &json!({"id":process_id}),
+            None,
+            None,
+        )
+        .unwrap();
+    println!(
+        "\n{}",
+        json!({"type":"artifact_fixture_ready","browser_id":browser_id,"artifact":screenshot["result"]})
+    );
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
+    super::run_rpc_with_host(&parsed, &mut agent, Arc::new(Mutex::new(host))).unwrap();
+    manager.shutdown();
+}
+
+#[test]
+#[ignore = "requires explicitly configured trusted Node and Playwright installation"]
+fn rpc_retained_browser_artifact_wire_exchange() {
+    use base64::Engine;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        process::{Command, Stdio},
+    };
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let state = tempfile::tempdir().unwrap();
+    let stderr = std::fs::File::create(state.path().join("stderr.txt")).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.env_clear();
+    for key in [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "DAVINCI_TRUSTED_NODE_TEST_PATH",
+        "DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let mut child = ChildGuard(
+        command
+            .args([
+                "--exact",
+                "browser_integration_tests::rpc_artifact_helper_entry",
+                "--nocapture",
+            ])
+            .env("DAVINCI_TEST_RPC_ARTIFACT_HELPER", "1")
+            .env("HOME", state.path())
+            .env("USERPROFILE", state.path())
+            .env("PI_CODING_AGENT_DIR", state.path())
+            .env("DAVINCI_CODING_AGENT_DIR", state.path())
+            .env("PI_OFFLINE", "1")
+            .env("PI_DISABLE_NETWORK", "1")
+            .env("PI_HOOKS_DRY_RUN", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let ready = loop {
+        let value = rx
+            .recv_timeout(Duration::from_secs(40))
+            .expect("RPC fixture startup timed out");
+        if value["type"] == "artifact_fixture_ready" {
+            break value;
+        }
+    };
+    let mut stdin = child.0.stdin.take().unwrap();
+    let request = json!({"browser_id":ready["browser_id"],"artifact":ready["artifact"]["artifact"],"offset":0,"limit":64});
+    writeln!(
+        stdin,
+        "{}",
+        json!({"id":"view","type":"get_browser_artifact","value":request.to_string()})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let response = loop {
+        let value = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("artifact RPC response timed out");
+        if value["id"] == "view" {
+            break value;
+        }
+    };
+    assert_eq!(response["success"], true, "{response}");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(response["data"]["base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes.len(), 64);
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(response["data"]["sha256"], ready["artifact"]["sha256"]);
+    assert_eq!(response["data"]["verification"], "observations_only");
+    writeln!(
+        stdin,
+        "{}",
+        json!({"id":"invalid","type":"get_browser_artifact","value":"{}"})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let response = loop {
+        let value = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("invalid artifact RPC response timed out");
+        if value["id"] == "invalid" {
+            break value;
+        }
+    };
+    assert_eq!(response["success"], false);
+    writeln!(stdin, "{}", json!({"id":"messages","type":"get_messages"})).unwrap();
+    stdin.flush().unwrap();
+    let response = loop {
+        let value = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("message RPC response timed out");
+        if value["id"] == "messages" {
+            break value;
+        }
+    };
+    assert_eq!(response["success"], true);
+    assert!(
+        response["data"]["messages"].as_array().unwrap().is_empty(),
+        "frontend binary retrieval must not populate the model conversation"
+    );
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "RPC child did not shut down after EOF"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
 fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
     for (shared, ipv6) in [(false, false), (true, false), (false, true), (true, true)] {

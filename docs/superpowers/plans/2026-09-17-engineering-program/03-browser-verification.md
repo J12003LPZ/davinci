@@ -917,4 +917,22 @@ lease rejection, permission revocation during retrieval, cancellation and parent
 session shutdown. External RPC frontend exchange, Graph retrieval transport,
 transaction-bound receipts and remaining P3 gates are still open. No subagents
 were used; P3 and the full program remain in progress.
-No subagents were used. P3 and the full program remain in progress.
+
+### External retained-artifact RPC exchange checkpoint
+
+The external-client fixture now launches a separate process and exchanges actual
+JSON commands and responses over stdin/stdout through the production RPC loop.
+Its host retains a real Chromium screenshot, closes the browser context and
+stops the managed server before accepting the retrieval request. The client
+receives exactly 64 decoded PNG bytes with the matching retained content hash
+and observations-only classification. Malformed requests receive a structured
+failure. A subsequent `get_messages` response contains no model messages, and
+closing stdin causes a successful child exit.
+
+`browser_integration_tests::rpc_retained_browser_artifact_wire_exchange` passed
+one explicitly enabled test on Windows (zero failed, zero ignored), using the
+configured trusted Node and Playwright installation. The fixture injects its
+prepared host into the extracted production `run_rpc_with_host` loop; it does
+not prove packaged CLI startup or frontend rendering. Graph retrieval transport,
+source/transaction-bound receipts and the remaining P3 acceptance gates are
+still open. No subagents were used.

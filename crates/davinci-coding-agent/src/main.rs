@@ -2972,6 +2972,18 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         return Ok(code);
     }
     install_mode_shutdown_watchers(parsed);
+    run_rpc_with_host(
+        parsed,
+        agent,
+        Arc::new(Mutex::new(loaded_extension_host(parsed))),
+    )
+}
+
+fn run_rpc_with_host(
+    parsed: &Args,
+    agent: &mut Agent,
+    host: Arc<Mutex<ExtensionHost>>,
+) -> Result<i32, String> {
     let session_dir = agent
         .session
         .as_ref()
@@ -2988,7 +3000,6 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         cwd,
         available_models(parsed),
     );
-    let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
     host.lock()
         .unwrap_or_else(|err| err.into_inner())
         .emit(ExtensionEvent::SessionStart);
