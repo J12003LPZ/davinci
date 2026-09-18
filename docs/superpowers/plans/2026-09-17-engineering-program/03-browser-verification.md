@@ -575,7 +575,13 @@ context successfully. Its first run exposed an uninitialized second page in the
 fixture; navigation was added before asserting surviving page content. Package
 formatting and all-target Clippy with warnings denied passed.
 
-P3 remains incomplete. Native normal/Graph in-flight cancellation integration,
+The real normal-session native dispatch fixture was subsequently extended with
+an in-flight missing-selector action. Both attachment variants cancel within two
+seconds, remove that context and preserve another context. The explicitly enabled
+executable fixture passed without skips. Checkpoint `487b6f6` was pushed; CI
+`35295532393` was queued when inspected, so exact-head CI is not yet established.
+
+P3 remains incomplete. Graph in-flight cancellation integration,
 stale-resource reconciliation, dead-engine recovery, remaining platform ownership
 proofs, transaction-bound receipts, artifact retrieval and final evaluations still
 require implementation or direct evidence. This checkpoint is not its completion

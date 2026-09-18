@@ -223,6 +223,45 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
                 assert!(details["result"].get("bytes").is_none());
             }
         }
+        let (interrupted, output, error) = super::test_impact_integration_tests::call(
+            &mut agent,
+            "browser_open",
+            json!({"process_id":process_id,"port":port}),
+        );
+        assert!(!error, "{output}");
+        let interrupted_id = interrupted["browser_id"].as_str().unwrap();
+        let live_abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut live_context = agent.tool_context.clone();
+        live_context.abort = Some(live_abort.clone());
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                live_abort.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let result = controller.execute(root.path(), "browser_click",
+                &json!({"browser_id":interrupted_id,"selector":{"kind":"role","role":"button","name":"Missing"}}),
+                &live_context);
+            assert!(result.is_err(), "cancelled action must not report success");
+        });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(controller
+            .execute(
+                root.path(),
+                "browser_snapshot",
+                &json!({"browser_id":interrupted_id}),
+                &agent.tool_context
+            )
+            .is_err());
+        let (_, output, error) = super::test_impact_integration_tests::call(
+            &mut agent,
+            "browser_snapshot",
+            json!({"browser_id":id}),
+        );
+        assert!(
+            !error,
+            "another context must survive cancellation: {output}"
+        );
         agent
             .permissions
             .lock()
