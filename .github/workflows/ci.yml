@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: '24'
       - name: Bounded browser backend and network policy
-        run: node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs
+        run: node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs
       - name: Use repository-pinned Rust
         run: rustup show
       - name: Test planning and filesystem observation

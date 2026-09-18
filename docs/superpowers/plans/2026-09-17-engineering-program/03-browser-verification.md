@@ -119,6 +119,39 @@ probes (including non-proxied protocols and TLS connection reuse); affected
 package tests, final diff review and exact-head green CI. The old fixture-only
 browser_bridge.js remains unchanged and must not be used as the production path.
 
+### Correlated JSONL transport checkpoint
+
+Added `interaction_testing/browser_transport.js` and focused deterministic/actual
+browser tests. Frames are validated as UTF-8 and capped at 16 KiB before parsing;
+responses are capped at 64 KiB after JSON escaping. Positive safe-integer request
+IDs must increase, preventing replay without an unbounded history. At most sixteen
+requests may remain pending, including output backpressure; output writes have a
+five-second deadline. Close and shutdown bypass the per-context action queue,
+abort pending opens, close contexts and shut down the shared backend. Protocol
+errors terminate input authority and clean up resources. Backend exception text
+is replaced by a fixed error to avoid returning page/credential contents.
+
+Screenshot requests require a trusted artifact callback before executing. Only
+a bounded artifact reference, byte count and media type enter JSONL. The real test
+uses an explicitly identified fixture callback, not the native artifact tracker;
+neither this callback nor these tests issue a source-bound RealBrowser receipt.
+
+Observed RED: the new transport test file exited 1 with MODULE_NOT_FOUND before
+implementation. GREEN: nine transport cases pass; the combined transport/backend/
+network suite passes all 29 deterministic cases, zero skipped. The combined actual
+Chromium suite passes five cases, zero skipped, including JSONL page interaction
+and PNG handoff. Syntax and whitespace checks pass. The CI native matrix now
+includes transport cases. Prior-head b9ee135 CI run 35289618547 was observed live:
+all package shards and aggregate succeeded, all three native browser steps passed,
+and remaining quality/native steps were still running. That run does not validate
+this transport checkpoint.
+
+Required next work remains the supervised Rust bridge and trusted artifact sink,
+request-time native authorization with dispatch permits, P2 current owner/port/
+lifetime leases, native settings/discovery, normal and Graph dispatch, source/
+transaction/action-bound evidence, lifecycle/security probes and milestone gates.
+The transport is host infrastructure only; no production caller is wired yet.
+
 ## Outcome
 
 An ordinary session verifies a real local frontend flow and returns bounded DOM/accessibility, console/network and screenshot evidence.
